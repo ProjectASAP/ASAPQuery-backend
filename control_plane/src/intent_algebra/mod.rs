@@ -113,8 +113,8 @@ pub use expr_ir::{ArithOp, ColumnRef, CompareOp, Expr, L2Expr, L3Expr, L3Scalar}
 pub use query_expr::{
     aggregate_output_schema, between, conjoin, label_filter_to_predicate, AtModifier, BinaryOpKind,
     BindingScope, DataModel, GroupKeys, GroupSide, InfoMatcher, JoinKind, LabelFilter, Predicate,
-    ProjectItem, QueryExpr, QueryExprError, SampleKind, SetOpKind, SortKey, Source, TimeShift,
-    VectorGrouping, VectorMatch, VectorMatchKind, WindowFuncKind, WindowKind,
+    ProjectItem, QueryExpr, QueryExprError, Reduction, SampleKind, SetOpKind, SortKey, Source,
+    TimeShift, VectorGrouping, VectorMatch, VectorMatchKind, WindowFuncKind, WindowKind,
 };
 pub use schema::{cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schema};
 

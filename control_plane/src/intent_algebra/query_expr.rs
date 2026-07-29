@@ -61,7 +61,7 @@ use asap_ir::intent_algebra::schema::ColumnId;
 pub use asap_ir::intent_algebra::{
     aggregate_output_schema, AtModifier, BinaryOpKind, BindingScope, DataModel, GroupKeys,
     GroupSide, InfoMatcher, JoinKind, Predicate, ProjectItem, QueryExpr, QueryExprError,
-    SampleKind, SetOpKind, SortKey, Source, TimeShift, VectorGrouping, VectorMatch,
+    Reduction, SampleKind, SetOpKind, SortKey, Source, TimeShift, VectorGrouping, VectorMatch,
     VectorMatchKind, WindowFuncKind, WindowKind,
 };
 pub use asap_ir::intent_algebra::{ArithOp, ColumnRef, CompareOp, Expr, L3Scalar};

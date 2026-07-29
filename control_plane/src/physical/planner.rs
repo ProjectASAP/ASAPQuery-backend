@@ -290,7 +290,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         //   * single other intent, no HAVING → sketch build, budget-placed
         //   * multi-intent or HAVING → exact HashAggregate at QueryEngine
         QueryExpr::Aggregate {
-            by,
+            reduction,
             aggs,
             having,
             child,
@@ -334,6 +334,9 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
             }
             // Multi-intent / HAVING aggregate → no single sketch can serve
             // it; fall back to an exact hash aggregation at the query engine.
+            // Always a genuine reduction (never per-entity -- see
+            // `intent_algebra::lower`'s single-intent-only per-entity rule).
+            let by = reduction.expect_reduce();
             let child = plan_node(child, config);
             let mut node = PhysicalNode {
                 op: PhysicalOp::HashAggregate {
@@ -588,7 +591,7 @@ mod tests {
     use crate::intent_algebra::relational::{
         default_cardinality, default_frequency, default_quantile,
     };
-    use crate::intent_algebra::{Schema, Source, WindowKind};
+    use crate::intent_algebra::{Reduction, Schema, Source, WindowKind};
     use crate::types_v2::AccuracyTarget;
 
     fn default_config() -> PhysicalPlannerConfig {
@@ -613,7 +616,7 @@ mod tests {
     /// canonical fold of the legacy `SketchAgg`.
     fn sketch_agg(intent: AggIntent, metric: &str) -> QueryExpr {
         QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction: Reduction::by(vec![]),
             aggs: vec![intent],
             output_names: Vec::new(),
             having: None,
@@ -695,7 +698,7 @@ mod tests {
     #[test]
     fn plan_topk_at_query_engine() {
         let expr = QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction: Reduction::by(vec![]),
             aggs: vec![AggIntent::TopK {
                 k: 10,
                 accuracy: AccuracyTarget::Epsilon(0.05),
@@ -714,7 +717,7 @@ mod tests {
         // TopK(QueryEngine) wrapping a sketch Aggregate(Agent) → Exchange
         // between them.
         let expr = QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction: Reduction::by(vec![]),
             aggs: vec![AggIntent::TopK {
                 k: 5,
                 accuracy: AccuracyTarget::Epsilon(0.05),
@@ -744,7 +747,7 @@ mod tests {
         // Multi-intent Aggregate → exact HashAggregate at QueryEngine
         // (no single sketch serves multiple intents).
         let expr = QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction: Reduction::by(vec![]),
             aggs: vec![AggIntent::Sum { col: None }, AggIntent::Min { col: None }],
             output_names: Vec::new(),
             having: None,
@@ -762,7 +765,7 @@ mod tests {
         // Backend, and the outer `TopK` intent runs at QueryEngine.
         // Should span: Agent → Backend → QueryEngine
         let expr = QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction: Reduction::by(vec![]),
             aggs: vec![AggIntent::TopK {
                 k: 10,
                 accuracy: AccuracyTarget::Epsilon(0.05),

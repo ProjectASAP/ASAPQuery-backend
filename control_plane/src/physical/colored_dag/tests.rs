@@ -13,7 +13,7 @@ use std::time::Duration;
 use asap_sketch::{L4Node, L4Schema, SketchQuery, SummaryExpr, SummaryKind, SummaryParams};
 
 use crate::intent_algebra::{
-    BindingScope, ColumnRef, GroupKeys, LabelFilter, QueryExpr, Schema, Source, WindowKind,
+    BindingScope, ColumnRef, LabelFilter, QueryExpr, Reduction, Schema, Source, WindowKind,
 };
 use crate::intent_algebra::schema::{Column, DataType};
 use crate::physical::colored_dag::allocator::StageAllocator;
@@ -104,14 +104,14 @@ fn logical_l4(qe: QueryExpr) -> Rc<L4Node> {
 /// `PhysicalExpr::SketchAgg { sketch_type, params, child }` construction,
 /// for fixtures that need a specific family without going through
 /// `implement_tree`'s cost-model selection.
-fn sketch_agg_l4(sketch: SummaryKind, params: SummaryParams, child: Rc<L4Node>) -> Rc<L4Node> {
+fn sketch_agg_l4(summary: SummaryKind, params: SummaryParams, child: Rc<L4Node>) -> Rc<L4Node> {
     Rc::new(L4Node {
         expr: SummaryExpr::SummaryAgg {
             child,
-            sketch,
+            summary,
             params,
             col: ColumnRef::SampleValue,
-            by: vec![],
+            reduction: Reduction::by(vec![]),
         },
         schema: dummy_l4_schema(),
     })
@@ -119,9 +119,9 @@ fn sketch_agg_l4(sketch: SummaryKind, params: SummaryParams, child: Rc<L4Node>) 
 
 /// Hand-build a `SummaryEstimate` node — mirrors the old
 /// `PhysicalExpr::SketchEstimate { op, child }`.
-fn estimate_l4(query: SketchQuery, sketch_input: Rc<L4Node>) -> Rc<L4Node> {
+fn estimate_l4(query: SketchQuery, summary_input: Rc<L4Node>) -> Rc<L4Node> {
     Rc::new(L4Node {
-        expr: SummaryExpr::SummaryEstimate { sketch_input, query },
+        expr: SummaryExpr::SummaryEstimate { summary_input, query },
         schema: dummy_l4_schema(),
     })
 }
@@ -164,7 +164,7 @@ fn is_ref(expr: &PhysicalExpr) -> bool {
 /// `boundary::summary_candidates`).
 fn quantile_kll_dag() -> PhysicalExpr {
     let q = QueryExpr::Aggregate {
-        by: GroupKeys::none(),
+        reduction: Reduction::by(vec![]),
         aggs: vec![crate::intent_algebra::AggIntent::Quantile {
             col: None,
             q: 0.99,

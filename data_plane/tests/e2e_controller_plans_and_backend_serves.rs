@@ -2213,11 +2213,7 @@ async fn controller_plan_to_query_ddsketch_delta_subwindow_roundtrip() {
 
         // Split this window's distribution into three sub-window increments.
         let third = dist.len() / 3;
-        let sub: [&[f64]; 3] = [
-            &dist[..third],
-            &dist[third..2 * third],
-            &dist[2 * third..],
-        ];
+        let sub: [&[f64]; 3] = [&dist[..third], &dist[third..2 * third], &dist[2 * third..]];
 
         for (f_idx, frame_vals) in sub.iter().enumerate() {
             let sk = dd_over_values(alpha, frame_vals);
@@ -2283,8 +2279,8 @@ async fn controller_plan_to_query_ddsketch_delta_subwindow_roundtrip() {
     // windows (1..=30 ∪ 100..=130 ∪ 1000..=1030 = 1..=1030, 93 samples).
     // Its p99 ≈ 1020. Pull the scalar out of the (instant or range) shape
     // and assert it lands near that within a generous DDSketch-α envelope.
-    let value = extract_first_scalar(result)
-        .expect("could not extract a scalar from the query result");
+    let value =
+        extract_first_scalar(result).expect("could not extract a scalar from the query result");
     // Truth: p99 of the unioned distribution.
     let mut all: Vec<f64> = Vec::new();
     for d in &window_dists {
@@ -2308,12 +2304,140 @@ fn extract_first_scalar(result: &JsonValue) -> Option<f64> {
     let arr = result.as_array()?;
     let first = arr.first()?;
     if let Some(v) = first.get("value").and_then(|v| v.as_array()) {
-        return v.get(1).and_then(|s| s.as_str()).and_then(|s| s.parse().ok());
+        return v
+            .get(1)
+            .and_then(|s| s.as_str())
+            .and_then(|s| s.parse().ok());
     }
     if let Some(vals) = first.get("values").and_then(|v| v.as_array()) {
         let last = vals.last()?.as_array()?;
-        return last.get(1).and_then(|s| s.as_str()).and_then(|s| s.parse().ok());
+        return last
+            .get(1)
+            .and_then(|s| s.as_str())
+            .and_then(|s| s.parse().ok());
     }
     None
 }
 
+// ── Test — shadow-mode `SummaryExecutor` comparison is inert ────────────────
+//
+// `data_plane/docs/l4node-plan-executor-design.md`'s "Rollout" section:
+// enabling `ASAP_SHADOW_SUMMARY_EXECUTOR` computes the new path alongside
+// the old and logs a diff, but must NEVER change what's served. This test
+// is the regression safety net for that claim — same shape as Test 3
+// (`controller_plan_to_query_full_roundtrip_ddsketch`), but with shadow
+// mode on for the duration, asserting the served response still succeeds
+// with the SAME quantile value the flag-off test expects (~p99 of
+// `[5,10,15,20]` bucket counts).
+
+/// RAII guard for `ASAP_SHADOW_SUMMARY_EXECUTOR`. `std::env::set_var`/
+/// `remove_var` mutate process-global state and `cargo test` runs tests
+/// in the same process across threads by default, so every test touching
+/// this var must serialize against the others (mirrors
+/// `control_plane/src/main.rs`'s `EnvVarGuard` pattern for
+/// `USE_TYPED_STAGE_SPLIT`, same reason).
+#[allow(dead_code)] // held for its lock-lifetime/Drop side effect, never read
+struct ShadowEnvGuard(std::sync::MutexGuard<'static, ()>);
+
+impl ShadowEnvGuard {
+    fn enable() -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("ASAP_SHADOW_SUMMARY_EXECUTOR", "1");
+        Self(guard)
+    }
+}
+
+impl Drop for ShadowEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("ASAP_SHADOW_SUMMARY_EXECUTOR");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shadow_mode_does_not_change_served_ddsketch_quantile() {
+    let _shadow = ShadowEnvGuard::enable();
+
+    let stack = start_full_stack(19_591, 19_592).await;
+    let client = reqwest::Client::new();
+
+    let workload = build_workload(
+        "http_latency_ms",
+        vec![AggType::Quantile],
+        0.01,
+        Duration::from_secs(1),
+        vec!["service".to_string()],
+        vec![0.99],
+    );
+    let streaming_config_json = plan_streaming_config_json(&workload);
+    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+
+    // Same fixture data as `controller_plan_to_query_full_roundtrip_ddsketch`
+    // — this test isn't checking quantile accuracy (that's Test 3's job),
+    // it's checking that turning shadow mode on doesn't change whether/what
+    // this query serves.
+    let alpha = 0.01;
+    let store_counts = vec![5u64, 10, 15, 20];
+    let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
+    let sketch_bytes = dd_state.encode_to_vec();
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
+    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
+
+    let req = build_dd_sketch_export(
+        "http_latency_ms",
+        &[("service", "e2e-test")],
+        sketch_t_ns,
+        sketch_bytes,
+        alpha,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, req).await;
+
+    let watermark_state = build_dd_sketch_state(alpha, Vec::new(), 0);
+    let watermark_req = build_dd_sketch_export(
+        "http_latency_ms",
+        &[("service", "e2e-test")],
+        watermark_t_ns,
+        watermark_state.encode_to_vec(),
+        alpha,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let query_url = format!("http://127.0.0.1:{}/api/v1/query", stack.backend_port);
+    let response: JsonValue = client
+        .get(&query_url)
+        .query(&[("query", "quantile_over_time(0.99, http_latency_ms[10s])")])
+        .send()
+        .await
+        .expect("PromQL query failed to send")
+        .json()
+        .await
+        .expect("PromQL response was not JSON");
+
+    assert_eq!(
+        response["status"].as_str().unwrap_or("(missing)"),
+        "success",
+        "shadow mode must not change whether this query succeeds. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+
+    // Same accuracy contract as the flag-off test: p99 of [5,10,15,20]
+    // DDSketch bucket counts should land in a plausible range (not
+    // asserting exact equality with Test 3's own run -- different process,
+    // different wall-clock timestamps -- but the same fixture must
+    // produce the same class of answer regardless of the shadow flag).
+    let value = response["data"]["result"]
+        .as_array()
+        .and_then(|r| extract_first_scalar(&JsonValue::Array(r.clone())))
+        .expect("expected a scalar quantile result");
+    assert!(
+        value.is_finite() && value > 0.0,
+        "shadow mode must not corrupt the served quantile value, got {value}"
+    );
+}

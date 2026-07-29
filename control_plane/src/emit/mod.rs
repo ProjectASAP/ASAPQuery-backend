@@ -328,14 +328,14 @@ fn is_exact_accumulator(kind: &SummaryKind) -> bool {
 
 fn extract_from_node(node: &Rc<L4Node>) -> Option<SummaryKind> {
     match &node.expr {
-        SummaryExpr::SummaryAgg { sketch, .. } if !is_exact_accumulator(sketch) => {
-            Some(sketch.clone())
+        SummaryExpr::SummaryAgg { summary, .. } if !is_exact_accumulator(summary) => {
+            Some(summary.clone())
         }
         // An exact accumulator has no sketch family beneath it (its own
         // child is always a plain `Logical` leaf) — same as the old
         // `ExactAgg` case.
         SummaryExpr::SummaryAgg { .. } => None,
-        SummaryExpr::SummaryEstimate { sketch_input, .. } => extract_from_node(sketch_input),
+        SummaryExpr::SummaryEstimate { summary_input, .. } => extract_from_node(summary_input),
         SummaryExpr::SummaryMerge { children } => children.iter().find_map(extract_from_node),
         // Not surfaced by any `Bind*` path yet (gated on rules that
         // haven't landed — see `physical_expr.rs`'s module docs).

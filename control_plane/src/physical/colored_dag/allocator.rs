@@ -193,8 +193,8 @@ impl ThreeStageWalker {
             // The "SketchEstimate MUST be on the same stage as its
             // consumers (typically Backend)" invariant is satisfied
             // because consumers above SummaryEstimate are also backend.
-            SummaryExpr::SummaryEstimate { sketch_input, .. } => {
-                let (cid, child_stage) = self.visit_l4node(sketch_input)?;
+            SummaryExpr::SummaryEstimate { summary_input, .. } => {
+                let (cid, child_stage) = self.visit_l4node(summary_input)?;
                 self.dag.edges.push((id, cid));
                 // If child is on edge or gateway, this is a cross-stage
                 // edge — that's expected (the wire-format hop).
@@ -232,8 +232,8 @@ impl ThreeStageWalker {
                 self.dag.edges.push((id, rid));
                 StageId::Gateway
             }
-            SummaryExpr::SummaryDelete { sketch_input, .. } => {
-                let (cid, _) = self.visit_l4node(sketch_input)?;
+            SummaryExpr::SummaryDelete { summary_input, .. } => {
+                let (cid, _) = self.visit_l4node(summary_input)?;
                 self.dag.edges.push((id, cid));
                 StageId::Gateway
             }
@@ -399,7 +399,7 @@ mod tests {
     #[test]
     fn three_stage_quantile_dag_basic() {
         let q = QueryExpr::Aggregate {
-            by: crate::intent_algebra::GroupKeys::none(),
+            reduction: crate::intent_algebra::Reduction::PerEntity,
             aggs: vec![crate::intent_algebra::AggIntent::Quantile {
                 col: None,
                 q: 0.99,

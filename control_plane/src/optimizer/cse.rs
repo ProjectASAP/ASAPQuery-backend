@@ -163,13 +163,13 @@ pub fn dedupe_subtrees(roots: Vec<(QueryId, QueryExpr)>) -> CseWorkloadPlan {
     for (qid, root) in roots {
         let new_root = match root {
             QueryExpr::Aggregate {
-                by,
+                reduction,
                 aggs,
                 output_names,
                 having,
                 child,
             } if *child == shared_expr => QueryExpr::Aggregate {
-                by,
+                reduction,
                 aggs,
                 output_names,
                 having,
@@ -194,7 +194,7 @@ pub fn dedupe_subtrees(roots: Vec<(QueryId, QueryExpr)>) -> CseWorkloadPlan {
 mod tests {
     use super::*;
     use crate::intent_algebra::agg_intent::AggIntent;
-    use crate::intent_algebra::query_expr::{LabelFilter, Source, WindowKind};
+    use crate::intent_algebra::query_expr::{LabelFilter, Reduction, Source, WindowKind};
     use crate::intent_algebra::schema::{Column, DataType, Schema};
     use crate::types_v2::AccuracyTarget;
     use std::time::Duration;
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn dedupe_subtrees_single_root_passthrough() {
         let q = QueryExpr::Aggregate {
-            by: vec![1].into(),
+            reduction: Reduction::by(vec![1]),
             aggs: vec![AggIntent::Quantile {
                 col: None,
                 q: 0.99,
@@ -280,7 +280,7 @@ mod tests {
     #[test]
     fn quantiles_over_different_columns_do_not_dedupe() {
         let mk = |col: usize| QueryExpr::Aggregate {
-            by: vec![1].into(),
+            reduction: Reduction::by(vec![1]),
             aggs: vec![AggIntent::Quantile {
                 col: Some(col),
                 q: 0.5,
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn dedupe_subtrees_basic() {
         let q1 = QueryExpr::Aggregate {
-            by: vec![1].into(),
+            reduction: Reduction::by(vec![1]),
             aggs: vec![AggIntent::Quantile {
                 col: None,
                 q: 0.99,
@@ -317,7 +317,7 @@ mod tests {
             child: Box::new(windowed_scan()),
         };
         let q2 = QueryExpr::Aggregate {
-            by: vec![1].into(),
+            reduction: Reduction::by(vec![1]),
             aggs: vec![AggIntent::Quantile {
                 col: None,
                 q: 0.95,
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn dedupe_subtrees_no_shared_subexpr() {
         let q1 = QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction: Reduction::PerEntity,
             aggs: vec![AggIntent::Sum { col: None }],
             output_names: Vec::new(),
             having: None,
@@ -378,7 +378,7 @@ mod tests {
             ),
         };
         let q2 = QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction: Reduction::PerEntity,
             aggs: vec![AggIntent::Max { col: None }],
             output_names: Vec::new(),
             having: None,
@@ -417,7 +417,7 @@ mod tests {
             ),
         };
         let mk = || QueryExpr::Aggregate {
-            by: vec![].into(),
+            reduction: Reduction::by(vec![]),
             aggs: vec![AggIntent::Sum { col: None }],
             output_names: Vec::new(),
             having: None,

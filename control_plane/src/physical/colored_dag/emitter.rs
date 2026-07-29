@@ -92,12 +92,12 @@ fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
     match expr {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
             SummaryExpr::Logical(qe) => NodeKind::Logical(qe),
-            SummaryExpr::SummaryAgg { sketch, params, .. } if is_exact_accumulator(sketch) => {
+            SummaryExpr::SummaryAgg { summary, params, .. } if is_exact_accumulator(summary) => {
                 let _ = params;
                 NodeKind::ExactAgg
             }
-            SummaryExpr::SummaryAgg { sketch, params, .. } => NodeKind::SketchAgg {
-                sketch_type: sketch,
+            SummaryExpr::SummaryAgg { summary, params, .. } => NodeKind::SketchAgg {
+                sketch_type: summary,
                 params,
             },
             SummaryExpr::SummaryEstimate { query, .. } => NodeKind::SketchEstimate { query },

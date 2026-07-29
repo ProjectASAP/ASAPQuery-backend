@@ -186,7 +186,7 @@ mod tests {
 
     fn dummy_agg() -> PhysicalExpr {
         let q = QueryExpr::Aggregate {
-            by: crate::intent_algebra::GroupKeys::none(),
+            reduction: crate::intent_algebra::Reduction::by(vec![]),
             aggs: vec![crate::intent_algebra::AggIntent::Sum { col: None }],
             output_names: Vec::new(),
             having: None,
@@ -197,7 +197,7 @@ mod tests {
 
     fn dummy_estimate() -> PhysicalExpr {
         let q = QueryExpr::Aggregate {
-            by: crate::intent_algebra::GroupKeys::none(),
+            reduction: crate::intent_algebra::Reduction::by(vec![]),
             aggs: vec![crate::intent_algebra::AggIntent::Quantile {
                 col: None,
                 q: 0.99,
