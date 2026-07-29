@@ -242,16 +242,18 @@ and readout, through the five trait methods:
   `SummaryExpr::Logical` escape hatch) — this deployment's fallback path
   for anything that reaches serving time without a summary decision.
 
-**Target: `storage_engines/sketch_db/query/sketch_reducer.rs` is retired
-once `SummaryExecutor` reaches parity.** Not before — per this repo's own
-rollout doc, cutover requires confidence data from a shadow-mode
-comparison period (compute both, log discrepancies, serve the legacy
-answer) before the legacy path can be deleted; the doc's own
-"Rollout design" section already specifies this precisely. This doc
-doesn't relitigate that plan — it just confirms the plan's target state
-(a single `SummaryExecutor`-driven serving path) is exactly what
-ASAPController's own interface is designed to make possible, not a
-deployment-specific detour from it.
+**`storage_engines/sketch_db/query/sketch_reducer.rs` and
+`asap_query_engine/shadow_compare.rs` are retired.** Neither was any more
+"ground truth" than `SummaryExecutor` itself — `shadow_compare.rs`'s job
+(validate `SummaryExecutor` against the legacy reducer before cutover)
+was done once the cutover landed (Part A, #427), and keeping the legacy
+reducer around after that only meant two independently-planned answering
+mechanisms could silently disagree with each other, not that either was
+more trustworthy. Shapes `SummaryExecutor` self-excludes before binding
+(`rate()`/`irate()`, `topk(K, sum by(...)(rate(...)))`, keyed-CMS
+point-estimate, and the outer-exact/summary composition gaps below) now
+fail over to archive directly — there is no legacy fallback left, by
+design, not because a rollout step is still pending.
 
 ## 4. What this means for current code — gap against this target
 
@@ -262,19 +264,22 @@ deployment-specific detour from it.
 | L3 | Zero local `QueryExpr`/`AggIntent`/`Schema` definitions | Already true — `intent_algebra/{agg_intent,query_expr,relational,schema,expr_ir}.rs` are thin re-export shims with only genuinely-local residues (`Frequency` extension helpers, `PerPartitionWrap`, PromQL-ergonomic `LabelFilter`). `intent_algebra/lower.rs` (~1000 lines) remains real local code — deliberately, for two documented reasons with no ASAPController equivalent (multi-agg fusion, the windowed-Count-as-Frequency heuristic). **Effectively closed modulo `lower.rs`'s two documented exceptions.** |
 | L4 | One `CostModel` impl; `Rc<L4Node>` used directly | `sketch_algebra::cost_model::ControlPlaneCostModel` + `sketch_algebra::lower::bind_query_expr` (delegating to `implement_tree_in_with`) already match this shape. `sketch_algebra::matcher::SummaryFamilyMatcher` is the `Matcher` impl this section's serving-time §3 depends on. **Effectively closed** — `PhysicalExpr`/`L4Plan` is a thin, acceptable L5-placement wrapper around `Rc<L4Node>`, not a competing L4 algebra. |
 | L5 | Full local `PhysicalPlanner`/`TopologyDescriptor`/`StageAllocator` impl | `physical/colored_dag/*` + `emit/*` already implement this shape structurally, just not against the trait names above (no literal `PhysicalPlanner` trait exists in this repo — the free functions/structs are the de facto impl). Low-priority gap: naming/trait-alignment, not missing functionality. |
-| Serving | Single `SummaryExecutor` impl is the live path | `data_plane`'s `summary_executor.rs` implements the trait fully and is **now the default-on live path** (`ASAP_SUMMARY_EXECUTOR_LIVE` default flipped from off to on — the grouping-ambiguity blocker below is resolved via `Reduction`, and both unit + e2e tests already proved correctness for the covered shapes). `sketch_reducer.rs` remains the permanent fallback for shapes this executor self-excludes before binding (`rate()`/`irate()`, `topk(K, sum by(...)(rate(...)))`, keyed-CMS point-estimate) — **not** legacy debt pending deletion, an intentional, indefinite split. |
+| Serving | Single `SummaryExecutor` impl is the live path | **Closed.** `data_plane`'s `summary_executor.rs` implements the trait fully and is the default-on, *sole* live path (`ASAP_SUMMARY_EXECUTOR_LIVE` default flipped from off to on, #427; the legacy `sketch_reducer.rs` and diagnostic `shadow_compare.rs` are both retired). Shapes it self-excludes before binding (`rate()`/`irate()`, `topk(K, sum by(...)(rate(...)))`, keyed-CMS point-estimate) and shapes it structurally can't realize yet (composed exact/summary aggregation in either nesting order — [ASAPController#171](https://github.com/ProjectASAP/ASAPController/issues/171), e.g. `max/avg by (zone) (quantile_over_time(...))`) fail over to archive directly, with no local workaround. |
 
 **Net reading**: L1–L4 and the serving-time cutover are all now at
 target. The earlier instinct that "`intent_algebra`/`sketch_algebra`
 should be unnecessary once connected to ASAPController" is correct and
 largely *already true* for L2–L4; L1 has since closed the same way
-(#428), and the serving-time cutover is done for the shapes
-`SummaryExecutor` covers (default-on, #427). `sketch_reducer.rs` is not
-pending deletion — it's the permanent, intentional fallback for shapes
-`SummaryExecutor` self-excludes before binding. L5 should **not** shrink
-— it's this deployment's own, permanent responsibility per
-ASAPController's own "no `asap-physical` crate" status; its only
-remaining gap is the low-priority naming/trait-alignment noted above.
+(#428), and the serving-time cutover is fully done (#427) — `sketch_reducer.rs`
+and `shadow_compare.rs` are both retired, not just superseded. The
+remaining serving-time gaps (rate/topk-over-rate/keyed-CMS,
+ASAPController#171's composed exact/summary shapes) are genuine upstream
+L4 limitations tracked in ASAPController, not something this repo routes
+around locally — same category as the already-tracked `TopK { accuracy:
+Exact }` gap (ASAPController#151). L5 should **not** shrink — it's this
+deployment's own, permanent responsibility per ASAPController's own "no
+`asap-physical` crate" status; its only remaining gap is the low-priority
+naming/trait-alignment noted above.
 
 ## 5. Open questions (carried from `data_plane/docs/l4node-plan-executor-design.md`, mostly resolved)
 

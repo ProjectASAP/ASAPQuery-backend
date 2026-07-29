@@ -1,11 +1,22 @@
-//! The actual `SummaryExecutor` serving cutover — unlike
-//! `shadow_compare.rs` (diagnostic only, never affects what's served),
-//! `try_serve_from_summary_executor` returning `Some(...)` means the
-//! caller uses THIS answer instead of calling the legacy
-//! `SketchReducer` path. See
+//! The `SummaryExecutor` serving path — the sole way `data_plane` answers
+//! a query from the sketch tier. `shadow_compare.rs` (diagnostic-only
+//! comparison against the legacy reducer, used to validate this path
+//! before it went live) and `sketch_reducer.rs` (the legacy reducer
+//! itself) are both retired: neither was "ground truth" any more than
+//! this path is, and once this path was the default-on live serving
+//! path (design-target-architecture.md Part A), keeping a second,
+//! independently-planned answering mechanism around only meant two
+//! things could silently disagree with each other, not that either was
+//! more trustworthy. See
 //! `data_plane/docs/l4node-plan-executor-design.md` and the Phase 2
 //! plan's "What 'safe to serve' means, precisely" section for the exact
 //! gate this applies.
+//!
+//! `try_serve_from_summary_executor` returning `None` (flag off, a
+//! self-excluded shape like `rate()`/`irate()`/`topk(K, sum
+//! by(...)(rate(...)))`/keyed-CMS point-estimate, or no matching
+//! registered sid) means the query fails over to archive — there is no
+//! other sketch-tier path left to try.
 
 use control_plane::types_v2::AccuracyTarget;
 
@@ -13,17 +24,19 @@ use crate::query_engines::asap_query_engine::l4_readout::execute_l4_readout;
 use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::sketch_db::query::ASAPTierResult;
 
-/// Fixed accuracy target for this phase — mirrors
-/// `shadow_compare::SHADOW_ACCURACY`; `data_plane` doesn't carry a
+/// Fallback accuracy target used only when `l4_lowering.rs`'s
+/// observed-family lookup finds nothing registered for the query's
+/// metric (in which case no family/params choice here can matter — the
+/// query can't be served either way). `data_plane` doesn't carry a
 /// per-workload `AccuracyTarget` today (see the design doc's "Rollout"
 /// section).
 const LIVE_ACCURACY: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
 
-/// Whether the actual serving cutover is enabled for this process.
-/// Mirrors `shadow_compare::shadow_summary_executor_enabled`'s exact
-/// mechanics and own flag — this is a materially riskier switch than
-/// shadow mode (it changes what's served, not just what's logged), so
-/// it must never be implied by the shadow flag.
+/// Whether the serving cutover is enabled for this process. The env var
+/// stays as a kill switch (`ASAP_SUMMARY_EXECUTOR_LIVE=0`/`false`/`off`) —
+/// with it set, every query fails over to archive rather than being
+/// served from the sketch tier at all (there's no legacy reducer left to
+/// fall through to).
 ///
 /// Default flipped to **on** (control_plane/docs/design-target-architecture.md
 /// §4/Part A): both unit tests and a real HTTP-level e2e test
@@ -32,12 +45,7 @@ const LIVE_ACCURACY: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
 /// correctness for the shapes `try_serve_from_summary_executor` covers,
 /// and the grouping-ambiguity problem that gated this default off
 /// (empty-`by` ambiguity) is resolved via the real `Reduction::{Reduce,
-/// PerEntity}` IR signal, not a heuristic. The env var stays as a kill
-/// switch (`ASAP_SUMMARY_EXECUTOR_LIVE=0`/`false`/`off`), not removed —
-/// shapes this executor self-excludes before binding (`rate()`/`irate()`,
-/// `topk(K, sum by(...)(rate(...)))`, keyed-CMS point-estimate) still
-/// fall through to the legacy `SketchReducer` path unconditionally,
-/// regardless of this flag.
+/// PerEntity}` IR signal, not a heuristic.
 pub fn summary_executor_live_enabled() -> bool {
     std::env::var("ASAP_SUMMARY_EXECUTOR_LIVE")
         .map(|v| {
@@ -48,11 +56,10 @@ pub fn summary_executor_live_enabled() -> bool {
 }
 
 /// Try to serve `query` entirely from `SummaryExecutor`. Returns `None`
-/// whenever the caller should fall back to the legacy path exactly as
-/// it does today (flag off, or lowering/execution failed) — `None` here
-/// is indistinguishable from Phase 1's shadow-only behavior. `Some(...)`
-/// means the new path answered and the caller must NOT also call the
-/// legacy reducer for this candidate.
+/// whenever the query can't be served this way (flag off, a
+/// self-excluded shape, no matching registered sid, or lowering/execution
+/// failed) — the caller fails over to archive. `Some(...)` means this
+/// answered the query.
 ///
 /// This used to carry a third fallback reason: a grouping-ambiguity gate
 /// that declined any empty-`by` shape producing >1 group

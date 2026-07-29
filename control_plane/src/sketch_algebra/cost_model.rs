@@ -380,6 +380,77 @@ impl CostModel for ForcedFamilyCostModel {
     }
 }
 
+/// A `CostModel` that forces both the family AND the exact parameters
+/// for whichever intent it's asked to rank/size, falling back to an
+/// inner accuracy-driven [`ControlPlaneCostModel`] when nothing was
+/// observed for the candidates on offer.
+///
+/// This is the seam `data_plane`'s live-serving re-binding path
+/// (`l4_lowering.rs`) needs: planning already decided a family + params
+/// for a metric (that decision is what's actually registered in the
+/// `SketchStore`), so serving-time re-parsing the same query must
+/// reproduce EXACTLY that plan, not size a fresh one from a guessed
+/// accuracy target (`ForcedFamilyCostModel` above forces the family but
+/// still re-derives params from `eps`/`delta` — the wrong tool here,
+/// since re-deriving is exactly what caused the mismatch this type
+/// exists to avoid; see `control_plane/docs/design-target-architecture.md`'s
+/// "planning vs serving" split). `observed` is `None` whenever this
+/// query's metric has no registered sid at all — `rank_candidates`/
+/// `size_params` then fall back to the accuracy-driven default, which
+/// won't match anything registered either way, so the outcome
+/// (`find_candidates` finds nothing) is unchanged.
+pub struct ObservedFamilyCostModel {
+    inner: ControlPlaneCostModel,
+    observed: Option<(SummaryKind, SummaryParams)>,
+}
+
+impl ObservedFamilyCostModel {
+    pub fn new(
+        workload_accuracy: AccuracyTarget,
+        observed: Option<(SummaryKind, SummaryParams)>,
+    ) -> Self {
+        Self {
+            inner: ControlPlaneCostModel::new(workload_accuracy),
+            observed,
+        }
+    }
+}
+
+impl CostModel for ObservedFamilyCostModel {
+    fn rank_candidates(&self, intent: &AggIntent, candidates: &[SummaryKind]) -> Vec<SummaryKind> {
+        match &self.observed {
+            Some((kind, _)) if candidates.contains(kind) => vec![kind.clone()],
+            _ => self.inner.rank_candidates(intent, candidates),
+        }
+    }
+
+    fn size_params(
+        &self,
+        kind: SummaryKind,
+        intent: &AggIntent,
+        eps: f64,
+        delta: f64,
+    ) -> SummaryParams {
+        match &self.observed {
+            Some((okind, oparams)) if *okind == kind => oparams.clone(),
+            _ => self.inner.size_params(kind, intent, eps, delta),
+        }
+    }
+
+    fn realize_extension(&self, ext_kind: &str, payload: &serde_json::Value) -> Implementation {
+        self.inner.realize_extension(ext_kind, payload)
+    }
+
+    fn readout_extension(
+        &self,
+        ext_kind: &str,
+        payload: &serde_json::Value,
+        col: &ColumnRef,
+    ) -> SketchQuery {
+        self.inner.readout_extension(ext_kind, payload, col)
+    }
+}
+
 /// Map an ε rank-error budget to a KLL stream-size `k`. Verbatim port of
 /// `bind_kll_quantile.rs::kll_k_for_eps` — power-of-two rungs (200, 400,
 /// 800, 2048, 8192) so the in-tree `algebra::directory` continues to
