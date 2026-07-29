@@ -257,22 +257,24 @@ deployment-specific detour from it.
 
 | Layer | Target | Current gap |
 |---|---|---|
-| L1 | `asap_frontend_promql::lower_promql` called directly; no local parser | `control_plane/src/query_parser/{mod,promql}.rs` (1793 lines) is still fully local — zero `asap-frontend-promql` dependency. **Full gap.** |
+| L1 | `asap_frontend_promql::lower_promql` called directly; no local parser | `query_parser::parse_query_expr_canonical`/`parse_query` call `lower_promql` directly; `query_parser/promql.rs` (the local parser, ~1187 lines) is deleted. No reconciliation pass — classification (e.g. bare selectors no longer implying `Aggregate{Sum}`) follows `asap-l2`'s lowering as-is. **Closed** (#428). |
 | L2 | `Binder::default()` / `convert_root` used via L1, no local schema logic | Already true in substance — `intent_algebra/{binder,column_resolution}.rs` are thin re-export shims. **Effectively closed.** |
 | L3 | Zero local `QueryExpr`/`AggIntent`/`Schema` definitions | Already true — `intent_algebra/{agg_intent,query_expr,relational,schema,expr_ir}.rs` are thin re-export shims with only genuinely-local residues (`Frequency` extension helpers, `PerPartitionWrap`, PromQL-ergonomic `LabelFilter`). `intent_algebra/lower.rs` (~1000 lines) remains real local code — deliberately, for two documented reasons with no ASAPController equivalent (multi-agg fusion, the windowed-Count-as-Frequency heuristic). **Effectively closed modulo `lower.rs`'s two documented exceptions.** |
 | L4 | One `CostModel` impl; `Rc<L4Node>` used directly | `sketch_algebra::cost_model::ControlPlaneCostModel` + `sketch_algebra::lower::bind_query_expr` (delegating to `implement_tree_in_with`) already match this shape. `sketch_algebra::matcher::SummaryFamilyMatcher` is the `Matcher` impl this section's serving-time §3 depends on. **Effectively closed** — `PhysicalExpr`/`L4Plan` is a thin, acceptable L5-placement wrapper around `Rc<L4Node>`, not a competing L4 algebra. |
 | L5 | Full local `PhysicalPlanner`/`TopologyDescriptor`/`StageAllocator` impl | `physical/colored_dag/*` + `emit/*` already implement this shape structurally, just not against the trait names above (no literal `PhysicalPlanner` trait exists in this repo — the free functions/structs are the de facto impl). Low-priority gap: naming/trait-alignment, not missing functionality. |
 | Serving | Single `SummaryExecutor` impl is the live path | `data_plane`'s `summary_executor.rs` implements the trait fully and is **now the default-on live path** (`ASAP_SUMMARY_EXECUTOR_LIVE` default flipped from off to on — the grouping-ambiguity blocker below is resolved via `Reduction`, and both unit + e2e tests already proved correctness for the covered shapes). `sketch_reducer.rs` remains the permanent fallback for shapes this executor self-excludes before binding (`rate()`/`irate()`, `topk(K, sum by(...)(rate(...)))`, keyed-CMS point-estimate) — **not** legacy debt pending deletion, an intentional, indefinite split. |
 
-**Net reading**: L2–L4 are substantially already at target — the earlier
-instinct that "`intent_algebra`/`sketch_algebra` should be unnecessary
-once connected to ASAPController" is correct and largely *already true*
-for L2–L4, not a still-open gap. The serving-time cutover is done for the
-shapes `SummaryExecutor` covers (default-on); the one real, still-open
-item is L1 (adopt `asap-frontend-promql`, retiring `query_parser/`
-outright). L5 should **not** shrink — it's this deployment's own,
-permanent responsibility per ASAPController's own "no `asap-physical`
-crate" status.
+**Net reading**: L1–L4 and the serving-time cutover are all now at
+target. The earlier instinct that "`intent_algebra`/`sketch_algebra`
+should be unnecessary once connected to ASAPController" is correct and
+largely *already true* for L2–L4; L1 has since closed the same way
+(#428), and the serving-time cutover is done for the shapes
+`SummaryExecutor` covers (default-on, #427). `sketch_reducer.rs` is not
+pending deletion — it's the permanent, intentional fallback for shapes
+`SummaryExecutor` self-excludes before binding. L5 should **not** shrink
+— it's this deployment's own, permanent responsibility per
+ASAPController's own "no `asap-physical` crate" status; its only
+remaining gap is the low-priority naming/trait-alignment noted above.
 
 ## 5. Open questions (carried from `data_plane/docs/l4node-plan-executor-design.md`, mostly resolved)
 

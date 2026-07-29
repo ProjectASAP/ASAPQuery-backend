@@ -78,6 +78,14 @@ use asap_sketch::L4Node;
 
 use crate::intent_algebra::query_expr::{BindingScope, QueryExpr};
 use crate::query_parser::parse_query_expr_canonical;
+use crate::types_v2::AccuracyTarget;
+
+/// Fixed accuracy target for this L1 call site (L1 adoption,
+/// design-target-architecture.md Part B) -- matches
+/// `asap_tier_analysis::WARM_TIER_ANALYSIS_ACCURACY`; this module has no
+/// per-query accuracy bound available either (see its own module doc:
+/// "not yet a drop-in replacement for `analyze_promql_for_asap_tier`").
+const IMPLEMENT_PROMQL_ACCURACY: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
 
 /// Find every independently-realizable `Aggregate` subtree in `expr`.
 ///
@@ -181,7 +189,7 @@ pub enum ImplementPromqlError {
 pub fn implement_promql_for_asap_tier(
     metricsql: &str,
 ) -> Result<Vec<Rc<L4Node>>, ImplementPromqlError> {
-    let expr = parse_query_expr_canonical(metricsql)
+    let expr = parse_query_expr_canonical(metricsql, IMPLEMENT_PROMQL_ACCURACY)
         .map_err(|e| ImplementPromqlError::UnparseableMetricsql(e.to_string()))?;
 
     let mut roots: Vec<&QueryExpr> = Vec::new();
@@ -208,17 +216,16 @@ mod tests {
     }
 
     #[test]
-    fn bare_selector_implements_to_an_exact_sum_agg() {
-        // The PromQL parser models a bare selector as `Aggregate { Sum }`
-        // over the sample value -- same shape as
-        // asap_tier_analysis::bare_vector_selector_binds_to_exact_agg on
-        // the flat path (Capability::ExactAgg(Sum)), NOT the "no call
-        // node found" case (that's for something parse-failure-adjacent,
-        // not a bare selector).
+    fn bare_selector_has_no_aggregate_root_to_implement() {
+        // L1 adoption (design-target-architecture.md Part B), accepted
+        // behavior change -- see
+        // asap_tier_analysis::bare_selector_is_no_longer_asap_tier_answerable's
+        // comment: `lower_promql` doesn't implicitly wrap a bare selector
+        // in `Aggregate { Sum }` the way the retired local parser did, so
+        // there's no `Aggregate` node here at all to find a root at.
         let roots =
             implement_promql_for_asap_tier("http_requests_total").expect("parses and implements");
-        assert_eq!(roots.len(), 1);
-        assert!(matches!(roots[0].expr, SummaryExpr::SummaryAgg { .. }));
+        assert!(roots.is_empty(), "{roots:?}");
     }
 
     #[test]
@@ -321,17 +328,22 @@ mod tests {
     /// behavior shift.
     #[test]
     fn implement_frequency_as_agg_test() {
+        // Per this test's own prior instructions: the gap it used to
+        // document (under-realizing to `Logical` because `asap-plan` had
+        // no `Extension`/`Frequency` opinion) is now closed -- not via an
+        // `Extension` hook, but because L1 adoption
+        // (design-target-architecture.md Part B) makes `count_over_time`
+        // lower directly to `AggIntent::Count { accuracy: Epsilon(...) }`
+        // (a real, first-class, non-exact intent) rather than needing
+        // this deployment's `Frequency` extension wrapper at all --
+        // `asap-plan` realizes a non-exact `Count` as a real CMS-backed
+        // `SummaryAgg` + `SummaryEstimate` on its own.
         let roots = implement_promql_for_asap_tier("count_over_time(http_requests_total[5m])")
             .expect("parses and implements");
         assert_eq!(roots.len(), 1);
         assert!(
-            matches!(roots[0].expr, SummaryExpr::Logical(_)),
-            "EXPECTED (for now): asap-plan has no Extension/Frequency \
-             opinion, so this under-realizes to Logical -- see module doc. \
-             If this assertion starts failing because it's now realized as \
-             a SummaryAgg/SummaryEstimate, the gap has been closed \
-             upstream or by a local Extension hook -- update this test to \
-             assert the new, better behavior instead of reverting it. Got: {:?}",
+            matches!(roots[0].expr, SummaryExpr::SummaryEstimate { .. }),
+            "expected a realized SummaryEstimate, got: {:?}",
             roots[0].expr,
         );
     }

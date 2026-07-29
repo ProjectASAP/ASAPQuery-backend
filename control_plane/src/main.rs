@@ -578,6 +578,14 @@ async fn main() {
 async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) -> impl IntoResponse {
     let wc = spec.workload.clone();
     let query_string = spec.query_string.clone();
+    // Captured before `spec` moves into `analyze` below -- L1 adoption
+    // (design-target-architecture.md Part B) needs a real AccuracyTarget
+    // for `parse_query_expr_canonical`; this is the one call site in the
+    // pipeline with an actual per-query accuracy value available, so
+    // thread it through rather than a flat deployment-wide default.
+    let accuracy = control_plane::types_v2::accuracy_target_from_legacy_accuracy_sla(
+        spec.accuracy_sla,
+    );
     let workload = match st.analyzer.analyze(spec) {
         Ok(w) => w,
         Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
@@ -608,7 +616,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
         let mut bound_physical: Option<control_plane::sketch_algebra::PhysicalExpr> = None;
         let mut plan_summary = None;
         if let Some(ref qs) = query_string {
-            match parse_query_expr_canonical(qs) {
+            match parse_query_expr_canonical(qs, accuracy) {
                 Err(e) => {
                     warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping algebra pipeline")
                 }
