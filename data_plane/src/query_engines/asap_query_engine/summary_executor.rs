@@ -213,6 +213,29 @@ impl GroupState {
             .query_statistic(stat, key, &std::collections::HashMap::new())
             .ok()
     }
+
+    /// Coverage analog of `exact_value` — folds `(min_window_end_ms,
+    /// max_window_end_ms)` from every window observed across the group's
+    /// entries, via the same `fold_coverage` helper
+    /// `readout_cumulative`/`readout_per_window` already use for the
+    /// sketch family (same window-end-only caveat — see `SummaryValue`'s
+    /// doc). Without this, a caller reading an `ExactAgg` group's value
+    /// via `exact_value` would have no coverage signal at all to decide
+    /// whether an archive tier also needs to be consulted — unlike
+    /// `SummaryValue::coverage()` on the sketch side. `None` for a
+    /// `Sketch` state or a group with no windows in range.
+    pub fn exact_coverage(&self) -> Option<(u64, u64)> {
+        let GroupState::ExactAgg { entries, .. } = self else {
+            return None;
+        };
+        let mut coverage: Option<(u64, u64)> = None;
+        for windows in entries {
+            for &w_end in windows.keys() {
+                fold_coverage(&mut coverage, w_end);
+            }
+        }
+        coverage
+    }
 }
 
 #[derive(Debug)]
@@ -2355,6 +2378,61 @@ mod tests {
             state.exact_value(&None),
             Some(25.0),
             "exact_value must merge both windows' sums (10 + 15)"
+        );
+        assert_eq!(
+            state.exact_coverage(),
+            Some((T0 + 1000, T0 + 2000)),
+            "exact_coverage must bracket both windows' end timestamps, mirroring \
+             SummaryValue::coverage()'s sketch-family behavior"
+        );
+    }
+
+    #[test]
+    fn exact_coverage_is_none_for_a_sketch_state() {
+        // `exact_coverage` is the `ExactAgg`-only counterpart to
+        // `SummaryValue::coverage()` -- must not silently return something
+        // for a `Sketch` state.
+        let idx = SketchStore::new();
+        let sid = 1u64;
+        idx.register(kll_meta(sid, "latency_ms", &[]));
+        idx.append_sample(
+            sid,
+            BTreeMap::new(),
+            (T0, T0 + 1000),
+            SketchSampleState {
+                bytes: encode_kll_items_proto(200, &[1.0, 2.0, 3.0]),
+                encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
+            },
+        );
+        let child = scan_node("latency_ms", None);
+        let tree = estimate_node(
+            kll_agg_node(child, Reduction::by(vec![])),
+            SketchQuery::Quantile { q: 0.5 },
+        );
+        let exec = ctx(&idx);
+        let ExecOutcome::Value(_) = execute(&tree, &exec).expect("execute should succeed") else {
+            panic!("expected a value");
+        };
+        // Build the Sketch GroupState directly via fetch_state to exercise
+        // exact_coverage's defensive None arm (readout() already proved
+        // this tree resolves to a real Sketch Value above).
+        let handles = exec
+            .find_candidates(
+                &SummaryKind::Kll,
+                &SummaryParams::Kll { k: 200 },
+                &ColumnRef::SampleValue,
+                &Reduction::by(vec![]),
+                &scan_node("latency_ms", None),
+            )
+            .expect("find_candidates should succeed");
+        let (_key, handle) = &handles[0];
+        let state = exec
+            .fetch_state(handle)
+            .expect("fetch_state should succeed");
+        assert_eq!(
+            state.exact_coverage(),
+            None,
+            "exact_coverage must be None for a Sketch state, not silently Some"
         );
     }
 

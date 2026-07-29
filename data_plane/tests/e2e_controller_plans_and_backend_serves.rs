@@ -2441,3 +2441,225 @@ async fn shadow_mode_does_not_change_served_ddsketch_quantile() {
         "shadow mode must not corrupt the served quantile value, got {value}"
     );
 }
+
+// ── Test — the live serving cutover actually answers from SummaryExecutor ───
+//
+// Phase 2 of the rollout (see the plan's "What 'safe to serve' means,
+// precisely" section): with `ASAP_SUMMARY_EXECUTOR_LIVE` set, an
+// unambiguous single-series query must be answered by `SummaryExecutor`
+// directly (`engine.rs` skips the legacy `SketchReducer` call for it
+// entirely), not merely shadow-compared. Same fixture as
+// `shadow_mode_does_not_change_served_ddsketch_quantile` -- this test's
+// job is proving the cutover serves a correct answer via the NEW code
+// path, not re-checking quantile accuracy.
+
+/// RAII guard for `ASAP_SUMMARY_EXECUTOR_LIVE`. Own lock, own var --
+/// mirrors `ShadowEnvGuard` exactly (same reason: `std::env::set_var`/
+/// `remove_var` mutate process-global state and `cargo test` runs tests
+/// in the same process across threads by default).
+#[allow(dead_code)]
+struct LiveServeEnvGuard(std::sync::MutexGuard<'static, ()>);
+
+impl LiveServeEnvGuard {
+    fn enable() -> Self {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("ASAP_SUMMARY_EXECUTOR_LIVE", "1");
+        Self(guard)
+    }
+}
+
+impl Drop for LiveServeEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var("ASAP_SUMMARY_EXECUTOR_LIVE");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_serve_actually_answers_ddsketch_quantile() {
+    let _live = LiveServeEnvGuard::enable();
+
+    let stack = start_full_stack(19_593, 19_594).await;
+    let client = reqwest::Client::new();
+
+    let workload = build_workload(
+        "http_latency_ms",
+        vec![AggType::Quantile],
+        0.01,
+        Duration::from_secs(1),
+        vec!["service".to_string()],
+        vec![0.99],
+    );
+    let streaming_config_json = plan_streaming_config_json(&workload);
+    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+
+    let alpha = 0.01;
+    let store_counts = vec![5u64, 10, 15, 20];
+    let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
+    let sketch_bytes = dd_state.encode_to_vec();
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
+    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
+
+    let req = build_dd_sketch_export(
+        "http_latency_ms",
+        &[("service", "e2e-test")],
+        sketch_t_ns,
+        sketch_bytes,
+        alpha,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, req).await;
+
+    let watermark_state = build_dd_sketch_state(alpha, Vec::new(), 0);
+    let watermark_req = build_dd_sketch_export(
+        "http_latency_ms",
+        &[("service", "e2e-test")],
+        watermark_t_ns,
+        watermark_state.encode_to_vec(),
+        alpha,
+    );
+    post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let query_url = format!("http://127.0.0.1:{}/api/v1/query", stack.backend_port);
+    let response: JsonValue = client
+        .get(&query_url)
+        .query(&[("query", "quantile_over_time(0.99, http_latency_ms[10s])")])
+        .send()
+        .await
+        .expect("PromQL query failed to send")
+        .json()
+        .await
+        .expect("PromQL response was not JSON");
+
+    assert_eq!(
+        response["status"].as_str().unwrap_or("(missing)"),
+        "success",
+        "live-serve must answer this unambiguous single-series quantile. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+
+    let value = response["data"]["result"]
+        .as_array()
+        .and_then(|r| extract_first_scalar(&JsonValue::Array(r.clone())))
+        .expect("expected a scalar quantile result");
+    assert!(
+        value.is_finite() && value > 0.0,
+        "live-serve must produce a correct served quantile value, got {value}"
+    );
+}
+
+// ── Test — the live serving cutover MERGES the global-merge shape ─────────
+//    correctly, end to end (ASAPController#163/#165)
+//
+// `count(hll_metric)` with NO `by (...)` and MULTIPLE distinct-service HLL
+// sids used to be the ambiguous shape the design doc's "Grouping
+// semantics" section described: `SummaryAgg{by: []}` couldn't tell "no
+// grouping concept" from "reduce everything," so `live_serve.rs`'s
+// `ambiguous_merge_risk` gate DECLINED to serve it from the new path and
+// fell back to the legacy `evaluate_cardinality_global` special case.
+//
+// `Reduction` (ASAPController#165) resolves that: `count(...)` is a
+// genuine aggregation operator, so it lowers to `Reduce([])` and
+// `resolve_group_key` gives both sids the same group key -- the new path
+// merges them itself. The gate is gone; this now exercises the new
+// path serving the shape directly, not a fallback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_serve_hll_global_count_merges_across_sids() {
+    let _live = LiveServeEnvGuard::enable();
+
+    let stack = start_full_stack(19_595, 19_596).await;
+    let client = reqwest::Client::new();
+
+    let workload = build_workload_with_override(
+        "unique_users_per_min",
+        vec![AggType::Cardinality],
+        0.05,
+        Duration::from_secs(1),
+        vec!["service".to_string()],
+        Vec::new(),
+        Some(SketchType::HLL),
+    );
+    let streaming_config_json = plan_streaming_config_json(&workload);
+    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+
+    let precision = 10u32;
+    let num_registers = 1usize << precision;
+
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
+    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
+
+    // Two distinct services, DISJOINT non-zero registers -- two separate
+    // sids the analyzer's `count(unique_users_per_min)` candidate resolves
+    // to together (empty group_by_keys), the exact shape ASAPController#163
+    // describes.
+    for (service, reg_idx) in [("svc-a", 0usize), ("svc-b", 500usize)] {
+        let mut registers = vec![0u8; num_registers];
+        registers[reg_idx] = 6;
+        let hll_state = build_hll_state(precision, registers);
+        let req = build_hll_export(
+            "unique_users_per_min",
+            &[("service", service)],
+            sketch_t_ns,
+            hll_state.encode_to_vec(),
+            precision,
+        );
+        post_otlp_http(&client, stack.otlp_http_port, req).await;
+
+        let watermark_state = build_hll_state(precision, vec![0u8; num_registers]);
+        let watermark_req = build_hll_export(
+            "unique_users_per_min",
+            &[("service", service)],
+            watermark_t_ns,
+            watermark_state.encode_to_vec(),
+            precision,
+        );
+        post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let response: JsonValue = client
+        .get(format!(
+            "http://127.0.0.1:{}/api/v1/query",
+            stack.backend_port
+        ))
+        .query(&[("query", "count(unique_users_per_min)")])
+        .send()
+        .await
+        .expect("query failed")
+        .json()
+        .await
+        .expect("response not JSON");
+
+    assert_eq!(
+        response["status"].as_str().unwrap_or("(missing)"),
+        "success",
+        "the global-merge shape must succeed with live-serve on. Response:\n{}",
+        serde_json::to_string_pretty(&response).unwrap_or_default()
+    );
+
+    let value = response["data"]["result"]
+        .as_array()
+        .and_then(|r| extract_first_scalar(&JsonValue::Array(r.clone())))
+        .expect("expected a scalar cardinality result");
+    // Each service set exactly ONE distinct non-zero register, and the two
+    // are disjoint -- a correct cross-sid merge estimates ~2, whereas
+    // serving only one sid's state would estimate ~1. The assertion is
+    // loose (HLL at precision 10 is approximate) but still distinguishes
+    // "merged both" from "dropped one."
+    assert!(
+        value.is_finite() && value >= 1.5,
+        "expected the MERGED cardinality across both services (~2), got {value} -- \
+         a value near 1 means only one sid's registers were counted"
+    );
+}

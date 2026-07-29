@@ -692,6 +692,12 @@ impl ASAPQueryEngine {
         let reducer = crate::storage_engines::sketch_db::query::SketchReducer::new(idx);
         let mut combined_result: Option<crate::storage_engines::sketch_db::query::ASAPTierResult> =
             None;
+        // Set when ANY candidate this loop was served directly from
+        // `SummaryExecutor` (see `live_serve.rs`) rather than the legacy
+        // reducer — gates the post-loop shadow-mode comparison below,
+        // since there's no legacy answer left to diff a live-served
+        // result against.
+        let mut any_live_served = false;
 
         for candidate in &analysis.candidates {
             // Resolve candidate → {sids} via the sid catalog. Schema-
@@ -773,40 +779,59 @@ impl ASAPQueryEngine {
             // sub-window sums and divides by the range to produce
             // events-per-second. See `SketchReducer::evaluate_exact_agg`
             // / `evaluate_exact_agg_rate` for the per-path semantics.
-            let result = match &candidate.required_capability {
-                crate::storage_engines::sketch_db::index::Capability::ExactAgg(agg_type) => {
-                    // Counter-function dispatch (issue #301) — mirror the
-                    // instant `execute(&str)` path's branching off the
-                    // typed `candidate.outer_fn`. On this explicit
-                    // RANGE (matrix) surface the per-window timeseries is
-                    // the correct shape for `sum`/`increase` (the wire
-                    // format wants a point per window), so
-                    // `accumulate_windows = false`. `rate` still folds +
-                    // divides; `sum_over_time` over a counter is refused
-                    // (decision (a)) so the query routes to archive.
-                    use control_plane::asap_tier_analysis::OuterFn;
-                    let is_exact_sum_family = matches!(
+            // Try serving this candidate directly from `SummaryExecutor`
+            // (see `live_serve.rs`) before falling back to the legacy
+            // reducer dispatch below. `None` here covers the flag being
+            // off, a rate-shaped candidate (self-excludes via
+            // `LoweringSkip::RateShape` — the legacy rate branch below
+            // is untouched for those), and every other "can't safely
+            // serve this way" outcome — all indistinguishable from
+            // Phase 1's shadow-only behavior.
+            let live_served_result =
+                crate::query_engines::asap_query_engine::live_serve::try_serve_from_summary_executor(
+                    idx, query, start_ms, end_ms, false,
+                );
+            let served_live = live_served_result.is_some();
+            if served_live {
+                any_live_served = true;
+            }
+
+            let result = match live_served_result {
+                Some(result) => result,
+                None => match &candidate.required_capability {
+                    crate::storage_engines::sketch_db::index::Capability::ExactAgg(agg_type) => {
+                        // Counter-function dispatch (issue #301) — mirror the
+                        // instant `execute(&str)` path's branching off the
+                        // typed `candidate.outer_fn`. On this explicit
+                        // RANGE (matrix) surface the per-window timeseries is
+                        // the correct shape for `sum`/`increase` (the wire
+                        // format wants a point per window), so
+                        // `accumulate_windows = false`. `rate` still folds +
+                        // divides; `sum_over_time` over a counter is refused
+                        // (decision (a)) so the query routes to archive.
+                        use control_plane::asap_tier_analysis::OuterFn;
+                        let is_exact_sum_family = matches!(
                         agg_type,
                         crate::storage_engines::sketch_db::data::AggregationType::Sum
                             | crate::storage_engines::sketch_db::data::AggregationType::MultipleSum
                             | crate::storage_engines::sketch_db::data::AggregationType::Increase
                             | crate::storage_engines::sketch_db::data::AggregationType::MultipleIncrease
                     );
-                    if is_exact_sum_family && candidate.outer_fn == OuterFn::SumOverTime {
-                        return Err(crate::query_engines::EngineError::capability_miss(
-                            crate::storage_engines::types::StorageBackend::SketchStore
-                                .data_source_id(),
-                            format!(
-                                "SketchStore cannot answer `sum_over_time` over counter \
+                        if is_exact_sum_family && candidate.outer_fn == OuterFn::SumOverTime {
+                            return Err(crate::query_engines::EngineError::capability_miss(
+                                crate::storage_engines::types::StorageBackend::SketchStore
+                                    .data_source_id(),
+                                format!(
+                                    "SketchStore cannot answer `sum_over_time` over counter \
                                  deltas for `{query}` (issue #301) — failing over to archive"
-                            ),
-                        ));
-                    }
-                    let use_rate_path = candidate.range_seconds > 0
-                        && candidate.outer_fn == OuterFn::Rate
-                        && is_exact_sum_family;
-                    if use_rate_path {
-                        reducer
+                                ),
+                            ));
+                        }
+                        let use_rate_path = candidate.range_seconds > 0
+                            && candidate.outer_fn == OuterFn::Rate
+                            && is_exact_sum_family;
+                        if use_rate_path {
+                            reducer
                             .evaluate_exact_agg_rate(
                                 &hit_sids,
                                 *agg_type,
@@ -824,63 +849,70 @@ impl ASAPQueryEngine {
                                     ),
                                 )
                             })?
-                    } else {
-                        reducer
-                            .evaluate_exact_agg(
-                                &hit_sids,
-                                *agg_type,
-                                &candidate.group_by_keys,
-                                start_ms,
-                                end_ms,
-                                false,
-                            )
-                            .map_err(|e| {
-                                crate::query_engines::EngineError::capability_miss(
-                                    crate::storage_engines::types::StorageBackend::SketchStore
-                                        .data_source_id(),
-                                    format!(
+                        } else {
+                            reducer
+                                .evaluate_exact_agg(
+                                    &hit_sids,
+                                    *agg_type,
+                                    &candidate.group_by_keys,
+                                    start_ms,
+                                    end_ms,
+                                    false,
+                                )
+                                .map_err(|e| {
+                                    crate::query_engines::EngineError::capability_miss(
+                                        crate::storage_engines::types::StorageBackend::SketchStore
+                                            .data_source_id(),
+                                        format!(
                                         "SketchStore exact-agg reducer failed for `{query}` over \
                                          [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
                                     ),
-                                )
-                            })?
+                                    )
+                                })?
+                        }
                     }
-                }
-                // P2-4 (typed dispatch): route off the analyzer's typed
-                // `required_capability` via `evaluate_for_capability`
-                // instead of round-tripping it through a function-name
-                // string the reducer re-parses.
-                _ => reducer
-                    .evaluate_for_capability(
-                        &candidate.required_capability,
-                        &hit_sids,
-                        &candidate.function_args,
-                        // Per-item CMS estimate(key) is wired through the reducer
-                        // but only dispatched once the engine resolves the item
-                        // value against an item_label-mode sid (Phase 2b). Until
-                        // then keyed CMS frequency safe-misses (see below), so the
-                        // bucket-total path is correct here.
-                        None,
-                        effective_is_cumulative(candidate),
-                        start_ms,
-                        end_ms,
-                    )
-                    .map_err(|e| {
-                        crate::query_engines::EngineError::capability_miss(
-                            crate::storage_engines::types::StorageBackend::SketchStore
-                                .data_source_id(),
-                            format!(
-                                "SketchStore reducer failed for `{query}` over \
-                                 [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
-                            ),
+                    // P2-4 (typed dispatch): route off the analyzer's typed
+                    // `required_capability` via `evaluate_for_capability`
+                    // instead of round-tripping it through a function-name
+                    // string the reducer re-parses.
+                    _ => reducer
+                        .evaluate_for_capability(
+                            &candidate.required_capability,
+                            &hit_sids,
+                            &candidate.function_args,
+                            // Per-item CMS estimate(key) is wired through the reducer
+                            // but only dispatched once the engine resolves the item
+                            // value against an item_label-mode sid (Phase 2b). Until
+                            // then keyed CMS frequency safe-misses (see below), so the
+                            // bucket-total path is correct here.
+                            None,
+                            effective_is_cumulative(candidate),
+                            start_ms,
+                            end_ms,
                         )
-                    })?,
+                        .map_err(|e| {
+                            crate::query_engines::EngineError::capability_miss(
+                                crate::storage_engines::types::StorageBackend::SketchStore
+                                    .data_source_id(),
+                                format!(
+                                    "SketchStore reducer failed for `{query}` over \
+                                 [{start_ms}, {end_ms}]: {e:?} — failing over to archive"
+                                ),
+                            )
+                        })?,
+                },
             };
             // Apply the analyzer's typed outer-aggregation operator on
             // the range-query path too (issue #296) — same identity
             // case + fold semantics as the instant-query trait
-            // adapter above.
-            let result = if candidate.outer_agg.is_some() && !outer_fold_already_consumed(candidate)
+            // adapter above. Skipped when `SummaryExecutor` already
+            // served this candidate: `bind_query_expr`'s lowering
+            // already realizes the full aggregation (including any
+            // `by (...)`) into the `L4Node` it executed, so re-folding
+            // here would double-apply it.
+            let result = if !served_live
+                && candidate.outer_agg.is_some()
+                && !outer_fold_already_consumed(candidate)
             {
                 apply_outer_agg_fold(result, &candidate.outer_agg)
             } else {
@@ -899,10 +931,15 @@ impl ASAPQueryEngine {
         // Shadow-mode comparison against the new SummaryExecutor path —
         // see `data_plane/docs/l4node-plan-executor-design.md`'s
         // "Rollout" section. No-op unless `ASAP_SHADOW_SUMMARY_EXECUTOR`
-        // is set; never affects `result`/the response below.
-        crate::query_engines::asap_query_engine::shadow_compare::maybe_shadow_compare(
-            idx, query, start_ms, end_ms, false, &result,
-        );
+        // is set; never affects `result`/the response below. Skipped
+        // entirely when `result` was already served BY SummaryExecutor
+        // (`any_live_served`) — there's no separate legacy answer left
+        // to diff it against.
+        if !any_live_served {
+            crate::query_engines::asap_query_engine::shadow_compare::maybe_shadow_compare(
+                idx, query, start_ms, end_ms, false, &result,
+            );
+        }
 
         // Matrix shape — the range_query wire format requires it.
         let warm_qr = asap_tier_result_to_query_result(result.clone(), end_ms, true);
@@ -1395,6 +1432,12 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             // vector`. Returning `Matrix` for an instant query
             // produces a 500 (adapter rejects the shape mismatch).
             let mut any_range_candidate = false;
+            // Set when ANY candidate this loop was served directly from
+            // `SummaryExecutor` (see `live_serve.rs`) rather than the
+            // legacy reducer — gates the post-loop shadow-mode
+            // comparison below, since there's no legacy answer left to
+            // diff a live-served result against.
+            let mut any_live_served = false;
 
             // Snapshot the streaming config once for this query's
             // policy lookups. Hot-reload swaps the underlying Arc; the
@@ -1722,8 +1765,49 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     combined_t0 = t0_ms;
                 }
 
-                let reducer_result =
-                    match &candidate.required_capability {
+                // Try serving this candidate directly from
+                // `SummaryExecutor` (see `live_serve.rs`) before falling
+                // back to the legacy reducer dispatch below. Skipped
+                // outright when the frequency-rate fallback already
+                // answered (`freq_rate_override`) — that path runs
+                // against an empty `hit_sids` sid set that the analyzer
+                // itself couldn't satisfy directly, so there's nothing
+                // for the new path to re-derive from the raw query
+                // that would be any more meaningful. `None` otherwise
+                // covers the flag being off, a rate-shaped candidate
+                // (self-excludes via `LoweringSkip::RateShape` — the
+                // legacy rate branch below is untouched for those), and
+                // every other "can't safely serve this way" outcome.
+                let live_served_result = if freq_rate_override.is_none() {
+                    crate::query_engines::asap_query_engine::live_serve::try_serve_from_summary_executor(
+                        idx,
+                        query,
+                        t0_ms,
+                        now_ms,
+                        effective_is_cumulative(candidate),
+                    )
+                } else {
+                    None
+                };
+                let served_live = live_served_result.is_some();
+                if served_live {
+                    any_live_served = true;
+                }
+
+                // P1-1: if the frequency-rate fallback produced a result
+                // (hit_sids was empty for an ExactAgg(Sum)+Rate candidate
+                // but a warm FrequencyEstimate sid answered), use it
+                // directly; the ExactAgg dispatch below would run
+                // against an empty `hit_sids` and is moot. Otherwise, if
+                // `SummaryExecutor` already served this candidate, use
+                // that. Only compute + dispatch the legacy reducer when
+                // neither of the above applies.
+                let result = if let Some(r) = freq_rate_override {
+                    r
+                } else if let Some(r) = live_served_result {
+                    r
+                } else {
+                    let reducer_result = match &candidate.required_capability {
                         crate::storage_engines::sketch_db::index::Capability::ExactAgg(
                             agg_type,
                         ) if use_rate_path => reducer.evaluate_exact_agg_rate(
@@ -1776,15 +1860,6 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                             now_ms,
                         ),
                     };
-
-                // P1-1: if the frequency-rate fallback produced a result
-                // (hit_sids was empty for an ExactAgg(Sum)+Rate candidate
-                // but a warm FrequencyEstimate sid answered), use it
-                // directly; the ExactAgg dispatch above ran against an
-                // empty `hit_sids` and is moot.
-                let result = if let Some(r) = freq_rate_override {
-                    r
-                } else {
                     match reducer_result {
                     Ok(r) => r,
                     Err(
@@ -1862,12 +1937,20 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // a single-value group, returning the same value
                 // unchanged. No special case needed; the general fold
                 // handles it.
-                let result =
-                    if candidate.outer_agg.is_some() && !outer_fold_already_consumed(candidate) {
-                        apply_outer_agg_fold(result, &candidate.outer_agg)
-                    } else {
-                        result
-                    };
+                //
+                // Skipped when `SummaryExecutor` already served this
+                // candidate (`served_live`): `bind_query_expr`'s
+                // lowering already realizes the full aggregation
+                // (including any `by (...)`) into the `L4Node` it
+                // executed, so re-folding here would double-apply it.
+                let result = if !served_live
+                    && candidate.outer_agg.is_some()
+                    && !outer_fold_already_consumed(candidate)
+                {
+                    apply_outer_agg_fold(result, &candidate.outer_agg)
+                } else {
+                    result
+                };
                 combined_result = Some(result);
             }
 
@@ -1901,10 +1984,15 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // `data_plane/docs/l4node-plan-executor-design.md`'s
                 // "Rollout" section. No-op unless
                 // `ASAP_SHADOW_SUMMARY_EXECUTOR` is set; never affects
-                // `result`/the response below.
-                crate::query_engines::asap_query_engine::shadow_compare::maybe_shadow_compare(
-                    idx, query, stitch_t0, now_ms, true, &result,
-                );
+                // `result`/the response below. Skipped entirely when
+                // `result` was already served BY SummaryExecutor
+                // (`any_live_served`) — there's no separate legacy
+                // answer left to diff it against.
+                if !any_live_served {
+                    crate::query_engines::asap_query_engine::shadow_compare::maybe_shadow_compare(
+                        idx, query, stitch_t0, now_ms, true, &result,
+                    );
+                }
                 let warm_qr = asap_tier_result_to_query_result(result.clone(), now_ms, false);
                 if let (Some((cov_lo, cov_hi)), Some(archive)) =
                     (result.coverage, self.archive_engine.as_ref())
