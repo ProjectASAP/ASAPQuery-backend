@@ -1,0 +1,184 @@
+syntax = "proto3";
+
+package control_plane.backend_plan.v1;
+
+// `BackendPlan` — the typed control-plane -> data-plane wire contract.
+// See `control_plane/docs/design-backend-plan-wire-format.md` for the
+// full design rationale. This file is the wire schema only; the
+// hand-written Rust domain types + conversions live in
+// `control_plane/src/backend_plan/mod.rs`.
+
+// ── Summary family (asap_sketch::SummaryKind / SummaryParams) ───────────────
+//
+// `SummaryParams`'s oneof tag already identifies which `SummaryKind` a
+// `Materialization` uses -- exact accumulators (Sum/Count/MinMax/Increase/
+// Rate) carry no tuning parameters at all, approximate sketches do.
+
+message KllParams { uint32 k = 1; }
+message CmsParams { uint32 width = 1; uint32 depth = 2; }
+message HllParams { uint32 precision = 1; }
+message DdSketchParams { double alpha = 1; }
+message CmsWithHeapParams { uint32 width = 1; uint32 depth = 2; uint32 heap_size = 3; }
+message KmvParams { uint32 k = 1; }
+message ThetaParams { uint32 k = 1; }
+message CountSketchParams { uint32 width = 1; uint32 depth = 2; }
+message CountSketchWithHeapParams { uint32 width = 1; uint32 depth = 2; uint32 heap_size = 3; }
+
+message SummaryParams {
+  oneof params {
+    bool sum = 1;
+    bool count = 2;
+    bool min_max = 3;
+    bool increase = 4;
+    bool rate = 5;
+    KllParams kll = 6;
+    CmsParams cms = 7;
+    HllParams hll = 8;
+    DdSketchParams ddsketch = 9;
+    CmsWithHeapParams cms_with_heap = 10;
+    KmvParams kmv = 11;
+    ThetaParams theta = 12;
+    CountSketchParams count_sketch = 13;
+    CountSketchWithHeapParams count_sketch_with_heap = 14;
+  }
+}
+
+// ── Capability (control_plane::sketch_algebra::capability) ──────────────────
+
+enum SketchKindHandle {
+  SKETCH_KIND_HANDLE_UNSPECIFIED = 0;
+  SKETCH_KIND_HANDLE_DDSKETCH = 1;
+  SKETCH_KIND_HANDLE_KLL = 2;
+  SKETCH_KIND_HANDLE_HLL = 3;
+  SKETCH_KIND_HANDLE_COUNT_SKETCH = 4;
+  SKETCH_KIND_HANDLE_COUNT_MIN = 5;
+  SKETCH_KIND_HANDLE_CMS_WITH_HEAP = 6;
+  SKETCH_KIND_HANDLE_COUNT_SKETCH_WITH_HEAP = 7;
+  SKETCH_KIND_HANDLE_ANY = 8;
+}
+
+// `asap_types::AggregationType` -- the data plane's exact-accumulator-family
+// enum `Capability::ExactAgg` names.
+enum AggregationType {
+  AGGREGATION_TYPE_UNSPECIFIED = 0;
+  AGGREGATION_TYPE_SUM = 1;
+  AGGREGATION_TYPE_INCREASE = 2;
+  AGGREGATION_TYPE_MIN_MAX = 3;
+  AGGREGATION_TYPE_DATASKETCHES_KLL = 4;
+  AGGREGATION_TYPE_MULTIPLE_SUM = 5;
+  AGGREGATION_TYPE_MULTIPLE_INCREASE = 6;
+  AGGREGATION_TYPE_MULTIPLE_MIN_MAX = 7;
+  AGGREGATION_TYPE_HYDRA_KLL = 8;
+  AGGREGATION_TYPE_COUNT_MIN_SKETCH = 9;
+  AGGREGATION_TYPE_COUNT_MIN_SKETCH_WITH_HEAP = 10;
+  AGGREGATION_TYPE_COUNT_SKETCH = 11;
+  AGGREGATION_TYPE_COUNT_SKETCH_WITH_HEAP = 12;
+  AGGREGATION_TYPE_HLL = 13;
+  AGGREGATION_TYPE_DDSKETCH = 14;
+  AGGREGATION_TYPE_SINGLE_SUBPOPULATION = 15;
+  AGGREGATION_TYPE_MULTIPLE_SUBPOPULATION = 16;
+}
+
+message Capability {
+  oneof capability {
+    SketchKindHandle quantile_approx = 1;
+    bool cardinality_approx = 2;
+    SketchKindHandle frequency_estimate = 3;
+    SketchKindHandle frequency_topk = 4;
+    AggregationType exact_agg = 5;
+  }
+}
+
+// ── L3 IR fragments (asap_ir::intent_algebra) ────────────────────────────────
+
+message Source {
+  oneof source {
+    string time_series_metric = 1;
+    string table_ref = 2;
+  }
+}
+
+message ColumnRef {
+  oneof column_ref {
+    string named = 1;
+    QualifiedColumn qualified = 2;
+    bool sample_value = 3;
+    bool wildcard = 4;
+  }
+}
+
+message QualifiedColumn {
+  string table = 1;
+  string name = 2;
+}
+
+enum WindowKind {
+  WINDOW_KIND_UNSPECIFIED = 0;
+  WINDOW_KIND_TUMBLING = 1;
+  WINDOW_KIND_SLIDING = 2;
+  WINDOW_KIND_SESSION = 3;
+}
+
+message WindowSpec {
+  WindowKind kind = 1;
+  uint64 size_ms = 2;
+  optional uint64 slide_ms = 3;
+}
+
+// ── Deployment-local types (no ASAPController/asap_ir equivalent) ───────────
+
+// Mirrors `data_plane::storage_engines::types::StorageBackend`. Kept as its
+// own copy rather than a shared dependency -- `control_plane` cannot depend
+// on `data_plane` (the dependency runs the other way; see
+// `asap_types::MonitorSpec`'s doc for the same constraint on that type).
+enum StorageBackend {
+  STORAGE_BACKEND_UNSPECIFIED = 0;
+  STORAGE_BACKEND_SKETCH_STORE = 1;
+  STORAGE_BACKEND_GORILLA_OBJECT_STORE = 2;
+  STORAGE_BACKEND_DOUBLE_WRITE = 3;
+  STORAGE_BACKEND_PROMETHEUS_REMOTE = 4;
+}
+
+message RetentionPolicy {
+  optional uint32 num_aggregates_to_retain = 1;
+}
+
+// Mirrors `asap_types::MonitorSpec`.
+message MonitorSpec {
+  uint64 agg_id = 1;
+  string functional = 2;
+  string key = 3;
+  double tau = 4;
+  double epsilon = 5;
+  uint64 window_ms = 6;
+  uint64 d = 7;
+  uint64 w = 8;
+  string mode = 9;
+}
+
+// ── BackendPlan itself ───────────────────────────────────────────────────────
+
+message Materialization {
+  uint64 fingerprint = 1;
+  Source source = 2;
+  WindowSpec window = 3;
+  repeated string group_by = 4;
+  repeated string rollup = 5;
+  SummaryParams params = 6;
+  ColumnRef col = 7;
+  optional RetentionPolicy retention = 8;
+}
+
+message RoutingEntry {
+  Capability satisfies = 1;
+  uint64 materialization = 2;
+  StorageBackend storage_backend = 3;
+}
+
+message BackendPlan {
+  uint64 plan_id = 1;
+  uint64 generated_at_unix_ms = 2;
+  map<uint64, Materialization> materializations = 3;
+  repeated RoutingEntry routing = 4;
+  repeated MonitorSpec monitors = 5;
+}
