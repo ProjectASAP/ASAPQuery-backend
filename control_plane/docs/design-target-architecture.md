@@ -257,22 +257,21 @@ deployment-specific detour from it.
 
 | Layer | Target | Current gap |
 |---|---|---|
-| L1 | `asap_frontend_promql::lower_promql` called directly; no local parser | `control_plane/src/query_parser/{mod,promql}.rs` (1793 lines) is still fully local — zero `asap-frontend-promql` dependency. **Full gap.** |
+| L1 | `asap_frontend_promql::lower_promql` called directly; no local parser | `query_parser::parse_query_expr_canonical`/`parse_query` call `lower_promql` directly; `query_parser/promql.rs` (the local parser, ~1187 lines) is deleted. No reconciliation pass — classification (e.g. bare selectors no longer implying `Aggregate{Sum}`) follows `asap-l2`'s lowering as-is. **Closed** (#428). |
 | L2 | `Binder::default()` / `convert_root` used via L1, no local schema logic | Already true in substance — `intent_algebra/{binder,column_resolution}.rs` are thin re-export shims. **Effectively closed.** |
 | L3 | Zero local `QueryExpr`/`AggIntent`/`Schema` definitions | Already true — `intent_algebra/{agg_intent,query_expr,relational,schema,expr_ir}.rs` are thin re-export shims with only genuinely-local residues (`Frequency` extension helpers, `PerPartitionWrap`, PromQL-ergonomic `LabelFilter`). `intent_algebra/lower.rs` (~1000 lines) remains real local code — deliberately, for two documented reasons with no ASAPController equivalent (multi-agg fusion, the windowed-Count-as-Frequency heuristic). **Effectively closed modulo `lower.rs`'s two documented exceptions.** |
 | L4 | One `CostModel` impl; `Rc<L4Node>` used directly | `sketch_algebra::cost_model::ControlPlaneCostModel` + `sketch_algebra::lower::bind_query_expr` (delegating to `implement_tree_in_with`) already match this shape. `sketch_algebra::matcher::SummaryFamilyMatcher` is the `Matcher` impl this section's serving-time §3 depends on. **Effectively closed** — `PhysicalExpr`/`L4Plan` is a thin, acceptable L5-placement wrapper around `Rc<L4Node>`, not a competing L4 algebra. |
 | L5 | Full local `PhysicalPlanner`/`TopologyDescriptor`/`StageAllocator` impl | `physical/colored_dag/*` + `emit/*` already implement this shape structurally, just not against the trait names above (no literal `PhysicalPlanner` trait exists in this repo — the free functions/structs are the de facto impl). Low-priority gap: naming/trait-alignment, not missing functionality. |
 | Serving | Single `SummaryExecutor` impl is the live path | `data_plane`'s `summary_executor.rs` implements the trait fully, but is not yet the live path — `engine.rs`'s query-serving entry point still calls the legacy flat `SketchReducer`/`capability_for`-based dispatch. `live_serve.rs`/`shadow_compare.rs` exist as the rollout mechanism (both env-flag-gated, off by default). **Rollout in progress, not complete.** |
 
-**Net reading**: L2–L4 are substantially already at target — the earlier
-instinct that "`intent_algebra`/`sketch_algebra` should be unnecessary
-once connected to ASAPController" is correct and largely *already true*
-for L2–L4, not a still-open gap. The two real, still-open items are L1
-(adopt `asap-frontend-promql`, retiring `query_parser/` outright) and the
-serving-time cutover (finish the `SummaryExecutor` rollout, then retire
-`sketch_reducer.rs`). L5 should **not** shrink — it's this deployment's
-own, permanent responsibility per ASAPController's own "no `asap-physical`
-crate" status.
+**Net reading**: L1–L4 are now at target. The earlier instinct that
+"`intent_algebra`/`sketch_algebra` should be unnecessary once connected
+to ASAPController" is correct and largely *already true* for L2–L4, and
+L1 has since closed the same way (#428). The one real, still-open item is
+the serving-time cutover (finish the `SummaryExecutor` rollout, then
+retire `sketch_reducer.rs`). L5 should **not** shrink — it's this
+deployment's own, permanent responsibility per ASAPController's own "no
+`asap-physical` crate" status.
 
 ## 5. Open questions (carried from `data_plane/docs/l4node-plan-executor-design.md`, still unresolved)
 
