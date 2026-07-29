@@ -27,8 +27,13 @@
 //!   hence `L4Plan` rather than `PhysicalExpr`.
 //! - **`RawAtEdgeSketchAtBackend` / `RawAtEdgePrometheusArchive`** — Phase
 //!   ε.1's placement decisions (where the sketch gets built, not what it
-//!   is). Genuinely L5 — see `optimizer::cost::wire::BindMode`, which names
-//!   the same three modes.
+//!   is). Genuinely L5. `optimizer::cost::wire` once named the same three
+//!   modes as `BindMode` with a `select_bind_mode` chooser, but that
+//!   selector was never wired to a caller (`bind_query_expr` always
+//!   produces `Committed`) and was removed in the 2026-07 retirement
+//!   pass — these two variants remain structurally unreachable in
+//!   production today, kept only because `physical/colored_dag/{allocator,emitter}.rs`
+//!   already pattern-match on them.
 //!
 //! `SketchAgg` / `SketchEstimate` / `SketchMerge` / `Logical` / `ExactAgg`
 //! don't get their own variants anymore — `asap_sketch::SummaryExpr`

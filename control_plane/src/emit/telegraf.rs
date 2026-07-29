@@ -24,8 +24,10 @@
 //!   identical**. The wire framing differs; the storage outcome does
 //!   not.
 //!
-//! Three modes (mirror the [`crate::planner::wire_cost::BindMode`] enum
-//! Phase ε.1 introduced):
+//! Three modes (the placement decision itself is made upstream in
+//! `stage_split`; the `BindMode`-shaped selector Phase ε.1 sketched out
+//! in `optimizer::cost::wire` was never wired in and was removed in the
+//! 2026-07 retirement pass — see that module's doc):
 //!
 //! 1. `SketchAtEdge` — `[[processors.allsketches]]` between
 //!    `[[inputs.opentelemetry]]` and `[[outputs.opentelemetry]]`.
