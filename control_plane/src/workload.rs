@@ -154,7 +154,8 @@ pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
     let Some(qs) = entry.query_string.as_ref() else {
         return AggRole::Other;
     };
-    let Ok(expr) = crate::query_parser::parse_query_expr_canonical(qs) else {
+    let accuracy = crate::types_v2::accuracy_target_from_legacy_accuracy_sla(entry.accuracy_sla);
+    let Ok(expr) = crate::query_parser::parse_query_expr_canonical(qs, accuracy) else {
         return AggRole::Other;
     };
     let (expr, _) = crate::optimizer::engine::QueryOptimizer::new(0.0).optimize(expr);
@@ -832,17 +833,35 @@ mod tests {
 
     #[test]
     fn agg_role_quantile_query_strings() {
-        for q in [
-            "quantile_over_time(0.99, m[5m])",
-            "quantile(0.5, m)",
-            "histogram_quantile(0.99, rate(m_bucket[5m]))",
-        ] {
+        for q in ["quantile_over_time(0.99, m[5m])", "quantile(0.5, m)"] {
             assert_eq!(
                 derive_agg_role(&entry("m", Some(q), None)),
                 AggRole::Quantile,
                 "query `{q}` should classify as Quantile"
             );
         }
+    }
+
+    #[test]
+    fn agg_role_classic_bucket_histogram_quantile_is_other() {
+        // L1 adoption (design-target-architecture.md Part B), accepted
+        // behavior change: the retired local parser unconditionally
+        // substituted `histogram_quantile(...)` with a sketchable
+        // `Quantile` intent. `lower_promql` instead detects the classic
+        // `_bucket` + `rate(...)` shape and produces the real,
+        // exact-only `AggIntent::HistogramQuantile`, which `capability_for`
+        // has no sketch-family mapping for (see
+        // `asap_tier_analysis::analyze_histogram_quantile_partially_answerable_via_inner_composition`).
+        // `derive_agg_role`'s wildcard arm correctly routes it to `Other`
+        // rather than misclassifying it as a sketch-routable `Quantile`.
+        assert_eq!(
+            derive_agg_role(&entry(
+                "m",
+                Some("histogram_quantile(0.99, rate(m_bucket[5m]))"),
+                None
+            )),
+            AggRole::Other
+        );
     }
 
     #[test]
