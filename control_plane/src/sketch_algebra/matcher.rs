@@ -54,16 +54,22 @@ impl Matcher for SummaryFamilyMatcher {
     ///   but not the reverse (a heap-less sketch cannot enumerate top-k
     ///   items it never tracked).
     fn is_satisfied_by(&self, required: &Implementation, available: &Implementation) -> bool {
+        // ASAPController#170 merged `Sketch`/`ExactAccumulator` into one
+        // `Summary { kind, params }` variant, recoverable via
+        // `kind.is_exact()`. The variant-tag mismatch that used to fall
+        // through to `_ => false` (comparing a `Sketch` against an
+        // `ExactAccumulator`) is now an explicit `is_exact()` mismatch
+        // between the two sides, still falling through the same way.
         match (required, available) {
             (Implementation::PassThrough, _) => true,
             (
-                Implementation::ExactAccumulator { kind: required, .. },
-                Implementation::ExactAccumulator { kind: have, .. },
-            ) => required == have,
+                Implementation::Summary { kind: required, .. },
+                Implementation::Summary { kind: have, .. },
+            ) if required.is_exact() && have.is_exact() => required == have,
             (
-                Implementation::Sketch { kind: required, .. },
-                Implementation::Sketch { kind: have, .. },
-            ) => sketch_family_satisfied(required, have),
+                Implementation::Summary { kind: required, .. },
+                Implementation::Summary { kind: have, .. },
+            ) if !required.is_exact() && !have.is_exact() => sketch_family_satisfied(required, have),
             _ => false,
         }
     }
@@ -174,12 +180,12 @@ mod tests {
 
     fn sketch(kind: SummaryKind) -> Implementation {
         let params = params_for(&kind);
-        Implementation::Sketch { kind, params }
+        Implementation::Summary { kind, params }
     }
 
     fn accumulator(kind: SummaryKind) -> Implementation {
         let params = params_for(&kind);
-        Implementation::ExactAccumulator { kind, params }
+        Implementation::Summary { kind, params }
     }
 
     #[test]

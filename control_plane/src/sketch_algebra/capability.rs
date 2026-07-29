@@ -614,8 +614,9 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
 /// Translate `asap-plan`'s per-intent implementation decision into this
 /// repo's own [`Capability`] vocabulary.
 ///
-/// `Implementation::Sketch`/`ExactAccumulator` both carry an
-/// `asap_sketch::SummaryKind` — this repo's `Capability` groups those
+/// `Implementation::Summary` carries an `asap_sketch::SummaryKind` for
+/// both the approximate-sketch and exact-accumulator cases (told apart
+/// via `kind.is_exact()`) — this repo's `Capability` groups those
 /// into coarser families (`QuantileApprox`/`CardinalityApprox`/
 /// `FrequencyEstimate`/`FrequencyTopk` for sketches; `ExactAgg(AggregationType)`
 /// for accumulators) because that's the granularity the sketch index
@@ -630,7 +631,45 @@ fn implementation_to_capability(implementation: asap_plan::Implementation) -> Op
 
     match implementation {
         Implementation::PassThrough => None,
-        Implementation::Sketch { kind, .. } => match kind {
+        // Exact accumulator half of the merged `Summary` variant
+        // (ASAPController#170 collapsed `Sketch`/`ExactAccumulator` into
+        // one `Summary { kind, params }`, recoverable via `kind.is_exact()`
+        // — see `asap_sketch::SummaryKind::is_exact`'s doc).
+        Implementation::Summary { kind, .. } if kind.is_exact() => match kind {
+            SummaryKind::Sum => Some(Capability::ExactAgg(AggregationType::Sum)),
+            SummaryKind::MinMax => Some(Capability::ExactAgg(AggregationType::MinMax)),
+            SummaryKind::Increase | SummaryKind::Rate => {
+                Some(Capability::ExactAgg(AggregationType::Increase))
+            }
+            // `AggregationType` (this repo's own exact-accumulator-family
+            // enum) has no `Count` variant — the data plane has no
+            // working count accumulator (`SumAccumulator` returns `sum`
+            // for both `Statistic::Sum` and `Statistic::Count`, so a
+            // `count_over_time` query matched against a `Sum` policy
+            // would silently return sum-of-values, not sample-count).
+            // `asap_plan::boundary::implementation_for` still reports
+            // `Count{Exact}` as exact (it assumes a real count
+            // accumulator exists, which is true in ASAPController's own
+            // reference implementation) — deliberately overridden here to
+            // `None` (archive) until a real `SumCountAccumulator` lands.
+            SummaryKind::Count => None,
+            SummaryKind::Kll
+            | SummaryKind::DDSketch
+            | SummaryKind::Hll
+            | SummaryKind::Theta
+            | SummaryKind::Kmv
+            | SummaryKind::Cms
+            | SummaryKind::CmsWithHeap
+            | SummaryKind::CountSketch
+            | SummaryKind::CountSketchWithHeap => {
+                unreachable!(
+                    "{kind:?} is a sketch-family SummaryKind, so kind.is_exact() is false — \
+                     never reached inside the is_exact() guard"
+                )
+            }
+        },
+        // Approximate-sketch half.
+        Implementation::Summary { kind, .. } => match kind {
             SummaryKind::Kll | SummaryKind::DDSketch => {
                 Some(Capability::QuantileApprox(SketchKindHandle::Any))
             }
@@ -649,42 +688,8 @@ fn implementation_to_capability(implementation: asap_plan::Implementation) -> Op
             | SummaryKind::Increase
             | SummaryKind::Rate => {
                 unreachable!(
-                    "{kind:?} is an exact-accumulator SummaryKind, never returned inside \
-                     Implementation::Sketch by asap_plan::boundary::implementation_for"
-                )
-            }
-        },
-        Implementation::ExactAccumulator { kind, .. } => match kind {
-            SummaryKind::Sum => Some(Capability::ExactAgg(AggregationType::Sum)),
-            SummaryKind::MinMax => Some(Capability::ExactAgg(AggregationType::MinMax)),
-            SummaryKind::Increase | SummaryKind::Rate => {
-                Some(Capability::ExactAgg(AggregationType::Increase))
-            }
-            // `AggregationType` (this repo's own exact-accumulator-family
-            // enum) has no `Count` variant — the data plane has no
-            // working count accumulator (`SumAccumulator` returns `sum`
-            // for both `Statistic::Sum` and `Statistic::Count`, so a
-            // `count_over_time` query matched against a `Sum` policy
-            // would silently return sum-of-values, not sample-count).
-            // `asap_plan::boundary::implementation_for` still reports
-            // `Count{Exact}` as an `ExactAccumulator` (it assumes a real
-            // count accumulator exists, which is true in ASAPController's
-            // own reference implementation) — deliberately overridden
-            // here to `None` (archive) until a real
-            // `SumCountAccumulator` lands.
-            SummaryKind::Count => None,
-            SummaryKind::Kll
-            | SummaryKind::DDSketch
-            | SummaryKind::Hll
-            | SummaryKind::Theta
-            | SummaryKind::Kmv
-            | SummaryKind::Cms
-            | SummaryKind::CmsWithHeap
-            | SummaryKind::CountSketch
-            | SummaryKind::CountSketchWithHeap => {
-                unreachable!(
-                    "{kind:?} is a sketch-family SummaryKind, never returned inside \
-                     Implementation::ExactAccumulator by asap_plan::boundary::implementation_for"
+                    "{kind:?} is an exact-accumulator SummaryKind, so kind.is_exact() is \
+                     true — the arm above already handles it"
                 )
             }
         },

@@ -68,10 +68,10 @@ asap_types.workspace = true
 # `AggIntent::Extension` hook this repo's `Extension{"frequency"}` intent
 # needs (ASAPController#150). 64df20d is a strict descendant of d4c1756
 # (the previous pin), so nothing this repo already consumes moves.
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "94795092c5d2d9582ddf7486ac0043ceb9f8a34c" }
-asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "94795092c5d2d9582ddf7486ac0043ceb9f8a34c" }
-asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "94795092c5d2d9582ddf7486ac0043ceb9f8a34c" }
-asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "94795092c5d2d9582ddf7486ac0043ceb9f8a34c" }
+asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
+asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
+asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
+asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

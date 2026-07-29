@@ -104,11 +104,11 @@ fn logical_l4(qe: QueryExpr) -> Rc<L4Node> {
 /// `PhysicalExpr::SketchAgg { sketch_type, params, child }` construction,
 /// for fixtures that need a specific family without going through
 /// `implement_tree`'s cost-model selection.
-fn sketch_agg_l4(sketch: SummaryKind, params: SummaryParams, child: Rc<L4Node>) -> Rc<L4Node> {
+fn sketch_agg_l4(summary: SummaryKind, params: SummaryParams, child: Rc<L4Node>) -> Rc<L4Node> {
     Rc::new(L4Node {
         expr: SummaryExpr::SummaryAgg {
             child,
-            sketch,
+            summary,
             params,
             col: ColumnRef::SampleValue,
             reduction: Reduction::by(vec![]),
@@ -119,9 +119,9 @@ fn sketch_agg_l4(sketch: SummaryKind, params: SummaryParams, child: Rc<L4Node>) 
 
 /// Hand-build a `SummaryEstimate` node — mirrors the old
 /// `PhysicalExpr::SketchEstimate { op, child }`.
-fn estimate_l4(query: SketchQuery, sketch_input: Rc<L4Node>) -> Rc<L4Node> {
+fn estimate_l4(query: SketchQuery, summary_input: Rc<L4Node>) -> Rc<L4Node> {
     Rc::new(L4Node {
-        expr: SummaryExpr::SummaryEstimate { sketch_input, query },
+        expr: SummaryExpr::SummaryEstimate { summary_input, query },
         schema: dummy_l4_schema(),
     })
 }

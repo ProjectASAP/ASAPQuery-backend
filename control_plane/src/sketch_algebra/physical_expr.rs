@@ -214,13 +214,13 @@ mod tests {
         let e = PhysicalExpr::committed(node);
         match e {
             PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
-                asap_sketch::SummaryExpr::SummaryEstimate { query, sketch_input } => {
+                asap_sketch::SummaryExpr::SummaryEstimate { query, summary_input } => {
                     assert!(matches!(query, asap_sketch::SketchQuery::Quantile { q } if *q == 0.99));
-                    match &sketch_input.expr {
+                    match &summary_input.expr {
                         asap_sketch::SummaryExpr::SummaryAgg {
-                            sketch, params, child, ..
+                            summary, params, child, ..
                         } => {
-                            assert_eq!(sketch, &SummaryKind::Kll);
+                            assert_eq!(summary, &SummaryKind::Kll);
                             assert_eq!(params, &SummaryParams::Kll { k: 200 });
                             assert!(matches!(child.expr, asap_sketch::SummaryExpr::Logical(_)));
                         }

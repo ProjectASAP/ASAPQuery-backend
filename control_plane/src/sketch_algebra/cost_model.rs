@@ -277,7 +277,7 @@ impl CostModel for ControlPlaneCostModel {
             return Implementation::PassThrough;
         };
         let (width, depth) = Self::cms_width_depth(eps, delta);
-        Implementation::Sketch {
+        Implementation::Summary {
             kind: SummaryKind::Cms,
             params: SummaryParams::Cms {
                 width: width.next_power_of_two(),

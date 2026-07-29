@@ -891,7 +891,7 @@ fn find_metric(node: &L4Node) -> Option<String> {
     match &node.expr {
         SummaryExpr::Logical(qe) => find_metric_in_query_expr(qe),
         SummaryExpr::SummaryAgg { child, .. } => find_metric(child),
-        SummaryExpr::SummaryEstimate { sketch_input, .. } => find_metric(sketch_input),
+        SummaryExpr::SummaryEstimate { summary_input, .. } => find_metric(summary_input),
         SummaryExpr::SummaryMerge { children } => children.first().and_then(|c| find_metric(c)),
         _ => None,
     }
@@ -981,7 +981,7 @@ mod tests {
         Rc::new(L4Node {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                sketch: SummaryKind::Kll,
+                summary: SummaryKind::Kll,
                 params: SummaryParams::Kll { k: 200 },
                 col: ColumnRef::SampleValue,
                 reduction,
@@ -1001,7 +1001,7 @@ mod tests {
         Rc::new(L4Node {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                sketch: SummaryKind::Hll,
+                summary: SummaryKind::Hll,
                 params: SummaryParams::Hll { precision: 10 },
                 col: ColumnRef::SampleValue,
                 reduction,
@@ -1013,10 +1013,10 @@ mod tests {
         })
     }
 
-    fn estimate_node(sketch_input: Rc<L4Node>, query: SketchQuery) -> Rc<L4Node> {
+    fn estimate_node(summary_input: Rc<L4Node>, query: SketchQuery) -> Rc<L4Node> {
         Rc::new(L4Node {
             expr: SummaryExpr::SummaryEstimate {
-                sketch_input,
+                summary_input,
                 query,
             },
             schema: L4Schema {
@@ -1143,7 +1143,7 @@ mod tests {
         Rc::new(L4Node {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                sketch: SummaryKind::Cms,
+                summary: SummaryKind::Cms,
                 params: SummaryParams::Cms {
                     width: 256,
                     depth: 4,
@@ -1199,7 +1199,7 @@ mod tests {
         Rc::new(L4Node {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                sketch: SummaryKind::CmsWithHeap,
+                summary: SummaryKind::CmsWithHeap,
                 params: SummaryParams::CmsWithHeap {
                     width: 256,
                     depth: 4,
@@ -1243,7 +1243,7 @@ mod tests {
         Rc::new(L4Node {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                sketch: SummaryKind::Sum,
+                summary: SummaryKind::Sum,
                 params: SummaryParams::Sum,
                 col: ColumnRef::SampleValue,
                 // Sum is a genuine PromQL aggregation operator -- an empty
@@ -2029,7 +2029,7 @@ mod tests {
         let mismatched = Rc::new(L4Node {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                sketch: SummaryKind::Kll,
+                summary: SummaryKind::Kll,
                 params: SummaryParams::Kll { k: 500 },
                 col: ColumnRef::SampleValue,
                 reduction: Reduction::by(vec![]),
@@ -2423,7 +2423,7 @@ mod tests {
         let tree = Rc::new(L4Node {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                sketch: SummaryKind::MinMax,
+                summary: SummaryKind::MinMax,
                 params: SummaryParams::MinMax,
                 col: ColumnRef::SampleValue,
                 reduction: Reduction::by(vec![]),
