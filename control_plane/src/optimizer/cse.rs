@@ -6,8 +6,10 @@
 //! Phase 0 decision: ASAPController places this pass in `crates/plan`
 //! ("the cost-aware optimizer layer (L4 decisions) over the L3 intent
 //! algebra"), not alongside the L3 IR type definitions — this repo's
-//! `optimizer` module is that layer (R1-R12 in `engine.rs`, and this
-//! pass's real consumer, `optimizer::cost::workload_cost`). The
+//! `optimizer` module is that layer (R1-R12 in `engine.rs`). The
+//! intended consumer, `optimizer::cost::workload_cost`, was removed as
+//! dead code (never wired to a caller) in the 2026-07 retirement pass —
+//! this pass has no in-tree consumer today. The
 //! algorithm is otherwise identical to `asap_plan::cse` (ASAPController's
 //! `crates/plan/src/cse.rs`) — adopted directly per the tie-break rule,
 //! including its structural-equality candidate scan (`QueryExpr:
@@ -22,8 +24,7 @@
 //! every `QueryExpr::Ref` construction site (`asap_ir`'s `BindingName`
 //! was always the *only* type that could actually name a `Ref`/
 //! `LetBinding`; the `types_v2` copy was this pass's own bookkeeping
-//! type, not a real second identity). `optimizer::cost::WorkloadCostPlan`
-//! — the pass's real consumer — moves with it for the same reason.
+//! type, not a real second identity).
 //! `types_v2::BindingName` remains the right type everywhere else it's
 //! used today (`sketch_algebra::PhysicalExpr`'s own, unrelated L4
 //! binding-name field; `pipeline.rs`'s `QueryId`) — this change is scoped

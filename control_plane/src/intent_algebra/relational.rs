@@ -71,8 +71,6 @@ pub use crate::intent_algebra::agg_intent::{
     default_quantile,
 };
 
-pub use crate::sketch_algebra::capability::{countmin_accuracy, hll_accuracy};
-
 /// Per-partition wrapper that historically lived on the legacy `AggIntent`
 /// enum as a `PerPartition { inner, keys }` variant. Canonical L3
 /// represents this shape via `QueryExpr::Aggregate { by: keys, aggs:
