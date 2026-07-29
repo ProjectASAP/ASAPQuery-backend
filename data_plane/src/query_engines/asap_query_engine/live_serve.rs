@@ -21,16 +21,30 @@ const LIVE_ACCURACY: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
 
 /// Whether the actual serving cutover is enabled for this process.
 /// Mirrors `shadow_compare::shadow_summary_executor_enabled`'s exact
-/// mechanics, own flag, own default (off) — this is a materially
-/// riskier switch than shadow mode (it changes what's served, not just
-/// what's logged), so it must never be implied by the shadow flag.
+/// mechanics and own flag — this is a materially riskier switch than
+/// shadow mode (it changes what's served, not just what's logged), so
+/// it must never be implied by the shadow flag.
+///
+/// Default flipped to **on** (control_plane/docs/design-target-architecture.md
+/// §4/Part A): both unit tests and a real HTTP-level e2e test
+/// (`live_serve_hll_global_count_merges_across_sids`,
+/// `live_serve_actually_answers_ddsketch_quantile`) already prove
+/// correctness for the shapes `try_serve_from_summary_executor` covers,
+/// and the grouping-ambiguity problem that gated this default off
+/// (empty-`by` ambiguity) is resolved via the real `Reduction::{Reduce,
+/// PerEntity}` IR signal, not a heuristic. The env var stays as a kill
+/// switch (`ASAP_SUMMARY_EXECUTOR_LIVE=0`/`false`/`off`), not removed —
+/// shapes this executor self-excludes before binding (`rate()`/`irate()`,
+/// `topk(K, sum by(...)(rate(...)))`, keyed-CMS point-estimate) still
+/// fall through to the legacy `SketchReducer` path unconditionally,
+/// regardless of this flag.
 pub fn summary_executor_live_enabled() -> bool {
     std::env::var("ASAP_SUMMARY_EXECUTOR_LIVE")
         .map(|v| {
             let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
         })
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Try to serve `query` entirely from `SummaryExecutor`. Returns `None`
@@ -195,7 +209,26 @@ mod tests {
     }
 
     #[test]
-    fn flag_off_never_serves() {
+    fn flag_explicitly_off_never_serves() {
+        // Kill switch: an explicit off-spelling still disables live-serve
+        // even though the default (unset) is now on.
+        let _guard = set_live_env("0");
+        let idx = ddsketch_fixture();
+        let result = try_serve_from_summary_executor(
+            &idx,
+            "quantile_over_time(0.99, latency_ms[1m])",
+            1_000,
+            2_000,
+            true,
+        );
+        assert!(result.is_none(), "flag explicitly off must never serve");
+    }
+
+    #[test]
+    fn unset_flag_defaults_to_serving() {
+        // Default flipped to on (design-target-architecture.md §4/Part A)
+        // -- an unset env var must serve, not fall back to the legacy
+        // path, for a shape this executor already proves safe.
         let _guard = clear_live_env();
         let idx = ddsketch_fixture();
         let result = try_serve_from_summary_executor(
@@ -205,7 +238,7 @@ mod tests {
             2_000,
             true,
         );
-        assert!(result.is_none(), "flag off must never serve");
+        assert!(result.is_some(), "unset flag must default to serving");
     }
 
     #[test]

@@ -262,33 +262,34 @@ deployment-specific detour from it.
 | L3 | Zero local `QueryExpr`/`AggIntent`/`Schema` definitions | Already true — `intent_algebra/{agg_intent,query_expr,relational,schema,expr_ir}.rs` are thin re-export shims with only genuinely-local residues (`Frequency` extension helpers, `PerPartitionWrap`, PromQL-ergonomic `LabelFilter`). `intent_algebra/lower.rs` (~1000 lines) remains real local code — deliberately, for two documented reasons with no ASAPController equivalent (multi-agg fusion, the windowed-Count-as-Frequency heuristic). **Effectively closed modulo `lower.rs`'s two documented exceptions.** |
 | L4 | One `CostModel` impl; `Rc<L4Node>` used directly | `sketch_algebra::cost_model::ControlPlaneCostModel` + `sketch_algebra::lower::bind_query_expr` (delegating to `implement_tree_in_with`) already match this shape. `sketch_algebra::matcher::SummaryFamilyMatcher` is the `Matcher` impl this section's serving-time §3 depends on. **Effectively closed** — `PhysicalExpr`/`L4Plan` is a thin, acceptable L5-placement wrapper around `Rc<L4Node>`, not a competing L4 algebra. |
 | L5 | Full local `PhysicalPlanner`/`TopologyDescriptor`/`StageAllocator` impl | `physical/colored_dag/*` + `emit/*` already implement this shape structurally, just not against the trait names above (no literal `PhysicalPlanner` trait exists in this repo — the free functions/structs are the de facto impl). Low-priority gap: naming/trait-alignment, not missing functionality. |
-| Serving | Single `SummaryExecutor` impl is the live path | `data_plane`'s `summary_executor.rs` implements the trait fully, but is not yet the live path — `engine.rs`'s query-serving entry point still calls the legacy flat `SketchReducer`/`capability_for`-based dispatch. `live_serve.rs`/`shadow_compare.rs` exist as the rollout mechanism (both env-flag-gated, off by default). **Rollout in progress, not complete.** |
+| Serving | Single `SummaryExecutor` impl is the live path | `data_plane`'s `summary_executor.rs` implements the trait fully and is **now the default-on live path** (`ASAP_SUMMARY_EXECUTOR_LIVE` default flipped from off to on — the grouping-ambiguity blocker below is resolved via `Reduction`, and both unit + e2e tests already proved correctness for the covered shapes). `sketch_reducer.rs` remains the permanent fallback for shapes this executor self-excludes before binding (`rate()`/`irate()`, `topk(K, sum by(...)(rate(...)))`, keyed-CMS point-estimate) — **not** legacy debt pending deletion, an intentional, indefinite split. |
 
-**Net reading**: L1–L4 are now at target. The earlier instinct that
-"`intent_algebra`/`sketch_algebra` should be unnecessary once connected
-to ASAPController" is correct and largely *already true* for L2–L4, and
-L1 has since closed the same way (#428). The one real, still-open item is
-the serving-time cutover (finish the `SummaryExecutor` rollout, then
-retire `sketch_reducer.rs`). L5 should **not** shrink — it's this
-deployment's own, permanent responsibility per ASAPController's own "no
-`asap-physical` crate" status.
+**Net reading**: L1–L4 and the serving-time cutover are all now at
+target. The earlier instinct that "`intent_algebra`/`sketch_algebra`
+should be unnecessary once connected to ASAPController" is correct and
+largely *already true* for L2–L4; L1 has since closed the same way
+(#428), and the serving-time cutover is done for the shapes
+`SummaryExecutor` covers (default-on, #427). `sketch_reducer.rs` is not
+pending deletion — it's the permanent, intentional fallback for shapes
+`SummaryExecutor` self-excludes before binding. L5 should **not** shrink
+— it's this deployment's own, permanent responsibility per
+ASAPController's own "no `asap-physical` crate" status; its only
+remaining gap is the low-priority naming/trait-alignment noted above.
 
-## 5. Open questions (carried from `data_plane/docs/l4node-plan-executor-design.md`, still unresolved)
+## 5. Open questions (carried from `data_plane/docs/l4node-plan-executor-design.md`, mostly resolved)
 
-These block the serving-time cutover in §3, not the L1 adoption in §4 —
-listed here because both docs describe the same target and shouldn't
+Listed here because both docs describe the same target and shouldn't
 drift into two different pictures of what's still open:
 
-1. **Grouping ambiguity for empty, sketch-family `by`.** PR #169's
-   `l3-intent-algebra.md` interface section resolves this at the type
-   level — `Reduction::{Reduce(GroupKeys), PerEntity}` is exactly the
-   upstream IR signal this repo's design doc flagged as missing (see
-   `Aggregate.reduction`'s doc: "an implementer must branch on `Reduce`
-   vs. `PerEntity` there, not guess from an empty key list"). **This
-   should now be resolvable** — `find_candidates`'s `reduction` parameter
-   already carries the distinction; the open work is wiring
-   `data_plane`'s `find_candidates` impl to actually branch on it instead
-   of the empty-key heuristic the current draft implementation uses.
+1. **Grouping ambiguity for empty, sketch-family `by`. RESOLVED.** PR
+   #169's `l3-intent-algebra.md` interface section resolves this at the
+   type level — `Reduction::{Reduce(GroupKeys), PerEntity}` is exactly
+   the upstream IR signal this repo's design doc flagged as missing.
+   `data_plane`'s `find_candidates` implementation (`summary_executor.rs`'s
+   `resolve_group_key`) already branches on the real `Reduction` value,
+   not an empty-key heuristic — confirmed by reading the current code,
+   not assumed. This was the stated blocker for the serving-time cutover
+   in §3/Part A; it's why that cutover was safe to default-on already.
 2. **Outer-fold family of gaps** (`topk(K, sum by (...) (rate(m[r])))`,
    stacking an outer exact statistic on a sketch/exact-agg readout) —
    still open, still a cross-repo IR design question per the original doc.
