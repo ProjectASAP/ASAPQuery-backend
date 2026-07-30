@@ -7,6 +7,7 @@ pub mod monitor_spec;
 pub mod policy_fingerprint;
 pub mod policy_registry;
 pub mod query_requirements;
+pub mod routing_index;
 pub mod traits;
 pub mod utils;
 
@@ -19,3 +20,4 @@ pub use monitor_spec::MonitorSpec;
 pub use policy_fingerprint::PolicyFingerprint;
 pub use policy_registry::PolicyRegistry;
 pub use query_requirements::*;
+pub use routing_index::RoutingIndex;

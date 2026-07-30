@@ -333,7 +333,7 @@ impl ASAPQueryEngine {
         }
 
         let streaming_snap = self.streaming_config_snapshot();
-        let policy_registry = streaming_snap.policy_registry();
+        let routing_index = asap_types::RoutingIndex::build(streaming_snap.policy_registry());
         let mut combined_result: Option<crate::storage_engines::sketch_db::query::ASAPTierResult> =
             None;
         // Resilience fix -- see the instant-query `execute(&str)` path's
@@ -365,7 +365,7 @@ impl ASAPQueryEngine {
             // populated `policy_fp`) but its result is unioned with
             // the catalog-walk result so we don't miss the sketches.
             let policy_fps = control_plane::asap_tier_analysis::find_matching_policies(
-                &policy_registry,
+                &routing_index,
                 candidate,
             );
             let mut sids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
@@ -843,7 +843,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             // policy lookups. Hot-reload swaps the underlying Arc; the
             // snapshot pins one revision for the duration.
             let streaming_snap = self.streaming_config_snapshot();
-            let policy_registry = streaming_snap.policy_registry();
+            let routing_index = asap_types::RoutingIndex::build(streaming_snap.policy_registry());
 
             // Resilience fix (design-target-architecture.md Part B,
             // completing the analyzer-side fix in
@@ -883,7 +883,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // empty for the MVP demo workload — see issue #271 /
                 // tracking #272.
                 let policy_fps = control_plane::asap_tier_analysis::find_matching_policies(
-                    &policy_registry,
+                    &routing_index,
                     candidate,
                 );
                 let mut sids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();

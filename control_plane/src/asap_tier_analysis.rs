@@ -812,40 +812,52 @@ pub fn find_policy_by_content(
     hit
 }
 
-/// Find every policy in `registry` whose contents satisfy `candidate`.
+/// Find every policy in `index` whose contents satisfy `candidate` — the
+/// "whole-query resolution" mode of
+/// `control_plane/docs/design-backend-plan-wire-format.md` §4's
+/// `RoutingIndex` (family-level `Capability` match, returns every
+/// surviving candidate rather than ranking down to one — see that
+/// design doc's note on why this differs from its own originally-sketched
+/// "pick one winner" framing: this function's actual, tested behavior is
+/// "union every match," and the caller's own sid-level Hit/Ghost
+/// classification does the real narrowing downstream).
+///
 /// The result is empty when no policy fits — caller routes the query
 /// to the archive engine (cold tier) in that case. Multiple matches
 /// are valid (different windows / different sketch families all
 /// serving the same intent); the caller can pick the cheapest via the
 /// cost model or fan out to all of them and combine.
 ///
+/// `index.candidates_for_metric(&candidate.metric_name)` (Tier 2) already
+/// narrows to this metric's own policies before any predicate below runs
+/// — no per-candidate metric-name check needed here anymore.
+///
 /// Matching predicate:
-/// 1. `policy.metric == candidate.metric_name`
-/// 2. `candidate.group_by_keys ⊆ policy.grouping_labels.labels` —
+/// 1. `candidate.group_by_keys ⊆ policy.grouping_labels.labels` —
 ///    the policy's group-by must cover every key the candidate names
 ///    (extra group-by keys on the policy are fine; the query can
 ///    re-aggregate down to its required projection).
-/// 3. `policy_capability(policy)` is `Some(c)` and
+/// 2. `policy_capability(policy)` is `Some(c)` and
 ///    `candidate.required_capability.is_satisfied_by(&c)`.
-/// 4. `policy.window_size ≤ candidate.range_seconds` — finer windows
+/// 3. `policy.window_size ≤ candidate.range_seconds` — finer windows
 ///    can answer coarser queries by merging; the reverse isn't true.
 ///    When `candidate.range_seconds == 0` (instant-vector query),
 ///    any policy window passes.
-/// 5. `policy.spatial_filter_normalized == candidate.spatial_filter_canonical`
+/// 4. `policy.spatial_filter_normalized == candidate.spatial_filter_canonical`
 ///    — exact match on the canonical filter form. Empty matches empty
 ///    (the unfiltered case); non-empty must be byte-identical (both
 ///    sides come from `asap_types::utils::normalize_spatial_filter`,
 ///    which sorts matchers, so the comparison is independent of the
 ///    user's source ordering).
 pub fn find_matching_policies(
-    registry: &asap_types::PolicyRegistry,
+    index: &asap_types::RoutingIndex,
     candidate: &ASAPTierCandidate,
 ) -> Vec<asap_types::PolicyFingerprint> {
     let mut out = Vec::new();
-    for (fp, cfg) in registry.iter() {
-        if cfg.metric != candidate.metric_name {
-            continue;
-        }
+    for fp in index.candidates_for_metric(&candidate.metric_name) {
+        let cfg = index
+            .get(*fp)
+            .expect("fp came from this index's own metric bucket");
         let policy_keys: BTreeSet<String> = cfg.grouping_labels.labels.iter().cloned().collect();
         if !candidate.group_by_keys.is_subset(&policy_keys) {
             continue;
@@ -1574,7 +1586,7 @@ mod tests {
         use super::super::*;
         use asap_types::AggregationType;
         use asap_types::KeyByLabelNames;
-        use asap_types::{AggregationConfig, PolicyFingerprint, PolicyRegistry};
+        use asap_types::{AggregationConfig, PolicyFingerprint, PolicyRegistry, RoutingIndex};
         use std::collections::HashMap;
 
         fn cfg(
@@ -1673,7 +1685,7 @@ mod tests {
                 60,
                 "",
             )];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "http_lat",
                 &[],
@@ -1692,7 +1704,7 @@ mod tests {
                 60,
                 "",
             )];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             // Query asks for per-zone increase; policy keeps {zone,
             // service} (superset).
             let cand = candidate(
@@ -1711,7 +1723,7 @@ mod tests {
             // check rejects this even though capabilities would
             // structurally satisfy.
             let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "http_lat",
                 &["zone"],
@@ -1724,7 +1736,7 @@ mod tests {
         #[test]
         fn matches_exact_metric_and_capability() {
             let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "http_lat",
                 &[],
@@ -1739,7 +1751,7 @@ mod tests {
         #[test]
         fn does_not_match_different_metric() {
             let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "cpu_pct",
                 &[],
@@ -1754,7 +1766,7 @@ mod tests {
             // Policy is Sum (ExactAgg); candidate asks for QuantileApprox.
             use crate::sketch_algebra::capability::SketchKindHandle;
             let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "http_lat",
                 &[],
@@ -1775,7 +1787,7 @@ mod tests {
                 60,
                 "",
             )];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "http_lat",
                 &["zone"],
@@ -1790,7 +1802,7 @@ mod tests {
             // Policy keeps {zone}; candidate asks for {zone, service}.
             // That's NOT covered — policy already projected service away.
             let policies = vec![cfg("http_lat", AggregationType::Sum, vec!["zone"], 60, "")];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "http_lat",
                 &["zone", "service"],
@@ -1805,7 +1817,7 @@ mod tests {
             // Policy emits 60s windows; candidate wants 300s range.
             // Finer can answer coarser via merge.
             let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "http_lat",
                 &[],
@@ -1820,7 +1832,7 @@ mod tests {
             // Policy emits 300s windows; candidate wants 60s range.
             // Can't downsample 300s into 60s.
             let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 300, "")];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "http_lat",
                 &[],
@@ -1834,7 +1846,7 @@ mod tests {
         fn zero_range_query_accepts_any_window() {
             // Instant-vector queries (range_seconds=0) match any policy.
             let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 300, "")];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "http_lat",
                 &[],
@@ -1856,7 +1868,7 @@ mod tests {
                 60,
                 r#"status="200""#,
             )];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate_with_filter(
                 "http_lat",
                 &[],
@@ -1876,7 +1888,7 @@ mod tests {
                 60,
                 r#"status="200""#,
             )];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "http_lat",
                 &[],
@@ -1889,7 +1901,7 @@ mod tests {
         #[test]
         fn unfiltered_policy_does_not_match_filtered_candidate() {
             let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate_with_filter(
                 "http_lat",
                 &[],
@@ -1909,7 +1921,7 @@ mod tests {
                 60,
                 r#"status="200""#,
             )];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate_with_filter(
                 "http_lat",
                 &[],
@@ -1928,7 +1940,7 @@ mod tests {
                 cfg("http_lat", AggregationType::Sum, vec![], 60, ""),
                 cfg("http_lat", AggregationType::Sum, vec![], 30, ""),
             ];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "http_lat",
                 &[],
@@ -1952,7 +1964,7 @@ mod tests {
                 60,
                 "",
             )];
-            let registry = PolicyRegistry::from_configs(policies);
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(
                 "http_lat",
                 &["zone"],
@@ -1964,7 +1976,7 @@ mod tests {
 
         #[test]
         fn empty_registry_yields_empty_matches() {
-            let registry = PolicyRegistry::from_configs(Vec::<AggregationConfig>::new());
+            let registry = RoutingIndex::build(PolicyRegistry::from_configs(Vec::<AggregationConfig>::new()));
             let cand = candidate(
                 "http_lat",
                 &[],
