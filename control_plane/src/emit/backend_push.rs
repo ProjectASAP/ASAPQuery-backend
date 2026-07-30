@@ -295,13 +295,13 @@ async fn push_documents_coupled(
 }
 
 /// Best-effort, single-attempt push of the encoded `BackendPlan` — no
-/// in-function retry loop, unlike [`push_documents_coupled`]. Nothing in
-/// `data_plane` consumes this yet (see the design doc's Phase 4), so
-/// there's no correctness reason to pay for a multi-attempt backoff
-/// against every replan cycle; the next cycle's push is itself the
-/// retry backstop, same contract [`push_or_log`] already establishes for
-/// the legacy YAML path. Logs at WARN on failure; never affects
-/// [`PushOutcome`], which real callers key legacy-path behavior on.
+/// in-function retry loop, unlike [`push_documents_coupled`]. A dropped
+/// push just leaves `data_plane`'s serving-time lookup falling back to
+/// `SketchStore` reconstruction until the next replan cycle re-pushes,
+/// so the next cycle is itself the retry backstop — same contract
+/// [`push_or_log`] already establishes for the legacy YAML path. Logs at
+/// WARN on failure; never affects [`PushOutcome`], which real callers
+/// key legacy-path behavior on.
 async fn push_backend_plan_best_effort(client: &Arc<BackendClient>, bytes: Vec<u8>) {
     match client.post_backend_plan_typed(bytes).await {
         Ok(()) => {
@@ -476,10 +476,10 @@ async fn push_cumulative_entries(
     // BackendPlan (design-backend-plan-wire-format.md): built from the
     // SAME `cumulative_be` snapshot as the legacy documents above, so all
     // three describe one consistent generation of planning state. This
-    // is a dual-push, additive alongside the legacy streaming-config /
-    // storage-routing documents — nothing in `data_plane` consumes it
-    // yet (see that design doc's Phase 4), so a failure here must never
-    // affect `PushOutcome`, which existing callers key real behavior on.
+    // is a dual-push, alongside (not instead of) the legacy
+    // streaming-config / storage-routing documents — a failure here must
+    // never affect `PushOutcome`, which existing callers key real
+    // behavior on.
     let plan_bytes = match crate::backend_plan::from_stage_config(
         &cumulative_be,
         monitors,
@@ -912,9 +912,8 @@ mod tests {
         assert_eq!(mock.routing_hits.load(StdOrdering::SeqCst), 1);
     }
 
-    /// BackendPlan wire-format cutover (Phase 2): the dual-push also
-    /// fires a best-effort `POST /api/v1/backend-plan`, alongside — not
-    /// instead of — the legacy documents.
+    /// The dual-push also fires a best-effort `POST /api/v1/backend-plan`,
+    /// alongside — not instead of — the legacy documents.
     #[tokio::test]
     async fn coupled_push_also_fires_backend_plan_push() {
         let (url, mock) =

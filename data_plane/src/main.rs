@@ -716,8 +716,7 @@ async fn main() -> Result<()> {
     // install an empty hot-reload handle so `GET/POST
     // /api/v1/backend-plan` don't 503 before the control plane's first
     // push lands — same "install empty, let the first push fill it in"
-    // pattern as `bootstrap_routing` below. Additive alongside
-    // `hot_reload_config`; nothing consumes the installed plan yet.
+    // pattern as `bootstrap_routing` below.
     let hot_reload_backend_plan = data_plane::storage_engines::types::HotReloadBackendPlan::new(
         control_plane::backend_plan::BackendPlan::default(),
     );

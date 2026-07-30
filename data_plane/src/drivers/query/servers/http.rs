@@ -168,9 +168,9 @@ pub struct HttpServer {
     hot_reload_config: Option<crate::storage_engines::types::HotReloadStreamingConfig>,
     /// Hot-reloadable `BackendPlan` handle for `GET/POST
     /// /api/v1/backend-plan` (see `control_plane/docs/design-backend-plan-wire-format.md`).
-    /// `None` when not wired up (unit tests, legacy binaries, or a
-    /// binary predating this cutover) — the endpoints return `503`.
-    /// Additive alongside `hot_reload_config`; nothing reads this yet.
+    /// `None` when not wired up (unit tests, legacy binaries) — the
+    /// endpoints return `503`. Shared with `ASAPQueryEngine` so its
+    /// serving-time lookup sees the same installed plan.
     hot_reload_backend_plan: Option<crate::storage_engines::types::HotReloadBackendPlan>,
     /// Per-metric storage-backend routing table consulted by the HTTP
     /// instant-query handler at request time. When `Some(..)` and the
@@ -477,9 +477,8 @@ impl HttpServer {
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
             // BackendPlan wire format (design-backend-plan-wire-format.md):
-            // additive sibling of streaming-config above. POST body is
-            // raw protobuf bytes; nothing consumes the installed plan
-            // yet (Phase 4 of that design doc's rollout).
+            // sibling of streaming-config above, read by ASAPQueryEngine's
+            // serving-time lookup. POST body is raw protobuf bytes.
             .route(
                 "/api/v1/backend-plan",
                 get(handle_get_backend_plan).post(handle_post_backend_plan),
@@ -560,9 +559,8 @@ impl HttpServer {
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
             // BackendPlan wire format (design-backend-plan-wire-format.md):
-            // additive sibling of streaming-config above. POST body is
-            // raw protobuf bytes; nothing consumes the installed plan
-            // yet (Phase 4 of that design doc's rollout).
+            // sibling of streaming-config above, read by ASAPQueryEngine's
+            // serving-time lookup. POST body is raw protobuf bytes.
             .route(
                 "/api/v1/backend-plan",
                 get(handle_get_backend_plan).post(handle_post_backend_plan),
@@ -5555,9 +5553,9 @@ async fn handle_post_streaming_config(
 // `POST /api/v1/backend-plan` — accept a protobuf body, decode, and
 //                                atomically swap via ArcSwap.
 //
-// Additive alongside `/api/v1/streaming-config` — the swap here does
-// NOT touch the sid catalog / SketchStore reconciliation; nothing reads
-// the installed plan yet (see that design doc's Phase 4).
+// Sits alongside `/api/v1/streaming-config`, not in place of it — the
+// swap here does NOT touch the sid catalog / SketchStore reconciliation;
+// that lifecycle management stays on the streaming-config path.
 
 async fn handle_get_backend_plan(State(state): State<AppState>) -> axum::response::Response {
     use axum::http::StatusCode;

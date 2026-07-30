@@ -326,11 +326,11 @@ impl BackendClient {
     }
 
     /// POST an encoded `BackendPlan` (protobuf bytes) to the backend's
-    /// `POST /api/v1/backend-plan` endpoint. This is the wire-format
-    /// cutover from `control_plane/docs/design-backend-plan-wire-format.md`
-    /// — additive, alongside the existing streaming-config/storage-routing
-    /// push, not a replacement (see `emit::backend_push`'s call site).
-    /// Same transient/permanent classification as the other typed POST
+    /// `POST /api/v1/backend-plan` endpoint (see
+    /// `control_plane/docs/design-backend-plan-wire-format.md`), sent
+    /// alongside the streaming-config/storage-routing push, not in place
+    /// of it (see `emit::backend_push`'s call site). Same
+    /// transient/permanent classification as the other typed POST
     /// methods.
     pub async fn post_backend_plan_typed(
         &self,

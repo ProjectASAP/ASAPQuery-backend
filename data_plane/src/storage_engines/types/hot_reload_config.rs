@@ -82,14 +82,14 @@ use arc_swap::ArcSwap;
 use crate::storage_engines::types::StreamingConfig;
 
 /// Hot-reloadable `BackendPlan` state — same `ArcSwap` shape as
-/// [`HotReloadStreamingConfig`], applied to the new
-/// `control_plane::backend_plan::BackendPlan` wire format (see
-/// `control_plane/docs/design-backend-plan-wire-format.md`). Additive,
-/// alongside [`HotReloadStreamingConfig`] — nothing reads this yet
-/// (Phase 4 of that design doc's rollout wires the first consumer); its
-/// purpose today is purely to give
-/// `POST /api/v1/backend-plan` somewhere to atomically install the
-/// latest plan for later phases to read.
+/// [`HotReloadStreamingConfig`], applied to
+/// `control_plane::backend_plan::BackendPlan` (see
+/// `control_plane/docs/design-backend-plan-wire-format.md`). Lives
+/// alongside [`HotReloadStreamingConfig`], not in place of it:
+/// `POST /api/v1/backend-plan` installs the latest plan here for
+/// `ASAPQueryEngine`'s serving-time lookup to read, while
+/// `POST /api/v1/streaming-config` still drives sid-catalog lifecycle
+/// (registration/retirement) on its own path.
 #[derive(Clone)]
 pub struct HotReloadBackendPlan {
     inner: Arc<ArcSwap<control_plane::backend_plan::BackendPlan>>,
