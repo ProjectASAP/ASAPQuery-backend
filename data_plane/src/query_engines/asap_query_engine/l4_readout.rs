@@ -69,8 +69,9 @@ pub fn execute_l4_readout(
     t1_ms: u64,
     is_cumulative: bool,
     accuracy: AccuracyTarget,
+    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<L4ReadoutOutcome, LoweringSkip> {
-    let node = lower_promql_to_l4node(index, query, accuracy)?;
+    let node = lower_promql_to_l4node(index, query, accuracy, backend_plan)?;
 
     let ctx = QueryExecutionContext {
         index,
@@ -253,6 +254,7 @@ mod tests {
             2_000,
             true,
             accuracy(),
+            None,
         )
         .expect("should execute");
         assert_eq!(outcome.series.len(), 1);
@@ -277,7 +279,7 @@ mod tests {
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
         let outcome =
-            execute_l4_readout(&idx, "count(unique_users)", 1_000, 2_000, true, accuracy())
+            execute_l4_readout(&idx, "count(unique_users)", 1_000, 2_000, true, accuracy(), None)
                 .expect("should execute");
         assert_eq!(
             outcome.series.len(),
@@ -322,7 +324,7 @@ mod tests {
             (1_000, 2_000),
             Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(42.0)),
         );
-        let outcome = execute_l4_readout(&idx, "sum(bytes_total)", 1_000, 2_000, true, accuracy())
+        let outcome = execute_l4_readout(&idx, "sum(bytes_total)", 1_000, 2_000, true, accuracy(), None)
             .expect("should execute");
         // Window-end-only coverage: a single window (1_000, 2_000) is
         // keyed by its end (2_000) alone, so both bounds equal 2_000 --

@@ -418,6 +418,18 @@ async fn main() -> Result<()> {
         None
     };
 
+    // BackendPlan wire format (design-backend-plan-wire-format.md):
+    // install an empty hot-reload handle so `GET/POST
+    // /api/v1/backend-plan` don't 503 before the control plane's first
+    // push lands — same "install empty, let the first push fill it in"
+    // pattern as `bootstrap_routing` below. Shared with both the query
+    // engine (serving-time cutover, Phase 4) and the HTTP server (the
+    // push target) so a POST is observable by the next query, same
+    // sharing contract as `hot_reload_config`.
+    let hot_reload_backend_plan = data_plane::storage_engines::types::HotReloadBackendPlan::new(
+        control_plane::backend_plan::BackendPlan::default(),
+    );
+
     // Setup query engine. ASAPQueryEngine shares the same
     // HotReloadStreamingConfig handle as the HTTP server, so a POST
     // to /api/v1/streaming-config is observable by the next query
@@ -434,7 +446,8 @@ async fn main() -> Result<()> {
         // drives the Phase 6 archive failover via
         // EngineError::CapabilityMiss when the ASAP tier is empty
         // / ghost / unknown.
-        .with_sketch_index(sketch_index.clone());
+        .with_sketch_index(sketch_index.clone())
+        .with_hot_reload_backend_plan(hot_reload_backend_plan.clone());
         if let Some(control_plane_endpoint) = args.control_plane_endpoint.as_ref() {
             info!(
                 "Capability-miss notifications enabled → {}",
@@ -712,18 +725,9 @@ async fn main() -> Result<()> {
     // `SchemaRegistry`. `POST /api/v1/streaming-config` drives
     // lifecycle transitions at the sid level via the shared
     // `SketchStore` (already passed in below).
-    // BackendPlan wire format (design-backend-plan-wire-format.md):
-    // install an empty hot-reload handle so `GET/POST
-    // /api/v1/backend-plan` don't 503 before the control plane's first
-    // push lands — same "install empty, let the first push fill it in"
-    // pattern as `bootstrap_routing` below.
-    let hot_reload_backend_plan = data_plane::storage_engines::types::HotReloadBackendPlan::new(
-        control_plane::backend_plan::BackendPlan::default(),
-    );
-
     let mut server = HttpServer::new(http_config, engine, sketch_index.clone())
         .with_hot_reload_config(hot_reload_config.clone())
-        .with_hot_reload_backend_plan(hot_reload_backend_plan)
+        .with_hot_reload_backend_plan(hot_reload_backend_plan.clone())
         .with_probe_cache(probe_cache.clone());
 
     // Per-metric storage-backend routing table (issue #46
