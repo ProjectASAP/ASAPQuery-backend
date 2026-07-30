@@ -56,6 +56,14 @@ pub struct ASAPQueryEngine {
     /// the rest of the routing matrix.
     archive_engine:
         Option<Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>>,
+    /// BackendPlan wire-format cutover (design-backend-plan-wire-format.md).
+    /// When `Some`, `l4_lowering.rs`'s serving-time family/params lookup
+    /// prefers reading the installed plan's materializations directly
+    /// over reconstructing from `SketchStore` metadata
+    /// (`ObservedFamilyCostModel`). `None` when not wired up (unit
+    /// tests, legacy callers) — behavior is then identical to before
+    /// this cutover.
+    hot_reload_backend_plan: Option<crate::storage_engines::types::HotReloadBackendPlan>,
 }
 
 impl ASAPQueryEngine {
@@ -86,7 +94,28 @@ impl ASAPQueryEngine {
             control_plane_client: None,
             sketch_index: None,
             archive_engine: None,
+            hot_reload_backend_plan: None,
         }
+    }
+
+    /// Attach a `HotReloadBackendPlan` handle so serving-time family/params
+    /// lookups prefer the control plane's installed `BackendPlan` over
+    /// `SketchStore` reconstruction (see this struct's field doc).
+    /// Without this call, behavior is unchanged from before the
+    /// BackendPlan cutover.
+    pub fn with_hot_reload_backend_plan(
+        mut self,
+        handle: crate::storage_engines::types::HotReloadBackendPlan,
+    ) -> Self {
+        self.hot_reload_backend_plan = Some(handle);
+        self
+    }
+
+    /// Snapshot of the currently installed `BackendPlan`, if a hot-reload
+    /// handle is wired up. `None` otherwise — callers fall back to the
+    /// pre-cutover `SketchStore`-reconstruction path.
+    fn backend_plan_snapshot(&self) -> Option<Arc<control_plane::backend_plan::BackendPlan>> {
+        self.hot_reload_backend_plan.as_ref().map(|h| h.snapshot())
     }
 
     /// Phase-5 hybrid-stitch builder — attach an archive engine the
@@ -423,9 +452,10 @@ impl ASAPQueryEngine {
             // and every other "can't safely serve this way" outcome —
             // none of these are answerable via the sketch tier anymore;
             // the caller fails over to archive.
+            let backend_plan_snap = self.backend_plan_snapshot();
             let live_served_result =
                 crate::query_engines::asap_query_engine::live_serve::try_serve_from_summary_executor(
-                    idx, query, start_ms, end_ms, false,
+                    idx, query, start_ms, end_ms, false, backend_plan_snap.as_deref(),
                 );
             let result = match live_served_result {
                 Some(result) => result,
@@ -1125,6 +1155,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // `live_serve_hll_global_count_merges_across_sids` for the
                 // former), and every other "can't safely serve this way"
                 // outcome — the caller fails over to archive.
+                let backend_plan_snap = self.backend_plan_snapshot();
                 let live_served_result =
                     crate::query_engines::asap_query_engine::live_serve::try_serve_from_summary_executor(
                         idx,
@@ -1132,6 +1163,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                         t0_ms,
                         now_ms,
                         effective_is_cumulative(candidate),
+                        backend_plan_snap.as_deref(),
                     );
                 let result = match live_served_result {
                     Some(r) => r,

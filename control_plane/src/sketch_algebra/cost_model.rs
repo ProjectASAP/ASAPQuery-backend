@@ -399,6 +399,18 @@ impl CostModel for ForcedFamilyCostModel {
 /// `size_params` then fall back to the accuracy-driven default, which
 /// won't match anything registered either way, so the outcome
 /// (`find_candidates` finds nothing) is unchanged.
+///
+/// **Fallback status (design-backend-plan-wire-format.md §5):** since the
+/// `BackendPlan` cutover, `l4_lowering.rs` no longer relies on this type's
+/// caller (`observed_family_for_metric`, the `SketchStore`-metadata
+/// reconstruction) as the primary source — it first tries reading
+/// planning's real decision directly off an installed `BackendPlan`'s
+/// materializations (no reconstruction needed, since
+/// `Materialization.kind`/`.params` already ARE the pair `observed`
+/// needs). This type and its `SketchStore`-reconstruction caller remain
+/// the fallback for deploys that haven't started pushing a `BackendPlan`
+/// yet, or for metrics a partial/stale plan doesn't cover — not dead
+/// code, just no longer the first thing consulted.
 pub struct ObservedFamilyCostModel {
     inner: ControlPlaneCostModel,
     observed: Option<(SummaryKind, SummaryParams)>,

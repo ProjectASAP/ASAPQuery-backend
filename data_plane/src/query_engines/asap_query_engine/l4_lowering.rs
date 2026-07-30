@@ -192,6 +192,25 @@ fn observed_family_for_metric(index: &SketchStore, metric: &str) -> Option<(Summ
     None
 }
 
+/// Look up what family/params `plan` says is materialized for `metric` —
+/// the `BackendPlan`-sourced sibling of [`observed_family_for_metric`].
+/// Unlike that function, no reconstruction is needed:
+/// `Materialization.kind`/`.params` already ARE the pair this needs,
+/// straight off the wire the control plane pushed. Returns the first
+/// matching materialization found (mirrors
+/// `observed_family_for_metric`'s "first sketch-typed one found"
+/// semantics); `None` when the plan has no materialization for this
+/// metric.
+fn observed_family_for_metric_from_plan(
+    plan: &control_plane::backend_plan::BackendPlan,
+    metric: &str,
+) -> Option<(SummaryKind, SummaryParams)> {
+    plan.materializations.values().find_map(|m| {
+        matches!(&m.source, control_plane::intent_algebra::Source::TimeSeries { metric: mm } if mm == metric)
+            .then(|| (m.kind.clone(), m.params.clone()))
+    })
+}
+
 /// Lower a raw PromQL query string to the `L4Node` tree
 /// `asap_sketch::exec::execute`/`SummaryExecutor` needs — the actual
 /// serving cutover (`live_serve.rs`). Returns `Err` for any shape serving
@@ -202,6 +221,7 @@ pub fn lower_promql_to_l4node(
     index: &SketchStore,
     query: &str,
     accuracy: AccuracyTarget,
+    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<Rc<L4Node>, LoweringSkip> {
     // Reuse the SAME candidate analysis `engine.rs` already runs for the
     // legacy dispatch, rather than re-deriving rate detection via a
@@ -226,7 +246,22 @@ pub fn lower_promql_to_l4node(
     // `ExactAgg` sid, which bypasses `CostModel` entirely), in which case
     // `ObservedFamilyCostModel` transparently falls back to the same
     // accuracy-driven behavior as before.
-    let observed = find_metric_in_query_expr(&qe).and_then(|metric| observed_family_for_metric(index, &metric));
+    //
+    // BackendPlan cutover (design-backend-plan-wire-format.md §5): when a
+    // `BackendPlan` is available AND has a materialization for this
+    // metric, prefer reading planning's decision directly off it --
+    // `Materialization.kind`/`.params` already ARE the
+    // `(SummaryKind, SummaryParams)` pair this needs, no
+    // `AggregationConfig` reconstruction required. Falls back to the
+    // `SketchStore`-reconstruction path (`observed_family_for_metric`)
+    // when no plan is installed yet, or the plan doesn't cover this
+    // metric -- same "reproduce reality, or fall back to the old
+    // accuracy-driven guess" contract either way.
+    let observed = find_metric_in_query_expr(&qe).and_then(|metric| {
+        backend_plan
+            .and_then(|plan| observed_family_for_metric_from_plan(plan, &metric))
+            .or_else(|| observed_family_for_metric(index, &metric))
+    });
     let cost_model = ObservedFamilyCostModel::new(accuracy, observed);
 
     let physical = bind_query_expr_with_cost_model(&qe, &cost_model)
@@ -264,7 +299,7 @@ mod tests {
     #[test]
     fn rate_query_is_skipped_before_binding() {
         let idx = empty_index();
-        let result = lower_promql_to_l4node(&idx, "rate(http_requests_total[5m])", accuracy());
+        let result = lower_promql_to_l4node(&idx, "rate(http_requests_total[5m])", accuracy(), None);
         assert!(
             matches!(result, Err(LoweringSkip::RateShape)),
             "expected RateShape, got {result:?}"
@@ -274,7 +309,7 @@ mod tests {
     #[test]
     fn irate_query_is_skipped_before_binding() {
         let idx = empty_index();
-        let result = lower_promql_to_l4node(&idx, "irate(http_requests_total[5m])", accuracy());
+        let result = lower_promql_to_l4node(&idx, "irate(http_requests_total[5m])", accuracy(), None);
         assert!(
             matches!(result, Err(LoweringSkip::RateShape)),
             "expected RateShape, got {result:?}"
@@ -284,7 +319,7 @@ mod tests {
     #[test]
     fn unparseable_query_is_skipped() {
         let idx = empty_index();
-        let result = lower_promql_to_l4node(&idx, "this is not promql (((", accuracy());
+        let result = lower_promql_to_l4node(&idx, "this is not promql (((", accuracy(), None);
         assert!(
             matches!(result, Err(LoweringSkip::ParseFailed(_))),
             "expected ParseFailed, got {result:?}"
@@ -304,7 +339,7 @@ mod tests {
         // expression stays one opaque `Logical` blob, which this module
         // surfaces as `NotRealized`.
         let idx = empty_index();
-        let result = lower_promql_to_l4node(&idx, "http_requests_total", accuracy());
+        let result = lower_promql_to_l4node(&idx, "http_requests_total", accuracy(), None);
         assert!(
             matches!(result, Err(LoweringSkip::NotRealized)),
             "expected NotRealized, got {result:?}"
@@ -326,7 +361,7 @@ mod tests {
         // before this module started consulting the `SketchStore`.
         let idx = empty_index();
         let node =
-            lower_promql_to_l4node(&idx, "count_over_time(http_requests_total[5m])", accuracy())
+            lower_promql_to_l4node(&idx, "count_over_time(http_requests_total[5m])", accuracy(), None)
                 .expect("Frequency intent must realize via bind_query_expr/ControlPlaneCostModel");
         assert!(
             !matches!(node.expr, SummaryExpr::Logical(_)),
@@ -347,10 +382,148 @@ mod tests {
             &idx,
             "topk(5, sum by (host) (rate(http_requests_total[5m])))",
             accuracy(),
+            None,
         );
         assert!(
             matches!(result, Err(LoweringSkip::NotRealized) | Err(LoweringSkip::RateShape)),
             "expected NotRealized or RateShape (both are valid skips for this shape), got {result:?}"
         );
+    }
+
+    // ── BackendPlan cutover (design-backend-plan-wire-format.md §5) ────
+
+    mod backend_plan_cutover {
+        use super::*;
+        use crate::storage_engines::sketch_db::index::{
+            AccuracyBound, Capability, SketchInstanceMetadata, SketchKindHandle,
+        };
+        use control_plane::backend_plan::{BackendPlan, Materialization, WindowSpec};
+        use control_plane::intent_algebra::{ColumnRef, Source, WindowKind};
+        use std::collections::HashMap;
+
+        fn register_kll(idx: &SketchStore, metric: &str) {
+            let cfg = SketchConfig::Kll { k: 200 };
+            idx.register(SketchInstanceMetadata {
+                sid: 1,
+                metric_name: metric.to_string(),
+                group_by_keys: Default::default(),
+                capability: Some(Capability::QuantileApprox(SketchKindHandle::Kll)),
+                agg_kind: AggKind::Sketch {
+                    kind: SketchKindHandle::Kll,
+                    config: cfg.clone(),
+                    spatial_filter_canonical: String::new(),
+                },
+                accuracy: Some(AccuracyBound::from_config(&cfg)),
+                first_seen_unix_ms: 0,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                policy_fp: asap_types::PolicyFingerprint::UNSET,
+            });
+        }
+
+        fn plan_with_ddsketch_materialization(metric: &str) -> BackendPlan {
+            let fingerprint = asap_types::PolicyFingerprint(42);
+            let mut materializations = HashMap::new();
+            materializations.insert(
+                fingerprint,
+                Materialization {
+                    fingerprint,
+                    source: Source::TimeSeries {
+                        metric: metric.to_string(),
+                    },
+                    window: WindowSpec {
+                        kind: WindowKind::Tumbling,
+                        size_ms: 60_000,
+                        slide_ms: None,
+                    },
+                    group_by: Vec::new(),
+                    rollup: Vec::new(),
+                    kind: SummaryKind::DDSketch,
+                    params: SummaryParams::DDSketch { alpha: 0.01 },
+                    col: ColumnRef::SampleValue,
+                    retention: None,
+                },
+            );
+            BackendPlan {
+                plan_id: 1,
+                generated_at_unix_ms: 0,
+                materializations,
+                routing: Vec::new(),
+                monitors: Vec::new(),
+            }
+        }
+
+        /// Extract the bound `(SummaryKind, SummaryParams)` from the
+        /// `SummaryEstimate { summary_input: L4Node { expr: SummaryAgg {
+        /// summary, params, .. }, .. }, .. }` shape a bare
+        /// `quantile_over_time` query lowers to (confirmed by inspecting
+        /// the tree directly).
+        fn bound_family(node: &L4Node) -> (SummaryKind, SummaryParams) {
+            match &node.expr {
+                SummaryExpr::SummaryEstimate { summary_input, .. } => match &summary_input.expr {
+                    SummaryExpr::SummaryAgg { summary, params, .. } => {
+                        (summary.clone(), params.clone())
+                    }
+                    other => panic!("expected SummaryAgg, got {other:?}"),
+                },
+                other => panic!("expected SummaryEstimate, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn without_a_plan_sketchstore_reconstruction_wins() {
+            // Baseline: no `BackendPlan` -- `observed_family_for_metric`'s
+            // SketchStore reconstruction is the only source, and it must
+            // still work exactly as before this cutover.
+            let idx = SketchStore::new();
+            register_kll(&idx, "m");
+            let node = lower_promql_to_l4node(&idx, "quantile_over_time(0.99, m[1m])", accuracy(), None)
+                .expect("should lower");
+            assert_eq!(bound_family(&node).0, SummaryKind::Kll);
+        }
+
+        #[test]
+        fn a_plan_materialization_wins_over_sketchstore_reconstruction() {
+            // The load-bearing proof for this cutover: `SketchStore` has
+            // Kll registered for `m` (what reconstruction alone would
+            // find), but the installed `BackendPlan` says DDSketch for
+            // the SAME metric. The plan must win -- serving time reads
+            // planning's real (plan-sourced) decision, not whatever
+            // `SketchStore` metadata happens to reconstruct to.
+            let idx = SketchStore::new();
+            register_kll(&idx, "m");
+            let plan = plan_with_ddsketch_materialization("m");
+            let node = lower_promql_to_l4node(
+                &idx,
+                "quantile_over_time(0.99, m[1m])",
+                accuracy(),
+                Some(&plan),
+            )
+            .expect("should lower");
+            assert_eq!(
+                bound_family(&node).0,
+                SummaryKind::DDSketch,
+                "BackendPlan's materialization must take priority over SketchStore reconstruction"
+            );
+        }
+
+        #[test]
+        fn plan_present_but_no_materialization_for_metric_falls_back_to_sketchstore() {
+            // The plan is installed but doesn't cover THIS metric --
+            // `observed_family_for_metric_from_plan` returns `None` for
+            // it, so the lookup must fall through to SketchStore
+            // reconstruction, not silently fail to observe anything.
+            let idx = SketchStore::new();
+            register_kll(&idx, "m");
+            let plan = plan_with_ddsketch_materialization("some_other_metric");
+            let node = lower_promql_to_l4node(
+                &idx,
+                "quantile_over_time(0.99, m[1m])",
+                accuracy(),
+                Some(&plan),
+            )
+            .expect("should lower");
+            assert_eq!(bound_family(&node).0, SummaryKind::Kll);
+        }
     }
 }

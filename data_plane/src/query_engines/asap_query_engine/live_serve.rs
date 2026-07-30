@@ -73,13 +73,21 @@ pub fn try_serve_from_summary_executor(
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
+    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Option<ASAPTierResult> {
     if !summary_executor_live_enabled() {
         return None;
     }
 
-    let outcome = match execute_l4_readout(index, query, t0_ms, t1_ms, is_cumulative, LIVE_ACCURACY)
-    {
+    let outcome = match execute_l4_readout(
+        index,
+        query,
+        t0_ms,
+        t1_ms,
+        is_cumulative,
+        LIVE_ACCURACY,
+        backend_plan,
+    ) {
         Ok(outcome) => outcome,
         Err(skip) => {
             tracing::debug!(
@@ -227,6 +235,7 @@ mod tests {
             1_000,
             2_000,
             true,
+            None,
         );
         assert!(result.is_none(), "flag explicitly off must never serve");
     }
@@ -244,6 +253,7 @@ mod tests {
             1_000,
             2_000,
             true,
+            None,
         );
         assert!(result.is_some(), "unset flag must default to serving");
     }
@@ -258,6 +268,7 @@ mod tests {
             1_000,
             2_000,
             true,
+            None,
         );
         let result = result.expect("unambiguous single-series quantile must serve");
         assert_eq!(result.series.len(), 1);
@@ -278,7 +289,7 @@ mod tests {
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
         let result =
-            try_serve_from_summary_executor(&idx, "count(unique_users)", 1_000, 2_000, true);
+            try_serve_from_summary_executor(&idx, "count(unique_users)", 1_000, 2_000, true, None);
         let result = result.expect(
             "global-merge shape is no longer ambiguous -- it must be served, not declined",
         );
@@ -301,7 +312,7 @@ mod tests {
         let _guard = set_live_env("1");
         let idx = SketchStore::new();
         let result =
-            try_serve_from_summary_executor(&idx, "rate(http_requests_total[5m])", 0, 1000, true);
+            try_serve_from_summary_executor(&idx, "rate(http_requests_total[5m])", 0, 1000, true, None);
         assert!(result.is_none());
     }
 }
