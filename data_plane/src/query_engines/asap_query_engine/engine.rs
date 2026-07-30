@@ -56,13 +56,13 @@ pub struct ASAPQueryEngine {
     /// the rest of the routing matrix.
     archive_engine:
         Option<Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>>,
-    /// BackendPlan wire-format cutover (design-backend-plan-wire-format.md).
-    /// When `Some`, `l4_lowering.rs`'s serving-time family/params lookup
+    /// BackendPlan wire format (design-backend-plan-wire-format.md). When
+    /// `Some`, `l4_lowering.rs`'s serving-time family/params lookup
     /// prefers reading the installed plan's materializations directly
     /// over reconstructing from `SketchStore` metadata
     /// (`ObservedFamilyCostModel`). `None` when not wired up (unit
-    /// tests, legacy callers) — behavior is then identical to before
-    /// this cutover.
+    /// tests, legacy callers), which falls back to `SketchStore`
+    /// reconstruction only.
     hot_reload_backend_plan: Option<crate::storage_engines::types::HotReloadBackendPlan>,
 }
 
@@ -101,8 +101,8 @@ impl ASAPQueryEngine {
     /// Attach a `HotReloadBackendPlan` handle so serving-time family/params
     /// lookups prefer the control plane's installed `BackendPlan` over
     /// `SketchStore` reconstruction (see this struct's field doc).
-    /// Without this call, behavior is unchanged from before the
-    /// BackendPlan cutover.
+    /// Without this call, lookups fall back to `SketchStore`
+    /// reconstruction unconditionally.
     pub fn with_hot_reload_backend_plan(
         mut self,
         handle: crate::storage_engines::types::HotReloadBackendPlan,
@@ -113,7 +113,7 @@ impl ASAPQueryEngine {
 
     /// Snapshot of the currently installed `BackendPlan`, if a hot-reload
     /// handle is wired up. `None` otherwise — callers fall back to the
-    /// pre-cutover `SketchStore`-reconstruction path.
+    /// `SketchStore`-reconstruction path.
     fn backend_plan_snapshot(&self) -> Option<Arc<control_plane::backend_plan::BackendPlan>> {
         self.hot_reload_backend_plan.as_ref().map(|h| h.snapshot())
     }

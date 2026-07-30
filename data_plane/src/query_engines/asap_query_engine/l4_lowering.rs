@@ -241,22 +241,17 @@ pub fn lower_promql_to_l4node(
         .map_err(|e| LoweringSkip::ParseFailed(e.to_string()))?;
 
     // Serving time must reproduce the REAL planning decision, not
-    // independently re-derive one -- see this module's docs. `observed`
-    // is `None` when this metric has nothing registered (or only an
-    // `ExactAgg` sid, which bypasses `CostModel` entirely), in which case
-    // `ObservedFamilyCostModel` transparently falls back to the same
-    // accuracy-driven behavior as before.
-    //
-    // BackendPlan cutover (design-backend-plan-wire-format.md §5): when a
-    // `BackendPlan` is available AND has a materialization for this
-    // metric, prefer reading planning's decision directly off it --
+    // independently re-derive one -- see this module's docs. Prefer
+    // reading it straight off an installed `BackendPlan`'s
+    // materializations when one covers this metric --
     // `Materialization.kind`/`.params` already ARE the
     // `(SummaryKind, SummaryParams)` pair this needs, no
-    // `AggregationConfig` reconstruction required. Falls back to the
-    // `SketchStore`-reconstruction path (`observed_family_for_metric`)
-    // when no plan is installed yet, or the plan doesn't cover this
-    // metric -- same "reproduce reality, or fall back to the old
-    // accuracy-driven guess" contract either way.
+    // `AggregationConfig` reconstruction required (design-backend-plan-wire-format.md
+    // §5). Otherwise fall back to the `SketchStore`-reconstruction path
+    // (`observed_family_for_metric`), which is `None` when this metric
+    // has nothing registered (or only an `ExactAgg` sid, which bypasses
+    // `CostModel` entirely) -- `ObservedFamilyCostModel` then falls back
+    // further to the accuracy-driven default.
     let observed = find_metric_in_query_expr(&qe).and_then(|metric| {
         backend_plan
             .and_then(|plan| observed_family_for_metric_from_plan(plan, &metric))
@@ -390,7 +385,7 @@ mod tests {
         );
     }
 
-    // ── BackendPlan cutover (design-backend-plan-wire-format.md §5) ────
+    // ── BackendPlan-sourced family lookup (design-backend-plan-wire-format.md §5) ────
 
     mod backend_plan_cutover {
         use super::*;
@@ -473,8 +468,7 @@ mod tests {
         #[test]
         fn without_a_plan_sketchstore_reconstruction_wins() {
             // Baseline: no `BackendPlan` -- `observed_family_for_metric`'s
-            // SketchStore reconstruction is the only source, and it must
-            // still work exactly as before this cutover.
+            // SketchStore reconstruction is the only source.
             let idx = SketchStore::new();
             register_kll(&idx, "m");
             let node = lower_promql_to_l4node(&idx, "quantile_over_time(0.99, m[1m])", accuracy(), None)
@@ -484,9 +478,9 @@ mod tests {
 
         #[test]
         fn a_plan_materialization_wins_over_sketchstore_reconstruction() {
-            // The load-bearing proof for this cutover: `SketchStore` has
-            // Kll registered for `m` (what reconstruction alone would
-            // find), but the installed `BackendPlan` says DDSketch for
+            // `SketchStore` has Kll registered for `m` (what
+            // reconstruction alone would find), but the installed
+            // `BackendPlan` says DDSketch for
             // the SAME metric. The plan must win -- serving time reads
             // planning's real (plan-sourced) decision, not whatever
             // `SketchStore` metadata happens to reconstruct to.
