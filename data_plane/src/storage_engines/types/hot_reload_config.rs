@@ -81,6 +81,97 @@ use arc_swap::ArcSwap;
 
 use crate::storage_engines::types::StreamingConfig;
 
+/// Hot-reloadable `BackendPlan` state — same `ArcSwap` shape as
+/// [`HotReloadStreamingConfig`], applied to the new
+/// `control_plane::backend_plan::BackendPlan` wire format (see
+/// `control_plane/docs/design-backend-plan-wire-format.md`). Additive,
+/// alongside [`HotReloadStreamingConfig`] — nothing reads this yet
+/// (Phase 4 of that design doc's rollout wires the first consumer); its
+/// purpose today is purely to give
+/// `POST /api/v1/backend-plan` somewhere to atomically install the
+/// latest plan for later phases to read.
+#[derive(Clone)]
+pub struct HotReloadBackendPlan {
+    inner: Arc<ArcSwap<control_plane::backend_plan::BackendPlan>>,
+}
+
+impl HotReloadBackendPlan {
+    pub fn new(initial: control_plane::backend_plan::BackendPlan) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::new(Arc::new(initial))),
+        }
+    }
+
+    pub fn from_arc(initial: Arc<control_plane::backend_plan::BackendPlan>) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::new(initial)),
+        }
+    }
+
+    pub fn snapshot(&self) -> Arc<control_plane::backend_plan::BackendPlan> {
+        self.inner.load_full()
+    }
+
+    pub fn swap(
+        &self,
+        new: control_plane::backend_plan::BackendPlan,
+    ) -> Arc<control_plane::backend_plan::BackendPlan> {
+        self.inner.swap(Arc::new(new))
+    }
+}
+
+impl Default for HotReloadBackendPlan {
+    fn default() -> Self {
+        Self::new(control_plane::backend_plan::BackendPlan::default())
+    }
+}
+
+impl std::fmt::Debug for HotReloadBackendPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let snap = self.snapshot();
+        f.debug_struct("HotReloadBackendPlan")
+            .field("plan_id", &snap.plan_id)
+            .field("materializations", &snap.materializations.len())
+            .field("routing", &snap.routing.len())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod hot_reload_backend_plan_tests {
+    use super::*;
+    use control_plane::backend_plan::BackendPlan;
+
+    fn plan(plan_id: u64) -> BackendPlan {
+        BackendPlan {
+            plan_id,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn snapshot_reflects_initial_plan() {
+        let hr = HotReloadBackendPlan::new(plan(1));
+        assert_eq!(hr.snapshot().plan_id, 1);
+    }
+
+    #[test]
+    fn swap_replaces_plan_atomically() {
+        let hr = HotReloadBackendPlan::new(plan(1));
+        let old = hr.swap(plan(2));
+        assert_eq!(old.plan_id, 1, "swap returns the pre-swap snapshot");
+        assert_eq!(hr.snapshot().plan_id, 2);
+    }
+
+    #[test]
+    fn clones_share_underlying_swap() {
+        let hr = HotReloadBackendPlan::new(plan(1));
+        let hr_clone = hr.clone();
+        hr.swap(plan(2));
+        assert_eq!(hr_clone.snapshot().plan_id, 2);
+    }
+}
+
 /// Thin wrapper around `ArcSwap<StreamingConfig>` with ergonomic
 /// snapshot + swap helpers. Cloneable; clones share the same
 /// underlying `ArcSwap` so all holders see the same swaps.

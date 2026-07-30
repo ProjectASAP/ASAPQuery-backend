@@ -166,6 +166,12 @@ pub struct HttpServer {
     /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
     /// is not wired up by the caller (unit tests, legacy binaries).
     hot_reload_config: Option<crate::storage_engines::types::HotReloadStreamingConfig>,
+    /// Hot-reloadable `BackendPlan` handle for `GET/POST
+    /// /api/v1/backend-plan` (see `control_plane/docs/design-backend-plan-wire-format.md`).
+    /// `None` when not wired up (unit tests, legacy binaries, or a
+    /// binary predating this cutover) — the endpoints return `503`.
+    /// Additive alongside `hot_reload_config`; nothing reads this yet.
+    hot_reload_backend_plan: Option<crate::storage_engines::types::HotReloadBackendPlan>,
     /// Per-metric storage-backend routing table consulted by the HTTP
     /// instant-query handler at request time. When `Some(..)` and the
     /// query parses, the handler extracts the metric name from the
@@ -228,6 +234,8 @@ struct AppState {
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
     hot_reload_config: Option<crate::storage_engines::types::HotReloadStreamingConfig>,
+    /// See [`HttpServer::hot_reload_backend_plan`].
+    hot_reload_backend_plan: Option<crate::storage_engines::types::HotReloadBackendPlan>,
     /// See [`HttpServer::backend_storage_routing`].
     backend_storage_routing: Option<crate::query_engines::routing::HotReloadBackendStorageRouting>,
     /// Backfill registry (sketch DB §10). See `HttpServer::backfill`.
@@ -257,6 +265,7 @@ impl HttpServer {
             query_router,
             sketch_index,
             hot_reload_config: None,
+            hot_reload_backend_plan: None,
             backend_storage_routing: None,
             backfill: None,
             data_retention_ms: None,
@@ -302,6 +311,20 @@ impl HttpServer {
         handle: crate::storage_engines::types::HotReloadStreamingConfig,
     ) -> Self {
         self.hot_reload_config = Some(handle);
+        self
+    }
+
+    /// Attach a `HotReloadBackendPlan` handle so the
+    /// `GET/POST /api/v1/backend-plan` endpoints can install and read
+    /// the control plane's typed `BackendPlan` push. Additive alongside
+    /// [`Self::with_hot_reload_config`] — without this handle the
+    /// endpoints return `503 Service Unavailable`, same contract as the
+    /// legacy streaming-config handle.
+    pub fn with_hot_reload_backend_plan(
+        mut self,
+        handle: crate::storage_engines::types::HotReloadBackendPlan,
+    ) -> Self {
+        self.hot_reload_backend_plan = Some(handle);
         self
     }
 
@@ -415,6 +438,7 @@ impl HttpServer {
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
+            hot_reload_backend_plan: self.hot_reload_backend_plan.clone(),
             backend_storage_routing: self.backend_storage_routing.clone(),
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
@@ -451,6 +475,14 @@ impl HttpServer {
             .route(
                 "/api/v1/streaming-config",
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
+            )
+            // BackendPlan wire format (design-backend-plan-wire-format.md):
+            // additive sibling of streaming-config above. POST body is
+            // raw protobuf bytes; nothing consumes the installed plan
+            // yet (Phase 4 of that design doc's rollout).
+            .route(
+                "/api/v1/backend-plan",
+                get(handle_get_backend_plan).post(handle_post_backend_plan),
             )
             // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
@@ -507,6 +539,7 @@ impl HttpServer {
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
+            hot_reload_backend_plan: self.hot_reload_backend_plan.clone(),
             backend_storage_routing: self.backend_storage_routing.clone(),
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
@@ -525,6 +558,14 @@ impl HttpServer {
             .route(
                 "/api/v1/streaming-config",
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
+            )
+            // BackendPlan wire format (design-backend-plan-wire-format.md):
+            // additive sibling of streaming-config above. POST body is
+            // raw protobuf bytes; nothing consumes the installed plan
+            // yet (Phase 4 of that design doc's rollout).
+            .route(
+                "/api/v1/backend-plan",
+                get(handle_get_backend_plan).post(handle_post_backend_plan),
             )
             // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
@@ -2209,6 +2250,34 @@ mod tests {
             .expect("Failed to start test server")
     }
 
+    async fn setup_test_server_with_backend_plan(
+        hot_reload: Option<crate::storage_engines::types::HotReloadBackendPlan>,
+    ) -> u16 {
+        let adapter_config = AdapterConfig::prometheus_promql(
+            "http://127.0.0.1:9999".to_string(),
+            false,
+        );
+        let config = HttpServerConfig {
+            port: 0,
+            handle_http_requests: true,
+            adapter_config,
+        };
+        let streaming_config = Arc::new(StreamingConfig::default());
+        let query_engine = Arc::new(ASAPQueryEngine::new(streaming_config.clone(), 15000));
+        let mut server = HttpServer::new(
+            config,
+            query_engine,
+            Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+        );
+        if let Some(handle) = hot_reload {
+            server = server.with_hot_reload_backend_plan(handle);
+        }
+        server
+            .start_test_server()
+            .await
+            .expect("Failed to start test server")
+    }
+
     #[tokio::test]
     async fn test_get_endpoint_plus_symbol_decoding() {
         // Enable debug logging for this test
@@ -2413,6 +2482,105 @@ aggregations:
                 "http://127.0.0.1:{server_port}/api/v1/streaming-config"
             ))
             .body("not: : : valid: yaml: :")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], "error");
+    }
+
+    // ── BackendPlan hot-reload (design-backend-plan-wire-format.md) ─────
+
+    /// POST an encoded `BackendPlan` and verify the active state via GET
+    /// reflects the swap, and that the underlying hot-reload handle
+    /// (cloned into the server at setup) sees it too — mirroring
+    /// `test_streaming_config_hot_reload_round_trip`.
+    #[tokio::test]
+    async fn test_backend_plan_hot_reload_round_trip() {
+        use control_plane::backend_plan::BackendPlan;
+
+        let hot_reload =
+            crate::storage_engines::types::HotReloadBackendPlan::new(BackendPlan::default());
+        let server_port = setup_test_server_with_backend_plan(Some(hot_reload.clone())).await;
+        let client = Client::new();
+
+        let initial = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/backend-plan"))
+            .send()
+            .await
+            .expect("GET failed");
+        assert!(initial.status().is_success());
+        let initial_body: serde_json::Value = initial.json().await.unwrap();
+        assert_eq!(initial_body["materialization_count"], 0);
+
+        let new_plan = BackendPlan {
+            plan_id: 7,
+            generated_at_unix_ms: 123,
+            ..Default::default()
+        };
+        let bytes = new_plan.encode_to_vec();
+
+        let post_resp = client
+            .post(format!("http://127.0.0.1:{server_port}/api/v1/backend-plan"))
+            .header("content-type", "application/x-protobuf")
+            .body(bytes)
+            .send()
+            .await
+            .expect("POST failed");
+        let post_status = post_resp.status();
+        let post_body: serde_json::Value = post_resp.json().await.unwrap();
+        assert!(
+            post_status.is_success(),
+            "POST returned {post_status}: {post_body}"
+        );
+        assert_eq!(post_body["status"], "success");
+        assert_eq!(post_body["plan_id"], 7);
+
+        let after = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/backend-plan"))
+            .send()
+            .await
+            .expect("GET after swap failed");
+        let after_body: serde_json::Value = after.json().await.unwrap();
+        assert_eq!(after_body["plan_id"], 7);
+        assert_eq!(after_body["generated_at_unix_ms"], 123);
+
+        assert_eq!(hot_reload.snapshot().plan_id, 7);
+    }
+
+    #[tokio::test]
+    async fn test_backend_plan_hot_reload_missing_handle_503() {
+        let server_port = setup_test_server_with_backend_plan(None).await;
+        let client = Client::new();
+
+        let get_resp = client
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/backend-plan"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+        let post_resp = client
+            .post(format!("http://127.0.0.1:{server_port}/api/v1/backend-plan"))
+            .body("anything")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(post_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_backend_plan_hot_reload_rejects_bad_bytes() {
+        use control_plane::backend_plan::BackendPlan;
+        let hot_reload =
+            crate::storage_engines::types::HotReloadBackendPlan::new(BackendPlan::default());
+        let server_port = setup_test_server_with_backend_plan(Some(hot_reload)).await;
+        let client = Client::new();
+
+        let resp = client
+            .post(format!("http://127.0.0.1:{server_port}/api/v1/backend-plan"))
+            .body(vec![0xFFu8, 0xFF, 0xFF])
             .send()
             .await
             .unwrap();
@@ -5377,6 +5545,75 @@ async fn handle_post_streaming_config(
         "agg_ids_removed": removed,
         "new_aggregation_count": new_ids.len(),
         "sids_retired": sid_summary.retired});
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+// ── BackendPlan hot-reload (design-backend-plan-wire-format.md) ─────────
+//
+// `GET /api/v1/backend-plan`  — return the currently installed plan as
+//                                JSON (debug / verification).
+// `POST /api/v1/backend-plan` — accept a protobuf body, decode, and
+//                                atomically swap via ArcSwap.
+//
+// Additive alongside `/api/v1/streaming-config` — the swap here does
+// NOT touch the sid catalog / SketchStore reconciliation; nothing reads
+// the installed plan yet (see that design doc's Phase 4).
+
+async fn handle_get_backend_plan(State(state): State<AppState>) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(handle) = state.hot_reload_backend_plan else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "hot-reload backend-plan handle not attached; backend was built without HttpServer::with_hot_reload_backend_plan"});
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    };
+    let snap = handle.snapshot();
+    let body = serde_json::json!({
+        "status": "success",
+        "plan_id": snap.plan_id,
+        "generated_at_unix_ms": snap.generated_at_unix_ms,
+        "materialization_count": snap.materializations.len(),
+        "routing_count": snap.routing.len(),
+        "monitor_count": snap.monitors.len()});
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+async fn handle_post_backend_plan(
+    State(state): State<AppState>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let Some(handle) = state.hot_reload_backend_plan else {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": "hot-reload backend-plan handle not attached; backend was built without HttpServer::with_hot_reload_backend_plan"});
+        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
+    };
+
+    let new_plan = match control_plane::backend_plan::BackendPlan::decode(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            let body = serde_json::json!({
+                "status": "error",
+                "error": format!("BackendPlan decode error: {e}")});
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
+        }
+    };
+
+    let materialization_count = new_plan.materializations.len();
+    let routing_count = new_plan.routing.len();
+    let plan_id = new_plan.plan_id;
+    handle.swap(new_plan);
+
+    let body = serde_json::json!({
+        "status": "success",
+        "plan_id": plan_id,
+        "materialization_count": materialization_count,
+        "routing_count": routing_count});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 

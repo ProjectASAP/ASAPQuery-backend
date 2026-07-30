@@ -324,6 +324,41 @@ impl BackendClient {
             ))
         }
     }
+
+    /// POST an encoded `BackendPlan` (protobuf bytes) to the backend's
+    /// `POST /api/v1/backend-plan` endpoint. This is the wire-format
+    /// cutover from `control_plane/docs/design-backend-plan-wire-format.md`
+    /// — additive, alongside the existing streaming-config/storage-routing
+    /// push, not a replacement (see `emit::backend_push`'s call site).
+    /// Same transient/permanent classification as the other typed POST
+    /// methods.
+    pub async fn post_backend_plan_typed(
+        &self,
+        bytes: Vec<u8>,
+    ) -> std::result::Result<(), BackendPostError> {
+        let url = derive_backend_plan_url(&self.endpoint);
+        debug!(
+            endpoint = %url,
+            plan_bytes = bytes.len(),
+            "posting BackendPlan to ASAPQuery-backend (typed)"
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .header("content-type", "application/x-protobuf")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(classify_reqwest_error)?;
+
+        let status = resp.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(classify_http_status(status, body, "BackendPlan POST"))
+        }
+    }
 }
 
 /// Map a streaming-config endpoint URL to the sibling storage-routing
@@ -340,6 +375,21 @@ fn derive_storage_routing_url(endpoint: &str) -> String {
     }
     if let Some(stripped) = endpoint.strip_suffix(STREAMING_PATH_UNDERSCORE) {
         return format!("{stripped}{ROUTING_PATH}");
+    }
+    endpoint.to_string()
+}
+
+/// Map a streaming-config endpoint URL to the sibling `backend-plan`
+/// endpoint, same rewrite convention as [`derive_storage_routing_url`].
+fn derive_backend_plan_url(endpoint: &str) -> String {
+    const STREAMING_PATH_DASH: &str = "/api/v1/streaming-config";
+    const STREAMING_PATH_UNDERSCORE: &str = "/api/v1/streaming_config";
+    const PLAN_PATH: &str = "/api/v1/backend-plan";
+    if let Some(stripped) = endpoint.strip_suffix(STREAMING_PATH_DASH) {
+        return format!("{stripped}{PLAN_PATH}");
+    }
+    if let Some(stripped) = endpoint.strip_suffix(STREAMING_PATH_UNDERSCORE) {
+        return format!("{stripped}{PLAN_PATH}");
     }
     endpoint.to_string()
 }
@@ -495,6 +545,73 @@ mod tests {
         );
         // Unrelated path passes through too — no surprise rewriting.
         assert_eq!(derive_storage_routing_url("http://x/foo"), "http://x/foo");
+    }
+
+    #[test]
+    fn backend_plan_url_rewrites_streaming_path() {
+        assert_eq!(
+            derive_backend_plan_url("http://backend:8088/api/v1/streaming-config"),
+            "http://backend:8088/api/v1/backend-plan"
+        );
+        assert_eq!(
+            derive_backend_plan_url("http://backend:8088/api/v1/streaming_config"),
+            "http://backend:8088/api/v1/backend-plan"
+        );
+    }
+
+    #[test]
+    fn backend_plan_url_preserves_unknown_paths_for_tests() {
+        assert_eq!(
+            derive_backend_plan_url("http://127.0.0.1:1/api/v1/backend-plan"),
+            "http://127.0.0.1:1/api/v1/backend-plan"
+        );
+        assert_eq!(derive_backend_plan_url("http://x/foo"), "http://x/foo");
+    }
+
+    #[tokio::test]
+    async fn backend_plan_post_round_trips_bytes_via_url_rewrite() {
+        let hits: StdArc<Mutex<Vec<Vec<u8>>>> = StdArc::new(Mutex::new(Vec::new()));
+        let hits_for_route = hits.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/backend-plan",
+                post(move |body: axum::body::Bytes| {
+                    let hits = hits_for_route.clone();
+                    async move {
+                        hits.lock().unwrap().push(body.to_vec());
+                        axum::http::StatusCode::OK
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = BackendClient::new(format!("http://{addr}/api/v1/streaming-config"));
+        let bytes = vec![1u8, 2, 3, 4];
+        client
+            .post_backend_plan_typed(bytes.clone())
+            .await
+            .expect("backend-plan post ok");
+
+        let received = hits.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0], bytes);
+    }
+
+    #[tokio::test]
+    async fn backend_plan_post_404_is_transient() {
+        let sink = SharedSink(StdArc::new(Mutex::new(Vec::new())));
+        let url = start_mock_backend(sink.clone(), axum::http::StatusCode::NOT_FOUND).await;
+        let client = BackendClient::new(url);
+        let err = client
+            .post_backend_plan_typed(vec![1, 2, 3])
+            .await
+            .expect_err("404 should surface as Err");
+        assert!(err.is_transient(), "404 must classify as transient: {err}");
     }
 
     /// Phase α: full happy path. A mock backend hosts the storage
