@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// into this exact type. `control_plane` cannot depend on `data_plane` (the
 /// dependency runs the other way), so this type has to live somewhere both
 /// sides can reach — same reasoning as `AggregationConfig`/`PolicyFingerprint`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonitorSpec {
     pub agg_id: u64,
     /// Additive readout the edge reports: "sum" (default), "cms_point", "f2".
