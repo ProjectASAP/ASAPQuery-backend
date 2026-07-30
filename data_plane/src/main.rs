@@ -712,8 +712,18 @@ async fn main() -> Result<()> {
     // `SchemaRegistry`. `POST /api/v1/streaming-config` drives
     // lifecycle transitions at the sid level via the shared
     // `SketchStore` (already passed in below).
+    // BackendPlan wire format (design-backend-plan-wire-format.md):
+    // install an empty hot-reload handle so `GET/POST
+    // /api/v1/backend-plan` don't 503 before the control plane's first
+    // push lands — same "install empty, let the first push fill it in"
+    // pattern as `bootstrap_routing` below.
+    let hot_reload_backend_plan = data_plane::storage_engines::types::HotReloadBackendPlan::new(
+        control_plane::backend_plan::BackendPlan::default(),
+    );
+
     let mut server = HttpServer::new(http_config, engine, sketch_index.clone())
         .with_hot_reload_config(hot_reload_config.clone())
+        .with_hot_reload_backend_plan(hot_reload_backend_plan)
         .with_probe_cache(probe_cache.clone());
 
     // Per-metric storage-backend routing table (issue #46

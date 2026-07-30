@@ -44,11 +44,12 @@ use std::collections::{BTreeMap, HashMap};
 // import is gated to keep the non-test build warning-free.
 #[cfg(test)]
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::backend_client::{BackendClient, BackendPostError};
 use crate::emit::{emit_backend_storage_routing, emit_backend_streaming_config_json};
@@ -72,6 +73,19 @@ use crate::workload::AggRole;
 const RETRY_MAX_ATTEMPTS: u32 = 5;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const RETRY_DELAY_CAP: Duration = Duration::from_millis(2700);
+
+/// Monotonic counter for `BackendPlan.plan_id` — observability only, not
+/// identity (see `BackendPlan`'s own doc). One process-wide sequence is
+/// enough; there's no existing streaming-config version counter to
+/// reuse for parity.
+static PLAN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Cheap process-wide jitter source. We don't have `rand` in the
 /// control plane's dependency set and don't want to add it for one
@@ -280,6 +294,30 @@ async fn push_documents_coupled(
     (streaming_ok, routing_ok, RETRY_MAX_ATTEMPTS)
 }
 
+/// Best-effort, single-attempt push of the encoded `BackendPlan` — no
+/// in-function retry loop, unlike [`push_documents_coupled`]. A dropped
+/// push just leaves `data_plane`'s serving-time lookup falling back to
+/// `SketchStore` reconstruction until the next replan cycle re-pushes,
+/// so the next cycle is itself the retry backstop — same contract
+/// [`push_or_log`] already establishes for the legacy YAML path. Logs at
+/// WARN on failure; never affects [`PushOutcome`], which real callers
+/// key legacy-path behavior on.
+async fn push_backend_plan_best_effort(client: &Arc<BackendClient>, bytes: Vec<u8>) {
+    match client.post_backend_plan_typed(bytes).await {
+        Ok(()) => {
+            debug!(stage = "backend", endpoint = %client.endpoint(), "BackendPlan push succeeded");
+        }
+        Err(e) => {
+            warn!(
+                stage = "backend",
+                endpoint = %client.endpoint(),
+                error = %e,
+                "BackendPlan push failed; next replan cycle will retry"
+            );
+        }
+    }
+}
+
 /// Update the cumulative cache with `be` for `(metric, role)` and
 /// POST the cumulative streaming-config + storage-routing JSON
 /// documents to the backend.
@@ -435,6 +473,26 @@ async fn push_cumulative_entries(
         }
     };
 
+    // BackendPlan (design-backend-plan-wire-format.md): built from the
+    // SAME `cumulative_be` snapshot as the legacy documents above, so all
+    // three describe one consistent generation of planning state. This
+    // is a dual-push, alongside (not instead of) the legacy
+    // streaming-config / storage-routing documents — a failure here must
+    // never affect `PushOutcome`, which existing callers key real
+    // behavior on.
+    let plan_bytes = match crate::backend_plan::from_stage_config(
+        &cumulative_be,
+        monitors,
+        PLAN_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+        now_unix_ms(),
+    ) {
+        Ok(plan) => Some(plan.encode_to_vec()),
+        Err(e) => {
+            warn!(error = %e, "backend_plan::from_stage_config failed; skipping BackendPlan push (legacy push unaffected)");
+            None
+        }
+    };
+
     // Storage-routing: the routing classifier (`build_routing_entry` in
     // `emit/stage_config.rs`) reads `cfg.aggregations` to derive shape
     // routing, so we MUST merge every role's aggregations for one metric
@@ -494,6 +552,13 @@ async fn push_cumulative_entries(
 
     let (streaming_ok, routing_ok, attempts) =
         push_documents_coupled(client, streaming_body, routing_body).await;
+
+    // Best-effort BackendPlan push — same backoff schedule as the legacy
+    // documents, but its own outcome never feeds into `PushOutcome` (see
+    // this function's doc above `plan_bytes`).
+    if let Some(bytes) = plan_bytes {
+        push_backend_plan_best_effort(client, bytes).await;
+    }
 
     if streaming_ok && routing_ok {
         info!(
@@ -770,6 +835,7 @@ mod tests {
     struct DualMock {
         streaming_hits: StdArc<StdAtomicU32>,
         routing_hits: StdArc<StdAtomicU32>,
+        plan_hits: StdArc<StdAtomicU32>,
         streaming_status: axum::http::StatusCode,
         routing_status: axum::http::StatusCode,
     }
@@ -781,6 +847,7 @@ mod tests {
         let mock = DualMock {
             streaming_hits: StdArc::new(StdAtomicU32::new(0)),
             routing_hits: StdArc::new(StdAtomicU32::new(0)),
+            plan_hits: StdArc::new(StdAtomicU32::new(0)),
             streaming_status,
             routing_status,
         };
@@ -800,6 +867,15 @@ mod tests {
                     |State(m): State<DualMock>, _body: axum::body::Bytes| async move {
                         m.routing_hits.fetch_add(1, StdOrdering::SeqCst);
                         m.routing_status
+                    },
+                ),
+            )
+            .route(
+                "/api/v1/backend-plan",
+                post(
+                    |State(m): State<DualMock>, _body: axum::body::Bytes| async move {
+                        m.plan_hits.fetch_add(1, StdOrdering::SeqCst);
+                        axum::http::StatusCode::OK
                     },
                 ),
             )
@@ -834,6 +910,70 @@ mod tests {
         assert_eq!(outcome, PushOutcome::BothApplied);
         assert_eq!(mock.streaming_hits.load(StdOrdering::SeqCst), 1);
         assert_eq!(mock.routing_hits.load(StdOrdering::SeqCst), 1);
+    }
+
+    /// The dual-push also fires a best-effort `POST /api/v1/backend-plan`,
+    /// alongside — not instead of — the legacy documents.
+    #[tokio::test]
+    async fn coupled_push_also_fires_backend_plan_push() {
+        let (url, mock) =
+            start_dual_mock(axum::http::StatusCode::OK, axum::http::StatusCode::OK).await;
+        let client = StdArc::new(BackendClient::new(url));
+        let cache = Mutex::new(HashMap::new());
+        let outcome = post_typed_backend_for_role(
+            Some(&client),
+            &cache,
+            "latency",
+            AggRole::Quantile,
+            make_be("latency", "q"),
+            &[],
+        )
+        .await;
+        assert_eq!(outcome, PushOutcome::BothApplied);
+        assert_eq!(mock.plan_hits.load(StdOrdering::SeqCst), 1);
+    }
+
+    /// A BackendPlan push failure (backend doesn't implement the
+    /// endpoint yet, or returns an error) must NOT affect `PushOutcome`
+    /// — nothing depends on the plan push succeeding in this phase.
+    #[tokio::test]
+    async fn backend_plan_push_failure_does_not_affect_push_outcome() {
+        // A mock that only serves the legacy endpoints (no
+        // `/api/v1/backend-plan` route) — the plan push 404s.
+        let app = Router::new()
+            .route(
+                "/api/v1/streaming-config",
+                post(|_body: axum::body::Bytes| async { axum::http::StatusCode::OK }),
+            )
+            .route(
+                "/api/v1/storage_routing",
+                post(|_body: axum::body::Bytes| async { axum::http::StatusCode::OK }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = StdArc::new(BackendClient::new(format!(
+            "http://{addr}/api/v1/streaming-config"
+        )));
+        let cache = Mutex::new(HashMap::new());
+        let outcome = post_typed_backend_for_role(
+            Some(&client),
+            &cache,
+            "latency",
+            AggRole::Quantile,
+            make_be("latency", "q"),
+            &[],
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PushOutcome::BothApplied,
+            "legacy documents must still report success even though the plan push 404s"
+        );
     }
 
     /// P2-3: streaming-config succeeds (200) but storage-routing always
