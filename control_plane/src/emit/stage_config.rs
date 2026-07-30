@@ -2962,7 +2962,7 @@ fn build_gateway_merge_block(mp: &GatewayMergeProcessor) -> Value {
 /// retired the controller-allocated id; identity is content-addressed
 /// in the backend via `PolicyFingerprint(u64)` derived from the fields
 /// above.
-fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
+pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonValue {
     // Option B (post-PR-#287): when `agg_type_override` is set, use
     // it as the wire `aggregationType` and emit an empty
     // `parameters` object — bypasses the sketch_kind → backend type

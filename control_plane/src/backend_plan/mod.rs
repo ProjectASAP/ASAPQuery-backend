@@ -24,6 +24,9 @@ pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/control_plane.backend_plan.v1.rs"));
 }
 
+mod from_stage_config;
+pub use from_stage_config::from_stage_config;
+
 use std::collections::HashMap;
 
 use asap_sketch::{SummaryKind, SummaryParams};
