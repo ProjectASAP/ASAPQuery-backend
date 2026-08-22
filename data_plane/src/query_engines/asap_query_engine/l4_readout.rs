@@ -1,12 +1,11 @@
-//! `L4Node` lowering + execution + conversion into `ASAPTierResult`'s
+//! `SummaryNode` lowering + execution + conversion into `ASAPTierResult`'s
 //! `(series, coverage)` shape — the core `live_serve.rs` (the serving
 //! cutover) calls into. See
 //! `data_plane/docs/l4node-plan-executor-design.md` for the design.
 
 use std::collections::BTreeMap;
 
-use asap_sketch::exec::{execute, ExecOutcome};
-use asap_sketch::{L4Node, SummaryExpr};
+use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome};
 use control_plane::types_v2::AccuracyTarget;
 
 use crate::query_engines::asap_query_engine::l4_lowering::{lower_promql_to_l4node, LoweringSkip};
@@ -93,7 +92,7 @@ pub fn execute_l4_readout(
         Ok(ExecOutcome::State(groups)) => {
             let mut coverage: Option<(u64, u64)> = None;
             let mut series = Vec::new();
-            for (group_key, state, _kind, _params) in &groups {
+            for (group_key, state, _family) in &groups {
                 fold_coverage(&mut coverage, state.exact_coverage());
                 let Some(value) = state.exact_value(&None) else {
                     continue;
@@ -278,9 +277,16 @@ mod tests {
         let idx = SketchStore::new();
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
-        let outcome =
-            execute_l4_readout(&idx, "count(unique_users)", 1_000, 2_000, true, accuracy(), None)
-                .expect("should execute");
+        let outcome = execute_l4_readout(
+            &idx,
+            "count(unique_users)",
+            1_000,
+            2_000,
+            true,
+            accuracy(),
+            None,
+        )
+        .expect("should execute");
         assert_eq!(
             outcome.series.len(),
             1,
@@ -324,8 +330,16 @@ mod tests {
             (1_000, 2_000),
             Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(42.0)),
         );
-        let outcome = execute_l4_readout(&idx, "sum(bytes_total)", 1_000, 2_000, true, accuracy(), None)
-            .expect("should execute");
+        let outcome = execute_l4_readout(
+            &idx,
+            "sum(bytes_total)",
+            1_000,
+            2_000,
+            true,
+            accuracy(),
+            None,
+        )
+        .expect("should execute");
         // Window-end-only coverage: a single window (1_000, 2_000) is
         // keyed by its end (2_000) alone, so both bounds equal 2_000 --
         // same semantics as `SummaryValue::coverage()`, reconfirmed for

@@ -7,7 +7,7 @@
 //! `proto/backend_plan.proto`), and the conversions between them.
 //!
 //! Deliberately reuses this deployment's existing canonical vocabulary
-//! rather than re-encoding it: `asap_sketch::{SummaryKind, SummaryParams}`
+//! rather than re-encoding it: `planner_types::post_asap::{SummaryKind, SummaryParams}`
 //! for the materialization payload (no separate `ExactAggregate` variant —
 //! see the design doc §3 for why), `asap_ir`/`crate::intent_algebra`'s
 //! `Source`/`ColumnRef`/`WindowKind` for the L3 IR fragments,
@@ -21,7 +21,10 @@
 
 pub mod proto {
     #![allow(clippy::all)]
-    include!(concat!(env!("OUT_DIR"), "/control_plane.backend_plan.v1.rs"));
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/control_plane.backend_plan.v1.rs"
+    ));
 }
 
 mod from_stage_config;
@@ -29,8 +32,8 @@ pub use from_stage_config::from_stage_config;
 
 use std::collections::HashMap;
 
-use asap_sketch::{SummaryKind, SummaryParams};
 use asap_types::{AggregationType, MonitorSpec, PolicyFingerprint};
+use asap_types::{SummaryKind, SummaryParams};
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -79,10 +82,11 @@ impl From<&WindowSpec> for proto::WindowSpec {
 impl TryFrom<proto::WindowSpec> for WindowSpec {
     type Error = DecodeError;
     fn try_from(w: proto::WindowSpec) -> Result<Self, DecodeError> {
-        let kind = proto::WindowKind::try_from(w.kind).map_err(|_| DecodeError::UnknownEnumValue {
-            field: "WindowSpec.kind",
-            value: w.kind,
-        })?;
+        let kind =
+            proto::WindowKind::try_from(w.kind).map_err(|_| DecodeError::UnknownEnumValue {
+                field: "WindowSpec.kind",
+                value: w.kind,
+            })?;
         Ok(WindowSpec {
             kind: kind.try_into()?,
             size_ms: w.size_ms,
@@ -200,7 +204,9 @@ impl From<&SummaryParams> for proto::SummaryParams {
             SummaryParams::Hll { precision } => Wire::Hll(proto::HllParams {
                 precision: *precision as u32,
             }),
-            SummaryParams::DDSketch { alpha } => Wire::Ddsketch(proto::DdSketchParams { alpha: *alpha }),
+            SummaryParams::DDSketch { alpha } => {
+                Wire::Ddsketch(proto::DdSketchParams { alpha: *alpha })
+            }
             SummaryParams::CmsWithHeap {
                 width,
                 depth,
@@ -238,7 +244,9 @@ impl From<&SummaryParams> for proto::SummaryParams {
 /// pair. Not a `TryFrom` impl because the single wire message decodes to
 /// TWO domain values (`SummaryKind` is implied, not carried separately on
 /// the wire) — see this module's doc.
-pub fn decode_summary_params(p: proto::SummaryParams) -> Result<(SummaryKind, SummaryParams), DecodeError> {
+pub fn decode_summary_params(
+    p: proto::SummaryParams,
+) -> Result<(SummaryKind, SummaryParams), DecodeError> {
     use proto::summary_params::Params as Wire;
     let params = p.params.ok_or(DecodeError::MissingOneof("SummaryParams"))?;
     Ok(match params {
@@ -261,7 +269,10 @@ pub fn decode_summary_params(p: proto::SummaryParams) -> Result<(SummaryKind, Su
                 precision: h.precision as u8,
             },
         ),
-        Wire::Ddsketch(d) => (SummaryKind::DDSketch, SummaryParams::DDSketch { alpha: d.alpha }),
+        Wire::Ddsketch(d) => (
+            SummaryKind::DDSketch,
+            SummaryParams::DDSketch { alpha: d.alpha },
+        ),
         Wire::CmsWithHeap(c) => (
             SummaryKind::CmsWithHeap,
             SummaryParams::CmsWithHeap {
@@ -317,7 +328,9 @@ impl TryFrom<proto::SketchKindHandle> for SketchKindHandle {
             proto::SketchKindHandle::CountSketch => Ok(SketchKindHandle::CountSketch),
             proto::SketchKindHandle::CountMin => Ok(SketchKindHandle::CountMin),
             proto::SketchKindHandle::CmsWithHeap => Ok(SketchKindHandle::CmsWithHeap),
-            proto::SketchKindHandle::CountSketchWithHeap => Ok(SketchKindHandle::CountSketchWithHeap),
+            proto::SketchKindHandle::CountSketchWithHeap => {
+                Ok(SketchKindHandle::CountSketchWithHeap)
+            }
             proto::SketchKindHandle::Any => Ok(SketchKindHandle::Any),
             proto::SketchKindHandle::Unspecified => Err(DecodeError::UnknownEnumValue {
                 field: "SketchKindHandle",
@@ -339,7 +352,9 @@ impl From<AggregationType> for proto::AggregationType {
             AggregationType::MultipleMinMax => proto::AggregationType::MultipleMinMax,
             AggregationType::HydraKLL => proto::AggregationType::HydraKll,
             AggregationType::CountMinSketch => proto::AggregationType::CountMinSketch,
-            AggregationType::CountMinSketchWithHeap => proto::AggregationType::CountMinSketchWithHeap,
+            AggregationType::CountMinSketchWithHeap => {
+                proto::AggregationType::CountMinSketchWithHeap
+            }
             AggregationType::CountSketch => proto::AggregationType::CountSketch,
             AggregationType::CountSketchWithHeap => proto::AggregationType::CountSketchWithHeap,
             AggregationType::HLL => proto::AggregationType::Hll,
@@ -408,12 +423,16 @@ impl TryFrom<proto::Capability> for Capability {
     type Error = DecodeError;
     fn try_from(c: proto::Capability) -> Result<Self, DecodeError> {
         use proto::capability::Capability as Wire;
-        let decode_handle = |v: i32, field: &'static str| -> Result<SketchKindHandle, DecodeError> {
-            proto::SketchKindHandle::try_from(v)
-                .map_err(|_| DecodeError::UnknownEnumValue { field, value: v })?
-                .try_into()
-        };
-        match c.capability.ok_or(DecodeError::MissingOneof("Capability"))? {
+        let decode_handle =
+            |v: i32, field: &'static str| -> Result<SketchKindHandle, DecodeError> {
+                proto::SketchKindHandle::try_from(v)
+                    .map_err(|_| DecodeError::UnknownEnumValue { field, value: v })?
+                    .try_into()
+            };
+        match c
+            .capability
+            .ok_or(DecodeError::MissingOneof("Capability"))?
+        {
             Wire::QuantileApprox(v) => Ok(Capability::QuantileApprox(decode_handle(
                 v,
                 "Capability.quantile_approx",
@@ -428,9 +447,11 @@ impl TryFrom<proto::Capability> for Capability {
                 "Capability.frequency_topk",
             )?)),
             Wire::ExactAgg(v) => {
-                let agg = proto::AggregationType::try_from(v).map_err(|_| DecodeError::UnknownEnumValue {
-                    field: "Capability.exact_agg",
-                    value: v,
+                let agg = proto::AggregationType::try_from(v).map_err(|_| {
+                    DecodeError::UnknownEnumValue {
+                        field: "Capability.exact_agg",
+                        value: v,
+                    }
                 })?;
                 Ok(Capability::ExactAgg(agg.try_into()?))
             }
@@ -575,7 +596,8 @@ impl TryFrom<proto::Materialization> for Materialization {
     type Error = DecodeError;
     fn try_from(m: proto::Materialization) -> Result<Self, DecodeError> {
         let (kind, params) = decode_summary_params(
-            m.params.ok_or(DecodeError::MissingOneof("Materialization.params"))?,
+            m.params
+                .ok_or(DecodeError::MissingOneof("Materialization.params"))?,
         )?;
         Ok(Materialization {
             fingerprint: PolicyFingerprint(m.fingerprint),
@@ -625,11 +647,12 @@ impl From<&RoutingEntry> for proto::RoutingEntry {
 impl TryFrom<proto::RoutingEntry> for RoutingEntry {
     type Error = DecodeError;
     fn try_from(r: proto::RoutingEntry) -> Result<Self, DecodeError> {
-        let storage_backend =
-            proto::StorageBackend::try_from(r.storage_backend).map_err(|_| DecodeError::UnknownEnumValue {
+        let storage_backend = proto::StorageBackend::try_from(r.storage_backend).map_err(|_| {
+            DecodeError::UnknownEnumValue {
                 field: "RoutingEntry.storage_backend",
                 value: r.storage_backend,
-            })?;
+            }
+        })?;
         Ok(RoutingEntry {
             satisfies: r
                 .satisfies
@@ -714,7 +737,11 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn sample_materialization(fingerprint: u64, kind: SummaryKind, params: SummaryParams) -> Materialization {
+    fn sample_materialization(
+        fingerprint: u64,
+        kind: SummaryKind,
+        params: SummaryParams,
+    ) -> Materialization {
         Materialization {
             fingerprint: PolicyFingerprint(fingerprint),
             source: Source::TimeSeries {
@@ -824,7 +851,10 @@ mod tests {
                 },
             ),
             (SummaryKind::Hll, SummaryParams::Hll { precision: 14 }),
-            (SummaryKind::DDSketch, SummaryParams::DDSketch { alpha: 0.01 }),
+            (
+                SummaryKind::DDSketch,
+                SummaryParams::DDSketch { alpha: 0.01 },
+            ),
             (
                 SummaryKind::CmsWithHeap,
                 SummaryParams::CmsWithHeap {

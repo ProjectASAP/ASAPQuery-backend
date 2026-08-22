@@ -290,9 +290,8 @@ mod tests {
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
         let result =
             try_serve_from_summary_executor(&idx, "count(unique_users)", 1_000, 2_000, true, None);
-        let result = result.expect(
-            "global-merge shape is no longer ambiguous -- it must be served, not declined",
-        );
+        let result = result
+            .expect("global-merge shape is no longer ambiguous -- it must be served, not declined");
         assert_eq!(
             result.series.len(),
             1,
@@ -311,8 +310,14 @@ mod tests {
     fn flag_on_unservable_query_falls_back() {
         let _guard = set_live_env("1");
         let idx = SketchStore::new();
-        let result =
-            try_serve_from_summary_executor(&idx, "rate(http_requests_total[5m])", 0, 1000, true, None);
+        let result = try_serve_from_summary_executor(
+            &idx,
+            "rate(http_requests_total[5m])",
+            0,
+            1000,
+            true,
+            None,
+        );
         assert!(result.is_none());
     }
 }

@@ -30,7 +30,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port: u16 = args.next().and_then(|s| s.parse().ok()).unwrap_or(4319);
     let agg_id: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1);
     let tau: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(100.0);
-    let window_ms: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(3_600_000);
+    let window_ms: u64 = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3_600_000);
     let timeout_secs: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(30);
     let key: Vec<u8> = args.next().map(|s| s.into_bytes()).unwrap_or_default();
 

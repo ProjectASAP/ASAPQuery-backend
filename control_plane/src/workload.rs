@@ -433,7 +433,10 @@ impl WorkloadRegistry {
     /// `StreamingConfig` (the coordinator then derives the ε-floor `p`). Shared
     /// across registry clones via the `Arc<RwLock<…>>` overlay.
     pub fn insert_runtime(&self, entry: WorkloadEntry) {
-        let mut rt = self.runtime.write().expect("runtime registry lock poisoned");
+        let mut rt = self
+            .runtime
+            .write()
+            .expect("runtime registry lock poisoned");
         rt.retain(|e| e.metric_name != entry.metric_name);
         rt.push(entry);
     }
@@ -445,16 +448,16 @@ impl WorkloadRegistry {
                 Ok(entries) => {
                     info!(path, count = entries.len(), "loaded workload registry");
                     Self {
-                    entries,
-                    runtime: Default::default(),
-                }
+                        entries,
+                        runtime: Default::default(),
+                    }
                 }
                 Err(e) => {
                     warn!(path, error = %e, "invalid workloads YAML; using empty registry");
                     Self {
-                    entries: vec![],
-                    runtime: Default::default(),
-                }
+                        entries: vec![],
+                        runtime: Default::default(),
+                    }
                 }
             },
             Err(_) => {
@@ -641,46 +644,46 @@ mod tests {
     #[test]
     fn for_role_filters_correctly() {
         let reg = WorkloadRegistry::from_entries(vec![
-                WorkloadEntry {
-                    metric_name: "a".into(),
-                    query_string: None,
-                    accuracy_sla: 0.01,
-                    assign_to_role: "agent".into(),
-                    sketch_family_override: None,
-                    target_path: None,
-                    grouping_labels: vec![],
-                    sample_p: 1.0,
-                    distinct_keys_per_window: None,
-                    item_label: None,
-                    monitor: None,
-                },
-                WorkloadEntry {
-                    metric_name: "b".into(),
-                    query_string: None,
-                    accuracy_sla: 0.05,
-                    assign_to_role: "backend".into(),
-                    sketch_family_override: None,
-                    target_path: None,
-                    grouping_labels: vec![],
-                    sample_p: 1.0,
-                    distinct_keys_per_window: None,
-                    item_label: None,
-                    monitor: None,
-                },
-                WorkloadEntry {
-                    metric_name: "c".into(),
-                    query_string: None,
-                    accuracy_sla: 0.02,
-                    assign_to_role: "agent".into(),
-                    sketch_family_override: None,
-                    target_path: None,
-                    grouping_labels: vec![],
-                    sample_p: 1.0,
-                    distinct_keys_per_window: None,
-                    item_label: None,
-                    monitor: None,
-                },
-            ]);
+            WorkloadEntry {
+                metric_name: "a".into(),
+                query_string: None,
+                accuracy_sla: 0.01,
+                assign_to_role: "agent".into(),
+                sketch_family_override: None,
+                target_path: None,
+                grouping_labels: vec![],
+                sample_p: 1.0,
+                distinct_keys_per_window: None,
+                item_label: None,
+                monitor: None,
+            },
+            WorkloadEntry {
+                metric_name: "b".into(),
+                query_string: None,
+                accuracy_sla: 0.05,
+                assign_to_role: "backend".into(),
+                sketch_family_override: None,
+                target_path: None,
+                grouping_labels: vec![],
+                sample_p: 1.0,
+                distinct_keys_per_window: None,
+                item_label: None,
+                monitor: None,
+            },
+            WorkloadEntry {
+                metric_name: "c".into(),
+                query_string: None,
+                accuracy_sla: 0.02,
+                assign_to_role: "agent".into(),
+                sketch_family_override: None,
+                target_path: None,
+                grouping_labels: vec![],
+                sample_p: 1.0,
+                distinct_keys_per_window: None,
+                item_label: None,
+                monitor: None,
+            },
+        ]);
         assert_eq!(reg.for_role("agent").len(), 2);
         assert_eq!(reg.for_role("backend").len(), 1);
         assert_eq!(reg.first_for_role("agent").unwrap().metric_name, "a");

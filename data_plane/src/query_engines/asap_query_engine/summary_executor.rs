@@ -1,5 +1,5 @@
-//! `data_plane`'s implementation of `asap_sketch::exec::SummaryExecutor`
-//! — the serving-time interface that resolves an `L4Node` plan tree
+//! `data_plane`'s implementation of `crate::query_engines::asap_query_engine::summary_exec::SummaryExecutor`
+//! — the serving-time interface that resolves an `SummaryNode` plan tree
 //! against whatever is actually materialized right now. See
 //! `data_plane/docs/l4node-plan-executor-design.md` for the surrounding
 //! design.
@@ -11,7 +11,7 @@
 //! specific item key) and a per-item point lookup (`count(cms_metric
 //! {item="x"})`, `SketchQuery::PointCount{key: Named(_), value: Some(_)}`
 //! — `value` is where the filter's actual value lives; see
-//! `asap_sketch::SketchQuery::PointCount`'s doc for why `readout` can't
+//! `planner_types::post_asap::SketchQuery::PointCount`'s doc for why `readout` can't
 //! resolve it itself from a `Filter` predicate) — for CMS/CountSketch/
 //! CMS-with-heap/CountSketch-with-heap, both cumulative (instant) and
 //! per-window (matrix/range). All modes do real cross-sid merging via
@@ -46,7 +46,7 @@
 //! `exact_agg_kind_match`'s doc for why `MinMax`/`Count`/`Rate` aren't
 //! matched) — one sid is one aggregation, read out directly, with no
 //! special-casing of exact-vs-approximate at the `find_candidates`/merge
-//! level. But `readout`/`SketchQuery` NEVER see these: `asap_plan::bind`
+//! level. But `readout`/`SketchQuery` NEVER see these: `asap_aware_mapping::bind`
 //! never wraps an `ExactAccumulator` implementation in a
 //! `SummaryEstimate` (`estimate = false` in `bind_summary_agg`), so
 //! `execute()` on such a tree returns `ExecOutcome::State` at the root
@@ -63,9 +63,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use asap_ir::intent_algebra::{ColumnId, ColumnRef, QueryExpr, Reduction, Source};
-use asap_sketch::exec::SummaryExecutor;
-use asap_sketch::{L4Node, SketchQuery, SummaryExpr, SummaryKind, SummaryParams};
+use crate::query_engines::asap_query_engine::summary_exec::SummaryExecutor;
+use planner_types::post_asap::{SketchQuery, SummaryExpr, SummaryFamilyType, SummaryNode};
+use planner_types::pre_asap::{ColumnId, ColumnRef, QueryExpr, Reduction, Source};
+// This file's own flat `(SummaryKind, SummaryParams)` -- spans both exact
+// accumulators and approximate sketches in one pair, matching every
+// internal matcher below (`summary_params_match`/`exact_agg_kind_match`)
+// -- vendored because ASAPPlanner split its old flat `SummaryKind` into
+// per-family `SketchKind`/`ExactKind` (ASAPPlanner#218). See
+// `crates/asap_types/src/accumulator_spec.rs`'s module doc and
+// control_plane/docs/design-asapplanner-pin-migration.md.
+use asap_types::{SummaryKind, SummaryParams};
 
 use control_plane::sketch_algebra::capability::SketchKindHandle;
 
@@ -323,12 +331,32 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
 
     fn find_candidates(
         &self,
-        sketch: &SummaryKind,
-        params: &SummaryParams,
+        family: &SummaryFamilyType,
         _col: &ColumnRef,
         reduction: &Reduction,
-        child: &L4Node,
+        child: &SummaryNode,
     ) -> Result<Vec<(Self::GroupKey, Self::Handle)>, Self::Error> {
+        // `SummaryAgg`'s `kind`/`params` collapsed into this one `family`
+        // field (ASAPPlanner#218 -- see this file's `use asap_types::{...}`
+        // note above); recover the flat `(SummaryKind, SummaryParams)`
+        // pair every matcher below still expects. `Plain`/`Sample`/
+        // `Wavelet`/`StatModel` never occur on a real `SummaryAgg` (never
+        // `Plain` by construction; the others are unreachable via this
+        // deployment's own `CostModel` -- see
+        // `sketch_algebra::capability`'s `implementation_to_capability`
+        // doc for the same reasoning), so there's no candidate to find.
+        let (sketch, params): (SummaryKind, SummaryParams) = match family {
+            SummaryFamilyType::ExactAggregate(kind, params) => {
+                (kind.clone().into(), params.clone().into())
+            }
+            SummaryFamilyType::Sketch(kind, params) => (kind.clone().into(), params.clone().into()),
+            SummaryFamilyType::Plain(_)
+            | SummaryFamilyType::Sample(..)
+            | SummaryFamilyType::Wavelet(..)
+            | SummaryFamilyType::StatModel(..) => return Ok(Vec::new()),
+        };
+        let sketch = &sketch;
+        let params = &params;
         let metric = find_metric(child).ok_or(SummaryExecutorError::NoMetricFound)?;
 
         let by: &[ColumnId] = reduction.group_keys().map(|k| k.keys()).unwrap_or(&[]);
@@ -387,7 +415,8 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
                     let Some(series) = series.into_iter().next() else {
                         continue;
                     };
-                    let group_key = resolve_group_key(reduction, &by_names, &series.series_label_values);
+                    let group_key =
+                        resolve_group_key(reduction, &by_names, &series.series_label_values);
                     out.push((
                         group_key,
                         SidHandle::Sketch {
@@ -418,7 +447,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
                 }
             }
         }
-        // Empty is NOT an error here -- `asap_sketch::exec::execute()`
+        // Empty is NOT an error here -- `crate::query_engines::asap_query_engine::summary_exec::execute()`
         // itself checks `find_candidates`'s result for emptiness and
         // raises the canonical `ExecError::NoCandidates`; erroring here
         // too would just wrap that in `ExecError::Executor(..)` instead,
@@ -477,7 +506,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         query: &SketchQuery,
     ) -> Result<Self::Value, Self::Error> {
         // `ExactAgg` states never reach here in practice -- see this
-        // module's doc (`asap_plan::bind` never wraps an ExactAccumulator
+        // module's doc (`asap_aware_mapping::bind` never wraps an ExactAccumulator
         // in a `SummaryEstimate`, so `execute()` stops at
         // `ExecOutcome::State` before ever calling `readout`). Defensive,
         // not a real path.
@@ -625,7 +654,7 @@ fn sketch_query_value(rs: &SummaryState, query: &SketchQuery) -> Result<f64, Sum
         // item" -- the bare bucket total. `key: Named(_), value: Some(v)`
         // is a per-item point lookup (e.g. `count(cms_metric{item="x"})`)
         // -- `value` is where the filter's actual value lives (see
-        // `asap_sketch::SketchQuery::PointCount`'s doc for why `readout`
+        // `planner_types::post_asap::SketchQuery::PointCount`'s doc for why `readout`
         // can't resolve it itself). Any other combination (e.g. a `Named`
         // key with no value, or `SampleValue` with a value) is a shape
         // this executor doesn't expect to see and reports rather than
@@ -902,7 +931,7 @@ fn to_delta_kind(kind: SketchKindHandle, config: &SketchConfig) -> Option<DeltaS
     }
 }
 
-/// Walk an `L4Node`'s `SummaryAgg`/`SummaryEstimate`/`SummaryMerge`
+/// Walk an `SummaryNode`'s `SummaryAgg`/`SummaryEstimate`/`SummaryMerge`
 /// spine down to a `Logical` leaf, then walk that leaf's `QueryExpr`
 /// down to a `Scan { source: Source::TimeSeries { metric }, .. }` to
 /// recover the metric name -- `SummaryAgg` itself carries no
@@ -910,7 +939,7 @@ fn to_delta_kind(kind: SketchKindHandle, config: &SketchConfig) -> Option<DeltaS
 /// doc). Mirrors `control_plane::asap_tier_implement::collect_aggregate_roots`'s
 /// exhaustive-variant recursion style (same `QueryExpr` type), swapping
 /// "collect Aggregate roots" for "find the first Scan".
-fn find_metric(node: &L4Node) -> Option<String> {
+fn find_metric(node: &SummaryNode) -> Option<String> {
     match &node.expr {
         SummaryExpr::Logical(qe) => find_metric_in_query_expr(qe),
         SummaryExpr::SummaryAgg { child, .. } => find_metric(child),
@@ -931,8 +960,7 @@ pub(crate) fn find_metric_in_query_expr(qe: &QueryExpr) -> Option<String> {
             source: Source::TimeSeries { metric },
             ..
         } => Some(metric.clone()),
-        QueryExpr::Window { child, .. }
-        | QueryExpr::Filter { child, .. }
+        QueryExpr::Filter { child, .. }
         | QueryExpr::Project { child, .. }
         | QueryExpr::Aggregate { child, .. }
         | QueryExpr::Distinct { child, .. }
@@ -942,9 +970,6 @@ pub(crate) fn find_metric_in_query_expr(qe: &QueryExpr) -> Option<String> {
         | QueryExpr::TimeRange { child, .. }
         | QueryExpr::TimeShift { child, .. }
         | QueryExpr::WindowFunc { child, .. } => find_metric_in_query_expr(child),
-        QueryExpr::LetBinding { expr, child, .. } => {
-            find_metric_in_query_expr(expr).or_else(|| find_metric_in_query_expr(child))
-        }
         QueryExpr::Merge { children } => children.iter().find_map(find_metric_in_query_expr),
         QueryExpr::Join { left, .. } | QueryExpr::SetOp { left, .. } => {
             find_metric_in_query_expr(left)
@@ -961,15 +986,15 @@ pub(crate) fn find_metric_in_query_expr(qe: &QueryExpr) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome};
     use crate::storage_engines::sketch_db::index::{
         AccuracyBound, Capability, SketchInstanceMetadata, SketchSampleState, SketchStore,
     };
-    use asap_ir::intent_algebra::{Column, DataType, Schema};
-    use asap_sketch::exec::{execute, ExecOutcome};
-    use asap_sketch::schema::{L4DataType, L4Field, L4Schema};
+    use planner_types::post_asap::{SummaryField, SummarySchema};
+    use planner_types::pre_asap::{Column, DataType, Schema};
     use std::rc::Rc;
 
-    fn scan_node(metric: &str, group_by_field: Option<&str>) -> Rc<L4Node> {
+    fn scan_node(metric: &str, group_by_field: Option<&str>) -> Rc<SummaryNode> {
         let qe = QueryExpr::Scan {
             source: Source::TimeSeries {
                 metric: metric.to_string(),
@@ -984,70 +1009,74 @@ mod tests {
                 vec![],
             ),
         };
-        let mut fields = vec![L4Field {
+        let mut fields = vec![SummaryField {
             name: "value".into(),
-            dtype: L4DataType::Primitive(DataType::Float64),
+            dtype: SummaryFamilyType::Plain(DataType::Float64),
             nullable: false,
         }];
         if let Some(name) = group_by_field {
-            fields.push(L4Field {
+            fields.push(SummaryField {
                 name: name.into(),
-                dtype: L4DataType::Primitive(DataType::Utf8),
+                dtype: SummaryFamilyType::Plain(DataType::Utf8),
                 nullable: false,
             });
         }
-        Rc::new(L4Node {
+        Rc::new(SummaryNode {
             expr: SummaryExpr::Logical(Box::new(qe)),
-            schema: L4Schema {
+            schema: SummarySchema {
                 fields,
                 time_index: None,
             },
         })
     }
 
-    fn kll_agg_node(child: Rc<L4Node>, reduction: Reduction) -> Rc<L4Node> {
-        Rc::new(L4Node {
+    fn kll_agg_node(child: Rc<SummaryNode>, reduction: Reduction) -> Rc<SummaryNode> {
+        Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                summary: SummaryKind::Kll,
-                params: SummaryParams::Kll { k: 200 },
+                family: SummaryFamilyType::Sketch(
+                    planner_types::post_asap::SketchKind::Kll,
+                    planner_types::post_asap::SketchParams::Kll { k: 200 },
+                ),
                 col: ColumnRef::SampleValue,
                 reduction,
             },
-            schema: L4Schema {
+            schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
         })
     }
 
-    fn hll_agg_node(child: Rc<L4Node>) -> Rc<L4Node> {
+    fn hll_agg_node(child: Rc<SummaryNode>) -> Rc<SummaryNode> {
         hll_agg_node_with(child, Reduction::by(vec![]))
     }
 
-    fn hll_agg_node_with(child: Rc<L4Node>, reduction: Reduction) -> Rc<L4Node> {
-        Rc::new(L4Node {
+    fn hll_agg_node_with(child: Rc<SummaryNode>, reduction: Reduction) -> Rc<SummaryNode> {
+        Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                summary: SummaryKind::Hll,
-                params: SummaryParams::Hll { precision: 10 },
+                family: SummaryFamilyType::Sketch(
+                    planner_types::post_asap::SketchKind::Hll,
+                    planner_types::post_asap::SketchParams::Hll { precision: 10 },
+                ),
                 col: ColumnRef::SampleValue,
                 reduction,
             },
-            schema: L4Schema {
+            schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
         })
     }
 
-    fn estimate_node(summary_input: Rc<L4Node>, query: SketchQuery) -> Rc<L4Node> {
-        Rc::new(L4Node {
+    fn estimate_node(summary_input: Rc<SummaryNode>, query: SketchQuery) -> Rc<SummaryNode> {
+        Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryEstimate {
                 summary_input,
                 query,
             },
-            schema: L4Schema {
+            schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
@@ -1167,19 +1196,21 @@ mod tests {
         sk.to_msgpack().expect("encode CountMinSketch msgpack")
     }
 
-    fn cms_agg_node(child: Rc<L4Node>) -> Rc<L4Node> {
-        Rc::new(L4Node {
+    fn cms_agg_node(child: Rc<SummaryNode>) -> Rc<SummaryNode> {
+        Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                summary: SummaryKind::Cms,
-                params: SummaryParams::Cms {
-                    width: 256,
-                    depth: 4,
-                },
+                family: SummaryFamilyType::Sketch(
+                    planner_types::post_asap::SketchKind::Cms,
+                    planner_types::post_asap::SketchParams::Cms {
+                        width: 256,
+                        depth: 4,
+                    },
+                ),
                 col: ColumnRef::SampleValue,
                 reduction: Reduction::by(vec![]),
             },
-            schema: L4Schema {
+            schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
@@ -1223,20 +1254,22 @@ mod tests {
             .expect("encode CountMinSketchWithHeap msgpack")
     }
 
-    fn cms_with_heap_agg_node(child: Rc<L4Node>) -> Rc<L4Node> {
-        Rc::new(L4Node {
+    fn cms_with_heap_agg_node(child: Rc<SummaryNode>) -> Rc<SummaryNode> {
+        Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                summary: SummaryKind::CmsWithHeap,
-                params: SummaryParams::CmsWithHeap {
-                    width: 256,
-                    depth: 4,
-                    heap_size: 10,
-                },
+                family: SummaryFamilyType::Sketch(
+                    planner_types::post_asap::SketchKind::CmsWithHeap,
+                    planner_types::post_asap::SketchParams::CmsWithHeap {
+                        width: 256,
+                        depth: 4,
+                        heap_size: 10,
+                    },
+                ),
                 col: ColumnRef::SampleValue,
                 reduction: Reduction::by(vec![]),
             },
-            schema: L4Schema {
+            schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
@@ -1267,19 +1300,21 @@ mod tests {
         }
     }
 
-    fn sum_agg_node(child: Rc<L4Node>, by: Vec<ColumnId>) -> Rc<L4Node> {
-        Rc::new(L4Node {
+    fn sum_agg_node(child: Rc<SummaryNode>, by: Vec<ColumnId>) -> Rc<SummaryNode> {
+        Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                summary: SummaryKind::Sum,
-                params: SummaryParams::Sum,
+                family: SummaryFamilyType::ExactAggregate(
+                    planner_types::post_asap::ExactKind::Sum,
+                    planner_types::post_asap::ExactParams::Sum,
+                ),
                 col: ColumnRef::SampleValue,
                 // Sum is a genuine PromQL aggregation operator -- an empty
                 // `by` always means "reduce fully," never `PerEntity` (see
                 // `resolve_group_key`'s doc).
                 reduction: Reduction::by(by),
             },
-            schema: L4Schema {
+            schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
@@ -1873,7 +1908,9 @@ mod tests {
         let tree = estimate_node(cms_agg_node(child), SketchQuery::TopK { k: 5 });
         let exec = ctx(&idx);
         match execute(&tree, &exec) {
-            Err(asap_sketch::exec::ExecError::Executor(SummaryExecutorError::Unsupported(_))) => {}
+            Err(crate::query_engines::asap_query_engine::summary_exec::ExecError::Executor(
+                SummaryExecutorError::Unsupported(_),
+            )) => {}
             other => panic!("expected Unsupported, got {}", other.is_ok()),
         }
     }
@@ -2033,7 +2070,8 @@ mod tests {
         );
         let exec = ctx(&idx);
         match execute(&tree, &exec) {
-            Err(asap_sketch::exec::ExecError::NoCandidates) => {}
+            Err(crate::query_engines::asap_query_engine::summary_exec::ExecError::NoCandidates) => {
+            }
             other => panic!("expected NoCandidates, got {}", other.is_ok()),
         }
     }
@@ -2054,15 +2092,17 @@ mod tests {
             },
         );
         let child = scan_node("latency_ms", None);
-        let mismatched = Rc::new(L4Node {
+        let mismatched = Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                summary: SummaryKind::Kll,
-                params: SummaryParams::Kll { k: 500 },
+                family: SummaryFamilyType::Sketch(
+                    planner_types::post_asap::SketchKind::Kll,
+                    planner_types::post_asap::SketchParams::Kll { k: 500 },
+                ),
                 col: ColumnRef::SampleValue,
                 reduction: Reduction::by(vec![]),
             },
-            schema: L4Schema {
+            schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
@@ -2070,7 +2110,8 @@ mod tests {
         let tree = estimate_node(mismatched, SketchQuery::Quantile { q: 0.5 });
         let exec = ctx(&idx);
         match execute(&tree, &exec) {
-            Err(asap_sketch::exec::ExecError::NoCandidates) => {}
+            Err(crate::query_engines::asap_query_engine::summary_exec::ExecError::NoCandidates) => {
+            }
             other => panic!(
                 "expected NoCandidates (param mismatch), got {}",
                 other.is_ok()
@@ -2376,9 +2417,14 @@ mod tests {
             1,
             "ungrouped query produces exactly one group"
         );
-        let (_key, state, kind, params) = &groups[0];
-        assert_eq!(*kind, SummaryKind::Sum);
-        assert_eq!(*params, SummaryParams::Sum);
+        let (_key, state, family) = &groups[0];
+        assert_eq!(
+            *family,
+            SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Sum,
+                planner_types::post_asap::ExactParams::Sum
+            )
+        );
         assert_eq!(
             state.exact_value(&None),
             Some(25.0),
@@ -2423,8 +2469,10 @@ mod tests {
         // this tree resolves to a real Sketch Value above).
         let handles = exec
             .find_candidates(
-                &SummaryKind::Kll,
-                &SummaryParams::Kll { k: 200 },
+                &SummaryFamilyType::Sketch(
+                    planner_types::post_asap::SketchKind::Kll,
+                    planner_types::post_asap::SketchParams::Kll { k: 200 },
+                ),
                 &ColumnRef::SampleValue,
                 &Reduction::by(vec![]),
                 &scan_node("latency_ms", None),
@@ -2503,22 +2551,25 @@ mod tests {
         );
 
         let child = scan_node("latency_max_ms", None);
-        let tree = Rc::new(L4Node {
+        let tree = Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                summary: SummaryKind::MinMax,
-                params: SummaryParams::MinMax,
+                family: SummaryFamilyType::ExactAggregate(
+                    planner_types::post_asap::ExactKind::MinMax,
+                    planner_types::post_asap::ExactParams::MinMax,
+                ),
                 col: ColumnRef::SampleValue,
                 reduction: Reduction::by(vec![]),
             },
-            schema: L4Schema {
+            schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
         });
         let exec = ctx(&idx);
         match execute(&tree, &exec) {
-            Err(asap_sketch::exec::ExecError::NoCandidates) => {}
+            Err(crate::query_engines::asap_query_engine::summary_exec::ExecError::NoCandidates) => {
+            }
             other => panic!("expected NoCandidates, got {}", other.is_ok()),
         }
     }

@@ -57,7 +57,10 @@ impl RoutingIndex {
         for (fp, cfg) in registry.iter() {
             by_metric.entry(cfg.metric.clone()).or_default().push(*fp);
         }
-        Self { registry, by_metric }
+        Self {
+            registry,
+            by_metric,
+        }
     }
 
     /// Tier 1 — exact fingerprint lookup. Delegates to the underlying
@@ -72,10 +75,7 @@ impl RoutingIndex {
     /// candidates" as a normal, expected outcome (capability miss →
     /// archive fallback), not a failure to report.
     pub fn candidates_for_metric(&self, metric: &str) -> &[PolicyFingerprint] {
-        self.by_metric
-            .get(metric)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.by_metric.get(metric).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Live policy count (same as the underlying registry's).
@@ -156,7 +156,10 @@ mod tests {
             None,
         );
         let b = cfg("http_lat");
-        assert_ne!(PolicyFingerprint::from_config(&a), PolicyFingerprint::from_config(&b));
+        assert_ne!(
+            PolicyFingerprint::from_config(&a),
+            PolicyFingerprint::from_config(&b)
+        );
         let idx = RoutingIndex::build(PolicyRegistry::from_configs(vec![a, b]));
         assert_eq!(idx.candidates_for_metric("http_lat").len(), 2);
     }
@@ -172,13 +175,19 @@ mod tests {
         let a = cfg("http_lat");
         let fp = PolicyFingerprint::from_config(&a);
         let idx = RoutingIndex::build(PolicyRegistry::from_configs(vec![a]));
-        assert_eq!(idx.get(fp).map(|c| c.metric.clone()), Some("http_lat".to_string()));
-        assert!(idx.get(PolicyFingerprint::from_config(&cfg("nope"))).is_none());
+        assert_eq!(
+            idx.get(fp).map(|c| c.metric.clone()),
+            Some("http_lat".to_string())
+        );
+        assert!(idx
+            .get(PolicyFingerprint::from_config(&cfg("nope")))
+            .is_none());
     }
 
     #[test]
     fn len_and_is_empty_match_registry() {
-        let idx = RoutingIndex::build(PolicyRegistry::from_configs(Vec::<AggregationConfig>::new()));
+        let idx =
+            RoutingIndex::build(PolicyRegistry::from_configs(Vec::<AggregationConfig>::new()));
         assert!(idx.is_empty());
         assert_eq!(idx.len(), 0);
 

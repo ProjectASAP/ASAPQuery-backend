@@ -4,7 +4,7 @@
 //!
 //! `Column` / `ColumnId` / `DataType` / `Schema` / `CseError` /
 //! `cse_reuse_is_legal` are no longer defined in this repo — re-exported
-//! from `asap_ir::intent_algebra::schema`. Unlike `AggIntent`'s merge
+//! from `planner_types::pre_asap::schema`. Unlike `AggIntent`'s merge
 //! (Phase 1b), this one needed no boundary-conversion layer: asap_ir's
 //! version is a pure additive superset of control_plane's pre-merge
 //! version —
@@ -35,6 +35,9 @@
 //! `Schema::new(..)` / `Schema::with_time_index(..)`, which default the
 //! new fields the same way the pre-merge constructors did.
 
-pub use asap_ir::intent_algebra::schema::{
-    cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schema,
-};
+// `cse_reuse_is_legal`/`CseError` were deleted upstream alongside
+// `QueryExpr::Ref`/`LetBinding` (ASAPPlanner#181/#192) -- their only
+// consumer in this repo was the now-deleted `optimizer::cse` (see
+// control_plane/docs/design-asapplanner-pin-migration.md), so the
+// re-export is dropped with it rather than stubbed.
+pub use planner_types::pre_asap::schema::{Column, ColumnId, DataType, Schema};

@@ -151,8 +151,7 @@ fn root_scan_schema(qe: &QueryExpr) -> Option<&crate::intent_algebra::Schema> {
     match qe {
         QueryExpr::Scan { schema, .. } => Some(schema),
         QueryExpr::Filter { child, .. }
-        | QueryExpr::Window { child, .. }
-        // `TimeRange`/`TimeShift` are `asap_l2::lower`'s range-vector-selector
+        // `TimeRange`/`TimeShift` are `lower_promql`'s range-vector-selector
         // and offset/@ markers (L1 adoption, design-target-architecture.md
         // Part B) -- pass-through wrappers over the same `Scan`.
         | QueryExpr::TimeRange { child, .. }
@@ -171,11 +170,7 @@ fn root_scan_schema(qe: &QueryExpr) -> Option<&crate::intent_algebra::Schema> {
             rhs: right,
             ..
         } => root_scan_schema(left).or_else(|| root_scan_schema(right)),
-        QueryExpr::LetBinding { expr, child, .. } => {
-            root_scan_schema(expr).or_else(|| root_scan_schema(child))
-        }
-        // `Ref` has no reachable `Scan` without a `LetBinding` scope, and
-        // the remaining PromQL-surface superset (Scalar/EvalTime/
+        // The remaining PromQL-surface superset (Scalar/EvalTime/
         // VectorFromScalar/ScalarFromVector/Relabel/InfoJoin/Sample/
         // WindowFunc) is real, new capability `lower_promql` adds but this
         // crate's flat `ParsedQuery` extraction doesn't attempt to unpack
@@ -231,13 +226,7 @@ impl QeCollector {
                 collect_filters_from_scalar(pred, schema, &mut self.label_filters);
                 self.visit(child, schema);
             }
-            QueryExpr::Window { size, child, .. } => {
-                if self.time_window.is_none() {
-                    self.time_window = Some(*size);
-                }
-                self.visit(child, schema);
-            }
-            // `TimeRange` is `asap_l2::lower`'s range-vector-selector marker
+            // `TimeRange` is `lower_promql`'s range-vector-selector marker
             // (`m[5m]` in `quantile_over_time(φ, m[5m])`) -- the range-window
             // duration this collector's `time_window` field wants, same as
             // `Window::size` above. `TimeShift` (`offset`/`@`) is a pure
@@ -251,7 +240,7 @@ impl QeCollector {
             QueryExpr::TimeShift { child, .. } => self.visit(child, schema),
             QueryExpr::Aggregate {
                 reduction,
-                aggs,
+                measures: aggs,
                 child,
                 ..
             } => {
@@ -302,16 +291,6 @@ impl QeCollector {
                 self.visit(left, schema);
                 self.visit(right, schema);
             }
-            QueryExpr::LetBinding { expr, child, .. } => {
-                self.visit(expr, schema);
-                self.visit(child, schema);
-            }
-            // `Ref` has no reachable `Scan` without a `LetBinding` scope
-            // to resolve it against, and the PromQL-surface superset
-            // (Scalar/EvalTime/VectorFromScalar/ScalarFromVector/Relabel/
-            // InfoJoin/Sample/TimeRange/TimeShift/WindowFunc) isn't
-            // constructed by this parser today.
-            QueryExpr::Ref { .. } => {}
             _ => {}
         }
     }
@@ -536,7 +515,8 @@ mod tests {
         use crate::intent_algebra::query_expr::QueryExpr as CQueryExpr;
         // A bare `avg_over_time(m[w])` (no `by`) lowers to canonical
         // `Aggregate { child: TimeRange { child: Scan } }`.
-        let expr = parse_query_expr_canonical("avg_over_time(cpu_seconds_total[10m])", ACC).unwrap();
+        let expr =
+            parse_query_expr_canonical("avg_over_time(cpu_seconds_total[10m])", ACC).unwrap();
         match expr {
             CQueryExpr::Aggregate { child, .. } => match *child {
                 CQueryExpr::TimeRange { child, .. } => {
@@ -576,7 +556,7 @@ mod doc_verify_all {
         match &expr {
             QueryExpr::Aggregate {
                 reduction,
-                aggs,
+                measures: aggs,
                 child,
                 ..
             } => {
@@ -603,7 +583,11 @@ mod doc_verify_all {
         // (see this module's doc: no longer necessarily the `Frequency`
         // extension), the outer `TopK` shape itself is unaffected.
         match &expr {
-            QueryExpr::Aggregate { aggs, child, .. } => {
+            QueryExpr::Aggregate {
+                measures: aggs,
+                child,
+                ..
+            } => {
                 assert!(matches!(aggs.as_slice(), [AggIntent::TopK { k: 10, .. }]));
                 // Inner reduction the TopK ranks by: `Aggregate { Count,
                 // child: TimeRange { child: Scan } }` -- same `TimeRange`
@@ -613,7 +597,7 @@ mod doc_verify_all {
                 // being forced exact -- adopted as-is per this module's doc.
                 match child.as_ref() {
                     QueryExpr::Aggregate {
-                        aggs: inner_aggs,
+                        measures: inner_aggs,
                         child: inner_child,
                         ..
                     } => {

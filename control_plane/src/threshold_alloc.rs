@@ -47,7 +47,10 @@ mod tests {
 
     #[test]
     fn degenerate_dims_return_infinity() {
-        assert_eq!(f2_isotropic_threshold(0.1, 1000.0, 4, 0, 256), f64::INFINITY);
+        assert_eq!(
+            f2_isotropic_threshold(0.1, 1000.0, 4, 0, 256),
+            f64::INFINITY
+        );
         assert_eq!(f2_isotropic_threshold(0.1, 1000.0, 4, 5, 0), f64::INFINITY);
     }
 }

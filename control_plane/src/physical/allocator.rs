@@ -122,7 +122,7 @@ impl SketchAllocator {
     fn alloc_node(&self, expr: QueryExpr, budget: &mut BudgetState) -> PlanNode {
         match expr {
             // ── Leaves ───────────────────────────────────────────────────────
-            QueryExpr::Scan { .. } | QueryExpr::Ref { .. } => {
+            QueryExpr::Scan { .. } => {
                 PlanNode::leaf(expr, PipelineStage::Agent, ExecutionMode::Passthrough)
             }
 
@@ -148,22 +148,17 @@ impl SketchAllocator {
                 }
             }
 
-            // A `Window` over a single-intent `Aggregate` is the canonical
-            // fold of the legacy `WindowedAgg`; for *stage* allocation the
-            // window is informational — this arm is a passthrough and the
-            // inner `Aggregate` arm does the sketch placement.
-            QueryExpr::Window {
-                kind,
-                size,
-                slide,
-                child,
-            } => {
+            // A `TimeRange` over a single-intent `Aggregate` is the
+            // canonical fold of the legacy `WindowedAgg` (was `Window`
+            // before the ASAPPlanner pin migration); for *stage*
+            // allocation the range is informational — this arm is a
+            // passthrough and the inner `Aggregate` arm does the sketch
+            // placement.
+            QueryExpr::TimeRange { range, child } => {
                 let child = self.alloc_node(*child, budget);
                 PlanNode {
-                    expr: QueryExpr::Window {
-                        kind,
-                        size,
-                        slide,
+                    expr: QueryExpr::TimeRange {
+                        range,
                         child: Box::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Agent,
@@ -202,7 +197,7 @@ impl SketchAllocator {
             //   * multi-intent or HAVING → general exact Aggregate at Db
             QueryExpr::Aggregate {
                 reduction,
-                aggs,
+                measures: aggs,
                 output_names,
                 having,
                 child,
@@ -214,7 +209,7 @@ impl SketchAllocator {
                         return PlanNode {
                             expr: QueryExpr::Aggregate {
                                 reduction,
-                                aggs,
+                                measures: aggs,
                                 output_names,
                                 having,
                                 child: Box::new(child.expr.clone()),
@@ -246,7 +241,7 @@ impl SketchAllocator {
                 PlanNode {
                     expr: QueryExpr::Aggregate {
                         reduction,
-                        aggs,
+                        measures: aggs,
                         output_names,
                         having,
                         child: Box::new(child.expr.clone()),
@@ -480,28 +475,8 @@ impl SketchAllocator {
                 }
             }
 
-            // ── Scoping constructs — propagate body's stage ───────────────
-            QueryExpr::LetBinding { name, expr, child } => {
-                let expr_node = self.alloc_node(*expr, budget);
-                let body_node = self.alloc_node(*child, budget);
-                let stage = body_node.stage.clone();
-                let mode = body_node.mode.clone();
-                PlanNode {
-                    expr: QueryExpr::LetBinding {
-                        name,
-                        expr: Box::new(expr_node.expr.clone()),
-                        child: Box::new(body_node.expr.clone()),
-                    },
-                    stage,
-                    mode,
-                    cost: CostEstimate::default(),
-                    annotation: NodeAnnotation {
-                        rationale: "LetBinding: stage = body stage".into(),
-                        ..Default::default()
-                    },
-                    children: vec![expr_node, body_node],
-                }
-            }
+            // `LetBinding`/`Ref` don't exist in the canonical `QueryExpr`
+            // anymore (see `optimizer::engine::CommonSubexprElim`'s doc).
 
             // `asap_ir`'s PromQL-surface superset (Scalar / EvalTime /
             // VectorFromScalar / ScalarFromVector / Relabel / InfoJoin /
@@ -544,12 +519,6 @@ impl SketchAllocator {
                     child: Box::new(c),
                 })
             }
-            QueryExpr::TimeRange { range, child } => {
-                self.alloc_passthrough_child(child, "TimeRange", budget, |c| QueryExpr::TimeRange {
-                    range,
-                    child: Box::new(c),
-                })
-            }
             QueryExpr::TimeShift { shift, child } => {
                 self.alloc_passthrough_child(child, "TimeShift", budget, |c| QueryExpr::TimeShift {
                     shift,
@@ -573,6 +542,17 @@ impl SketchAllocator {
                     child: Box::new(c),
                 }
             }),
+            // Scalar-expression node (Column/Literal/Compare/BoolAnd/
+            // BoolOr/Not/IsNull/IsNotNull/Cast/InList/FunctionCall/Arith/
+            // Case) — these live inside `Predicate`/`ProjectItem` scalar
+            // positions this deployment's front end builds, never as a
+            // bare top-level relational tree node reaching this
+            // allocator directly (folded into `QueryExpr` itself by
+            // ASAPPlanner#205/#214, see
+            // control_plane/docs/design-asapplanner-pin-migration.md).
+            // Defensive leaf fallback, matching `Scan`'s treatment,
+            // rather than a panic, in case that assumption ever breaks.
+            _ => PlanNode::leaf(expr, PipelineStage::Agent, ExecutionMode::Passthrough),
         }
     }
 
@@ -621,7 +601,7 @@ impl SketchAllocator {
             return PlanNode {
                 expr: QueryExpr::Aggregate {
                     reduction,
-                    aggs,
+                    measures: aggs,
                     output_names,
                     having: None,
                     child: Box::new(child.expr.clone()),
@@ -645,7 +625,7 @@ impl SketchAllocator {
             return PlanNode {
                 expr: QueryExpr::Aggregate {
                     reduction,
-                    aggs,
+                    measures: aggs,
                     output_names,
                     having: None,
                     child: Box::new(child.expr.clone()),
@@ -675,7 +655,7 @@ impl SketchAllocator {
             return PlanNode {
                 expr: QueryExpr::Aggregate {
                     reduction,
-                    aggs,
+                    measures: aggs,
                     output_names,
                     having: None,
                     child: Box::new(child.expr.clone()),
@@ -703,7 +683,7 @@ impl SketchAllocator {
             return PlanNode {
                 expr: QueryExpr::Aggregate {
                     reduction,
-                    aggs,
+                    measures: aggs,
                     output_names,
                     having: None,
                     child: Box::new(child.expr.clone()),
@@ -731,7 +711,7 @@ impl SketchAllocator {
         PlanNode {
             expr: QueryExpr::Aggregate {
                 reduction,
-                aggs,
+                measures: aggs,
                 output_names,
                 having: None,
                 child: Box::new(child.expr.clone()),
@@ -845,7 +825,7 @@ mod tests {
     fn agg(intent: AggIntent) -> QueryExpr {
         QueryExpr::Aggregate {
             reduction: Reduction::by(vec![]),
-            aggs: vec![intent],
+            measures: vec![intent],
             output_names: Vec::new(),
             having: None,
             child: Box::new(scan("m")),
@@ -889,7 +869,7 @@ mod tests {
     #[test]
     fn filter_at_agent() {
         let expr = QueryExpr::Filter {
-            pred: Predicate(L3Expr::Literal(L3Scalar::Boolean(true))),
+            pred: Predicate(Box::new(L3Expr::Literal(L3Scalar::Boolean(true)))),
             child: Box::new(scan("m")),
         };
         let node = alloc(unlimited(), expr);
@@ -992,7 +972,7 @@ mod tests {
     fn join_goes_to_db() {
         let expr = QueryExpr::Join {
             kind: JoinKind::Inner,
-            pred: Predicate(L3Expr::Literal(L3Scalar::Boolean(true))),
+            pred: Predicate(Box::new(L3Expr::Literal(L3Scalar::Boolean(true)))),
             left: Box::new(scan("orders")),
             right: Box::new(scan("items")),
         };
@@ -1006,7 +986,7 @@ mod tests {
     fn multi_intent_aggregate_goes_to_db() {
         let expr = QueryExpr::Aggregate {
             reduction: Reduction::by(vec![]),
-            aggs: vec![AggIntent::Sum { col: None }, AggIntent::Min { col: None }],
+            measures: vec![AggIntent::Sum { col: None }, AggIntent::Min { col: None }],
             output_names: Vec::new(),
             having: None,
             child: Box::new(scan("m")),
@@ -1016,16 +996,14 @@ mod tests {
         assert_eq!(node.mode, ExecutionMode::Exact);
     }
 
-    // ── Window over a single-intent Aggregate (the WindowedAgg fold) ──────────
+    // ── TimeRange over a single-intent Aggregate (the WindowedAgg fold) ───────
 
     #[test]
     fn window_over_aggregate_window_passthrough_agg_sketches() {
-        // Canonical fold of legacy `WindowedAgg`: Window passthrough at
+        // Canonical fold of legacy `WindowedAgg`: TimeRange passthrough at
         // Agent, inner Aggregate does the sketch placement.
-        let expr = QueryExpr::Window {
-            kind: crate::intent_algebra::WindowKind::Tumbling,
-            size: std::time::Duration::from_secs(300),
-            slide: None,
+        let expr = QueryExpr::TimeRange {
+            range: std::time::Duration::from_secs(300),
             child: Box::new(agg(default_quantile(0.5))),
         };
         let node = alloc(unlimited(), expr);
@@ -1036,21 +1014,10 @@ mod tests {
         assert_eq!(node.children[0].mode, ExecutionMode::Sketch);
     }
 
-    // ── LetBinding inherits body stage ────────────────────────────────────────
-
-    #[test]
-    fn let_binding_inherits_body_stage() {
-        let expr = QueryExpr::LetBinding {
-            name: asap_ir::intent_algebra::BindingName::new("base"),
-            expr: Box::new(scan("cpu")),
-            child: Box::new(agg(AggIntent::TopK {
-                k: 5,
-                accuracy: AccuracyTarget::Epsilon(0.05),
-            })),
-        };
-        let node = alloc(unlimited(), expr);
-        assert_eq!(node.stage, PipelineStage::Precompute);
-    }
+    // `LetBinding` doesn't exist in the canonical `QueryExpr` anymore
+    // (see `optimizer::engine::CommonSubexprElim`'s doc) -- the
+    // `let_binding_inherits_body_stage` test that used to exercise it
+    // is gone with it.
 
     // ── Memory estimate helpers ───────────────────────────────────────────────
 

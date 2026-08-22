@@ -28,10 +28,6 @@
 //! `WindowedAgg` into `Window { Aggregate }`, and `TopK` into an
 //! `Aggregate` carrying an `AggIntent::TopK`.
 
-use std::collections::HashMap;
-
-use asap_ir::intent_algebra::BindingName;
-
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::query_expr::{QueryExpr, Reduction, SetOpKind, Source};
 use crate::intent_algebra::relational::{agg_is_exact, agg_is_mergeable};
@@ -94,11 +90,11 @@ pub fn load_sketch_capabilities(
 /// Built-in capability profile for a known sketch type. Thin shim —
 /// the real defaults live in `optimizer::cost::sketch_capability::default_capability_table`.
 pub fn sketch_capability(st: &crate::types::SketchType) -> SketchCapability {
-    use asap_sketch::SummaryKind;
-    let kind: SummaryKind = st.clone().into();
+    use planner_types::post_asap::SketchKind;
+    let kind: SketchKind = st.clone().into();
     default_capability_table()
         .remove(&kind)
-        .expect("default_capability_table covers every SummaryKind variant")
+        .expect("default_capability_table covers every SketchKind variant")
 }
 
 // ── Stage budgets ───────────────────────────────────────────────────────────
@@ -195,9 +191,11 @@ pub struct DefaultCostModel {
 /// shape (multi-intent / HAVING aggregate, or a non-`Aggregate` node).
 fn single_sketch_intent(expr: &QueryExpr) -> Option<&AggIntent> {
     match expr {
-        QueryExpr::Aggregate { aggs, having, .. } if aggs.len() == 1 && having.is_none() => {
-            Some(&aggs[0])
-        }
+        QueryExpr::Aggregate {
+            measures: aggs,
+            having,
+            ..
+        } if aggs.len() == 1 && having.is_none() => Some(&aggs[0]),
         _ => None,
     }
 }
@@ -213,16 +211,18 @@ impl CostModel for DefaultCostModel {
         // into `Aggregate`, so the intent-driven factor reads the single
         // intent of a single-intent `Aggregate`.
         let factor = match expr {
-            QueryExpr::Aggregate { aggs, having, .. } if aggs.len() == 1 && having.is_none() => {
-                match &aggs[0] {
-                    AggIntent::Quantile { .. } => 0.05,
-                    AggIntent::Cardinality { .. } => 0.02,
-                    op if crate::intent_algebra::as_frequency(op).is_some() => 0.03,
-                    AggIntent::TopK { k, .. } => (*k as f64).recip().min(0.1),
-                    op if agg_is_exact(op) => 1.0,
-                    _ => 0.1,
-                }
-            }
+            QueryExpr::Aggregate {
+                measures: aggs,
+                having,
+                ..
+            } if aggs.len() == 1 && having.is_none() => match &aggs[0] {
+                AggIntent::Quantile { .. } => 0.05,
+                AggIntent::Cardinality { .. } => 0.02,
+                op if crate::intent_algebra::as_frequency(op).is_some() => 0.03,
+                AggIntent::TopK { k, .. } => (*k as f64).recip().min(0.1),
+                op if agg_is_exact(op) => 1.0,
+                _ => 0.1,
+            },
             QueryExpr::Merge { children } => 1.0 / (children.len().max(1) as f64),
             QueryExpr::Filter { .. } => 0.5,
             QueryExpr::Distinct { .. } => 0.9,
@@ -248,12 +248,14 @@ impl CostModel for DefaultCostModel {
         if let Some(dc) = &self.deployment {
             // Map each expression to its default stage budget.
             let stage_budget = match expr {
-                QueryExpr::Scan { .. } | QueryExpr::Filter { .. } | QueryExpr::Window { .. } => {
+                QueryExpr::Scan { .. } | QueryExpr::Filter { .. } | QueryExpr::TimeRange { .. } => {
                     &dc.agent
                 }
-                QueryExpr::Aggregate { aggs, having, .. }
-                    if aggs.len() == 1 && having.is_none() =>
-                {
+                QueryExpr::Aggregate {
+                    measures: aggs,
+                    having,
+                    ..
+                } if aggs.len() == 1 && having.is_none() => {
                     match &aggs[0] {
                         // TopK-intent aggregate runs at the precompute engine.
                         AggIntent::TopK { .. } => &dc.backend_db,
@@ -345,16 +347,13 @@ impl RewriteRule for PredicatePushDown {
     fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
         match expr {
             QueryExpr::Filter { pred, child } => match *child {
-                // Filter below Window
-                QueryExpr::Window {
-                    kind,
-                    size,
-                    slide,
+                // Filter below TimeRange (the canonical range-vector-selector
+                // node -- see control_plane/docs/design-asapplanner-pin-migration.md).
+                QueryExpr::TimeRange {
+                    range,
                     child: inner,
-                } => Some(QueryExpr::Window {
-                    kind,
-                    size,
-                    slide,
+                } => Some(QueryExpr::TimeRange {
+                    range,
                     child: Box::new(QueryExpr::Filter { pred, child: inner }),
                 }),
                 // Filter below Sort (safe when pred references input columns only)
@@ -397,7 +396,7 @@ impl RewriteRule for MergeLifting {
         match expr {
             QueryExpr::Aggregate {
                 ref reduction,
-                ref aggs,
+                measures: ref aggs,
                 ref having,
                 ref child,
                 ..
@@ -407,7 +406,7 @@ impl RewriteRule for MergeLifting {
                         .iter()
                         .map(|branch| QueryExpr::Aggregate {
                             reduction: reduction.clone(),
-                            aggs: aggs.clone(),
+                            measures: aggs.clone(),
                             output_names: Vec::new(),
                             having: None,
                             child: Box::new(branch.clone()),
@@ -441,7 +440,7 @@ impl RewriteRule for HLLDedupElim {
         match expr {
             QueryExpr::Aggregate {
                 reduction,
-                aggs,
+                measures: aggs,
                 output_names,
                 having: None,
                 child,
@@ -449,7 +448,7 @@ impl RewriteRule for HLLDedupElim {
                 if let QueryExpr::Distinct { child: inner, .. } = *child {
                     return Some(QueryExpr::Aggregate {
                         reduction,
-                        aggs,
+                        measures: aggs,
                         output_names,
                         having: None,
                         child: inner,
@@ -476,17 +475,13 @@ impl RewriteRule for FilterWindowSwap {
     fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
         match expr {
             QueryExpr::Filter { pred, child } => {
-                if let QueryExpr::Window {
-                    kind,
-                    size,
-                    slide,
+                if let QueryExpr::TimeRange {
+                    range,
                     child: inner,
                 } = *child
                 {
-                    return Some(QueryExpr::Window {
-                        kind,
-                        size,
-                        slide,
+                    return Some(QueryExpr::TimeRange {
+                        range,
                         child: Box::new(QueryExpr::Filter { pred, child: inner }),
                     });
                 }
@@ -524,7 +519,7 @@ impl RewriteRule for TopKFusion {
                     if !keys.is_empty() && keys.iter().all(|k| !k.ascending) {
                         return Some(QueryExpr::Aggregate {
                             reduction: Reduction::by(vec![]),
-                            aggs: vec![AggIntent::TopK {
+                            measures: vec![AggIntent::TopK {
                                 k: n,
                                 accuracy: AccuracyTarget::Epsilon(0.05),
                             }],
@@ -560,6 +555,20 @@ impl RewriteRule for TopKFusion {
 
 /// Identify identical `Scan` sub-trees that appear in multiple branches of
 /// a `Merge` node and hoist them into a `LetBinding`.
+///
+/// **Disabled** (ASAPPlanner pin migration): the canonical `QueryExpr` has
+/// no `Ref`/`LetBinding` variant anymore (ASAPPlanner#181/#192 deleted
+/// them upstream as dead scaffolding; the canonical tree type genuinely
+/// has no room for them — Rust doesn't allow adding variants to a foreign
+/// enum). Unlike the workload-level `optimizer::cse` this repo deleted
+/// outright (zero callers, confirmed dead), this rule is a real,
+/// registered `RewriteRule` — but with the hoisting *representation*
+/// gone, `try_rewrite` can no longer construct its result at all.
+/// Always returns `None` (no rewrite) rather than invent a
+/// representation upstream doesn't support; the query still computes the
+/// correct answer without this optimization, just re-scanning a
+/// duplicated metric across `Merge` branches instead of sharing one scan.
+/// See control_plane/docs/design-asapplanner-pin-migration.md.
 pub struct CommonSubexprElim;
 
 /// The metric name of a `Scan { TimeSeries }` leaf, if `qe` is one.
@@ -578,54 +587,9 @@ impl RewriteRule for CommonSubexprElim {
         "CommonSubexprElim"
     }
 
-    fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
-        match expr {
-            QueryExpr::Merge { ref children } => {
-                // Count occurrences of each scanned metric name.
-                let mut counts: HashMap<String, usize> = HashMap::new();
-                for c in children {
-                    if let Some(m) = scan_metric(c) {
-                        *counts.entry(m.to_string()).or_insert(0) += 1;
-                    }
-                }
-                let repeated: Vec<String> = counts
-                    .into_iter()
-                    .filter(|(_, c)| *c > 1)
-                    .map(|(n, _)| n)
-                    .collect();
-                if repeated.is_empty() {
-                    return None;
-                }
-                // Hoist the first repeated scan into a LetBinding.
-                let metric = repeated.into_iter().next()?;
-                let binding_name = format!("__cse_{metric}");
-                let hoisted = children
-                    .iter()
-                    .find(|c| scan_metric(c) == Some(metric.as_str()))?
-                    .clone();
-                let new_children: Vec<QueryExpr> = children
-                    .iter()
-                    .cloned()
-                    .map(|c| {
-                        if scan_metric(&c) == Some(metric.as_str()) {
-                            QueryExpr::Ref {
-                                name: BindingName::new(binding_name.clone()),
-                            }
-                        } else {
-                            c
-                        }
-                    })
-                    .collect();
-                Some(QueryExpr::LetBinding {
-                    name: BindingName::new(binding_name),
-                    expr: Box::new(hoisted),
-                    child: Box::new(QueryExpr::Merge {
-                        children: new_children,
-                    }),
-                })
-            }
-            _ => None,
-        }
+    fn try_rewrite(&self, _expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
+        // See the struct doc: no `LetBinding`/`Ref` to hoist into anymore.
+        None
     }
 }
 
@@ -664,24 +628,20 @@ impl RewriteRule for WindowMerge {
 
     fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
         match expr {
-            QueryExpr::Window {
-                kind,
-                size,
-                slide,
-                child,
-            } => {
-                if let QueryExpr::Window {
-                    kind: inner_kind,
-                    size: inner_size,
-                    slide: inner_slide,
+            // `TimeRange` is the canonical range-vector-selector node (see
+            // control_plane/docs/design-asapplanner-pin-migration.md) --
+            // was `Window { kind, size, slide, child }`; the identity-merge
+            // rule collapses to comparing `range` alone now that there's no
+            // separate kind/slide to also agree on.
+            QueryExpr::TimeRange { range, child } => {
+                if let QueryExpr::TimeRange {
+                    range: inner_range,
                     child: inner_child,
                 } = *child
                 {
-                    if kind == inner_kind && size == inner_size && slide == inner_slide {
-                        return Some(QueryExpr::Window {
-                            kind,
-                            size,
-                            slide,
+                    if range == inner_range {
+                        return Some(QueryExpr::TimeRange {
+                            range,
                             child: inner_child,
                         });
                     }
@@ -833,7 +793,10 @@ impl QueryOptimizer {
             }};
         }
         match expr {
-            QueryExpr::Scan { .. } | QueryExpr::Ref { .. } => (expr, false),
+            // `Ref` doesn't exist in the canonical `QueryExpr` anymore
+            // (see `CommonSubexprElim`'s doc) -- `Scan` is the only leaf
+            // that still matches here unchanged.
+            QueryExpr::Scan { .. } => (expr, false),
 
             QueryExpr::Filter { pred, child } => {
                 let (new_child, c) = recurse!(child);
@@ -862,7 +825,7 @@ impl QueryOptimizer {
             }
             QueryExpr::Aggregate {
                 reduction,
-                aggs,
+                measures: aggs,
                 output_names,
                 having,
                 child,
@@ -871,7 +834,7 @@ impl QueryOptimizer {
                 (
                     QueryExpr::Aggregate {
                         reduction,
-                        aggs,
+                        measures: aggs,
                         output_names,
                         having,
                         child: new_child,
@@ -879,18 +842,11 @@ impl QueryOptimizer {
                     c,
                 )
             }
-            QueryExpr::Window {
-                kind,
-                size,
-                slide,
-                child,
-            } => {
+            QueryExpr::TimeRange { range, child } => {
                 let (new_child, c) = recurse!(child);
                 (
-                    QueryExpr::Window {
-                        kind,
-                        size,
-                        slide,
+                    QueryExpr::TimeRange {
+                        range,
                         child: new_child,
                     },
                     c,
@@ -1011,18 +967,8 @@ impl QueryOptimizer {
                     cl || cr,
                 )
             }
-            QueryExpr::LetBinding { name, expr, child } => {
-                let (new_expr, ce) = recurse!(expr);
-                let (new_child, cb) = recurse!(child);
-                (
-                    QueryExpr::LetBinding {
-                        name,
-                        expr: new_expr,
-                        child: new_child,
-                    },
-                    ce || cb,
-                )
-            }
+            // `LetBinding` doesn't exist in the canonical `QueryExpr`
+            // anymore -- see `CommonSubexprElim`'s doc.
             // `asap_ir`'s `QueryExpr` superset (Scalar / EvalTime /
             // VectorFromScalar / ScalarFromVector / Relabel / InfoJoin /
             // Sample / TimeRange / TimeShift / WindowFunc) — PromQL
@@ -1085,7 +1031,7 @@ mod tests {
     fn sketch_agg(intent: AggIntent, child: QueryExpr) -> QueryExpr {
         QueryExpr::Aggregate {
             reduction: Reduction::by(vec![]),
-            aggs: vec![intent],
+            measures: vec![intent],
             output_names: Vec::new(),
             having: None,
             child: Box::new(child),
@@ -1093,7 +1039,7 @@ mod tests {
     }
 
     fn true_pred() -> Predicate {
-        Predicate(L3Expr::Literal(L3Scalar::Boolean(true)))
+        Predicate(Box::new(L3Expr::Literal(L3Scalar::Boolean(true))))
     }
 
     fn opt() -> QueryOptimizer {
@@ -1112,7 +1058,7 @@ mod tests {
             QueryExpr::Filter { child, .. }
             | QueryExpr::Project { child, .. }
             | QueryExpr::Aggregate { child, .. }
-            | QueryExpr::Window { child, .. }
+            | QueryExpr::TimeRange { child, .. }
             | QueryExpr::Sort { child, .. }
             | QueryExpr::Limit { child, .. }
             | QueryExpr::Subquery { child, .. } => contains_distinct(child),
@@ -1124,9 +1070,6 @@ mod tests {
                 rhs: right,
                 ..
             } => contains_distinct(left) || contains_distinct(right),
-            QueryExpr::LetBinding { expr, child, .. } => {
-                contains_distinct(expr) || contains_distinct(child)
-            }
             _ => false,
         }
     }
@@ -1137,16 +1080,14 @@ mod tests {
     fn r1_pushes_filter_below_window() {
         let expr = QueryExpr::Filter {
             pred: true_pred(),
-            child: Box::new(QueryExpr::Window {
-                kind: WindowKind::Tumbling,
-                size: Duration::from_secs(60),
-                slide: None,
+            child: Box::new(QueryExpr::TimeRange {
+                range: Duration::from_secs(60),
                 child: Box::new(scan("m")),
             }),
         };
         let (result, _) = opt().optimize(expr);
         assert!(
-            matches!(&result, QueryExpr::Window { child, .. }
+            matches!(&result, QueryExpr::TimeRange { child, .. }
                 if matches!(child.as_ref(), QueryExpr::Filter { .. })),
             "filter should be inside window: {result:?}"
         );
@@ -1208,7 +1149,7 @@ mod tests {
         };
         let (result, _) = opt().optimize(expr);
         assert!(
-            matches!(&result, QueryExpr::Aggregate { aggs, .. }
+            matches!(&result, QueryExpr::Aggregate { measures: aggs, .. }
                 if matches!(aggs.as_slice(), [AggIntent::TopK { k: 10, .. }])),
             "expected Aggregate[TopK(10)], got {result:?}"
         );
@@ -1231,7 +1172,7 @@ mod tests {
         };
         let (result, _) = opt().optimize(expr);
         assert!(
-            !matches!(&result, QueryExpr::Aggregate { aggs, .. }
+            !matches!(&result, QueryExpr::Aggregate { measures: aggs, .. }
                 if matches!(aggs.as_slice(), [AggIntent::TopK { .. }])),
             "ascending sort should not become a TopK aggregate"
         );
@@ -1241,21 +1182,17 @@ mod tests {
 
     #[test]
     fn r10_merges_duplicate_windows() {
-        let expr = QueryExpr::Window {
-            kind: WindowKind::Tumbling,
-            size: Duration::from_secs(300),
-            slide: None,
-            child: Box::new(QueryExpr::Window {
-                kind: WindowKind::Tumbling,
-                size: Duration::from_secs(300),
-                slide: None,
+        let expr = QueryExpr::TimeRange {
+            range: Duration::from_secs(300),
+            child: Box::new(QueryExpr::TimeRange {
+                range: Duration::from_secs(300),
                 child: Box::new(scan("m")),
             }),
         };
         let (result, _) = opt().optimize(expr);
         assert!(
-            matches!(&result, QueryExpr::Window { child, .. }
-                if !matches!(child.as_ref(), QueryExpr::Window { .. })),
+            matches!(&result, QueryExpr::TimeRange { child, .. }
+                if !matches!(child.as_ref(), QueryExpr::TimeRange { .. })),
             "duplicate window should be merged: {result:?}"
         );
     }
@@ -1276,10 +1213,8 @@ mod tests {
         //   R3: Window(Filter(Aggregate[Cardinality](Scan)))
         let expr = QueryExpr::Filter {
             pred: true_pred(),
-            child: Box::new(QueryExpr::Window {
-                kind: WindowKind::Tumbling,
-                size: Duration::from_secs(60),
-                slide: None,
+            child: Box::new(QueryExpr::TimeRange {
+                range: Duration::from_secs(60),
                 child: Box::new(sketch_agg(
                     default_cardinality(),
                     QueryExpr::Distinct {
@@ -1335,30 +1270,20 @@ mod tests {
         }
     }
 
-    // ── R8: CommonSubexprElim ────────────────────────────────────────────────
+    // ── R8: CommonSubexprElim (disabled -- see the rule's own doc) ───────────
 
     #[test]
-    fn r8_hoists_repeated_scan() {
+    fn r8_no_longer_hoists_repeated_scan() {
+        // `CommonSubexprElim` always returns `None` now (no `LetBinding`/
+        // `Ref` to hoist into) -- the tree comes back unchanged rather
+        // than with duplicate scans hoisted into a shared binding.
         let expr = QueryExpr::Merge {
             children: vec![scan("dup"), scan("dup"), scan("other")],
         };
         let (result, _) = opt().optimize(expr);
         match result {
-            QueryExpr::LetBinding { name, child, .. } => {
-                assert!(name.as_str().starts_with("__cse_"));
-                // The two "dup" scans become Refs; "other" stays a Scan.
-                match *child {
-                    QueryExpr::Merge { children } => {
-                        let refs = children
-                            .iter()
-                            .filter(|c| matches!(c, QueryExpr::Ref { .. }))
-                            .count();
-                        assert_eq!(refs, 2, "both dup scans should become Refs");
-                    }
-                    other => panic!("expected Merge under LetBinding, got {other:?}"),
-                }
-            }
-            other => panic!("expected LetBinding, got {other:?}"),
+            QueryExpr::Merge { children } => assert_eq!(children.len(), 3),
+            other => panic!("expected Merge(3), got {other:?}"),
         }
     }
 

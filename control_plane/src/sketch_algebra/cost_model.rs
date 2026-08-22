@@ -1,6 +1,6 @@
 //! `ControlPlaneCostModel` — plugs control_plane's own sketch-family
 //! selection + parameter-sizing policy into
-//! `asap_plan::bind::implement_tree_in_with` via the two `CostModel`
+//! `asap_aware_mapping::bind::implement_tree_in_with` via the two `CostModel`
 //! extension points (`rank_candidates` for family choice, `size_params`
 //! for parameter sizing — the latter added by ASAPController PR #146
 //! specifically to support this migration).
@@ -11,7 +11,7 @@
 //! priority order, same recall-tier logic — just re-homed behind the
 //! `CostModel` trait instead of a bespoke `Rule` dispatcher, so the L3→L4
 //! walk itself (schema derivation, `col`/`by` computation, DAG
-//! construction) can be `asap_plan::bind`'s rather than a forked copy.
+//! construction) can be `asap_aware_mapping::bind`'s rather than a forked copy.
 //!
 //! `AggIntent::Extension` (control_plane's `Frequency` point-query) used
 //! to be one of two shapes `implement_tree_in_with` couldn't realize even
@@ -35,10 +35,10 @@
 
 #![allow(dead_code)]
 
-use asap_ir::intent_algebra::expr_ir::ColumnRef;
-use asap_plan::boundary::Implementation;
-use asap_plan::CostModel;
-use asap_sketch::{SketchQuery, SummaryKind, SummaryParams};
+use asap_aware_mapping::boundary::Implementation;
+use asap_aware_mapping::CostModel;
+use planner_types::post_asap::{SketchKind, SketchParams, SketchQuery};
+use planner_types::pre_asap::expr_ir::ColumnRef;
 
 use crate::intent_algebra::agg_intent::FREQUENCY_EXT_KIND;
 use crate::intent_algebra::AggIntent;
@@ -123,16 +123,16 @@ impl ControlPlaneCostModel {
     /// Verbatim port of `bind_cms_topk.rs`'s `TopkRecallTier` +
     /// `candidate_families` + `cheapest_family`. Public (within the
     /// crate) for the same reason as [`Self::topk_eps_delta`].
-    pub(crate) fn topk_family_order(&self, intent_accuracy: &AccuracyTarget) -> Vec<SummaryKind> {
+    pub(crate) fn topk_family_order(&self, intent_accuracy: &AccuracyTarget) -> Vec<SketchKind> {
         let tight = matches!(self.workload_accuracy, AccuracyTarget::Exact)
             || matches!(intent_accuracy, AccuracyTarget::Exact);
-        let allowed: &[SummaryKind] = if tight {
-            &[SummaryKind::CountSketchWithHeap]
+        let allowed: &[SketchKind] = if tight {
+            &[SketchKind::CountSketchWithHeap]
         } else {
-            &[SummaryKind::CmsWithHeap, SummaryKind::CountSketchWithHeap]
+            &[SketchKind::CmsWithHeap, SketchKind::CountSketchWithHeap]
         };
         let table = WireCostTable::default();
-        let mut ranked: Vec<SummaryKind> = allowed.to_vec();
+        let mut ranked: Vec<SketchKind> = allowed.to_vec();
         ranked.sort_by_key(|k| table.for_kind(k).per_flush());
         ranked
     }
@@ -164,7 +164,7 @@ fn intent_accuracy(intent: &AggIntent) -> AccuracyTarget {
 }
 
 impl CostModel for ControlPlaneCostModel {
-    fn rank_candidates(&self, intent: &AggIntent, candidates: &[SummaryKind]) -> Vec<SummaryKind> {
+    fn rank_candidates(&self, intent: &AggIntent, candidates: &[SketchKind]) -> Vec<SketchKind> {
         match intent {
             // bind_ddsketch_quantile (priority 6) always wins the old
             // dispatcher's tie-break over bind_kll_quantile (priority 5)
@@ -174,7 +174,7 @@ impl CostModel for ControlPlaneCostModel {
             // eps). Pure static reorder: DDSketch before Kll.
             AggIntent::Quantile { .. } => {
                 let mut v = candidates.to_vec();
-                if let Some(pos) = v.iter().position(|k| *k == SummaryKind::DDSketch) {
+                if let Some(pos) = v.iter().position(|k| *k == SketchKind::DDSketch) {
                     let dd = v.remove(pos);
                     v.insert(0, dd);
                 }
@@ -190,11 +190,11 @@ impl CostModel for ControlPlaneCostModel {
 
     fn size_params(
         &self,
-        kind: SummaryKind,
+        kind: SketchKind,
         intent: &AggIntent,
         eps: f64,
         delta: f64,
-    ) -> SummaryParams {
+    ) -> SketchParams {
         match intent {
             AggIntent::TopK { k, .. } => {
                 let (eps, delta) = self.topk_eps_delta(&intent_accuracy(intent));
@@ -206,12 +206,12 @@ impl CostModel for ControlPlaneCostModel {
                 let w = w.next_power_of_two();
                 let heap_size = *k as u32;
                 match kind {
-                    SummaryKind::CmsWithHeap => SummaryParams::CmsWithHeap {
+                    SketchKind::CmsWithHeap => SketchParams::CmsWithHeap {
                         width: w,
                         depth: d,
                         heap_size,
                     },
-                    _ => SummaryParams::CountSketchWithHeap {
+                    _ => SketchParams::CountSketchWithHeap {
                         width: w,
                         depth: d,
                         heap_size,
@@ -225,30 +225,34 @@ impl CostModel for ControlPlaneCostModel {
                     // reaches `bind_summary_with` upstream — see
                     // `implementation_for_with`'s `Exact => exact_realization`
                     // arm), kept as a safe fallback rather than a panic.
-                    return asap_plan::boundary::default_size_params(kind, intent, eps, delta);
+                    return asap_aware_mapping::boundary::default_size_params(
+                        kind, intent, eps, delta,
+                    );
                 };
                 match kind {
-                    SummaryKind::Kll => SummaryParams::Kll {
+                    SketchKind::Kll => SketchParams::Kll {
                         k: kll_k_for_eps(eps),
                     },
-                    SummaryKind::DDSketch if (0.0..1.0).contains(&eps) => {
-                        SummaryParams::DDSketch { alpha: eps }
+                    SketchKind::DDSketch if (0.0..1.0).contains(&eps) => {
+                        SketchParams::DDSketch { alpha: eps }
                     }
-                    SummaryKind::Hll => SummaryParams::Hll {
+                    SketchKind::Hll => SketchParams::Hll {
                         precision: hll_precision_for_eps(eps),
                     },
-                    SummaryKind::Cms => {
+                    SketchKind::Cms => {
                         let (w, d) = Self::cms_width_depth(eps, delta);
-                        SummaryParams::Cms { width: w, depth: d }
+                        SketchParams::Cms { width: w, depth: d }
                     }
-                    other => asap_plan::boundary::default_size_params(other, intent, eps, delta),
+                    other => {
+                        asap_aware_mapping::boundary::default_size_params(other, intent, eps, delta)
+                    }
                 }
             }
         }
     }
 
     /// Realize control_plane's `Frequency` (`ext_kind: "frequency"`)
-    /// point-query intent (ASAPController#150). `SummaryKind::Cms` (heap-
+    /// point-query intent (ASAPController#150). `SketchKind::Cms` (heap-
     /// less — a point lookup needs no heap, unlike `TopK`) matches
     /// `capability_matching::pick_family`'s own `Frequency → Cms` mapping
     /// (and its `is_valid_pair` truth table, which declares `(Cms,
@@ -277,9 +281,9 @@ impl CostModel for ControlPlaneCostModel {
             return Implementation::PassThrough;
         };
         let (width, depth) = Self::cms_width_depth(eps, delta);
-        Implementation::Summary {
-            kind: SummaryKind::Cms,
-            params: SummaryParams::Cms {
+        Implementation::Sketch {
+            kind: SketchKind::Cms,
+            params: SketchParams::Cms {
                 width: width.next_power_of_two(),
                 depth,
             },
@@ -329,11 +333,11 @@ impl CostModel for ControlPlaneCostModel {
 /// a fresh selection decision.
 pub struct ForcedFamilyCostModel {
     inner: ControlPlaneCostModel,
-    forced: SummaryKind,
+    forced: SketchKind,
 }
 
 impl ForcedFamilyCostModel {
-    pub fn new(workload_accuracy: AccuracyTarget, forced: SummaryKind) -> Self {
+    pub fn new(workload_accuracy: AccuracyTarget, forced: SketchKind) -> Self {
         Self {
             inner: ControlPlaneCostModel::new(workload_accuracy),
             forced,
@@ -342,21 +346,17 @@ impl ForcedFamilyCostModel {
 }
 
 impl CostModel for ForcedFamilyCostModel {
-    fn rank_candidates(
-        &self,
-        _intent: &AggIntent,
-        _candidates: &[SummaryKind],
-    ) -> Vec<SummaryKind> {
+    fn rank_candidates(&self, _intent: &AggIntent, _candidates: &[SketchKind]) -> Vec<SketchKind> {
         vec![self.forced.clone()]
     }
 
     fn size_params(
         &self,
-        kind: SummaryKind,
+        kind: SketchKind,
         intent: &AggIntent,
         eps: f64,
         delta: f64,
-    ) -> SummaryParams {
+    ) -> SketchParams {
         self.inner.size_params(kind, intent, eps, delta)
     }
 
@@ -410,13 +410,13 @@ impl CostModel for ForcedFamilyCostModel {
 /// installed yet, or for metrics a partial/stale plan doesn't cover.
 pub struct ObservedFamilyCostModel {
     inner: ControlPlaneCostModel,
-    observed: Option<(SummaryKind, SummaryParams)>,
+    observed: Option<(SketchKind, SketchParams)>,
 }
 
 impl ObservedFamilyCostModel {
     pub fn new(
         workload_accuracy: AccuracyTarget,
-        observed: Option<(SummaryKind, SummaryParams)>,
+        observed: Option<(SketchKind, SketchParams)>,
     ) -> Self {
         Self {
             inner: ControlPlaneCostModel::new(workload_accuracy),
@@ -426,7 +426,7 @@ impl ObservedFamilyCostModel {
 }
 
 impl CostModel for ObservedFamilyCostModel {
-    fn rank_candidates(&self, intent: &AggIntent, candidates: &[SummaryKind]) -> Vec<SummaryKind> {
+    fn rank_candidates(&self, intent: &AggIntent, candidates: &[SketchKind]) -> Vec<SketchKind> {
         match &self.observed {
             Some((kind, _)) if candidates.contains(kind) => vec![kind.clone()],
             _ => self.inner.rank_candidates(intent, candidates),
@@ -435,11 +435,11 @@ impl CostModel for ObservedFamilyCostModel {
 
     fn size_params(
         &self,
-        kind: SummaryKind,
+        kind: SketchKind,
         intent: &AggIntent,
         eps: f64,
         delta: f64,
-    ) -> SummaryParams {
+    ) -> SketchParams {
         match &self.observed {
             Some((okind, oparams)) if *okind == kind => oparams.clone(),
             _ => self.inner.size_params(kind, intent, eps, delta),
@@ -512,16 +512,16 @@ mod tests {
         let model = ControlPlaneCostModel::new(AccuracyTarget::Epsilon(0.1));
         let ranked = model.rank_candidates(
             &default_quantile(0.99),
-            &[SummaryKind::Kll, SummaryKind::DDSketch],
+            &[SketchKind::Kll, SketchKind::DDSketch],
         );
-        assert_eq!(ranked, vec![SummaryKind::DDSketch, SummaryKind::Kll]);
+        assert_eq!(ranked, vec![SketchKind::DDSketch, SketchKind::Kll]);
     }
 
     #[test]
     fn kll_k_matches_bind_kll_quantile_rungs() {
         let model = ControlPlaneCostModel::new(AccuracyTarget::Epsilon(1.0));
-        let params = model.size_params(SummaryKind::Kll, &default_quantile(0.99), 0.01, 0.01);
-        assert_eq!(params, SummaryParams::Kll { k: 200 });
+        let params = model.size_params(SketchKind::Kll, &default_quantile(0.99), 0.01, 0.01);
+        assert_eq!(params, SketchParams::Kll { k: 200 });
 
         let model = ControlPlaneCostModel::new(AccuracyTarget::Epsilon(1.0));
         let tight = crate::intent_algebra::AggIntent::Quantile {
@@ -529,15 +529,15 @@ mod tests {
             q: 0.99,
             accuracy: eps(0.001),
         };
-        let params = model.size_params(SummaryKind::Kll, &tight, 0.01, 0.01);
-        assert_eq!(params, SummaryParams::Kll { k: 2048 });
+        let params = model.size_params(SketchKind::Kll, &tight, 0.01, 0.01);
+        assert_eq!(params, SketchParams::Kll { k: 2048 });
     }
 
     #[test]
     fn hll_precision_matches_bind_hll_cardinality_rungs() {
         let model = ControlPlaneCostModel::new(AccuracyTarget::Epsilon(1.0));
-        let params = model.size_params(SummaryKind::Hll, &default_cardinality(), 0.01, 0.01);
-        assert_eq!(params, SummaryParams::Hll { precision: 14 });
+        let params = model.size_params(SketchKind::Hll, &default_cardinality(), 0.01, 0.01);
+        assert_eq!(params, SketchParams::Hll { precision: 14 });
     }
 
     #[test]
@@ -549,9 +549,9 @@ mod tests {
         };
         let ranked = model.rank_candidates(
             &intent,
-            &[SummaryKind::CmsWithHeap, SummaryKind::CountSketchWithHeap],
+            &[SketchKind::CmsWithHeap, SketchKind::CountSketchWithHeap],
         );
-        assert_eq!(ranked, vec![SummaryKind::CountSketchWithHeap]);
+        assert_eq!(ranked, vec![SketchKind::CountSketchWithHeap]);
     }
 
     #[test]
@@ -563,9 +563,9 @@ mod tests {
         };
         let ranked = model.rank_candidates(
             &intent,
-            &[SummaryKind::CmsWithHeap, SummaryKind::CountSketchWithHeap],
+            &[SketchKind::CmsWithHeap, SketchKind::CountSketchWithHeap],
         );
-        assert_eq!(ranked[0], SummaryKind::CmsWithHeap);
+        assert_eq!(ranked[0], SketchKind::CmsWithHeap);
     }
 
     #[test]
@@ -575,8 +575,8 @@ mod tests {
             k: 5,
             accuracy: eps(0.01),
         };
-        let params = model.size_params(SummaryKind::CmsWithHeap, &intent, 0.0, 0.0);
-        let SummaryParams::CmsWithHeap {
+        let params = model.size_params(SketchKind::CmsWithHeap, &intent, 0.0, 0.0);
+        let SketchParams::CmsWithHeap {
             width, heap_size, ..
         } = params
         else {

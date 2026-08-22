@@ -723,14 +723,14 @@ mod tests {
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendReadout,
         };
-        use asap_sketch::SketchQuery;
-        use asap_sketch::{SummaryKind, SummaryParams};
+        use planner_types::post_asap::SketchQuery;
+        use planner_types::post_asap::{SketchKind, SketchParams};
         BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 aggregation_id: agg_id.to_string(),
                 metric_name: metric.to_string(),
-                sketch_kind: SummaryKind::DDSketch,
-                sketch_params: SummaryParams::DDSketch { alpha: 0.01 },
+                sketch_kind: SketchKind::DDSketch.into(),
+                sketch_params: SketchParams::DDSketch { alpha: 0.01 }.into(),
                 grouping: vec![],
                 item_label: None,
                 spatial_filter: String::new(),

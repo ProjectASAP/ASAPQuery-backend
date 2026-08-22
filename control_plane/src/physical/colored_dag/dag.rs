@@ -145,7 +145,7 @@ impl ColoredDag {
 mod tests {
     use super::*;
     use crate::intent_algebra::schema::{Column, DataType};
-    use crate::intent_algebra::{BindingScope, QueryExpr, Schema, Source};
+    use crate::intent_algebra::{QueryExpr, Schema, Source};
     use crate::sketch_algebra::PhysicalExpr;
 
     // These three dummies only need to be *structurally valid* and
@@ -179,26 +179,24 @@ mod tests {
     }
 
     fn dummy_logical() -> PhysicalExpr {
-        PhysicalExpr::committed(
-            asap_plan::bind::logical(&dummy_scan(), &BindingScope::default()).unwrap(),
-        )
+        PhysicalExpr::committed(asap_aware_mapping::bind::logical(&dummy_scan()).unwrap())
     }
 
     fn dummy_agg() -> PhysicalExpr {
         let q = QueryExpr::Aggregate {
             reduction: crate::intent_algebra::Reduction::by(vec![]),
-            aggs: vec![crate::intent_algebra::AggIntent::Sum { col: None }],
+            measures: vec![crate::intent_algebra::AggIntent::Sum { col: None }],
             output_names: Vec::new(),
             having: None,
             child: Box::new(dummy_scan()),
         };
-        PhysicalExpr::committed(asap_plan::bind::implement_tree(&q).unwrap())
+        PhysicalExpr::committed(asap_aware_mapping::bind::implement_tree(&q).unwrap())
     }
 
     fn dummy_estimate() -> PhysicalExpr {
         let q = QueryExpr::Aggregate {
             reduction: crate::intent_algebra::Reduction::by(vec![]),
-            aggs: vec![crate::intent_algebra::AggIntent::Quantile {
+            measures: vec![crate::intent_algebra::AggIntent::Quantile {
                 col: None,
                 q: 0.99,
                 accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
@@ -207,7 +205,7 @@ mod tests {
             having: None,
             child: Box::new(dummy_scan()),
         };
-        PhysicalExpr::committed(asap_plan::bind::implement_tree(&q).unwrap())
+        PhysicalExpr::committed(asap_aware_mapping::bind::implement_tree(&q).unwrap())
     }
 
     #[test]

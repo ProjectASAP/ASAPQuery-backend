@@ -1,6 +1,7 @@
 use control_plane::accuracy;
 use control_plane::backend_client;
 use control_plane::emit;
+use control_plane::epsilon_alloc;
 use control_plane::intent_algebra;
 use control_plane::metrics_exposer;
 use control_plane::monitor;
@@ -8,7 +9,6 @@ use control_plane::opamp;
 use control_plane::optimizer;
 use control_plane::physical;
 use control_plane::pipeline;
-use control_plane::epsilon_alloc;
 use control_plane::query_parser;
 use control_plane::replan;
 use control_plane::runtime_samples;
@@ -583,9 +583,8 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
     // for `parse_query_expr_canonical`; this is the one call site in the
     // pipeline with an actual per-query accuracy value available, so
     // thread it through rather than a flat deployment-wide default.
-    let accuracy = control_plane::types_v2::accuracy_target_from_legacy_accuracy_sla(
-        spec.accuracy_sla,
-    );
+    let accuracy =
+        control_plane::types_v2::accuracy_target_from_legacy_accuracy_sla(spec.accuracy_sla);
     let workload = match st.analyzer.analyze(spec) {
         Ok(w) => w,
         Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
@@ -604,7 +603,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
     let raw_bps = plan.transmission_cost_summary.raw_bytes_per_sec;
     let budgets = StageResourceBudgets::from_workload_chars(&wc);
     // Everything that touches `sketch_algebra::PhysicalExpr` (which
-    // carries `Rc<asap_sketch::L4Node>` since Step B of the
+    // carries `Rc<planner_types::post_asap::SummaryNode>` since Step B of the
     // plan-shaped-serving migration adopted ASAPController's own
     // `Rc`-based DAG sharing) is scoped to this block and resolved down
     // to Send-safe outputs (`Option<PlanSummary>`,
@@ -621,7 +620,8 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                     warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping algebra pipeline")
                 }
                 Ok(qe) => {
-                    let constraints = optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
+                    let constraints =
+                        optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
                     let (opt_qe, _) =
                         QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
                     // L4 sketch binding: lower the optimised L3 tree to the
@@ -629,7 +629,9 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                     let accuracy = if workload.accuracy_sla >= 1.0 {
                         control_plane::types_v2::AccuracyTarget::Exact
                     } else {
-                        control_plane::types_v2::AccuracyTarget::Epsilon(1.0 - workload.accuracy_sla)
+                        control_plane::types_v2::AccuracyTarget::Epsilon(
+                            1.0 - workload.accuracy_sla,
+                        )
                     };
                     bound_physical =
                         control_plane::sketch_algebra::bind_query_expr(&opt_qe, accuracy).ok();
@@ -714,140 +716,140 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
     // `bind_workload_typed`, which lowers the flat `QueryWorkload`
     // summary to a `PhysicalExpr` directly.
     if let Some(configs) = stage_configs {
-                for (stage_id, stage_cfg) in configs {
-                    match stage_cfg {
-                        crate::physical::colored_dag::StageConfig::Edge(mut edge) => {
-                            // MVP blocker B3 — patch per-metric grouping
-                            // labels onto the edge cfg so the 5-sketch
-                            // routing emitter prepends a
-                            // `transform/keep_for_*` OTTL processor in
-                            // front of each sketch pipeline. The typed
-                            // L5 emitter leaves
-                            // `metric_to_grouping_labels` empty by
-                            // design (same rationale as the
-                            // `agg.grouping = workload.group_by_labels`
-                            // patch on the Backend stage below).
-                            edge.metric_to_grouping_labels.insert(
-                                workload.metric_name.clone(),
-                                workload.group_by_labels.clone(),
+        for (stage_id, stage_cfg) in configs {
+            match stage_cfg {
+                crate::physical::colored_dag::StageConfig::Edge(mut edge) => {
+                    // MVP blocker B3 — patch per-metric grouping
+                    // labels onto the edge cfg so the 5-sketch
+                    // routing emitter prepends a
+                    // `transform/keep_for_*` OTTL processor in
+                    // front of each sketch pipeline. The typed
+                    // L5 emitter leaves
+                    // `metric_to_grouping_labels` empty by
+                    // design (same rationale as the
+                    // `agg.grouping = workload.group_by_labels`
+                    // patch on the Backend stage below).
+                    edge.metric_to_grouping_labels.insert(
+                        workload.metric_name.clone(),
+                        workload.group_by_labels.clone(),
+                    );
+                    // Issue #2: broadcast push — no single agent id
+                    // in scope, so emit `$AGENT_ID` placeholder and
+                    // rely on the agent container's env to expand it
+                    // at boot. Per-agent re-pushes (push_config_to_agent
+                    // / replan_metric inner loop) get the real id.
+                    match emit::emit_edge_yaml(&edge, &st.opamp_endpoint, "$AGENT_ID") {
+                        Ok(yaml) => {
+                            let hash = short_hash(&yaml);
+                            info!(
+                                stage = "edge",
+                                bytes = yaml.len(),
+                                "[USE_TYPED_STAGE_SPLIT] pushing typed edge YAML"
                             );
-                            // Issue #2: broadcast push — no single agent id
-                            // in scope, so emit `$AGENT_ID` placeholder and
-                            // rely on the agent container's env to expand it
-                            // at boot. Per-agent re-pushes (push_config_to_agent
-                            // / replan_metric inner loop) get the real id.
-                            match emit::emit_edge_yaml(&edge, &st.opamp_endpoint, "$AGENT_ID") {
-                                Ok(yaml) => {
-                                    let hash = short_hash(&yaml);
-                                    info!(
-                                        stage = "edge",
-                                        bytes = yaml.len(),
-                                        "[USE_TYPED_STAGE_SPLIT] pushing typed edge YAML"
-                                    );
-                                    st.opamp
-                                        .push_to_role(
-                                            AgentRole::Agent,
-                                            RemoteConfig {
-                                                config_hash: hash,
-                                                yaml,
-                                            },
-                                        )
-                                        .await;
-                                }
-                                Err(e) => warn!(error = %e, "emit_edge_yaml failed"),
-                            }
+                            st.opamp
+                                .push_to_role(
+                                    AgentRole::Agent,
+                                    RemoteConfig {
+                                        config_hash: hash,
+                                        yaml,
+                                    },
+                                )
+                                .await;
                         }
-                        crate::physical::colored_dag::StageConfig::Gateway(gw) => {
-                            // Phase C: AgentRole::Gateway is now wired
-                            // through the OpAMP role-routing path, so
-                            // the gateway YAML is pushed to gateway-role
-                            // collectors the same way the edge YAML is
-                            // pushed to agent-role collectors above.
-                            // Issue #2: gateway broadcast — `$AGENT_ID` placeholder.
-                            match emit::emit_gateway_yaml(&gw, &st.opamp_endpoint, "$AGENT_ID") {
-                                Ok(yaml) => {
-                                    let hash = short_hash(&yaml);
-                                    info!(
-                                        stage = "gateway",
-                                        bytes = yaml.len(),
-                                        "[USE_TYPED_STAGE_SPLIT] pushing typed gateway YAML"
-                                    );
-                                    st.opamp
-                                        .push_to_role(
-                                            AgentRole::Gateway,
-                                            RemoteConfig {
-                                                config_hash: hash,
-                                                yaml,
-                                            },
-                                        )
-                                        .await;
-                                }
-                                Err(e) => warn!(error = %e, "emit_gateway_yaml failed"),
-                            }
-                        }
-                        crate::physical::colored_dag::StageConfig::Backend(mut be) => {
-                            // Patch metric_name + grouping from the
-                            // workload spec. The typed L5 emitter:
-                            //   * sets `metric_name` from
-                            //     `edge.source_metric`, which is
-                            //     populated by `extract_edge_facts`
-                            //     walking the `Logical(Scan{...})`
-                            //     chain. The path-recovery isn't
-                            //     guaranteed across every binder
-                            //     output shape, so we belt-and-brace
-                            //     it with `workload.metric_name`.
-                            //   * leaves `grouping` empty because the
-                            //     canonical L3 `QueryExpr::Aggregate.by`
-                            //     is positional `ColumnId`s against a
-                            //     synthesized schema with no label
-                            //     columns (open-set label naming is
-                            //     a Step γ TODO in
-                            //     `intent_algebra::column_resolution`).
-                            // `QueryWorkload` carries both unambiguously,
-                            // and every aggregation under one workload
-                            // shares them — so the patch is uniform.
-                            let item_labels = emit::collect_metric_to_item_label(
-                                &st.workload_registry,
-                                &st.workload_store,
-                            );
-                            for agg in &mut be.aggregations {
-                                if agg.metric_name.is_empty() {
-                                    agg.metric_name = workload.metric_name.clone();
-                                }
-                                if agg.window_secs == 0 {
-                                    agg.window_secs = workload.time_window.as_secs();
-                                }
-                                agg.grouping = workload.group_by_labels.clone();
-                                agg.item_label = item_labels.get(&agg.metric_name).cloned();
-                            }
-                            // Option B unification: every typed cumulative
-                            // emit (handle_plan here, Replanner triggers
-                            // below, startup pre-pop tick, OpAMP
-                            // on-connect tick) flows through the same
-                            // helper. See [`post_typed_backend_for_role`]
-                            // doc for the swap-semantics rationale +
-                            // cumulative-cache contract.
-                            // CDM monitor specs from the workload registry
-                            // (global; coordinator_url unused for the backend's
-                            // agg_id/τ/window-only entries).
-                            let monitors = st.workload_registry.monitor_intents("");
-                            post_typed_backend_for_role(
-                                st.backend_client.as_ref(),
-                                &st.backend_routing_cache,
-                                &workload.metric_name,
-                                role,
-                                be,
-                                &monitors,
-                            )
-                            .await;
-
-                            // Mention stage_id so `match` arms aren't
-                            // collapsed into untagged log lines if the
-                            // tracing filter drops the per-arm event.
-                            let _ = stage_id;
-                        }
+                        Err(e) => warn!(error = %e, "emit_edge_yaml failed"),
                     }
                 }
+                crate::physical::colored_dag::StageConfig::Gateway(gw) => {
+                    // Phase C: AgentRole::Gateway is now wired
+                    // through the OpAMP role-routing path, so
+                    // the gateway YAML is pushed to gateway-role
+                    // collectors the same way the edge YAML is
+                    // pushed to agent-role collectors above.
+                    // Issue #2: gateway broadcast — `$AGENT_ID` placeholder.
+                    match emit::emit_gateway_yaml(&gw, &st.opamp_endpoint, "$AGENT_ID") {
+                        Ok(yaml) => {
+                            let hash = short_hash(&yaml);
+                            info!(
+                                stage = "gateway",
+                                bytes = yaml.len(),
+                                "[USE_TYPED_STAGE_SPLIT] pushing typed gateway YAML"
+                            );
+                            st.opamp
+                                .push_to_role(
+                                    AgentRole::Gateway,
+                                    RemoteConfig {
+                                        config_hash: hash,
+                                        yaml,
+                                    },
+                                )
+                                .await;
+                        }
+                        Err(e) => warn!(error = %e, "emit_gateway_yaml failed"),
+                    }
+                }
+                crate::physical::colored_dag::StageConfig::Backend(mut be) => {
+                    // Patch metric_name + grouping from the
+                    // workload spec. The typed L5 emitter:
+                    //   * sets `metric_name` from
+                    //     `edge.source_metric`, which is
+                    //     populated by `extract_edge_facts`
+                    //     walking the `Logical(Scan{...})`
+                    //     chain. The path-recovery isn't
+                    //     guaranteed across every binder
+                    //     output shape, so we belt-and-brace
+                    //     it with `workload.metric_name`.
+                    //   * leaves `grouping` empty because the
+                    //     canonical L3 `QueryExpr::Aggregate.by`
+                    //     is positional `ColumnId`s against a
+                    //     synthesized schema with no label
+                    //     columns (open-set label naming is
+                    //     a Step γ TODO in
+                    //     `intent_algebra::column_resolution`).
+                    // `QueryWorkload` carries both unambiguously,
+                    // and every aggregation under one workload
+                    // shares them — so the patch is uniform.
+                    let item_labels = emit::collect_metric_to_item_label(
+                        &st.workload_registry,
+                        &st.workload_store,
+                    );
+                    for agg in &mut be.aggregations {
+                        if agg.metric_name.is_empty() {
+                            agg.metric_name = workload.metric_name.clone();
+                        }
+                        if agg.window_secs == 0 {
+                            agg.window_secs = workload.time_window.as_secs();
+                        }
+                        agg.grouping = workload.group_by_labels.clone();
+                        agg.item_label = item_labels.get(&agg.metric_name).cloned();
+                    }
+                    // Option B unification: every typed cumulative
+                    // emit (handle_plan here, Replanner triggers
+                    // below, startup pre-pop tick, OpAMP
+                    // on-connect tick) flows through the same
+                    // helper. See [`post_typed_backend_for_role`]
+                    // doc for the swap-semantics rationale +
+                    // cumulative-cache contract.
+                    // CDM monitor specs from the workload registry
+                    // (global; coordinator_url unused for the backend's
+                    // agg_id/τ/window-only entries).
+                    let monitors = st.workload_registry.monitor_intents("");
+                    post_typed_backend_for_role(
+                        st.backend_client.as_ref(),
+                        &st.backend_routing_cache,
+                        &workload.metric_name,
+                        role,
+                        be,
+                        &monitors,
+                    )
+                    .await;
+
+                    // Mention stage_id so `match` arms aren't
+                    // collapsed into untagged log lines if the
+                    // tracing filter drops the per-arm event.
+                    let _ = stage_id;
+                }
+            }
+        }
     } else if physical::stage_split::typed_stage_split_enabled() {
         warn!(
             metric = %workload.metric_name,
@@ -1002,7 +1004,9 @@ async fn handle_plan_auto(
                 epsilon: req.epsilon,
                 // Auto-derive the CDM window to the edge epoch unless pinned —
                 // a mismatch silently no-ops the grant (alignment guard).
-                window_secs: am.window_secs.unwrap_or_else(autonomous_monitor_window_secs),
+                window_secs: am
+                    .window_secs
+                    .unwrap_or_else(autonomous_monitor_window_secs),
             });
             let entry = WorkloadEntry {
                 metric_name: metric.clone(),

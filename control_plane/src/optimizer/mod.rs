@@ -26,11 +26,22 @@
 
 pub mod baseline;
 pub mod cost;
-pub mod cse;
 pub mod engine;
 pub mod rules;
 
+// `cse` (workload-level CSE via `QueryExpr::Ref`/`LetBinding`) was deleted
+// as part of the ASAPPlanner pin migration (see
+// control_plane/docs/design-asapplanner-pin-migration.md): ASAPPlanner
+// deleted the identical `Ref`/`LetBinding` scaffolding upstream
+// (ASAPPlanner#181/#192) on the same grounds this file's own module doc
+// already stated -- "no in-tree consumer today" -- and the canonical
+// `QueryExpr` this crate depends on no longer has room for those variants
+// at all (Rust doesn't allow adding variants to a foreign enum). Nothing
+// in the live query path called `dedupe_subtrees`; re-introducing
+// workload-level CSE needs a representation that doesn't ride on
+// `QueryExpr::Ref`/`LetBinding`, tracked as a follow-up rather than
+// invented here.
+
 // Re-exports — preserve the surface that `crate::algebra::QueryOptimizer`
 // and `crate::planner::*` consumers historically relied on.
-pub use cse::{dedupe_subtrees, CseWorkloadPlan};
 pub use engine::{DeploymentConstraints, QueryOptimizer};

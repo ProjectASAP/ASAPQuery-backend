@@ -325,7 +325,10 @@ mod tests {
         m.on_register("e1", 60_000, 0);
         let a = m.on_report("e1", 0, 100_000.0);
         let p = sample_p_in(&a, "e1");
-        assert!(p < 1.0, "a lone high-rate edge should still be sampled, got p={p}");
+        assert!(
+            p < 1.0,
+            "a lone high-rate edge should still be sampled, got p={p}"
+        );
     }
 
     #[test]

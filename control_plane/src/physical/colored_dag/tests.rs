@@ -10,12 +10,13 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use asap_sketch::{L4Node, L4Schema, SketchQuery, SummaryExpr, SummaryKind, SummaryParams};
-
-use crate::intent_algebra::{
-    BindingScope, ColumnRef, LabelFilter, QueryExpr, Reduction, Schema, Source, WindowKind,
+use planner_types::post_asap::{
+    SketchKind, SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType, SummaryNode,
+    SummarySchema,
 };
+
 use crate::intent_algebra::schema::{Column, DataType};
+use crate::intent_algebra::{ColumnRef, LabelFilter, QueryExpr, Reduction, Schema, Source};
 use crate::physical::colored_dag::allocator::StageAllocator;
 use crate::physical::colored_dag::emitter::{EmitError, Emitter, StageConfig, ThreeStageEmitter};
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
@@ -71,10 +72,8 @@ fn ts_scan(metric: &str, label: Option<(&str, &str)>) -> QueryExpr {
 }
 
 fn windowed_scan() -> QueryExpr {
-    QueryExpr::Window {
-        kind: WindowKind::Sliding,
-        size: Duration::from_secs(300),
-        slide: None,
+    QueryExpr::TimeRange {
+        range: Duration::from_secs(300),
         child: Box::new(ts_scan(
             "http_request_duration_seconds",
             Some(("service", "api")),
@@ -82,13 +81,13 @@ fn windowed_scan() -> QueryExpr {
     }
 }
 
-/// Empty `L4Schema` — the coloring/emitter logic under test here never
+/// Empty `SummarySchema` — the coloring/emitter logic under test here never
 /// inspects node schemas (only `SummaryExpr` shape + `PhysicalExpr`
 /// placement), so hand-built L4 nodes below carry a placeholder, same
 /// spirit as this file's old comment: "these dummies only need to be
 /// *structurally valid* and distinct `PhysicalExpr` values".
-fn dummy_l4_schema() -> L4Schema {
-    L4Schema {
+fn dummy_l4_schema() -> SummarySchema {
+    SummarySchema {
         fields: vec![],
         time_index: None,
     }
@@ -96,20 +95,23 @@ fn dummy_l4_schema() -> L4Schema {
 
 /// Wrap `qe` as an unbound `Logical` L4 leaf — mirrors the old
 /// `PhysicalExpr::Logical(qe)` construction for hand-built fixtures.
-fn logical_l4(qe: QueryExpr) -> Rc<L4Node> {
-    asap_plan::bind::logical(&qe, &BindingScope::default()).unwrap()
+fn logical_l4(qe: QueryExpr) -> Rc<SummaryNode> {
+    asap_aware_mapping::bind::logical(&qe).unwrap()
 }
 
 /// Hand-build a `SummaryAgg` node — mirrors the old
 /// `PhysicalExpr::SketchAgg { sketch_type, params, child }` construction,
 /// for fixtures that need a specific family without going through
 /// `implement_tree`'s cost-model selection.
-fn sketch_agg_l4(summary: SummaryKind, params: SummaryParams, child: Rc<L4Node>) -> Rc<L4Node> {
-    Rc::new(L4Node {
+fn sketch_agg_l4(
+    kind: SketchKind,
+    params: SketchParams,
+    child: Rc<SummaryNode>,
+) -> Rc<SummaryNode> {
+    Rc::new(SummaryNode {
         expr: SummaryExpr::SummaryAgg {
             child,
-            summary,
-            params,
+            family: SummaryFamilyType::Sketch(kind, params),
             col: ColumnRef::SampleValue,
             reduction: Reduction::by(vec![]),
         },
@@ -119,9 +121,12 @@ fn sketch_agg_l4(summary: SummaryKind, params: SummaryParams, child: Rc<L4Node>)
 
 /// Hand-build a `SummaryEstimate` node — mirrors the old
 /// `PhysicalExpr::SketchEstimate { op, child }`.
-fn estimate_l4(query: SketchQuery, summary_input: Rc<L4Node>) -> Rc<L4Node> {
-    Rc::new(L4Node {
-        expr: SummaryExpr::SummaryEstimate { summary_input, query },
+fn estimate_l4(query: SketchQuery, summary_input: Rc<SummaryNode>) -> Rc<SummaryNode> {
+    Rc::new(SummaryNode {
+        expr: SummaryExpr::SummaryEstimate {
+            summary_input,
+            query,
+        },
         schema: dummy_l4_schema(),
     })
 }
@@ -131,8 +136,8 @@ fn estimate_l4(query: SketchQuery, summary_input: Rc<L4Node>) -> Rc<L4Node> {
 /// upstream replacement) carries no `algebra` field — `MergeAlgebra` was
 /// this crate's own addition and doesn't exist upstream (see
 /// `physical_expr.rs`'s module docs).
-fn merge_l4(children: Vec<Rc<L4Node>>) -> Rc<L4Node> {
-    Rc::new(L4Node {
+fn merge_l4(children: Vec<Rc<SummaryNode>>) -> Rc<SummaryNode> {
+    Rc::new(SummaryNode {
         expr: SummaryExpr::SummaryMerge { children },
         schema: dummy_l4_schema(),
     })
@@ -165,7 +170,7 @@ fn is_ref(expr: &PhysicalExpr) -> bool {
 fn quantile_kll_dag() -> PhysicalExpr {
     let q = QueryExpr::Aggregate {
         reduction: Reduction::by(vec![]),
-        aggs: vec![crate::intent_algebra::AggIntent::Quantile {
+        measures: vec![crate::intent_algebra::AggIntent::Quantile {
             col: None,
             q: 0.99,
             accuracy: AccuracyTarget::Epsilon(0.01),
@@ -174,7 +179,7 @@ fn quantile_kll_dag() -> PhysicalExpr {
         having: None,
         child: Box::new(windowed_scan()),
     };
-    PhysicalExpr::committed(asap_plan::bind::implement_tree(&q).unwrap())
+    PhysicalExpr::committed(asap_aware_mapping::bind::implement_tree(&q).unwrap())
 }
 
 // ── Allocator: per-rule + edge-case tests ─────────────────────────────────────
@@ -216,8 +221,8 @@ fn allocator_sketch_agg_under_scan_pinned_edge() {
     // Exact design.md §6 invariant: a SummaryAgg whose child is a Scan
     // (wrapped in Logical) MUST land on Edge.
     let expr = PhysicalExpr::committed(sketch_agg_l4(
-        SummaryKind::Hll,
-        SummaryParams::Hll { precision: 14 },
+        SketchKind::Hll,
+        SketchParams::Hll { precision: 14 },
         logical_l4(ts_scan("events", None)),
     ));
     let dag = StageAllocator
@@ -248,18 +253,18 @@ fn allocator_let_binding_color_propagates() {
     //
     // NOTE — shape change forced by the type system, not just syntax:
     // the old fixture nested `Ref` *inside* a `SketchEstimate`'s child.
-    // The new `SummaryEstimate::sketch_input` field is `Rc<L4Node>` —
+    // The new `SummaryEstimate::sketch_input` field is `Rc<SummaryNode>` —
     // upstream `asap_sketch`'s own type, which has no `Ref`/`LetBinding`
     // concept at all — so a `Ref`/`LetBinding` can only appear where an
     // `L4Plan` is expected (this crate's own named-binding sharing
-    // mechanism layered *above* `L4Node`, not inside it; see
+    // mechanism layered *above* `SummaryNode`, not inside it; see
     // `physical_expr.rs`'s module docs). The property under test —
     // LetBinding colors by its bound expression's stage — is preserved
     // with the `child` position held by a bare `Ref` instead of a
     // `SketchEstimate{child: Ref}`.
     let inner_agg = sketch_agg_l4(
-        SummaryKind::Kll,
-        SummaryParams::Kll { k: 200 },
+        SketchKind::Kll,
+        SketchParams::Kll { k: 200 },
         logical_l4(windowed_scan()),
     );
     let bind = PhysicalExpr::Committed(L4Plan::LetBinding {
@@ -288,8 +293,8 @@ fn allocator_ref_resolves_to_binding_stage() {
     // note there); the Ref child of the LetBinding must color Edge (the
     // binding's stage).
     let inner_agg = sketch_agg_l4(
-        SummaryKind::Kll,
-        SummaryParams::Kll { k: 200 },
+        SketchKind::Kll,
+        SketchParams::Kll { k: 200 },
         logical_l4(windowed_scan()),
     );
     let bind = PhysicalExpr::Committed(L4Plan::LetBinding {
@@ -315,8 +320,8 @@ fn allocator_sketch_merge_lands_gateway() {
     // SummaryMerge over edge-built KLL sketches → Gateway.
     let one_agg = || {
         sketch_agg_l4(
-            SummaryKind::Kll,
-            SummaryParams::Kll { k: 200 },
+            SketchKind::Kll,
+            SketchParams::Kll { k: 200 },
             logical_l4(windowed_scan()),
         )
     };
@@ -345,8 +350,8 @@ fn emitter_three_stage_emits_three_configs() {
     // SummaryMerge over two SummaryAggs.
     let one_agg = || {
         sketch_agg_l4(
-            SummaryKind::Kll,
-            SummaryParams::Kll { k: 200 },
+            SketchKind::Kll,
+            SketchParams::Kll { k: 200 },
             logical_l4(windowed_scan()),
         )
     };
@@ -372,7 +377,7 @@ fn emitter_edge_config_has_correct_processor_kll() {
         StageConfig::Edge(e) => {
             assert_eq!(e.sketch_processors.len(), 1);
             assert_eq!(e.sketch_processors[0].processor_name, "KLL");
-            assert_eq!(e.sketch_processors[0].sketch_kind, SummaryKind::Kll);
+            assert_eq!(e.sketch_processors[0].sketch_kind, SketchKind::Kll);
             assert_eq!(
                 e.source_metric.as_deref(),
                 Some("http_request_duration_seconds")
@@ -388,8 +393,8 @@ fn emitter_edge_config_has_correct_processor_ddsketch() {
     let expr = PhysicalExpr::committed(estimate_l4(
         SketchQuery::Quantile { q: 0.99 },
         sketch_agg_l4(
-            SummaryKind::DDSketch,
-            SummaryParams::DDSketch { alpha: 0.01 },
+            SketchKind::DDSketch,
+            SketchParams::DDSketch { alpha: 0.01 },
             logical_l4(windowed_scan()),
         ),
     ));
@@ -419,7 +424,7 @@ fn emitter_backend_config_routes_aggregation_id() {
         StageConfig::Backend(b) => {
             assert_eq!(b.aggregations.len(), 1);
             assert_eq!(b.aggregations[0].aggregation_id, edge_aid);
-            assert_eq!(b.aggregations[0].sketch_kind, SummaryKind::Kll);
+            assert_eq!(b.aggregations[0].sketch_kind, SketchKind::Kll.into());
             assert_eq!(b.readouts.len(), 1);
             assert_eq!(b.readouts[0].aggregation_id, edge_aid);
             // `SketchQuery` has no `PartialEq` upstream — destructure
@@ -470,8 +475,8 @@ fn end_to_end_quantile_workload() {
     // root).
     let agg = || {
         sketch_agg_l4(
-            SummaryKind::Kll,
-            SummaryParams::Kll { k: 200 },
+            SketchKind::Kll,
+            SketchParams::Kll { k: 200 },
             logical_l4(windowed_scan()),
         )
     };
@@ -502,7 +507,7 @@ fn end_to_end_quantile_workload() {
         StageConfig::Gateway(g) => {
             assert!(!g.merge_processors.is_empty());
             assert_eq!(g.merge_processors[0].processor_name, "sketchmergeprocessor");
-            assert_eq!(g.merge_processors[0].sketch_kind, SummaryKind::Kll);
+            assert_eq!(g.merge_processors[0].sketch_kind, SketchKind::Kll);
         }
         _ => unreachable!(),
     }

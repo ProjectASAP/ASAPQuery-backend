@@ -9,7 +9,7 @@
 //!
 //! The canonical L3 IR keeps "one canonical form per plan" (design.md
 //! §6): it has no fused windowed-aggregate variant — a windowed sketch is
-//! the stacked `Window { child: Aggregate { aggs: [one], .. } }` shape.
+//! the stacked `Window { child: Aggregate { measures: [one], .. } }` shape.
 //! `lower` produces exactly that shape when it folds a
 //! single-statistic sketchable `Aggregate` sitting over a `Window`. This
 //! module is the planner-side **peephole recognizer** that puts the
@@ -55,7 +55,7 @@ pub struct FusedWindowSketch<'a> {
     pub inner_child: &'a QueryExpr,
 }
 
-/// Recognize the canonical `Window { child: Aggregate { aggs: [one],
+/// Recognize the canonical `Window { child: Aggregate { measures: [one],
 /// having: None, .. } }` shape — the stacked form `lower`
 /// folds a legacy `WindowedAgg` into — and return a [`FusedWindowSketch`]
 /// view of it. Returns `None` for any other shape (a multi-intent
@@ -67,18 +67,25 @@ pub struct FusedWindowSketch<'a> {
 /// legacy planner already builds with `PhysicalWindow::None`. This
 /// recognizer is specifically the window-defines-lifecycle peephole.
 pub fn recognize_windowed_sketch(expr: &QueryExpr) -> Option<FusedWindowSketch<'_>> {
-    let QueryExpr::Window {
-        kind,
-        size,
-        slide,
-        child,
-    } = expr
-    else {
+    // ASAPPlanner has no canonical `Window` node (ASAPPlanner#193 --
+    // "nothing ever constructs canonical QueryExpr::Window", confirmed by
+    // upstream's own corpus walk, true even at the previously-pinned
+    // rev): `asap_frontend_promql::lower_promql` -- the real production
+    // entry point since #428 -- has only ever emitted `TimeRange { range,
+    // child }` for a range-vector selector. This recognizer used to match
+    // `Window` regardless, which means it could never actually fire for
+    // real `lower_promql`-produced trees; matching `TimeRange` here is a
+    // fix, not just a rename. `TimeRange` carries no kind/slide -- real
+    // PromQL has no syntax to request anything but the implicit tumbling
+    // form, so `window_kind`/`window_slide` default to that (matching
+    // every other real-traffic call site in this codebase; see
+    // control_plane/docs/design-asapplanner-pin-migration.md).
+    let QueryExpr::TimeRange { range, child } = expr else {
         return None;
     };
     let QueryExpr::Aggregate {
         reduction,
-        aggs,
+        measures,
         having,
         child: inner_child,
         ..
@@ -88,7 +95,7 @@ pub fn recognize_windowed_sketch(expr: &QueryExpr) -> Option<FusedWindowSketch<'
     };
     // The legacy `WindowedAgg` always carried exactly one intent and
     // never a HAVING clause — only that shape is the fused sketch.
-    if aggs.len() != 1 || having.is_some() {
+    if measures.len() != 1 || having.is_some() {
         return None;
     }
     let by: &[ColumnId] = reduction
@@ -96,10 +103,10 @@ pub fn recognize_windowed_sketch(expr: &QueryExpr) -> Option<FusedWindowSketch<'
         .map(|keys| keys.keys())
         .unwrap_or(&[]);
     Some(FusedWindowSketch {
-        agg: &aggs[0],
-        window_kind: kind.clone(),
-        window_size: *size,
-        window_slide: *slide,
+        agg: &measures[0],
+        window_kind: WindowKind::Tumbling,
+        window_size: *range,
+        window_slide: None,
         by,
         inner_child,
     })
@@ -178,12 +185,9 @@ pub fn fused_sketch_decision(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::relational::{
-        AggFunc, AggItem, ColumnRef as LColumnRef, QueryExpr as LQueryExpr, SourceSpec,
-    };
-    use crate::intent_algebra::{
-        convert_root, default_cardinality, default_frequency, default_quantile,
-    };
+    use crate::intent_algebra::query_expr::Source;
+    use crate::intent_algebra::schema::Schema;
+    use crate::intent_algebra::{default_cardinality, default_frequency, default_quantile};
     use crate::optimizer::engine::DeploymentConstraints;
     use crate::physical::planner::{plan, PhysicalOp};
     use crate::types::StageResourceBudgets;
@@ -195,28 +199,34 @@ mod tests {
         }
     }
 
-    /// A canonical `Scan` leaf — built through `convert_root` so it carries
-    /// the same Binder-built schema a real converted tree would.
+    /// A canonical `Scan` leaf, built directly — the pre-ASAPPlanner-pin
+    /// version of this helper built it through `convert_root`
+    /// (`intent_algebra::lower`), which was deleted alongside the L2 tree
+    /// it converted from (see `intent_algebra::relational`'s module doc);
+    /// `Scan` is simple enough to construct directly instead.
     fn canonical_scan(metric: &str) -> QueryExpr {
-        convert_root(&LQueryExpr::Source(SourceSpec::new(metric))).expect("convert source")
+        QueryExpr::Scan {
+            source: Source::TimeSeries {
+                metric: metric.to_string(),
+            },
+            predicates: vec![],
+            schema: Schema::with_time_index(vec![], 0, vec![]),
+        }
     }
 
-    /// The canonical `Window { Aggregate { by: [], aggs: [agg] } }` shape —
-    /// the fold `lower` produces for a windowed single-sketch
-    /// aggregate.
-    fn windowed_sketch(
-        agg: AggIntent,
-        kind: WindowKind,
-        size: Duration,
-        slide: Option<Duration>,
-    ) -> QueryExpr {
-        QueryExpr::Window {
-            kind,
-            size,
-            slide,
+    /// The canonical `TimeRange { Aggregate { by: [], measures: [agg] } }`
+    /// shape — what `asap_frontend_promql::lower_promql` (the real
+    /// production entry point) emits for a windowed single-sketch
+    /// aggregate. Real PromQL has no syntax for anything but the implicit
+    /// tumbling form (see `recognize_windowed_sketch`'s doc), so unlike
+    /// the pre-migration version of this helper, there is no `kind`/
+    /// `slide` parameter to take anymore.
+    fn windowed_sketch(agg: AggIntent, size: Duration) -> QueryExpr {
+        QueryExpr::TimeRange {
+            range: size,
             child: Box::new(QueryExpr::Aggregate {
                 reduction: crate::intent_algebra::Reduction::by(vec![]),
-                aggs: vec![agg],
+                measures: vec![agg],
                 output_names: Vec::new(),
                 having: None,
                 child: Box::new(canonical_scan("m")),
@@ -224,22 +234,17 @@ mod tests {
         }
     }
 
-    /// End-to-end fusion assertion: the canonical `Window { Aggregate }`
+    /// End-to-end fusion assertion: the canonical `TimeRange { Aggregate }`
     /// shape, run through the recognizer + `fused_sketch_decision` and
     /// through the canonical planner, produces a *fused* `OtelSketchBuild`
     /// carrying a resolved (non-`None`) physical window — the
     /// window-defines-sketch-lifecycle invariant as a planner peephole.
-    fn assert_equivalent(
-        agg: AggIntent,
-        kind: WindowKind,
-        size: Duration,
-        slide: Option<Duration>,
-    ) {
+    fn assert_equivalent(agg: AggIntent, size: Duration) {
         let cfg = config();
-        let canonical = windowed_sketch(agg, kind, size, slide);
+        let canonical = windowed_sketch(agg, size);
 
         let fused = recognize_windowed_sketch(&canonical)
-            .expect("canonical Window{Aggregate} should be recognized as a fused sketch");
+            .expect("canonical TimeRange{Aggregate} should be recognized as a fused sketch");
         let (decided_op, _placement) = fused_sketch_decision(&fused, &cfg);
         let PhysicalOp::OtelSketchBuild {
             window: decided_window,
@@ -262,7 +267,7 @@ mod tests {
         } = &node.op
         else {
             panic!(
-                "canonical planner did not fuse Window{{Aggregate}}: {:?}",
+                "canonical planner did not fuse TimeRange{{Aggregate}}: {:?}",
                 node.op
             );
         };
@@ -275,72 +280,32 @@ mod tests {
     }
 
     #[test]
-    fn equivalence_tumbling_quantile() {
-        assert_equivalent(
-            default_quantile(0.99),
-            WindowKind::Tumbling,
-            Duration::from_secs(300),
-            None,
-        );
+    fn equivalence_quantile() {
+        assert_equivalent(default_quantile(0.99), Duration::from_secs(300));
     }
 
     #[test]
-    fn equivalence_sliding_quantile() {
-        assert_equivalent(
-            default_quantile(0.5),
-            WindowKind::Sliding,
-            Duration::from_secs(600),
-            Some(Duration::from_secs(60)),
-        );
+    fn equivalence_cardinality() {
+        assert_equivalent(default_cardinality(), Duration::from_secs(60));
     }
 
     #[test]
-    fn equivalence_session_quantile() {
-        assert_equivalent(
-            default_quantile(0.95),
-            WindowKind::Session,
-            Duration::from_secs(30),
-            None,
-        );
-    }
-
-    #[test]
-    fn equivalence_tumbling_cardinality() {
-        assert_equivalent(
-            default_cardinality(),
-            WindowKind::Tumbling,
-            Duration::from_secs(60),
-            None,
-        );
-    }
-
-    #[test]
-    fn equivalence_tumbling_frequency() {
-        assert_equivalent(
-            default_frequency(),
-            WindowKind::Tumbling,
-            Duration::from_secs(120),
-            None,
-        );
+    fn equivalence_frequency() {
+        assert_equivalent(default_frequency(), Duration::from_secs(120));
     }
 
     #[test]
     fn equivalence_sum_intent() {
-        assert_equivalent(
-            AggIntent::Sum { col: None },
-            WindowKind::Tumbling,
-            Duration::from_secs(300),
-            None,
-        );
+        assert_equivalent(AggIntent::Sum { col: None }, Duration::from_secs(300));
     }
 
     #[test]
     fn recognizer_rejects_bare_aggregate() {
-        // A canonical `Aggregate` with no enclosing `Window` is the unfused
-        // sketch case — not a windowed sketch.
+        // A canonical `Aggregate` with no enclosing `TimeRange` is the
+        // unfused sketch case — not a windowed sketch.
         let canonical = QueryExpr::Aggregate {
             reduction: crate::intent_algebra::Reduction::by(vec![]),
-            aggs: vec![AggIntent::Sum { col: None }],
+            measures: vec![AggIntent::Sum { col: None }],
             output_names: Vec::new(),
             having: None,
             child: Box::new(canonical_scan("m")),
@@ -350,37 +315,20 @@ mod tests {
 
     #[test]
     fn recognizer_rejects_window_over_non_aggregate() {
-        // `Window` directly over a `Scan` — no inner `Aggregate` to fuse.
-        let legacy = LQueryExpr::Window {
-            duration: Duration::from_secs(60),
-            slide: None,
-            input: Box::new(LQueryExpr::Source(SourceSpec::new("m"))),
+        // `TimeRange` directly over a `Scan` — no inner `Aggregate` to fuse.
+        let canonical = QueryExpr::TimeRange {
+            range: Duration::from_secs(60),
+            child: Box::new(canonical_scan("m")),
         };
-        let canonical = convert_root(&legacy).expect("convert");
         assert!(recognize_windowed_sketch(&canonical).is_none());
     }
 
     #[test]
-    fn recognizer_accepts_converted_windowed_agg() {
-        // The L2 `Aggregate { Quantile } over Window` shape the parsers
-        // emit converts to canonical `Window { Aggregate }` — exactly the
-        // shape the recognizer matches.
-        let legacy = LQueryExpr::Aggregate {
-            keys: vec![],
-            without: false,
-            aggs: vec![AggItem {
-                alias: Some("q".into()),
-                func: AggFunc::Quantile(0.99),
-                col: LColumnRef::SampleValue,
-            }],
-            having: None,
-            input: Box::new(LQueryExpr::Window {
-                duration: Duration::from_secs(300),
-                slide: None,
-                input: Box::new(LQueryExpr::Source(SourceSpec::new("m"))),
-            }),
-        };
-        let canonical = convert_root(&legacy).expect("convert");
+    fn recognizer_accepts_windowed_agg() {
+        // The `TimeRange { Aggregate { Quantile } }` shape
+        // `lower_promql` emits for `quantile_over_time(...)` — exactly
+        // the shape the recognizer matches.
+        let canonical = windowed_sketch(default_quantile(0.99), Duration::from_secs(300));
         let fused = recognize_windowed_sketch(&canonical).expect("should recognize");
         assert_eq!(fused.window_kind, WindowKind::Tumbling);
         assert_eq!(fused.window_size, Duration::from_secs(300));

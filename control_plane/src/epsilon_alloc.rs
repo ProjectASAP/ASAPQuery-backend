@@ -125,8 +125,8 @@ pub fn allocate_knobs(
         .iter()
         .map(|m| {
             let sample_p = derive_sample_p(epsilon, rate_for(&m.metric_name));
-            let delta_threshold = monitor_for(&m.metric_name)
-                .map(|(tau, k)| derive_delta_threshold(epsilon, tau, k));
+            let delta_threshold =
+                monitor_for(&m.metric_name).map(|(tau, k)| derive_delta_threshold(epsilon, tau, k));
             AllocatedMetric {
                 metric_name: m.metric_name.clone(),
                 sketches: m.sketches.clone(),
@@ -190,9 +190,7 @@ pub fn metric_rate_from_telemetry(
             continue;
         }
         if let Some(rec) = store.latest(&key) {
-            if let Some(tp) =
-                rec.payload["bench"]["throughput_items_per_sec"]["mean"].as_f64()
-            {
+            if let Some(tp) = rec.payload["bench"]["throughput_items_per_sec"]["mean"].as_f64() {
                 total += tp;
                 matched = true;
             }
@@ -332,22 +330,30 @@ mod tests {
 
     #[test]
     fn allocate_knobs_attaches_p_and_optional_delta() {
-        let plan = plan_sketches_for_queries([
-            "quantile_over_time(0.99, latency_ms[5m])",
-        ]);
+        let plan = plan_sketches_for_queries(["quantile_over_time(0.99, latency_ms[5m])"]);
         // latency_ms has a monitored threshold τ=7000 over k=4 sites; rate 2000/win
         let allocated = allocate_knobs(
             0.05,
             &plan,
             |_m| 2000.0,
-            |m| if m == "latency_ms" { Some((7000.0, 4)) } else { None },
+            |m| {
+                if m == "latency_ms" {
+                    Some((7000.0, 4))
+                } else {
+                    None
+                }
+            },
         );
         let a = allocated
             .iter()
             .find(|a| a.metric_name == "latency_ms")
             .expect("metric present");
         // p = 1/(1+0.0025*2000) = 1/6 = 0.1667…
-        assert!((a.knobs.sample_p - 1.0 / 6.0).abs() < 1e-9, "p={}", a.knobs.sample_p);
+        assert!(
+            (a.knobs.sample_p - 1.0 / 6.0).abs() < 1e-9,
+            "p={}",
+            a.knobs.sample_p
+        );
         // δ = 0.05*7000/4 = 87.5
         assert_eq!(a.knobs.delta_threshold, Some(87.5));
         // the sketch set survived from slice 2
@@ -383,7 +389,7 @@ mod tests {
         );
         assert!((m.sample_p - 1.0 / 6.0).abs() < 1e-9); // 1/(1+0.0025*2000)
         assert_eq!(m.delta_threshold, Some(87.5)); // 0.05*7000/4
-        // the unparseable query falls through to cold
+                                                   // the unparseable query falls through to cold
         assert_eq!(resp.cold_only.len(), 1);
         // and the response serializes to JSON cleanly (the handler's job)
         let v = serde_json::to_value(&resp).expect("serializes");
@@ -392,9 +398,7 @@ mod tests {
 
     #[test]
     fn metric_without_monitor_gets_no_delta() {
-        let plan = plan_sketches_for_queries([
-            "quantile_over_time(0.99, latency_ms[5m])",
-        ]);
+        let plan = plan_sketches_for_queries(["quantile_over_time(0.99, latency_ms[5m])"]);
         let allocated = allocate_knobs(0.05, &plan, |_m| 500.0, |_m| None);
         let a = &allocated[0];
         assert_eq!(a.knobs.delta_threshold, None);
@@ -449,7 +453,11 @@ mod tests {
             |_m, sks| metric_rate_from_telemetry(&store, sks),
             &monitors,
         );
-        let m = resp.metrics.iter().find(|m| m.metric == "latency_ms").unwrap();
+        let m = resp
+            .metrics
+            .iter()
+            .find(|m| m.metric == "latency_ms")
+            .unwrap();
         // p = 1/(1+0.0025*2000) = 1/6 (telemetry), NOT 1/(1+0.0025*1) (default)
         assert!((m.sample_p - 1.0 / 6.0).abs() < 1e-9, "p={}", m.sample_p);
     }

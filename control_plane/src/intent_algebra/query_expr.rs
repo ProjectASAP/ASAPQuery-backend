@@ -4,7 +4,7 @@
 //! ## Phase 2 step 3 (docs/migration-plan-backend-plan.md)
 //!
 //! `QueryExpr` and its supporting types are no longer defined in this
-//! repo — re-exported from `asap_ir::intent_algebra`. `asap_ir`'s version
+//! repo — re-exported from `planner_types::pre_asap::intent_algebra`. `asap_ir`'s version
 //! is a real superset (~22 variants vs. this repo's pre-merge 16:
 //! `EvalTime`, `VectorFromScalar`/`ScalarFromVector`, `Relabel`,
 //! `InfoJoin`, `Sample`, `TimeRange`, `TimeShift`, `WindowFunc` are new,
@@ -57,17 +57,23 @@
 //! `label_filter_to_predicate` below (`asap_ir`'s `Scan` takes typed
 //! `Predicate`s, not a separate label-filter list).
 
-use asap_ir::intent_algebra::schema::ColumnId;
-pub use asap_ir::intent_algebra::{
-    aggregate_output_schema, AtModifier, BinaryOpKind, BindingScope, DataModel, GroupKeys,
-    GroupSide, InfoMatcher, JoinKind, Predicate, ProjectItem, QueryExpr, QueryExprError,
-    Reduction, SampleKind, SetOpKind, SortKey, Source, TimeShift, VectorGrouping, VectorMatch,
-    VectorMatchKind, WindowFuncKind, WindowKind,
+use planner_types::pre_asap::schema::ColumnId;
+pub use planner_types::pre_asap::{
+    aggregate_output_schema, AtModifier, BinaryOpKind, DataModel, GroupKeys, GroupSide,
+    InfoMatcher, JoinKind, Predicate, ProjectItem, QueryExpr, QueryExprError, Reduction,
+    SampleKind, SetOpKind, SortKey, Source, TimeShift, VectorGrouping, VectorMatch,
+    VectorMatchKind, WindowFuncKind,
 };
-pub use asap_ir::intent_algebra::{ArithOp, ColumnRef, CompareOp, Expr, L3Scalar};
+pub use planner_types::pre_asap::{ArithOp, ColumnRef, CompareOp};
+// `L3Scalar`/`L3Expr`/`L2Expr` and `WindowKind`: see `expr_ir.rs`'s and
+// `crates/asap_types/src/enums.rs`'s module docs respectively --
+// ASAPPlanner deleted its `WindowKind` (no `QueryExpr::Window` producer
+// left to need it) and folded the old standalone `Expr<C>` into
+// `QueryExpr` itself, renaming its scalar-literal type `ScalarValue`.
+pub use crate::intent_algebra::expr_ir::{L2Expr, L3Expr, L3Scalar};
+pub use asap_types::enums::WindowKind;
 
 use crate::intent_algebra::schema::Schema;
-use crate::intent_algebra::L3Expr;
 
 /// Equality label filter on a `Scan`. PromQL `{service="api"}` — kept as
 /// ergonomic sugar for the parser; converted to a typed `Predicate` via
@@ -86,11 +92,11 @@ pub struct LabelFilter {
 /// to the schema; this is a defensive fallback, not the primary path).
 pub fn label_filter_to_predicate(lf: &LabelFilter, schema: &Schema) -> Option<Predicate> {
     let id = schema.column_id(&lf.label)?;
-    Some(Predicate(L3Expr::Compare {
+    Some(Predicate(Box::new(L3Expr::Compare {
         left: Box::new(L3Expr::Column(id)),
         op: CompareOp::Eq,
         right: Box::new(L3Expr::Literal(L3Scalar::Utf8(lf.equals.clone()))),
-    }))
+    })))
 }
 
 /// Conjoin `predicates` into a single `Predicate` (`BoolAnd`), or `None`
@@ -98,11 +104,11 @@ pub fn label_filter_to_predicate(lf: &LabelFilter, schema: &Schema) -> Option<Pr
 /// single tree, so most callers won't need this — provided for the few
 /// call sites that want one combined predicate (e.g. `Filter.pred`).
 pub fn conjoin(predicates: Vec<Predicate>) -> Option<Predicate> {
-    let mut exprs: Vec<L3Expr> = predicates.into_iter().map(|p| p.0).collect();
+    let mut exprs: Vec<L3Expr> = predicates.into_iter().map(|p| *p.0).collect();
     match exprs.len() {
         0 => None,
-        1 => Some(Predicate(exprs.remove(0))),
-        _ => Some(Predicate(L3Expr::BoolAnd(exprs))),
+        1 => Some(Predicate(Box::new(exprs.remove(0)))),
+        _ => Some(Predicate(Box::new(L3Expr::BoolAnd(exprs)))),
     }
 }
 

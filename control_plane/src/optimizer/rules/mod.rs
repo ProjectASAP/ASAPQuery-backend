@@ -65,7 +65,7 @@ pub fn bind_workload_typed_with_item_filter(
     };
     use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
     use crate::types_v2::AccuracyTarget;
-    use asap_sketch::SummaryKind;
+    use planner_types::post_asap::SketchKind;
 
     // Contract-row metrics (`classify_demo_metric` returns `Some`) and
     // operator-supplied overrides both signal "this metric must be
@@ -112,20 +112,20 @@ pub fn bind_workload_typed_with_item_filter(
     // the statistic from the override whenever the derived one is
     // incompatible, so the override drives both family and statistic.
     if let Some(st) = w.sketch_type_override.as_ref() {
-        let ov = SummaryKind::from(st.clone());
+        let ov = SketchKind::from(st.clone());
         if !is_valid_pair(ov.clone(), statistic) {
             let (s, ap) = match ov {
-                SummaryKind::DDSketch | SummaryKind::Kll => {
+                SketchKind::DDSketch | SketchKind::Kll => {
                     (StatisticClass::Quantile, AccuracyPreference::RelativeError)
                 }
-                SummaryKind::Hll => (StatisticClass::Cardinality, AccuracyPreference::default()),
-                SummaryKind::Cms => (StatisticClass::Frequency, AccuracyPreference::default()),
-                SummaryKind::CountSketch => (StatisticClass::TopK, AccuracyPreference::default()),
-                // `ov` always comes from `SummaryKind::from(SketchType)`
+                SketchKind::Hll => (StatisticClass::Cardinality, AccuracyPreference::default()),
+                SketchKind::Cms => (StatisticClass::Frequency, AccuracyPreference::default()),
+                SketchKind::CountSketch => (StatisticClass::TopK, AccuracyPreference::default()),
+                // `ov` always comes from `SketchKind::from(SketchType)`
                 // (`w.sketch_type_override` is the legacy 5-family enum),
                 // so only these 5 canonical families are ever reachable.
                 other => unreachable!(
-                    "sketch_type_override resolved to an unsupported SummaryKind {other:?}"
+                    "sketch_type_override resolved to an unsupported SketchKind {other:?}"
                 ),
             };
             statistic = s;
@@ -139,7 +139,7 @@ pub fn bind_workload_typed_with_item_filter(
         return None;
     }
 
-    // ── Resolve the SummaryKind (override > capability-matched default) ─
+    // ── Resolve the SketchKind (override > capability-matched default) ─
     //
     // The workload-spec's `sketch_type_override` (= the spec's
     // `sketch_family_override` per orchestrator contract) wins over the
@@ -148,10 +148,10 @@ pub fn bind_workload_typed_with_item_filter(
     // workload) is silently dropped — the catalog-default family runs
     // instead so the binding never produces a nonsense (sketch, stat)
     // pair.
-    let override_kind: Option<SummaryKind> = w
+    let override_kind: Option<SketchKind> = w
         .sketch_type_override
         .as_ref()
-        .map(|st| SummaryKind::from(st.clone()));
+        .map(|st| SketchKind::from(st.clone()));
     let kind = match override_kind {
         Some(k) if is_valid_pair(k.clone(), statistic) => k,
         _ => pick_family(statistic, accuracy_pref)?,
@@ -224,10 +224,8 @@ pub fn bind_workload_typed_with_item_filter(
             vec![vec![0]],
         ),
     };
-    let windowed = QueryExpr::Window {
-        kind: WindowKind::Sliding,
-        size: w.time_window,
-        slide: None,
+    let windowed = QueryExpr::TimeRange {
+        range: w.time_window,
         child: Box::new(scan),
     };
     let aggregate = QueryExpr::Aggregate {
@@ -237,7 +235,7 @@ pub fn bind_workload_typed_with_item_filter(
         // `PerEntity` is the representative choice for a windowed shape
         // with no `by` (ASAPController#163/#165).
         reduction: crate::intent_algebra::Reduction::PerEntity,
-        aggs: vec![intent],
+        measures: vec![intent],
         output_names: Vec::new(),
         having: None,
         child: Box::new(windowed),
@@ -252,7 +250,7 @@ pub fn bind_workload_typed_with_item_filter(
     // dispatcher's tie-break (DDSketch p=6 vs KLL p=5) cannot accidentally
     // flip `request_size_bytes`'s KLL pick to DDSketch.
     //
-    // CMS+TopK note: when the picker selected `SummaryKind::Cms` for a
+    // CMS+TopK note: when the picker selected `SketchKind::Cms` for a
     // TopK statistic (only reachable today via a `sketch_family_override:
     // CountMinSketch` on a TopK metric), this forces the CMS-with-heap
     // variant. The CMS-Heap pattern (Cormode & Muthukrishnan 2005) gives
@@ -263,33 +261,28 @@ pub fn bind_workload_typed_with_item_filter(
     //
     // `StatisticClass::Frequency` (the `endpoint_request_freq` contract
     // row) is `AggIntent::Extension`-shaped. This used to always decline
-    // (return `None`) here, because `asap_plan::boundary::implementation_for`
+    // (return `None`) here, because `asap_aware_mapping::boundary::implementation_for`
     // mapped every `Extension` to `PassThrough` unconditionally (a core-
     // vs-deployment-specific-shape gap, ASAPController#150). Now that
     // `ForcedFamilyCostModel::realize_extension`/`readout_extension`
     // delegate to `ControlPlaneCostModel`'s own `"frequency"` handling,
     // this contract row commits like any other.
     let forced = match kind {
-        SummaryKind::CountSketch => SummaryKind::CountSketchWithHeap,
-        SummaryKind::Cms if statistic == StatisticClass::TopK => SummaryKind::CmsWithHeap,
+        SketchKind::CountSketch => SketchKind::CountSketchWithHeap,
+        SketchKind::Cms if statistic == StatisticClass::TopK => SketchKind::CmsWithHeap,
         other => other,
     };
     let cost_model = ForcedFamilyCostModel::new(accuracy.clone(), forced);
-    let node = asap_plan::bind::implement_tree_in_with(
-        &aggregate,
-        &crate::intent_algebra::BindingScope::default(),
-        &cost_model,
-    )
-    .ok()?;
-    // `implement_tree_in_with` never *errors* on "nothing bound" — an
+    let node = asap_aware_mapping::bind::implement_tree_with(&aggregate, &cost_model).ok()?;
+    // `implement_tree_with` never *errors* on "nothing bound" — an
     // intent `boundary::implementation_for`/`CostModel::realize_extension`
     // can't realize (e.g. `TopK { accuracy: Exact }`, ASAPController#151,
-    // still open) still returns `Ok(Rc<L4Node>)`, just wrapping the input
+    // still open) still returns `Ok(Rc<SummaryNode>)`, just wrapping the input
     // as `SummaryExpr::Logical` unchanged. `bind_workload_typed`'s own
     // contract is `None` for "typed path doesn't support this shape yet"
     // — translate the two by checking whether anything actually got
     // committed.
-    if matches!(node.expr, asap_sketch::SummaryExpr::Logical(_)) {
+    if matches!(node.expr, planner_types::post_asap::SummaryExpr::Logical(_)) {
         return None;
     }
     Some(crate::sketch_algebra::physical_expr::PhysicalExpr::committed(node))
@@ -482,18 +475,18 @@ mod tests {
     #[test]
     fn override_pins_nonquantile_family_over_misclassified_query() {
         use crate::emit::extract_root_sketch_kind;
-        use asap_sketch::SummaryKind;
+        use planner_types::post_asap::SketchKind;
         for (ov, expect) in [
-            (SketchType::DDSketch, SummaryKind::DDSketch),
-            (SketchType::KLL, SummaryKind::Kll),
-            (SketchType::HLL, SummaryKind::Hll),
+            (SketchType::DDSketch, SketchKind::DDSketch),
+            (SketchType::KLL, SketchKind::Kll),
+            (SketchType::HLL, SketchKind::Hll),
             // CountSketch override re-derives statistic as TopK (see the
             // override arm below), and `bind_cms_topk` always binds the
             // heap-bearing kind for a top-k intent — matches this
-            // fixture's pre-`SummaryKind`-split expectation, when
+            // fixture's pre-`SketchKind`-split expectation, when
             // `with_heap: true` was a params flag rather than kind
             // identity.
-            (SketchType::CountSketch, SummaryKind::CountSketchWithHeap),
+            (SketchType::CountSketch, SketchKind::CountSketchWithHeap),
         ] {
             // Query classifies as Quantile (the mis-derived case observed
             // live for count()/topk()/count_over_time()); the override must win.
@@ -512,7 +505,7 @@ mod tests {
         // `AggIntent::Extension`-shaped (this deployment's point-frequency
         // query). `ControlPlaneCostModel::realize_extension`/
         // `readout_extension` (ASAPController#150) now realize it as
-        // `SummaryKind::Cms` — matching `capability_matching::pick_family`'s
+        // `SketchKind::Cms` — matching `capability_matching::pick_family`'s
         // own `Frequency -> Cms` mapping — so this override binds like any
         // other now.
         let mut w = workload(vec![AggType::Quantile]);
@@ -521,7 +514,7 @@ mod tests {
             .unwrap_or_else(|| panic!("CountMinSketch override should bind (ASAPController#150)"));
         assert_eq!(
             extract_root_sketch_kind(&pe),
-            Some(SummaryKind::Cms),
+            Some(SketchKind::Cms),
             "CountMinSketch override should pin Cms (Frequency's family), not decline",
         );
     }
@@ -646,14 +639,14 @@ mod tests {
     // | `endpoint_request_freq` | CMS          |
 
     use crate::sketch_algebra::physical_expr::PhysicalExpr;
-    use asap_ir::intent_algebra::expr_ir::ColumnRef;
-    use asap_sketch::SummaryKind;
+    use planner_types::post_asap::SketchKind;
+    use planner_types::pre_asap::expr_ir::ColumnRef;
 
     /// Walk the L4 binding output and pull out the approximate sketch
     /// family. Returns `None` if no sketch node is present (raw / pure
     /// logical pass-through, or an exact accumulator — see
     /// `emit::extract_root_sketch_kind`, whose logic this mirrors).
-    fn extract_family(expr: &PhysicalExpr) -> Option<SummaryKind> {
+    fn extract_family(expr: &PhysicalExpr) -> Option<SketchKind> {
         crate::emit::extract_root_sketch_kind(expr)
     }
 
@@ -661,14 +654,16 @@ mod tests {
     /// `SummaryEstimate` -- unlike `extract_family`, this needs the
     /// readout itself (to check `PointCount`'s `key`/`value`), not just
     /// the sketch family underneath it.
-    fn extract_query(expr: &PhysicalExpr) -> Option<asap_sketch::SketchQuery> {
+    fn extract_query(expr: &PhysicalExpr) -> Option<planner_types::post_asap::SketchQuery> {
         let PhysicalExpr::Committed(crate::sketch_algebra::physical_expr::L4Plan::Summary(node)) =
             expr
         else {
             return None;
         };
         match &node.expr {
-            asap_sketch::SummaryExpr::SummaryEstimate { query, .. } => Some(query.clone()),
+            planner_types::post_asap::SummaryExpr::SummaryEstimate { query, .. } => {
+                Some(query.clone())
+            }
             _ => None,
         }
     }
@@ -715,7 +710,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("http_latency_ms must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SummaryKind::DDSketch),
+            Some(SketchKind::DDSketch),
             "http_latency_ms should bind to DDSketch (Quantile, rel-err)",
         );
     }
@@ -730,7 +725,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("request_size_bytes must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SummaryKind::Kll),
+            Some(SketchKind::Kll),
             "request_size_bytes should bind to KLL (Quantile, rank-err)",
         );
     }
@@ -742,7 +737,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("unique_users_per_min must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SummaryKind::Hll),
+            Some(SketchKind::Hll),
             "unique_users_per_min should bind to HLL (Cardinality)",
         );
     }
@@ -757,7 +752,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("top_endpoint_qps must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SummaryKind::CountSketchWithHeap),
+            Some(SketchKind::CountSketchWithHeap),
             "top_endpoint_qps should bind to CountSketch-with-heap (TopK)",
         );
     }
@@ -766,7 +761,7 @@ mod tests {
     fn typed_binding_endpoint_request_freq_binds_cms() {
         // Contract: `endpoint_request_freq` → CMS (Frequency). `Frequency`
         // is `AggIntent::Extension`-shaped; this used to decline the typed
-        // path entirely (`asap_plan::boundary::implementation_for` mapped
+        // path entirely (`asap_aware_mapping::boundary::implementation_for` mapped
         // every `Extension` to `PassThrough` unconditionally — core has no
         // realization opinion for a deployment-specific shape it doesn't
         // know, ASAPController#150). Now that
@@ -776,7 +771,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("endpoint_request_freq must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SummaryKind::Cms),
+            Some(SketchKind::Cms),
             "endpoint_request_freq should bind to Cms (Frequency)",
         );
     }
@@ -790,7 +785,7 @@ mod tests {
         assert!(
             matches!(
                 extract_query(&bound),
-                Some(asap_sketch::SketchQuery::PointCount {
+                Some(planner_types::post_asap::SketchQuery::PointCount {
                     key: ColumnRef::SampleValue,
                     value: None
                 })
@@ -805,7 +800,7 @@ mod tests {
             bind_workload_typed_with_item_filter(&w, Some(("endpoint", "checkout")))
                 .expect("must bind");
         match extract_query(&bound_filtered) {
-            Some(asap_sketch::SketchQuery::PointCount {
+            Some(planner_types::post_asap::SketchQuery::PointCount {
                 key: ColumnRef::Named(label),
                 value: Some(value),
             }) => {
@@ -829,7 +824,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("override should still bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SummaryKind::Kll),
+            Some(SketchKind::Kll),
             "sketch_type_override=KLL should pin KLL despite the contract's DDSketch default",
         );
     }
@@ -843,7 +838,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("override should still bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SummaryKind::DDSketch),
+            Some(SketchKind::DDSketch),
             "sketch_type_override=DDSketch should pin DDSketch despite the contract's KLL default",
         );
     }
@@ -861,7 +856,7 @@ mod tests {
             bind_workload_typed(&w).expect("CountMin override on a TopK metric should still bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SummaryKind::CmsWithHeap),
+            Some(SketchKind::CmsWithHeap),
             "sketch_type_override=CountMinSketch on a TopK metric should pin CMS-with-heap",
         );
     }
@@ -875,7 +870,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("top_endpoint_qps must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SummaryKind::CountSketchWithHeap),
+            Some(SketchKind::CountSketchWithHeap),
             "default TopK pick must remain CountSketch-with-heap (unbiased estimator)",
         );
     }
@@ -890,7 +885,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("fallback should bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SummaryKind::DDSketch),
+            Some(SketchKind::DDSketch),
             "invalid (HLL, Quantile) override should be rejected; planner falls back to DDSketch",
         );
     }
@@ -902,27 +897,27 @@ mod tests {
         // Single test that drives the full contract row set through
         // `bind_workload_typed` — this is the per-task acceptance test
         // ("verify each produces the expected `PhysicalExpr` family").
-        let cases: Vec<(&str, AggType, Option<SummaryKind>)> = vec![
+        let cases: Vec<(&str, AggType, Option<SketchKind>)> = vec![
             ("http_requests_total", AggType::Frequency, None),
             (
                 "http_latency_ms",
                 AggType::Quantile,
-                Some(SummaryKind::DDSketch),
+                Some(SketchKind::DDSketch),
             ),
             (
                 "request_size_bytes",
                 AggType::Quantile,
-                Some(SummaryKind::Kll),
+                Some(SketchKind::Kll),
             ),
             (
                 "unique_users_per_min",
                 AggType::Cardinality,
-                Some(SummaryKind::Hll),
+                Some(SketchKind::Hll),
             ),
             (
                 "top_endpoint_qps",
                 AggType::Frequency,
-                Some(SummaryKind::CountSketchWithHeap),
+                Some(SketchKind::CountSketchWithHeap),
             ),
             // `Extension`/Frequency now binds via `ControlPlaneCostModel`'s
             // `realize_extension` (ASAPController#150) — see
@@ -930,7 +925,7 @@ mod tests {
             (
                 "endpoint_request_freq",
                 AggType::Frequency,
-                Some(SummaryKind::Cms),
+                Some(SketchKind::Cms),
             ),
         ];
         for (metric, agg, expected) in cases {

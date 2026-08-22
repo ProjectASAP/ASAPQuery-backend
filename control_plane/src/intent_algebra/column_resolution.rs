@@ -23,7 +23,11 @@
 //!   (`Schema::closed == false`, per `Binder`'s PromQL-only usage-derived
 //!   catalog), so this degrades to the old strict behavior in practice —
 //!   ready for when a closed (SQL) schema starts flowing through.
-pub use asap_l2::column_resolution::{
-    infer_schema_for_root, infer_source_schema, output_schema_for_aggregate, resolve_column_ref,
-    resolve_column_refs, resolve_expr, resolve_group_keys_promql, ResolveError,
+// `infer_schema_for_root`/`infer_source_schema` no longer exist upstream
+// (ASAPPlanner's crate consolidation, ASAPPlanner#198) and had zero real
+// callers in this repo beyond this re-export -- dropped rather than
+// vendored. See control_plane/docs/design-asapplanner-pin-migration.md.
+pub use planner_types::pre_asap::column_resolution::{
+    output_schema_for_aggregate, resolve_column_ref, resolve_column_refs, resolve_expr,
+    resolve_group_keys_promql, ResolveError,
 };

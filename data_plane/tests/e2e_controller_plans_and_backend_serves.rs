@@ -1120,7 +1120,8 @@ async fn controller_really_pushes_backend_plan_and_query_really_serves() {
     assert_eq!(installed["status"], "success");
     assert_eq!(installed["plan_id"], 1);
     assert_eq!(
-        installed["materialization_count"], 1,
+        installed["materialization_count"],
+        1,
         "GET /api/v1/backend-plan must reflect the just-installed plan, not a stale/empty one:\n{}",
         serde_json::to_string_pretty(&installed).unwrap_or_default()
     );

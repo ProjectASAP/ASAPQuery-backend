@@ -118,13 +118,57 @@ impl FromStr for CleanupPolicy {
 
 /// Window lifecycle/flush semantics for streaming aggregations.
 ///
-/// Formerly a local `WindowType` (`Tumbling`/`Sliding`) enum. Retired in
-/// favor of `asap_ir::intent_algebra::query_expr::WindowKind` directly —
-/// same concept, plus a `Session` variant this workspace didn't have.
-/// `Copy`/`Default`/`Hash`/`Display`/`FromStr` and
-/// `#[serde(rename_all = "snake_case")]` were added upstream
-/// (ASAPController PR #143) specifically so this re-export could replace
-/// the old local type without touching any call site's behavior: same
-/// `Tumbling` default, same lowercase `Display`/`FromStr` round-trip, same
-/// wire format.
-pub use asap_ir::intent_algebra::query_expr::WindowKind;
+/// Formerly a local `WindowType` (`Tumbling`/`Sliding`) enum, retired in
+/// favor of a re-export of `asap_ir::intent_algebra::query_expr::WindowKind`
+/// (ASAPController PR #143 added `Copy`/`Default`/`Hash`/`Display`/
+/// `FromStr` and `#[serde(rename_all = "snake_case")]` upstream
+/// specifically so that re-export could replace the old local type
+/// without touching any call site's behavior).
+///
+/// **Vendored back as a local type** (ASAPPlanner pin migration, see
+/// `control_plane/docs/design-asapplanner-pin-migration.md`): ASAPPlanner
+/// deleted `QueryExpr::Window` outright ("no producer exists" — issue
+/// #181/#192) and with it every trace of a window-lifecycle `WindowKind`
+/// concept; ASAPPlanner's own scope (a batch query-workload planner, not
+/// a streaming execution engine) has no use for tumbling/sliding/session
+/// flush semantics. This workspace's streaming aggregation config still
+/// does, so the type moves back to being owned here — same shape as the
+/// old re-export (`Tumbling` default, lowercase `Display`/`FromStr`
+/// round-trip, same wire format), so none of this repo's ~145 call sites
+/// needed to change.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowKind {
+    /// Fixed, non-overlapping windows (e.g. a new 30s bucket every 30s).
+    #[default]
+    Tumbling,
+    /// Overlapping windows that advance by less than their width.
+    Sliding,
+    /// Gap-based windows that close after a period of inactivity.
+    Session,
+}
+
+impl fmt::Display for WindowKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WindowKind::Tumbling => write!(f, "tumbling"),
+            WindowKind::Sliding => write!(f, "sliding"),
+            WindowKind::Session => write!(f, "session"),
+        }
+    }
+}
+
+impl FromStr for WindowKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tumbling" => Ok(WindowKind::Tumbling),
+            "sliding" => Ok(WindowKind::Sliding),
+            "session" => Ok(WindowKind::Session),
+            _ => Err(format!("Unknown window kind: '{s}'")),
+        }
+    }
+}

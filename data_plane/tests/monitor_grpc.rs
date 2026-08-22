@@ -82,7 +82,9 @@ fn sum_cfg(epsilon: f64) -> MonitorConfig {
 async fn connect_edge(url: &str) -> (mpsc::Sender<EdgeToCoord>, Arc<Mutex<Vec<f64>>>) {
     use asap_otel_proto::monitor::v1::coord_to_edge;
 
-    let mut client = MonitorServiceClient::connect(url.to_string()).await.unwrap();
+    let mut client = MonitorServiceClient::connect(url.to_string())
+        .await
+        .unwrap();
     let (tx, rx) = mpsc::channel(32);
     let mut inbound = client
         .monitor(ReceiverStream::new(rx))
@@ -116,7 +118,10 @@ async fn single_edge_gets_sampled_over_grpc() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let got = *p.lock().unwrap().last().expect("edge received a grant");
-    assert!(got > 0.0 && got < 1.0, "expected a real sampling grant, got {got}");
+    assert!(
+        got > 0.0 && got < 1.0,
+        "expected a real sampling grant, got {got}"
+    );
 }
 
 /// Live multi-edge coupling: two edges open real gRPC streams, report SKEWED
@@ -135,14 +140,28 @@ async fn two_edges_get_differentiated_sample_p_over_grpc() {
 
     // e1 hot (100k items/win), e2 quiet (1k/win).
     for seq in 1..=4 {
-        tx_hot.send(report_edge("e1", seq, 100_000.0)).await.unwrap();
-        tx_quiet.send(report_edge("e2", seq, 1_000.0)).await.unwrap();
+        tx_hot
+            .send(report_edge("e1", seq, 100_000.0))
+            .await
+            .unwrap();
+        tx_quiet
+            .send(report_edge("e2", seq, 1_000.0))
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(40)).await;
     }
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let hot = *p_hot.lock().unwrap().last().expect("hot edge received a grant");
-    let quiet = *p_quiet.lock().unwrap().last().expect("quiet edge received a grant");
+    let hot = *p_hot
+        .lock()
+        .unwrap()
+        .last()
+        .expect("hot edge received a grant");
+    let quiet = *p_quiet
+        .lock()
+        .unwrap()
+        .last()
+        .expect("quiet edge received a grant");
     println!("LIVE coupling over gRPC: hot(e1,rate=100k) sample_p={hot} | quiet(e2,rate=1k) sample_p={quiet}");
 
     assert!(
@@ -170,6 +189,12 @@ async fn report_grants_only_the_reporting_edge_over_grpc() {
     tx_a.send(report_edge("e1", 1, 50_000.0)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    assert!(!p_a.lock().unwrap().is_empty(), "e1 should have received its own grant");
-    assert!(p_b.lock().unwrap().is_empty(), "e2 must not receive a grant it never reported for");
+    assert!(
+        !p_a.lock().unwrap().is_empty(),
+        "e1 should have received its own grant"
+    );
+    assert!(
+        p_b.lock().unwrap().is_empty(),
+        "e2 must not receive a grant it never reported for"
+    );
 }
