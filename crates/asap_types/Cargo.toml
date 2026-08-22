@@ -12,17 +12,22 @@ anyhow.workspace = true
 clap.workspace = true
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
-# First cross-crate ASAPController dependency for data_plane (transitively,
-# via this crate): WindowType -> asap_ir::intent_algebra::query_expr::WindowKind
+# First cross-crate ASAPPlanner dependency for data_plane (transitively,
+# via this crate): WindowType -> planner_types::pre_asap::query_expr::WindowKind
 # unification (scratchpad/artifacts/enum-unification-plan.md). Pin matches
-# control_plane's -- see control_plane/Cargo.toml's comment for the rationale.
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
-# Step 5 of the sketch-identity unification (see
-# scratchpad/artifacts/enum-unification-plan.md): `AccumulatorSpec`
+# control_plane's -- see control_plane/Cargo.toml's comment for the
+# rationale, including why this is aliased to `planner-types` rather than
+# depended on as `asap-types` directly (this crate IS `asap_types` --
+# depending on the upstream package under its own name would collide).
+#
+# `asap-ir` and `asap-sketch` (this repo's old two separate pins) merged
+# into this one upstream crate (ASAPPlanner#198); `pre_asap`/`post_asap`
+# modules replace the old L3/L4 split. `AccumulatorSpec`
 # (accumulator_spec.rs) converges data_plane's identity representation
-# onto ASAPController's `SummaryKind`/`SummaryParams`, same as
-# control_plane already does (Stage 3, merged). Pin MUST match
-# control_plane's pin exactly (`control_plane/Cargo.toml`) -- two
-# different revs of the same git dependency in one workspace resolve
-# to two distinct Rust types that won't unify.
-asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
+# onto ASAPPlanner's `SketchKind`/`SketchParams` (formerly
+# `SummaryKind`/`SummaryParams`, split per-family in ASAPPlanner#218),
+# same as control_plane already does. Pin MUST match control_plane's pin
+# exactly (`control_plane/Cargo.toml`) -- two different revs of the same
+# git dependency in one workspace resolve to two distinct Rust types that
+# won't unify.
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "cb70086b4c4a7ba89baf2516be81d0b192137a3a" }

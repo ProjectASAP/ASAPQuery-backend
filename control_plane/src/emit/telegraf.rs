@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 
 use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, EdgeStageConfig, ExportTarget};
 use crate::physical::colored_dag::stage_id::StageId;
-use asap_sketch::{SummaryKind, SummaryParams};
+use planner_types::post_asap::{SketchKind, SketchParams};
 
 /// Default Prometheus remote-write URL for Mode 3 — Telegraf doesn't
 /// support OTLP-HTTP egress, so we land in the same Prometheus archive
@@ -168,65 +168,56 @@ fn emit_processors_allsketches(
         sketch_kind_tag(&sp.sketch_kind)
     ));
     match &sp.sketch_params {
-        SummaryParams::Kll { k } => {
+        SketchParams::Kll { k } => {
             out.push_str(&format!("  k = {k}\n"));
         }
-        SummaryParams::DDSketch { alpha } => {
+        SketchParams::DDSketch { alpha } => {
             out.push_str(&format!("  relative_accuracy = {alpha}\n"));
             out.push_str("  delta_transmission = true\n");
         }
-        SummaryParams::Hll { .. } => {
+        SketchParams::Hll { .. } => {
             out.push_str("  delta_transmission = true\n");
         }
         // Heap-bearing width/depth extraction is identical to the bare
         // kind — this path never distinguished `with_heap` even before
-        // `SummaryKind` split it into its own variant.
-        SummaryParams::Cms { width, depth } | SummaryParams::CmsWithHeap { width, depth, .. } => {
+        // `SketchKind` split it into its own variant.
+        SketchParams::Cms { width, depth } | SketchParams::CmsWithHeap { width, depth, .. } => {
             out.push_str(&format!("  rows = {depth}\n"));
             out.push_str(&format!("  columns = {width}\n"));
             out.push_str("  delta_transmission = true\n");
         }
-        SummaryParams::CountSketch { width, depth }
-        | SummaryParams::CountSketchWithHeap { width, depth, .. } => {
+        SketchParams::CountSketch { width, depth }
+        | SketchParams::CountSketchWithHeap { width, depth, .. } => {
             let epsilon = std::f64::consts::E / (*width as f64);
             let delta = 2f64.powi(-(*depth as i32));
             out.push_str(&format!("  epsilon = {epsilon}\n"));
             out.push_str(&format!("  delta = {delta}\n"));
             out.push_str("  delta_transmission = true\n");
         }
-        SummaryParams::Sum
-        | SummaryParams::Count
-        | SummaryParams::MinMax
-        | SummaryParams::Increase
-        | SummaryParams::Rate
-        | SummaryParams::Kmv { .. }
-        | SummaryParams::Theta { .. } => {
+        // Exact-accumulator kinds (Sum/Count/MinMax/Increase/Rate) aren't
+        // representable in `SketchParams` at all anymore -- they're
+        // `ExactParams`, a distinct type post ASAPPlanner#218's split.
+        SketchParams::Kmv { .. } | SketchParams::Theta { .. } => {
             unreachable!(
-                "edge sketch processor config requested for a non-sketch or unsupported \
-                 SummaryKind; no Bind* rule in this repo produces one"
+                "edge sketch processor config requested for an unsupported SketchKind; \
+                 no Bind* rule in this repo produces one"
             )
         }
     }
     out.push('\n');
 }
 
-fn sketch_kind_tag(kind: &SummaryKind) -> &'static str {
+fn sketch_kind_tag(kind: &SketchKind) -> &'static str {
     match kind {
-        SummaryKind::Kll => "kll",
-        SummaryKind::DDSketch => "ddsketch",
-        SummaryKind::Hll => "hll",
-        SummaryKind::Cms | SummaryKind::CmsWithHeap => "cms",
-        SummaryKind::CountSketch | SummaryKind::CountSketchWithHeap => "count_sketch",
-        SummaryKind::Sum
-        | SummaryKind::Count
-        | SummaryKind::MinMax
-        | SummaryKind::Increase
-        | SummaryKind::Rate
-        | SummaryKind::Kmv
-        | SummaryKind::Theta => {
+        SketchKind::Kll => "kll",
+        SketchKind::DDSketch => "ddsketch",
+        SketchKind::Hll => "hll",
+        SketchKind::Cms | SketchKind::CmsWithHeap => "cms",
+        SketchKind::CountSketch | SketchKind::CountSketchWithHeap => "count_sketch",
+        SketchKind::Kmv | SketchKind::Theta => {
             unreachable!(
-                "edge sketch processor config requested for a non-sketch or unsupported \
-                 SummaryKind; no Bind* rule in this repo produces one"
+                "edge sketch processor config requested for an unsupported \
+                 SketchKind; no Bind* rule in this repo produces one"
             )
         }
     }
@@ -327,7 +318,7 @@ mod toml_minimal {
 mod tests {
     use super::*;
     use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, PrometheusArchiveMetric};
-    use asap_sketch::{SummaryKind, SummaryParams};
+    use planner_types::post_asap::{SketchKind, SketchParams};
 
     fn ddsketch_edge_cfg_mode1() -> EdgeStageConfig {
         EdgeStageConfig {
@@ -336,8 +327,8 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "ddsketch".to_string(),
-                sketch_kind: SummaryKind::DDSketch,
-                sketch_params: SummaryParams::DDSketch { alpha: 0.01 },
+                sketch_kind: SketchKind::DDSketch,
+                sketch_params: SketchParams::DDSketch { alpha: 0.01 },
                 aggregation_id: "agg0".to_string(),
             }],
             exporter_target: ExportTarget::Stage(StageId::Gateway),
@@ -545,8 +536,8 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "KLL".to_string(),
-                sketch_kind: SummaryKind::Kll,
-                sketch_params: SummaryParams::Kll { k: 200 },
+                sketch_kind: SketchKind::Kll,
+                sketch_params: SketchParams::Kll { k: 200 },
                 aggregation_id: "agg0".to_string(),
             }],
             exporter_target: ExportTarget::Stage(StageId::Gateway),

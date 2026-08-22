@@ -229,13 +229,6 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
             children: vec![],
         },
 
-        QueryExpr::Ref { .. } => PhysicalNode {
-            op: PhysicalOp::Passthrough,
-            placement: Placement::QueryEngine,
-            cost: PhysicalCost::default(),
-            children: vec![],
-        },
-
         // ── Filter: same placement as child ─────────────────────────
         QueryExpr::Filter { pred, child } => {
             let child = plan_node(child, config);
@@ -249,12 +242,13 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
             }
         }
 
-        // ── Window: a Window over a single-intent Aggregate is the
-        // canonical fold of the legacy WindowedAgg — recognize it and
-        // reconstruct the fused OtelSketchBuild { window } placement.
-        // Any other Window is a plain passthrough inheriting the child's
+        // ── TimeRange: a TimeRange over a single-intent Aggregate is the
+        // canonical fold of the legacy WindowedAgg (was `Window` before
+        // the ASAPPlanner pin migration) — recognize it and reconstruct
+        // the fused OtelSketchBuild { window } placement. Any other
+        // TimeRange is a plain passthrough inheriting the child's
         // placement.
-        QueryExpr::Window {
+        QueryExpr::TimeRange {
             child: window_child,
             ..
         } => {
@@ -291,7 +285,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         //   * multi-intent or HAVING → exact HashAggregate at QueryEngine
         QueryExpr::Aggregate {
             reduction,
-            aggs,
+            measures: aggs,
             having,
             child,
             ..
@@ -440,15 +434,13 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
             }
         }
 
-        // ── LetBinding ──────────────────────────────────────────────
-        QueryExpr::LetBinding { child, .. } => plan_node(child, config),
-
         // The PromQL-surface superset (Scalar/EvalTime/VectorFromScalar/
-        // ScalarFromVector/Relabel/InfoJoin/Sample/TimeRange/TimeShift/
-        // WindowFunc) isn't constructed by this parser today. `Scalar` /
-        // `EvalTime` are leaves; every other new variant wraps exactly
-        // one child — inherit its placement, mirroring the Sort/Limit/
-        // Project arm above, until a dedicated physical op is written.
+        // ScalarFromVector/Relabel/InfoJoin/Sample/TimeShift/WindowFunc)
+        // isn't constructed by this parser today (`TimeRange` has its own
+        // arm above -- it *is* constructed). `Scalar` / `EvalTime` are
+        // leaves; every other new variant wraps exactly one child —
+        // inherit its placement, mirroring the Sort/Limit/Project arm
+        // above, until a dedicated physical op is written.
         QueryExpr::Scalar(_) | QueryExpr::EvalTime => PhysicalNode {
             op: PhysicalOp::Passthrough,
             placement: Placement::QueryEngine,
@@ -460,7 +452,6 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         | QueryExpr::Relabel { child, .. }
         | QueryExpr::InfoJoin { child, .. }
         | QueryExpr::Sample { child, .. }
-        | QueryExpr::TimeRange { child, .. }
         | QueryExpr::TimeShift { child, .. }
         | QueryExpr::WindowFunc { child, .. } => {
             let child = plan_node(child, config);
@@ -471,6 +462,16 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
                 children: vec![child],
             }
         }
+        // Scalar-expression node (Column/Literal/Compare/BoolAnd/BoolOr/
+        // Not/IsNull/IsNotNull/Cast/InList/FunctionCall/Arith/Case) --
+        // see `physical::allocator`'s matching catch-all for why this
+        // never reaches here as a bare top-level node in practice.
+        _ => PhysicalNode {
+            op: PhysicalOp::Passthrough,
+            placement: Placement::QueryEngine,
+            cost: PhysicalCost::default(),
+            children: vec![],
+        },
     }
 }
 
@@ -591,7 +592,7 @@ mod tests {
     use crate::intent_algebra::relational::{
         default_cardinality, default_frequency, default_quantile,
     };
-    use crate::intent_algebra::{Reduction, Schema, Source, WindowKind};
+    use crate::intent_algebra::{Reduction, Schema, Source};
     use crate::types_v2::AccuracyTarget;
 
     fn default_config() -> PhysicalPlannerConfig {
@@ -617,20 +618,18 @@ mod tests {
     fn sketch_agg(intent: AggIntent, metric: &str) -> QueryExpr {
         QueryExpr::Aggregate {
             reduction: Reduction::by(vec![]),
-            aggs: vec![intent],
+            measures: vec![intent],
             output_names: Vec::new(),
             having: None,
             child: Box::new(scan(metric)),
         }
     }
 
-    /// `Window { Aggregate }` — the canonical fold of the legacy
+    /// `TimeRange { Aggregate }` — the canonical fold of the legacy
     /// `WindowedAgg`.
     fn windowed_agg(intent: AggIntent, size_secs: u64, metric: &str) -> QueryExpr {
-        QueryExpr::Window {
-            kind: WindowKind::Tumbling,
-            size: Duration::from_secs(size_secs),
-            slide: None,
+        QueryExpr::TimeRange {
+            range: Duration::from_secs(size_secs),
             child: Box::new(sketch_agg(intent, metric)),
         }
     }
@@ -699,7 +698,7 @@ mod tests {
     fn plan_topk_at_query_engine() {
         let expr = QueryExpr::Aggregate {
             reduction: Reduction::by(vec![]),
-            aggs: vec![AggIntent::TopK {
+            measures: vec![AggIntent::TopK {
                 k: 10,
                 accuracy: AccuracyTarget::Epsilon(0.05),
             }],
@@ -718,7 +717,7 @@ mod tests {
         // between them.
         let expr = QueryExpr::Aggregate {
             reduction: Reduction::by(vec![]),
-            aggs: vec![AggIntent::TopK {
+            measures: vec![AggIntent::TopK {
                 k: 5,
                 accuracy: AccuracyTarget::Epsilon(0.05),
             }],
@@ -748,7 +747,7 @@ mod tests {
         // (no single sketch serves multiple intents).
         let expr = QueryExpr::Aggregate {
             reduction: Reduction::by(vec![]),
-            aggs: vec![AggIntent::Sum { col: None }, AggIntent::Min { col: None }],
+            measures: vec![AggIntent::Sum { col: None }, AggIntent::Min { col: None }],
             output_names: Vec::new(),
             having: None,
             child: Box::new(scan("trades")),
@@ -766,7 +765,7 @@ mod tests {
         // Should span: Agent → Backend → QueryEngine
         let expr = QueryExpr::Aggregate {
             reduction: Reduction::by(vec![]),
-            aggs: vec![AggIntent::TopK {
+            measures: vec![AggIntent::TopK {
                 k: 10,
                 accuracy: AccuracyTarget::Epsilon(0.05),
             }],

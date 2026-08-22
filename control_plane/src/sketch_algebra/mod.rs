@@ -6,13 +6,13 @@
 //!   deployment-independent). Single-rooted per query; multi-root
 //!   workload-level fan-in lives one layer up in
 //!   `types_v2::WorkloadPlan`.
-//! - `asap_sketch::SummaryKind` / `SummaryParams` — typed sketch-family
+//! - `planner_types::post_asap::SummaryKind` / `SummaryParams` — typed sketch-family
 //!   selector + parameter payload (moved out of this crate — formerly
 //!   `sketch_params::SketchKind`/`SketchParams` — Stage 3 of the
 //!   sketch-identity unification; see
 //!   `scratchpad/artifacts/enum-unification-plan.md`).
 //! - [`bind_query_expr`] — the L3→L4 lowering driver: bottom-up walk
-//!   that delegates to `asap_plan::bind::implement_tree_in_with` (the
+//!   that delegates to `asap_aware_mapping::bind::implement_tree_in_with` (the
 //!   local `Bind*` rule family it used to fire was retired in Step B).
 //!
 //! Scope reduction (per orchestrator spec): the variant set ships the

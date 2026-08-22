@@ -257,7 +257,13 @@ impl MonitorCoordinator {
                 // are no longer consulted — no countdown left to feed them
                 // into; they still ride the wire message for compatibility).
                 if let Some(actions) = self
-                    .apply_report(rep.agg_id, rep.key.clone(), &rep.edge_id, rep.window_start_ms, rep.rate)
+                    .apply_report(
+                        rep.agg_id,
+                        rep.key.clone(),
+                        &rep.edge_id,
+                        rep.window_start_ms,
+                        rep.rate,
+                    )
                     .await
                 {
                     self.dispatch(rep.agg_id, &rep.key, actions).await;
@@ -367,8 +373,7 @@ mod reconfigure_tests {
         );
 
         // Drop agg 1, keep agg 2 unchanged.
-        let (added, changed, removed) =
-            coord.reconfigure(vec![cfg(2, "s0", 5000.0)]).await;
+        let (added, changed, removed) = coord.reconfigure(vec![cfg(2, "s0", 5000.0)]).await;
         assert_eq!((added, changed, removed), (0, 0, 1));
         assert_eq!(coord.monitor_count(), 1);
     }
@@ -380,7 +385,10 @@ mod reconfigure_tests {
         let actions = coord
             .apply_register(7, b"s0".to_vec(), "edge-a", 15_000, 15_000)
             .await;
-        assert!(actions.is_some(), "register for a configured monitor succeeds");
+        assert!(
+            actions.is_some(),
+            "register for a configured monitor succeeds"
+        );
         assert_eq!(coord.monitors.lock().await.len(), 1);
 
         // Changing the spec (new τ) must drop the stale live state so the next

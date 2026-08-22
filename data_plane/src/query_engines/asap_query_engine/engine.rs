@@ -471,7 +471,7 @@ impl ASAPQueryEngine {
             // fix): every `result` now comes from `SummaryExecutor`
             // (`live_served_result` above), and `bind_query_expr`'s
             // lowering already realizes the full aggregation (including
-            // any `by (...)`) into the `L4Node` it executed — re-folding
+            // any `by (...)`) into the `SummaryNode` it executed — re-folding
             // here would double-apply it.
             combined_result = Some(result);
         }
@@ -1185,7 +1185,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 // `result` now comes from `SummaryExecutor` above, and
                 // `bind_query_expr`'s lowering already realizes the full
                 // aggregation (including any `by (...)`) into the
-                // `L4Node` it executed — re-folding here would
+                // `SummaryNode` it executed — re-folding here would
                 // double-apply it.
                 combined_result = Some(result);
             }
@@ -2939,7 +2939,7 @@ mod asap_tier_classify_tests {
         // Whichever query has a `rate(...)` call ANYWHERE in its tree
         // (bare `rate(...)` or composed `sum by (...) (rate(...))`) binds
         // to `AggIntent::Rate` and now maps to `ExactAgg(Increase)` --
-        // matching `asap_plan::boundary::implementation_for`'s
+        // matching `asap_aware_mapping::boundary::implementation_for`'s
         // `SummaryKind::Rate` (ASAPController models Rate as its own
         // summary family; see `capability_for`'s module doc and
         // `Capability::is_satisfied_by`'s `sum_satisfies_increase` for
@@ -3375,7 +3375,7 @@ mod outer_agg_integration_tests {
     /// -- identity here, since each zone already has one row). There's no
     /// equivalent in `SummaryExecutor`'s single-tree-bind model: the outer
     /// `AggIntent::Max` commits unconditionally to its own `MinMax`
-    /// accumulator (`asap_plan::boundary::implementation_for_with`), which
+    /// accumulator (`asap_aware_mapping::boundary::implementation_for_with`), which
     /// requires a real, independently-registered `MinMax` sid that never
     /// exists for this shape -- so the whole tree fails to realize even
     /// though the inner quantile would answer fine standalone. This is a
@@ -3497,7 +3497,7 @@ mod outer_agg_integration_tests {
     /// `execute_max_by_zone_over_quantile_over_time_capability_misses_pending_asapcontroller_171`
     /// above, except `AggIntent::Avg` maps to `Implementation::PassThrough`
     /// rather than an accumulator commitment
-    /// (`asap_plan::boundary::implementation_for_with`), so
+    /// (`asap_aware_mapping::boundary::implementation_for_with`), so
     /// `implement_tree_in_with`'s conservative fallback wraps the WHOLE
     /// tree — including the otherwise-realizable inner quantile — as one
     /// opaque `Logical` blob. Same accepted-gap outcome either way:

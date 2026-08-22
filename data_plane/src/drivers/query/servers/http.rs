@@ -2251,10 +2251,8 @@ mod tests {
     async fn setup_test_server_with_backend_plan(
         hot_reload: Option<crate::storage_engines::types::HotReloadBackendPlan>,
     ) -> u16 {
-        let adapter_config = AdapterConfig::prometheus_promql(
-            "http://127.0.0.1:9999".to_string(),
-            false,
-        );
+        let adapter_config =
+            AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
         let config = HttpServerConfig {
             port: 0,
             handle_http_requests: true,
@@ -2504,7 +2502,9 @@ aggregations:
         let client = Client::new();
 
         let initial = client
-            .get(format!("http://127.0.0.1:{server_port}/api/v1/backend-plan"))
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/backend-plan"
+            ))
             .send()
             .await
             .expect("GET failed");
@@ -2520,7 +2520,9 @@ aggregations:
         let bytes = new_plan.encode_to_vec();
 
         let post_resp = client
-            .post(format!("http://127.0.0.1:{server_port}/api/v1/backend-plan"))
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/backend-plan"
+            ))
             .header("content-type", "application/x-protobuf")
             .body(bytes)
             .send()
@@ -2536,7 +2538,9 @@ aggregations:
         assert_eq!(post_body["plan_id"], 7);
 
         let after = client
-            .get(format!("http://127.0.0.1:{server_port}/api/v1/backend-plan"))
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/backend-plan"
+            ))
             .send()
             .await
             .expect("GET after swap failed");
@@ -2553,14 +2557,18 @@ aggregations:
         let client = Client::new();
 
         let get_resp = client
-            .get(format!("http://127.0.0.1:{server_port}/api/v1/backend-plan"))
+            .get(format!(
+                "http://127.0.0.1:{server_port}/api/v1/backend-plan"
+            ))
             .send()
             .await
             .unwrap();
         assert_eq!(get_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
 
         let post_resp = client
-            .post(format!("http://127.0.0.1:{server_port}/api/v1/backend-plan"))
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/backend-plan"
+            ))
             .body("anything")
             .send()
             .await
@@ -2577,7 +2585,9 @@ aggregations:
         let client = Client::new();
 
         let resp = client
-            .post(format!("http://127.0.0.1:{server_port}/api/v1/backend-plan"))
+            .post(format!(
+                "http://127.0.0.1:{server_port}/api/v1/backend-plan"
+            ))
             .body(vec![0xFFu8, 0xFF, 0xFF])
             .send()
             .await

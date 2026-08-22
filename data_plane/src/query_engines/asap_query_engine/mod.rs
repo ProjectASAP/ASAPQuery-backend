@@ -13,6 +13,7 @@ pub mod engine;
 pub mod l4_lowering;
 pub mod l4_readout;
 pub mod live_serve;
+pub mod summary_exec;
 pub mod summary_executor;
 
 // Phase-5 reorg: ASAP-tier reducer moved to `sketch_db::query`. The

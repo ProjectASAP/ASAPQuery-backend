@@ -13,4 +13,4 @@
 //! [`Binder::bind_with_inherited`] for the `BinaryOp`-side-rebinding case
 //! (issue #52) — a capability this repo's Binder never had.
 
-pub use asap_l2::binder::{Binder, SchemaCatalog, UsageDerivedCatalog};
+pub use planner_types::pre_asap::binder::{Binder, SchemaCatalog, UsageDerivedCatalog};

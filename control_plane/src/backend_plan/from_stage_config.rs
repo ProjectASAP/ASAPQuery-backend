@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use asap_sketch::SummaryKind;
+use asap_types::SummaryKind;
 use asap_types::{AggregationConfig, MonitorSpec, PolicyFingerprint, QueryLanguage};
 
 use crate::emit::monitor::{agg_id_for_metric, MonitorIntent};
@@ -147,8 +147,10 @@ fn policy_fingerprint_for_aggregation(agg: &BackendAggregation) -> Result<Policy
 /// `AggregationType::FromStr` (same parser
 /// `AggregationConfig::from_yaml_data` uses) and carry it as the
 /// matching `SummaryKind`/`SummaryParams` exact-agg pair.
-fn exact_kind_params_for_override(exact_type: &str) -> Result<(SummaryKind, asap_sketch::SummaryParams)> {
-    use asap_sketch::SummaryParams;
+fn exact_kind_params_for_override(
+    exact_type: &str,
+) -> Result<(SummaryKind, asap_types::SummaryParams)> {
+    use asap_types::SummaryParams;
     match exact_type {
         "Sum" => Ok((SummaryKind::Sum, SummaryParams::Sum)),
         "Count" => Ok((SummaryKind::Count, SummaryParams::Count)),
@@ -166,9 +168,12 @@ fn exact_kind_params_for_override(exact_type: &str) -> Result<(SummaryKind, asap
 /// the sketch family + readout op, matching
 /// `sketch_algebra::capability::Capability`'s variant-per-query-shape
 /// design.
-fn capability_for_readout(agg: &BackendAggregation, op: &asap_sketch::SketchQuery) -> Result<Capability> {
-    use asap_sketch::SketchQuery;
+fn capability_for_readout(
+    agg: &BackendAggregation,
+    op: &planner_types::post_asap::SketchQuery,
+) -> Result<Capability> {
     use asap_types::AggregationType;
+    use planner_types::post_asap::SketchQuery;
 
     if let Some(exact_type) = &agg.agg_type_override {
         let agg_type: AggregationType = exact_type
@@ -207,8 +212,10 @@ fn sketch_kind_handle(kind: &SummaryKind) -> Result<SketchKindHandle> {
 mod tests {
     use super::*;
     use crate::physical::colored_dag::emitter::{AggregationInput, BackendReadout};
-    use asap_sketch::{SketchQuery, SummaryParams};
-    use asap_types::{AggregationType, KeyByLabelNames, WindowKind as AsapWindowKind};
+    use asap_types::{
+        AggregationType, KeyByLabelNames, SummaryParams, WindowKind as AsapWindowKind,
+    };
+    use planner_types::post_asap::SketchQuery;
     use std::collections::HashMap as StdHashMap;
 
     fn agg(
@@ -327,10 +334,9 @@ mod tests {
 
         for agg in &cfg.aggregations {
             let expected = hand_built_config(agg).policy_fingerprint();
-            let m = plan
-                .materializations
-                .get(&expected)
-                .unwrap_or_else(|| panic!("no materialization for expected fingerprint of {agg:?}"));
+            let m = plan.materializations.get(&expected).unwrap_or_else(|| {
+                panic!("no materialization for expected fingerprint of {agg:?}")
+            });
             assert_eq!(m.fingerprint, expected);
         }
     }
@@ -374,7 +380,10 @@ mod tests {
             .iter()
             .find(|r| r.materialization == ddsketch_fp)
             .expect("routing entry for ddsketch");
-        assert_eq!(quantile_entry.satisfies, Capability::QuantileApprox(SketchKindHandle::DDSketch));
+        assert_eq!(
+            quantile_entry.satisfies,
+            Capability::QuantileApprox(SketchKindHandle::DDSketch)
+        );
 
         let hll_fp = plan
             .materializations
@@ -431,17 +440,24 @@ mod tests {
             ],
         };
         let plan = from_stage_config(&cfg, &[], 1, 0).expect("build plan");
-        let topk_entry = plan
-            .routing
-            .iter()
-            .find(|r| r.satisfies == Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap));
-        assert!(topk_entry.is_some(), "expected a FrequencyTopk routing entry: {:?}", plan.routing);
+        let topk_entry = plan.routing.iter().find(|r| {
+            r.satisfies == Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap)
+        });
+        assert!(
+            topk_entry.is_some(),
+            "expected a FrequencyTopk routing entry: {:?}",
+            plan.routing
+        );
 
         let freq_entry = plan
             .routing
             .iter()
             .find(|r| r.satisfies == Capability::FrequencyEstimate(SketchKindHandle::CountMin));
-        assert!(freq_entry.is_some(), "expected a FrequencyEstimate routing entry: {:?}", plan.routing);
+        assert!(
+            freq_entry.is_some(),
+            "expected a FrequencyEstimate routing entry: {:?}",
+            plan.routing
+        );
     }
 
     #[test]
@@ -462,7 +478,11 @@ mod tests {
             }],
         };
         let plan = from_stage_config(&cfg, &[], 1, 0).expect("build plan");
-        let (_, m) = plan.materializations.iter().next().expect("one materialization");
+        let (_, m) = plan
+            .materializations
+            .iter()
+            .next()
+            .expect("one materialization");
         assert!(m.kind.is_exact());
         assert_eq!(m.kind, SummaryKind::Sum);
 

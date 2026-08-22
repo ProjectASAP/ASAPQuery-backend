@@ -178,7 +178,9 @@ impl Analyzer {
             .map(|q| {
                 query_parser::parse_query(
                     q,
-                    spec.accuracy.clone().unwrap_or(AccuracyTarget::Epsilon(0.01)),
+                    spec.accuracy
+                        .clone()
+                        .unwrap_or(AccuracyTarget::Epsilon(0.01)),
                 )
             })
             .transpose()

@@ -572,17 +572,16 @@ mod tests {
     async fn backend_plan_post_round_trips_bytes_via_url_rewrite() {
         let hits: StdArc<Mutex<Vec<Vec<u8>>>> = StdArc::new(Mutex::new(Vec::new()));
         let hits_for_route = hits.clone();
-        let app = Router::new()
-            .route(
-                "/api/v1/backend-plan",
-                post(move |body: axum::body::Bytes| {
-                    let hits = hits_for_route.clone();
-                    async move {
-                        hits.lock().unwrap().push(body.to_vec());
-                        axum::http::StatusCode::OK
-                    }
-                }),
-            );
+        let app = Router::new().route(
+            "/api/v1/backend-plan",
+            post(move |body: axum::body::Bytes| {
+                let hits = hits_for_route.clone();
+                async move {
+                    hits.lock().unwrap().push(body.to_vec());
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

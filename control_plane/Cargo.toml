@@ -25,23 +25,20 @@ tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 chrono      = { version = "0.4",  features = ["serde"] }
 # Private mirror of GreptimeTeam/promql-parser (Apache-2.0), matching
-# ASAPController's frontend-promql -- carries local patches (limitk /
-# limit_ratio, a batch of experimental Prometheus functions) upstream
-# crates.io 0.8 doesn't have. Pinned to a commit, not the `asap` branch,
-# for the same reproducibility reason as the asap-ir pin below.
+# ASAPPlanner's frontend-promql historically -- carries local patches
+# (limitk / limit_ratio, a batch of experimental Prometheus functions)
+# upstream crates.io 0.8 doesn't have. Pinned to a commit, not the `asap`
+# branch, for the same reproducibility reason as the planner-types pin
+# below.
 #
-# Known duplication: `asap-frontend-promql` (below) references this same
-# repo via a floating `branch = "asap"` rather than `rev =`, so cargo
-# resolves two distinct package instances today (verified: `cargo tree -i
-# promql-parser` lists both). They happen to be the same commit right
-# now. Tried unifying via a workspace `[patch]` -- cargo rejects patching
-# a source with a different ref of itself ("patches must point to
-# different sources"), and no local checkout exists to patch to path=
-# instead (unlike the asap_sketchlib precedent in the root Cargo.toml).
-# Accepted as a known, low-severity tradeoff (extra compile time, a
-# latent divergence risk if either pin moves) rather than forcing a
-# fragile workaround -- revisit if `asap-frontend-promql` ever pins via
-# `rev` itself.
+# ASAPPlanner's own `asap-frontend-promql` has since switched to the
+# public crates.io `promql-parser = "0.10"` release (ASAPPlanner#209) --
+# 0.10 upstreamed most of what this fork carries as patches (the
+# duplication note that used to live here is stale now that upstream
+# isn't on a floating branch at all), except the legacy `holt_winters`
+# alias this repo doesn't reference. Dropping this private-fork pin in
+# favor of the public 0.10 release is a reasonable follow-up but is out
+# of scope for the ASAPController -> ASAPPlanner pin migration.
 promql-parser  = { git = "https://github.com/ProjectASAP/promql-parser", rev = "c51beafb361af4cc95ed62ae377862c660ceb757" }
 prost          = "0.13"
 bytes          = "1"
@@ -52,49 +49,60 @@ tonic          = { version = "0.12", features = ["gzip"] }
 tokio-stream   = { version = "0.1", features = ["net"] }
 asap_types.workspace = true
 
-# Transitional pin (docs/migration-plan-backend-plan.md Phase 1b): locked to a
-# specific commit on ASAPController's main, not a tag -- ASAPController has no
-# tagged releases yet. Re-pin as ASAPController's IR evolves; move to a tag
-# once one exists.
+# Transitional pin (docs/migration-plan-backend-plan.md Phase 1b; see also
+# control_plane/docs/design-asapplanner-pin-migration.md for the migration
+# this bump landed): locked to a specific commit on ASAPPlanner's main,
+# not a tag -- ASAPPlanner has no tagged releases yet. Re-pin as
+# ASAPPlanner's IR evolves; move to a tag once one exists.
 #
-# Bumped to fc09c3a (main tip, "feat(sketch): SummaryExecutor --
-# serving-time execution model for L4Node", #155) to pick up
-# `asap_sketch::exec::{SummaryExecutor, execute}` -- the serving-time
-# counterpart to `asap_plan::bind`'s planning-time L4Node construction,
-# needed for data_plane/docs/l4node-plan-executor-design.md (Step C).
-# fc09c3a is a strict descendant of 7fcaf91 (the previous pin, "add
-# serving-time traits to WindowKind" / Phase 2 #395), so nothing this
-# repo already consumes from that revision moves.
+# Bumped to cb70086 (main tip, 2026-08-22) from cc18c987. In between,
+# ASAPPlanner consolidated its crates (ASAPPlanner#198): `asap-ir` and
+# `asap-sketch` merged into one crate -- Cargo package `asap-types`, with
+# `pre_asap`/`post_asap` modules replacing the old L3/L4 split -- and
+# `asap-l2` was deleted outright (folded into `asap-frontend-promql` +
+# `asap-types::pre_asap`). Depended on here under the `planner-types` key
+# (via `package = "asap-types"`), not `asap-types` directly, because this
+# repo already has its own crate literally named `asap_types`
+# (crates/asap_types) -- Cargo canonicalizes `-`/`_` for the extern-crate
+# identifier, so the two would collide on the same Rust path under the
+# upstream package's own name. `package =` renames the *local* identifier
+# only; nothing upstream changes.
 #
 # asap-plan owns the single authoritative AggIntent -> sketch-vs-exact
 # implementation decision (`boundary::implementation_for`, Cascades
 # "implementation rule" terminology -- see that crate's doc); capability_for
-# delegates to it instead of maintaining its own parallel judgment. asap-plan
-# depends only on asap-ir (per its own crate doc's layering invariant), so
-# this doesn't pull in datafusion or any front-end weight. asap-sketch is
-# asap-plan's own dependency (SummaryKind/SummaryParams), needed here only
-# to translate Implementation into this repo's own Capability vocabulary.
+# delegates to it instead of maintaining its own parallel judgment. It is
+# now its own crate, `asap-aware-mapping` (same role, same public API
+# shape -- `implement_tree`/`implement_tree_with`,
+# `CostModel::{rank_candidates, size_params, realize_extension,
+# readout_extension}`, `boundary::Matcher` -- just relocated and renamed
+# alongside the rest of the restructure). It still depends only on
+# `asap-types` (per its own crate doc's layering invariant), so this
+# doesn't pull in datafusion or any front-end weight.
 #
-# Bumped to 64df20d (main tip, "feat(plan): pluggable AggIntent::Extension
-# realization + readout hook", #162) to pick up
 # `CostModel::{realize_extension, readout_extension}` -- the pluggable
 # `AggIntent::Extension` hook this repo's `Extension{"frequency"}` intent
-# needs (ASAPController#150). 64df20d is a strict descendant of d4c1756
-# (the previous pin), so nothing this repo already consumes moves.
-asap-ir = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
-asap-l2 = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
-asap-sketch = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
-asap-plan = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
+# needs (ASAPPlanner#150) -- kept the same shape across the restructure
+# (verified by reading `asap-aware-mapping/src/cost_model.rs` on `main`).
+#
+# `asap_sketch::exec` (`SummaryExecutor`/`execute`) -- the serving-time
+# counterpart to `asap-aware-mapping`'s planning-time `SummaryNode`
+# construction, needed for data_plane/docs/l4node-plan-executor-design.md
+# (Step C) -- was deleted upstream (ASAPPlanner#190/#197): upstream's own
+# repo search found no implementor and concluded the module was dead
+# scaffolding, unaware that `data_plane`'s `summary_executor.rs` in *this*
+# repo is a real one. Vendored locally instead of chased upstream -- see
+# `data_plane/src/query_engines/asap_query_engine/summary_exec.rs`.
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "cb70086b4c4a7ba89baf2516be81d0b192137a3a" }
+asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "cb70086b4c4a7ba89baf2516be81d0b192137a3a" }
 
 # L1 adoption (design-target-architecture.md Part B): the PromQL front
 # end itself, replacing control_plane's own query_parser/promql.rs.
-# Pinned via `rev`, not ASAPController's own `branch = "asap"` reference
-# on its internal `promql-parser` dependency -- keeps this crate's own
-# `promql-parser` pin (above) as the single source of truth for that
-# transitive dependency's exact commit, avoiding two git-sourced copies
-# of the same crate diverging over time. Same rev as the other
-# ASAPController crates above -- no separate re-pin history yet.
-asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPController", rev = "cc18c9872bbaf0cadf43566892c3974ec9948eba" }
+# Pinned via `rev`, not a floating branch reference. Same rev as
+# `planner-types`/`asap-aware-mapping` above -- these three MUST move
+# together (two revs of the same upstream repo's types in one workspace
+# resolve to distinct Rust types that won't unify).
+asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "cb70086b4c4a7ba89baf2516be81d0b192137a3a" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -34,7 +34,7 @@
 //!
 //! ## What moved, what didn't
 //!
-//! Per Phase 0's tie-break rule, `asap_ir::AggIntent`'s shape wins
+//! Per Phase 0's tie-break rule, `planner_types::pre_asap::AggIntent`'s shape wins
 //! wherever it differs from this repo's pre-merge version. One
 //! consequence: `Rate` / `Increase` / `Changes` / `Delta` / `IDelta` /
 //! `Deriv` / `Resets` no longer carry `window: Duration` — the window
@@ -48,8 +48,8 @@
 //! the window off the enclosing `QueryExpr::Window` node it already has
 //! in scope, not off the intent.
 
-use asap_ir::intent_algebra::agg_accuracy as asap_agg_accuracy;
-pub use asap_ir::intent_algebra::{
+use planner_types::pre_asap::agg_accuracy as asap_agg_accuracy;
+pub use planner_types::pre_asap::{
     agg_is_exact, agg_is_mergeable, default_cardinality, default_quantile,
     is_frequency_heavy_hitter, ranking_measure, AggIntent, MathFunc, RankingMeasure, TimeFunc,
 };
@@ -106,7 +106,7 @@ pub fn as_frequency(intent: &AggIntent) -> Option<AccuracyTarget> {
 }
 
 /// Accuracy parameter as a fractional ε (`0.0` for exact ops). Wraps
-/// `asap_ir::agg_accuracy`, which returns `0.0` for `Frequency` (it's
+/// `planner_types::pre_asap::agg_accuracy`, which returns `0.0` for `Frequency` (it's
 /// opaque `Extension` payload to core) — special-cased here so callers
 /// don't need to know `Frequency` isn't a first-class shared variant.
 pub fn agg_accuracy(intent: &AggIntent) -> f64 {
@@ -123,7 +123,7 @@ pub fn agg_accuracy(intent: &AggIntent) -> f64 {
 /// today. `false` means a `Bind*` rule may match. `true` means the L5
 /// emitter routes the intent to the cold-store / archive tier.
 ///
-/// Every intent `asap_ir::AggIntent` carries that this repo didn't have
+/// Every intent `planner_types::pre_asap::AggIntent` carries that this repo didn't have
 /// before the merge (histogram accessors, math/trig, time/calendar
 /// accessors, presence functions, `Group`/`CountValues`, the extended
 /// range-vector reducers) is archive-only — none has a `Bind*` rule yet.
@@ -169,7 +169,7 @@ pub fn archive_only(intent: &AggIntent) -> bool {
 }
 
 /// Output column name + type produced by this intent when applied to
-/// `input`. Delegates to `asap_ir::AggIntent::output_column` (the
+/// `input`. Delegates to `planner_types::pre_asap::AggIntent::output_column` (the
 /// inherent method on the shared type) for everything except
 /// control_plane's `Frequency` extension, which core's generic
 /// `Extension` handling can't name/type correctly (core has no idea

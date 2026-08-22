@@ -1,6 +1,6 @@
-//! The reference downstream implementation of [`asap_plan::Matcher`].
+//! The reference downstream implementation of [`asap_aware_mapping::Matcher`].
 //!
-//! `asap_plan::boundary::Matcher` is a trait with no default implementation
+//! `asap_aware_mapping::boundary::Matcher` is a trait with no default implementation
 //! and no shipped instance — deliberately, per its crate doc: which
 //! `Implementation`s are actually *available* anywhere is entirely a
 //! downstream deployment's concern, and even the pure sketch-algebra
@@ -37,8 +37,8 @@
 //! which is actively being built to replace
 //! `storage_engines/sketch_db/query/sketch_reducer.rs`. Restored in full.
 
-use asap_plan::{Implementation, Matcher};
-use asap_sketch::SummaryKind;
+use asap_aware_mapping::{Implementation, Matcher};
+use planner_types::post_asap::SketchKind;
 
 /// [`Matcher`] impl covering pure sketch-family compatibility. See the
 /// module doc for what this deliberately does not cover.
@@ -63,31 +63,34 @@ impl Matcher for SummaryFamilyMatcher {
     ///   but not the reverse (a heap-less sketch cannot enumerate top-k
     ///   items it never tracked).
     fn is_satisfied_by(&self, required: &Implementation, available: &Implementation) -> bool {
-        // ASAPController#170 merged `Sketch`/`ExactAccumulator` into one
-        // `Summary { kind, params }` variant, recoverable via
-        // `kind.is_exact()`. The variant-tag mismatch that used to fall
-        // through to `_ => false` (comparing a `Sketch` against an
-        // `ExactAccumulator`) is now an explicit `is_exact()` mismatch
-        // between the two sides, still falling through the same way.
+        // ASAPController#170 had merged `Sketch`/`ExactAccumulator` into
+        // one `Summary { kind, params }` variant, recoverable via
+        // `kind.is_exact()`; ASAPPlanner#218 split them back into
+        // distinct `Sketch`/`ExactAggregate` variants (see
+        // control_plane/docs/design-asapplanner-pin-migration.md). The
+        // variant-tag mismatch this match falls through to `_ => false`
+        // for (comparing a `Sketch` against an `ExactAggregate`) is now
+        // just the natural consequence of them being separate variants
+        // again, same behavior as the `is_exact()` mismatch this replaced.
         match (required, available) {
             (Implementation::PassThrough, _) => true,
             (
-                Implementation::Summary { kind: required, .. },
-                Implementation::Summary { kind: have, .. },
-            ) if required.is_exact() && have.is_exact() => required == have,
+                Implementation::ExactAggregate { kind: required, .. },
+                Implementation::ExactAggregate { kind: have, .. },
+            ) => required == have,
             (
-                Implementation::Summary { kind: required, .. },
-                Implementation::Summary { kind: have, .. },
-            ) if !required.is_exact() && !have.is_exact() => sketch_family_satisfied(required, have),
+                Implementation::Sketch { kind: required, .. },
+                Implementation::Sketch { kind: have, .. },
+            ) => sketch_family_satisfied(required, have),
             _ => false,
         }
     }
 }
 
-/// Pure `SummaryKind`-to-`SummaryKind` family-compatibility check — the
+/// Pure `SketchKind`-to-`SketchKind` family-compatibility check — the
 /// same rule [`SummaryFamilyMatcher::is_satisfied_by`] applies in its
 /// `Sketch` arm, exposed directly for callers that only have bare kinds
-/// (no [`asap_sketch::SummaryParams`]) to compare.
+/// (no [`planner_types::post_asap::SketchParams`]) to compare.
 /// `control_plane::sketch_algebra::capability::Capability::is_satisfied_by`
 /// is the first such caller: its `SketchKindHandle` query-side dispatch
 /// tag never carries params, so constructing a full
@@ -95,16 +98,17 @@ impl Matcher for SummaryFamilyMatcher {
 /// would mean fabricating meaningless param values. See that module's
 /// doc for why `Capability`/`SketchKindHandle` themselves aren't deleted
 /// outright (`scratchpad/artifacts/enum-unification-plan.md` §8 Step 4).
-pub fn sketch_family_satisfied(required: &SummaryKind, available: &SummaryKind) -> bool {
-    match (summary_family(required), summary_family(available)) {
-        (Some(req_family), Some(have_family)) => req_family.satisfied_by(have_family),
-        _ => false,
-    }
+pub fn sketch_family_satisfied(required: &SketchKind, available: &SketchKind) -> bool {
+    let req_family = summary_family(required);
+    let have_family = summary_family(available);
+    req_family.satisfied_by(have_family)
 }
 
-/// The family a [`SummaryKind`] belongs to, for [`SummaryFamilyMatcher`].
-/// `None` for the exact-accumulator kinds, which aren't grouped into
-/// families (see [`SummaryFamilyMatcher::is_satisfied_by`]'s doc).
+/// The family a [`SketchKind`] belongs to, for [`SummaryFamilyMatcher`].
+/// Total now (every `SketchKind` variant is an approximate-sketch family
+/// by construction, post ASAPPlanner#218's split — the exact-accumulator
+/// kinds this used to also cover live in `ExactKind` now, a distinct type
+/// this function never sees).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SummaryFamily {
     Quantile,
@@ -126,60 +130,46 @@ impl SummaryFamily {
     }
 }
 
-fn summary_family(kind: &SummaryKind) -> Option<SummaryFamily> {
+fn summary_family(kind: &SketchKind) -> SummaryFamily {
     match kind {
-        SummaryKind::Kll | SummaryKind::DDSketch => Some(SummaryFamily::Quantile),
-        SummaryKind::Hll | SummaryKind::Theta | SummaryKind::Kmv => {
-            Some(SummaryFamily::Cardinality)
-        }
-        SummaryKind::Cms | SummaryKind::CountSketch => Some(SummaryFamily::Frequency),
-        SummaryKind::CmsWithHeap | SummaryKind::CountSketchWithHeap => {
-            Some(SummaryFamily::FrequencyTopk)
-        }
-        SummaryKind::Sum
-        | SummaryKind::Count
-        | SummaryKind::MinMax
-        | SummaryKind::Increase
-        | SummaryKind::Rate => None,
+        SketchKind::Kll | SketchKind::DDSketch => SummaryFamily::Quantile,
+        SketchKind::Hll | SketchKind::Theta | SketchKind::Kmv => SummaryFamily::Cardinality,
+        SketchKind::Cms | SketchKind::CountSketch => SummaryFamily::Frequency,
+        SketchKind::CmsWithHeap | SketchKind::CountSketchWithHeap => SummaryFamily::FrequencyTopk,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asap_sketch::SummaryParams;
+    use planner_types::post_asap::{ExactKind, ExactParams, SketchParams};
 
-    /// A valid `SummaryParams` for `kind` — `is_satisfied_by` only matches
+    /// A valid `SketchParams` for `kind` — `is_satisfied_by` only matches
     /// on `kind`, never `params`, but the test values should still be
     /// real, constructible `(kind, params)` pairs rather than nonsense
     /// combinations (e.g. `Hll` paired with `Kll`'s params) that could
     /// never arise from real code.
-    fn params_for(kind: &SummaryKind) -> SummaryParams {
+    fn params_for(kind: &SketchKind) -> SketchParams {
         match kind {
-            SummaryKind::Sum => SummaryParams::Sum,
-            SummaryKind::Count => SummaryParams::Count,
-            SummaryKind::MinMax => SummaryParams::MinMax,
-            SummaryKind::Increase => SummaryParams::Increase,
-            SummaryKind::Rate => SummaryParams::Rate,
-            SummaryKind::Kll => SummaryParams::Kll { k: 200 },
-            SummaryKind::Cms => SummaryParams::Cms {
+            SketchKind::Kll => SketchParams::Kll { k: 200 },
+            SketchKind::Cms => SketchParams::Cms {
                 width: 100,
                 depth: 5,
             },
-            SummaryKind::Hll => SummaryParams::Hll { precision: 14 },
-            SummaryKind::DDSketch => SummaryParams::DDSketch { alpha: 0.01 },
-            SummaryKind::CmsWithHeap => SummaryParams::CmsWithHeap {
+            SketchKind::Hll => SketchParams::Hll { precision: 14 },
+            SketchKind::DDSketch => SketchParams::DDSketch { alpha: 0.01 },
+            SketchKind::CmsWithHeap => SketchParams::CmsWithHeap {
                 width: 100,
                 depth: 5,
                 heap_size: 10,
             },
-            SummaryKind::Kmv => SummaryParams::Kmv { k: 1024 },
-            SummaryKind::Theta => SummaryParams::Theta { k: 1024 },
-            SummaryKind::CountSketch => SummaryParams::CountSketch {
+            SketchKind::Kmv => SketchParams::Kmv { k: 1024 },
+            SketchKind::Theta => SketchParams::Theta { k: 1024 },
+            SketchKind::CountSketch => SketchParams::CountSketch {
                 width: 100,
                 depth: 5,
             },
-            SummaryKind::CountSketchWithHeap => SummaryParams::CountSketchWithHeap {
+            SketchKind::CountSketchWithHeap => SketchParams::CountSketchWithHeap {
                 width: 100,
                 depth: 5,
                 heap_size: 10,
@@ -187,39 +177,49 @@ mod tests {
         }
     }
 
-    fn sketch(kind: SummaryKind) -> Implementation {
-        let params = params_for(&kind);
-        Implementation::Summary { kind, params }
+    fn exact_params_for(kind: &ExactKind) -> ExactParams {
+        match kind {
+            ExactKind::Sum => ExactParams::Sum,
+            ExactKind::Count => ExactParams::Count,
+            ExactKind::MinMax => ExactParams::MinMax,
+            ExactKind::Increase => ExactParams::Increase,
+            ExactKind::Rate => ExactParams::Rate,
+        }
     }
 
-    fn accumulator(kind: SummaryKind) -> Implementation {
+    fn sketch(kind: SketchKind) -> Implementation {
         let params = params_for(&kind);
-        Implementation::Summary { kind, params }
+        Implementation::Sketch { kind, params }
+    }
+
+    fn accumulator(kind: ExactKind) -> Implementation {
+        let params = exact_params_for(&kind);
+        Implementation::ExactAggregate { kind, params }
     }
 
     #[test]
     fn same_sketch_kind_satisfies_itself() {
         let m = SummaryFamilyMatcher;
-        assert!(m.is_satisfied_by(&sketch(SummaryKind::Kll), &sketch(SummaryKind::Kll)));
-        assert!(m.is_satisfied_by(&sketch(SummaryKind::Hll), &sketch(SummaryKind::Hll)));
+        assert!(m.is_satisfied_by(&sketch(SketchKind::Kll), &sketch(SketchKind::Kll)));
+        assert!(m.is_satisfied_by(&sketch(SketchKind::Hll), &sketch(SketchKind::Hll)));
     }
 
     #[test]
     fn same_family_alternate_kind_satisfies() {
         let m = SummaryFamilyMatcher;
         // Kll / DDSketch are interchangeable quantile answers.
-        assert!(m.is_satisfied_by(&sketch(SummaryKind::Kll), &sketch(SummaryKind::DDSketch)));
+        assert!(m.is_satisfied_by(&sketch(SketchKind::Kll), &sketch(SketchKind::DDSketch)));
         // Hll / Theta / Kmv are interchangeable cardinality answers.
-        assert!(m.is_satisfied_by(&sketch(SummaryKind::Hll), &sketch(SummaryKind::Theta)));
-        assert!(m.is_satisfied_by(&sketch(SummaryKind::Hll), &sketch(SummaryKind::Kmv)));
+        assert!(m.is_satisfied_by(&sketch(SketchKind::Hll), &sketch(SketchKind::Theta)));
+        assert!(m.is_satisfied_by(&sketch(SketchKind::Hll), &sketch(SketchKind::Kmv)));
     }
 
     #[test]
     fn cross_family_never_satisfies() {
         let m = SummaryFamilyMatcher;
-        assert!(!m.is_satisfied_by(&sketch(SummaryKind::Kll), &sketch(SummaryKind::Hll)));
-        assert!(!m.is_satisfied_by(&sketch(SummaryKind::Hll), &sketch(SummaryKind::Kll)));
-        assert!(!m.is_satisfied_by(&sketch(SummaryKind::Kll), &sketch(SummaryKind::Cms)));
+        assert!(!m.is_satisfied_by(&sketch(SketchKind::Kll), &sketch(SketchKind::Hll)));
+        assert!(!m.is_satisfied_by(&sketch(SketchKind::Hll), &sketch(SketchKind::Kll)));
+        assert!(!m.is_satisfied_by(&sketch(SketchKind::Kll), &sketch(SketchKind::Cms)));
     }
 
     #[test]
@@ -227,10 +227,10 @@ mod tests {
         let m = SummaryFamilyMatcher;
         // A CmsWithHeap instance already carries the plain CMS matrix, so
         // it answers a bare frequency point-query too.
-        assert!(m.is_satisfied_by(&sketch(SummaryKind::Cms), &sketch(SummaryKind::CmsWithHeap)));
+        assert!(m.is_satisfied_by(&sketch(SketchKind::Cms), &sketch(SketchKind::CmsWithHeap)));
         assert!(m.is_satisfied_by(
-            &sketch(SummaryKind::CountSketch),
-            &sketch(SummaryKind::CountSketchWithHeap)
+            &sketch(SketchKind::CountSketch),
+            &sketch(SketchKind::CountSketchWithHeap)
         ));
     }
 
@@ -239,60 +239,57 @@ mod tests {
         let m = SummaryFamilyMatcher;
         // The reverse does not hold: a heap-less sketch never tracked the
         // heavy-hitter heap, so it cannot enumerate top-k items.
-        assert!(!m.is_satisfied_by(&sketch(SummaryKind::CmsWithHeap), &sketch(SummaryKind::Cms)));
+        assert!(!m.is_satisfied_by(&sketch(SketchKind::CmsWithHeap), &sketch(SketchKind::Cms)));
         assert!(!m.is_satisfied_by(
-            &sketch(SummaryKind::CountSketchWithHeap),
-            &sketch(SummaryKind::CountSketch)
+            &sketch(SketchKind::CountSketchWithHeap),
+            &sketch(SketchKind::CountSketch)
         ));
     }
 
     #[test]
     fn cms_and_count_sketch_are_the_same_frequency_family() {
         let m = SummaryFamilyMatcher;
-        assert!(m.is_satisfied_by(&sketch(SummaryKind::Cms), &sketch(SummaryKind::CountSketch)));
+        assert!(m.is_satisfied_by(&sketch(SketchKind::Cms), &sketch(SketchKind::CountSketch)));
         assert!(m.is_satisfied_by(
-            &sketch(SummaryKind::CmsWithHeap),
-            &sketch(SummaryKind::CountSketchWithHeap)
+            &sketch(SketchKind::CmsWithHeap),
+            &sketch(SketchKind::CountSketchWithHeap)
         ));
     }
 
     #[test]
     fn exact_accumulator_requires_the_exact_same_kind() {
         let m = SummaryFamilyMatcher;
-        assert!(m.is_satisfied_by(
-            &accumulator(SummaryKind::Sum),
-            &accumulator(SummaryKind::Sum)
+        assert!(m.is_satisfied_by(&accumulator(ExactKind::Sum), &accumulator(ExactKind::Sum)));
+        assert!(!m.is_satisfied_by(
+            &accumulator(ExactKind::Sum),
+            &accumulator(ExactKind::MinMax)
         ));
         assert!(!m.is_satisfied_by(
-            &accumulator(SummaryKind::Sum),
-            &accumulator(SummaryKind::MinMax)
-        ));
-        assert!(!m.is_satisfied_by(
-            &accumulator(SummaryKind::Increase),
-            &accumulator(SummaryKind::Rate)
+            &accumulator(ExactKind::Increase),
+            &accumulator(ExactKind::Rate)
         ));
     }
 
     #[test]
     fn sketch_and_accumulator_never_satisfy_each_other() {
         let m = SummaryFamilyMatcher;
-        assert!(!m.is_satisfied_by(&sketch(SummaryKind::Kll), &accumulator(SummaryKind::Sum)));
-        assert!(!m.is_satisfied_by(&accumulator(SummaryKind::Sum), &sketch(SummaryKind::Kll)));
+        assert!(!m.is_satisfied_by(&sketch(SketchKind::Kll), &accumulator(ExactKind::Sum)));
+        assert!(!m.is_satisfied_by(&accumulator(ExactKind::Sum), &sketch(SketchKind::Kll)));
     }
 
     #[test]
     fn pass_through_required_is_vacuously_satisfied() {
         let m = SummaryFamilyMatcher;
-        assert!(m.is_satisfied_by(&Implementation::PassThrough, &sketch(SummaryKind::Kll)));
-        assert!(m.is_satisfied_by(&Implementation::PassThrough, &accumulator(SummaryKind::Sum)));
+        assert!(m.is_satisfied_by(&Implementation::PassThrough, &sketch(SketchKind::Kll)));
+        assert!(m.is_satisfied_by(&Implementation::PassThrough, &accumulator(ExactKind::Sum)));
         assert!(m.is_satisfied_by(&Implementation::PassThrough, &Implementation::PassThrough));
     }
 
     #[test]
     fn pass_through_available_never_satisfies_a_real_requirement() {
         let m = SummaryFamilyMatcher;
-        assert!(!m.is_satisfied_by(&sketch(SummaryKind::Kll), &Implementation::PassThrough));
-        assert!(!m.is_satisfied_by(&accumulator(SummaryKind::Sum), &Implementation::PassThrough));
+        assert!(!m.is_satisfied_by(&sketch(SketchKind::Kll), &Implementation::PassThrough));
+        assert!(!m.is_satisfied_by(&accumulator(ExactKind::Sum), &Implementation::PassThrough));
     }
 
     // ── sketch_family_satisfied (the bare-kind entry point) ──────────────
@@ -301,36 +298,26 @@ mod tests {
     fn sketch_family_satisfied_matches_is_satisfied_by_on_the_sketch_arm() {
         // The free function is meant to be exactly the logic
         // `SummaryFamilyMatcher::is_satisfied_by` applies to its `Sketch`
-        // arm, just without needing `SummaryParams` to call it.
+        // arm, just without needing `SketchParams` to call it.
         assert!(sketch_family_satisfied(
-            &SummaryKind::Kll,
-            &SummaryKind::DDSketch
+            &SketchKind::Kll,
+            &SketchKind::DDSketch
         ));
         assert!(sketch_family_satisfied(
-            &SummaryKind::Cms,
-            &SummaryKind::CmsWithHeap
+            &SketchKind::Cms,
+            &SketchKind::CmsWithHeap
         ));
         assert!(!sketch_family_satisfied(
-            &SummaryKind::CmsWithHeap,
-            &SummaryKind::Cms
+            &SketchKind::CmsWithHeap,
+            &SketchKind::Cms
         ));
-        assert!(!sketch_family_satisfied(
-            &SummaryKind::Kll,
-            &SummaryKind::Hll
-        ));
+        assert!(!sketch_family_satisfied(&SketchKind::Kll, &SketchKind::Hll));
     }
 
-    #[test]
-    fn sketch_family_satisfied_rejects_exact_accumulator_kinds() {
-        // Exact-accumulator kinds have no family (`summary_family` returns
-        // `None` for them) — never satisfied by anything via this path.
-        assert!(!sketch_family_satisfied(
-            &SummaryKind::Sum,
-            &SummaryKind::Sum
-        ));
-        assert!(!sketch_family_satisfied(
-            &SummaryKind::Kll,
-            &SummaryKind::Sum
-        ));
-    }
+    // The old `sketch_family_satisfied_rejects_exact_accumulator_kinds`
+    // test (passing `SummaryKind::Sum` -- an exact-accumulator kind -- to
+    // this sketch-only function) no longer type-checks at all post
+    // ASAPPlanner#218's split: `SketchKind` has no exact-accumulator
+    // variants to construct in the first place, so the property that test
+    // asserted is now enforced by the type system instead of at runtime.
 }

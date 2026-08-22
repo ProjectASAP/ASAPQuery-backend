@@ -15,7 +15,7 @@
 //!   ↓  query_parser::parse_query  (the control plane's PromQL → ParsedQuery)
 //! ParsedQuery
 //!   ↓  intent_algebra::lower::lower_parsed_query
-//! QueryExpr (intent_algebra) — Scan / Window / Aggregate{ aggs: Vec<AggIntent> }
+//! QueryExpr (intent_algebra) — Scan / Window / Aggregate{ measures: Vec<AggIntent> }
 //!   ↓  walk and call capability_for(&AggIntent)
 //! Vec<ASAPTierCandidate>
 //! ```
@@ -339,16 +339,16 @@ fn render_spatial_filter(label_filters: &std::collections::HashMap<String, Strin
 /// `AggIntent` instead of a PromQL-string-prefix heuristic.
 pub(crate) fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
     match expr {
-        QueryExpr::Aggregate { aggs, child, .. } => {
+        QueryExpr::Aggregate {
+            measures: aggs,
+            child,
+            ..
+        } => {
             out.extend(aggs.iter().cloned());
             collect_agg_intents(child, out);
         }
-        QueryExpr::Window { child, .. } => collect_agg_intents(child, out),
-        QueryExpr::LetBinding { expr, child, .. } => {
-            collect_agg_intents(expr, out);
-            collect_agg_intents(child, out);
-        }
-        QueryExpr::Scan { .. } | QueryExpr::Ref { .. } => {}
+        QueryExpr::TimeRange { child, .. } => collect_agg_intents(child, out),
+        QueryExpr::Scan { .. } => {}
         // A-variants lifted in Batch 2 of the relational migration. They
         // carry no AggIntent themselves — recurse into their children to
         // find Aggregates further down the tree. `Partition` no longer
@@ -1976,7 +1976,8 @@ mod tests {
 
         #[test]
         fn empty_registry_yields_empty_matches() {
-            let registry = RoutingIndex::build(PolicyRegistry::from_configs(Vec::<AggregationConfig>::new()));
+            let registry =
+                RoutingIndex::build(PolicyRegistry::from_configs(Vec::<AggregationConfig>::new()));
             let cand = candidate(
                 "http_lat",
                 &[],

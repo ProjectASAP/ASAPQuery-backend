@@ -88,12 +88,12 @@ pub mod schema;
 pub mod column_resolution;
 pub mod relational;
 
-// The L2 → canonical-L3 lowering. The `query_parser` entry points emit a
-// raw `relational::QueryExpr` tree and route it through `convert_root`,
-// which lowers it (single-statistic sketchable `Aggregate` fusion folded
-// in) onto the canonical IR.
-pub mod lower;
-pub use lower::{convert, convert_root, ConvertError};
+// `lower` (the L2 -> canonical-L3 conversion, `convert`/`convert_root`)
+// was deleted in the ASAPPlanner pin migration -- see
+// `relational.rs`'s module doc. `query_parser` entry points have called
+// `asap_frontend_promql::lower_promql` directly since #428; this module
+// was already dead in production before the migration and depended on
+// the now-deleted `asap_l2` crate's L2 tree type.
 
 // Step γ7: the L3 Binder — name resolution as an explicit pass. Produces
 // the complete self-contained `Schema` every `ColumnId` indexes into;
@@ -110,14 +110,14 @@ pub use agg_intent::{
     default_frequency, default_quantile, frequency, is_frequency_heavy_hitter, output_column,
     ranking_measure, AggIntent, MathFunc, RankingMeasure, TimeFunc,
 };
-pub use expr_ir::{ArithOp, ColumnRef, CompareOp, Expr, L2Expr, L3Expr, L3Scalar};
+pub use expr_ir::{ArithOp, ColumnRef, CompareOp, L2Expr, L3Expr, L3Scalar};
 pub use query_expr::{
     aggregate_output_schema, between, conjoin, label_filter_to_predicate, AtModifier, BinaryOpKind,
-    BindingScope, DataModel, GroupKeys, GroupSide, InfoMatcher, JoinKind, LabelFilter, Predicate,
-    ProjectItem, QueryExpr, QueryExprError, Reduction, SampleKind, SetOpKind, SortKey, Source,
-    TimeShift, VectorGrouping, VectorMatch, VectorMatchKind, WindowFuncKind, WindowKind,
+    DataModel, GroupKeys, GroupSide, InfoMatcher, JoinKind, LabelFilter, Predicate, ProjectItem,
+    QueryExpr, QueryExprError, Reduction, SampleKind, SetOpKind, SortKey, Source, TimeShift,
+    VectorGrouping, VectorMatch, VectorMatchKind, WindowFuncKind, WindowKind,
 };
-pub use schema::{cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schema};
+pub use schema::{Column, ColumnId, DataType, Schema};
 
 // Schema-driven column-resolution helpers used by the planning stack
 // (`optimizer/engine.rs`, `physical/{allocator,planner,stage_split}.rs`,
@@ -125,6 +125,6 @@ pub use schema::{cse_reuse_is_legal, Column, ColumnId, CseError, DataType, Schem
 // `relational::QueryExpr` traversal. Consumers call `resolve_column_ref`
 // at the point where they need a positional `ColumnId`.
 pub use column_resolution::{
-    infer_schema_for_root, infer_source_schema, output_schema_for_aggregate, resolve_column_ref,
-    resolve_column_refs, resolve_expr, resolve_group_keys_promql, ResolveError,
+    output_schema_for_aggregate, resolve_column_ref, resolve_column_refs, resolve_expr,
+    resolve_group_keys_promql, ResolveError,
 };

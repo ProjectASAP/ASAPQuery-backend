@@ -31,7 +31,7 @@
 //! agent telemetry once the OnlineMetricsStore feeds back into the
 //! planner.
 
-use asap_sketch::SummaryKind;
+use planner_types::post_asap::SketchKind;
 
 // ── Wire-cost table ──────────────────────────────────────────────────────────
 
@@ -105,7 +105,7 @@ impl WireCostTable {
 
     /// Lookup the per-flush cost for a sketch family.
     ///
-    /// `SummaryKind` (unlike the retired `sketch_algebra::SketchKind`)
+    /// `SketchKind` (unlike the retired `sketch_algebra::SketchKind`)
     /// distinguishes heap-bearing from bare frequency sketches at the
     /// kind level rather than via a `with_heap` param flag. This table
     /// never modeled the heap's extra bytes separately (the old
@@ -117,23 +117,22 @@ impl WireCostTable {
     /// list stays `Hll`-only, see `capability.rs`); they reuse `hll_delta`
     /// as a same-order-of-magnitude placeholder pending real numbers if
     /// this repo ever adopts them.
-    pub const fn for_kind(&self, kind: &SummaryKind) -> SketchWireCost {
+    // Exhaustive over `SketchKind` alone now (ASAPPlanner#218 split the
+    // old flat `SummaryKind` into `SketchKind`/`ExactKind` -- the exact-
+    // accumulator arm this match used to need, and its
+    // "exact accumulators have no sketch wire-state cost" panic, are
+    // unreachable by construction now instead of at runtime; see
+    // control_plane/docs/design-asapplanner-pin-migration.md).
+    pub const fn for_kind(&self, kind: &SketchKind) -> SketchWireCost {
         match kind {
-            SummaryKind::DDSketch => self.ddsketch_delta,
-            SummaryKind::Kll => self.kll_full,
-            SummaryKind::Hll => self.hll_delta,
-            SummaryKind::Kmv | SummaryKind::Theta => self.hll_delta,
-            SummaryKind::Cms => self.count_min_delta,
-            SummaryKind::CmsWithHeap => self.count_min_delta,
-            SummaryKind::CountSketch => self.count_sketch_delta,
-            SummaryKind::CountSketchWithHeap => self.count_sketch_delta,
-            SummaryKind::Sum
-            | SummaryKind::Count
-            | SummaryKind::MinMax
-            | SummaryKind::Increase
-            | SummaryKind::Rate => {
-                panic!("WireCostTable::for_kind: exact accumulators have no sketch wire-state cost")
-            }
+            SketchKind::DDSketch => self.ddsketch_delta,
+            SketchKind::Kll => self.kll_full,
+            SketchKind::Hll => self.hll_delta,
+            SketchKind::Kmv | SketchKind::Theta => self.hll_delta,
+            SketchKind::Cms => self.count_min_delta,
+            SketchKind::CmsWithHeap => self.count_min_delta,
+            SketchKind::CountSketch => self.count_sketch_delta,
+            SketchKind::CountSketchWithHeap => self.count_sketch_delta,
         }
     }
 }

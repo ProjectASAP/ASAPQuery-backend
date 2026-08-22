@@ -341,43 +341,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "asap-aware-mapping"
+version = "0.1.0"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=cb70086b4c4a7ba89baf2516be81d0b192137a3a#cb70086b4c4a7ba89baf2516be81d0b192137a3a"
+dependencies = [
+ "asap-types",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPController?rev=cc18c9872bbaf0cadf43566892c3974ec9948eba#cc18c9872bbaf0cadf43566892c3974ec9948eba"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=cb70086b4c4a7ba89baf2516be81d0b192137a3a#cb70086b4c4a7ba89baf2516be81d0b192137a3a"
 dependencies = [
- "asap-ir",
- "asap-l2",
- "promql-parser 0.9.0 (git+https://github.com/ProjectASAP/promql-parser?branch=asap)",
-]
-
-[[package]]
-name = "asap-ir"
-version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPController?rev=cc18c9872bbaf0cadf43566892c3974ec9948eba#cc18c9872bbaf0cadf43566892c3974ec9948eba"
-dependencies = [
- "serde",
- "serde_json",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "asap-l2"
-version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPController?rev=cc18c9872bbaf0cadf43566892c3974ec9948eba#cc18c9872bbaf0cadf43566892c3974ec9948eba"
-dependencies = [
- "asap-ir",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "asap-plan"
-version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPController?rev=cc18c9872bbaf0cadf43566892c3974ec9948eba#cc18c9872bbaf0cadf43566892c3974ec9948eba"
-dependencies = [
- "asap-ir",
- "asap-sketch",
- "serde_json",
- "thiserror 2.0.18",
+ "asap-types",
+ "promql-parser 0.10.0",
 ]
 
 [[package]]
@@ -391,11 +370,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "asap-sketch"
+name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPController?rev=cc18c9872bbaf0cadf43566892c3974ec9948eba#cc18c9872bbaf0cadf43566892c3974ec9948eba"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=cb70086b4c4a7ba89baf2516be81d0b192137a3a#cb70086b4c4a7ba89baf2516be81d0b192137a3a"
 dependencies = [
- "asap-ir",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -430,8 +411,7 @@ name = "asap_types"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "asap-ir",
- "asap-sketch",
+ "asap-types",
  "clap 4.6.1",
  "serde",
  "serde_json",
@@ -801,11 +781,9 @@ name = "control_plane"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "asap-aware-mapping",
  "asap-frontend-promql",
- "asap-ir",
- "asap-l2",
- "asap-plan",
- "asap-sketch",
+ "asap-types",
  "asap_types",
  "axum",
  "bytes",
@@ -814,7 +792,7 @@ dependencies = [
  "http-body-util",
  "parking_lot",
  "prometheus",
- "promql-parser 0.9.0 (git+https://github.com/ProjectASAP/promql-parser?rev=c51beafb361af4cc95ed62ae377862c660ceb757)",
+ "promql-parser 0.9.0",
  "prost",
  "prost-build",
  "reqwest 0.12.28",
@@ -1000,9 +978,8 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "arrow",
- "asap-ir",
  "asap-precompute-rs",
- "asap-sketch",
+ "asap-types",
  "asap_otel_proto",
  "asap_sketchlib",
  "asap_types",
@@ -2494,7 +2471,7 @@ dependencies = [
 [[package]]
 name = "promql-parser"
 version = "0.9.0"
-source = "git+https://github.com/ProjectASAP/promql-parser?branch=asap#c51beafb361af4cc95ed62ae377862c660ceb757"
+source = "git+https://github.com/ProjectASAP/promql-parser?rev=c51beafb361af4cc95ed62ae377862c660ceb757#c51beafb361af4cc95ed62ae377862c660ceb757"
 dependencies = [
  "cfgrammar",
  "chrono",
@@ -2506,8 +2483,9 @@ dependencies = [
 
 [[package]]
 name = "promql-parser"
-version = "0.9.0"
-source = "git+https://github.com/ProjectASAP/promql-parser?rev=c51beafb361af4cc95ed62ae377862c660ceb757#c51beafb361af4cc95ed62ae377862c660ceb757"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e8c90c956be4237a93be6f2298302b56974ef862ab11e0f98869d1f27c69f88"
 dependencies = [
  "cfgrammar",
  "chrono",

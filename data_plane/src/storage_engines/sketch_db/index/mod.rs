@@ -743,7 +743,11 @@ impl SketchStore {
                         // reducer uses it as the rolling base. Only splice it
                         // when that window-end has no frames yet (don't
                         // duplicate a base the in-window scan already saw).
-                        let frames = by_label_id.entry(label_id).or_default().entry(w_end).or_default();
+                        let frames = by_label_id
+                            .entry(label_id)
+                            .or_default()
+                            .entry(w_end)
+                            .or_default();
                         if frames.is_empty() {
                             frames.push(state);
                         }
@@ -983,7 +987,11 @@ impl SketchStore {
             }
         }
         for (label_map, (w_end, state)) in latest_full {
-            let frames = by_label_map.entry(label_map).or_default().entry(w_end).or_default();
+            let frames = by_label_map
+                .entry(label_map)
+                .or_default()
+                .entry(w_end)
+                .or_default();
             if frames.is_empty() {
                 frames.push(state);
             }

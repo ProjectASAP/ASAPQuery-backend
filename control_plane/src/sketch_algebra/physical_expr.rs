@@ -7,18 +7,18 @@
 //! Step B of the plan-shaped-serving migration retires this crate's own
 //! `PhysicalExpr`-as-L4-algebra (the old `Logical` / `SketchAgg` /
 //! `SketchEstimate` / `SketchMerge` / `ExactAgg` variants) in favor of
-//! ASAPController's canonical L4 IR, `asap_sketch::{SummaryExpr, L4Node}`
+//! ASAPController's canonical L4 IR, `planner_types::post_asap::{SummaryExpr, SummaryNode}`
 //! — the same move Step 3 of the enum-unification made for
-//! `SketchKind → SummaryKind`, one layer up. `implement_promql_for_asap_tier`
-//! (`asap_tier_implement.rs`, Step A) already builds `Rc<L4Node>` trees via
-//! `asap_plan::bind::implement_tree_in_with`; this module gives the rest of
+//! `SketchKind → SketchKind`, one layer up. `implement_promql_for_asap_tier`
+//! (`asap_tier_implement.rs`, Step A) already builds `Rc<SummaryNode>` trees via
+//! `asap_aware_mapping::bind::implement_tree_in_with`; this module gives the rest of
 //! the crate (optimizer, physical, emit) the same IR shape.
 //!
-//! Two things `asap_sketch::L4Node` genuinely doesn't have, kept here:
+//! Two things `planner_types::post_asap::SummaryNode` genuinely doesn't have, kept here:
 //!
 //! - **`LetBinding` / `Ref`** — named fan-in sharing (SQL
 //!   `WITH name AS (expr) ...` / a `SketchAgg` shared by two `SketchEstimate`
-//!   readouts). `L4Node`'s own DAG sharing is structural (multiple `Rc`
+//!   readouts). `SummaryNode`'s own DAG sharing is structural (multiple `Rc`
 //!   references to the same node), not named — but the rule-firing walk in
 //!   this crate discovers sharing incrementally, per-node, so it still needs
 //!   a name to thread a bound value across sibling calls. This is a
@@ -36,21 +36,21 @@
 //!   already pattern-match on them.
 //!
 //! `SketchAgg` / `SketchEstimate` / `SketchMerge` / `Logical` / `ExactAgg`
-//! don't get their own variants anymore — `asap_sketch::SummaryExpr`
+//! don't get their own variants anymore — `planner_types::post_asap::SummaryExpr`
 //! already unifies all of them (including "exact accumulator" and "sketch"
 //! as the same `SummaryAgg` node, with or without a wrapping
-//! `SummaryEstimate`) inside a single `L4Plan::Summary(Rc<L4Node>)`.
+//! `SummaryEstimate`) inside a single `L4Plan::Summary(Rc<SummaryNode>)`.
 
 #![allow(dead_code)]
 
 use std::rc::Rc;
 use std::time::Duration;
 
-use asap_sketch::{L4Node, SummaryKind, SummaryParams};
+use planner_types::post_asap::{SketchKind, SketchParams, SummaryNode};
 
 use crate::types_v2::BindingName;
 
-/// L4 IR — "what to compute". Wraps `asap_sketch::L4Node` (the sketch
+/// L4 IR — "what to compute". Wraps `planner_types::post_asap::SummaryNode` (the sketch
 /// algebra itself, owned upstream) and adds only the named-binding sharing
 /// mechanism `asap_sketch` doesn't have. See module docs.
 #[derive(Debug, Clone)]
@@ -58,7 +58,7 @@ pub enum L4Plan {
     /// A committed L4 sub-tree — `SummaryAgg` / `SummaryEstimate` /
     /// `SummaryMerge` / `Logical`, whatever `implement_tree_in_with` (or a
     /// deployment-specific pre-pass) produced.
-    Summary(Rc<L4Node>),
+    Summary(Rc<SummaryNode>),
 
     /// SQL `WITH name AS (expr) SELECT ... FROM name` / sketch-state
     /// fan-in: name a sub-expression so multiple parents can reference it.
@@ -100,9 +100,9 @@ pub enum PhysicalExpr {
     /// this metric.
     RawAtEdgeSketchAtBackend {
         /// Sketch family the backend will build at ingest.
-        family: SummaryKind,
+        family: SketchKind,
         /// Sketch parameters (validated by the catalog at bind time).
-        params: SummaryParams,
+        params: SketchParams,
         /// Input sub-tree — typically `Summary(Logical(Window{...}))` or
         /// `Summary(Logical(Scan{...}))`.
         child: Box<L4Plan>,
@@ -138,8 +138,8 @@ pub enum PhysicalExpr {
 
 impl PhysicalExpr {
     /// Convenience constructor for the common case: a committed
-    /// `L4Node` sketch-built at the edge, no placement wrapper.
-    pub fn committed(node: Rc<L4Node>) -> Self {
+    /// `SummaryNode` sketch-built at the edge, no placement wrapper.
+    pub fn committed(node: Rc<SummaryNode>) -> Self {
         PhysicalExpr::Committed(L4Plan::Summary(node))
     }
 }
@@ -194,10 +194,8 @@ mod tests {
     }
 
     fn windowed_scan() -> QueryExpr {
-        QueryExpr::Window {
-            kind: WindowKind::Sliding,
-            size: Duration::from_secs(300),
-            slide: None,
+        QueryExpr::TimeRange {
+            range: Duration::from_secs(300),
             child: Box::new(ts_scan()),
         }
     }
@@ -206,7 +204,7 @@ mod tests {
     fn committed_wraps_an_implement_tree_result() {
         let q = QueryExpr::Aggregate {
             reduction: crate::intent_algebra::Reduction::by(vec![]),
-            aggs: vec![crate::intent_algebra::AggIntent::Quantile {
+            measures: vec![crate::intent_algebra::AggIntent::Quantile {
                 col: None,
                 q: 0.99,
                 accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
@@ -215,19 +213,32 @@ mod tests {
             having: None,
             child: Box::new(windowed_scan()),
         };
-        let node = asap_plan::bind::implement_tree(&q).expect("implements");
+        let node = asap_aware_mapping::bind::implement_tree(&q).expect("implements");
         let e = PhysicalExpr::committed(node);
         match e {
             PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
-                asap_sketch::SummaryExpr::SummaryEstimate { query, summary_input } => {
-                    assert!(matches!(query, asap_sketch::SketchQuery::Quantile { q } if *q == 0.99));
+                planner_types::post_asap::SummaryExpr::SummaryEstimate {
+                    query,
+                    summary_input,
+                } => {
+                    assert!(
+                        matches!(query, planner_types::post_asap::SketchQuery::Quantile { q } if *q == 0.99)
+                    );
                     match &summary_input.expr {
-                        asap_sketch::SummaryExpr::SummaryAgg {
-                            summary, params, child, ..
+                        planner_types::post_asap::SummaryExpr::SummaryAgg {
+                            family, child, ..
                         } => {
-                            assert_eq!(summary, &SummaryKind::Kll);
-                            assert_eq!(params, &SummaryParams::Kll { k: 200 });
-                            assert!(matches!(child.expr, asap_sketch::SummaryExpr::Logical(_)));
+                            assert_eq!(
+                                family,
+                                &planner_types::post_asap::SummaryFamilyType::Sketch(
+                                    SketchKind::Kll,
+                                    SketchParams::Kll { k: 200 }
+                                )
+                            );
+                            assert!(matches!(
+                                child.expr,
+                                planner_types::post_asap::SummaryExpr::Logical(_)
+                            ));
                         }
                         other => panic!("expected SummaryAgg, got {other:?}"),
                     }

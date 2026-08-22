@@ -1,5 +1,5 @@
 //! L3 → L4/L5 lowering — `QueryExpr` walk that adopts
-//! `asap_plan::bind::implement_tree_in_with` for the sketch algebra
+//! `asap_aware_mapping::bind::implement_tree_in_with` for the sketch algebra
 //! itself (Step B of the plan-shaped-serving migration), with
 //! `crate::sketch_algebra::cost_model::ControlPlaneCostModel` plugged in
 //! for family selection + parameter sizing.
@@ -10,7 +10,7 @@
 //! `Logical(…)`."
 //!
 //! Two node shapes are rewritten *before* delegating to
-//! `implement_tree_in_with`, because `asap_plan::boundary::implementation_for`
+//! `implement_tree_in_with`, because `asap_aware_mapping::boundary::implementation_for`
 //! actively binds them to an `Implementation` this deployment's data plane
 //! doesn't (or, deliberately, shouldn't) serve — not something the
 //! `CostModel` hook can reach, since the decision of *whether* to call
@@ -31,24 +31,22 @@
 
 #![allow(dead_code)]
 
-use std::rc::Rc;
-
-use asap_plan::bind::implement_tree_in_with;
-use asap_plan::cost_model::CostModel;
+use asap_aware_mapping::bind::implement_tree_with;
+use asap_aware_mapping::cost_model::CostModel;
 use thiserror::Error;
 
-use crate::intent_algebra::{AggIntent, BindingScope, QueryExpr};
+use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::sketch_algebra::cost_model::ControlPlaneCostModel;
 use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
-use crate::types_v2::{AccuracyTarget, BindingName};
+use crate::types_v2::AccuracyTarget;
 
 /// Errors surfaced by the `bind_query_expr` lowering.
 #[derive(Debug, Error)]
 pub enum BindingError {
-    /// L3 schema derivation failed while lifting an edge to `L4Schema` —
-    /// forwarded from `asap_plan::bind`.
+    /// L3 schema derivation failed while lifting an edge to `SummarySchema` —
+    /// forwarded from `asap_aware_mapping::bind`.
     #[error("L3->L4 implementation failed: {0}")]
-    Implement(#[from] asap_plan::ImplementError),
+    Implement(#[from] asap_aware_mapping::ImplementError),
 }
 
 /// Lower an L3 `QueryExpr` to L4/L5 under the supplied workload-level
@@ -72,7 +70,7 @@ pub fn bind_query_expr(
 /// live-serving path (`l4_lowering.rs`) must NOT re-derive a family/params
 /// choice independently of what was actually planned — it looks up what's
 /// really registered in the `SketchStore` and hands in a cost model that
-/// echoes that back, so the resulting `L4Node` matches reality by
+/// echoes that back, so the resulting `SummaryNode` matches reality by
 /// construction rather than by a coincidental accuracy-target match. See
 /// `control_plane/docs/design-target-architecture.md`'s "planning vs
 /// serving" split.
@@ -85,32 +83,28 @@ pub fn bind_query_expr_with_cost_model(
 
 fn bind_recursive(expr: &QueryExpr, cost_model: &dyn CostModel) -> Result<L4Plan, BindingError> {
     match expr {
-        QueryExpr::LetBinding { name, expr, child } => Ok(L4Plan::LetBinding {
-            name: BindingName::new(name.as_str()),
-            expr: Rc::new(bind_recursive(expr, cost_model)?),
-            child: Rc::new(bind_recursive(child, cost_model)?),
-        }),
-        QueryExpr::Ref { name } => Ok(L4Plan::Ref {
-            name: BindingName::new(name.as_str()),
-        }),
+        // `QueryExpr::LetBinding`/`::Ref` don't exist in the canonical IR
+        // anymore (ASAPPlanner#181/#192 -- see
+        // control_plane/docs/design-asapplanner-pin-migration.md), so
+        // this walk can never actually receive that shape; the arms that
+        // used to produce `L4Plan::LetBinding`/`L4Plan::Ref` here are
+        // gone with it.
 
-        // The canonical L3 IR places `Window` *above* a single-statistic
-        // sketchable `Aggregate` (`lower`'s window-swap). `implement_tree_in_with`
+        // The canonical L3 IR places `TimeRange` *above* a single-statistic
+        // sketchable `Aggregate` (`lower_promql`'s window-swap; was
+        // `Window` before the ASAPPlanner pin migration). `implement_tree_with`
         // only recurses through the `Aggregate` spine (see its module
         // docs' "conservative fallbacks" — a logical parent above a
-        // bindable aggregate subsumes it unbound), so push the window
+        // bindable aggregate subsumes it unbound), so push the range
         // down under the aggregate and re-dispatch, exactly as the old
-        // hand-written walk did — the window then rides along inside the
+        // hand-written walk did — the range then rides along inside the
         // bound node's `Logical(...)` child.
-        QueryExpr::Window {
-            kind,
-            size,
-            slide,
-            child,
-        } if matches!(child.as_ref(), QueryExpr::Aggregate { .. }) => {
+        QueryExpr::TimeRange { range, child }
+            if matches!(child.as_ref(), QueryExpr::Aggregate { .. }) =>
+        {
             let QueryExpr::Aggregate {
                 reduction,
-                aggs,
+                measures: aggs,
                 output_names,
                 having,
                 child: agg_child,
@@ -120,13 +114,11 @@ fn bind_recursive(expr: &QueryExpr, cost_model: &dyn CostModel) -> Result<L4Plan
             };
             let pushed = QueryExpr::Aggregate {
                 reduction: reduction.clone(),
-                aggs: aggs.clone(),
+                measures: aggs.clone(),
                 output_names: output_names.clone(),
                 having: having.clone(),
-                child: Box::new(QueryExpr::Window {
-                    kind: kind.clone(),
-                    size: *size,
-                    slide: *slide,
+                child: Box::new(QueryExpr::TimeRange {
+                    range: *range,
                     child: agg_child.clone(),
                 }),
             };
@@ -134,18 +126,20 @@ fn bind_recursive(expr: &QueryExpr, cost_model: &dyn CostModel) -> Result<L4Plan
         }
 
         // `AggIntent::Count { accuracy: Exact }` — `boundary::implementation_for`'s
-        // `exact_realization` actively binds this to `SummaryKind::Count`,
+        // `exact_realization` actively binds this to `ExactKind::Count`,
         // but this deployment's data plane has no count accumulator: its
         // `SumAccumulator` only tracks `sum: f64`, so a `Count`
         // accumulator would silently return the sum of sample VALUES, not
         // the sample count (PR #200/#201, reverted — see the retired
-        // `bind_exact_agg.rs`). Force the same fallback `implement_tree_in_with`
+        // `bind_exact_agg.rs`). Force the same fallback `implement_tree_with`
         // uses for unbound shapes, via the public `bind::logical`
         // ASAPController exposes for exactly this "deployment knows
         // better" case — no local schema-lift duplication needed. Stays
         // on archive, matching today's behavior.
         QueryExpr::Aggregate {
-            aggs, having: None, ..
+            measures: aggs,
+            having: None,
+            ..
         } if matches!(
             aggs.as_slice(),
             [AggIntent::Count {
@@ -153,15 +147,12 @@ fn bind_recursive(expr: &QueryExpr, cost_model: &dyn CostModel) -> Result<L4Plan
             }]
         ) =>
         {
-            Ok(L4Plan::Summary(asap_plan::bind::logical(
-                expr,
-                &BindingScope::default(),
-            )?))
+            Ok(L4Plan::Summary(asap_aware_mapping::bind::logical(expr)?))
         }
 
         _ => {
             let rewritten = rewrite_rate_to_increase(expr);
-            let node = implement_tree_in_with(&rewritten, &BindingScope::default(), cost_model)?;
+            let node = implement_tree_with(&rewritten, cost_model)?;
             Ok(L4Plan::Summary(node))
         }
     }
@@ -184,13 +175,13 @@ fn rewrite_rate_to_increase(expr: &QueryExpr) -> QueryExpr {
     match expr {
         QueryExpr::Aggregate {
             reduction,
-            aggs,
+            measures: aggs,
             output_names,
             having,
             child,
         } => QueryExpr::Aggregate {
             reduction: reduction.clone(),
-            aggs: aggs
+            measures: aggs
                 .iter()
                 .map(|intent| {
                     if matches!(intent, AggIntent::Rate) {

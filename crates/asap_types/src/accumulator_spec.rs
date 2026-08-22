@@ -4,7 +4,7 @@
 //!
 //! **Step 5 of the sketch-identity unification** (see
 //! `scratchpad/artifacts/enum-unification-plan.md`, §7-8). Converges
-//! accumulator *identity* onto ASAPController's `asap_sketch::SummaryKind`
+//! accumulator *identity* onto ASAPController's `planner_types::post_asap::SummaryKind`
 //! / `SummaryParams` — the same representation `control_plane` already
 //! uses as of Stage 3 (merged) — extended with the one axis that
 //! representation doesn't have: keyed-vs-unkeyed grouping, which
@@ -48,8 +48,24 @@
 //!
 //! ## What doesn't fit `SummaryKind`/`SummaryParams`
 //!
-//! `asap_sketch`'s types are ASAPController's, not ours to extend from
-//! this repo, and two data_plane-specific details don't fit them:
+//! `SummaryKind`/`SummaryParams` were ASAPController's (now ASAPPlanner's)
+//! types, not ours to extend from this repo, until ASAPPlanner split them
+//! into a per-family `(ExactKind, SketchKind, SamplingKind, ...)` union
+//! (ASAPPlanner#218) with no single flat type spanning both exact and
+//! approximate accumulator identity anymore — see
+//! `control_plane/docs/design-asapplanner-pin-migration.md`. This
+//! module's own `AccumulatorSpec::kind`/`params` dispatch (below, and its
+//! ~25 call sites in `data_plane::precompute_engine::accumulator_factory`)
+//! never needed that pre-ASAP/post-ASAP distinction in the first place —
+//! it's a flat "which concrete Rust accumulator struct to construct"
+//! question, entirely internal to this workspace. Rather than thread a
+//! two-level `Exact(ExactKind) | Sketch(SketchKind)` wrapper through every
+//! one of those call sites for a distinction they don't care about,
+//! `SummaryKind`/`SummaryParams` are now vendored here as local types,
+//! same 14-variant shape as before the split (mirrors the same call this
+//! workspace made for `WindowKind` — see `enums.rs`).
+//!
+//! Two data_plane-specific details don't fit them:
 //!
 //! - **Min/max direction.** `SummaryParams::MinMax` carries no fields —
 //!   upstream doesn't model a direction axis. `accumulator_factory.rs`
@@ -74,7 +90,240 @@ use crate::aggregation_config::AggregationConfig;
 use crate::key_by_label_names::KeyByLabelNames;
 use crate::AggregationType;
 
-pub use asap_sketch::{SummaryKind, SummaryParams};
+/// Which accumulator family to run — identity only (no keyed/unkeyed
+/// axis, no heap-vs-bare ambiguity: heap-bearing sketches are their own
+/// variant, e.g. `CmsWithHeap` vs `Cms`). Vendored (see module doc): same
+/// 14-variant shape ASAPController's pre-split `asap_sketch::SummaryKind`
+/// had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SummaryKind {
+    Sum,
+    Count,
+    MinMax,
+    Increase,
+    Rate,
+    Kll,
+    Cms,
+    Hll,
+    DDSketch,
+    CmsWithHeap,
+    Kmv,
+    Theta,
+    CountSketch,
+    CountSketchWithHeap,
+}
+
+impl SummaryKind {
+    /// True for the exact, zero-error mergeable-accumulator kinds (no
+    /// tuning parameters, upstream's old `ExactKind` set); false for the
+    /// approximate sketch families (upstream's old `SketchKind` set).
+    pub fn is_exact(&self) -> bool {
+        matches!(
+            self,
+            SummaryKind::Sum
+                | SummaryKind::Count
+                | SummaryKind::MinMax
+                | SummaryKind::Increase
+                | SummaryKind::Rate
+        )
+    }
+}
+
+/// Typed tuning parameters matching a [`SummaryKind`]. Vendored
+/// alongside it (see module doc) — same shape as ASAPController's
+/// pre-split `asap_sketch::SummaryParams`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SummaryParams {
+    Sum,
+    Count,
+    MinMax,
+    Increase,
+    Rate,
+    Kll {
+        k: u32,
+    },
+    Cms {
+        width: u32,
+        depth: u32,
+    },
+    Hll {
+        precision: u8,
+    },
+    DDSketch {
+        alpha: f64,
+    },
+    CmsWithHeap {
+        width: u32,
+        depth: u32,
+        heap_size: u32,
+    },
+    Kmv {
+        k: u32,
+    },
+    Theta {
+        k: u32,
+    },
+    CountSketch {
+        width: u32,
+        depth: u32,
+    },
+    CountSketchWithHeap {
+        width: u32,
+        depth: u32,
+        heap_size: u32,
+    },
+}
+
+/// Widen an upstream (post-ASAPPlanner#218) `ExactKind` into this crate's
+/// flat [`SummaryKind`]. See the module doc for why the flat type exists.
+impl From<planner_types::post_asap::ExactKind> for SummaryKind {
+    fn from(k: planner_types::post_asap::ExactKind) -> Self {
+        use planner_types::post_asap::ExactKind as K;
+        match k {
+            K::Sum => SummaryKind::Sum,
+            K::Count => SummaryKind::Count,
+            K::MinMax => SummaryKind::MinMax,
+            K::Increase => SummaryKind::Increase,
+            K::Rate => SummaryKind::Rate,
+        }
+    }
+}
+
+impl From<planner_types::post_asap::ExactParams> for SummaryParams {
+    fn from(p: planner_types::post_asap::ExactParams) -> Self {
+        use planner_types::post_asap::ExactParams as P;
+        match p {
+            P::Sum => SummaryParams::Sum,
+            P::Count => SummaryParams::Count,
+            P::MinMax => SummaryParams::MinMax,
+            P::Increase => SummaryParams::Increase,
+            P::Rate => SummaryParams::Rate,
+        }
+    }
+}
+
+/// Widen an upstream (post-ASAPPlanner#218) `SketchKind` -- always a real
+/// approximate sketch, never exact -- into this crate's flat
+/// [`SummaryKind`]. Used at the boundary where a wire/config type needs
+/// to represent both exact and approximate accumulators in one field
+/// (e.g. `control_plane`'s `BackendAggregation`) but the value in hand is
+/// known-sketch. See the module doc for why the flat type exists.
+impl From<planner_types::post_asap::SketchKind> for SummaryKind {
+    fn from(k: planner_types::post_asap::SketchKind) -> Self {
+        use planner_types::post_asap::SketchKind as K;
+        match k {
+            K::Kll => SummaryKind::Kll,
+            K::Cms => SummaryKind::Cms,
+            K::Hll => SummaryKind::Hll,
+            K::DDSketch => SummaryKind::DDSketch,
+            K::CmsWithHeap => SummaryKind::CmsWithHeap,
+            K::Kmv => SummaryKind::Kmv,
+            K::Theta => SummaryKind::Theta,
+            K::CountSketch => SummaryKind::CountSketch,
+            K::CountSketchWithHeap => SummaryKind::CountSketchWithHeap,
+        }
+    }
+}
+
+/// Narrow this crate's flat [`SummaryKind`] back down to an upstream
+/// `SketchKind`, when it identifies a real approximate sketch. `None` for
+/// the exact-accumulator variants (Sum/Count/MinMax/Increase/Rate),
+/// which have no `SketchKind` equivalent -- the inverse of the widening
+/// [`From`] impl above, fallible because that direction isn't total.
+impl SummaryKind {
+    pub fn as_sketch_kind(&self) -> Option<planner_types::post_asap::SketchKind> {
+        use planner_types::post_asap::SketchKind as K;
+        Some(match self {
+            SummaryKind::Kll => K::Kll,
+            SummaryKind::Cms => K::Cms,
+            SummaryKind::Hll => K::Hll,
+            SummaryKind::DDSketch => K::DDSketch,
+            SummaryKind::CmsWithHeap => K::CmsWithHeap,
+            SummaryKind::Kmv => K::Kmv,
+            SummaryKind::Theta => K::Theta,
+            SummaryKind::CountSketch => K::CountSketch,
+            SummaryKind::CountSketchWithHeap => K::CountSketchWithHeap,
+            SummaryKind::Sum
+            | SummaryKind::Count
+            | SummaryKind::MinMax
+            | SummaryKind::Increase
+            | SummaryKind::Rate => return None,
+        })
+    }
+}
+
+/// Same narrowing as [`SummaryKind::as_sketch_kind`], for the paired
+/// params. `None` whenever `self` isn't a sketch-family variant.
+impl SummaryParams {
+    pub fn as_sketch_params(&self) -> Option<planner_types::post_asap::SketchParams> {
+        use planner_types::post_asap::SketchParams as P;
+        Some(match self.clone() {
+            SummaryParams::Kll { k } => P::Kll { k },
+            SummaryParams::Cms { width, depth } => P::Cms { width, depth },
+            SummaryParams::Hll { precision } => P::Hll { precision },
+            SummaryParams::DDSketch { alpha } => P::DDSketch { alpha },
+            SummaryParams::CmsWithHeap {
+                width,
+                depth,
+                heap_size,
+            } => P::CmsWithHeap {
+                width,
+                depth,
+                heap_size,
+            },
+            SummaryParams::Kmv { k } => P::Kmv { k },
+            SummaryParams::Theta { k } => P::Theta { k },
+            SummaryParams::CountSketch { width, depth } => P::CountSketch { width, depth },
+            SummaryParams::CountSketchWithHeap {
+                width,
+                depth,
+                heap_size,
+            } => P::CountSketchWithHeap {
+                width,
+                depth,
+                heap_size,
+            },
+            SummaryParams::Sum
+            | SummaryParams::Count
+            | SummaryParams::MinMax
+            | SummaryParams::Increase
+            | SummaryParams::Rate => return None,
+        })
+    }
+}
+
+impl From<planner_types::post_asap::SketchParams> for SummaryParams {
+    fn from(p: planner_types::post_asap::SketchParams) -> Self {
+        use planner_types::post_asap::SketchParams as P;
+        match p {
+            P::Kll { k } => SummaryParams::Kll { k },
+            P::Cms { width, depth } => SummaryParams::Cms { width, depth },
+            P::Hll { precision } => SummaryParams::Hll { precision },
+            P::DDSketch { alpha } => SummaryParams::DDSketch { alpha },
+            P::CmsWithHeap {
+                width,
+                depth,
+                heap_size,
+            } => SummaryParams::CmsWithHeap {
+                width,
+                depth,
+                heap_size,
+            },
+            P::Kmv { k } => SummaryParams::Kmv { k },
+            P::Theta { k } => SummaryParams::Theta { k },
+            P::CountSketch { width, depth } => SummaryParams::CountSketch { width, depth },
+            P::CountSketchWithHeap {
+                width,
+                depth,
+                heap_size,
+            } => SummaryParams::CountSketchWithHeap {
+                width,
+                depth,
+                heap_size,
+            },
+        }
+    }
+}
 
 /// Data_plane's typed replacement for
 /// `(aggregation_type, aggregation_sub_type, parameters)`: which

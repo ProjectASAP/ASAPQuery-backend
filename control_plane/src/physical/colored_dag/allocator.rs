@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use asap_sketch::{L4Node, SummaryExpr};
+use planner_types::post_asap::{SummaryExpr, SummaryNode};
 
 use crate::physical::colored_dag::dag::{ColoredDag, ColoredNode, NodeId};
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
@@ -126,7 +126,7 @@ impl ThreeStageWalker {
 
     /// Recursively visit an [`L4Plan`] — the "what to compute" layer.
     /// [`L4Plan::Summary`] delegates the actual per-node granularity to
-    /// [`Self::visit_l4node`] (walking `asap_sketch::L4Node`'s own DAG
+    /// [`Self::visit_l4node`] (walking `planner_types::post_asap::SummaryNode`'s own DAG
     /// shape); [`L4Plan::LetBinding`] / [`L4Plan::Ref`] are this crate's
     /// own named-binding sharing mechanism, unchanged from before Step B.
     fn visit_plan(&mut self, plan: &L4Plan) -> Result<(NodeId, StageId), AllocateError> {
@@ -159,7 +159,7 @@ impl ThreeStageWalker {
         }
     }
 
-    /// Recursively visit one `asap_sketch::L4Node` — the sketch algebra
+    /// Recursively visit one `planner_types::post_asap::SummaryNode` — the sketch algebra
     /// itself, owned upstream. Every semantic node gets its own
     /// [`ColoredNode`] (matching the granularity the old, locally-defined
     /// `PhysicalExpr::{SketchAgg,SketchEstimate,SketchMerge}` had),
@@ -167,7 +167,7 @@ impl ThreeStageWalker {
     /// wrapping just that sub-node, so downstream consumers
     /// (`colored_dag::emitter`, `emit::mod`) keep pattern-matching
     /// against the same `PhysicalExpr` shape.
-    fn visit_l4node(&mut self, node: &Rc<L4Node>) -> Result<(NodeId, StageId), AllocateError> {
+    fn visit_l4node(&mut self, node: &Rc<SummaryNode>) -> Result<(NodeId, StageId), AllocateError> {
         let id = self.reserve_node(PhysicalExpr::committed(Rc::clone(node)));
 
         let stage = match &node.expr {
@@ -279,7 +279,7 @@ impl ThreeStageWalker {
         use crate::intent_algebra::QueryExpr as QE;
         match qe {
             QE::Scan { .. } => Ok(StageId::Edge),
-            QE::Window { .. } => Ok(StageId::Edge),
+            QE::TimeRange { .. } => Ok(StageId::Edge),
             // Aggregate at L3-in-L4: the design.md L5 table says
             // `Aggregate{exact}` (e.g. `Max`) → Edge, and the *root of
             // q3* (the same Aggregate after a SketchMerge / Merge) →
@@ -291,18 +291,8 @@ impl ThreeStageWalker {
             // sibling structure) — Phase G+ adds an explicit
             // `Logical(Merge)` PhysicalExpr variant for the gateway hop.
             QE::Aggregate { .. } => Ok(StageId::Edge),
-            // Lexical scope for L3 LetBinding / Ref — mirrors the
-            // PhysicalExpr-level handling.
-            QE::LetBinding { name, expr, child } => {
-                let expr_stage = self.colour_logical(expr)?;
-                self.scope.insert(name.as_str().to_string(), expr_stage);
-                self.colour_logical(child)
-            }
-            QE::Ref { name } => self
-                .scope
-                .get(name.as_str())
-                .copied()
-                .ok_or_else(|| AllocateError::UnresolvedRef(name.as_str().to_string())),
+            // `LetBinding`/`Ref` don't exist in the canonical `QueryExpr`
+            // anymore -- see `optimizer::engine::CommonSubexprElim`'s doc.
             // A-variants lifted in Batch 2 of the relational migration.
             // No colored-DAG consumer constructs them today; conservatively
             // route to the Edge stage (matches the per-row Scan/Window
@@ -330,9 +320,7 @@ impl ThreeStageWalker {
 // stage lookup keyed by binding name.
 pub(crate) fn binding_stage(dag: &ColoredDag, name: &BindingName) -> Option<StageId> {
     dag.nodes.iter().find_map(|n| match &n.expr {
-        PhysicalExpr::Committed(L4Plan::LetBinding { name: n2, .. }) if n2 == name => {
-            Some(n.stage)
-        }
+        PhysicalExpr::Committed(L4Plan::LetBinding { name: n2, .. }) if n2 == name => Some(n.stage),
         _ => None,
     })
 }
@@ -343,7 +331,7 @@ pub(crate) fn binding_stage(dag: &ColoredDag, name: &BindingName) -> Option<Stag
 mod tests {
     use super::*;
     use crate::intent_algebra::schema::{Column, DataType};
-    use crate::intent_algebra::{BindingScope, QueryExpr, Schema, Source, WindowKind};
+    use crate::intent_algebra::{QueryExpr, Schema, Source};
     use std::time::Duration;
 
     fn ts_scan() -> QueryExpr {
@@ -374,19 +362,15 @@ mod tests {
     }
 
     fn windowed_scan() -> QueryExpr {
-        QueryExpr::Window {
-            kind: WindowKind::Sliding,
-            size: Duration::from_secs(300),
-            slide: None,
+        QueryExpr::TimeRange {
+            range: Duration::from_secs(300),
             child: Box::new(ts_scan()),
         }
     }
 
     #[test]
     fn allocate_unsupported_topology_errors() {
-        let leaf = PhysicalExpr::committed(
-            asap_plan::bind::logical(&ts_scan(), &BindingScope::default()).unwrap(),
-        );
+        let leaf = PhysicalExpr::committed(asap_aware_mapping::bind::logical(&ts_scan()).unwrap());
         let err = StageAllocator
             .allocate(&leaf, Topology::SingleStage)
             .unwrap_err();
@@ -400,7 +384,7 @@ mod tests {
     fn three_stage_quantile_dag_basic() {
         let q = QueryExpr::Aggregate {
             reduction: crate::intent_algebra::Reduction::PerEntity,
-            aggs: vec![crate::intent_algebra::AggIntent::Quantile {
+            measures: vec![crate::intent_algebra::AggIntent::Quantile {
                 col: None,
                 q: 0.99,
                 accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
@@ -409,7 +393,7 @@ mod tests {
             having: None,
             child: Box::new(windowed_scan()),
         };
-        let node = asap_plan::bind::implement_tree(&q).unwrap();
+        let node = asap_aware_mapping::bind::implement_tree(&q).unwrap();
         let expr = PhysicalExpr::committed(node);
         let dag = StageAllocator
             .allocate(&expr, Topology::ThreeStage)

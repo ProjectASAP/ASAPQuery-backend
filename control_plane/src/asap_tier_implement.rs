@@ -1,4 +1,4 @@
-//! PromQL → compositional L4 plan (`asap_plan::bind::implement_tree`
+//! PromQL → compositional L4 plan (`asap_aware_mapping::bind::implement_tree`
 //! adoption, Step A of the plan-shaped-serving scoping).
 //!
 //! ## Terminology: "implementation", not "bind"
@@ -17,9 +17,9 @@
 //! logical) so it doesn't become a fifth colliding sense. Following that
 //! lead here: [`collect_aggregate_roots`] *finds* realizable `Aggregate`
 //! subtrees, [`implement_promql_for_asap_tier`] *implements* (realizes)
-//! them via `asap_plan::bind::implement_tree_in_with` — "bind" is used
+//! them via `asap_aware_mapping::bind::implement_tree_in_with` — "bind" is used
 //! below only where citing `asap-plan`'s own module/function names
-//! (`asap_plan::bind`, `implement_tree_in_with`) or the specific
+//! (`asap_aware_mapping::bind`, `implement_tree_in_with`) or the specific
 //! deployment-side "Bind #2" placement decision that table names.
 //!
 //! ## The gap this closes
@@ -31,8 +31,8 @@
 //! composes multiple accumulators into a multi-stage plan (`Avg = Sum /
 //! Count` stays archive-only for exactly this reason).
 //!
-//! `asap_plan::bind::implement_tree_in_with` already builds a genuinely
-//! compositional plan (`Rc<L4Node>` / `SummaryExpr` — `SummaryAgg`,
+//! `asap_aware_mapping::bind::implement_tree_in_with` already builds a genuinely
+//! compositional plan (`Rc<SummaryNode>` / `SummaryExpr` — `SummaryAgg`,
 //! `SummaryEstimate`, `SummaryMerge`, ...) from an L3 `QueryExpr` — but
 //! it is deliberately conservative about *where* it looks for a
 //! realizable `Aggregate`: hitting any non-`Aggregate` node (`Filter`,
@@ -65,18 +65,18 @@
 //! path. `implement_frequency_as_agg_test` below pins this as a known,
 //! tracked gap (not a silent trap) — closing it needs either an
 //! `asap-plan` extension hook or a hand-rolled `SummaryAgg`/
-//! `SummaryEstimate` construction here (the L4Node-building helpers in
-//! `asap_plan::bind` are private, so today there's no way to do the
+//! `SummaryEstimate` construction here (the SummaryNode-building helpers in
+//! `asap_aware_mapping::bind` are private, so today there's no way to do the
 //! latter without reimplementing them). Not yet wired into the live
 //! serving path for this reason — see module doc for the broader
 //! plan-shaped-serving scope this is Step A of.
 
 use std::rc::Rc;
 
-use asap_plan::{implement_tree_in_with, DefaultCostModel, ImplementError};
-use asap_sketch::L4Node;
+use asap_aware_mapping::{implement_tree_with, DefaultCostModel, ImplementError};
+use planner_types::post_asap::SummaryNode;
 
-use crate::intent_algebra::query_expr::{BindingScope, QueryExpr};
+use crate::intent_algebra::query_expr::QueryExpr;
 use crate::query_parser::parse_query_expr_canonical;
 use crate::types_v2::AccuracyTarget;
 
@@ -110,7 +110,7 @@ const IMPLEMENT_PROMQL_ACCURACY: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
 fn collect_aggregate_roots<'a>(expr: &'a QueryExpr, out: &mut Vec<&'a QueryExpr>) {
     match expr {
         QueryExpr::Aggregate {
-            aggs,
+            measures: aggs,
             having,
             child,
             ..
@@ -121,12 +121,8 @@ fn collect_aggregate_roots<'a>(expr: &'a QueryExpr, out: &mut Vec<&'a QueryExpr>
                 collect_aggregate_roots(child, out);
             }
         }
-        QueryExpr::Window { child, .. } => collect_aggregate_roots(child, out),
-        QueryExpr::LetBinding { expr, child, .. } => {
-            collect_aggregate_roots(expr, out);
-            collect_aggregate_roots(child, out);
-        }
-        QueryExpr::Scan { .. } | QueryExpr::Ref { .. } => {}
+        QueryExpr::TimeRange { child, .. } => collect_aggregate_roots(child, out),
+        QueryExpr::Scan { .. } => {}
         // A-variants lifted in Batch 2 of the relational migration. They
         // carry no AggIntent themselves — recurse into their children to
         // find Aggregates further down the tree. `Partition` no longer
@@ -168,15 +164,15 @@ pub enum ImplementPromqlError {
     /// PromQL failed to parse / lower to canonical `QueryExpr`.
     UnparseableMetricsql(String),
     /// L3→L4 implementation failed for a found `Aggregate` root (schema
-    /// derivation error — see `asap_plan::bind::ImplementError`).
+    /// derivation error — see `asap_aware_mapping::bind::ImplementError`).
     Implement(ImplementError),
 }
 
 /// Parse `metricsql`, find every independently-realizable `Aggregate`
 /// subtree ([`collect_aggregate_roots`]), and implement each into a
-/// compositional L4 plan via `asap_plan::bind::implement_tree_in_with`.
+/// compositional L4 plan via `asap_aware_mapping::bind::implement_tree_in_with`.
 ///
-/// Returns one `Rc<L4Node>` per root found, in tree order. Empty (not an
+/// Returns one `Rc<SummaryNode>` per root found, in tree order. Empty (not an
 /// error) when the query has no realizable `Aggregate` at all (a bare
 /// selector, or a window-bound exact-aggregation the lowerer didn't
 /// emit an `Aggregate` for) — same "no candidates" contract
@@ -188,7 +184,7 @@ pub enum ImplementPromqlError {
 /// path.
 pub fn implement_promql_for_asap_tier(
     metricsql: &str,
-) -> Result<Vec<Rc<L4Node>>, ImplementPromqlError> {
+) -> Result<Vec<Rc<SummaryNode>>, ImplementPromqlError> {
     let expr = parse_query_expr_canonical(metricsql, IMPLEMENT_PROMQL_ACCURACY)
         .map_err(|e| ImplementPromqlError::UnparseableMetricsql(e.to_string()))?;
 
@@ -198,8 +194,7 @@ pub fn implement_promql_for_asap_tier(
     roots
         .into_iter()
         .map(|root| {
-            implement_tree_in_with(root, &BindingScope::default(), &DefaultCostModel)
-                .map_err(ImplementPromqlError::Implement)
+            implement_tree_with(root, &DefaultCostModel).map_err(ImplementPromqlError::Implement)
         })
         .collect()
 }
@@ -207,7 +202,7 @@ pub fn implement_promql_for_asap_tier(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asap_sketch::SummaryExpr;
+    use planner_types::post_asap::SummaryExpr;
 
     fn root_count(metricsql: &str) -> usize {
         implement_promql_for_asap_tier(metricsql)

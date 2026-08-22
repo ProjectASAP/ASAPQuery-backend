@@ -5,13 +5,14 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use asap_ir::intent_algebra::expr_ir::ColumnRef;
-use asap_sketch::{L4Node, SketchQuery, SummaryExpr, SummaryKind, SummaryParams};
+use planner_types::post_asap::{
+    ExactKind, ExactParams, SketchKind, SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType,
+    SummaryNode,
+};
+use planner_types::pre_asap::expr_ir::ColumnRef;
 
 use crate::intent_algebra::schema::{Column, DataType};
-use crate::intent_algebra::{
-    AggIntent, BindingScope, LabelFilter, QueryExpr, Reduction, Schema, Source, WindowKind,
-};
+use crate::intent_algebra::{AggIntent, LabelFilter, QueryExpr, Reduction, Schema, Source};
 use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
 use crate::sketch_algebra::lower::bind_query_expr;
 use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
@@ -54,10 +55,8 @@ fn ts_scan() -> QueryExpr {
 }
 
 fn windowed_scan() -> QueryExpr {
-    QueryExpr::Window {
-        kind: WindowKind::Sliding,
-        size: Duration::from_secs(300),
-        slide: None,
+    QueryExpr::TimeRange {
+        range: Duration::from_secs(300),
         child: Box::new(ts_scan()),
     }
 }
@@ -68,7 +67,7 @@ fn agg_quantile(q: f64, accuracy: AccuracyTarget) -> QueryExpr {
         // `quantile_over_time(...)` lowers to: per-series, not a
         // cross-series reduction (see #165's `Reduction`).
         reduction: Reduction::PerEntity,
-        aggs: vec![AggIntent::Quantile {
+        measures: vec![AggIntent::Quantile {
             col: None,
             q,
             accuracy,
@@ -100,10 +99,10 @@ fn plan_is_archive(plan: &L4Plan) -> bool {
     }
 }
 
-fn node_is_archive(node: &Rc<L4Node>) -> bool {
+fn node_is_archive(node: &Rc<SummaryNode>) -> bool {
     match &node.expr {
         SummaryExpr::Logical(qe) => match qe.as_ref() {
-            QueryExpr::Aggregate { aggs, .. } => {
+            QueryExpr::Aggregate { measures: aggs, .. } => {
                 aggs.iter().any(crate::intent_algebra::archive_only)
             }
             _ => false,
@@ -131,10 +130,9 @@ fn bind_kll_quantile_basic() {
     // tie-break exercised separately by
     // `bind_picks_ddsketch_over_kll_when_eps_explicit` below.
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
-    let cost_model = ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SummaryKind::Kll);
-    let node =
-        asap_plan::bind::implement_tree_in_with(&expr, &BindingScope::default(), &cost_model)
-            .expect("KLL should bind a Quantile{0.99, ε=0.01}");
+    let cost_model = ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SketchKind::Kll);
+    let node = asap_aware_mapping::bind::implement_tree_with(&expr, &cost_model)
+        .expect("KLL should bind a Quantile{0.99, ε=0.01}");
     match &node.expr {
         SummaryExpr::SummaryEstimate {
             query,
@@ -142,14 +140,11 @@ fn bind_kll_quantile_basic() {
         } => {
             assert!(matches!(query, SketchQuery::Quantile { q } if *q == 0.99));
             match &summary_input.expr {
-                SummaryExpr::SummaryAgg {
-                    summary,
-                    params,
-                    child,
-                    ..
-                } => {
-                    assert_eq!(summary, &SummaryKind::Kll);
-                    assert_eq!(params, &SummaryParams::Kll { k: 200 });
+                SummaryExpr::SummaryAgg { family, child, .. } => {
+                    assert_eq!(
+                        family,
+                        &SummaryFamilyType::Sketch(SketchKind::Kll, SketchParams::Kll { k: 200 })
+                    );
                     assert!(matches!(child.expr, SummaryExpr::Logical(_)));
                 }
                 other => panic!("expected SummaryAgg, got {other:?}"),
@@ -165,10 +160,9 @@ fn bind_ddsketch_quantile_basic() {
     // of the retired `BindDDSketchOnQuantile` rule struct.
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
     let cost_model =
-        ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SummaryKind::DDSketch);
-    let node =
-        asap_plan::bind::implement_tree_in_with(&expr, &BindingScope::default(), &cost_model)
-            .expect("DDSketch should bind a Quantile{0.99, ε=0.01}");
+        ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SketchKind::DDSketch);
+    let node = asap_aware_mapping::bind::implement_tree_with(&expr, &cost_model)
+        .expect("DDSketch should bind a Quantile{0.99, ε=0.01}");
     match &node.expr {
         SummaryExpr::SummaryEstimate {
             query,
@@ -176,15 +170,15 @@ fn bind_ddsketch_quantile_basic() {
         } => {
             assert!(matches!(query, SketchQuery::Quantile { q } if *q == 0.99));
             match &summary_input.expr {
-                SummaryExpr::SummaryAgg { summary, params, .. } => {
-                    assert_eq!(summary, &SummaryKind::DDSketch);
-                    match params {
-                        SummaryParams::DDSketch { alpha } => {
-                            assert!((alpha - 0.01).abs() < 1e-12)
-                        }
-                        other => panic!("expected DDSketch params, got {other:?}"),
+                SummaryExpr::SummaryAgg { family, .. } => match family {
+                    SummaryFamilyType::Sketch(
+                        SketchKind::DDSketch,
+                        SketchParams::DDSketch { alpha },
+                    ) => {
+                        assert!((alpha - 0.01).abs() < 1e-12)
                     }
-                }
+                    other => panic!("expected DDSketch family, got {other:?}"),
+                },
                 other => panic!("expected SummaryAgg, got {other:?}"),
             }
         }
@@ -204,11 +198,10 @@ fn bind_picks_ddsketch_over_kll_when_eps_explicit() {
     match bound {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryEstimate { summary_input, .. } => match &summary_input.expr {
-                SummaryExpr::SummaryAgg { summary, .. } => {
-                    assert_eq!(
-                        summary,
-                        &SummaryKind::DDSketch,
-                        "dispatcher should pick DDSketch over KLL on ε-driven Quantile"
+                SummaryExpr::SummaryAgg { family, .. } => {
+                    assert!(
+                        matches!(family, SummaryFamilyType::Sketch(SketchKind::DDSketch, _)),
+                        "dispatcher should pick DDSketch over KLL on ε-driven Quantile, got {family:?}"
                     );
                 }
                 other => panic!("expected SummaryAgg, got {other:?}"),
@@ -225,19 +218,19 @@ fn agg_topk(k: usize, accuracy: AccuracyTarget) -> QueryExpr {
         // A ranking always reduces — empty `by` ranks the whole input,
         // never per-entity (see `lower.rs`'s `LQueryExpr::TopK` handling).
         reduction: Reduction::by(vec![]),
-        aggs: vec![AggIntent::TopK { k, accuracy }],
+        measures: vec![AggIntent::TopK { k, accuracy }],
         output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
     }
 }
 
-/// Pull the bound `(SummaryKind, w, d)` out of a top-k binding.
-/// `SummaryKind` (unlike the retired `sketch_algebra::SketchKind`)
-/// promotes `with_heap` to kind identity — the top-k cost model always
-/// binds `CmsWithHeap`/`CountSketchWithHeap` for a top-k intent, never
-/// the bare kind, so there's no separate heap flag to return anymore.
-fn topk_binding_family(bound: &PhysicalExpr) -> (SummaryKind, u32, u32) {
+/// Pull the bound `(SketchKind, w, d)` out of a top-k binding.
+/// `SketchKind` promotes `with_heap` to kind identity — the top-k cost
+/// model always binds `CmsWithHeap`/`CountSketchWithHeap` for a top-k
+/// intent, never the bare kind, so there's no separate heap flag to
+/// return anymore.
+fn topk_binding_family(bound: &PhysicalExpr) -> (SketchKind, u32, u32) {
     match bound {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryEstimate {
@@ -246,15 +239,17 @@ fn topk_binding_family(bound: &PhysicalExpr) -> (SummaryKind, u32, u32) {
             } => {
                 assert!(matches!(query, SketchQuery::TopK { k } if *k == 10));
                 match &summary_input.expr {
-                    SummaryExpr::SummaryAgg { summary, params, .. } => match params {
-                        SummaryParams::CmsWithHeap { width, depth, .. } => {
-                            (summary.clone(), *width, *depth)
-                        }
-                        SummaryParams::CountSketchWithHeap { width, depth, .. } => {
-                            (summary.clone(), *width, *depth)
-                        }
+                    SummaryExpr::SummaryAgg { family, .. } => match family {
+                        SummaryFamilyType::Sketch(
+                            kind @ SketchKind::CmsWithHeap,
+                            SketchParams::CmsWithHeap { width, depth, .. },
+                        )
+                        | SummaryFamilyType::Sketch(
+                            kind @ SketchKind::CountSketchWithHeap,
+                            SketchParams::CountSketchWithHeap { width, depth, .. },
+                        ) => (kind.clone(), *width, *depth),
                         other => {
-                            panic!("expected CmsWithHeap/CountSketchWithHeap params, got {other:?}")
+                            panic!("expected CmsWithHeap/CountSketchWithHeap family, got {other:?}")
                         }
                     },
                     other => panic!("expected SummaryAgg, got {other:?}"),
@@ -280,7 +275,7 @@ fn bind_cms_topk_loose_recall_picks_cms_heap() {
     let (kind, w, d) = topk_binding_family(&bound);
     assert_eq!(
         kind,
-        SummaryKind::CmsWithHeap,
+        SketchKind::CmsWithHeap,
         "loose-recall top-k must bind the cheap CMS-with-heap, not CountSketch"
     );
     assert!(w >= 2);
@@ -294,7 +289,7 @@ fn bind_cms_topk_loose_recall_picks_cms_heap() {
 /// NOTE — behavior change forced by the new binder, not just a rename:
 /// the old fixture used `AggIntent::TopK{accuracy: Exact}` (the intent's
 /// OWN accuracy) to signal "tight/exact-recall". Under
-/// `asap_plan::boundary::implementation_for_with`, the per-intent
+/// `asap_aware_mapping::boundary::implementation_for_with`, the per-intent
 /// summary-vs-exact boundary decision checks the intent's own `accuracy`
 /// field FIRST: `TopK{accuracy: Exact}` now declines to bind at all
 /// (`SummaryExpr::Logical`) rather than reaching the cost model's
@@ -315,7 +310,7 @@ fn bind_cms_topk_tight_recall_picks_countsketch() {
     let (kind, w, d) = topk_binding_family(&bound);
     assert_eq!(
         kind,
-        SummaryKind::CountSketchWithHeap,
+        SketchKind::CountSketchWithHeap,
         "exact-rank top-k must bind the unbiased CountSketch-with-heap"
     );
     assert!(w >= 2);
@@ -331,8 +326,8 @@ fn bind_cms_topk_tight_recall_picks_countsketch() {
 fn bind_cms_topk_picks_cost_min_meeting_sla() {
     use crate::optimizer::cost::wire::WireCostTable;
     let table = WireCostTable::default();
-    let cms = table.for_kind(&SummaryKind::Cms).per_flush();
-    let cs = table.for_kind(&SummaryKind::CountSketch).per_flush();
+    let cms = table.for_kind(&SketchKind::Cms).per_flush();
+    let cs = table.for_kind(&SketchKind::CountSketch).per_flush();
     assert!(
         cms < cs,
         "CMS-heap ({cms} B) must be cheaper than CountSketch ({cs} B) on the wire"
@@ -354,14 +349,14 @@ fn bind_cms_topk_picks_cost_min_meeting_sla() {
         cms.min(cs),
         "must pick the cost-min family that meets the SLA"
     );
-    assert_eq!(kind, SummaryKind::CmsWithHeap);
+    assert_eq!(kind, SketchKind::CmsWithHeap);
 }
 
 #[test]
 fn bind_hll_cardinality_basic() {
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::PerEntity,
-        aggs: vec![AggIntent::Cardinality {
+        measures: vec![AggIntent::Cardinality {
             col: None,
             accuracy: AccuracyTarget::Epsilon(0.01),
         }],
@@ -378,18 +373,18 @@ fn bind_hll_cardinality_basic() {
             } => {
                 assert!(matches!(query, SketchQuery::Cardinality));
                 match &summary_input.expr {
-                    SummaryExpr::SummaryAgg { summary, params, .. } => {
-                        assert_eq!(summary, &SummaryKind::Hll);
-                        match params {
-                            SummaryParams::Hll { precision } => {
-                                assert!(
-                                    *precision >= 12,
-                                    "ε=0.01 should land on at least precision 12 (~1.6%) per the rung table"
-                                );
-                            }
-                            other => panic!("expected HllParams, got {other:?}"),
+                    SummaryExpr::SummaryAgg { family, .. } => match family {
+                        SummaryFamilyType::Sketch(
+                            SketchKind::Hll,
+                            SketchParams::Hll { precision },
+                        ) => {
+                            assert!(
+                                *precision >= 12,
+                                "ε=0.01 should land on at least precision 12 (~1.6%) per the rung table"
+                            );
                         }
-                    }
+                        other => panic!("expected Hll family, got {other:?}"),
+                    },
                     other => panic!("expected SummaryAgg, got {other:?}"),
                 }
             }
@@ -403,16 +398,16 @@ fn bind_hll_cardinality_basic() {
 fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     // `AggIntent::Sum` binds to a bare `SummaryAgg` with `summary:
     // SummaryKind::Sum` and no `SummaryEstimate` wrapper (the partial
-    // state *is* the value — see `asap_plan::bind`'s module docs). The
+    // state *is* the value — see `asap_aware_mapping::bind`'s module docs). The
     // old locally-defined `PhysicalExpr::ExactAgg { agg_type, .. }`
     // variant (and `asap_types::AggregationType`) no longer exist at
-    // the L4 IR level: `asap_sketch::SummaryExpr` unifies exact
+    // the L4 IR level: `planner_types::post_asap::SummaryExpr` unifies exact
     // accumulators and approximate sketches into the same `SummaryAgg`
     // node shape, keyed by `SummaryKind` (see `physical_expr.rs`'s
     // module docs).
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::PerEntity,
-        aggs: vec![AggIntent::Sum { col: None }],
+        measures: vec![AggIntent::Sum { col: None }],
         output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
@@ -420,13 +415,12 @@ fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     let bound = bind_query_expr(&expr, AccuracyTarget::Exact).expect("no error");
     match bound {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
-            SummaryExpr::SummaryAgg { summary, params, .. } => {
+            SummaryExpr::SummaryAgg { family, .. } => {
                 assert_eq!(
-                    summary,
-                    &SummaryKind::Sum,
+                    family,
+                    &SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
                     "Sum should bind to SummaryAgg(Sum)"
                 );
-                assert_eq!(params, &SummaryParams::Sum);
             }
             other => panic!("expected bare SummaryAgg(Sum), got {other:?}"),
         },
@@ -468,7 +462,7 @@ fn bind_exact_accuracy_disables_quantile_binding() {
 fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::PerEntity,
-        aggs: vec![AggIntent::Quantile {
+        measures: vec![AggIntent::Quantile {
             col: None,
             q: 0.99,
             accuracy: AccuracyTarget::Epsilon(0.01),
@@ -486,8 +480,11 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
             } => {
                 assert!(matches!(query, SketchQuery::Quantile { .. }));
                 match &summary_input.expr {
-                    SummaryExpr::SummaryAgg { summary, .. } => {
-                        assert!(matches!(summary, SummaryKind::Kll | SummaryKind::DDSketch));
+                    SummaryExpr::SummaryAgg { family, .. } => {
+                        assert!(matches!(
+                            family,
+                            SummaryFamilyType::Sketch(SketchKind::Kll | SketchKind::DDSketch, _)
+                        ));
                     }
                     other => panic!("expected SummaryAgg under SummaryEstimate, got {other:?}"),
                 }
@@ -509,7 +506,7 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
 fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::PerEntity,
-        aggs: vec![AggIntent::Sum { col: None }],
+        measures: vec![AggIntent::Sum { col: None }],
         output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
@@ -517,8 +514,11 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
-            SummaryExpr::SummaryAgg { summary, .. } => {
-                assert_eq!(summary, &SummaryKind::Sum);
+            SummaryExpr::SummaryAgg { family, .. } => {
+                assert_eq!(
+                    family,
+                    &SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum)
+                );
             }
             other => panic!("expected SummaryAgg(Sum), got {other:?}"),
         },
@@ -538,7 +538,7 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
 fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::by(vec![1]), // service column
-        aggs: vec![AggIntent::Sum { col: None }],
+        measures: vec![AggIntent::Sum { col: None }],
         output_names: Vec::new(),
         having: None,
         child: Box::new(ts_scan()),
@@ -547,9 +547,12 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
     match bound {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryAgg {
-                summary, reduction, ..
+                family, reduction, ..
             } => {
-                assert_eq!(summary, &SummaryKind::Sum);
+                assert_eq!(
+                    family,
+                    &SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum)
+                );
                 assert_eq!(
                     reduction.group_keys().map(|k| k.keys()),
                     Some(&[1][..]),
@@ -573,7 +576,7 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
 fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::by(vec![1]),
-        aggs: vec![AggIntent::Rate],
+        measures: vec![AggIntent::Rate],
         output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
@@ -582,9 +585,12 @@ fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
     match bound {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryAgg {
-                summary, reduction, ..
+                family, reduction, ..
             } => {
-                assert_eq!(summary, &SummaryKind::Increase);
+                assert_eq!(
+                    family,
+                    &SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase)
+                );
                 assert_eq!(reduction.group_keys().map(|k| k.keys()), Some(&[1][..]));
             }
             other => panic!("expected SummaryAgg(Increase, by=[1]), got {other:?}"),
@@ -613,7 +619,7 @@ fn phase_b_pattern_archive_only_routes_to_archive() {
     );
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::PerEntity,
-        aggs: vec![intent.clone()],
+        measures: vec![intent.clone()],
         output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
@@ -624,7 +630,7 @@ fn phase_b_pattern_archive_only_routes_to_archive() {
     match bound {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
             SummaryExpr::Logical(qe) => match qe.as_ref() {
-                QueryExpr::Aggregate { aggs, .. } => {
+                QueryExpr::Aggregate { measures: aggs, .. } => {
                     assert_eq!(aggs, &vec![intent]);
                 }
                 other => panic!("expected Aggregate, got {other:?}"),
@@ -673,7 +679,7 @@ fn phase_b_e2e_quantile_over_time_binds_to_quantile_sketch() {
     );
     let kind = crate::emit::extract_root_sketch_kind(&bound);
     assert!(
-        matches!(kind, Some(SummaryKind::Kll) | Some(SummaryKind::DDSketch)),
+        matches!(kind, Some(SketchKind::Kll) | Some(SketchKind::DDSketch)),
         "expected quantile summary family, got {kind:?}"
     );
     assert!(
@@ -797,7 +803,7 @@ fn phase_b_e2e_archive_only_e2e_binding() {
     let intent = AggIntent::Absent;
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::PerEntity,
-        aggs: vec![intent.clone()],
+        measures: vec![intent.clone()],
         output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
@@ -840,7 +846,7 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
     for intent in intents {
         let expr = QueryExpr::Aggregate {
             reduction: Reduction::PerEntity,
-            aggs: vec![intent.clone()],
+            measures: vec![intent.clone()],
             output_names: Vec::new(),
             having: None,
             child: Box::new(windowed_scan()),
@@ -850,7 +856,7 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
         match bound {
             PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
                 SummaryExpr::Logical(qe) => match qe.as_ref() {
-                    QueryExpr::Aggregate { aggs, .. } => {
+                    QueryExpr::Aggregate { measures: aggs, .. } => {
                         assert_eq!(aggs.len(), 1);
                         assert!(
                             crate::intent_algebra::archive_only(&aggs[0]),
@@ -888,7 +894,7 @@ fn frequency_extension_binds_cms() {
     let intent = crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01), None);
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::PerEntity,
-        aggs: vec![intent],
+        measures: vec![intent],
         output_names: Vec::new(),
         having: None,
         child: Box::new(windowed_scan()),
@@ -907,7 +913,7 @@ fn frequency_extension_binds_cms() {
                 matches!(
                     &summary_input.expr,
                     SummaryExpr::SummaryAgg {
-                        summary: SummaryKind::Cms,
+                        family: SummaryFamilyType::Sketch(SketchKind::Cms, _),
                         ..
                     }
                 ),

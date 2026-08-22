@@ -3,13 +3,14 @@
 //! (asap-precompute-go/monitor/grpcclient/monitorpb TestCouplingFixture) and
 //! MUST decode field-for-field here via prost — proving SlackGrant.sample_p
 //! (coord->edge) and MonitorReport.rate (edge->coord) cross the wire.
-use asap_otel_proto::monitor::v1::{
-    coord_to_edge, edge_to_coord, CoordToEdge, EdgeToCoord,
-};
+use asap_otel_proto::monitor::v1::{coord_to_edge, edge_to_coord, CoordToEdge, EdgeToCoord};
 use prost::Message;
 
 fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
 }
 
 #[test]
@@ -46,11 +47,18 @@ fn rust_grant_sample_p_emit_for_go() {
     use asap_otel_proto::monitor::v1::SlackGrant;
     let env = CoordToEdge {
         msg: Some(coord_to_edge::Msg::Grant(SlackGrant {
-            agg_id: 99, round: 4, local_slack: 1.0, window_start_ms: 1_700_000_000_000,
-            sample_p: 0.3, ..Default::default()
+            agg_id: 99,
+            round: 4,
+            local_slack: 1.0,
+            window_start_ms: 1_700_000_000_000,
+            sample_p: 0.3,
+            ..Default::default()
         })),
     };
     let mut buf = Vec::new();
     env.encode(&mut buf).unwrap();
-    println!("RUST_GRANT_HEX={}", buf.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+    println!(
+        "RUST_GRANT_HEX={}",
+        buf.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+    );
 }

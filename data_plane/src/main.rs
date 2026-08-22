@@ -612,7 +612,9 @@ async fn main() -> Result<()> {
     // sample_p grant. Global-threshold alerting is retired (see
     // data_plane::monitor module docs) — this coordinator never fires one.
     let monitor_handle = if args.enable_monitor_coordinator {
-        use data_plane::monitor::{Functional, MonitorConfig, MonitorCoordinator, MonitorServiceImpl};
+        use data_plane::monitor::{
+            Functional, MonitorConfig, MonitorCoordinator, MonitorServiceImpl,
+        };
         let specs: Vec<MonitorConfig> = streaming_config
             .monitors()
             .iter()
