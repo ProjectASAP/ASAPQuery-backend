@@ -45,15 +45,8 @@ Add or complete in **ASAPPlanner**:
 - Lower `RepeatingEntry` workloads in the PromQL and SQL frontends. The
   workload type exists today, but the batch frontend helpers currently consume
   only `query_batch`.
-- Provide one generic workload-lowering facade that preserves caller IDs and
-  returns named canonical roots, without introducing protocol concepts.
 - Keep canonicalization, schema binding, workload CSE, replacement strategies,
   candidate search, cost ranking, and global selection upstream.
-- Add a public, deployment-neutral operation that applies a
-  `GlobalSelection` to all workload roots and returns the complete selected
-  post-ASAP workload DAG with explicit target/decision provenance. Do not make
-  each downstream consumer reproduce the substitution code used by
-  `dag_export`.
 - Keep `AccuracyTarget`, `QueryRequirements`, `BatchEntry`, `RepeatingEntry`,
   `QueryLanguage`, `DataCharacteristics`, pre/post-ASAP schemas, and DAG
   explain/export types canonical upstream.
@@ -68,6 +61,9 @@ Add or complete in **ASAPPlanner**:
 Add or retain in **ASAPQuery control plane**:
 
 - `O11yMetricsQuery` ingestion and source adapters.
+- Caller-ID correlation outside the planner workload: zip ordered lowering
+  results with adapter-owned IDs before passing `(Id, Rc<QueryExpr>)` roots to
+  search.
 - A deployment cost-model implementation using runtime statistics and budgets.
 - Executor-capability validation for selected post-ASAP shapes.
 - Placement across collector/backend/archive, physical fingerprints,
@@ -140,12 +136,10 @@ Protocol/source adapters
                     |
                     v
         PlanSpace::global_selection
-                    |
-                    v
-    ASAPPlanner SelectedPostAsapWorkload
               /                 \
              v                   v
-       Explain view     ASAPQuery DeploymentPlan
+    upstream explain     ASAPQuery DeploymentPlan
+         views            (apply choices + placement)
                                |
                                v
                           BackendPlan
@@ -210,9 +204,9 @@ and rollback.
 - Independent source/protocol adapters, beginning with Prometheus query and
   rule adapters, that produce `O11yMetricsQuery` values.
 - A thin `O11yMetricsQuery -> ASAPPlanner QueryWorkload` conversion.
-- An ASAPQuery deployment-plan representation built from ASAPPlanner's
-  upstream-materialized selected post-ASAP workload DAG.
-- A materializer from that selected DAG into placement and `BackendPlan`.
+- An ASAPQuery `DeploymentPlan` builder that consumes canonical roots plus
+  ASAPPlanner `GlobalSelection`, applies the chosen replacements in a
+  deployment-aware way, assigns placement, and emits `BackendPlan`.
 - An explain/debug endpoint over ASAPPlanner's existing DAG export and
   replacement-explanation types.
 - Planning phase timings, search-size metrics, deadlines, and cancellation.
@@ -358,11 +352,13 @@ enum O11yWorkloadEntry {
 }
 ```
 
-The generic converter groups entries by `QueryLanguage`, moves their existing
-entry values into `QueryWorkload`, and keeps caller IDs beside them for
-lowering/CSE/search. It performs no query parsing, canonicalization, accuracy
-conversion, or schedule interpretation. Caller IDs do not require a second
-planner `QueryId` type.
+The generic converter groups entries by `QueryLanguage` and moves their
+existing entry values into `QueryWorkload`. Caller IDs remain in a parallel
+adapter-owned vector/map. ASAPPlanner frontend lowering returns results in
+entry order; ASAPQuery zips those results back to caller IDs before passing
+`(Id, Rc<QueryExpr>)` roots to CSE/search. It performs no query parsing,
+canonicalization, accuracy conversion, or schedule interpretation. Caller IDs
+do not require a planner `QueryId` type or a new named-lowering API.
 
 Define the adapter contract around an input and two deliberately separated
 outputs:
@@ -405,16 +401,15 @@ Acceptance criteria:
 - equivalent subtrees remain shareable across roots;
 - malformed queries and schemas return per-query diagnostics.
 
-### PR 3: Complete ASAPPlanner workload planning APIs
+### PR 3: Complete repeating workload lowering in ASAPPlanner
 
-Land the generic upstream gaps first:
+Land the one generic upstream gap:
 
-- PromQL/SQL lowering for `repeating_queries` as well as `query_batch`;
-- named-root lowering that preserves caller IDs;
-- materialization of `GlobalSelection` into a complete selected post-ASAP
-  workload DAG with explicit decision provenance.
+- PromQL/SQL lowering for `repeating_queries` as well as `query_batch`, with
+  one result per entry in input order.
 
-No ASAPQuery, Prometheus, placement, wire, or runtime types enter these APIs.
+No caller ID, ASAPQuery, Prometheus, placement, wire, or runtime types enter
+these APIs.
 
 ### PR 4: Workload-wide search and deployment selection
 
@@ -426,9 +421,13 @@ let space = search_workload_with(roots, &strategies);
 let selection = space.global_selection(&backend_cost_model);
 ```
 
-Consume ASAPPlanner's materialized selected workload DAG while preserving
-shared node identity. ASAPQuery must not implement its own recursive
-`Replacement::Summary`/`Replacement::Rewrite` substitution engine.
+Build ASAPQuery's `DeploymentPlan` from the canonical roots plus
+`GlobalSelection`. This is the downstream commitment/materialization boundary
+ASAPPlanner's crate documentation assigns to a deployment: apply chosen
+`Replacement::Summary`/`Replacement::Rewrite` alternatives, preserve shared
+node identity, validate executor support, and decide placement. Keep this
+logic in one control-plane module so explain, stage allocation, and
+`BackendPlan` generation cannot implement competing substitutions.
 
 This phase should activate and test:
 
@@ -458,9 +457,9 @@ Acceptance criteria:
 Introduce a direct conversion:
 
 ```text
-SelectedPostAsapWorkload
-  -> deployment placement
-  -> DeploymentPlan
+canonical roots + GlobalSelection
+  -> ASAPQuery DeploymentPlan
+  -> apply choices + deployment placement
   -> materializations and readouts
   -> BackendPlan
 ```
@@ -768,7 +767,7 @@ The planner remains deterministic and free of timers:
 
 ```text
 ASAPPlanner:
-select(workload, schemas, statistics) -> SelectedPostAsapWorkload
+search(workload roots, cost model) -> PlanSpace + GlobalSelection
 
 ASAPQuery control plane:
 diff(active_deployment, selected_workload) -> DeploymentPlanDiff
@@ -924,7 +923,7 @@ Add negative fixtures for:
 Tests are required at four boundaries:
 
 1. query workload -> selected strategies;
-2. `SelectedPostAsapWorkload` -> `DeploymentPlan` -> `BackendPlan`;
+2. canonical roots + `GlobalSelection` -> `DeploymentPlan` -> `BackendPlan`;
 3. protobuf -> data-plane hot reload and `RoutingIndex`;
 4. ingest -> plan push -> warm query response, including archive fallback.
 
