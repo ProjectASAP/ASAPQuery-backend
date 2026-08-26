@@ -70,9 +70,9 @@ families or parameters for the same query.
 ## 3. Target architecture
 
 ```text
-WorkloadPlanRequest
-  queries: [{id, language, text, accuracy, schema_refs, recurrence?}]
-  table_schemas: [...]
+HTTP/YAML adapter
+  -> ASAPPlanner QueryWorkload
+     BatchEntry / RepeatingEntry / QueryRequirements
                     |
                     v
           parse and schema-bind every query
@@ -118,6 +118,18 @@ that point.
   control plane.
 - `BackendStageConfig -> BackendPlan` as the canonical source of planning
   decisions. It can remain temporarily as a legacy compatibility adapter.
+- The placeholder `types_v2::WorkloadPlan`, `BindingName`, and
+  `QueryExprPlaceholder`; ASAPPlanner already represents the workload as
+  canonical roots and performs real `Rc`-identity CSE without `Ref` or
+  `LetBinding` placeholders.
+- The backend-local `types_v2::QueryLanguage`; use ASAPPlanner's workload
+  language type.
+- Backend-local one-shot/periodic query-shape modeling where it duplicates
+  `BatchEntry` versus `RepeatingEntry`.
+- The duplicate `DataDistribution` and overlapping statistical fields in
+  `WorkloadCharacteristics`; populate ASAPPlanner `DataCharacteristics` and
+  keep only deployment-only constraints such as collector memory budget in
+  the placement layer.
 
 Delete these paths only after the new workload path is the production source
 of `BackendPlan`. During migration they remain available for shadow comparison
@@ -139,12 +151,12 @@ and rollback.
 
 ### 4.3 Add
 
-- A typed batch workload request.
+- Thin HTTP/YAML adapters into ASAPPlanner's existing `QueryWorkload` model.
 - A deployment-owned `SelectedWorkloadPlan` representation.
 - A materializer from ASAPPlanner's global selection into the selected
   post-ASAP DAG and then into `BackendPlan`.
-- An explain/debug representation with explicit pre-node, decision, and
-  post-node mappings.
+- An explain/debug endpoint over ASAPPlanner's existing DAG export and
+  replacement-explanation types.
 - Planning phase timings, search-size metrics, deadlines, and cancellation.
 
 ## 5. Migration stack
@@ -185,6 +197,20 @@ Adapt the ASAPQuery cost model:
   available;
 - expose numeric `estimate_cost` values for observability.
 
+Use ASAPPlanner's `AccuracyTarget` as the only correctness/accuracy input
+model. During compatibility migration, `control_plane::types_v2` may re-export
+that upstream type, but ASAPQuery must not define a second semantic equivalent.
+Delete after API migration:
+
+- the legacy `accuracy_sla: f64` fields and their `1.0 - accuracy_sla`
+  conversions;
+- the data-plane routing `AccuracyTarget::{Exact, Approximate}` enum;
+- any backend-local `CorrectnessPolicy` proposal.
+
+Routing, placement, and execution should consume the selected plan and the
+original upstream `AccuracyTarget`, not collapse it to an exact/approximate
+boolean.
+
 Acceptance criteria:
 
 - `cargo build --workspace` succeeds;
@@ -192,9 +218,10 @@ Acceptance criteria:
 - no ASAPPlanner crate is pinned to a different revision;
 - the compatibility path does not change production output yet.
 
-### PR 2: Canonical batch workload input
+### PR 2: Adopt ASAPPlanner's canonical workload input
 
-Add a new API such as `POST /api/v1/workloads/plan`:
+Add a new API such as `POST /api/v1/workloads/plan`. Its JSON is an API DTO,
+not another planner-domain model:
 
 ```json
 {
@@ -214,16 +241,24 @@ Add a new API such as `POST /api/v1/workloads/plan`:
 Requirements:
 
 - stable, caller-visible query IDs;
-- one typed `AccuracyTarget` per query, with an optional workload default;
-- an optional explicit recurrence and workload source for scheduled workloads;
-- PromQL lowering first, retaining an explicit language field;
-- table schemas and schema binding before enabling SQL;
+- map every accuracy field directly into
+  `QueryRequirements.accuracy: Option<AccuracyTarget>`;
+- map one-shot queries into `BatchEntry` and scheduled queries into
+  `RepeatingEntry`;
+- use ASAPPlanner's `QueryLanguage` rather than the backend's local language
+  enum;
+- group mixed-language API requests into one ASAPPlanner `QueryWorkload` per
+  language until upstream supports mixed languages in one workload;
+- pass table schemas through ASAPPlanner's existing `SchemaCatalog` binder
+  before enabling SQL;
 - request limits and validation;
 - old single-query endpoints adapt into a one-query workload rather than
   maintaining a second planner.
 
-The result of this phase is a vector of named `Rc<QueryExpr>` roots, not a
-`QuerySetPlan` of flattened capabilities.
+ASAPPlanner already owns canonicalization and workload CSE. The backend should
+invoke those existing paths and preserve the resulting named
+`Rc<QueryExpr>` roots; it must not implement its own AST normalization,
+semantic equality, or `QuerySetPlan` capability flattening.
 
 Acceptance criteria:
 
@@ -342,10 +377,11 @@ Add an optional explain response or endpoint containing:
 - edge schemas;
 - phase timings.
 
-The shape may reuse ASAPPlanner's `dag_export` domain types where they are
-appropriate, but production planning must call Rust APIs directly. It must
-not start the Python viewer server or invoke the `dag_export` binary as a
-subprocess.
+Use ASAPPlanner's existing `DagGraph`, `DagDecision`, `TargetReplacement`,
+`WorkloadGraph`, `export_post_asap`, and replacement-explanation APIs. Do not
+define a second backend graph/decision schema. Production planning calls these
+Rust APIs directly; it must not start the Python viewer server or invoke the
+`dag_export` binary as a subprocess.
 
 Record at least:
 
@@ -400,14 +436,20 @@ authority for rule scheduling, pending/firing state, `for`,
 `keep_firing_for`, and Alertmanager integration.
 
 ```text
-Prometheus rule files
+Prometheus rule files (ASAPQuery-backend boundary)
         |
         v
-Rule importer ---> normalized recurring workload
-        |           interval, offset, phase, expression, correctness
-        v
-ASAPPlanner -----> shared temporal aggregations
-        |           window, retention, labels, summary/error policy
+ASAPQuery rule importer
+        |----> generic RepeatingEntry + QueryRequirements ----+
+        |                                                      |
+        +----> backend-only scheduler/rule metadata             |
+               offset, group ordering, alert state              |
+                                                               v
+                                                        ASAPPlanner
+                                                               |
+                                                               v
+ASAPQuery deployment -----> shared temporal aggregations
+        |                    window, retention, labels, summary policy
         v
 ASAP QueryEngine
         |
@@ -435,36 +477,35 @@ and exposes per-query-group repetition configuration
 That inference remains useful for ad hoc dashboards. A declared rule schedule,
 however, is authoritative and must not be replaced by frequency inference.
 
-### 6.1 Recurrence and correctness in the workload model
+### 6.1 Use ASAPPlanner's existing repeating-workload model unchanged
 
-Add an optional recurrence to a query intent:
+ASAPPlanner already defines `QueryRequirements.accuracy: Option<AccuracyTarget>`,
+`RepeatingEntry`, and `RepetitionInterval`. They already contain everything
+replacement planning needs: the expression, repetition interval, accuracy,
+and optional latency requirement. Do not add a parallel ASAPQuery workload
+type and do not add `phase`, `query_offset`, missed-tick behavior, or rule-group
+identity to ASAPPlanner's model.
 
 ```rust
-struct Recurrence {
-    interval_ms: u64,
-    phase_ms: u64,
-    query_offset_ms: u64,
-    missed_tick_policy: MissedTickPolicy,
-    concurrency_key: String,
-}
-
-enum MissedTickPolicy {
-    Skip,
-}
-
-struct QueryIntent {
-    expression: String,
-    normalized_expression: String,
-    evaluation: EvaluationKind,
-    recurrence: Option<Recurrence>,
-    correctness: CorrectnessPolicy,
-    source: WorkloadSource,
+struct RepeatingEntry {
+    query: Query,
+    interval: RepetitionInterval,
+    requirements: Option<QueryRequirements>,
 }
 ```
 
-`concurrency_key` identifies the Prometheus rule group. `Skip` is the first
-and initially only missed-tick behavior because it matches Prometheus rule
-groups.
+The Prometheus importer returns two linked outputs:
+
+1. existing ASAPPlanner `RepeatingEntry` values for planning;
+2. scheduler-only rule metadata containing group identity/order,
+   `query_offset`, missed-tick behavior, `for`, and `keep_firing_for`.
+
+The importer and the second output belong to ASAPQuery-backend, not
+ASAPPlanner. The second output is never part of `QueryWorkload`, lowering,
+replacement search, post-ASAP IR, or `PlanSpace`. ASAPPlanner receives no
+Prometheus rule-group concept at any layer. Normalized expression text is
+derived from ASAPPlanner's canonical pre-ASAP IR and must not be stored as a
+second caller-controlled truth.
 
 Example normalized input:
 
@@ -486,7 +527,9 @@ query_groups:
             > 0.05
         for_ms: 300000
         keep_firing_for_ms: 60000
-        correctness: exact_or_validate
+        accuracy:
+          epsilon: 0.002
+          delta: 0.01
 ```
 
 Keep these time concepts separate:
@@ -500,47 +543,10 @@ Keep these time concepts separate:
 - A rule evaluation is an instant query even when its expression contains
   range vectors such as `[5m]`.
 
-### 6.2 Hybrid precompute and residual planning
+### 6.2 Temporal alignment, watermark, and retention
 
-Alert expressions commonly end in a comparison:
-
-```promql
-sum(rate(errors_total[5m])) / sum(rate(requests_total[5m])) > 0.05
-```
-
-The historical PromQL planner intentionally excludes comparison and set
-operators from its binary-arm decomposition
-([promql.rs](https://github.com/ProjectASAP/ASAPQuery/blob/1fc18be81ec2e0f44fa0ded85151b513ee5312b7/asap-planner-rs/src/planner/promql.rs)).
-The new workload planner should not reject the complete alert because the
-outer comparison is not streamable. It should separate supported expensive
-leaves from an exact residual:
-
-```text
-Precomputed leaf A: sum(rate(errors_total[5m]))
-Precomputed leaf B: sum(rate(requests_total[5m]))
-
-Residual: A / B > 0.05
-```
-
-Represent this boundary explicitly:
-
-```rust
-struct HybridQueryPlan {
-    precomputed_leaves: Vec<AggregationRef>,
-    residual_expression: ResidualExpr,
-    output_labels: LabelContract,
-}
-```
-
-The residual is a typed expression tree, not a string substitution. Its label
-contract must preserve PromQL vector matching and label propagation. The
-residual comparison is evaluated exactly over exact values or validated
-estimate intervals. This also permits ASAP to accelerate supported inner
-sub-DAGs beneath otherwise unsupported outer functions.
-
-### 6.3 Temporal alignment, watermark, and retention
-
-Extend the selected temporal aggregation with explicit alignment metadata:
+The deployment plan, rather than ASAPPlanner's workload model, records runtime
+alignment metadata:
 
 ```rust
 struct WindowPlan {
@@ -551,11 +557,13 @@ struct WindowPlan {
 }
 ```
 
-For a scheduler trigger at timestamp `T`:
+For a scheduler trigger at timestamp `T`, the scheduler invokes QueryEngine at
+the already-offset logical timestamp:
 
 ```text
 logical evaluation time = T - query_offset
-read only buckets whose watermark covers the logical evaluation time
+QueryEngine receives logical evaluation time
+runtime reads only buckets whose watermark covers that time
 ```
 
 The common anchor is required for correctness. Equal-duration buckets with
@@ -579,39 +587,28 @@ When several rules need the same aggregation at different compatible
 intervals, materialize the smallest compatible pane and merge panes for the
 slower rule. Do not allocate one streaming aggregation per alert interval.
 
-### 6.4 Alert correctness policy
+### 6.3 AccuracyTarget and KeepPreAsap are sufficient
 
-Alert planning requires a stronger correctness contract than ordinary
-dashboard planning:
+Do not add `CorrectnessPolicy::{Exact, Approximate, ExactOrValidate}`.
+ASAPPlanner's existing `AccuracyTarget` is the single source of truth:
 
 ```rust
-enum CorrectnessPolicy {
-    Exact,
-    Approximate,
-    ExactOrValidate,
-}
+AccuracyTarget::Exact
+AccuracyTarget::Epsilon(epsilon)
+AccuracyTarget::EpsilonDelta { epsilon, delta }
 ```
 
-For `ExactOrValidate`, propagate an error interval through the residual
-expression and compare the complete interval with the alert threshold:
+`Exact` excludes approximate candidates. A node for which no valid exact ASAP
+replacement exists remains `KeepPreAsap`, which means ASAPQuery executes the
+original pre-ASAP subtree from raw/archive data. `Epsilon` and
+`EpsilonDelta` allow ASAPPlanner to choose a summary sized to that target.
 
-```text
-interval entirely above threshold -> true
-interval entirely below threshold -> false
-interval overlaps threshold       -> exact fallback
-```
+No `ResidualExpr`, `GuardedResult`, interval-propagation layer, or conditional
+exact-fallback policy is needed for this migration. ASAPQuery consumes
+`SummaryNode` replacements and executes `KeepPreAsap` exactly; it must not
+reinterpret the accuracy requirement or define a competing correctness enum.
 
-For example, an estimate of `5.4% +/- 0.2%` is safely above a `5.0%`
-threshold because its lower bound is `5.2%`. If the interval crosses `5.0%`,
-evaluate the exact expression through Prometheus/archive instead.
-
-Only deterministic or otherwise policy-approved bounds may make an alert
-decision directly. A sketch without an applicable bound must use exact ASAP
-state, validation fallback, or Prometheus evaluation. The fallback result and
-its logical evaluation timestamp must be recorded so one uncertain estimate
-does not accidentally reset or advance a Prometheus `for` interval.
-
-### 6.5 Keep scheduling outside ASAPPlanner
+### 6.4 Keep scheduling outside ASAPPlanner
 
 The planner remains deterministic and free of timers:
 
@@ -623,10 +620,10 @@ A scheduler, ruler, or materializer owns time:
 
 1. Determine the group evaluation timestamp.
 2. Apply `query_offset_ms` to obtain logical evaluation time.
-3. Prevent overlapping evaluations for the same `concurrency_key`.
+3. Prevent overlapping evaluations for the same Prometheus rule group.
 4. Invoke QueryEngine with the selected plan and timestamp.
-5. Evaluate the exact/validated residual.
-6. Materialize a result or update alert state.
+5. Execute selected summary nodes and any `KeepPreAsap` subtree.
+6. Materialize the result or update alert state.
 
 #### Materialize into Prometheus first
 
@@ -661,7 +658,7 @@ group scheduling, missed-iteration handling, label/annotation templates,
 state persistence, `for`, `keep_firing_for`, limits, reload behavior, and
 Alertmanager delivery. This is intentionally not the first milestone.
 
-### 6.6 Incremental replanning and rule reload
+### 6.5 Incremental replanning and rule reload
 
 The historical input model already contains `existing_streaming_config` and
 `existing_inference_config`, although they are reserved rather than acted on
@@ -710,19 +707,21 @@ Safe rule reload is:
 5. Atomically switch query/rule mappings at a group evaluation boundary.
 6. Retire unreferenced physical states after their retention horizon.
 
-### 6.7 Recurring-workload delivery track
+### 6.6 Recurring-workload delivery track
 
 Build this after the base workload planner in Section 5 can produce and serve
 a selected `BackendPlan`:
 
-1. Add a Prometheus rule-file importer and explicit `Recurrence`.
-2. Canonicalize PromQL ASTs and deduplicate equivalent precompute leaves.
-3. Add comparison-aware hybrid planning and typed residual expressions.
-4. Add window anchoring, watermark, lateness, and retention metadata.
-5. Implement exact-only materialization back into Prometheus.
-6. Add `ExactOrValidate` for summaries with usable bounds.
-7. Implement current-plan diffs, warm cutovers, and evaluation-boundary swaps.
-8. Only then consider an ASAP-native ruler.
+1. In ASAPQuery-backend, add a Prometheus rule-file importer that emits
+   existing generic `RepeatingEntry` values plus separate backend scheduler
+   metadata; make no ASAPPlanner rule-group model change.
+2. Feed imported expressions through ASAPPlanner's existing canonicalization
+   and workload CSE.
+3. Add deployment window anchoring, watermark, lateness, and retention
+   metadata.
+4. Materialize exact or selected approximate results back into Prometheus.
+5. Implement current-plan diffs, warm cutovers, and evaluation-boundary swaps.
+6. Only then consider an ASAP-native ruler.
 
 The conceptual change is:
 
@@ -732,9 +731,8 @@ query string + inferred repetition delay
   -> static aggregation config
 
 Target:
-scheduled query intent + correctness contract
+ASAPPlanner RepeatingEntry + AccuracyTarget
   -> shared temporal aggregation plan
-  + exact/validated residual expression
   + incremental deployment plan
 ```
 
@@ -812,6 +810,8 @@ The migration is complete when:
 - the selected post-ASAP plan is the sole source of `BackendPlan` decisions;
 - shared sub-DAGs remain shared through materialization and serving;
 - the data plane does not independently select summary families or params;
+- ASAPPlanner's `AccuracyTarget` is the only accuracy model and legacy
+  `accuracy_sla`/local exact-vs-approximate enums have been removed;
 - q1/q2/q3/q4/q6 pass cross-repository end-to-end tests;
 - explain output maps every selected post-ASAP replacement explicitly to its
   pre-ASAP target;
@@ -823,11 +823,11 @@ The migration is complete when:
 Recurring-rule support is complete only when:
 
 - rule schedules override frequency inference;
-- evaluation interval, query offset, lookback, and alert-state durations stay
-  distinct throughout the plan;
+- only the generic evaluation interval enters ASAPPlanner; query offset and
+  alert-state durations remain scheduler metadata;
 - temporal panes have an explicit common anchor and watermark contract;
-- hybrid plans execute precomputed leaves plus an exact or validated residual;
-- uncertain approximate results fall back without corrupting alert state;
+- `AccuracyTarget::Exact` plans either select exact ASAP summaries or execute
+  `KeepPreAsap` from raw/archive data;
 - rule reload uses a warm, versioned `PlanDiff` cutover;
 - the initial production path materializes into Prometheus while Prometheus
   retains alert-state authority.
