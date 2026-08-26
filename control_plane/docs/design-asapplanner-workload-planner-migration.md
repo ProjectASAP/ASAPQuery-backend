@@ -70,7 +70,8 @@ families or parameters for the same query.
 ## 3. Target architecture
 
 ```text
-HTTP/YAML adapter
+Protocol/source adapters
+  -> ASAPQuery O11yMetricsQuery
   -> ASAPPlanner QueryWorkload
      BatchEntry / RepeatingEntry / QueryRequirements
                     |
@@ -78,7 +79,7 @@ HTTP/YAML adapter
           parse and schema-bind every query
                     |
                     v
-       Vec<(QueryId, Rc<QueryExpr>)>
+       Vec<(CallerId, Rc<QueryExpr>)>
                     |
                     v
        ASAPPlanner search_workload_with
@@ -151,7 +152,10 @@ and rollback.
 
 ### 4.3 Add
 
-- Thin HTTP/YAML adapters into ASAPPlanner's existing `QueryWorkload` model.
+- An adapter-neutral ASAPQuery `O11yMetricsQuery` ingestion model.
+- Independent source/protocol adapters, beginning with Prometheus query and
+  rule adapters, that produce `O11yMetricsQuery` values.
+- A thin `O11yMetricsQuery -> ASAPPlanner QueryWorkload` conversion.
 - A deployment-owned `SelectedWorkloadPlan` representation.
 - A materializer from ASAPPlanner's global selection into the selected
   post-ASAP DAG and then into `BackendPlan`.
@@ -220,8 +224,10 @@ Acceptance criteria:
 
 ### PR 2: Adopt ASAPPlanner's canonical workload input
 
-Add a new API such as `POST /api/v1/workloads/plan`. Its JSON is an API DTO,
-not another planner-domain model:
+Add a new API such as `POST /api/v1/workloads/plan`. Its JSON is decoded by a
+source adapter into ASAPQuery's adapter-neutral `O11yMetricsQuery`, then
+converted into ASAPPlanner's existing workload types. Neither layer is a
+second planner-domain model:
 
 ```json
 {
@@ -254,6 +260,51 @@ Requirements:
 - request limits and validation;
 - old single-query endpoints adapt into a one-query workload rather than
   maintaining a second planner.
+
+Use a module boundary such as:
+
+```text
+control_plane/src/o11y_query/
+  mod.rs                    # O11yMetricsQuery and generic conversion
+  adapters/
+    mod.rs                  # adapter trait/error contract
+    prometheus/
+      query.rs              # Prometheus instant/range request adapter
+      rules.rs              # Prometheus rule-file adapter
+      runtime.rs            # Prometheus-only scheduling/alert metadata
+```
+
+Keep this as an independent dependency boundary even if it initially lives in
+the `control_plane` crate:
+
+```text
+adapters/prometheus -> O11yMetricsQuery -> ASAPPlanner workload types
+ASAPPlanner          -X-> adapters/prometheus
+planner/search       -X-> Prometheus rule/runtime types
+```
+
+It can move into a workspace adapter crate later without changing planner or
+deployment APIs.
+
+`O11yMetricsQuery` contains only source-independent query information and
+reuses ASAPPlanner vocabulary for language, requirements, accuracy, and repeat
+interval. It must not copy `QueryExpr`, `AccuracyTarget`, or `QueryLanguage`
+into new local enums:
+
+```rust
+struct O11yMetricsQuery<Id> {
+    id: Id,
+    query: Query,
+    language: QueryLanguage,
+    requirements: Option<QueryRequirements>,
+    repetition: Option<RepetitionInterval>,
+}
+```
+
+The generic converter maps `repetition: None` to `BatchEntry` and
+`Some(interval)` to `RepeatingEntry`. Caller IDs remain beside the workload
+entries and become the generic IDs passed to CSE/search; they do not require a
+second planner `QueryId` type.
 
 ASAPPlanner already owns canonicalization and workload CSE. The backend should
 invoke those existing paths and preserve the resulting named
@@ -436,19 +487,21 @@ authority for rule scheduling, pending/firing state, `for`,
 `keep_firing_for`, and Alertmanager integration.
 
 ```text
-Prometheus rule files (ASAPQuery-backend boundary)
-        |
-        v
-ASAPQuery rule importer
-        |----> generic RepeatingEntry + QueryRequirements ----+
-        |                                                      |
-        +----> backend-only scheduler/rule metadata             |
-               offset, group ordering, alert state              |
-                                                               v
-                                                        ASAPPlanner
-                                                               |
-                                                               v
-ASAPQuery deployment -----> shared temporal aggregations
+Prometheus instant/range queries ----+
+                                     |
+Prometheus rule files ---------------+--> adapters/prometheus
+                                             |          |
+                                             |          +--> Prometheus-only
+                                             |               runtime metadata
+                                             |               (adapter boundary)
+                                             v
+                                      O11yMetricsQuery
+                                             |
+                                             v
+                               ASAPPlanner QueryWorkload
+                                             |
+                                             v
+ASAPQuery deployment ----------> shared temporal aggregations
         |                    window, retention, labels, summary policy
         v
 ASAP QueryEngine
@@ -494,18 +547,21 @@ struct RepeatingEntry {
 }
 ```
 
-The Prometheus importer returns two linked outputs:
+The Prometheus rules adapter returns two linked outputs:
 
-1. existing ASAPPlanner `RepeatingEntry` values for planning;
+1. generic `O11yMetricsQuery` values, subsequently converted into existing
+   ASAPPlanner `RepeatingEntry` values;
 2. scheduler-only rule metadata containing group identity/order,
    `query_offset`, missed-tick behavior, `for`, and `keep_firing_for`.
 
-The importer and the second output belong to ASAPQuery-backend, not
-ASAPPlanner. The second output is never part of `QueryWorkload`, lowering,
-replacement search, post-ASAP IR, or `PlanSpace`. ASAPPlanner receives no
-Prometheus rule-group concept at any layer. Normalized expression text is
-derived from ASAPPlanner's canonical pre-ASAP IR and must not be stored as a
-second caller-controlled truth.
+Both the Prometheus query adapter and rules adapter live under the same
+independent `adapters/prometheus` boundary. Adapter output (1) crosses into
+ASAPQuery core only as `O11yMetricsQuery`; output (2) remains in the
+Prometheus adapter/runtime integration. It never enters `O11yMetricsQuery`,
+`QueryWorkload`, lowering, replacement search, post-ASAP IR, or `PlanSpace`.
+ASAPPlanner receives no Prometheus query-protocol or rule-group concept at any
+layer. Normalized expression text is derived from ASAPPlanner's canonical
+pre-ASAP IR and must not be stored as a second caller-controlled truth.
 
 Example normalized input:
 
@@ -712,16 +768,18 @@ Safe rule reload is:
 Build this after the base workload planner in Section 5 can produce and serve
 a selected `BackendPlan`:
 
-1. In ASAPQuery-backend, add a Prometheus rule-file importer that emits
-   existing generic `RepeatingEntry` values plus separate backend scheduler
-   metadata; make no ASAPPlanner rule-group model change.
-2. Feed imported expressions through ASAPPlanner's existing canonicalization
+1. Add the adapter-neutral `O11yMetricsQuery` model and its direct conversion
+   into ASAPPlanner `BatchEntry`/`RepeatingEntry` workloads.
+2. Add an independent `adapters/prometheus` module with query and rule-file
+   adapters. Emit `O11yMetricsQuery` plus separately contained Prometheus
+   runtime metadata; make no ASAPPlanner Prometheus model change.
+3. Feed adapted expressions through ASAPPlanner's existing canonicalization
    and workload CSE.
-3. Add deployment window anchoring, watermark, lateness, and retention
+4. Add deployment window anchoring, watermark, lateness, and retention
    metadata.
-4. Materialize exact or selected approximate results back into Prometheus.
-5. Implement current-plan diffs, warm cutovers, and evaluation-boundary swaps.
-6. Only then consider an ASAP-native ruler.
+5. Materialize exact or selected approximate results back into Prometheus.
+6. Implement current-plan diffs, warm cutovers, and evaluation-boundary swaps.
+7. Only then consider an ASAP-native ruler.
 
 The conceptual change is:
 
