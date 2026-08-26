@@ -38,6 +38,60 @@ The boundary is intentional: ASAPPlanner decides *what a query sub-DAG may be
 replaced with*; ASAPQuery decides *where the selected replacement runs, how it
 is represented on the wire, and how it is served*.
 
+### 1.1 Ownership after reviewing the current code
+
+Add or complete in **ASAPPlanner**:
+
+- Lower `RepeatingEntry` workloads in the PromQL and SQL frontends. The
+  workload type exists today, but the batch frontend helpers currently consume
+  only `query_batch`.
+- Provide one generic workload-lowering facade that preserves caller IDs and
+  returns named canonical roots, without introducing protocol concepts.
+- Keep canonicalization, schema binding, workload CSE, replacement strategies,
+  candidate search, cost ranking, and global selection upstream.
+- Add a public, deployment-neutral operation that applies a
+  `GlobalSelection` to all workload roots and returns the complete selected
+  post-ASAP workload DAG with explicit target/decision provenance. Do not make
+  each downstream consumer reproduce the substitution code used by
+  `dag_export`.
+- Keep `AccuracyTarget`, `QueryRequirements`, `BatchEntry`, `RepeatingEntry`,
+  `QueryLanguage`, `DataCharacteristics`, pre/post-ASAP schemas, and DAG
+  explain/export types canonical upstream.
+- If recurring-query interval ever changes candidate costing or enables
+  generic cross-interval reuse, implement that as a protocol-neutral workload
+  strategy over `RepeatingEntry`. Do not add Prometheus schedules or rule
+  groups.
+- If logical plan identity/diffing is needed by more than one deployment, add
+  a canonical semantic ID and logical selected-plan diff upstream. Physical
+  rollout remains downstream.
+
+Add or retain in **ASAPQuery control plane**:
+
+- `O11yMetricsQuery` ingestion and source adapters.
+- A deployment cost-model implementation using runtime statistics and budgets.
+- Executor-capability validation for selected post-ASAP shapes.
+- Placement across collector/backend/archive, physical fingerprints,
+  `BackendPlan`, collector configuration, and routing entries.
+- Physical `DeploymentPlanDiff`, warm-up, atomic route switch, retirement, and
+  replanning triggers.
+- Explain HTTP endpoints and planning telemetry, using upstream explain types.
+
+Retain in **ASAPQuery data plane/runtime**:
+
+- Execution of selected `SummaryNode` and `KeepPreAsap` trees.
+- `BackendPlan` hot reload, `RoutingIndex`, storage lookup, watermarks,
+  lateness/readiness checks, and archive fallback.
+- Protocol response formatting and the existing Prometheus HTTP serving
+  adapter.
+
+Keep in **source/protocol adapters**, outside planner and deployment core:
+
+- Prometheus HTTP query request parsing.
+- Prometheus rule-file parsing and rule-group scheduling metadata.
+- `query_offset`, missed iterations, ordering, `for`, `keep_firing_for`, label
+  and annotation templates, and Alertmanager integration.
+- Translation into protocol-neutral `O11yMetricsQuery` values.
+
 ## 2. Why the legacy query planner should be removed
 
 ASAPQuery currently has several overlapping planning paths:
@@ -88,10 +142,10 @@ Protocol/source adapters
         PlanSpace::global_selection
                     |
                     v
-       ASAPQuery SelectedWorkloadPlan
+    ASAPPlanner SelectedPostAsapWorkload
               /                 \
              v                   v
-       ExplainPlan      deployment placement
+       Explain view     ASAPQuery DeploymentPlan
                                |
                                v
                           BackendPlan
@@ -156,9 +210,9 @@ and rollback.
 - Independent source/protocol adapters, beginning with Prometheus query and
   rule adapters, that produce `O11yMetricsQuery` values.
 - A thin `O11yMetricsQuery -> ASAPPlanner QueryWorkload` conversion.
-- A deployment-owned `SelectedWorkloadPlan` representation.
-- A materializer from ASAPPlanner's global selection into the selected
-  post-ASAP DAG and then into `BackendPlan`.
+- An ASAPQuery deployment-plan representation built from ASAPPlanner's
+  upstream-materialized selected post-ASAP workload DAG.
+- A materializer from that selected DAG into placement and `BackendPlan`.
 - An explain/debug endpoint over ASAPPlanner's existing DAG export and
   replacement-explanation types.
 - Planning phase timings, search-size metrics, deadlines, and cancellation.
@@ -286,25 +340,58 @@ planner/search       -X-> Prometheus rule/runtime types
 It can move into a workspace adapter crate later without changing planner or
 deployment APIs.
 
-`O11yMetricsQuery` contains only source-independent query information and
-reuses ASAPPlanner vocabulary for language, requirements, accuracy, and repeat
-interval. It must not copy `QueryExpr`, `AccuracyTarget`, or `QueryLanguage`
-into new local enums:
+`O11yMetricsQuery` contains only source-independent identity plus one existing
+ASAPPlanner workload entry. It must not flatten and copy the fields of
+`BatchEntry`/`RepeatingEntry`, or copy `QueryExpr`, `AccuracyTarget`, or
+`QueryLanguage` into new local enums:
 
 ```rust
 struct O11yMetricsQuery<Id> {
     id: Id,
-    query: Query,
     language: QueryLanguage,
-    requirements: Option<QueryRequirements>,
-    repetition: Option<RepetitionInterval>,
+    entry: O11yWorkloadEntry,
+}
+
+enum O11yWorkloadEntry {
+    OneShot(BatchEntry),
+    Repeating(RepeatingEntry),
 }
 ```
 
-The generic converter maps `repetition: None` to `BatchEntry` and
-`Some(interval)` to `RepeatingEntry`. Caller IDs remain beside the workload
-entries and become the generic IDs passed to CSE/search; they do not require a
-second planner `QueryId` type.
+The generic converter groups entries by `QueryLanguage`, moves their existing
+entry values into `QueryWorkload`, and keeps caller IDs beside them for
+lowering/CSE/search. It performs no query parsing, canonicalization, accuracy
+conversion, or schedule interpretation. Caller IDs do not require a second
+planner `QueryId` type.
+
+Define the adapter contract around an input and two deliberately separated
+outputs:
+
+```rust
+trait O11yMetricsAdapter<Input> {
+    type PrivateMetadata;
+
+    fn adapt(
+        &self,
+        input: Input,
+    ) -> Result<AdaptedMetricsInput<Self::PrivateMetadata>, AdapterError>;
+}
+
+struct AdaptedMetricsInput<M> {
+    queries: Vec<O11yMetricsQuery<String>>,
+    private_metadata: M,
+}
+```
+
+Only `queries` crosses into planning. `private_metadata` remains owned by the
+adapter/runtime integration and is indexed by caller ID. For an ordinary
+Prometheus query it can be empty; for a rule file it contains rule groups and
+alerting semantics.
+
+Do not extend the existing data-plane `QueryRequestAdapter` for this purpose.
+That trait is an Axum/HTTP serving adapter coupled to execution timestamps and
+`QueryResult` response formatting. Planning ingestion adapters belong in the
+control-plane boundary and share only protocol parsing utilities where useful.
 
 ASAPPlanner already owns canonicalization and workload CSE. The backend should
 invoke those existing paths and preserve the resulting named
@@ -318,7 +405,18 @@ Acceptance criteria:
 - equivalent subtrees remain shareable across roots;
 - malformed queries and schemas return per-query diagnostics.
 
-### PR 3: Workload-wide search and selection
+### PR 3: Complete ASAPPlanner workload planning APIs
+
+Land the generic upstream gaps first:
+
+- PromQL/SQL lowering for `repeating_queries` as well as `query_batch`;
+- named-root lowering that preserves caller IDs;
+- materialization of `GlobalSelection` into a complete selected post-ASAP
+  workload DAG with explicit decision provenance.
+
+No ASAPQuery, Prometheus, placement, wire, or runtime types enter these APIs.
+
+### PR 4: Workload-wide search and deployment selection
 
 Run one planning operation for the complete workload:
 
@@ -328,10 +426,9 @@ let space = search_workload_with(roots, &strategies);
 let selection = space.global_selection(&backend_cost_model);
 ```
 
-Build `SelectedWorkloadPlan` from the result while preserving shared node
-identity. It must support selected `Replacement::Summary` and
-`Replacement::Rewrite` candidates and recursively compose choices for
-descendant targets.
+Consume ASAPPlanner's materialized selected workload DAG while preserving
+shared node identity. ASAPQuery must not implement its own recursive
+`Replacement::Summary`/`Replacement::Rewrite` substitution engine.
 
 This phase should activate and test:
 
@@ -356,13 +453,14 @@ Acceptance criteria:
 - selection is deterministic for identical workload, statistics, and cost
   model inputs.
 
-### PR 4: Selected workload to BackendPlan
+### PR 5: Selected workload to BackendPlan
 
 Introduce a direct conversion:
 
 ```text
-SelectedWorkloadPlan
+SelectedPostAsapWorkload
   -> deployment placement
+  -> DeploymentPlan
   -> materializations and readouts
   -> BackendPlan
 ```
@@ -391,7 +489,7 @@ Acceptance criteria:
 - protobuf encode/decode and hot reload preserve the chosen plan;
 - the data plane never has to run a cost model to reconstruct the choice.
 
-### PR 5: Data-plane execution coverage
+### PR 6: Data-plane execution coverage
 
 Make the data plane execute or explicitly reject every post-ASAP shape the
 control plane may select. Cover at least:
@@ -416,7 +514,7 @@ Acceptance criteria:
 - archive fallback remains available for unsupported queries;
 - end-to-end tests prove plan push, hot reload, and serving.
 
-### PR 6: Explain and planner observability
+### PR 7: Explain and planner observability
 
 Add an optional explain response or endpoint containing:
 
@@ -444,7 +542,7 @@ Record at least:
 - `BackendPlan` construction and push time;
 - target, candidate, shared-node, and selected-materialization counts.
 
-### PR 7: Shadow rollout and legacy deletion
+### PR 8: Shadow rollout and legacy deletion
 
 Introduce a feature flag such as `ASAP_WORKLOAD_PLANNER_V2` and use three
 rollout modes:
@@ -669,7 +767,11 @@ reinterpret the accuracy requirement or define a competing correctness enum.
 The planner remains deterministic and free of timers:
 
 ```text
-plan(workload, schemas, existing_plan, statistics) -> PlanDiff
+ASAPPlanner:
+select(workload, schemas, statistics) -> SelectedPostAsapWorkload
+
+ASAPQuery control plane:
+diff(active_deployment, selected_workload) -> DeploymentPlanDiff
 ```
 
 A scheduler, ruler, or materializer owns time:
@@ -719,19 +821,22 @@ Alertmanager delivery. This is intentionally not the first milestone.
 The historical input model already contains `existing_streaming_config` and
 `existing_inference_config`, although they are reserved rather than acted on
 ([input.rs](https://github.com/ProjectASAP/ASAPQuery/blob/1fc18be81ec2e0f44fa0ded85151b513ee5312b7/asap-planner-rs/src/config/input.rs)).
-Use the equivalent current-plan input to produce a versioned diff:
+ASAPQuery uses the active deployment plus the new upstream-selected workload
+to produce a versioned physical diff:
 
 ```rust
-struct PlanDiff {
-    reuse: Vec<LogicalAggregationId>,
-    add: Vec<AggregationPlan>,
-    resize: Vec<AggregationMigration>,
+struct DeploymentPlanDiff {
+    reuse: Vec<MaterializationFingerprint>,
+    add: Vec<PhysicalMaterialization>,
+    resize: Vec<PhysicalMigration>,
     retire: Vec<MaterializationFingerprint>,
 }
 ```
 
 Use two identities rather than conflating logical reuse with one physical
-revision:
+revision. The logical semantic ID should come from ASAPPlanner if/when it
+provides a public canonical identity; the physical fingerprint remains an
+ASAPQuery deployment identity:
 
 ```text
 LogicalAggregationId = hash(
@@ -757,7 +862,7 @@ stable content-addressed fingerprint.
 Safe rule reload is:
 
 1. Parse and validate the complete new rule set.
-2. Generate `PlanDiff` against the active version.
+2. Generate `DeploymentPlanDiff` against the active version.
 3. Reuse unchanged aggregations and start additions/resizes.
 4. Warm new aggregations for their maximum lookback.
 5. Atomically switch query/rule mappings at a group evaluation boundary.
@@ -819,7 +924,7 @@ Add negative fixtures for:
 Tests are required at four boundaries:
 
 1. query workload -> selected strategies;
-2. selected workload -> `BackendPlan`;
+2. `SelectedPostAsapWorkload` -> `DeploymentPlan` -> `BackendPlan`;
 3. protobuf -> data-plane hot reload and `RoutingIndex`;
 4. ingest -> plan push -> warm query response, including archive fallback.
 
@@ -886,6 +991,6 @@ Recurring-rule support is complete only when:
 - temporal panes have an explicit common anchor and watermark contract;
 - `AccuracyTarget::Exact` plans either select exact ASAP summaries or execute
   `KeepPreAsap` from raw/archive data;
-- rule reload uses a warm, versioned `PlanDiff` cutover;
+- rule reload uses a warm, versioned `DeploymentPlanDiff` cutover;
 - the initial production path materializes into Prometheus while Prometheus
   retains alert-state authority.
