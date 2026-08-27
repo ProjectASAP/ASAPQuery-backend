@@ -1,295 +1,310 @@
-# `BackendPlan`: the control-plane → data-plane wire contract
+# BackendPlan: control-plane to data-plane contract
 
-> Scope: the wire format and query-time structure connecting `control_plane`
-> (planning) to `data_plane` (serving) in this deployment. This document
-> designs the target shape directly — it does not narrate what currently
-> exists or what a migration path looks like; see PR history for that.
+> Status: proposed
+>
+> Scope: the typed runtime contract by which ASAPQuery-backend's control
+> plane tells its data plane what summary materializations exist, how they
+> are ingested, and which query capabilities they serve.
 
-## 0. One-sentence version
+## TL;DR
 
-`BackendPlan` is the typed message `control_plane` pushes to `data_plane`
-describing every materialization it has decided on and what query
-capabilities each one answers; `RoutingIndex` is the structure `data_plane`
-builds from it and consults at query time — both planning time and serving
-time end up reading the *same* decision, instead of serving time
-re-deriving one independently.
+Planning chooses once; serving reuses that exact decision.
 
-## 1. Why this exists: planning decides once, serving must reuse it exactly
+`BackendPlan` is the backend half of a `CompiledPlan`. It describes the state
+that matching CollectorPlans produce and the readout/routing decisions the
+data plane must apply. It prevents the data plane from independently guessing
+summary family, parameters, grouping, windows, accuracy, or storage.
 
-Planning (`control_plane`) and serving (`data_plane`) are different
-processes with different jobs — planning picks a summary family and sizes
-its parameters from a query shape and an accuracy target, symbolically;
-serving walks already-materialized state and answers queries against it.
-Those two steps must agree on **exactly** which `SummaryFamilyType` a given
-metric's materialization uses, including algorithm, parameters, and grouping
-layout, because `SummaryExecutor::find_candidates` matches on that state type *by strict
-equality*, on purpose: this deployment chose exact agreement over silently
-serving an answer under a looser accuracy guarantee than what was
-actually planned (see `summary_executor.rs::summary_params_match`'s
-rationale).
-
-The wire format is the mechanism that keeps those two sides honest. If
-serving time ever has to *guess* what was planned — e.g. re-deriving a
-family/params choice from a hardcoded default accuracy, independent of
-what a specific metric's workload actually requested — that guess will
-occasionally be wrong, and the two sides drift apart silently (a query
-that should be servable warm capability-misses to archive for no
-query-shape reason, only because the guess didn't match reality). The
-correct shape is: `control_plane` decides once, writes the decision into
-`BackendPlan`, and `data_plane` (via `RoutingIndex`) reads that same
-decision back — never re-derives it.
-
-This has one direct implication for `data_plane`'s serving-time L4
-lowering: it should resolve a query's selected `SummaryFamilyType` by
-looking it up in `RoutingIndex` (built from the `BackendPlan` `control_plane`
-already pushed), not by invoking a `CostModel` a second time at query time.
-`CostModel::rank_candidates`/`size_params` are a **planning-time-only**
-concern — they run once, when `BackendPlan` is built, never again per
-query.
-
-## 2. Goals
-
-- One wire message, typed end to end, that both sketch-based and exact
-  materializations populate identically — no "exact means unplanned"
-  loophole.
-- A query-time structure in `data_plane` that resolves "which
-  materialization answers this query" by direct lookup against what was
-  actually planned, not by independently re-classifying the query and
-  hoping the classification matches reality.
-- Reuse this deployment's existing canonical vocabulary
-  (ASAPPlanner's `QueryExpr`/`AggIntent`/`SummaryFamilyType`, and
-  `control_plane`'s own `Capability`/`PolicyFingerprint`)
-  directly. No parallel, wire-specific re-encoding of concepts that already
-  have a canonical type.
-
-## 3. `Materialization`: exact and approximate are already the same shape
-
-ASAPPlanner's current `SummaryFamilyType` is the canonical union of plain,
-exact-aggregate, sketch, sample, wavelet, and statistical-model state. A
-sketch-valued family carries its concrete `SketchKind` and
-`GroupingStrategy`; `SketchKind` carries category, algorithm, and parameters.
-`BackendPlan` preserves that selected type instead of flattening it into the
-obsolete local `(SummaryKind, SummaryParams)` pair.
-
-```rust
-pub struct BackendPlan {
-    // Cross-subplan identity as of design-compiled-plan-collector-backend-
-    // split.md: shared verbatim with this plan's CollectorSubplan, so the
-    // two can be checked for agreement. `PolicyFingerprint` below remains
-    // the identity of one materialization; `plan_id` answers "were the
-    // collector and backend subplans compiled together," which no
-    // per-materialization fingerprint can answer on its own.
-    pub plan_id: PlanId,
-    pub plan_version: u64,
-    pub activation: DateTime<Utc>,
-    pub expiry: Option<DateTime<Utc>>,
-    pub backend_compat: BackendCompatId,
-    pub generated_at: DateTime<Utc>,
-
-    /// Every materialization this backend should build/maintain,
-    /// keyed by content-addressed identity.
-    pub materializations: HashMap<PolicyFingerprint, Materialization>,
-
-    /// Query-time capability routing — see §4 for why this is a
-    /// separate table rather than 1:1 with `materializations`.
-    pub routing: Vec<RoutingEntry>,
-
-    pub monitors: Vec<MonitorSpec>,   // CDM, unchanged concept
-}
-
-pub struct Materialization {
-    pub fingerprint: PolicyFingerprint,
-
-    // Reuses asap_ir/asap_sketch types directly — no re-flattening into
-    // ad-hoc string/HashMap fields.
-    pub source: Source,                // metric + label filter
-    pub window: WindowSpec,            // kind / size / slide
-    pub group_by: Vec<GroupKey>,
-    pub rollup: Vec<GroupKey>,
-
-    /// The exact selected Planner state type, including concrete sketch
-    /// algorithm/parameters and grouping layout where applicable.
-    pub family: SummaryFamilyType,
-    pub col: ColumnRef,
-
-    /// Collector assignments that produce this state under the matching
-    /// CollectorPlan.
-    pub sources: Vec<EdgeSourceRef>,
-
-    /// Present when the pinned Planner revision computes a guarantee for
-    /// this selected result. Unknown is not represented as exact.
-    pub guarantee: Option<ResultGuarantee>,
-
-    pub retention: Option<RetentionPolicy>,
-}
-
-pub struct RoutingEntry {
-    pub satisfies: Capability,         // control_plane's own coarse,
-                                        // family-level routing vocabulary
-    pub materialization: PolicyFingerprint,
-    pub storage_backend: StorageBackend,
-}
+```text
+selected Planner DAG
+        |
+        v
+physical compile
+   /           \
+CollectorPlan  BackendPlan
+   |           |
+summary state  ingest + route + readout
 ```
 
-**Why `routing` is a separate table from `materializations`, not a 1:1
-map:** one materialization can satisfy several query capabilities — a
-single KLL(k=200) sketch built for p99 can also answer p50/p95, and
-`Capability::is_satisfied_by` already does family-wildcard matching
-(`QuantileApprox(Any)` vs `QuantileApprox(DDSketch)`). Binding "what's
-built" to "what it can answer" 1:1 can't express that reuse; a separate
-routing table can — adding a new answerable shape for an existing
-materialization is one new `RoutingEntry`, not a change to the
-materialization itself.
+## 1. Why BackendPlan exists
 
-**Why `Capability` still exists as its own type, distinct from
-`SummaryFamilyType`:** `Capability` is the *family-level*
-question ("does anything at all answer a `QuantileApprox` shape for this
-metric") used for coarse routing decisions — miss detection, archive
-fallback, "should I even try the sketch tier." `SummaryFamilyType` is the
-*exact* question `SummaryExecutor::find_candidates`
-needs — because two candidates must agree exactly to be legally mergeable
-via `merge_states`, family-level compatibility alone isn't enough to
-decide that. These are genuinely different match precisions for genuinely
-different callers (see §4) — collapsing them into one would either make
-routing too strict (rejecting a real family match on an incidental params
-difference) or make serving too loose (merging things that don't actually
-agree).
+Control-plane planning and data-plane serving happen in different processes
+and at different times. They must nevertheless agree on:
 
-## 4. `RoutingIndex`: query-time structure in `data_plane`
+- which materializations should exist;
+- their exact summary state types;
+- where their payloads come from;
+- which windows and groups they represent;
+- which queries/readouts they can answer;
+- which guarantees apply; and
+- which plan version is active.
 
-Built fresh from each `BackendPlan` push, atomically swapped
-(`arc-swap`) so a config update never serves from a half-updated index.
+Without a typed plan, serving tends to reconstruct decisions from query text,
+hard-coded defaults, or observed storage metadata. That can silently select a
+different algorithm or parameters, miss valid state, merge incompatible
+state, or serve under the wrong accuracy contract.
 
-**Tier 1 — exact fingerprint, O(1).** Compute the incoming query's own
-shape fingerprint using the same hash function as `PolicyFingerprint`
-(metric + agg shape + params + grouping/rollup labels + window +
-normalized filter) and look it up directly in `materializations`. Covers
-the common case — a query structurally identical to something
-`control_plane` already planned (the majority of fixed-dashboard traffic).
+BackendPlan makes the control-plane decision authoritative.
 
-**Tier 2 — structural/capability match, on Tier-1 miss.**
+## 2. Relationship to other plans
 
-```rust
-pub struct RoutingIndex {
-    exact: HashMap<PolicyFingerprint, PolicyFingerprint>,   // Tier 1
-    by_metric: HashMap<MetricId, MetricBucket>,             // Tier 2
-}
+ASAPPlanner supplies the selected logical post-ASAP DAG. ASAPQuery's physical
+compiler creates:
 
-/// Columnar, not `Vec<CandidateEntry>` nested in a `HashMap` — see §4.1.
-struct MetricBucket {
-    group_shape_ids:  Vec<GroupShapeId>,
-    filter_ids:       Vec<FilterId>,
-    windows:          Vec<WindowSpec>,
-    capabilities:     Vec<Capability>,
-    families:         Vec<SummaryFamilyType>,
-    guarantees:       Vec<Option<ResultGuarantee>>,
-    fingerprints:     Vec<PolicyFingerprint>,
-    storage_backends: Vec<StorageBackend>,
-}
+- CollectorPlan, which constructs and transmits materializations; and
+- BackendPlan, which validates, stores, routes, merges, and reads them.
+
+The two are defined together in
+[`design-compiled-plan-collector-backend-split.md`](design-compiled-plan-collector-backend-split.md).
+
+BackendPlan is not:
+
+- a copy of ASAPPlanner's internal DAG;
+- a query-language AST;
+- a collector configuration;
+- a storage inventory discovered after planning; or
+- an explain/viewer artifact.
+
+## 3. Plan envelope
+
+Every BackendPlan contains:
+
+| Field | Meaning |
+| --- | --- |
+| `plan_id` | Identity shared with every CollectorPlan compiled from the same decision. |
+| `plan_version` | Ordered version within that plan identity. |
+| `activation` | Earliest time this plan may serve queries. |
+| `expiry` | Optional time after which this plan is invalid. |
+| `backend_compat` | Backend-plan and summary-state schema compatibility identity. |
+| `generated_at` | Time the control plane emitted the plan. |
+| `planner_revision` | Immutable Planner revision that produced the logical selection. |
+
+The data plane rejects stale, conflicting, premature, expired, or
+incompatible plans. Reapplying the same plan/version/content is idempotent.
+
+## 4. Materializations
+
+A materialization describes one logical summary state expected by the
+backend. It contains:
+
+- content-addressed materialization identity;
+- bound metric/source and canonical filters;
+- summarized value or item label;
+- physical/logical window contract;
+- reduction and grouping layout;
+- exact `SummaryFamilyType`, including concrete algorithm and parameters;
+- collector producer references;
+- state encoding/schema compatibility;
+- storage destination and retention; and
+- selected result guarantee when supplied by Planner.
+
+Exact accumulators and approximate summaries use the same materialization
+concept. The family discriminator determines which state and parameters are
+valid. An algorithm/parameter mismatch is a decoding or validation failure,
+not an untyped configuration bag.
+
+The materialization identity includes every semantic property required for
+safe reuse and merge. Two states with the same metric name but different
+filters, reductions, grouping, windows, families, parameters, or encoding are
+different materializations.
+
+## 5. Routing and readout
+
+Materializations describe what state exists. Routing entries describe what
+queries that state can answer. These are separate because one materialization
+may serve several readouts or queries.
+
+For example, one sufficiently accurate quantile materialization may support
+p50, p95, and p99 readouts. It remains one maintained state with several
+routing entries.
+
+A routing entry identifies:
+
+- the query capability/readout it satisfies;
+- the materialization used;
+- any remaining backend-side operation;
+- required grouping/window compatibility;
+- the storage tier; and
+- exact fallback behavior on a miss.
+
+Routing never changes the materialization's summary semantics. A capability
+match can choose among already valid planned routes; it cannot reinterpret
+stored state as another family or parameterization.
+
+## 6. Two levels of matching
+
+Serving needs two different matching strengths.
+
+### Capability matching
+
+Capability matching answers:
+
+> Is there a planned materialization that can answer this logical query shape?
+
+It may allow a compatible family-level or readout-level relationship, such as
+using one quantile summary for several ranks or rolling up a mergeable finer
+grouping when the plan explicitly permits it.
+
+### State compatibility matching
+
+State compatibility answers:
+
+> Can these exact payloads be decoded, merged, and read under this
+> materialization contract?
+
+This comparison is strict. Family, algorithm, parameters, grouping layout,
+window, encoding, plan identity, and materialization identity must agree.
+
+Capability compatibility never implies state compatibility. The backend may
+route a query to a compatible planned materialization, but it may merge only
+strictly compatible states.
+
+## 7. Accuracy guarantees
+
+`AccuracyTarget` is the requested constraint used during planning. When the
+pinned Planner revision provides `ResultGuarantee`, BackendPlan preserves the
+selected result's:
+
+- error metric;
+- bound expression;
+- failure probability;
+- provenance and budget allocation; and
+- any unavailable statistic that kept the guarantee unknown.
+
+The data plane does not recompute or weaken that guarantee. Unknown is not
+zero and not exact. A route that requires a guarantee fails when the stored
+plan lacks a sufficient one.
+
+For an explicitly permitted approximate realization of an Exact-requested
+TopK query, BackendPlan records the effective approximation target and
+guarantee. It must never label that realization exact.
+
+## 8. Source and payload validation
+
+Each ingested summary payload identifies:
+
+- plan ID and version;
+- backend compatibility identity;
+- materialization ID;
+- collector/producer ID;
+- window identity;
+- state schema version; and
+- full/delta sequencing and checkpoint identity when applicable.
+
+The backend rejects payloads that are unknown, stale, incompatible, out of
+sequence, or addressed to another active plan. It does not place them into a
+best-effort metric-name bucket.
+
+A plan may reference several collector producers for one sharded
+materialization. The backend merges them only if the materialization contract
+and family algebra allow it.
+
+## 9. Installation and lifecycle
+
+BackendPlan installation is staged and atomic:
+
+1. Decode and validate the complete plan.
+2. Validate every family, readout, route, source, and storage capability.
+3. Build a new routing/index view without mutating the active view.
+4. Confirm compatibility with the matching collector subplan.
+5. Mark the plan staged until its activation time and collector application
+   evidence are available.
+6. Atomically switch query routing to the new view.
+7. Retain the previous view until in-flight readers and the configured drain
+   horizon finish.
+
+An invalid update never partially changes routing. The previous unexpired
+plan remains available for rollback.
+
+## 10. Query-time behavior
+
+At query time, the data plane:
+
+1. parses/canonicalizes the query only as needed to identify its planned
+   logical shape;
+2. looks up routes installed from BackendPlan;
+3. verifies readiness, freshness, grouping, window, and guarantee;
+4. fetches strictly compatible states;
+5. merges and reads them according to the planned operation; and
+6. returns the result or takes the explicit exact fallback.
+
+It does not invoke Planner candidate search, run a planning cost model, resize
+a sketch, or infer a missing parameter.
+
+## 11. Example
+
+Suppose the workload contains:
+
+```promql
+quantile_over_time(0.95, request_duration_seconds[5m])
 ```
 
-Match algorithm on Tier-1 miss:
+The selected and compiled plan may contain one DDSketch materialization with
+one-minute panes and a p95 routing/readout entry. BackendPlan records the
+DDSketch parameter, per-entity reduction, independent grouping layout,
+producer collectors, storage route, window composition, and selected
+guarantee.
 
-1. `by_metric.get(metric_id)`.
-2. Filter `group_shape_ids` for rows equal to, or a rollup-derivable parent
-   of, the query's requested group-by.
-3. Filter remaining rows by window compatibility — exact match, or the
-   existing window-merge/closest-pane logic
-   (`storage_engines/sketch_db/query/window_merger.rs`).
-4. Filter remaining rows for filter *subsumption* (materialization's
-   baked-in filter ⊆ query's filter — not equality).
-5. **Match precision depends on the caller** — this is the one place
-   `RoutingIndex` has two genuinely different read modes, not a single
-   shared one:
-   - **Whole-query resolution** (deciding whether this query can be
-     served warm at all, and which storage backend to route to): match
-     `Capability::is_satisfied_by(query_agg_intent, accuracy)` —
-     family-level.
-   - **`SummaryExecutor::find_candidates`** (per-`L4Node`-leaf, called
-     during `asap_sketch::exec::execute()`'s walk): match exact
-     exact `SummaryFamilyType` equality — required for anything that can feed
-     a `SummaryMerge`, and the reason `l4_lowering.rs` no longer needs to
-     independently observe or guess this (see §5).
-6. **Whole-query resolution only:** if more than one candidate survives,
-   rank by error bound / storage-tier cost and return the single winner.
-   **`find_candidates` only:** skip ranking — return every row that
-   survived step 5's exact match, so `execute()` can fold them all via
-   `merge_states`.
-7. No survivors → archive/Thanos fallback routing (whole-query mode), or
-   `ExecError::NoCandidates` (`find_candidates` mode) — two callers of the
-   same "empty" outcome.
+When the query arrives, the data plane finds that route, fetches five
+compatible panes, merges DDSketch state, and reads p95. It does not run a cost
+model to reconsider KLL or choose a new DDSketch parameter.
 
-### 4.1 Why columnar + interned ids, not nested `HashMap<Vec<LabelName>, Vec<_>>`
+## 12. Wire-format principles
 
-Consistency with an existing, already production-validated pattern one
-layer down: `storage_engines/sketch_db/index/epoch_columnar.rs` already
-does exactly this for the physical sketch index — `LabelValuesId = u32`
-interns each group-by label-values vector so the hot loop compares a
-4-byte int instead of walking a `BTreeMap<String, String>`, and the epoch
-store itself is parallel arrays ("range scan touches only `windows_col`").
-`RoutingIndex` should use `GroupShapeId`/`FilterId` interning and
-parallel-array storage per `MetricBucket` for the same reason: at the
-scale of thousands of planned materializations per metric, Tier-2 lookup
-is effectively a small in-memory OLAP scan, not a handful of hash lookups,
-and should be built that way rather than reinvented as nested hash maps.
+BackendPlan is a typed protobuf contract.
 
-## 5. What this replaces at serving time
+The schema follows these principles:
 
-Today, `data_plane`'s serving-time L4 lowering (`l4_lowering.rs`) parses
-the raw query string down to a canonical `QueryExpr`, then has to
-*independently reconstruct* which `SummaryFamilyType` a
-metric's registered sid actually uses by inspecting the `SketchStore`'s
-own metadata (`ObservedFamilyCostModel`) before it can bind an `L4Node`
-that `find_candidates` will actually match. That's a real, working
-mechanism, but it's inherently a *reconstruction* — it infers the plan
-from its side effect (what got registered), rather than reading the plan
-directly.
+- family-specific values use typed discriminated variants;
+- invalid family/parameter combinations are unrepresentable or rejected;
+- additive optional fields support controlled rollout;
+- unknown required variants fail closed;
+- compatibility is explicit through `backend_compat`;
+- materialization identity is stable and content-addressed; and
+- debug/explain fields are not runtime identity.
 
-Once `RoutingIndex` exists, serving-time lowering simplifies to: parse to
-`QueryExpr` (L1-L3, still genuinely needed — a query's *shape* has to be
-recovered from its text regardless of any wire format), then resolve the
-query's selected `SummaryFamilyType` via `RoutingIndex`'s
-`find_candidates`-mode lookup directly, and construct the `L4Node` from
-that pair — no `CostModel::rank_candidates`/`size_params` call at serving
-time at all. `CostModel` becomes exactly what its name says: a
-planning-time cost model, invoked once when `BackendPlan` is built, never
-re-invoked per query. `ObservedFamilyCostModel`'s SketchStore-introspection
-approach was always a stopgap for the absence of this lookup, not a
-replacement for it.
+Exact protobuf field numbers and generated-language types belong in the
+protocol definition and implementation review, not this design document.
 
-## 6. Transport
+## 13. Fail-closed behavior
 
-**Proto, not YAML/JSON.** `BackendPlan` is a typed protobuf contract.
-`SummaryFamilyType` and its family-specific values become proper protobuf
-`oneof`s, with invalid family/parameter combinations rejected during decode.
-`backend_compat` explicitly protects coordinated use with the independently
-delivered CollectorPlan and emitted summary-state schema; deployment timing
-must not be treated as an implicit compatibility guarantee. Additive fields
-and backward decoding support controlled rollout, with unknown required
-variants rejected rather than placed in an untyped
-`HashMap<String, Value>` bag.
+The plan or query fails when:
 
-## 7. Open questions
+- the plan envelope is stale or incompatible;
+- a materialization family/parameter/grouping/window is unsupported;
+- a collector source does not match the expected contract;
+- state payload identities or sequences are invalid;
+- a requested route has no valid materialization;
+- a required guarantee is absent or insufficient;
+- required state is empty, stale, or incomplete; or
+- exact fallback is required but unavailable.
 
-- **Query-side fingerprinting.** Does Tier-1 matching reuse
-  `PolicyFingerprint::from_config` verbatim, or does an incoming query
-  need a distinct fingerprint function (it carries no `original_yaml` or
-  `num_aggregates_to_retain` — both already excluded from the hash per
-  `policy_fingerprint.rs`'s own doc comment, so likely fine as-is, but
-  worth verifying rather than assuming).
-- **Rollup algebra.** Step 2 above assumes "a materialization grouped by
-  `(zone, region)` can answer a query grouped by `(zone)` alone" is a
-  known-safe operation gated by the `rollup` field. The precise algebra —
-  which summary families roll up safely (`Sum`/`Count`-family: yes;
-  `Quantile`: generally no without re-estimation error) — needs its own
-  short design pass before this step can be implemented as described.
-- **Exact-requested top-k policy.** ASAPPlanner PR #293 permits a deployment
-  cost model to offer `CmsWithHeap`/`CountSketchWithHeap` for
-  `TopK { accuracy: Exact }` only with an explicit effective approximation
-  target, while retaining pass-through. If the pinned revision contains that
-  hook and ASAPQuery opts in, `BackendPlan` records the approximate family,
-  effective target, and selected guarantee; it must not describe the result as
-  exact. Without the opt-in, the query routes to exact raw/archive execution.
-- **`RoutingIndex` performance.** New query-time hot path in a
-  latency-sensitive service — needs a benchmark pass against the current
-  lookup, not just a correctness pass, before it can replace anything.
+The backend must not return a plausible summary result from mismatched state,
+silently drop missing series, treat missing data as zero, or hide a failure as
+a routing miss.
+
+## 14. Non-goals
+
+This document does not define:
+
+- Planner candidate generation or ranking;
+- CollectorPlan;
+- summary-state byte encoding;
+- storage-engine implementation;
+- query parser implementation;
+- routing-index data structures or performance optimizations; or
+- protobuf field numbering.
+
+## 15. Definition of done
+
+The BackendPlan design is satisfied when:
+
+- control plane and data plane share one typed contract;
+- every expected collector materialization has an exact backend declaration;
+- one materialization can serve several explicit routes/readouts;
+- state merge uses strict compatibility;
+- guarantees remain Planner-derived and fail closed;
+- plan installation and routing switch atomically;
+- query serving performs no independent summary planning;
+- stale or mismatched payloads are rejected; and
+- end-to-end tests prove matching plans serve and mismatched plans fail.

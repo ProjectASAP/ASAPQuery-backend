@@ -1,426 +1,314 @@
-# Compiling a selected post-ASAP DAG into two physical subplans
+# Compiling one Planner decision into collector and backend plans
 
-> Status: proposed, 2026-08-27
+> Status: proposed
 >
-> Scope: the interface between ASAPQuery-backend's control plane and its two
-> executors — ASAPCollector (via OpAMP) and the ASAPQuery-backend data plane
-> (via `BackendPlan`). This document replaces the implicit assumption, in
-> earlier design notes, that a selected post-ASAP node can be serialized
-> more or less directly into collector YAML. It complements
-> [`design-asapplanner-workload-planner-migration.md`](design-asapplanner-workload-planner-migration.md)
-> (the planner-migration boundary) and
-> [`design-backend-plan-wire-format.md`](design-backend-plan-wire-format.md)
-> (the backend half of the wire contract this document extends).
+> Scope: the ASAPQuery-backend physical-planning step between ASAPPlanner's
+> selected post-ASAP workload DAG and the two runtime executors:
+> ASAPCollector and the ASAPQuery data plane.
 
-## 0. The boundary this document sits on
+## TL;DR
 
-ASAPPlanner's own scope statement (`README.md`, "Scope") is explicit:
+ASAPPlanner selects a logical plan. That plan says which summaries and exact
+operations answer a workload, but it intentionally does not choose machines,
+shards, runtime windows, transport modes, or storage routes.
 
-> not caring about CTSA stages i.e. whether a part of a plan is executed at
-> the collector or at the analytics stage
-> not caring about assignment of physical resources, like CPU threads and
-> memory, to nodes in the ASAP plan
+ASAPQuery-backend performs one physical compile that produces both runtime
+views of the decision:
 
-and `docs/design_docs/asap-aware-mapping/README.md`'s non-goals repeat this
-for the mapping layer specifically: no CPU/memory assignment, no machine
-placement, no scheduling, no admission control, no low-level execution
-tuning. ASAPPlanner's own README names the resulting open question directly
-("Open questions", #1): its output "has semantics of batch query execution
-over data at rest" and "needs to be converted into two plans: (1) streaming
-dataflow graph that computes summaries on raw data, and (2) batch query
-execution plan that uses summaries to answer queries" — collector and
-backend, in this deployment's vocabulary.
-
-So: ASAPPlanner selects **what** replaces a query sub-DAG (which summary
-family, algorithm, parameters, grouping layout, and how per-query readouts
-compose over shared summary state). ASAPQuery-backend's control plane
-decides **where** each piece of that selected DAG runs, **how** it is
-represented on each wire, and **that** both sides agree they are running the
-same decision. This document is the second half — the "where/how/that" —
-concretely.
-
-## 1. What ASAPPlanner hands us today
-
-Grounded in `crates/types/src/post_asap/{mod,expr,schema,sketch}.rs` on
-ASAPPlanner `main`, not carried over from older docs. The selected output of
-`asap_aware_mapping::replacement::search_workload_with(...).global_selection(...)`
-is a DAG of `Rc<SummaryNode>` (shared `Rc` = shared physical state — see
-[migration doc](design-asapplanner-workload-planner-migration.md) §3), each
-node one of:
-
-- **`SummaryExpr::SummaryAgg { child, family, col, reduction, grouping }`**
-  — the *update* side: consumes raw/plain input and produces summary state.
-  `family: SummaryFamilyType` is one of `ExactAggregate(ExactKind,
-  ExactParams)`, `Sketch(SketchKind, GroupingStrategy)` (`SketchKind` itself
-  nests `category`/`algorithm`/`params` — `Kll`/`DDSketch`/`Hll`/`Cms`/
-  `CmsWithHeap`/`Kmv`/`Theta`/`CountSketch`/`CountSketchWithHeap`, each with
-  its own concrete `SketchParams`), `Sample(SamplingKind, SamplingParams)`,
-  `Wavelet(WaveletKind, WaveletParams)`, or `StatModel(StatModelKind,
-  StatModelParams)`. `reduction: Reduction` is `Reduce(GroupKeys)` or
-  `PerEntity` (`crates/types/src/pre_asap/query_expr.rs`). `grouping:
-  GroupingStrategy` is `PerSubpopulationInstance` (default) or
-  `SharedMultiSubpopulation { kind: HydraKind, params: HydraParams }`.
-- **`SummaryExpr::SummaryEstimate { summary_input, query }`** — the
-  *readout* side: reads a `SketchQuery` (`Quantile`/`PointCount`/
-  `Cardinality`/`TopK`) out of already-built summary state, producing a
-  plain value. Summary-state typing does not propagate past this node.
-- **`SummaryExpr::SummaryMerge { children }`** / **`SummarySubtract`** /
-  **`SummaryDelete`** / **`SummaryJoin`** — combine or transform summary
-  state; still summary-typed in/out, still on the readout side of any
-  `SummaryEstimate` that eventually consumes them.
-- **`SummaryExpr::KeepPreAsap(Rc<QueryExpr>)`** — no replacement chosen;
-  executed against raw/archive data, never against collector-maintained
-  state.
-
-**Forward note on an open upstream PR.** ASAPPlanner PR
-[#300](https://github.com/ProjectASAP/ASAPPlanner/pull/300) (open, not yet
-merged) proposes to make exactly this update/readout distinction an
-explicit, validated field: `post_asap::phase::ExecutionAvailability {
-UpdateValue, SummaryState, ReadoutValue }`, with `SummaryAgg.child` typed to
-accept only `UpdateValue` (or nested exact-accumulator state), and
-`SummaryEstimate` typed `SummaryState -> ReadoutValue`. The split this
-document defines (§2) is derived from the same structural fact —
-`SummaryAgg` is the only node that *consumes* plain/update values and
-*produces* summary state — so it does not depend on #300 landing, but it is
-literally the same boundary #300 gives a name to. If/when #300 merges, §2's
-partition rule should be re-expressed as "everything upstream of and
-including a `PhaseAssignment` boundary at `SummaryState`" rather than
-re-derived structurally; no other part of this design changes.
-
-## 2. Why not compile 1:1, node-by-node, straight to collector YAML
-
-A naive compiler would walk the selected DAG and, for each `SummaryAgg`,
-emit one `asap_edge.metrics[]` entry with the same `family`/`col`/
-`reduction` fields, then hand the whole thing to whichever process asks for
-it. This does not work, for reasons that are all direct consequences of §0's
-non-goals:
-
-1. **No stage/edge/shard is chosen.** ASAPPlanner has no concept of "which
-   collector process" or "how many shards" — `SummaryAgg` names a logical
-   aggregation, not a physical instance of one. Something has to decide
-   fan-out: one `SummaryAgg` shared by two queries might still be one
-   physical summary; one `SummaryAgg` under high cardinality might be
-   sharded across `shard_count` collector processes and merged with
-   `SummaryMerge` before it ever reaches a `SummaryEstimate`. That decision
-   is deployment placement, owned here, not upstream.
-2. **No transport/physical parameters exist upstream.** `edge_id`,
-   `window_duration`, `warm_allowed_lateness`, `drop_original`,
-   `delta_transmission`, `delta_threshold` (see
-   [ASAPCollector's OpAMP interface doc](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/opamp-config-push.md))
-   are bandwidth/latency/resource trade-offs a deployment makes; ASAPPlanner
-   has no field for any of them and should not grow one (they are the
-   physical-resource assignment its own non-goals name explicitly).
-3. **Sharing and sharding both break 1-selected-node = 1-wire-fragment.** A
-   shared `Rc<SummaryNode>` reached by two query roots must still be *one*
-   collector-side summary and *one* backend-side `Materialization` with two
-   `RoutingEntry` rows (see
-   [`design-backend-plan-wire-format.md`](design-backend-plan-wire-format.md)
-   §3 on why routing is a separate table). A single logical node sharded for
-   cardinality must become *several* collector-side instances merged back
-   into *one* backend-side materialization. Neither direction is a
-   serialization concern; both require an explicit compile/allocate pass.
-4. **Two independent readings of the same DAG can silently disagree.**
-   The [migration plan](design-asapplanner-workload-planner-migration.md)
-   requires one physical compile path for exactly this reason. If the collector
-   subplan and the backend subplan are derived independently — even from
-   the same selected DAG, by two different code paths, at two different
-   times — nothing stops them drifting. A single compile step that emits
-   both subplans from one pass over one selected DAG, stamped with one
-   shared identity (§4), is what removes that possibility structurally
-   instead of by convention.
-5. **The two wires evolve independently and are consumed by different
-   processes at different times.** OpAMP YAML is read by ASAPCollector;
-   `BackendPlan` protobuf is read by `data_plane`. Neither should decode
-   the other's format, and neither should decode ASAPPlanner's internal
-   Rust IR — that IR is not a stable cross-process wire contract and was
-   never meant to be one (migration plan §§2 and 4.2).
-
-## 3. `CompiledPlan`: one compile step, two subplans, one identity
-
-```rust
-/// The output of compiling one `GlobalSelection` for one deployment
-/// topology. This is control_plane's L5 (see
-/// design-target-architecture.md §2, "L5 — physical plan": the one layer
-/// this deployment owns in full because no upstream `asap-physical` crate
-/// exists) — and it is the *only* thing that leaves the control plane's
-/// planning boundary. Neither subplan is ever emitted independently of the
-/// other; they are two views produced by the same compile call.
-pub struct CompiledPlan {
-    /// Shared identity across BOTH subplans. Content addressed from the
-    /// selected DAG, topology identity, and semantic constraints. Mutable
-    /// sizing and lifecycle values are deliberately excluded and ordered by
-    /// `plan_version` instead.
-    pub plan_id: PlanId,
-    /// Monotonic per-`plan_id` counter — bumped on re-compile against an
-    /// unchanged selection (e.g. a resize), not on every replan.
-    pub plan_version: u64,
-    /// Not-before: neither subplan should be treated as authoritative
-    /// before this time. Lets a warm cutover (see migration plan §9,
-    /// `DeploymentPlanDiff`) land both subplans ahead of the switch.
-    pub activation: DateTime<Utc>,
-    /// Not-after / supersede horizon. `None` for "until superseded."
-    pub expiry: Option<DateTime<Utc>>,
-    /// Identifies the *wire schema version* the backend subplan requires,
-    /// so a collector/backend pair that somehow ends up on mismatched
-    /// deploys fails a compatibility check instead of silently serving
-    /// under the wrong contract. Distinct from `plan_id`: this changes on
-    /// a schema/deploy version bump, not on every replan.
-    pub backend_compat: BackendCompatId,
-
-    pub collector: CollectorSubplan,
-    pub backend: BackendSubplan,
-}
-
-pub struct CollectorSubplan {
-    pub plan_id: PlanId,           // == CompiledPlan::plan_id
-    pub plan_version: u64,         // == CompiledPlan::plan_version
-    pub activation: DateTime<Utc>,
-    pub expiry: Option<DateTime<Utc>>,
-    pub backend_compat: BackendCompatId,
-    /// One entry per collector fleet member this plan touches.
-    pub edges: Vec<EdgeAssignment>,
-}
-
-pub struct EdgeAssignment {
-    pub edge_id: String,
-    /// The versioned CollectorPlan fields (§5), produced by compiling the
-    /// `SummaryAgg` nodes assigned to this edge, not authored ad hoc.
-    pub config: AsapEdgeConfig,
-    /// Opaque identity of *this edge's* exact YAML body — unchanged
-    /// semantics from ASAPCollector's existing `config_hash` (it still
-    /// identifies collector-config bytes, nothing more); `plan_id` is the
-    /// new, separate field that identifies the plan those bytes were
-    /// compiled from.
-    pub config_hash: ConfigHash,
-}
-
-pub struct BackendSubplan {
-    pub plan_id: PlanId,           // == CompiledPlan::plan_id
-    pub plan_version: u64,         // == CompiledPlan::plan_version
-    pub activation: DateTime<Utc>,
-    pub expiry: Option<DateTime<Utc>>,
-    pub backend_compat: BackendCompatId,
-    /// `BackendPlan` from design-backend-plan-wire-format.md §3. Its
-    /// envelope fields equal this `BackendSubplan` and the matching
-    /// `CollectorSubplan`.
-    pub backend_plan: BackendPlan,
-}
+```text
+selected post-ASAP workload DAG
+              |
+              v
+      physical compilation
+         /             \
+        v               v
+CollectorSubplan     BackendSubplan
+CollectorPlan(s)     BackendPlan
 ```
 
-## 4. Compile algorithm
+The two subplans share the same plan and materialization identities. They are
+never derived independently and are never considered active unless both sides
+confirm a compatible decision.
 
-Input: the materialized selection (`GlobalSelection::materialize()`'s
-`Rc<SummaryNode>` roots, with the shared identity required by migration plan
-§4.2 intact) plus this deployment's topology and
-constraints (collector fleet membership, per-edge shard/memory budgets,
-transport cost model — the same inputs `physical::colored_dag` already
-takes today, see §8).
+## 1. Why this layer exists
 
-1. **Partition by node kind**, not by heuristic: every `SummaryAgg`
-   reached anywhere in the selection is an *update-side* node; every
-   `SummaryEstimate`/`SummaryMerge`/`SummarySubtract`/`SummaryDelete`/
-   `SummaryJoin` is a *readout-side* node (it consumes summary state and
-   either produces more summary state for further readout-side composition,
-   or a plain value). `KeepPreAsap` subtrees are neither — they stay the
-   backend/archive fallback path already described in
-   [`design-target-architecture.md`](design-target-architecture.md) §3.
-2. **Allocate each distinct `SummaryAgg` (by `Rc` identity) to one or more
-   collector edges.** A single logical `SummaryAgg` may become several
-   `EdgeAssignment` entries (sharding by cardinality/volume budget) or share
-   one existing edge with another `SummaryAgg` from a different query root
-   (the shared-`Rc` case). This is where `shard_count`, `edge_id` selection,
-   and per-edge resource budgeting happen — genuinely new information, not
-   copied from the selection.
-3. **Insert `SummaryMerge` at the shard boundary** when step 2 sharded a
-   node: the collector side ships `shard_count` partial states: the backend
-   side's `Materialization` reflects one logical summary, reconciled via
-   merge before any `SummaryEstimate` reads it (`SummaryMerge`'s own
-   catalog-`mergeable` requirement, already enforced upstream, is what makes
-   this legal at all).
-4. **Compile every readout-side subtree into `Materialization` +
-   `RoutingEntry` rows** in the backend subplan (§7), each one recording
-   which `EdgeAssignment`(s) supply its input summary state.
-5. **Decide transport parameters** (`delta_transmission`, `delta_threshold`,
-   `drop_original`, `warm_allowed_lateness`) per `EdgeAssignment` from the
-   deployment cost model — never from the selection, which has no opinion
-   on transport (§2.2).
-6. **Compute `plan_id`** from the compiled structure (§3), stamp it plus
-   `plan_version`/`activation`/`expiry`/`backend_compat` identically onto
-   both subplans, and return the `CompiledPlan`.
+ASAPPlanner owns logical choices such as:
 
-Steps 2–3 are exactly the job `physical::allocator::SketchAllocator` and
-`physical::stage_split` already do today against the *legacy* locally-typed
-`QueryExpr`/`PipelineStage` tree (`physical/plan.rs`); this document asks
-for the same allocation job, retargeted to consume ASAPPlanner's own
-`SummaryNode` selection instead of a parallel local IR — see §9.
+- exact accumulator versus approximate summary;
+- summary family, algorithm, and parameters;
+- reduction and grouping strategy;
+- logical sharing and composition;
+- summary readout; and
+- exact fallback.
 
-## 5. Collector subplan wire contract
+The runtime still needs deployment decisions that do not belong in Planner:
 
-The authoritative collector-side schema is ASAPCollector's
-[`ASAPQuery-to-ASAPCollector collection-plan interface`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/opamp-config-push.md).
-This document does not define a second flat `asap_edge.metrics[]` schema.
+- which collector or backend stage runs each operation;
+- how logical state is sharded or shared;
+- which streaming panes materialize a query time range;
+- whether state is sent as raw observations, full summaries, or deltas;
+- where state is stored and queried;
+- when a new plan becomes active; and
+- how incompatible or failed updates are rolled back.
 
-For each `EdgeAssignment`, the compiler emits one versioned
-`CollectorPlan` YAML document in the exact OpAMP `AgentConfigMap` entry
-`asap-collector-plan.yaml`, with content type `application/yaml`. The OpAMP
-protobuf is the transport envelope; the YAML document is the typed physical
-execution contract. It is not a serialized ASAPPlanner Rust DAG and it is
-not a complete OTel Collector configuration.
+Skipping this layer causes two common failures:
 
-The compiler maps the selected DAG into that schema as follows:
+1. treating a logical `SummaryAgg` as though it already names a collector
+   process and runtime configuration; and
+2. deriving collector and backend plans separately, allowing family,
+   parameters, grouping, windows, or identities to drift.
 
-| Selected post-ASAP field | `CollectorPlan` field |
+The physical compiler closes both gaps in one operation.
+
+## 2. Input contract
+
+The compiler receives:
+
+- the selected post-ASAP DAG for the whole workload;
+- stable workload/query correlation information;
+- collector and backend capability snapshots;
+- deployment topology and stage boundaries;
+- workload statistics and resource constraints;
+- runtime window, freshness, and retention policy; and
+- transmission and storage policy.
+
+Shared logical nodes remain shared at this boundary. The compiler must not
+first flatten the workload into independent per-query or per-metric rows.
+
+The selected DAG may contain summary producers, estimates, merges,
+subtractions, deletes, joins, exact operations, shared sub-DAGs, and
+`KeepPreAsap` fallback. A pinned Planner revision may also carry explicit
+execution phases and result guarantees. The compiler consumes those canonical
+values rather than defining local equivalents.
+
+## 3. Output contract
+
+One compile returns one `CompiledPlan` with:
+
+- a collector subplan containing one `CollectorPlan` for every targeted
+  collector;
+- a backend subplan containing one `BackendPlan` for the ASAPQuery data
+  plane;
+- a shared plan envelope;
+- content-addressed materialization identities; and
+- a validation record showing that both subplans were produced from the same
+  selected DAG and capability snapshots.
+
+### Shared plan envelope
+
+| Field | Meaning |
 | --- | --- |
-| `SummaryAgg` identity | `materializations[].logical_node_ref` plus a content-addressed `materializations[].id` |
-| bound `Source` and predicates | `materializations[].input.metric` and canonical `input.matchers` |
-| `SummaryAgg.col` | `materializations[].input.value` |
-| `SummaryFamilyType` | `materializations[].summary.family` |
-| sketch algorithm and parameters | `summary.algorithm` and typed `summary.parameters` |
-| Planner accuracy constraint | `summary.accuracy` |
-| `Reduction::PerEntity` | `reduction.kind: per_entity` |
-| `Reduction::Reduce(GroupKeys)` | `reduction.kind: reduce`, explicit `by`, and `without` |
-| `GroupingStrategy` | `grouping.kind`, plus Hydra kind/parameters for shared grouping |
+| `plan_id` | Content-addressed identity of the logical selection, topology identity, and semantic constraints. |
+| `plan_version` | Ordered update within the same plan identity, such as changed sizing or lifecycle policy. |
+| `activation` | Earliest time at which both subplans may become authoritative. |
+| `expiry` | Optional time after which the plan may no longer produce or serve state. |
+| `backend_compat` | Compatibility identity for BackendPlan and emitted summary-state schemas. |
+| `planner_revision` | Immutable ASAPPlanner revision used for the selection. |
 
-The physical compiler adds fields ASAPPlanner intentionally does not own:
-target agent/edge, capability snapshot, concrete streaming windows, local
-shards, exporter reference, and raw/full/delta transmission policy. These
-fields must never be inferred by ASAPCollector from missing values.
+Mutable lifecycle or sizing fields do not silently change the identity of an
+existing version. Reusing the same `(plan_id, plan_version)` for different
+content is invalid.
 
-The complete plan envelope carries `plan_id`, `plan_version`, `activation`,
-`expiry`, and `backend_compat` verbatim from `CompiledPlan`. Each emitted
-summary or delta also carries those compatibility identities plus its
-materialization, window, producer, and sequence/checkpoint identity.
+### Materialization identity
 
-Unsupported Planner alternatives remain visible in the logical candidate
-space but cannot be emitted unless the targeted collector capability snapshot
-and backend compatibility ID both support them. The compiler chooses another
-valid candidate or exact fallback; it never renames an unsupported algorithm
-to a similar supported one. In particular, shared Hydra grouping must not be
-silently flattened to independent per-group state.
+A materialization is the physical state built for one selected logical
+summary producer. Its identity includes every property required for safe
+reuse and merge, including:
 
-## 6. Gaps this closes vs. what it still leaves open
+- bound source and filters;
+- summarized value/item;
+- summary family, algorithm, and parameters;
+- reduction and grouping layout;
+- logical/physical window contract; and
+- state schema compatibility.
 
-**Closes in the target design**, on the ASAPCollector side: the
-`CollectorPlan` envelope now has explicit `plan_id`, `plan_version`,
-`activation`, `expiry`, and `backend_compat` fields, carried identically on
-the matching backend plan. It is delivered as the
-`asap-collector-plan.yaml` OpAMP config-map entry. The collector returns the
-semantic result through the `io.asap.collector.plan.v1` /
-`application_report` custom message. The MVP harness compares the active
-plan and materialization identities on both sides instead of treating
-OpAMP's `config_hash` or `RemoteConfigStatus.APPLIED` as proof of semantic
-activation.
+Placement, transport cadence, or storage location may change without
+pretending a semantically different summary is the same materialization.
 
-This remains a target contract rather than a claim about current runtime
-behavior. ASAPCollector currently writes a complete OTel YAML file, restarts,
-and reports only the OpAMP config hash after a syntax check. Implementing the
-new parser, atomic activation, and application report is a separate code
-change.
+Explain or viewer node IDs are traceability metadata, not materialization
+identity.
 
-**Opens**, in ASAPCollector's execution layer: the target schema can name all
-Planner families and grouping layouts, but `cms_with_heap`,
-`count_sketch_with_heap`, KMV, Theta, sampling, wavelets, statistical models,
-and shared Hydra grouping still require actual collector and backend support.
-Naming an algorithm in the schema does not advertise that runtime support.
+## 4. Partitioning the selected DAG
 
-**Stays open**, and is explicitly out of scope here: the rollup algebra
-question already on record in
-[`design-backend-plan-wire-format.md`](design-backend-plan-wire-format.md)
-§7 ("which summary families roll up safely"), and the composed exact/summary
-execution gaps tracked against ASAPPlanner PR #300 / issue #171.
-`CompiledPlan` treats a `RollupStrategy` selection the same as any other
-readout-side subtree (§4 step 4) — it does not independently re-derive
-rollup legality, which remains ASAPPlanner's decision to have made during
-selection.
+The baseline partition follows data availability:
 
-## 7. Backend subplan materialization shape
+- operations that consume new observations and construct maintained state
+  belong on the update side;
+- operations that read, merge, or transform maintained state into query
+  answers belong on the readout side; and
+- `KeepPreAsap` remains exact backend/archive execution.
 
-[`design-backend-plan-wire-format.md`](design-backend-plan-wire-format.md)
-§3 carries ASAPPlanner's current `SummaryFamilyType` directly. That type
-nests algorithm and parameters for sketches and retains the orthogonal
-`GroupingStrategy` axis; the backend wire must not re-flatten it into a local
-`SummaryKind`/`SummaryParams` vocabulary:
+In the current Planner vocabulary, `SummaryAgg` is the principal update-side
+boundary and `SummaryEstimate` is a readout. Summary merge and other state
+composition are placed according to topology, capabilities, and transport
+cost without changing their logical semantics.
 
-```rust
-pub struct Materialization {
-    pub fingerprint: PolicyFingerprint,
-    pub source: Source,
-    pub window: WindowSpec,
-    pub group_by: Vec<GroupKey>,
-    pub rollup: Vec<GroupKey>,
+If the pinned Planner revision provides explicit execution availability or
+phase assignments, those validated phases are authoritative. The compiler
+must not infer a conflicting phase from node names.
 
-    /// Current upstream type directly, including sketch grouping layout.
-    pub family: SummaryFamilyType,
-    pub col: ColumnRef,
+An operation may be assigned only to an executor that advertises its full
+semantics. A nameable Planner alternative is not automatically deployable.
 
-    /// New: which `EdgeAssignment`(s) this materialization's input summary
-    /// state comes from. Lets the backend validate, at plan-apply time,
-    /// that the collector subplan sharing this `CompiledPlan::plan_id`
-    /// actually produces a `family`-compatible input — the concrete
-    /// mechanism behind the migration doc's completion criterion
-    /// ("Backend applies an incompatible plan -> reject the emitted state
-    /// or fail the run").
-    pub sources: Vec<EdgeSourceRef>,
+## 5. Collector subplan
 
-    pub retention: Option<RetentionPolicy>,
-}
+The collector subplan follows ASAPCollector's
+[collection-plan interface](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/opamp-config-push.md).
 
-pub struct EdgeSourceRef {
-    pub edge_id: String,
-    pub materialization_id: PolicyFingerprint,
-}
+For each assigned collector, it specifies:
+
+- target collector and capability snapshot;
+- the shared plan envelope;
+- source metrics and matchers;
+- materialization identities;
+- summary family, algorithm, parameters, and accuracy requirement;
+- reduction and grouping semantics;
+- concrete streaming windows and lateness;
+- local sharding;
+- raw, full, or delta transmission; and
+- backend endpoint/schema compatibility.
+
+OpAMP is the delivery transport. The payload is the versioned
+`asap-collector-plan.yaml` document, not ASAPPlanner's Rust IR and not the
+collector's complete bootstrap configuration.
+
+## 6. Backend subplan
+
+The backend subplan follows
+[`design-backend-plan-wire-format.md`](design-backend-plan-wire-format.md).
+
+It specifies:
+
+- the same plan envelope;
+- every expected materialization;
+- the collector assignments producing its state;
+- exact summary family, algorithm, parameters, grouping, and windows;
+- ingestion/storage destination;
+- query capabilities and readouts satisfied by the materialization;
+- remaining backend-side operators; and
+- selected result guarantees when provided by Planner.
+
+The backend does not reconstruct the chosen summary from query text or stored
+state. It installs and executes the control plane's exact decision.
+
+## 7. Sharing, sharding, and merge
+
+One shared logical producer remains one logical materialization even when it
+serves several queries. The backend may associate several routing/readout
+entries with that one materialization.
+
+A materialization may have several physical producers when sharded across
+collectors. The compiler records all producers and inserts a compatible merge
+at the selected boundary. A merge is legal only when every input agrees on
+the materialization contract and the selected family supports merge.
+
+Sharding does not create several unrelated logical summaries, and sharing
+does not allow consumers with incompatible filters, reductions, grouping,
+windows, parameters, or guarantees to reuse state.
+
+## 8. Window and transmission decisions
+
+Planner time ranges express query semantics. The physical compiler chooses
+streaming panes capable of answering those ranges.
+
+For the MVP:
+
+- panes are anchored and tumbling;
+- pane composition must exactly cover each claimed query range;
+- allowed lateness and watermark behavior are explicit;
+- incompatible alignment is rejected; and
+- freshness policy is shared with the backend readiness check.
+
+Transmission is independent of logical summary choice:
+
+- `raw` forwards selected observations for exact/backend execution;
+- `full` sends complete summary state; and
+- `delta` sends ordered state changes plus periodic full checkpoints.
+
+Delta is legal only when collector and backend advertise the same state,
+sequence, and checkpoint semantics. Every payload identifies its plan,
+materialization, producer, window, sequence, and base/checkpoint.
+
+## 9. Compile and activation sequence
+
+1. Validate the selected DAG against both capability snapshots.
+2. Allocate update/readout operators and physical producers.
+3. Choose compatible windows, transmission, and storage routes.
+4. Construct materialization identities.
+5. Emit both subplans from the same in-memory decision.
+6. Validate cross-subplan equality for all shared contracts.
+7. Stage both subplans before `activation`.
+8. Require backend installation and collector semantic application reports.
+9. Route queries to the new plan only after both sides report compatible
+   active identities.
+10. Retire old state after its readers and lateness horizon drain.
+
+If any step fails, the previous unexpired plan remains authoritative. A
+partial push, OpAMP delivery acknowledgement, file write, or process restart
+does not constitute plan activation.
+
+## 10. Fail-closed rules
+
+The compiler or runtime rejects the plan when:
+
+- an assigned executor lacks a required family, algorithm, grouping, phase,
+  readout, window, or transmission capability;
+- collector and backend materialization contracts differ;
+- a required accuracy guarantee is unknown or insufficient;
+- a merge combines incompatible state;
+- delta sequencing/checkpoint semantics do not match;
+- plan versions conflict or lifecycle conditions disallow activation; or
+- semantic application evidence is missing.
+
+It must never substitute another family, parameter, grouping layout,
+accuracy target, or transmission semantics to make an invalid plan appear
+deployable.
+
+## 11. Example
+
+For:
+
+```promql
+quantile_over_time(0.95, request_duration_seconds{region="us-east"}[5m])
 ```
 
-`BackendPlan.plan_id` is the field joining the two subplans. Content-addressed
-`PolicyFingerprint` remains the identity of one `Materialization`
-(reuse/diff/resize within a single backend subplan, per the migration doc's
-`DeploymentPlanDiff`); `plan_id` answers a different question — "were these
-two subplans compiled together" — that a per-materialization fingerprint
-cannot answer.
+Planner may select a per-entity DDSketch summary and a p95 readout. The
+physical compiler may then:
 
-## 8. What does not change
+- assign DDSketch construction to selected collectors;
+- choose one-minute panes that compose into the five-minute query range;
+- transmit deltas every ten seconds with periodic full checkpoints;
+- declare one shared DDSketch materialization in BackendPlan; and
+- route the p95 query readout to that materialization.
 
-- `PolicyFingerprint`, `RoutingIndex`, hot reload, `DeploymentPlanDiff`,
-  warm cutover, and archive fallback — all as designed in
-  `design-backend-plan-wire-format.md` and
-  `design-asapplanner-workload-planner-migration.md` §5/§6.
-- OpAMP's `AgentRemoteConfig`/`AgentConfigMap`/`config_hash` delivery
-  mechanics. `config_hash` still identifies exact remote-config bytes; it
-  does not replace `plan_id` or the semantic application report.
-- Existing `asap_edge` runtime behavior until the versioned `CollectorPlan`
-  parser and apply path are implemented.
+The compiler does not change DDSketch to KLL, change the accuracy parameter,
+or aggregate series together merely because another physical layout would be
+cheaper. Such a change requires selection of a different valid Planner
+candidate.
 
-## 9. Migration notes
+## 12. Non-goals
 
-- `physical::plan::PlanNode` / `PipelineStage` / `physical::allocator::
-  SketchAllocator` / `physical::stage_split` operate on this repo's own
-  locally-typed `QueryExpr` (`crate::intent_algebra`), annotated with a
-  per-node `PipelineStage` tag on one combined tree. `CompiledPlan` replaces
-  that shape with two explicit typed subplans compiled from ASAPPlanner's
-  own selected `SummaryNode` DAG. This module belongs on the
-  migration plan §9 Phase 6 removal list — remove it only after the compiled
-  plan path is selected and rollback no longer depends on legacy planning.
-- `emit::agent::generate_agent_collector_config` currently builds a complete
-  collector YAML. It should become the `EdgeAssignment -> CollectorPlan`
-  serializer defined in §5. Bootstrap OTel receivers/exporters and credentials
-  remain deployment configuration; a workload replan must not replace them.
-- Both subplans should land behind the same workload-planner rollout mode
-  the migration plan defines (§9 Phase 5): in
-  `shadow` mode, compile `CompiledPlan` and record `plan_id` agreement and
-  field-level diffs against the legacy allocator's output without pushing
-  either subplan, exactly mirroring that section's existing comparison
-  list.
+This document does not define:
 
-## 10. Open questions
-- **`backend_compat` granularity.** One id per `BackendPlan` proto schema
-  version, or one per `(schema version, family vocabulary version)` so an
-  `asap_edge` schema gap closing (§6) doesn't force every unrelated plan to
-  recompute compatibility — needs a decision before the field ships, not
-  after.
-- **Cross-shard `SummaryMerge` placement.** Step 3 (§4) inserts
-  `SummaryMerge` "at the shard boundary" without saying which physical
-  stage performs it — collector-side gateway merge vs. backend-side merge
-  on ingest are both live options already implied by `PipelineStage`'s
-  existing `Backend`/`Precompute` distinction, and the choice affects
-  `EdgeAssignment` fan-in bandwidth materially. Needs its own short design
-  pass, not resolved here.
+- query parsing or summary selection;
+- internal Planner serialization;
+- exact protobuf field numbers;
+- summary-state byte encoding;
+- collector bootstrap configuration;
+- storage-engine implementation; or
+- query-engine implementation details.
+
+## 13. Definition of done
+
+The compiled-plan design is satisfied when:
+
+- one compile produces both subplans;
+- all shared identities and semantic fields match;
+- shared Planner nodes remain shared materializations;
+- sharded producers merge only under a valid contract;
+- unsupported shapes fail before activation;
+- both plans stage and activate atomically from the user's perspective;
+- emitted state carries the active identities;
+- the data plane serves without replanning; and
+- a deliberately mismatched or partially applied plan is rejected in an
+  end-to-end test.
