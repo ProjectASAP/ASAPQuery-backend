@@ -77,7 +77,13 @@ know or care.
 
 ```rust
 pub struct BackendPlan {
-    pub plan_id: PlanId,              // observability only, not identity
+    // Cross-subplan identity as of design-compiled-plan-collector-backend-
+    // split.md: shared verbatim with this plan's CollectorSubplan, so the
+    // two can be checked for agreement. `PolicyFingerprint` below remains
+    // the identity of one materialization; `plan_id` answers "were the
+    // collector and backend subplans compiled together," which no
+    // per-materialization fingerprint can answer on its own.
+    pub plan_id: PlanId,
     pub generated_at: DateTime<Utc>,
 
     /// Every materialization this backend should build/maintain,

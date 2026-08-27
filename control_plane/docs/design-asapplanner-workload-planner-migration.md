@@ -28,15 +28,38 @@ ASAPQuery-backend remains the owner of:
 ```text
 selected post-ASAP DAG
   -> deployment placement
-  -> collector/backend stage allocation
-  -> BackendPlan
-  -> materialization and routing
+  -> compile into two physical subplans sharing one plan identity:
+       collector subplan (OpAMP / asap_edge YAML)
+       backend subplan   (BackendPlan / materialization and routing)
   -> data-plane execution and archive fallback
 ```
 
 The boundary is intentional: ASAPPlanner decides *what a query sub-DAG may be
 replaced with*; ASAPQuery decides *where the selected replacement runs, how it
 is represented on the wire, and how it is served*.
+
+**The selected post-ASAP DAG is not the collector config, and must not be
+compiled as if it were.** ASAPPlanner's own scope statement is explicit that
+it does not choose collector/backend placement, transport mode, or physical
+resources (`README.md` "Scope"; `asap-aware-mapping/README.md`
+"Non-Goals") — a `SummaryAgg` node names a logical aggregation, not a
+collector process, shard count, or window/transport parameter. Treating the
+selected DAG as directly serializable into `asap_edge` YAML skips the one
+step that actually assigns placement, and lets the collector-side and
+backend-side views of the same decision be derived independently, with
+nothing pinning them to having come from the same selection (see §2's
+"silently select different physical summary families" failure mode, which
+this restates for the collector/backend split specifically). The compile
+step described in
+[`design-compiled-plan-collector-backend-split.md`](design-compiled-plan-collector-backend-split.md)
+is where that placement decision is actually made: one pass over one
+selected DAG emits a `CompiledPlan` carrying a `CollectorSubplan` and a
+`BackendSubplan` that share one `plan_id`/`plan_version` — the identity that
+document closes ASAPCollector's own documented contract gap with (no
+`plan_id`, version, activation/expiry, or backend-compatibility identifier
+on the OpAMP wire today). Every "collector/backend stage allocation" and
+"collector configuration generation" reference below (§1.1, §4.2) means that
+document's compile step, not a direct IR-to-YAML dump.
 
 ### 1.1 Ownership after reviewing the current code
 
@@ -142,11 +165,24 @@ Protocol/source adapters
          views            (apply choices + placement)
                                |
                                v
-                          BackendPlan
-                               |
-                               v
-                           data_plane
+                    compile -> CompiledPlan
+                    (one plan_id/plan_version,
+                     shared by both subplans below)
+                          /            \
+                         v              v
+              CollectorSubplan     BackendSubplan
+              (asap_edge YAML       (BackendPlan:
+               via OpAMP)            materializations + routing)
+                    |                      |
+                    v                      v
+              ASAPCollector            data_plane
 ```
+
+The two subplans are never emitted independently of each other — see
+[`design-compiled-plan-collector-backend-split.md`](design-compiled-plan-collector-backend-split.md)
+for the compile step that produces both from one pass over one
+`GlobalSelection`, and for why a direct DAG-to-YAML dump on the collector
+side (skipping this step) is not an equivalent shortcut.
 
 The selected workload and its shared `Rc<QueryExpr>`/`Rc<SummaryNode>`
 identities must remain intact until placement and materialization are complete.
@@ -179,6 +215,15 @@ that point.
   `WorkloadCharacteristics`; populate ASAPPlanner `DataCharacteristics` and
   keep only deployment-only constraints such as collector memory budget in
   the placement layer.
+- `physical::plan::PlanNode`/`PipelineStage` and
+  `physical::allocator::SketchAllocator`, once the compile step in
+  [`design-compiled-plan-collector-backend-split.md`](design-compiled-plan-collector-backend-split.md)
+  is the production source of `CollectorSubplan`/`BackendSubplan`. They
+  annotate a locally-typed `QueryExpr` tree with a per-node `PipelineStage`
+  tag rather than compiling ASAPPlanner's own selected `SummaryNode` DAG,
+  and their `PipelineStage::Agent`/`Backend` split predates a shared
+  cross-subplan `plan_id`. Keep them live until that compile step replaces
+  their callers — not before.
 
 Delete these paths only after the new workload path is the production source
 of `BackendPlan`. During migration they remain available for shadow comparison
@@ -190,8 +235,12 @@ and rollback.
 - Replanning triggers and runtime telemetry.
 - ASAPQuery's cost model, implemented through ASAPPlanner's `CostModel` trait.
 - Deployment constraints and resource budgets.
-- Stage splitting and placement across collector, backend, and archive.
-- Collector configuration generation.
+- Stage splitting and placement across collector, backend, and archive —
+  retargeted to compile from ASAPPlanner's selected `SummaryNode` DAG
+  instead of the legacy local `QueryExpr`/`PipelineStage` tree; see
+  [`design-compiled-plan-collector-backend-split.md`](design-compiled-plan-collector-backend-split.md).
+- Collector configuration generation — as the `CollectorSubplan` half of
+  that same compile step, not a separate code path.
 - `PolicyFingerprint` and persistent materialization identity.
 - `BackendPlan`, `RoutingIndex`, push, hot reload, and plan versioning.
 - Data-plane summary execution and cold/archive fallback.
@@ -206,7 +255,9 @@ and rollback.
 - A thin `O11yMetricsQuery -> ASAPPlanner QueryWorkload` conversion.
 - An ASAPQuery `DeploymentPlan` builder that consumes canonical roots plus
   ASAPPlanner `GlobalSelection`, applies the chosen replacements in a
-  deployment-aware way, assigns placement, and emits `BackendPlan`.
+  deployment-aware way, assigns placement, and compiles a `CompiledPlan`
+  (`CollectorSubplan` + `BackendSubplan`, sharing one `plan_id`) — see
+  [`design-compiled-plan-collector-backend-split.md`](design-compiled-plan-collector-backend-split.md).
 - An explain/debug endpoint over ASAPPlanner's existing DAG export and
   replacement-explanation types.
 - Planning phase timings, search-size metrics, deadlines, and cancellation.
@@ -452,28 +503,55 @@ Acceptance criteria:
 - selection is deterministic for identical workload, statistics, and cost
   model inputs.
 
-### PR 5: Selected workload to BackendPlan
+### PR 5: Selected workload to `CompiledPlan` (collector + backend subplans)
 
-Introduce a direct conversion:
+Introduce a direct compile step, not a `BackendPlan`-only conversion — see
+[`design-compiled-plan-collector-backend-split.md`](design-compiled-plan-collector-backend-split.md)
+for the full design this stack step implements:
 
 ```text
 canonical roots + GlobalSelection
   -> ASAPQuery DeploymentPlan
   -> apply choices + deployment placement
-  -> materializations and readouts
-  -> BackendPlan
+  -> compile into CompiledPlan { plan_id, plan_version, activation, expiry,
+                                  backend_compat, collector, backend }
+       collector: CollectorSubplan (asap_edge YAML per edge, config_hash)
+       backend:   BackendSubplan   (BackendPlan: materializations + routing)
 ```
 
-Continue using `PolicyFingerprint` for persistent runtime identity. Exporter
-IDs such as DAG node IDs or `workload_node_id` are scoped to an explain result
-and must not become materialization keys.
+`SummaryAgg` nodes compile into the collector subplan (update side);
+`SummaryEstimate`/`SummaryMerge`/`SummarySubtract`/`SummaryDelete`/
+`SummaryJoin` subtrees compile into the backend subplan (readout side) —
+this split is structural, derived from the selected DAG's own node kinds,
+not a second per-metric classification pass. A selected DAG must never be
+serialized into `asap_edge` YAML directly: neither `edge_id`, `shard_count`,
+transport mode, nor any other physical parameter exists in ASAPPlanner's
+output (its own non-goals), so something has to assign them, and that
+assignment is what turns one selection into two *agreeing* subplans instead
+of two independently-guessed ones.
+
+Continue using `PolicyFingerprint` for persistent runtime identity *within*
+one subplan (materialization reuse/diff/resize across replans). `plan_id`
+answers a different question — whether the collector subplan and the
+backend subplan now active were compiled together — and is carried
+identically on both (see the compile doc §3/§7 for why `BackendPlan`'s
+existing `plan_id` field, currently documented as "observability only," is
+redefined to be this identity, not a second one). Exporter IDs such as DAG
+node IDs or `workload_node_id` are scoped to an explain result and must not
+become materialization keys.
 
 Review whether the wire needs additive fields for:
 
-- exact versus sketch summary family;
+- exact versus sketch summary family, using `SummaryFamilyType` directly
+  (see the compile doc §7 — not a re-flattened `SummaryKind`/`SummaryParams`
+  pair, which does not match ASAPPlanner's current post-ASAP IR shape);
 - sketch algorithm and parameters;
 - independent versus Hydra grouping layout;
-- shared materialization dependencies;
+- shared materialization dependencies, including which `EdgeAssignment`(s)
+  supply a materialization's input summary state (`Materialization.sources`
+  in the compile doc §7) — the field that lets the backend reject a plan
+  whose collector subplan doesn't actually produce what this materialization
+  expects;
 - multiple query/readout consumers of one materialization;
 - derived readouts such as `avg = sum / count`, rollups, and top-k prefix
   reuse.
@@ -486,7 +564,12 @@ Acceptance criteria:
   legal routes/readouts;
 - materialization fingerprints are stable across replans;
 - protobuf encode/decode and hot reload preserve the chosen plan;
-- the data plane never has to run a cost model to reconstruct the choice.
+- the data plane never has to run a cost model to reconstruct the choice;
+- a `CollectorSubplan` and `BackendSubplan` produced by the same compile
+  call carry the same `plan_id`/`plan_version`, and a deliberately
+  mismatched pair (e.g. an old collector config against a new
+  `BackendPlan`) is detectable from those fields alone, without needing to
+  diff YAML against protobuf by hand.
 
 ### PR 6: Data-plane execution coverage
 
@@ -504,6 +587,25 @@ control plane may select. Cover at least:
 Unsupported candidates must be removed before selection or fail planning with
 a clear capability diagnostic. They must never be accepted by the control
 plane and fail later during query serving.
+
+**Track, don't block on, two open upstream ASAPPlanner PRs that change this
+list's shape.**
+[#300](https://github.com/ProjectASAP/ASAPPlanner/pull/300) (open) adds
+`SummaryExpr::ExactTransform`/`ExactPostProcess` — composed exact-over-
+summary and summary-over-exact plans across an explicit update/readout
+boundary — which is exactly the boundary
+[`design-compiled-plan-collector-backend-split.md`](design-compiled-plan-collector-backend-split.md)
+§1 uses to split a selected DAG between the two subplans; if it merges, that
+document's structural partition rule should be re-expressed in terms of its
+`ExecutionAvailability`/`PhaseAssignment` types, per that section's own
+forward note, without changing which nodes land in which subplan.
+[#299](https://github.com/ProjectASAP/ASAPPlanner/pull/299) (open) propagates
+end-to-end accuracy guarantees for approximate-over-approximate plans, which
+bears on this PR's "accuracy... not re-derived at serving time" criterion
+below once summary-over-summary composition is selectable. Neither PR is a
+migration-stack dependency — this stack should not stall waiting for them —
+but PR 6's "cover at least" list should be revisited against whichever of
+the two has merged by the time it lands.
 
 Acceptance criteria:
 
