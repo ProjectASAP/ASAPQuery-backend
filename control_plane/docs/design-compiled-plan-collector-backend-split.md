@@ -258,22 +258,128 @@ Steps 2–3 are exactly the job `physical::allocator::SketchAllocator` and
 for the same allocation job, retargeted to consume ASAPPlanner's own
 `SummaryNode` selection instead of a parallel local IR — see §9.
 
-## 5. `SummaryAgg` → `asap_edge.metrics[]`, field by field
+## 5. Redesigning `asap_edge.metrics[]` to match the DAG's own shape
 
-| Selected-DAG source | `asap_edge.metrics[]` field | Notes |
-|---|---|---|
-| `col` | `metric` | Direct. |
-| `family: ExactAggregate(Sum\|Count\|MinMax\|Increase\|Rate, _)` | `family: sum` (+ new `exact_kind`) | Today's `asap_edge` schema only lists sketch families (`sum, ddsketch, kll, hll, countsketch, countminsketch`, per ASAPCollector's doc) — needs an `exact_kind` discriminator to carry `Count`/`MinMax`/`Increase`/`Rate`, not just `Sum`. **Gap to close in ASAPCollector's schema**, flagged in §6. |
-| `family: Sketch(SketchKind{algorithm, params, ..}, grouping)` | `family`, `relative_accuracy`/`k`/`rows`,`cols` | `algorithm` selects the enum value; `params` fills the matching size field(s) directly — `SketchParams::DDSketch{alpha}` → `relative_accuracy`, `SketchParams::Kll{k}` → `k`, `SketchParams::Cms{width,depth}`/`CountSketch{width,depth}` → `cols`/`rows`. `CmsWithHeap`/`CountSketchWithHeap`/`Kmv`/`Theta` have no `asap_edge` field yet — **gap**, see §6. |
-| `grouping: SharedMultiSubpopulation{kind, params}` | *(none today)* | Hydra layouts have no `asap_edge` representation at all yet — **gap**, see §6. `PerSubpopulationInstance` (the default) is today's only implicit behavior and needs no new field. |
-| `reduction: Reduce(by)` | `mode: whole_stream`, `aggregate_by: by` | Combine matching series, retain `by` as the output grouping key — this is the compile step's translation, not a 1:1 field rename: `Reduction` and `asap_edge`'s `mode`/`aggregate_by` are different vocabularies (§6). |
-| `reduction: PerEntity` | `mode: per_series`, `aggregate_by: []` | No cross-series merge, matching `PerEntity`'s "never merges across entities." |
-| *(not in selection — deployment decision)* | `edge_id`, `shard_count`, `window_duration`, `warm_allowed_lateness`, `drop_original`, `delta_transmission`, `delta_threshold`, `sample_p`, `max_series` | Filled by compile steps 2/5, from topology/cost-model inputs, never from the selected DAG. |
+The compile step's output should not reinvent a second vocabulary for what
+the selected DAG already names. Checked against the real processor, not a
+doc summary of it —
+[`opentelemetry-collector-contrib-patch/processor/asapedgeprocessor/config.go`](https://github.com/ProjectASAP/ASAPCollector/blob/main/opentelemetry-collector-contrib-patch/processor/asapedgeprocessor/config.go) —
+today's `MetricFamily` struct does exactly that in two places: `Mode` is a
+bare string validated to exactly two values (`precompute.ParseAggMode`
+accepts only `per_series`/`whole_stream`), and `AggregateBy []string` has no
+way to express `GroupKeys.without`. Neither can distinguish
+`Reduction::PerEntity` from a genuine zero-key `Reduce` — the exact
+ambiguity ASAPPlanner's own `Reduction` type was introduced to remove
+(issue #163, per `crates/types/src/post_asap/expr.rs`'s own doc comment on
+`SummaryAgg.reduction`). `Family` is a flat string covering only `sum`/
+`ddsketch`/`kll`/`hll`/`countsketch`/`countminsketch`, with no discriminator
+for the other four `ExactKind` variants and no field at all for
+`GroupingStrategy`.
 
-`item_label` (set/frequency item column) comes from the deployment's
-`Frequency` extension realization
-(`design-target-architecture.md`'s `CostModel::realize_extension`), the
-same place it's produced today.
+Go's `mapstructure` decoding has no polymorphic nested-union support the way
+`serde` does, and this file's own existing pattern (`FamilyKind`/`Tier`/
+`ColdFormat`) is already flat discriminator-plus-sibling-fields, not
+nesting. So "aligned with the DAG" here means *the same flat shape*, with
+every field name and enum spelling drawn directly from `post_asap` — not a
+Rust-style nested tagged union grafted onto a struct that was never built to
+decode one:
+
+```go
+// today                              // redesigned
+type MetricFamily struct {            type MetricFamily struct {
+    Metric      string                    Source    string     // SummaryAgg.col
+    Family      FamilyKind                Family    FamilyKind // exact|ddsketch|kll|hll|
+                // sum|ddsketch|kll|                // cms|count_sketch|
+                // hll|countsketch|                 // cms_with_heap|
+                // countminsketch                   // count_sketch_with_heap|
+                                                      // kmv|theta
+    AggregateBy []string                  ExactKind ExactKind  // sum|count|min_max|
+    // Mode: "" | "per_series" |                     // increase|rate — read only
+    // "whole_stream" — free string,                 // when family=exact
+    // no per_entity / without concept
+    Mode        string                    // Reduction, named directly.
+                                           // PerEntity excludes ReduceBy/
+                                           // ReduceWithout — Validate() enforces it.
+                                           ReduceBy      []string
+                                           ReduceWithout bool
+                                           PerEntity     bool
+
+                                           // GroupingStrategy — no field
+                                           // existed before.
+                                           Grouping      GroupingKind // per_subpopulation_instance
+                                                                       // (default) |
+                                                                       // shared_multi_subpopulation
+                                           HydraKind     string
+                                           SharedRows    uint32
+                                           SharedColumns uint32
+
+    RelativeAccuracy, K, Rows, Cols        RelativeAccuracy, K, Rows, Cols
+    // ...ItemLabel, SampleP,              // ...unchanged, see below
+    // MaxSeries, Tier, SpatialFilter,
+    // GosDeltaEpsilon, GosSites,
+    // EmitHeap, HeapSize, WeightMode,
+    // Threshold, HLLSparse
+}                                      }
+```
+
+Worked example — p99 latency by `(service, region)`, an exact per-zone
+sum, and a Hydra-CMS unique-IP count by zone:
+
+```yaml
+metrics:
+  - source: request_duration_seconds
+    family: ddsketch
+    reduce_by: [service, region]
+    reduce_without: false
+    relative_accuracy: 0.01
+    delta_transmission: true
+
+  - source: page_views
+    family: sum
+    exact_kind: sum
+    reduce_by: [zone]
+
+  - source: unique_ips
+    family: cms
+    grouping: shared_multi_subpopulation
+    hydra_kind: cms
+    shared_rows: 4
+    shared_columns: 2048
+    reduce_by: [zone]
+    rows: 4
+    cols: 2048
+```
+
+Two consequences fall out of the realignment itself, not as separate
+follow-ups: an `exact_kind` slot and a `grouping`/`hydra_kind` slot exist
+because every `post_asap` variant now has somewhere to go — they were
+"gaps" in the old flat vocabulary specifically because that vocabulary was
+invented independently of `SummaryFamilyType`/`GroupingStrategy` rather than
+read off them. `cms_with_heap`/`count_sketch_with_heap`/`kmv`/`theta` are
+named for completeness; the processor doesn't implement them yet (today's
+`EmitHeap: true` on `count_sketch` approximates `CountSketchWithHeap` as a
+special case) — naming the slot doesn't imply the runtime behind it exists.
+
+`edge_id`/`shard_count`/`window_duration`/`warm_allowed_lateness`/
+`drop_original` stay top-level `Config` fields, and `tier`/`spatial_filter`/
+`sample_p`/`max_series`/`item_label`/`delta_transmission`/`delta_threshold`/
+`gos_delta_epsilon`/`gos_sites`/`emit_heap`/`heap_size`/`weight_mode`/
+`hll_sparse`/`threshold{…}`/`cold{…}`/`control_channel{…}` all stay exactly
+as they are on `MetricFamily` — collector-implementation and deployment
+knobs with no `post_asap` counterpart to align to. Realigning them would
+mean inventing DAG concepts that don't exist, the same mistake in reverse.
+`item_label` in particular still comes from the deployment's `Frequency`
+extension realization (`design-target-architecture.md`'s
+`CostModel::realize_extension`), the same place it's produced today.
+
+This is a schema proposal, not a claim that ASAPCollector has implemented
+it. `Source`/`ReduceBy`/`ReduceWithout`/`PerEntity`/`Grouping`/`HydraKind`/
+`SharedRows`/`SharedColumns`/`ExactKind` do not exist on `MetricFamily`
+today; `Metric`/`AggregateBy`/`Mode` remain the only way to express this
+today. A migration should decode both old and new field names for one
+release (`Metric`→`Source`, `AggregateBy`→`ReduceBy`, `Mode` derived from
+`PerEntity`/`ReduceWithout`) rather than break existing deployed configs on
+cutover.
 
 ## 6. Gaps this closes vs. what it still leaves open
 
@@ -295,17 +401,18 @@ This is additive to — not a replacement for — ASAPCollector's own
 where in the OpAMP message envelope these fields should be encoded (an
 ASAPCollector-side decision this document does not make unilaterally).
 
-**Opens**, in `asap_edge`'s own schema (ASAPCollector-owned, needs a
-follow-up there, not answered here): an `exact_kind` discriminator for
-`ExactAggregate` families beyond `Sum`; fields for `CmsWithHeap`/
-`CountSketchWithHeap`/`Kmv`/`Theta`; and a grouping-strategy block for
-`SharedMultiSubpopulation`/Hydra (`hydra_kind`, `shared_rows`,
-`shared_columns` or `shared_buckets`, mirroring
-`crates/types/src/post_asap/sketch.rs`'s `HydraParams` shape). None of
-these are exercised by this deployment's current MVP metric set, so they
-are out of scope for the first `CompiledPlan` implementation, but the field
-table in §5 should not be read as "these are all the families `asap_edge`
-will ever need" — only as what compiles today.
+**Opens**, in `asap_edge`'s own schema (ASAPCollector-owned — §5's redesign
+proposes the shape, but implementing it there is a separate, tracked change,
+not something this document does unilaterally): the `exact_kind` and
+`grouping`/`hydra_kind` slots §5 proposes cover every `post_asap` variant
+that exists today, but `cms_with_heap`/`count_sketch_with_heap`/`kmv`/
+`theta` name families the processor doesn't build yet — exercising them
+still needs real runtime support, not just a schema slot. None of that is
+exercised by this deployment's current MVP metric set, so implementing the
+unbuilt families is out of scope for the first `CompiledPlan`
+implementation; §5's redesign should not be read as "these are all the
+families `asap_edge` will ever need" — only as "every family that exists
+today has somewhere to go."
 
 **Stays open**, and is explicitly out of scope here: the rollup algebra
 question already on record in
