@@ -120,10 +120,8 @@ non-goals:
    into *one* backend-side materialization. Neither direction is a
    serialization concern; both require an explicit compile/allocate pass.
 4. **Two independent readings of the same DAG can silently disagree.**
-   [`design-asapplanner-workload-planner-migration.md`](design-asapplanner-workload-planner-migration.md)
-   §2 already names this failure mode for the legacy planner ("the control
-   plane, data plane, and ASAPPlanner silently select different physical
-   summary families or parameters for the same query"). If the collector
+   The [migration plan](design-asapplanner-workload-planner-migration.md)
+   requires one physical compile path for exactly this reason. If the collector
    subplan and the backend subplan are derived independently — even from
    the same selected DAG, by two different code paths, at two different
    times — nothing stops them drifting. A single compile step that emits
@@ -135,10 +133,7 @@ non-goals:
    `BackendPlan` protobuf is read by `data_plane`. Neither should decode
    the other's format, and neither should decode ASAPPlanner's internal
    Rust IR — that IR is not a stable cross-process wire contract and was
-   never meant to be one (`design-asapplanner-workload-planner-migration.md`
-   §5/PR4: *"Do not copy `dag_export`'s JSON into the runtime contract and
-   do not infer mappings from labels, hashes, strategy rationale, or viewer
-   node signatures."*).
+   never meant to be one (migration plan §§2 and 4.2).
 
 ## 3. `CompiledPlan`: one compile step, two subplans, one identity
 
@@ -160,7 +155,7 @@ pub struct CompiledPlan {
     /// unchanged selection (e.g. a resize), not on every replan.
     pub plan_version: u64,
     /// Not-before: neither subplan should be treated as authoritative
-    /// before this time. Lets a warm cutover (see migration doc §6.5,
+    /// before this time. Lets a warm cutover (see migration plan §9,
     /// `DeploymentPlanDiff`) land both subplans ahead of the switch.
     pub activation: DateTime<Utc>,
     /// Not-after / supersede horizon. `None` for "until superseded."
@@ -188,8 +183,8 @@ pub struct CollectorSubplan {
 
 pub struct EdgeAssignment {
     pub edge_id: String,
-    /// Today's `asap_edge` processor fields (§5) — produced by compiling
-    /// the `SummaryAgg` nodes assigned to this edge, not authored ad hoc.
+    /// The versioned CollectorPlan fields (§5), produced by compiling the
+    /// `SummaryAgg` nodes assigned to this edge, not authored ad hoc.
     pub config: AsapEdgeConfig,
     /// Opaque identity of *this edge's* exact YAML body — unchanged
     /// semantics from ASAPCollector's existing `config_hash` (it still
@@ -215,9 +210,8 @@ pub struct BackendSubplan {
 ## 4. Compile algorithm
 
 Input: the materialized selection (`GlobalSelection::materialize()`'s
-`Rc<SummaryNode>` roots, per
-[migration doc](design-asapplanner-workload-planner-migration.md) §5/PR4 —
-shared node identity intact) plus this deployment's topology and
+`Rc<SummaryNode>` roots, with the shared identity required by migration plan
+§4.2 intact) plus this deployment's topology and
 constraints (collector fleet membership, per-edge shard/memory budgets,
 transport cost model — the same inputs `physical::colored_dag` already
 takes today, see §8).
@@ -404,15 +398,14 @@ cannot answer.
   per-node `PipelineStage` tag on one combined tree. `CompiledPlan` replaces
   that shape with two explicit typed subplans compiled from ASAPPlanner's
   own selected `SummaryNode` DAG. This module belongs on the
-  [migration doc](design-asapplanner-workload-planner-migration.md) §4.1
-  removal list (it is not currently listed there) — add it once PR4/PR5 of
-  that stack lands, not before, since it is still the live path until then.
+  migration plan §9 Phase 6 removal list — remove it only after the compiled
+  plan path is selected and rollback no longer depends on legacy planning.
 - `emit::agent::generate_agent_collector_config` currently builds a complete
   collector YAML. It should become the `EdgeAssignment -> CollectorPlan`
   serializer defined in §5. Bootstrap OTel receivers/exporters and credentials
   remain deployment configuration; a workload replan must not replace them.
-- Both subplans should land behind the same `ASAP_WORKLOAD_PLANNER_V2`
-  shadow-rollout flag the migration doc already proposes (§5/PR8): in
+- Both subplans should land behind the same workload-planner rollout mode
+  the migration plan defines (§9 Phase 5): in
   `shadow` mode, compile `CompiledPlan` and record `plan_id` agreement and
   field-level diffs against the legacy allocator's output without pushing
   either subplan, exactly mirroring that section's existing comparison
