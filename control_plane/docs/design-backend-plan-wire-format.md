@@ -20,9 +20,9 @@ Planning (`control_plane`) and serving (`data_plane`) are different
 processes with different jobs — planning picks a summary family and sizes
 its parameters from a query shape and an accuracy target, symbolically;
 serving walks already-materialized state and answers queries against it.
-Those two steps must agree on **exactly** which `(SummaryKind,
-SummaryParams)` a given metric's materialization uses, because
-`SummaryExecutor::find_candidates` matches on that pair *by strict
+Those two steps must agree on **exactly** which `SummaryFamilyType` a given
+metric's materialization uses, including algorithm, parameters, and grouping
+layout, because `SummaryExecutor::find_candidates` matches on that state type *by strict
 equality*, on purpose: this deployment chose exact agreement over silently
 serving an answer under a looser accuracy guarantee than what was
 actually planned (see `summary_executor.rs::summary_params_match`'s
@@ -40,7 +40,7 @@ correct shape is: `control_plane` decides once, writes the decision into
 decision back — never re-derives it.
 
 This has one direct implication for `data_plane`'s serving-time L4
-lowering: it should resolve a query's `(SummaryKind, SummaryParams)` by
+lowering: it should resolve a query's selected `SummaryFamilyType` by
 looking it up in `RoutingIndex` (built from the `BackendPlan` `control_plane`
 already pushed), not by invoking a `CostModel` a second time at query time.
 `CostModel::rank_candidates`/`size_params` are a **planning-time-only**
@@ -57,23 +57,19 @@ query.
   actually planned, not by independently re-classifying the query and
   hoping the classification matches reality.
 - Reuse this deployment's existing canonical vocabulary
-  (`asap_ir`/`asap_sketch`'s `QueryExpr`/`AggIntent`/`SummaryKind`/
-  `SummaryParams`, and `control_plane`'s own `Capability`/`PolicyFingerprint`)
+  (ASAPPlanner's `QueryExpr`/`AggIntent`/`SummaryFamilyType`, and
+  `control_plane`'s own `Capability`/`PolicyFingerprint`)
   directly. No parallel, wire-specific re-encoding of concepts that already
   have a canonical type.
 
 ## 3. `Materialization`: exact and approximate are already the same shape
 
-`asap_sketch::SummaryKind`/`SummaryParams` already unify "approximate
-sketch" and "exact accumulator" into one vocabulary — `Sum`/`Count`/
-`MinMax`/`Increase`/`Rate` are `SummaryKind` variants exactly like `Kll`/
-`DDSketch`/`Hll`/`Cms`, distinguished only by `SummaryKind::is_exact()`.
-There is no reason for the wire format to reintroduce a
-`Sketch`-vs-`ExactAggregate` split on top of a vocabulary that has already
-closed that split. A `Materialization`'s payload is a `(SummaryKind,
-SummaryParams)` pair, full stop — whichever family it names decides
-whether readout is exact or approximate; the wire schema doesn't need to
-know or care.
+ASAPPlanner's current `SummaryFamilyType` is the canonical union of plain,
+exact-aggregate, sketch, sample, wavelet, and statistical-model state. A
+sketch-valued family carries its concrete `SketchKind` and
+`GroupingStrategy`; `SketchKind` carries category, algorithm, and parameters.
+`BackendPlan` preserves that selected type instead of flattening it into the
+obsolete local `(SummaryKind, SummaryParams)` pair.
 
 ```rust
 pub struct BackendPlan {
@@ -84,6 +80,10 @@ pub struct BackendPlan {
     // collector and backend subplans compiled together," which no
     // per-materialization fingerprint can answer on its own.
     pub plan_id: PlanId,
+    pub plan_version: u64,
+    pub activation: DateTime<Utc>,
+    pub expiry: Option<DateTime<Utc>>,
+    pub backend_compat: BackendCompatId,
     pub generated_at: DateTime<Utc>,
 
     /// Every materialization this backend should build/maintain,
@@ -107,12 +107,18 @@ pub struct Materialization {
     pub group_by: Vec<GroupKey>,
     pub rollup: Vec<GroupKey>,
 
-    /// What this materialization actually is. `kind.is_exact()` tells
-    /// readers whether this is an exact accumulator or an approximate
-    /// sketch — no separate enum arm needed for that distinction.
-    pub kind: SummaryKind,
-    pub params: SummaryParams,
+    /// The exact selected Planner state type, including concrete sketch
+    /// algorithm/parameters and grouping layout where applicable.
+    pub family: SummaryFamilyType,
     pub col: ColumnRef,
+
+    /// Collector assignments that produce this state under the matching
+    /// CollectorPlan.
+    pub sources: Vec<EdgeSourceRef>,
+
+    /// Present when the pinned Planner revision computes a guarantee for
+    /// this selected result. Unknown is not represented as exact.
+    pub guarantee: Option<ResultGuarantee>,
 
     pub retention: Option<RetentionPolicy>,
 }
@@ -136,11 +142,11 @@ materialization is one new `RoutingEntry`, not a change to the
 materialization itself.
 
 **Why `Capability` still exists as its own type, distinct from
-`(SummaryKind, SummaryParams)`:** `Capability` is the *family-level*
+`SummaryFamilyType`:** `Capability` is the *family-level*
 question ("does anything at all answer a `QuantileApprox` shape for this
 metric") used for coarse routing decisions — miss detection, archive
-fallback, "should I even try the sketch tier." `(SummaryKind,
-SummaryParams)` is the *exact* question `SummaryExecutor::find_candidates`
+fallback, "should I even try the sketch tier." `SummaryFamilyType` is the
+*exact* question `SummaryExecutor::find_candidates`
 needs — because two candidates must agree exactly to be legally mergeable
 via `merge_states`, family-level compatibility alone isn't enough to
 decide that. These are genuinely different match precisions for genuinely
@@ -175,8 +181,8 @@ struct MetricBucket {
     filter_ids:       Vec<FilterId>,
     windows:          Vec<WindowSpec>,
     capabilities:     Vec<Capability>,
-    kinds:            Vec<SummaryKind>,
-    params:           Vec<SummaryParams>,
+    families:         Vec<SummaryFamilyType>,
+    guarantees:       Vec<Option<ResultGuarantee>>,
     fingerprints:     Vec<PolicyFingerprint>,
     storage_backends: Vec<StorageBackend>,
 }
@@ -201,7 +207,7 @@ Match algorithm on Tier-1 miss:
      family-level.
    - **`SummaryExecutor::find_candidates`** (per-`L4Node`-leaf, called
      during `asap_sketch::exec::execute()`'s walk): match exact
-     `(SummaryKind, SummaryParams)` — required for anything that can feed
+     exact `SummaryFamilyType` equality — required for anything that can feed
      a `SummaryMerge`, and the reason `l4_lowering.rs` no longer needs to
      independently observe or guess this (see §5).
 6. **Whole-query resolution only:** if more than one candidate survives,
@@ -231,7 +237,7 @@ and should be built that way rather than reinvented as nested hash maps.
 
 Today, `data_plane`'s serving-time L4 lowering (`l4_lowering.rs`) parses
 the raw query string down to a canonical `QueryExpr`, then has to
-*independently reconstruct* which `(SummaryKind, SummaryParams)` a
+*independently reconstruct* which `SummaryFamilyType` a
 metric's registered sid actually uses by inspecting the `SketchStore`'s
 own metadata (`ObservedFamilyCostModel`) before it can bind an `L4Node`
 that `find_candidates` will actually match. That's a real, working
@@ -242,7 +248,7 @@ directly.
 Once `RoutingIndex` exists, serving-time lowering simplifies to: parse to
 `QueryExpr` (L1-L3, still genuinely needed — a query's *shape* has to be
 recovered from its text regardless of any wire format), then resolve the
-query's `(SummaryKind, SummaryParams)` via `RoutingIndex`'s
+query's selected `SummaryFamilyType` via `RoutingIndex`'s
 `find_candidates`-mode lookup directly, and construct the `L4Node` from
 that pair — no `CostModel::rank_candidates`/`size_params` call at serving
 time at all. `CostModel` becomes exactly what its name says: a
@@ -253,13 +259,15 @@ replacement for it.
 
 ## 6. Transport
 
-**Proto, not YAML/JSON.** `control_plane` and `data_plane` deploy
-atomically in this deployment (no independent rollout, no coordinated
-upgrade window), so there's no wire-compatibility constraint across
-versions to protect. `SummaryParams`/`SummaryKind` become proper `oneof`s,
-checked at compile time on both ends — no untyped `parameters:
-HashMap<String, Value>` bag to fall back into. The project already has
-proto precedent (`asap_otel_proto` for OTLP ingest).
+**Proto, not YAML/JSON.** `BackendPlan` is a typed protobuf contract.
+`SummaryFamilyType` and its family-specific values become proper protobuf
+`oneof`s, with invalid family/parameter combinations rejected during decode.
+`backend_compat` explicitly protects coordinated use with the independently
+delivered CollectorPlan and emitted summary-state schema; deployment timing
+must not be treated as an implicit compatibility guarantee. Additive fields
+and backward decoding support controlled rollout, with unknown required
+variants rejected rather than placed in an untyped
+`HashMap<String, Value>` bag.
 
 ## 7. Open questions
 
@@ -272,16 +280,16 @@ proto precedent (`asap_otel_proto` for OTLP ingest).
 - **Rollup algebra.** Step 2 above assumes "a materialization grouped by
   `(zone, region)` can answer a query grouped by `(zone)` alone" is a
   known-safe operation gated by the `rollup` field. The precise algebra —
-  which `SummaryKind`s roll up safely (`Sum`/`Count`-family: yes;
+  which summary families roll up safely (`Sum`/`Count`-family: yes;
   `Quantile`: generally no without re-estimation error) — needs its own
   short design pass before this step can be implemented as described.
-- **Exact top-k has no `SummaryKind` to name.** `asap_sketch::SummaryKind`
-  has no exact (non-approximate) top-k variant — `TopK` only exists as an
-  approximate family (`CmsWithHeap`/`CountSketchWithHeap`). A
-  `Materialization` for `topk(k, metric)` at `accuracy: Exact` can't be
-  expressed in this schema until that vocabulary gap closes upstream (see
-  the tracked issue for this — an ASAPController-side vocabulary
-  extension, not a `BackendPlan` schema question).
+- **Exact-requested top-k policy.** ASAPPlanner PR #293 permits a deployment
+  cost model to offer `CmsWithHeap`/`CountSketchWithHeap` for
+  `TopK { accuracy: Exact }` only with an explicit effective approximation
+  target, while retaining pass-through. If the pinned revision contains that
+  hook and ASAPQuery opts in, `BackendPlan` records the approximate family,
+  effective target, and selected guarantee; it must not describe the result as
+  exact. Without the opt-in, the query routes to exact raw/archive execution.
 - **`RoutingIndex` performance.** New query-time hot path in a
   latency-sensitive service — needs a benchmark pass against the current
   lookup, not just a correctness pass, before it can replace anything.

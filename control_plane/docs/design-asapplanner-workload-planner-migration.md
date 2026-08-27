@@ -29,7 +29,7 @@ ASAPQuery-backend remains the owner of:
 selected post-ASAP DAG
   -> deployment placement
   -> compile into two physical subplans sharing one plan identity:
-       collector subplan (OpAMP / asap_edge YAML)
+       collector subplan (OpAMP / versioned CollectorPlan YAML)
        backend subplan   (BackendPlan / materialization and routing)
   -> data-plane execution and archive fallback
 ```
@@ -171,7 +171,7 @@ Protocol/source adapters
                           /            \
                          v              v
               CollectorSubplan     BackendSubplan
-              (asap_edge YAML       (BackendPlan:
+              (CollectorPlan YAML   (BackendPlan:
                via OpAMP)            materializations + routing)
                     |                      |
                     v                      v
@@ -262,6 +262,50 @@ and rollback.
   replacement-explanation types.
 - Planning phase timings, search-size metrics, deadlines, and cancellation.
 
+### 4.4 Integration contract across all open ASAPPlanner PRs
+
+The integration must track ASAPPlanner's public planning types and APIs, not
+copy proposed branch types into ASAPQuery. As of 2026-08-27, every open
+ASAPPlanner PR falls into one of the following classes:
+
+| PR | Change | ASAPQuery integration consequence | Runtime-wire consequence |
+| --- | --- | --- | --- |
+| [#300](https://github.com/ProjectASAP/ASAPPlanner/pull/300) | Adds `ExactTransform`, `ExactPostProcess`, `ExecutionAvailability`, `PhaseAssignment`, and phase validation for exact/summary composition | When merged, partition the selected DAG by validated execution availability rather than re-deriving update/readout stages from node names. Advertise mixed-execution capabilities through the deployment cost model. | Collector plan accepts update-side exact transforms only when the collector advertises them. Backend plan carries readout-side exact post-processing. Invalid readout-under-maintenance plans are rejected before physical compilation. |
+| [#299](https://github.com/ProjectASAP/ASAPPlanner/pull/299) | Adds typed end-to-end `ResultGuarantee`, error metrics, bound/probability expressions, provenance, budget allocation, and rejected candidates | Use `search_workload_with_targets`; pass root `QueryRequirements.accuracy`; preserve the selected guarantee and rejection reason. Never rank a candidate that upstream rejected for accuracy. | Backend materializations/routes retain the selected guarantee. Collector plan retains the original accuracy constraint and concrete summary parameters; query reports compare the backend result against the selected guarantee. Unknown guarantees fail closed. |
+| [#295](https://github.com/ProjectASAP/ASAPPlanner/pull/295) | Adds recurrence-aware CSE cost profiles and `global_selection_with_recurrence` | Convert `RepeatingEntry` intervals plus ingest/update statistics into upstream recurrence inputs and use recurrence-aware global selection. One-shot/repeating mixtures supply the required horizon explicitly. | None directly. Scheduling, watermark, lateness, and retention remain downstream runtime policy. |
+| [#293](https://github.com/ProjectASAP/ASAPPlanner/pull/293) | Lets `CostModel` explicitly opt `TopK { accuracy: Exact }` into approximate heap-sketch candidates with a real sizing target | Implement `topk_exact_accuracy_target` only if product policy permits approximation for an exact-requested TopK. The opt-in returns an explicit non-Exact budget; it must never use a hidden default or clamp-sized pseudo-budget. | The selected plan records that the realization is approximate, its effective target, algorithm, parameters, and guarantee. Pass-through remains a candidate/fallback. |
+| [#291](https://github.com/ProjectASAP/ASAPPlanner/pull/291) | Adds optional caller-proven `Concat` discriminator unique-key metadata | Update exhaustive `QueryExpr` visitors and preserve the metadata through canonical roots. Do not invent discriminator keys downstream. | No new collector primitive. A retained `Concat` stays backend/archive-side unless a later selected strategy gives it an executable summary realization. |
+| [#296](https://github.com/ProjectASAP/ASAPPlanner/pull/296) | Adds workload cost/benefit annotations to DAG export and viewer | Consume the upstream explain/export fields in the optional explain endpoint. Do not recompute or scrape viewer output. | None; explain metadata is not a runtime plan identity or wire contract. |
+| [#292](https://github.com/ProjectASAP/ASAPPlanner/pull/292) | Corrects DAG-viewer node categories and adds drift checks | No planning dependency. Accept new upstream explain kind/category output when the pinned revision includes it. | None; viewer categories must never drive placement or execution. |
+
+This table is an integration audit, not a requirement to wait for every PR or
+to combine unmerged branches. ASAPQuery pins one immutable, tested
+ASAPPlanner revision. Code is written against the public API at that revision;
+when an upstream PR merges, the pin-update PR adds the corresponding adapter,
+compiler, capability, and golden-test changes in the same commit.
+
+The open PRs must not be imitated locally in advance. In particular:
+
+- do not define backend copies of `ExecutionAvailability`, `ResultGuarantee`,
+  recurrence profiles, or `ConcatDiscriminatorKey`;
+- do not use DAG-export JSON, viewer categories, decision rationale strings,
+  or debug node IDs as runtime input;
+- do not enable a newly nameable summary/phase until the collector and data
+  plane advertise compatible execution capabilities; and
+- do not silently discard a new field when exhaustive upstream types change.
+  Compilation must fail with a typed unsupported-shape diagnostic until the
+  new variant is deliberately mapped.
+
+The integration test matrix has three lanes:
+
+1. **Pinned baseline:** build and run against the single revision in
+   `Cargo.lock`.
+2. **Pin update:** for each newly merged contract-affecting Planner PR, update
+   all Planner crates together and run cross-repository golden workloads.
+3. **Capability mismatch:** deliberately select or decode a plan shape that
+   one executor does not support and prove planning fails before either
+   subplan is activated.
+
 ## 5. Migration stack
 
 Each phase should land as a separate, buildable PR. Later PRs may be stacked
@@ -269,9 +313,10 @@ while earlier ones are under review.
 
 ### PR 1: ASAPPlanner pin and API compatibility
 
-Move every ASAPPlanner dependency to the same immutable revision. The first
-target containing the workload planner and DAG-viewer changes is
-`747c66a8958409afd727b4d8046e16c653d228f6` (ASAPPlanner PR #283).
+Move every ASAPPlanner dependency to the same immutable revision of `main`.
+Do not pin to an open PR branch and do not combine commits from several open
+branches. Record the Planner commit in build metadata and emitted plan
+artifacts.
 
 Update together:
 
@@ -290,7 +335,7 @@ call sites to `asap_aware_mapping::replacement` and its public re-exports:
 - `PlanSpace::global_selection`;
 - `replacement::default_size_params`.
 
-Adapt the ASAPQuery cost model:
+Adapt the ASAPQuery cost model to the public API present at that pin:
 
 - rank `SketchAlgorithm` values and return an exact permutation of the input;
 - size `SketchParams` for the selected algorithm;
@@ -299,6 +344,22 @@ Adapt the ASAPQuery cost model:
 - supply subpopulation estimates and grouping-state costs when statistics are
   available;
 - expose numeric `estimate_cost` values for observability.
+
+When the pin contains the corresponding open-PR work described in §4.4:
+
+- #295: supply update/evaluation rates, one-shot counts, horizon, maintenance,
+  read, build, and raw-recompute costs, then call recurrence-aware global
+  selection for mixed workloads;
+- #293: implement the TopK-Exact opt-in hook only with an explicit approved
+  approximation budget;
+- #299: supply accuracy propagation statistics and call the target-aware
+  workload search API; and
+- #300: advertise only the exact-transform/post-process phase capabilities
+  the deployed collector and backend actually execute.
+
+Missing runtime statistics remain unknown, never numeric zero. An unavailable
+hook or type at the pinned revision is simply absent from the adapter; it is
+not recreated as a backend-local compatibility type.
 
 Use ASAPPlanner's `AccuracyTarget` as the only correctness/accuracy input
 model. During compatibility migration, `control_plane::types_v2` may re-export
@@ -319,6 +380,7 @@ Acceptance criteria:
 - `cargo build --workspace` succeeds;
 - existing control-plane and data-plane tests pass;
 - no ASAPPlanner crate is pinned to a different revision;
+- the recorded Planner revision matches every linked Planner crate;
 - the compatibility path does not change production output yet.
 
 ### PR 2: Adopt ASAPPlanner's canonical workload input
@@ -454,13 +516,30 @@ Acceptance criteria:
 
 ### PR 3: Complete repeating workload lowering in ASAPPlanner
 
-Land the one generic upstream gap:
+Complete the generic upstream lowering gap:
 
 - PromQL/SQL lowering for `repeating_queries` as well as `query_batch`, with
   one result per entry in input order.
 
 No caller ID, ASAPQuery, Prometheus, placement, wire, or runtime types enter
 these APIs.
+
+If ASAPPlanner #295 is present at the pinned revision, lowering and selection
+remain separate operations: the frontend lowers every `RepeatingEntry`, then
+ASAPQuery supplies the entry intervals and workload ingest rate to
+`recurrence_profiles` and calls `global_selection_with_recurrence`. The
+Prometheus adapter owns rule-group scheduling; the Planner receives only
+protocol-neutral recurrence and cost inputs.
+
+Acceptance criteria:
+
+- batch and repeating entries return one canonical root per input entry in
+  stable order;
+- two repeating consumers with different intervals contribute the sum of
+  their evaluation rates to a shared sub-DAG;
+- missing or invalid recurrence statistics produce a typed failure or the
+  documented structural fallback, never a fabricated zero cost; and
+- one-shot/repeating mixtures require an explicit costing horizon.
 
 ### PR 4: Workload-wide search and deployment selection
 
@@ -471,6 +550,12 @@ let strategies = default_strategies_with(&backend_cost_model);
 let space = search_workload_with(roots, &strategies);
 let selection = space.global_selection(&backend_cost_model);
 ```
+
+The snippet is the baseline API. When the pinned revision contains #299,
+construct the space with root accuracy targets and the deployment accuracy
+model. When it contains #295, select with the recurrence-aware API. When both
+are present, accuracy rejection happens before recurrence-aware cost ranking;
+cost must never resurrect an accuracy-invalid candidate.
 
 Build ASAPQuery's `DeploymentPlan` from the canonical roots plus
 `GlobalSelection`. This is the downstream commitment/materialization boundary
@@ -502,6 +587,10 @@ Acceptance criteria:
 - every chosen replacement records its real strategy name and target;
 - selection is deterministic for identical workload, statistics, and cost
   model inputs.
+- an upstream accuracy rejection remains rejected under every downstream cost
+  or placement decision;
+- a TopK-Exact sketch candidate exists only when the #293 hook explicitly
+  supplies its effective approximation target.
 
 ### PR 5: Selected workload to `CompiledPlan` (collector + backend subplans)
 
@@ -515,7 +604,8 @@ canonical roots + GlobalSelection
   -> apply choices + deployment placement
   -> compile into CompiledPlan { plan_id, plan_version, activation, expiry,
                                   backend_compat, collector, backend }
-       collector: CollectorSubplan (asap_edge YAML per edge, config_hash)
+       collector: CollectorSubplan (versioned CollectorPlan YAML per edge,
+                                    carried by OpAMP with config_hash)
        backend:   BackendSubplan   (BackendPlan: materializations + routing)
 ```
 
@@ -524,29 +614,32 @@ canonical roots + GlobalSelection
 `SummaryJoin` subtrees compile into the backend subplan (readout side) —
 this split is structural, derived from the selected DAG's own node kinds,
 not a second per-metric classification pass. A selected DAG must never be
-serialized into `asap_edge` YAML directly: neither `edge_id`, `shard_count`,
-transport mode, nor any other physical parameter exists in ASAPPlanner's
-output (its own non-goals), so something has to assign them, and that
-assignment is what turns one selection into two *agreeing* subplans instead
-of two independently-guessed ones.
+serialized directly as collector processor configuration: neither `edge_id`,
+shard count, streaming window, transport mode, nor any other physical
+parameter exists in ASAPPlanner's output. The physical compiler adds those
+decisions and emits the versioned `CollectorPlan` contract defined by
+ASAPCollector. That assignment is what turns one selection into two
+*agreeing* subplans instead of two independently guessed ones.
 
 Continue using `PolicyFingerprint` for persistent runtime identity *within*
 one subplan (materialization reuse/diff/resize across replans). `plan_id`
 answers a different question — whether the collector subplan and the
 backend subplan now active were compiled together — and is carried
 identically on both (see the compile doc §3/§7 for why `BackendPlan`'s
-existing `plan_id` field, currently documented as "observability only," is
-redefined to be this identity, not a second one). Exporter IDs such as DAG
-node IDs or `workload_node_id` are scoped to an explain result and must not
-become materialization keys.
+`plan_id` is this identity, not a second one). Exporter IDs such as DAG node
+IDs or `workload_node_id` are scoped to an explain result and must not become
+materialization keys.
 
-Review whether the wire needs additive fields for:
+The two wire contracts contain typed fields for:
 
 - exact versus sketch summary family, using `SummaryFamilyType` directly
-  (see the compile doc §7 — not a re-flattened `SummaryKind`/`SummaryParams`
-  pair, which does not match ASAPPlanner's current post-ASAP IR shape);
+  (see the compile doc §7 and backend wire-format doc §3);
 - sketch algorithm and parameters;
 - independent versus Hydra grouping layout;
+- selected result guarantee and its machine-readable provenance when #299 is
+  present at the Planner pin;
+- execution phase/availability and exact transform/post-process operators when
+  #300 is present at the Planner pin;
 - shared materialization dependencies, including which `EdgeAssignment`(s)
   supply a materialization's input summary state (`Materialization.sources`
   in the compile doc §7) — the field that lets the backend reject a plan
@@ -564,12 +657,18 @@ Acceptance criteria:
   legal routes/readouts;
 - materialization fingerprints are stable across replans;
 - protobuf encode/decode and hot reload preserve the chosen plan;
+- the OpAMP entry is exactly `asap-collector-plan.yaml` with
+  `application/yaml`, and bootstrap OTel configuration is not overwritten by
+  a workload replan;
 - the data plane never has to run a cost model to reconstruct the choice;
 - a `CollectorSubplan` and `BackendSubplan` produced by the same compile
   call carry the same `plan_id`/`plan_version`, and a deliberately
   mismatched pair (e.g. an old collector config against a new
   `BackendPlan`) is detectable from those fields alone, without needing to
-  diff YAML against protobuf by hand.
+  diff YAML against protobuf by hand;
+- `RemoteConfigStatus.APPLIED` alone cannot pass activation: the collector's
+  semantic application report and emitted materialization identities must
+  agree with the backend plan.
 
 ### PR 6: Data-plane execution coverage
 
@@ -588,30 +687,22 @@ Unsupported candidates must be removed before selection or fail planning with
 a clear capability diagnostic. They must never be accepted by the control
 plane and fail later during query serving.
 
-**Track, don't block on, two open upstream ASAPPlanner PRs that change this
-list's shape.**
-[#300](https://github.com/ProjectASAP/ASAPPlanner/pull/300) (open) adds
-`SummaryExpr::ExactTransform`/`ExactPostProcess` — composed exact-over-
-summary and summary-over-exact plans across an explicit update/readout
-boundary — which is exactly the boundary
-[`design-compiled-plan-collector-backend-split.md`](design-compiled-plan-collector-backend-split.md)
-§1 uses to split a selected DAG between the two subplans; if it merges, that
-document's structural partition rule should be re-expressed in terms of its
-`ExecutionAvailability`/`PhaseAssignment` types, per that section's own
-forward note, without changing which nodes land in which subplan.
-[#299](https://github.com/ProjectASAP/ASAPPlanner/pull/299) (open) propagates
-end-to-end accuracy guarantees for approximate-over-approximate plans, which
-bears on this PR's "accuracy... not re-derived at serving time" criterion
-below once summary-over-summary composition is selectable. Neither PR is a
-migration-stack dependency — this stack should not stall waiting for them —
-but PR 6's "cover at least" list should be revisited against whichever of
-the two has merged by the time it lands.
+The exact coverage list is derived from the pinned Planner revision and the
+complete open-PR audit in §4.4. In particular, a pin containing #300 adds
+exact-transform/post-process and phase-validation cases; a pin containing
+#299 adds guarantee propagation, budget, rejection, and unknown-guarantee
+cases; a pin containing #291 adds exhaustive retained-`Concat` handling.
+Viewer-only changes in #296/#292 add no execution cases. The migration does
+not wait for open PRs, but every pin update expands this matrix in the same PR
+that changes the upstream types.
 
 Acceptance criteria:
 
 - control plane selects once and the data plane consumes that exact choice;
 - family, parameters, grouping, and accuracy are not re-derived at serving
   time;
+- result guarantees and phase assignments present in the selected Planner DAG
+  survive physical compilation without being weakened or guessed;
 - archive fallback remains available for unsupported queries;
 - end-to-end tests prove plan push, hot reload, and serving.
 
@@ -842,7 +933,7 @@ When several rules need the same aggregation at different compatible
 intervals, materialize the smallest compatible pane and merge panes for the
 slower rule. Do not allocate one streaming aggregation per alert interval.
 
-### 6.3 AccuracyTarget and KeepPreAsap are sufficient
+### 6.3 Accuracy requirements, guarantees, and exact fallback
 
 Do not add `CorrectnessPolicy::{Exact, Approximate, ExactOrValidate}`.
 ASAPPlanner's existing `AccuracyTarget` is the single source of truth:
@@ -853,15 +944,39 @@ AccuracyTarget::Epsilon(epsilon)
 AccuracyTarget::EpsilonDelta { epsilon, delta }
 ```
 
-`Exact` excludes approximate candidates. A node for which no valid exact ASAP
-replacement exists remains `KeepPreAsap`, which means ASAPQuery executes the
-original pre-ASAP subtree from raw/archive data. `Epsilon` and
+By default, `Exact` excludes approximate candidates. A node for which no valid
+exact ASAP replacement exists remains `KeepPreAsap`, which means ASAPQuery
+executes the original pre-ASAP subtree from raw/archive data. `Epsilon` and
 `EpsilonDelta` allow ASAPPlanner to choose a summary sized to that target.
 
-No `ResidualExpr`, `GuardedResult`, interval-propagation layer, or conditional
-exact-fallback policy is needed for this migration. ASAPQuery consumes
-`SummaryNode` replacements and executes `KeepPreAsap` exactly; it must not
-reinterpret the accuracy requirement or define a competing correctness enum.
+If the pinned revision contains #293, an ASAPQuery deployment may explicitly
+offer approximate heap-sketch candidates for `TopK { accuracy: Exact }`, but
+only by returning a concrete non-Exact sizing target from the upstream cost
+model hook. This is a visible product-policy exception: pass-through remains
+available, and the compiled plan records the effective approximation target.
+It must not be generalized to other Exact intents.
+
+If the pinned revision contains #299, `AccuracyTarget` is the requested
+constraint and `ResultGuarantee` is the Planner-computed guarantee of a
+selected result. They are not interchangeable. ASAPQuery:
+
+1. supplies root targets to target-aware workload search;
+2. lets Planner reject unknown or insufficient composed guarantees before
+   cost ranking;
+3. preserves the selected guarantee, metric, probability bound, and
+   provenance in `BackendPlan` and explain output; and
+4. treats an unknown guarantee as unavailable, never exact and never zero.
+
+The CollectorPlan carries the original constraint and concrete summary
+parameters needed to build state. The backend plan carries the selected
+result guarantee because readout and composition occur there. The MVP report
+compares observed error using that same metric and bound.
+
+No backend-local `ResidualExpr`, `GuardedResult`, guarantee algebra, or
+conditional exact-fallback policy is needed for this migration. ASAPQuery
+consumes Planner replacements/guarantees and executes `KeepPreAsap` exactly;
+it must not reinterpret the requirement or define a competing correctness
+enum.
 
 ### 6.4 Keep scheduling outside ASAPPlanner
 
@@ -1025,9 +1140,12 @@ Add negative fixtures for:
 Tests are required at four boundaries:
 
 1. query workload -> selected strategies;
-2. canonical roots + `GlobalSelection` -> `DeploymentPlan` -> `BackendPlan`;
-3. protobuf -> data-plane hot reload and `RoutingIndex`;
-4. ingest -> plan push -> warm query response, including archive fallback.
+2. canonical roots + `GlobalSelection` -> `DeploymentPlan` -> matching
+   `CollectorPlan` and `BackendPlan`;
+3. OpAMP/YAML and backend protobuf -> semantic activation, data-plane hot
+   reload, and `RoutingIndex`;
+4. ingest -> both plan pushes -> identity-matched warm query response,
+   including archive fallback.
 
 ## 8. Complexity and safety limits
 
@@ -1071,11 +1189,17 @@ Protect the control plane with:
 The migration is complete when:
 
 - all production queries enter one workload-aware ASAPPlanner path;
-- the selected post-ASAP plan is the sole source of `BackendPlan` decisions;
+- the selected post-ASAP plan plus one downstream physical compile is the sole
+  source of matching `CollectorPlan` and `BackendPlan` decisions;
 - shared sub-DAGs remain shared through materialization and serving;
 - the data plane does not independently select summary families or params;
-- ASAPPlanner's `AccuracyTarget` is the only accuracy model and legacy
-  `accuracy_sla`/local exact-vs-approximate enums have been removed;
+- ASAPPlanner's `AccuracyTarget` and, when available at the pin,
+  `ResultGuarantee` are the only accuracy contract; legacy
+  `accuracy_sla`, local exact-vs-approximate enums, and backend guarantee
+  algebra have been removed;
+- every open ASAPPlanner PR in §4.4 is either absent from the immutable pin or
+  has its documented adapter/compiler/capability tests in the same pin-update
+  change;
 - q1/q2/q3/q4/q6 pass cross-repository end-to-end tests;
 - explain output maps every selected post-ASAP replacement explicitly to its
   pre-ASAP target;
@@ -1090,8 +1214,9 @@ Recurring-rule support is complete only when:
 - only the generic evaluation interval enters ASAPPlanner; query offset and
   alert-state durations remain scheduler metadata;
 - temporal panes have an explicit common anchor and watermark contract;
-- `AccuracyTarget::Exact` plans either select exact ASAP summaries or execute
-  `KeepPreAsap` from raw/archive data;
+- `AccuracyTarget::Exact` plans either select exact summaries, execute
+  `KeepPreAsap` from raw/archive data, or use only the explicit, recorded
+  TopK exception enabled through ASAPPlanner #293's cost-model hook;
 - rule reload uses a warm, versioned `DeploymentPlanDiff` cutover;
 - the initial production path materializes into Prometheus while Prometheus
   retains alert-state authority.

@@ -151,12 +151,10 @@ non-goals:
 /// planning boundary. Neither subplan is ever emitted independently of the
 /// other; they are two views produced by the same compile call.
 pub struct CompiledPlan {
-    /// Shared identity across BOTH subplans — the field this document adds
-    /// to close ASAPCollector's own documented gap (§6 below). Content
-    /// addressed: a hash of the selected DAG's structure plus the
-    /// deployment topology/constraints the compiler ran against, so two
-    /// compiles of the same selection against the same topology produce
-    /// the same `plan_id` and two different selections never collide.
+    /// Shared identity across BOTH subplans. Content addressed from the
+    /// selected DAG, topology identity, and semantic constraints. Mutable
+    /// sizing and lifecycle values are deliberately excluded and ordered by
+    /// `plan_version` instead.
     pub plan_id: PlanId,
     /// Monotonic per-`plan_id` counter — bumped on re-compile against an
     /// unchanged selection (e.g. a resize), not on every replan.
@@ -181,6 +179,8 @@ pub struct CompiledPlan {
 pub struct CollectorSubplan {
     pub plan_id: PlanId,           // == CompiledPlan::plan_id
     pub plan_version: u64,         // == CompiledPlan::plan_version
+    pub activation: DateTime<Utc>,
+    pub expiry: Option<DateTime<Utc>>,
     pub backend_compat: BackendCompatId,
     /// One entry per collector fleet member this plan touches.
     pub edges: Vec<EdgeAssignment>,
@@ -202,10 +202,12 @@ pub struct EdgeAssignment {
 pub struct BackendSubplan {
     pub plan_id: PlanId,           // == CompiledPlan::plan_id
     pub plan_version: u64,         // == CompiledPlan::plan_version
-    /// Today's `BackendPlan` (design-backend-plan-wire-format.md §3), with
-    /// one change: `BackendPlan::plan_id` stops being "observability only"
-    /// (its current doc comment) and becomes literally
-    /// `CompiledPlan::plan_id` — see §6.
+    pub activation: DateTime<Utc>,
+    pub expiry: Option<DateTime<Utc>>,
+    pub backend_compat: BackendCompatId,
+    /// `BackendPlan` from design-backend-plan-wire-format.md §3. Its
+    /// envelope fields equal this `BackendSubplan` and the matching
+    /// `CollectorSubplan`.
     pub backend_plan: BackendPlan,
 }
 ```
@@ -258,185 +260,92 @@ Steps 2–3 are exactly the job `physical::allocator::SketchAllocator` and
 for the same allocation job, retargeted to consume ASAPPlanner's own
 `SummaryNode` selection instead of a parallel local IR — see §9.
 
-## 5. Redesigning `asap_edge.metrics[]` to match the DAG's own shape
+## 5. Collector subplan wire contract
 
-The compile step's output should not reinvent a second vocabulary for what
-the selected DAG already names. Checked against the real processor, not a
-doc summary of it —
-[`opentelemetry-collector-contrib-patch/processor/asapedgeprocessor/config.go`](https://github.com/ProjectASAP/ASAPCollector/blob/main/opentelemetry-collector-contrib-patch/processor/asapedgeprocessor/config.go) —
-today's `MetricFamily` struct does exactly that in two places: `Mode` is a
-bare string validated to exactly two values (`precompute.ParseAggMode`
-accepts only `per_series`/`whole_stream`), and `AggregateBy []string` has no
-way to express `GroupKeys.without`. Neither can distinguish
-`Reduction::PerEntity` from a genuine zero-key `Reduce` — the exact
-ambiguity ASAPPlanner's own `Reduction` type was introduced to remove
-(issue #163, per `crates/types/src/post_asap/expr.rs`'s own doc comment on
-`SummaryAgg.reduction`). `Family` is a flat string covering only `sum`/
-`ddsketch`/`kll`/`hll`/`countsketch`/`countminsketch`, with no discriminator
-for the other four `ExactKind` variants and no field at all for
-`GroupingStrategy`.
+The authoritative collector-side schema is ASAPCollector's
+[`ASAPQuery-to-ASAPCollector collection-plan interface`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/opamp-config-push.md).
+This document does not define a second flat `asap_edge.metrics[]` schema.
 
-Go's `mapstructure` decoding has no polymorphic nested-union support the way
-`serde` does, and this file's own existing pattern (`FamilyKind`/`Tier`/
-`ColdFormat`) is already flat discriminator-plus-sibling-fields, not
-nesting. So "aligned with the DAG" here means *the same flat shape*, with
-every field name and enum spelling drawn directly from `post_asap` — not a
-Rust-style nested tagged union grafted onto a struct that was never built to
-decode one:
+For each `EdgeAssignment`, the compiler emits one versioned
+`CollectorPlan` YAML document in the exact OpAMP `AgentConfigMap` entry
+`asap-collector-plan.yaml`, with content type `application/yaml`. The OpAMP
+protobuf is the transport envelope; the YAML document is the typed physical
+execution contract. It is not a serialized ASAPPlanner Rust DAG and it is
+not a complete OTel Collector configuration.
 
-```go
-// today                              // redesigned
-type MetricFamily struct {            type MetricFamily struct {
-    Metric      string                    Source    string     // SummaryAgg.col
-    Family      FamilyKind                Family    FamilyKind // exact|ddsketch|kll|hll|
-                // sum|ddsketch|kll|                // cms|count_sketch|
-                // hll|countsketch|                 // cms_with_heap|
-                // countminsketch                   // count_sketch_with_heap|
-                                                      // kmv|theta
-    AggregateBy []string                  ExactKind ExactKind  // sum|count|min_max|
-    // Mode: "" | "per_series" |                     // increase|rate — read only
-    // "whole_stream" — free string,                 // when family=exact
-    // no per_entity / without concept
-    Mode        string                    // Reduction, named directly.
-                                           // PerEntity excludes ReduceBy/
-                                           // ReduceWithout — Validate() enforces it.
-                                           ReduceBy      []string
-                                           ReduceWithout bool
-                                           PerEntity     bool
+The compiler maps the selected DAG into that schema as follows:
 
-                                           // GroupingStrategy — no field
-                                           // existed before.
-                                           Grouping      GroupingKind // per_subpopulation_instance
-                                                                       // (default) |
-                                                                       // shared_multi_subpopulation
-                                           HydraKind     string
-                                           SharedRows    uint32
-                                           SharedColumns uint32
+| Selected post-ASAP field | `CollectorPlan` field |
+| --- | --- |
+| `SummaryAgg` identity | `materializations[].logical_node_ref` plus a content-addressed `materializations[].id` |
+| bound `Source` and predicates | `materializations[].input.metric` and canonical `input.matchers` |
+| `SummaryAgg.col` | `materializations[].input.value` |
+| `SummaryFamilyType` | `materializations[].summary.family` |
+| sketch algorithm and parameters | `summary.algorithm` and typed `summary.parameters` |
+| Planner accuracy constraint | `summary.accuracy` |
+| `Reduction::PerEntity` | `reduction.kind: per_entity` |
+| `Reduction::Reduce(GroupKeys)` | `reduction.kind: reduce`, explicit `by`, and `without` |
+| `GroupingStrategy` | `grouping.kind`, plus Hydra kind/parameters for shared grouping |
 
-    RelativeAccuracy, K, Rows, Cols        RelativeAccuracy, K, Rows, Cols
-    // ...ItemLabel, SampleP,              // ...unchanged, see below
-    // MaxSeries, Tier, SpatialFilter,
-    // GosDeltaEpsilon, GosSites,
-    // EmitHeap, HeapSize, WeightMode,
-    // Threshold, HLLSparse
-}                                      }
-```
+The physical compiler adds fields ASAPPlanner intentionally does not own:
+target agent/edge, capability snapshot, concrete streaming windows, local
+shards, exporter reference, and raw/full/delta transmission policy. These
+fields must never be inferred by ASAPCollector from missing values.
 
-Worked example — p99 latency by `(service, region)`, an exact per-zone
-sum, and a Hydra-CMS unique-IP count by zone:
+The complete plan envelope carries `plan_id`, `plan_version`, `activation`,
+`expiry`, and `backend_compat` verbatim from `CompiledPlan`. Each emitted
+summary or delta also carries those compatibility identities plus its
+materialization, window, producer, and sequence/checkpoint identity.
 
-```yaml
-metrics:
-  - source: request_duration_seconds
-    family: ddsketch
-    reduce_by: [service, region]
-    reduce_without: false
-    relative_accuracy: 0.01
-    delta_transmission: true
-
-  - source: page_views
-    family: sum
-    exact_kind: sum
-    reduce_by: [zone]
-
-  - source: unique_ips
-    family: cms
-    grouping: shared_multi_subpopulation
-    hydra_kind: cms
-    shared_rows: 4
-    shared_columns: 2048
-    reduce_by: [zone]
-    rows: 4
-    cols: 2048
-```
-
-Two consequences fall out of the realignment itself, not as separate
-follow-ups: an `exact_kind` slot and a `grouping`/`hydra_kind` slot exist
-because every `post_asap` variant now has somewhere to go — they were
-"gaps" in the old flat vocabulary specifically because that vocabulary was
-invented independently of `SummaryFamilyType`/`GroupingStrategy` rather than
-read off them. `cms_with_heap`/`count_sketch_with_heap`/`kmv`/`theta` are
-named for completeness; the processor doesn't implement them yet (today's
-`EmitHeap: true` on `count_sketch` approximates `CountSketchWithHeap` as a
-special case) — naming the slot doesn't imply the runtime behind it exists.
-
-`edge_id`/`shard_count`/`window_duration`/`warm_allowed_lateness`/
-`drop_original` stay top-level `Config` fields, and `tier`/`spatial_filter`/
-`sample_p`/`max_series`/`item_label`/`delta_transmission`/`delta_threshold`/
-`gos_delta_epsilon`/`gos_sites`/`emit_heap`/`heap_size`/`weight_mode`/
-`hll_sparse`/`threshold{…}`/`cold{…}`/`control_channel{…}` all stay exactly
-as they are on `MetricFamily` — collector-implementation and deployment
-knobs with no `post_asap` counterpart to align to. Realigning them would
-mean inventing DAG concepts that don't exist, the same mistake in reverse.
-`item_label` in particular still comes from the deployment's `Frequency`
-extension realization (`design-target-architecture.md`'s
-`CostModel::realize_extension`), the same place it's produced today.
-
-This is a schema proposal, not a claim that ASAPCollector has implemented
-it. `Source`/`ReduceBy`/`ReduceWithout`/`PerEntity`/`Grouping`/`HydraKind`/
-`SharedRows`/`SharedColumns`/`ExactKind` do not exist on `MetricFamily`
-today; `Metric`/`AggregateBy`/`Mode` remain the only way to express this
-today. A migration should decode both old and new field names for one
-release (`Metric`→`Source`, `AggregateBy`→`ReduceBy`, `Mode` derived from
-`PerEntity`/`ReduceWithout`) rather than break existing deployed configs on
-cutover.
+Unsupported Planner alternatives remain visible in the logical candidate
+space but cannot be emitted unless the targeted collector capability snapshot
+and backend compatibility ID both support them. The compiler chooses another
+valid candidate or exact fallback; it never renames an unsupported algorithm
+to a similar supported one. In particular, shared Hydra grouping must not be
+silently flattened to independent per-group state.
 
 ## 6. Gaps this closes vs. what it still leaves open
 
-**Closes**, on the ASAPCollector side (its own documented gap, verbatim from
-[`opamp-config-push.md`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/opamp-config-push.md)'s
-"Current contract gap" section): *"the implemented OpAMP YAML schema
-currently has no explicit `plan_id`, `plan_version`, activation time, expiry
-time, or backend compatibility identifier. `config_hash` identifies the
-remote collector configuration; it is not a complete versioned end-to-end
-plan contract."* `CompiledPlan`'s envelope (§3) is exactly those five
-fields, carried on both `CollectorSubplan` and `BackendSubplan`. The MVP
-harness (per that same doc) can now compare `plan_id`/`plan_version`
-reported by a collector's `AgentToServer` health/status against the
-`plan_id`/`plan_version` the backend reports as active, instead of only
-having `config_hash` (which proves the collector loaded *some* YAML, not
-that it's the YAML compiled alongside the currently-active `BackendPlan`).
-This is additive to — not a replacement for — ASAPCollector's own
-`AgentRemoteConfig`/`config_hash` mechanics; see that document for exactly
-where in the OpAMP message envelope these fields should be encoded (an
-ASAPCollector-side decision this document does not make unilaterally).
+**Closes in the target design**, on the ASAPCollector side: the
+`CollectorPlan` envelope now has explicit `plan_id`, `plan_version`,
+`activation`, `expiry`, and `backend_compat` fields, carried identically on
+the matching backend plan. It is delivered as the
+`asap-collector-plan.yaml` OpAMP config-map entry. The collector returns the
+semantic result through the `io.asap.collector.plan.v1` /
+`application_report` custom message. The MVP harness compares the active
+plan and materialization identities on both sides instead of treating
+OpAMP's `config_hash` or `RemoteConfigStatus.APPLIED` as proof of semantic
+activation.
 
-**Opens**, in `asap_edge`'s own schema (ASAPCollector-owned — §5's redesign
-proposes the shape, but implementing it there is a separate, tracked change,
-not something this document does unilaterally): the `exact_kind` and
-`grouping`/`hydra_kind` slots §5 proposes cover every `post_asap` variant
-that exists today, but `cms_with_heap`/`count_sketch_with_heap`/`kmv`/
-`theta` name families the processor doesn't build yet — exercising them
-still needs real runtime support, not just a schema slot. None of that is
-exercised by this deployment's current MVP metric set, so implementing the
-unbuilt families is out of scope for the first `CompiledPlan`
-implementation; §5's redesign should not be read as "these are all the
-families `asap_edge` will ever need" — only as "every family that exists
-today has somewhere to go."
+This remains a target contract rather than a claim about current runtime
+behavior. ASAPCollector currently writes a complete OTel YAML file, restarts,
+and reports only the OpAMP config hash after a syntax check. Implementing the
+new parser, atomic activation, and application report is a separate code
+change.
+
+**Opens**, in ASAPCollector's execution layer: the target schema can name all
+Planner families and grouping layouts, but `cms_with_heap`,
+`count_sketch_with_heap`, KMV, Theta, sampling, wavelets, statistical models,
+and shared Hydra grouping still require actual collector and backend support.
+Naming an algorithm in the schema does not advertise that runtime support.
 
 **Stays open**, and is explicitly out of scope here: the rollup algebra
 question already on record in
 [`design-backend-plan-wire-format.md`](design-backend-plan-wire-format.md)
-§7 ("which `SummaryKind`s roll up safely"), and the composed exact/summary
+§7 ("which summary families roll up safely"), and the composed exact/summary
 execution gaps tracked against ASAPPlanner PR #300 / issue #171.
 `CompiledPlan` treats a `RollupStrategy` selection the same as any other
 readout-side subtree (§4 step 4) — it does not independently re-derive
 rollup legality, which remains ASAPPlanner's decision to have made during
 selection.
 
-## 7. Backend subplan: one correction to the existing `Materialization` shape
+## 7. Backend subplan materialization shape
 
 [`design-backend-plan-wire-format.md`](design-backend-plan-wire-format.md)
-§3 defines `Materialization.kind: SummaryKind` / `params: SummaryParams` as
-a flat pair, citing `asap_sketch::SummaryKind`/`SummaryParams`. Those exact
-type names do not exist in ASAPPlanner's current `crates/types::post_asap`
-(§1) — the flat-pair shape predates the current IR, which nests kind+params
-*per family* inside `SummaryFamilyType` (and nests a further
-algorithm+params level specifically for `Sketch`, plus the orthogonal
-`GroupingStrategy` axis). `Materialization` should be updated to carry the
-current type directly, the same "reuse the canonical vocabulary, don't
-re-flatten it" principle §3 of that document already states as its own
-goal:
+§3 carries ASAPPlanner's current `SummaryFamilyType` directly. That type
+nests algorithm and parameters for sketches and retains the orthogonal
+`GroupingStrategy` axis; the backend wire must not re-flatten it into a local
+`SummaryKind`/`SummaryParams` vocabulary:
 
 ```rust
 pub struct Materialization {
@@ -446,9 +355,7 @@ pub struct Materialization {
     pub group_by: Vec<GroupKey>,
     pub rollup: Vec<GroupKey>,
 
-    /// Was `kind: SummaryKind, params: SummaryParams`. Now the current
-    /// upstream type directly — carries grouping layout for `Sketch` too,
-    /// which the old flat pair had no field for at all.
+    /// Current upstream type directly, including sketch grouping layout.
     pub family: SummaryFamilyType,
     pub col: ColumnRef,
 
@@ -466,17 +373,16 @@ pub struct Materialization {
 
 pub struct EdgeSourceRef {
     pub edge_id: String,
-    pub metric: String, // matches an EdgeAssignment's asap_edge.metrics[].metric
+    pub materialization_id: PolicyFingerprint,
 }
 ```
 
-`BackendPlan.plan_id`'s doc comment ("observability only, not identity") no
-longer holds under this design — see §3: it becomes the field two subplans
-are joined on. Content-addressed `PolicyFingerprint` remains correct as the
-identity of one `Materialization` (reuse/diff/resize within a single
-backend subplan, per the migration doc's `DeploymentPlanDiff`); `plan_id`
-now answers a different question — "were these two subplans compiled
-together" — that `PolicyFingerprint` was never meant to answer.
+`BackendPlan.plan_id` is the field joining the two subplans. Content-addressed
+`PolicyFingerprint` remains the identity of one `Materialization`
+(reuse/diff/resize within a single backend subplan, per the migration doc's
+`DeploymentPlanDiff`); `plan_id` answers a different question — "were these
+two subplans compiled together" — that a per-materialization fingerprint
+cannot answer.
 
 ## 8. What does not change
 
@@ -484,11 +390,11 @@ together" — that `PolicyFingerprint` was never meant to answer.
   warm cutover, and archive fallback — all as designed in
   `design-backend-plan-wire-format.md` and
   `design-asapplanner-workload-planner-migration.md` §5/§6.
-- ASAPCollector's `AgentRemoteConfig`/`AgentConfigMap`/`config_hash`
-  mechanics and apply/restart semantics — unchanged; this document adds
-  envelope fields alongside them, per §6.
-- The `asap_edge` processor's already-documented fields (§5's left two
-  columns) — extended, not replaced.
+- OpAMP's `AgentRemoteConfig`/`AgentConfigMap`/`config_hash` delivery
+  mechanics. `config_hash` still identifies exact remote-config bytes; it
+  does not replace `plan_id` or the semantic application report.
+- Existing `asap_edge` runtime behavior until the versioned `CollectorPlan`
+  parser and apply path are implemented.
 
 ## 9. Migration notes
 
@@ -501,13 +407,10 @@ together" — that `PolicyFingerprint` was never meant to answer.
   [migration doc](design-asapplanner-workload-planner-migration.md) §4.1
   removal list (it is not currently listed there) — add it once PR4/PR5 of
   that stack lands, not before, since it is still the live path until then.
-- `emit::agent::generate_agent_collector_config` currently builds one
-  processor keyed by `cfg.sketch_type` per collector — a shape that
-  predates the unified `asap_edge` processor with a `metrics[]` list that
-  ASAPCollector's own OpAMP doc now documents as canonical. It should become
-  the `EdgeAssignment -> asap_edge YAML` serializer described here, which is
-  a strictly larger rewrite than a field-mapping change — flagging it here
-  so it isn't mistaken for a small follow-up.
+- `emit::agent::generate_agent_collector_config` currently builds a complete
+  collector YAML. It should become the `EdgeAssignment -> CollectorPlan`
+  serializer defined in §5. Bootstrap OTel receivers/exporters and credentials
+  remain deployment configuration; a workload replan must not replace them.
 - Both subplans should land behind the same `ASAP_WORKLOAD_PLANNER_V2`
   shadow-rollout flag the migration doc already proposes (§5/PR8): in
   `shadow` mode, compile `CompiledPlan` and record `plan_id` agreement and
@@ -516,13 +419,6 @@ together" — that `PolicyFingerprint` was never meant to answer.
   list.
 
 ## 10. Open questions
-
-- **Where in the OpAMP envelope do `plan_id`/`plan_version`/`activation`/
-  `expiry`/`backend_compat` live?** A sibling top-level YAML key next to
-  `processors.asap_edge`, a field inside `asap_edge` itself, or a separate
-  `AgentConfigFile` entry — this is ASAPCollector's schema to own; this
-  document only establishes that the fields must exist and must be
-  identical to the backend subplan's copy.
 - **`backend_compat` granularity.** One id per `BackendPlan` proto schema
   version, or one per `(schema version, family vocabulary version)` so an
   `asap_edge` schema gap closing (§6) doesn't force every unrelated plan to
