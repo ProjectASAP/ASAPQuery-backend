@@ -2,6 +2,9 @@
 
 > Status: proposed
 >
+> MVP relation: required for the ASAPQuery data plane to ingest and query the
+> state selected by the control plane.
+>
 > Scope: the typed runtime contract by which ASAPQuery-backend's control
 > plane tells its data plane what summary materializations exist, how they
 > are ingested, and which query capabilities they serve.
@@ -55,7 +58,7 @@ compiler creates:
 - BackendPlan, which validates, stores, routes, merges, and reads them.
 
 The two are defined together in
-[`design-compiled-plan-collector-backend-split.md`](design-compiled-plan-collector-backend-split.md).
+[`physical-planning.md`](physical-planning.md).
 
 BackendPlan is not:
 

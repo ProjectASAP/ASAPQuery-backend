@@ -1,6 +1,9 @@
-# Compiling one Planner decision into collector and backend plans
+# Physical planning for collector and backend execution
 
 > Status: proposed
+>
+> MVP relation: required to turn one Planner selection into matching collector
+> and backend runtime plans.
 >
 > Scope: the ASAPQuery-backend physical-planning step between ASAPPlanner's
 > selected post-ASAP workload DAG and the two runtime executors:
@@ -175,7 +178,7 @@ collector's complete bootstrap configuration.
 ## 6. Backend subplan
 
 The backend subplan follows
-[`design-backend-plan-wire-format.md`](design-backend-plan-wire-format.md).
+[`backend-plan.md`](backend-plan.md).
 
 It specifies:
 
@@ -228,6 +231,28 @@ Transmission is independent of logical summary choice:
 Delta is legal only when collector and backend advertise the same state,
 sequence, and checkpoint semantics. Every payload identifies its plan,
 materialization, producer, window, sequence, and base/checkpoint.
+
+### Aggregation placement
+
+Planner's reduction and grouping are logical requirements. The physical
+compiler decides where that reduction runs without changing them. For example,
+`sum by (region) (rate(http_requests_total[5m]))` may maintain one summary per
+`region` at collectors, while a query with no grouping may use one
+whole-workload materialization. A per-series or per-group result must never be
+silently collapsed into a global result.
+
+### State representation
+
+Dense versus sparse state is a physical representation choice, not a new
+summary choice. For example, an HLL materialization may use sparse state for
+low-cardinality groups and promote to dense state as cardinality grows, but
+both representations must preserve the same HLL parameters, merge semantics,
+wire compatibility, and accuracy contract.
+
+The compiler may select a representation only when both producer and consumer
+advertise compatible support. Otherwise it uses the declared fallback or
+rejects the plan. Representation details such as collector configuration field
+names belong in the collector interface, not in this design.
 
 ## 9. Compile and activation sequence
 
