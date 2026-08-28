@@ -1,71 +1,139 @@
-# Query routing and summary readout
+# Developing query routing and summary readout
 
-> Implementation status: partial; summary execution and fallback exist while
-> BackendPlan replaces legacy routing and local query-shape logic.
+> Interface status: target public API. Summary execution and fallback exist;
+> BackendPlan is still replacing legacy routing and local query-shape logic.
 
-## Purpose
+## 1. Code architecture
 
-This component converts a Prometheus-compatible request into a BackendPlan route,
-checks readiness, executes the declared summary readout and remaining operators,
-or invokes the explicit exact fallback.
+```text
+protocol request -> QueryAdapter -> QueryService
+                                      |
+                           BackendPlanSnapshot
+                              /              \
+                         SummaryReader    ExactQueryClient
+                              \              /
+                               QueryResponse
+```
 
-Design source: [Plan-aware query execution](../design_docs/query-execution.md).
+The adapter owns protocol conversion. `QueryService` owns plan-aware route
+selection. `SummaryReader` executes an already selected readout. The exact
+client executes only explicit fallback routes.
 
-## Current code map
+## 2. Public interfaces and definitions
 
-| Responsibility | Current entry point |
+```rust
+pub struct QueryRequest {
+    pub tenant: String,
+    pub language: QueryLanguage,
+    pub expression: String,
+    pub evaluation: EvaluationRange,
+    pub requested_accuracy: AccuracyRequirement,
+}
+
+pub struct EvaluationRange {
+    pub start: Timestamp,
+    pub end: Timestamp,
+    pub step: Option<Duration>,
+}
+```
+
+```rust
+pub trait QueryService {
+    type Error;
+    async fn execute(&self, request: QueryRequest)
+        -> Result<QueryResponse, Self::Error>;
+}
+
+pub trait SummaryReader {
+    type Error;
+    fn read(
+        &self,
+        request: &QueryRequest,
+        route: &SummaryRoute,
+        plan: &BackendPlanSnapshot,
+    ) -> Result<SummaryReadout, Self::Error>;
+}
+
+pub struct SummaryRoute {
+    pub query_id: String,
+    pub materialization_ids: Vec<String>,
+    pub readout: ReadoutSpec,
+    pub required_guarantee: AccuracyRequirement,
+}
+
+pub struct SummaryReadout {
+    pub result: PrometheusResult,
+    pub guarantee: ResultGuarantee,
+    pub coverage: LogicalCoverage,
+}
+
+pub trait ExactQueryClient {
+    type Error;
+    async fn execute_exact(&self, request: &QueryRequest)
+        -> Result<QueryResponse, Self::Error>;
+}
+```
+
+Supporting public type definitions:
+
+| Type | Definition |
 | --- | --- |
-| ASAP query engine | [`asap_query_engine/engine.rs`](../../src/query_engines/asap_query_engine/engine.rs) |
-| Live summary-serving gate | [`asap_query_engine/live_serve.rs`](../../src/query_engines/asap_query_engine/live_serve.rs) |
-| Planner-node readout | [`asap_query_engine/l4_readout.rs`](../../src/query_engines/asap_query_engine/l4_readout.rs) |
-| Summary executor contract | [`summary_exec.rs`](../../src/query_engines/asap_query_engine/summary_exec.rs), [`summary_executor.rs`](../../src/query_engines/asap_query_engine/summary_executor.rs) |
-| Legacy routing during migration | [`routing/backend_storage_routing.rs`](../../src/query_engines/routing/backend_storage_routing.rs) |
-| Engine/fallback dispatch | [`routing/query_engine_routing.rs`](../../src/query_engines/routing/query_engine_routing.rs) |
-| Freshness probes | [`routing/freshness_probe_cache.rs`](../../src/query_engines/routing/freshness_probe_cache.rs) |
+| `QueryLanguage` | Language identifier; MVP value is PromQL. |
+| `AccuracyRequirement` | Exact, epsilon, or epsilon-delta constraint requested for the result. |
+| `ReadoutSpec` | Planner-selected operation and typed parameters applied to maintained state. |
+| `PrometheusResult` | Matrix/vector/scalar/string result with labels, timestamps, values, warnings, and errors. |
+| `ResultGuarantee` | Effective exact/approximate guarantee of the returned result. |
+| `LogicalCoverage` | Requested and actually covered time intervals plus readiness timestamp. |
+| `QueryError` | Typed parse, unsupported, inactive-plan, missing/stale/gapped state, or exact-backend failure. |
 
-## Request flow
+```rust
+pub struct QueryResponse {
+    pub result: PrometheusResult,
+    pub source: QuerySource,
+    pub guarantee: ResultGuarantee,
+    pub coverage: LogicalCoverage,
+    pub plan_id: Option<String>,
+    pub materialization_ids: Vec<String>,
+}
 
-1. Adapter produces canonical query, evaluation time/range, tenant, and accuracy
-   requirement.
-2. Snapshot one active BackendPlan.
-3. Match a route by canonical query capability and bound source—not by metric
-   name alone.
-4. Resolve referenced materializations and required logical windows.
-5. Check plan identity, coverage, watermark, delta continuity, and producer
-   completeness.
-6. Execute the declared readout and remaining backend operators.
-7. Align labels/timestamps and encode the Prometheus response.
-8. If the plan selects exact fallback, forward the same logical request.
+pub enum QuerySource {
+    Summary,
+    ExactFallback,
+}
+```
 
-## Result contract
+Why these interfaces exist: protocol code cannot bypass plan/readiness checks,
+and callers can interpret whether an answer is summary-backed or exact with its
+coverage and guarantee.
 
-- Missing or extra series are not treated as zero or dropped.
-- One response does not combine incompatible materializations/plan versions.
-- Approximation metadata reflects the selected result guarantee.
-- A partial interval is not returned as a complete answer.
-- Unsupported/missing/stale state returns a typed miss/error or explicit exact
-  route; it never returns a plausible summary value.
+## 3. Adding and verifying functionality
 
-## Current migration boundary
+### Add a readout/operator
 
-`BackendStorageRouting`, backend capability matching, and some lowering helpers
-still contain local query-shape logic. BackendPlan is the target authority.
-Do not add a new query-to-summary rule to these legacy paths; add logical
-support to ASAPPlanner and consume its selected readout.
+1. Add the logical semantics and guarantee to ASAPPlanner.
+2. Extend public backend readout capability and BackendPlan route types.
+3. Implement it through `SummaryReader`; do not parse and choose a family again.
+4. Return labels/timestamps/result type through `PrometheusResult`.
+5. Compare with the exact backend over identical series and logical range.
 
-## Adding a readout/operator
+### Add a protocol adapter
 
-1. Confirm ASAPPlanner represents its exact/approximate semantics and guarantee.
-2. Add backend capability advertisement.
-3. Map the canonical Planner node to one executor operation without replanning.
-4. Define label, timestamp, scalar/vector, and partial-coverage behavior.
-5. Add exact-baseline comparison for the same PromQL and logical interval.
+Convert protocol inputs to `QueryRequest` and `QueryResponse` back to protocol
+output. Verify tenant, evaluation timestamps, labels, result type, errors, and
+accuracy metadata round-trip unchanged.
 
-## Required tests
+### Add an exact backend
 
-- the three MVP aggregation shapes;
-- matching and deliberately mismatched labels/timestamps;
-- incomplete/stale windows and delta gaps;
-- exact versus approximate accuracy handling;
-- unsupported query fallback and fallback failure; and
-- concurrent plan swap does not mix versions in one response.
+Implement `ExactQueryClient`, preserving the complete `QueryRequest`. Verify
+remote failures remain errors and are not successful empty vectors.
+
+### Interpret and verify output
+
+- `QuerySource::Summary` requires active plan/materialization IDs and complete
+  coverage.
+- `QuerySource::ExactFallback` must satisfy exact semantics and carry no false
+  summary guarantee.
+- Missing/additional labels or timestamps are validation failures.
+- Partial/stale/gapped summary state must not return a successful complete
+  `QueryResponse`.
+- A plan swap during execution must not mix identities in one response.

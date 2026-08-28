@@ -1,53 +1,107 @@
-# Data-plane extension boundaries
+# Developing protocol and fallback extensions
 
-> Status: active
->
-> MVP relation: Prometheus HTTP and the configured exact fallback are required;
-> additional protocols and fallback systems are future extensions.
+> Interface status: public extension boundary. Concrete trait names may migrate
+> toward the canonical interfaces below; private server helpers are not API.
 
-## TL;DR
+## 1. Code architecture
 
-The data plane separates network transport, request/response adaptation,
-plan-aware execution, and exact fallback. An extension implements one boundary
-without duplicating planning or bypassing BackendPlan validation.
+```text
+network request -> ProtocolServer -> ProtocolAdapter -> QueryService
+                                                        |
+                                                ExactQueryClient
+```
 
-## Protocol server
+- `ProtocolServer` owns transport, authentication context, limits, timeout, and
+  cancellation.
+- `ProtocolAdapter` converts protocol-specific data to/from canonical query
+  structures.
+- `QueryService` performs plan-aware execution.
+- `ExactQueryClient` is called only for an explicit fallback route.
 
-A protocol server owns network concerns: endpoints, authentication context,
-request limits, cancellation, and transport errors. It hands a request to a
-protocol adapter and returns the adapter's response.
+## 2. Public interfaces and definitions
 
-It does not parse Planner IR, select a summary, access summary storage directly,
-or decide when fallback is allowed.
+```rust
+pub trait ProtocolAdapter: Send + Sync {
+    type Request;
+    type Response;
+    type Error;
 
-## Protocol adapter
+    fn decode(&self, request: Self::Request)
+        -> Result<QueryRequest, Self::Error>;
 
-An adapter converts a protocol request into the data plane's canonical query
-request and converts the canonical result back into the protocol response.
-Prometheus label and timestamp semantics must survive both conversions.
+    fn encode(&self, response: QueryResponse)
+        -> Result<Self::Response, Self::Error>;
 
-An adapter may report that a language feature cannot be represented, but it
-must not approximate or rewrite an unsupported query on its own.
+    fn encode_error(&self, error: QueryError) -> Self::Response;
+}
+```
 
-## Fallback client
+```rust
+pub trait ProtocolServer {
+    type Error;
+    async fn serve<S>(&self, service: Arc<S>) -> Result<(), Self::Error>
+    where
+        S: QueryService<Error = QueryError> + Send + Sync + 'static;
+}
+```
 
-A fallback client executes the canonical query against the exact backend named
-by BackendPlan. It preserves the logical evaluation time, range, tenant, and
-error response.
+```rust
+pub trait ExactQueryClient: Send + Sync {
+    type Error;
+    async fn execute_exact(&self, request: &QueryRequest)
+        -> Result<QueryResponse, Self::Error>;
 
-Fallback is invoked by plan-aware routing. A fallback client must not turn a
-remote error into an empty successful result.
+    fn capabilities(&self) -> ExactBackendCapabilities;
+}
 
-## Adding an extension
+pub struct ExactBackendCapabilities {
+    pub backend_id: String,
+    pub query_languages: Vec<QueryLanguage>,
+    pub supports_instant: bool,
+    pub supports_range: bool,
+    pub maximum_range: Option<Duration>,
+}
+```
 
-An extension is complete when it demonstrates:
+`QueryRequest` and `QueryResponse` are defined in
+[Query routing and readout](query-routing-and-readout.md). They preserve tenant,
+query language/expression, logical evaluation range, requested accuracy,
+result labels/timestamps/type, source, guarantee, and coverage.
 
-- request and response semantic round trips;
-- cancellation, timeout, and error propagation;
-- tenant and authentication context preservation;
-- plan-aware routing rather than direct store access;
-- no silent fallback or approximation; and
-- integration coverage with one successful and one failing request.
+Why these interfaces exist: transport/protocol extensions cannot bypass
+BackendPlan routing or directly access summary storage, and fallback backends
+cannot silently reinterpret a request.
 
-Implementation locations and trait signatures are intentionally left to the
-code and API documentation, where they can evolve without changing this design.
+## 3. Adding and verifying functionality
+
+### Add a protocol adapter
+
+1. Implement `ProtocolAdapter` for its request/response types.
+2. Map every supported evaluation-time/range and tenant field.
+3. Preserve Prometheus label/timestamp/result/error semantics where applicable.
+4. Verify decode→canonical→encode round trips for success and error cases.
+
+### Add a protocol server
+
+1. Implement `ProtocolServer` and inject only the public `QueryService`.
+2. Propagate cancellation, timeout, authentication, and request limits.
+3. Never call `SummaryStore` or an exact client directly.
+4. Verify cancelled requests stop downstream work and transport errors map
+   through `encode_error`.
+
+### Add an exact fallback backend
+
+1. Implement `ExactQueryClient` and declare `ExactBackendCapabilities`.
+2. Forward the canonical logical range and tenant unchanged.
+3. Return exact `QueryResponse` or a visible error.
+4. Verify unsupported capability and remote failure do not return an empty
+   successful result.
+
+### Interpret and verify output
+
+- Adapter output is canonical input, not a routing decision.
+- Server success means the response was transported, not that it was
+  summary-backed.
+- Inspect `QueryResponse.source` to distinguish summary and exact fallback.
+- End-to-end tests must include one supported request, one explicit fallback,
+  one malformed request, and one backend failure.

@@ -1,84 +1,158 @@
-# Summary storage and series identity
+# Developing summary storage and series identity
 
-> Implementation status: partial; the store/index and SID resolver exist, while
-> plan/materialization lifecycle convergence remains target work.
+> Interface status: target public API. Store/index and SID resolution exist;
+> plan/materialization lifecycle convergence is partial.
 
-## Purpose
-
-The store maintains plan-compatible summary materializations by canonical
-series/group and logical window. The SID registry provides stable metric-series
-identity; it does not replace plan or materialization identity.
-
-Design sources:
-
-- [Summary storage](../../../docs/design_docs/summary-storage.md)
-- [Series identity](../../../docs/design_docs/series-identity.md)
-
-## Current code map
-
-| Responsibility | Current entry point |
-| --- | --- |
-| Store/index and metadata | [`sketch_db/index/mod.rs`](../../src/storage_engines/sketch_db/index/mod.rs) |
-| Epoch data layout | [`sketch_db/index/epoch_columnar.rs`](../../src/storage_engines/sketch_db/index/epoch_columnar.rs) |
-| Summary payload/config types | [`sketch_db/data/mod.rs`](../../src/storage_engines/sketch_db/data/mod.rs) |
-| Window/timeline query | [`sketch_db/query/`](../../src/storage_engines/sketch_db/query/) |
-| Lifecycle/reconciliation | [`sketch_db/lifecycle/`](../../src/storage_engines/sketch_db/lifecycle/) |
-| SID resolution | [`drivers/ingest/series_resolver.rs`](../../src/drivers/ingest/series_resolver.rs) |
-| Persistence (future/non-MVP scope) | [`sketch_db/persistence/`](../../src/storage_engines/sketch_db/persistence/) |
-
-## Identity hierarchy
+## 1. Code architecture
 
 ```text
-plan_id / plan_version
-  materialization_id
-    tenant + canonical series SID or reduction group
-      logical window
-        compatible summary state/checkpoint
+CanonicalSeriesKey -> SeriesRegistry -> SeriesId
+                                         |
+ValidatedMaterialization ----------------+
+             |
+             v
+         SummaryStore
+       write / coverage / read / retire
 ```
 
-`sid` identifies a raw metric series. Materialization identity adds source
-binding, summary family/parameters, reduction/grouping, and window semantics.
-Plan identity versions deployment. Never use one identity as a substitute for
-another.
+The series registry owns only canonical metric-series identity. The summary
+store owns materialization/group/window state. Plan, materialization, and SID
+identities remain distinct.
 
-## Store operations
+## 2. Public interfaces and definitions
 
-The component boundary should expose semantic operations rather than internal
-maps:
+```rust
+pub trait SeriesRegistry: Send + Sync {
+    type Error;
 
-- register/stage a materialization contract;
-- append or replace compatible full state;
-- apply compatible delta state;
-- resolve exact window coverage for a readout;
-- mark state active, draining, expired, gapped, or rejected; and
-- retire state only after readers/lateness/rollback no longer require it.
+    fn resolve(&self, key: CanonicalSeriesKey)
+        -> Result<ResolvedSeries, Self::Error>;
 
-Lookup returns complete state or a typed unavailability reason. It never
-silently skips a missing group/window.
+    fn lookup(&self, sid: u64, namespace_version: &str)
+        -> Result<Option<ResolvedSeries>, Self::Error>;
+}
+```
 
-## Concurrency and lifecycle
+`CanonicalSeriesKey` and `ResolvedSeries` are defined by the ingestion public
+interface. `resolve` is idempotent. A sender-provided SID never overrides a
+conflicting canonical key.
 
-- Registration and state append validate against one plan snapshot.
-- Readers get stable metadata/state for the operation duration.
-- Plan transition may keep old/new versions concurrently but never merges them.
-- Eviction cannot remove required active state without first changing
-  readiness/routing.
-- Persistence recovery must restore identity/compatibility before making parts
-  queryable.
+```rust
+pub struct MaterializationKey {
+    pub plan_id: String,
+    pub plan_version: u64,
+    pub materialization_id: String,
+    pub tenant: String,
+    pub group: MaterializationGroup,
+    pub window: LogicalWindow,
+}
 
-## Adding a stored family
+pub enum MaterializationState {
+    Staged,
+    Queryable,
+    Gapped,
+    Draining,
+    Expired,
+    Rejected,
+}
+```
 
-Follow [Adding a summary family](../../../docs/developer_docs/adding-summary-family.md).
-Store work includes canonical parameter identity, payload validation, supported
-merge/readout, accuracy metadata, full/delta encoding identity, and lifecycle
-tests. A byte decoder alone is not store support.
+```rust
+pub trait SummaryStore: Send + Sync {
+    type Error;
 
-## Required tests
+    fn register(&self, contract: ValidatedMaterialization)
+        -> Result<MaterializationState, Self::Error>;
 
-- canonical labels yield stable SID independent of order;
-- distinct tenants/label sets never collide;
-- same SID across different materializations remains isolated;
-- incompatible parameters/windows/versions never merge;
-- exact coverage and missing-window failure;
-- concurrent append/read/retire safety; and
-- recovery never exposes state before compatible metadata.
+    fn apply(&self, update: ValidatedSummary)
+        -> Result<StoreWriteResult, Self::Error>;
+
+    fn coverage(&self, request: CoverageRequest)
+        -> Result<CoverageResult, Self::Error>;
+
+    fn read(&self, request: SummaryReadRequest)
+        -> Result<SummaryReadResult, Self::Error>;
+
+    fn retire(&self, materialization_id: &str, policy: RetirementPolicy)
+        -> Result<MaterializationState, Self::Error>;
+}
+
+pub struct CoverageRequest {
+    pub plan: BackendPlanSnapshot,
+    pub materialization_ids: Vec<String>,
+    pub range: EvaluationRange,
+}
+
+pub struct SummaryReadRequest {
+    pub coverage: LogicalCoverage,
+    pub route: SummaryRoute,
+}
+
+pub struct SummaryReadResult {
+    pub states: Vec<SummaryState>,
+    pub coverage: LogicalCoverage,
+}
+
+pub struct RetirementPolicy {
+    pub drain_until: Timestamp,
+    pub retain_for_rollback_until: Option<Timestamp>,
+}
+```
+
+```rust
+pub struct StoreWriteResult {
+    pub key: MaterializationKey,
+    pub state: MaterializationState,
+    pub disposition: IngestDisposition,
+}
+
+pub enum CoverageResult {
+    Complete(LogicalCoverage),
+    Missing(Vec<LogicalWindow>),
+    Stale { newest_source_timestamp: Timestamp },
+    Gapped { producer: String, expected_sequence: u64 },
+    Incompatible { reason: String },
+}
+```
+
+Supporting types `ValidatedMaterialization`, `ValidatedSummary`, and
+`IngestDisposition` are defined by
+[OTLP summary ingestion](otlp-summary-ingestion.md). `EvaluationRange`,
+`SummaryRoute`, and `LogicalCoverage` are defined by
+[Query routing and readout](query-routing-and-readout.md).
+
+Why these interfaces exist: callers receive typed completeness/failure rather
+than interpreting an empty collection as “no data,” and storage cannot accept
+unvalidated summary bytes.
+
+## 3. Adding and verifying functionality
+
+### Add a summary family to storage
+
+1. Extend public materialization capability/contract types.
+2. Define canonical parameters and representation compatibility.
+3. Accept only `ValidatedSummary` through `SummaryStore::apply`.
+4. Implement merge/read behavior through public result types.
+5. Verify incompatible family/parameters/windows never merge.
+
+### Add a storage backend
+
+Implement `SummaryStore` with identical semantic outputs. Persistence or remote
+transport must not change coverage, lifecycle, identity, or error behavior.
+Verify restart restores metadata before returning `Complete` or `Queryable`.
+
+### Add SID persistence/distribution
+
+Implement `SeriesRegistry` while preserving deterministic canonical keys,
+tenant isolation, idempotent resolve, namespace versioning, and conflict
+detection. Verify cache loss/restart cannot bind an old SID to new labels.
+
+### Interpret and verify output
+
+- `Queryable` means the registered state may be considered for coverage; it is
+  not proof that every requested window is complete.
+- Only `CoverageResult::Complete` may proceed to summary readout.
+- `Missing`, `Stale`, `Gapped`, and `Incompatible` must remain distinguishable.
+- `StoreWriteResult` identifies exactly which plan/materialization/window was
+  changed.
+- Concurrent plan versions remain isolated through `MaterializationKey`.

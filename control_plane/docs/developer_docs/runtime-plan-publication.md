@@ -1,115 +1,180 @@
-# Runtime plan publication
+# Developing runtime plan publication
 
-> Implementation status: target contract; transport exists, but semantic
-> CollectorPlan application/reporting is not complete.
+> Interface status: target public API. OpAMP transport exists today; semantic
+> CollectorPlan application/reporting is still incomplete.
 
-## Purpose
+## 1. Code architecture
 
-Plan publication stages and activates the matching CollectorPlan and BackendPlan
-created by the physical compiler. Transport success is not semantic activation.
+Publication begins only after physical compilation returns a complete bundle:
 
-Design sources:
+```text
+CompiledPlanBundle
+      |
+      v
+PlanPublisher
+  |             |
+  v             v
+CollectorClient BackendPlanClient
+  |             |
+  v             v
+CollectorReport BackendPlanReport
+       \         /
+        v       v
+      ActivationResult
+```
 
-- [Physical planning](../physical-planning.md)
-- [BackendPlan](../backend-plan.md)
-- [ASAPCollector plan interface](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/opamp-config-push.md)
-
-## Current code map
-
-| Responsibility | Current entry point |
-| --- | --- |
-| Runtime-specific emission | [`emit/mod.rs`](../../src/emit/mod.rs) |
-| Collector/gateway/backend payloads | [`emit/stage_config.rs`](../../src/emit/stage_config.rs) |
-| Backend publication | [`emit/backend_push.rs`](../../src/emit/backend_push.rs) |
-| OpAMP collector delivery/status | [`opamp/mod.rs`](../../src/opamp/mod.rs) |
-| BackendPlan schema | [`backend_plan/mod.rs`](../../src/backend_plan/mod.rs) |
-| BackendPlan protobuf | [`proto/backend_plan.proto`](../../proto/backend_plan.proto) |
-
-## Publication sequence
-
-1. Validate both runtime plans against the capability snapshots used to compile
-   them.
-2. Stage BackendPlan without routing production queries to it.
-3. Deliver CollectorPlan through OpAMP to every required collector.
-4. Require backend installation evidence and collector semantic-application
-   evidence for the same plan/version.
-5. Activate query routing at the declared activation boundary.
-6. Drain and retire the previous version after readers and lateness expire.
-
-Any partial failure leaves the previous unexpired plan authoritative.
-
-## Collector transport contract
-
-Do not duplicate the CollectorPlan schema here. The authoritative field and
-validation definitions are in ASAPCollector's
+`CollectorClient` is the ASAPQuery-side counterpart of ASAPCollector's
+authoritative
 [`opamp-config-push.md`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/opamp-config-push.md).
+This repository does not redefine CollectorPlan fields.
 
-The backend publisher must preserve these corresponding requirements:
+## 2. Public interfaces and definitions
 
-- transport is OpAMP `AgentRemoteConfig`/`AgentConfigMap`;
-- the exact entry name is `asap-collector-plan.yaml`;
-- the body is the versioned YAML `CollectorPlan`, with
-  `content_type: application/yaml`;
-- OpAMP `config_hash` identifies delivered bytes and is distinct from the
-  cross-runtime `metadata.plan_id`;
-- CollectorPlan and BackendPlan share `plan_id`, `plan_version`,
-  `backend_compat`, and materialization identities; and
-- an OpAMP `RemoteConfigStatus.APPLIED` response does not prove semantic
-  activation.
+### Runtime clients
 
-The expected semantic application report uses the collector capability
-`io.asap.collector.plan.v1`, message type `application_report`, and reports the
-active plan/version, remote-config hash, backend compatibility, active
-materializations, effective capability hash, timestamps, and structured
-errors. Treat unknown or missing fields according to the versioned collector
-contract rather than guessing defaults.
+```rust
+pub trait CollectorPlanClient {
+    type Error;
 
-## Evidence contract
+    async fn stage(
+        &self,
+        target: CollectorTarget,
+        plan: CollectorPlan,
+    ) -> Result<CollectorApplicationReport, Self::Error>;
+}
 
-The publisher distinguishes:
+pub trait BackendPlanClient {
+    type Error;
 
-- transport acknowledgement: bytes reached an endpoint;
-- validation acknowledgement: payload schema/capabilities were accepted;
-- semantic application: the runtime reports the expected active plan and
-  materialization identities; and
-- data evidence: emitted/ingested state carries those identities.
+    async fn stage(
+        &self,
+        target: BackendTarget,
+        plan: BackendPlan,
+    ) -> Result<BackendApplicationReport, Self::Error>;
+}
+```
 
-Only semantic application plus compatible data evidence can make a plan
-queryable.
+Collector transport requirements come directly from the corresponding
+ASAPCollector interface:
 
-## Current implementation gap
+- OpAMP `AgentRemoteConfig`/`AgentConfigMap`;
+- exact entry name `asap-collector-plan.yaml`;
+- YAML CollectorPlan with `content_type: application/yaml`;
+- OpAMP `config_hash` identifies bytes, not cross-runtime plan semantics; and
+- `RemoteConfigStatus.APPLIED` is delivery/application evidence, not semantic
+  activation evidence.
 
-The corresponding ASAPCollector document records that current OpAMP handling
-still applies a complete OTel Collector YAML, identifies it primarily by
-`config_hash`, and reports `APPLIED` after syntactic validation/file write. It
-does not yet provide the target CollectorPlan parser, atomic in-process apply,
-or semantic application report.
+### Application reports
 
-Backend code and tests must represent this honestly. Until both sides implement
-the target contract, `APPLIED` is delivery evidence only and cannot satisfy the
-MVP plan-application gate.
+```rust
+pub enum ApplicationStatus {
+    Rejected,
+    Staged,
+    Active,
+    Expired,
+    Failed,
+}
 
-## Versioning and retry
+pub struct ApplicationError {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+}
 
-- Re-sending identical `(plan_id, plan_version)` content is idempotent.
-- Reusing that pair for different content is an error.
-- Older or expired versions cannot replace a newer active version.
-- Retry preserves activation and expiry timestamps.
-- Rollback selects an explicitly retained compatible version; it does not edit
-  an active plan in place.
+pub struct CollectorApplicationReport {
+    pub plan_id: String,
+    pub plan_version: u64,
+    pub backend_compat: String,
+    pub remote_config_hash: Vec<u8>,
+    pub status: ApplicationStatus,
+    pub active_materialization_ids: Vec<String>,
+    pub effective_capability_hash: String,
+    pub observed_at: Timestamp,
+    pub activated_at: Option<Timestamp>,
+    pub errors: Vec<ApplicationError>,
+}
 
-## Failure handling
+pub struct BackendApplicationReport {
+    pub plan_id: String,
+    pub plan_version: u64,
+    pub backend_compat: String,
+    pub status: ApplicationStatus,
+    pub active_materialization_ids: Vec<String>,
+    pub observed_at: Timestamp,
+    pub activated_at: Option<Timestamp>,
+    pub errors: Vec<ApplicationError>,
+}
+```
 
-Surface collector rejection, backend rejection, timeout, partial rollout, stale
-status, and identity mismatch separately. Do not report a successful plan push
-when only one runtime side applied it.
+The collector report corresponds to capability
+`io.asap.collector.plan.v1`, message type `application_report`. Unknown report
+versions or missing required fields are errors.
 
-## Required tests
+Why reports are separate from transport acknowledgement: the MVP must prove the
+runtime applied the intended semantic plan, not merely that bytes arrived.
 
-- idempotent repeated delivery;
-- stale version rejection;
-- collector-only and backend-only application remain inactive;
-- activation succeeds only for matching identities;
-- failed rollout retains the old route;
-- rollback restores a complete prior pair; and
-- status artifacts contain enough evidence for the MVP harness.
+### Publisher
+
+```rust
+pub trait PlanPublisher {
+    type Error;
+
+    async fn publish(
+        &self,
+        bundle: CompiledPlanBundle,
+    ) -> Result<ActivationResult, Self::Error>;
+
+    async fn rollback(
+        &self,
+        plan_id: &str,
+        plan_version: u64,
+    ) -> Result<ActivationResult, Self::Error>;
+}
+
+pub struct ActivationResult {
+    pub plan_id: String,
+    pub plan_version: u64,
+    pub status: ApplicationStatus,
+    pub collector_reports: Vec<CollectorApplicationReport>,
+    pub backend_report: BackendApplicationReport,
+}
+```
+
+`publish` returns `Active` only when every required runtime reports the same
+plan/version/compatibility and expected materializations. Partial staging is an
+error result and keeps the prior valid plan authoritative.
+
+## 3. Adding and verifying functionality
+
+### Add another collector transport
+
+1. Implement `CollectorPlanClient`; keep CollectorPlan unchanged.
+2. Preserve plan identity separately from transport byte identity.
+3. Map transport errors to structured client errors.
+4. Verify identical re-delivery is idempotent and conflicting bytes for the same
+   plan/version are rejected.
+
+Interpretation: a successful `stage` report is not global activation; only
+`PlanPublisher::publish` can return an active bundle.
+
+### Add an application status or report field
+
+1. Version the public report schema/capability.
+2. Define required/optional behavior and compatibility.
+3. Update collector and backend clients together.
+4. Verify older readers reject unknown required semantics rather than defaulting.
+
+### Add rollback policy
+
+1. Select only a retained complete bundle through `rollback`.
+2. Stage both runtime sides like a normal publication.
+3. Verify the result reports the restored version and all materializations.
+4. Verify failed rollback leaves the current active bundle unchanged.
+
+### Required output checks
+
+- reports match bundle identity and expected materialization sets;
+- stale/expired/conflicting versions fail;
+- collector-only or backend-only success never returns `Active`;
+- report artifacts are machine-readable by the MVP harness; and
+- post-activation emitted state carries the activated identities.

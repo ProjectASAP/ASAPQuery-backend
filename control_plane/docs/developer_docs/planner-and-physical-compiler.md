@@ -1,110 +1,190 @@
-# Planner adapter and physical compiler
+# Developing the Planner adapter and physical compiler
 
-> Implementation status: target integration; current modules are migration
-> substrate and do not replace ASAPPlanner ownership.
+> Interface status: target public API. Existing migration modules must converge
+> on this boundary.
 
-## Purpose
+## 1. Code architecture
 
-This component consumes one ASAPPlanner-selected workload plan and compiles it
-into matching collector and backend runtime plans. It must preserve Planner's
-logical semantics while adding only ASAPQuery-backend-owned deployment choices.
-
-Design sources:
-
-- [ASAPPlanner integration](../asapplanner-integration.md)
-- [Physical planning](../physical-planning.md)
-
-## Component boundary
+The control plane has three public layers:
 
 ```text
-workload + schema + logical constraints
-                  |
-                  v
-          ASAPPlanner adapter
-                  |
-        selected workload DAG
-                  |
-                  v
-          physical compiler
-             /          \
-            v            v
-     CollectorPlan    BackendPlan
+PlanningRequest
+      |
+      v
+PlannerAdapter ----------> SelectedLogicalPlan
+                                  |
+                                  v
+PhysicalCompiler -------> CompiledPlanBundle
+                            |             |
+                            v             v
+                       CollectorPlan   BackendPlan
 ```
 
-The adapter must use the pinned ASAPPlanner API directly. It must not recreate
-Planner IR, query-to-summary rules, accuracy algebra, or candidate ranking in
-backend-local types.
+- **Planner adapter** owns the typed call to ASAPPlanner. It supplies the whole
+  workload and receives one selected logical plan without copying Planner IR.
+- **Physical compiler** adds backend-owned placement, windows, transport, and
+  runtime capabilities without changing logical semantics.
+- **Plan bundle** is the only output passed to publication. CollectorPlan and
+  BackendPlan are created together and share identities.
 
-## Current code map
+Logical query parsing, summary alternatives, guarantees, and candidate search
+remain public ASAPPlanner interfaces. Runtime publication is documented in
+[Runtime plan publication](runtime-plan-publication.md).
 
-| Responsibility | Current entry point |
+## 2. Public interfaces and definitions
+
+### Planner adapter
+
+```rust
+pub trait PlannerAdapter {
+    type Error;
+
+    fn select(
+        &self,
+        request: PlanningRequest,
+    ) -> Result<SelectedLogicalPlan, Self::Error>;
+}
+```
+
+`PlanningRequest` is backend-owned request context around Planner's canonical
+workload value:
+
+```rust
+pub struct PlanningRequest {
+    pub workload: asap_planner::Workload,
+    pub schema: asap_planner::SchemaCatalog,
+    pub constraints: asap_planner::PlanningConstraints,
+    pub cost_inputs: asap_planner::CostInputs,
+    pub planner_revision: String,
+}
+```
+
+Input definitions:
+
+| Field | Definition |
 | --- | --- |
-| Workload pipeline coordination | [`pipeline.rs`](../../src/pipeline.rs) |
-| Planner-facing workload/types during migration | [`workload.rs`](../../src/workload.rs), [`types_v2.rs`](../../src/types_v2.rs) |
-| Physical allocation | [`physical/allocator.rs`](../../src/physical/allocator.rs) |
-| Stage allocation and topology | [`physical/colored_dag/`](../../src/physical/colored_dag/) |
-| Window realization | [`physical/window_fusion.rs`](../../src/physical/window_fusion.rs) |
-| Runtime stage model and emitter | [`physical/colored_dag/emitter.rs`](../../src/physical/colored_dag/emitter.rs) |
-| BackendPlan compilation | [`backend_plan/from_stage_config.rs`](../../src/backend_plan/from_stage_config.rs) |
+| `workload` | Complete workload; shared queries must not be split into independent calls. |
+| `schema` | Source/label/type information required to bind queries. |
+| `constraints` | Accuracy and logical requirements supplied by the caller. |
+| `cost_inputs` | Measured/declared logical cost inputs; unknown values stay unknown. |
+| `planner_revision` | Immutable Planner build/revision used for reproducibility. |
 
-The legacy `intent_algebra`, `sketch_algebra`, and optimizer modules are
-migration inputs, not a second canonical Planner implementation. New logical
-semantics belong in ASAPPlanner.
+`SelectedLogicalPlan` wraps Planner's public selected post-ASAP workload plan
+and correlation metadata; it does not define another DAG:
 
-## Inputs
+```rust
+pub struct SelectedLogicalPlan {
+    pub workload_plan: asap_planner::SelectedWorkloadPlan,
+    pub planner_revision: String,
+    pub query_ids: Vec<String>,
+}
+```
 
-The compile operation requires:
+Why this interface exists: it prevents adapters, protocols, and physical
+planning from each implementing their own query-to-summary mapping.
 
-- the complete selected Planner workload DAG, with shared nodes intact;
-- the immutable Planner revision;
-- collector and backend capability snapshots;
-- deployment topology and tenant boundaries;
-- physical window, freshness, retention, and transmission policy; and
-- runtime statistics and resource constraints used for physical placement.
+### Physical compiler
 
-Missing capabilities or statistics stay unknown. Do not replace unknown values
-with zero cost, exact accuracy, or universal support.
+```rust
+pub trait PhysicalCompiler {
+    type Error;
 
-## Outputs
+    fn compile(
+        &self,
+        selected: SelectedLogicalPlan,
+        environment: DeploymentEnvironment,
+        policy: RuntimePolicy,
+    ) -> Result<CompiledPlanBundle, Self::Error>;
+}
+```
 
-One compile produces one shared plan envelope plus:
+```rust
+pub struct DeploymentEnvironment {
+    pub topology: DeploymentTopology,
+    pub collectors: Vec<CollectorTarget>,
+    pub backend: BackendTarget,
+    pub capability_snapshot_id: String,
+}
 
-- one CollectorPlan for each targeted collector; and
-- one BackendPlan for the data plane.
+pub struct RuntimePolicy {
+    pub activation: Timestamp,
+    pub expiry: Option<Timestamp>,
+    pub freshness: FreshnessPolicy,
+    pub retention: RetentionPolicy,
+    pub transmission: TransmissionPolicy,
+}
 
-Both sides must agree on materialization identity, family, parameters,
-grouping, windows, representation, and transmission semantics. Generate them
-from one in-memory compiled decision, never with independent reinterpretation.
+pub struct CompiledPlanBundle {
+    pub envelope: PlanEnvelope,
+    pub collector_plans: Vec<CollectorPlan>,
+    pub backend_plan: BackendPlan,
+}
+```
 
-## Implementation invariants
+Supporting public types:
 
-- Preserve workload-wide sharing; do not flatten to independent metric rows.
-- Treat Planner result guarantees and exact fallback as authoritative.
-- Reject an operation if its assigned executor lacks any required capability.
-- Keep logical range semantics separate from physical pane size.
-- Keep aggregation placement separate from logical grouping.
-- Permit delta only when both endpoints share sequencing/checkpoint semantics.
-- Make plan/materialization identity deterministic from semantic content.
+| Type | Definition |
+| --- | --- |
+| `DeploymentTopology` | Runtime stages, network relationships, and isolation boundaries available for placement. |
+| `CollectorTarget` | Collector identity, edge assignment, endpoint reference, and advertised capability snapshot. |
+| `BackendTarget` | Data-plane identity, endpoint reference, storage routes, and advertised capabilities. |
+| `FreshnessPolicy` | Maximum readiness lag, watermark, and allowed-lateness requirements. |
+| `RetentionPolicy` | Duration and lifecycle rules for active/draining materializations. |
+| `TransmissionPolicy` | Allowed raw/full/delta modes, cadence, encoding, and checkpoint limits. |
+| `PlanEnvelope` | Shared `plan_id`, `plan_version`, activation/expiry, backend compatibility, and Planner revision. |
+| `CollectorPlan` | Versioned public YAML execution contract owned by ASAPCollector. |
+| `BackendPlan` | Versioned public data-plane materialization/routing contract defined in this repository. |
 
-## Adding a physical decision
+Output definitions:
 
-When adding placement, window, representation, or transport behavior:
+| Output | Definition |
+| --- | --- |
+| `envelope` | Shared plan/version/activation/compatibility identity. |
+| `collector_plans` | One plan per targeted collector, following ASAPCollector's public CollectorPlan schema. |
+| `backend_plan` | Matching data-plane materialization and routing contract. |
 
-1. Confirm it does not change the selected logical result.
-2. Add the capability input needed to make the decision safely.
-3. Include every semantic effect in materialization or compatibility identity.
-4. Emit the choice to both runtime plans where applicable.
-5. Add a mismatch test showing incompatible plans fail before activation.
+The compiler error must identify an unsupported capability, invalid placement,
+window incompatibility, identity conflict, or invalid selected guarantee. It
+must not silently substitute another logical summary.
 
-If the change selects a different summary or changes its guarantee, implement
-it in ASAPPlanner instead.
+Why this interface exists: one compile guarantees that producer and consumer
+receive the same family, parameters, grouping, window, and materialization
+identity.
 
-## Required tests
+## 3. Adding and verifying functionality
 
-- shared Planner nodes remain one logical materialization;
-- collector and backend outputs carry identical semantic fields;
-- unsupported capabilities fail closed;
-- incompatible windows or delta semantics are rejected;
-- deterministic input produces deterministic identities; and
-- a three-query PromQL workload covers within-series, across-label, and combined
-  time-plus-label aggregation shapes.
+### Add a deployment topology
+
+1. Add a public `DeploymentTopology` variant and its required target fields.
+2. Teach `PhysicalCompiler::compile` how selected operators can be placed on it.
+3. Reject plans requiring an unavailable stage/capability.
+4. Verify the output contains one complete CollectorPlan for every producer and
+   one BackendPlan referencing all produced materializations.
+
+Interpretation: a successful bundle means both runtime views are complete and
+cross-consistent; it does not mean they have been activated.
+
+### Add a transmission mode
+
+1. Extend public `TransmissionPolicy` and capability declarations.
+2. Define representation, sequencing, checkpoint, and fallback requirements.
+3. Emit the same compatibility identity into producer and consumer plans.
+4. Verify unsupported endpoint combinations return a compile error.
+
+For delta, verify duplicate, missing, reordered, and recovery-checkpoint cases.
+
+### Add a physical window policy
+
+1. Add the public policy variant with anchor, size, slide, and lateness.
+2. Prove it covers the selected logical range without changing semantics.
+3. Include it in materialization identity.
+4. Verify generated collector/backend windows are identical and incompatible
+   query ranges fail compilation.
+
+### Required output checks
+
+- deterministic inputs produce deterministic plan/materialization identities;
+- shared logical producers remain shared materializations;
+- every referenced materialization has a producer and backend declaration;
+- all query IDs remain traceable; and
+- unsupported inputs return structured errors, never partial bundles.

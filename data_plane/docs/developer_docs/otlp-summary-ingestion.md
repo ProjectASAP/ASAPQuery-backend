@@ -1,79 +1,181 @@
-# OTLP summary ingestion
+# Developing OTLP summary ingestion
 
-> Implementation status: partial; OTLP decoding, SID resolution, and summary
-> handling exist, while full BackendPlan-gated validation remains target work.
+> Interface status: target public API. OTLP decoding, SID resolution, and
+> summary handling exist; complete BackendPlan-gated validation is partial.
 
-## Purpose
+## 1. Code architecture
 
-The ingestion component receives OTel metric payloads from ASAPCollector,
-resolves series identity, validates summary state against the active
-BackendPlan, applies full/delta semantics, and appends queryable windows to
-summary storage.
+```text
+OTLP request
+    |
+    v
+SummaryDecoder -> SeriesIdentityResolver -> SummaryValidator
+                                              |
+                                              v
+                                      SummaryStateApplier
+                                              |
+                                              v
+                                         SummaryStore
+```
 
-Design sources:
+Transport decoding is separate from semantic validation. No decoder is allowed
+to append directly to storage or choose a summary family.
 
-- [Plan-aware query execution](../design_docs/query-execution.md)
-- [Summary storage](../../../docs/design_docs/summary-storage.md)
-- [Series identity](../../../docs/design_docs/series-identity.md)
+## 2. Public interfaces and definitions
 
-## Current code map
+```rust
+pub trait SummaryDecoder {
+    type Error;
+    fn decode(&self, request: OtlpMetricsRequest)
+        -> Result<Vec<ReceivedSummary>, Self::Error>;
+}
 
-| Responsibility | Current entry point |
+pub struct ReceivedSummary {
+    pub tenant: String,
+    pub resource: AttributeSet,
+    pub scope: InstrumentationScope,
+    pub metric_name: String,
+    pub attributes: AttributeSet,
+    pub source_timestamp: Timestamp,
+    pub envelope: SummaryEnvelope,
+}
+```
+
+`SummaryEnvelope` contains plan/materialization/producer/window identity,
+family/parameters/encoding, full-or-delta metadata, and payload bytes. Required
+identity cannot be inferred from metric-name suffixes.
+
+```rust
+pub struct SummaryEnvelope {
+    pub plan_id: String,
+    pub plan_version: u64,
+    pub materialization_id: String,
+    pub producer_id: String,
+    pub window: LogicalWindow,
+    pub family: SummaryFamily,
+    pub algorithm: SummaryAlgorithm,
+    pub parameters: SummaryParameters,
+    pub encoding: SummaryEncoding,
+    pub frame: SummaryFrame,
+    pub payload: Bytes,
+}
+
+pub enum SummaryFrame {
+    Full { checkpoint_id: String },
+    Delta {
+        base_checkpoint_id: String,
+        sequence: u64,
+    },
+}
+```
+
+```rust
+pub trait SeriesIdentityResolver {
+    type Error;
+    fn resolve(&self, key: CanonicalSeriesKey)
+        -> Result<ResolvedSeries, Self::Error>;
+}
+
+pub struct CanonicalSeriesKey {
+    pub tenant: String,
+    pub metric_name: String,
+    pub identifying_labels: BTreeMap<String, String>,
+}
+
+pub struct ResolvedSeries {
+    pub sid: u64,
+    pub canonical_key: CanonicalSeriesKey,
+    pub namespace_version: String,
+}
+```
+
+```rust
+pub trait SummaryValidator {
+    type Error;
+    fn validate(
+        &self,
+        received: ReceivedSummary,
+        plan: &BackendPlanSnapshot,
+        series: ResolvedSeries,
+    ) -> Result<ValidatedSummary, Self::Error>;
+}
+
+pub trait SummaryStateApplier {
+    type Error;
+    fn apply(&self, summary: ValidatedSummary)
+        -> Result<IngestResult, Self::Error>;
+}
+
+pub struct ValidatedSummary {
+    pub received: ReceivedSummary,
+    pub series: ResolvedSeries,
+    pub materialization: ValidatedMaterialization,
+}
+
+pub struct ValidatedMaterialization {
+    pub plan_id: String,
+    pub plan_version: u64,
+    pub materialization_id: String,
+    pub compatibility_fingerprint: String,
+}
+
+pub struct IngestResult {
+    pub disposition: IngestDisposition,
+    pub plan_id: String,
+    pub materialization_id: String,
+    pub sid: u64,
+    pub window: LogicalWindow,
+    pub queryable_at: Option<Timestamp>,
+}
+
+pub enum IngestDisposition {
+    AppliedFull,
+    AppliedDelta,
+    Duplicate,
+    Rejected,
+    AwaitingCheckpoint,
+}
+```
+
+Supporting type definitions:
+
+| Type | Definition |
 | --- | --- |
-| OTLP receivers and decoding | [`drivers/ingest/otel.rs`](../../src/drivers/ingest/otel.rs) |
-| Canonical SID resolution | [`drivers/ingest/series_resolver.rs`](../../src/drivers/ingest/series_resolver.rs) |
-| Full/delta evaluation helpers | [`sketch_db/query/delta_apply.rs`](../../src/storage_engines/sketch_db/query/delta_apply.rs) |
-| Summary decoders | [`sketch_db/query/decoders.rs`](../../src/storage_engines/sketch_db/query/decoders.rs) |
-| Store/index | [`sketch_db/index/`](../../src/storage_engines/sketch_db/index/) |
+| `OtlpMetricsRequest` | Decoded public OTLP ExportMetricsServiceRequest. |
+| `AttributeSet` | Canonically typed OTel attributes with no identity-relevant loss. |
+| `InstrumentationScope` | OTel scope name/version/schema identifying the producer library. |
+| `LogicalWindow` | Start/end plus window identity used by plan, state, and query coverage. |
+| `SummaryEncoding` | Versioned state representation shared by collector/backend capabilities. |
 
-## Processing stages
+Why these interfaces exist: each stage can reject invalid data without changing
+queryable state, and `IngestResult` gives the MVP harness unambiguous evidence.
 
-1. Decode OTLP without discarding resource, scope, metric, point labels, or
-   source timestamps needed for identity and freshness.
-2. Resolve tenant and canonical series key to `sid`.
-3. Locate the materialization in the active BackendPlan.
-4. Validate producer, family, parameters, grouping, window, encoding, and
-   schema compatibility.
-5. Apply full or delta sequencing to an isolated candidate state.
-6. Commit the window/state atomically to the store.
-7. Update readiness/freshness evidence and structured ingest telemetry.
+## 3. Adding and verifying functionality
 
-Each batch/item must have an explicit failure policy. A decoding error must not
-silently convert an incompatible summary into a raw metric or another family.
+### Add an OTLP summary encoding
 
-## Full and delta invariants
+1. Extend public `SummaryEnvelope` encoding/version definitions.
+2. Implement `SummaryDecoder` without applying state.
+3. Add compatibility validation against BackendPlan/capabilities.
+4. Implement full/delta application through `SummaryStateApplier`.
+5. Verify corrupt bytes return an error and do not change storage.
 
-- Full state identifies its checkpoint and replaces only the compatible base.
-- Delta identifies plan, materialization, producer, window, sequence, and base.
-- Duplicate delivery is idempotent.
-- A missing/reordered/conflicting delta creates a visible gap.
-- State after a gap remains unqueryable until a compatible full checkpoint.
-- State from different plan versions or materialization contracts never merges.
+### Add a delta-capable family
 
-## SID behavior
+Define base/checkpoint, sequence scope, duplicate handling, gap behavior, and
+recovery full state. Verify `AppliedDelta`, `Duplicate`, and
+`AwaitingCheckpoint` are distinguishable outputs for reorder/gap tests.
 
-Always canonicalize metric name and identifying labels deterministically.
-Sender-provided numeric IDs are shortcuts, not authority. Unknown or conflicting
-IDs must be resolved from canonical identity evidence or rejected.
+### Add series identity behavior
 
-## Freshness evidence
+Add canonical input fields to `CanonicalSeriesKey`, never to the numeric SID
+alone. Verify label-order independence, tenant isolation, cached-ID conflict
+recovery, and stable namespace reporting.
 
-Preserve the source sample/window timestamp separately from receive and commit
-timestamps. The MVP freshness measurement starts at the source timestamp and
-ends at the first queryable committed state; substituting ingestion wall time
-understates lag.
+### Interpret and verify output
 
-## Adding an encoding
-
-An encoding is supported only when its decoder, compatibility identity,
-full/delta behavior, checkpoint recovery, capability advertisement, collector
-parity, and corrupt-input tests land together.
-
-## Required tests
-
-- full payload for every MVP family;
-- delta duplicate, gap, reorder, wrong base, and recovery checkpoint;
-- wrong plan/materialization/family/parameters/window rejection;
-- SID cache hit, unknown ID, and conflicting identity recovery;
-- timestamps retained for freshness; and
-- rejected input never changes queryable state.
+- `Applied*` means compatible state was committed.
+- `Duplicate` means idempotent replay with no second mutation.
+- `AwaitingCheckpoint` means a visible delta gap and non-queryable state.
+- `queryable_at` is populated only when coverage/readiness is satisfied.
+- Freshness uses `source_timestamp -> queryable_at`, not receive time.

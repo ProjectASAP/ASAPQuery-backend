@@ -1,82 +1,127 @@
-# BackendPlan installation and runtime state
+# Developing BackendPlan installation
 
-> Implementation status: partial; atomic plan storage exists, while complete
-> staging, lifecycle, and cross-runtime activation checks remain target work.
+> Interface status: target public API. Atomic snapshot storage exists; complete
+> staging/lifecycle/cross-runtime activation remains partial.
 
-## Purpose
-
-This component validates, stages, and atomically installs the BackendPlan
-produced by the control plane. Query and ingest operations take stable snapshots
-of the active plan; they do not observe a partially written plan.
-
-Design source: [BackendPlan](../../../control_plane/docs/backend-plan.md).
-
-## Current code map
-
-| Responsibility | Current entry point |
-| --- | --- |
-| Shared BackendPlan types/decoder | [`control_plane::backend_plan`](../../../control_plane/src/backend_plan/mod.rs) |
-| Atomic runtime holder | [`HotReloadBackendPlan`](../../src/storage_engines/types/hot_reload_config.rs) |
-| HTTP installation surface | [`drivers/query/servers/http.rs`](../../src/drivers/query/servers/http.rs) |
-| Plan-aware readout | [`l4_readout.rs`](../../src/query_engines/asap_query_engine/l4_readout.rs) |
-
-The current `HotReloadBackendPlan` is an `ArcSwap` holder. Atomic pointer swap
-is necessary but not sufficient: target validation, version ordering, staged
-activation, expiry, and matching collector evidence belong around that holder.
-
-## Installation pipeline
+## 1. Code architecture
 
 ```text
-received BackendPlan
+BackendPlan bytes
       |
-decode and closed-schema validation
-      |
-capability + state-compatibility validation
-      |
-stage materializations/routes
-      |
-match CollectorPlan application evidence
-      |
-atomic activation
+      v
+BackendPlanDecoder -> BackendPlanValidator -> BackendPlanRuntime
+                                                |
+                                      BackendPlanSnapshot
+                                         /             \
+                                      ingest          query
 ```
 
-Validation must complete before replacing the active snapshot. Readers already
-holding the previous snapshot may finish, but a single request must not mix plan
-versions.
+The decoder owns wire decoding, the validator owns semantic/capability checks,
+and the runtime owns staged/active snapshots. Ingest and query components only
+consume immutable snapshots; they do not mutate plans.
 
-## Required validation
+## 2. Public interfaces and definitions
 
-- plan/version/lifecycle ordering;
-- immutable content for repeated `(plan_id, plan_version)`;
-- unique materialization and route identity;
-- known family, algorithm, parameters, grouping, windows, and readout;
-- backend capability support for ingest, merge, representation, and readout;
-- route references resolve to declared materializations or exact fallback;
-- result guarantees meet the route's declared requirement; and
-- collector compatibility/evidence matches before activation.
+```rust
+pub trait BackendPlanDecoder {
+    type Error;
+    fn decode(&self, bytes: &[u8]) -> Result<BackendPlan, Self::Error>;
+}
 
-Reject the whole plan on failure. Do not drop one invalid route and activate the
-rest unless a future schema explicitly defines partial activation semantics.
+pub trait BackendPlanValidator {
+    type Error;
+    fn validate(
+        &self,
+        plan: &BackendPlan,
+        capabilities: &BackendCapabilities,
+    ) -> Result<ValidatedBackendPlan, Self::Error>;
+}
+```
 
-## Reader contract
+`ValidatedBackendPlan` must be constructible only through validation. It proves
+schema/lifecycle ordering, unique identities, resolved routes, supported
+families/parameters/windows/readouts, and compatible result guarantees.
 
-Ingest and query entry points obtain one active-plan snapshot at operation
-start. They pass it through validation/routing rather than consulting global
-state repeatedly. State emitted under another version is not accepted merely
-because its summary bytes decode.
+```rust
+pub struct ValidatedBackendPlan {
+    pub plan: BackendPlan,
+    pub capability_hash: String,
+    pub validated_at: Timestamp,
+}
 
-## Current migration boundary
+pub struct BackendCapabilities {
+    pub capability_hash: String,
+    pub ingest: Vec<IngestCapability>,
+    pub readouts: Vec<ReadoutCapability>,
+    pub storage: Vec<StorageCapability>,
+}
 
-`StreamingConfig`, `BackendStorageRouting`, and BackendPlan currently coexist.
-Treat the first two as legacy runtime inputs being absorbed into BackendPlan.
-New semantic fields should be added to the versioned plan contract rather than
-creating another independently hot-reloaded configuration source.
+pub struct BackendPlanSnapshot {
+    pub plan: Arc<BackendPlan>,
+    pub status: PlanRuntimeStatus,
+    pub installed_at: Timestamp,
+}
 
-## Required tests
+pub enum PlanRuntimeStatus {
+    Staged,
+    Active,
+    Draining,
+    Expired,
+}
+```
 
-- malformed and unknown schema values fail without swapping;
-- older/conflicting versions fail;
-- concurrent readers see one complete version;
-- routes cannot reference missing materializations;
-- plan activation waits for matching collector evidence; and
-- rollback restores a complete retained snapshot.
+Capability entry definitions:
+
+| Type | Definition |
+| --- | --- |
+| `IngestCapability` | Supported family, algorithm, parameters, encoding version, and full/delta semantics. |
+| `ReadoutCapability` | Supported Planner readout/operator and guarantee kinds. |
+| `StorageCapability` | Supported materialization representation, merge, window, retention, and durability behavior. |
+
+```rust
+pub trait BackendPlanRuntime: Send + Sync {
+    type Error;
+
+    fn stage(&self, plan: ValidatedBackendPlan)
+        -> Result<BackendApplicationReport, Self::Error>;
+
+    fn activate(&self, plan_id: &str, plan_version: u64)
+        -> Result<BackendApplicationReport, Self::Error>;
+
+    fn snapshot(&self) -> BackendPlanSnapshot;
+
+    fn retire(&self, plan_id: &str, plan_version: u64)
+        -> Result<BackendApplicationReport, Self::Error>;
+}
+```
+
+Why these interfaces exist: decoding, validation, and activation have different
+failure semantics. A decoded plan must never become queryable before validation
+and matching collector evidence.
+
+## 3. Adding and verifying functionality
+
+### Add a BackendPlan field
+
+1. Add it to the public versioned wire/domain structure.
+2. Define requiredness, identity impact, and compatibility behavior.
+3. Validate it in `BackendPlanValidator`.
+4. Expose it through immutable `BackendPlanSnapshot` to its consumer.
+5. Verify missing/unknown/incompatible values fail before `stage`.
+
+### Add a runtime lifecycle state
+
+1. Extend `PlanRuntimeStatus` with allowed transitions.
+2. Define whether ingest/query may use the state.
+3. Return the effective state through `BackendApplicationReport`.
+4. Verify invalid transitions do not change `snapshot()`.
+
+### Interpret and verify output
+
+- A `ValidatedBackendPlan` means the plan is deployable by this backend, not
+  active.
+- A `Staged` report means resources/routes are prepared, not queryable.
+- An `Active` report must match the requested plan/version and materializations.
+- One request must observe one `BackendPlanSnapshot`, including during swap.
+- Re-delivery of identical content is idempotent; conflicting content for the
+  same identity fails.
