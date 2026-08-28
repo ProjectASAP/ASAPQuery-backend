@@ -5,6 +5,9 @@
 > MVP relation: provides stable identity for ingestion, grouping, and result
 > labels across collector and backend boundaries.
 
+Developer guide:
+[Summary storage and series identity](../../data_plane/docs/developer_docs/summary-storage-and-series-identity.md).
+
 ## TL;DR
 
 A series ID (`sid`) names one canonical metric series within a tenant and

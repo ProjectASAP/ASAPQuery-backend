@@ -18,6 +18,12 @@
 
 - [Adding a summary family](developer_docs/adding-summary-family.md)
 - [Data-plane extension boundaries](../data_plane/docs/developer_docs/extension-points.md)
+- [Planner adapter and physical compiler](../control_plane/docs/developer_docs/planner-and-physical-compiler.md)
+- [Runtime plan publication](../control_plane/docs/developer_docs/runtime-plan-publication.md)
+- [BackendPlan runtime](../data_plane/docs/developer_docs/backend-plan-runtime.md)
+- [OTLP summary ingestion](../data_plane/docs/developer_docs/otlp-summary-ingestion.md)
+- [Query routing and readout](../data_plane/docs/developer_docs/query-routing-and-readout.md)
+- [Summary storage and series identity](../data_plane/docs/developer_docs/summary-storage-and-series-identity.md)
 - [Querying ASAP](../data_plane/docs/user_guide/querying-asap.md)
 
 ## Documentation ownership

@@ -9,6 +9,10 @@
 > selected post-ASAP workload DAG and the two runtime executors:
 > ASAPCollector and the ASAPQuery data plane.
 
+Developer guides:
+[Planner adapter and physical compiler](developer_docs/planner-and-physical-compiler.md)
+and [runtime plan publication](developer_docs/runtime-plan-publication.md).
+
 ## TL;DR
 
 ASAPPlanner selects a logical plan. That plan says which summaries and exact

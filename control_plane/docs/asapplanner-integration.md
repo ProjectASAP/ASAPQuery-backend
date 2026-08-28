@@ -4,6 +4,8 @@
 >
 > MVP relation: required for query planning and control-plane decisions.
 
+Developer guide: [Planner adapter and physical compiler](developer_docs/planner-and-physical-compiler.md).
+
 ## TL;DR
 
 ASAPPlanner chooses a logical plan for a query workload. ASAPQuery-backend

@@ -18,6 +18,14 @@ or re-plan queries.
 
 - [Extension boundaries](developer_docs/extension-points.md) — responsibilities
   of protocol servers, adapters, and fallback clients.
+- [BackendPlan runtime](developer_docs/backend-plan-runtime.md) — validation,
+  staging, atomic installation, and snapshots.
+- [OTLP summary ingestion](developer_docs/otlp-summary-ingestion.md) — decoding,
+  plan validation, SID resolution, and full/delta handling.
+- [Query routing and readout](developer_docs/query-routing-and-readout.md) —
+  readiness, summary execution, and exact fallback.
+- [Summary storage and series identity](developer_docs/summary-storage-and-series-identity.md)
+  — store boundaries, identity hierarchy, lifecycle, and concurrency.
 - [Adding a summary family](../../docs/developer_docs/adding-summary-family.md) —
   cross-repository prerequisites and backend validation.
 
