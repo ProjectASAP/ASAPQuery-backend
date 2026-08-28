@@ -1,22 +1,37 @@
-# ASAP Developer Documentation
+# ASAPQuery-backend documentation
 
 ## Getting started
 
-- [Overview & Key Concepts](01-getting-started/overview.md) — what ASAP is
-- [Architecture](01-getting-started/architecture.md) — system design & data flows
-- [Local Setup](01-getting-started/local-setup.md) — set up a dev environment
+- [Overview](01-getting-started/overview.md)
+- [System architecture](01-getting-started/architecture.md)
+- [Local setup](01-getting-started/local-setup.md)
 
-## How-to guides
+## Component design
 
-- [Bootstrap Config from Query Log](03-how-to-guides/operations/bootstrap-config-from-query-log.md) — auto-generate sketch configs from Prometheus query traffic
+- [Control plane](../control_plane/docs/README.md)
+- [Data plane](../data_plane/docs/README.md)
+- [Summary storage](design_docs/summary-storage.md)
+- [Series identity](design_docs/series-identity.md)
+- [Future storage and compression](design_docs/future-storage-and-compression.md)
 
-## Design docs
+## Developer guides
 
-In-depth design notes live as flat `design-*.md` files in this directory. Starting points:
+- [Adding a summary family](developer_docs/adding-summary-family.md)
+- [Data-plane extension boundaries](../data_plane/docs/developer_docs/extension-points.md)
+- [Querying ASAP](../data_plane/docs/user_guide/querying-asap.md)
 
-- [Controller-into-backend refactor](design-controller-into-backend.md) — the two-plane (data/control) architecture
-- [Sketch DB core](design-sketch-db-core.md) — the warm-tier `SketchStore`
-- [Adding a new sketch](adding-a-new-sketch.md) — end-to-end recipe
-- [Correctness proofs](proofs.md) — accuracy/lifecycle invariants
+## Documentation ownership
 
-See the remaining `design-*.md` files here for sketch-DB persistence, lifecycle, the SID model, and SQL/PromQL planning.
+This repository documents ASAPQuery-backend-specific physical planning,
+runtime query execution, and storage contracts.
+
+- Logical query planning and query-to-summary mapping belong to
+  [ASAPPlanner](https://github.com/ProjectASAP/ASAPPlanner).
+- Collector processing and CollectorPlan application belong to
+  [ASAPCollector](https://github.com/ProjectASAP/ASAPCollector).
+- Summary algorithm implementation and mathematical guarantees belong to the
+  corresponding summary library.
+
+Design documents link to those owners instead of maintaining parallel copies.
+Benchmark outputs, migration histories, file-by-file implementation plans, and
+future roadmaps are not active design specifications.

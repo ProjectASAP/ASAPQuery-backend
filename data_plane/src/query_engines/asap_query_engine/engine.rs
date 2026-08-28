@@ -282,7 +282,7 @@ impl ASAPQueryEngine {
         query_kwargs: &HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         // Phase 1b of the sketch DB design
-        // (docs/design-sketch-db.md §5.1 / §16 Phase 1):
+        // (docs/design_docs/summary-storage.md):
         // for single-subpopulation queries on additive statistics
         // (Count / Sum / Min / Max), serve from the typed aux
         // columns without deserialising the sketch payload.

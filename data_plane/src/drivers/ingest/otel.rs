@@ -1862,7 +1862,7 @@ fn derive_sketch_policy_fp(
 /// query (`quantile_over_time`, `count`/HLL, `topk`) capability-misses
 /// and the user sees `data_source: asap_query, "No result"`.
 ///
-/// Per `docs/design-controller-into-backend.md` §1 the sketch *family*
+/// Per `docs/design_docs/series-identity.md`, the summary *family*
 /// is a wire-level attribute (carried here in `agg_kind` /
 /// [`SketchKindHandle`]), NOT a name suffix; storage + query must be
 /// keyed on the raw SDK metric name. This helper applies that
@@ -2758,7 +2758,7 @@ mod canonical_metric_name_tests {
 
     #[test]
     fn leaves_bare_name_untouched_idempotent() {
-        // Once agents stop suffixing (design-controller-into-backend
+        // Once agents stop suffixing (series-identity
         // Phase 1), the strip must be a no-op.
         assert_eq!(
             canonical_sketch_metric_name("request_size_bytes", SketchKind::Kll),

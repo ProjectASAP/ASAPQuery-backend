@@ -1,8 +1,8 @@
 //! `AccuracyProfile` — derived error / confidence bound for each
 //! `AggregationConfig`.
 //!
-//! Implements §6.4 of the sketch DB design
-//! ([`design-sketch-db.md`](../../../../../docs/design-sketch-db.md)).
+//! Implements backend accuracy metadata consumed under BackendPlan. Logical
+//! guarantees are owned by ASAPPlanner and family bounds by summary libraries.
 //! Given the `aggregation_type` + `parameters` pinned on an
 //! `AggSchema`, the registry can expose the theoretical accuracy
 //! bound of every query answer computed from it — so users and
@@ -40,7 +40,7 @@
 //! rather than loose textbook versions; sources are cited inline
 //! in each branch of [`AccuracyProfile::derive`].
 //!
-// See `docs/proofs.md` for formal statements of the accuracy bounds + combine_statistic / write-barrier / backfill theorems.
+// See `docs/design_docs/summary-storage.md` for backend storage guarantees.
 
 use serde::{Deserialize, Serialize};
 

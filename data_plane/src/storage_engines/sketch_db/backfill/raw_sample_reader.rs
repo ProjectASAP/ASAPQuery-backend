@@ -1,7 +1,7 @@
 //! `RawSampleReader` — trait + mock implementation for reading raw
 //! samples from the exact DB during a [`BackfillJob`] run.
 //!
-//! Implements §10 of the sketch DB design ([`design-sketch-db.md`](../../../../../docs/design-sketch-db.md))
+//! Supports the future backfill scope ([`future-storage-and-compression.md`](../../../../../docs/design_docs/future-storage-and-compression.md)).
 //! and specifically §10.2's `BackfillSource` dispatch: every
 //! concrete source (S3+Gorilla, Prometheus, ClickHouse, OtherSketch)
 //! will eventually implement this trait so the worker pool (Phase 5c)

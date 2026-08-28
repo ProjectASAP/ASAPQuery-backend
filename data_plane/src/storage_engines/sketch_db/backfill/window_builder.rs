@@ -2,7 +2,7 @@
 //!
 //! Implements the "real rebuild" piece of §10 (refreshable view
 //! maintenance) from the sketch DB design
-//! ([`design-sketch-db.md`](../../../../../docs/design-sketch-db.md)).
+//! ([`future-storage-and-compression.md`](../../../../../docs/design_docs/future-storage-and-compression.md)).
 //! Given an `AggregationConfig` and a batch of raw samples for one
 //! `(agg_id, window)` pair, produces the `Box<dyn AggregateCore>`
 //! that would have been produced had those samples flowed through

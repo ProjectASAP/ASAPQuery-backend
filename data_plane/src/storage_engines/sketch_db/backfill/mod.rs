@@ -1,7 +1,7 @@
 //! `BackfillJob` lifecycle types + in-memory `BackfillRegistry`.
 //!
 //! Implements §10 (refreshable view maintenance / backfill path) of the
-//! sketch DB design ([`design-sketch-db.md`](../../../../../docs/design-sketch-db.md)).
+//! future storage scope ([`future-storage-and-compression.md`](../../../../../docs/design_docs/future-storage-and-compression.md)).
 //!
 //! ## Why this exists
 //!

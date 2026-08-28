@@ -3,7 +3,7 @@
 //! them into the store.
 //!
 //! Implements §10 (refreshable view maintenance) of the sketch DB
-//! design ([`design-sketch-db.md`](../../../../../docs/design-sketch-db.md)).
+//! design ([`future-storage-and-compression.md`](../../../../../docs/design_docs/future-storage-and-compression.md)).
 //! Reads raw samples from a [`RawSampleReader`] (Phase 5b), groups
 //! them by the agg's `grouping_labels` just like live ingest does,
 //! and writes per-(group, window) precomputes to the store.

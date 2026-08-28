@@ -1,7 +1,7 @@
-//! Sketch DB scaffolding (Phase 2 of the sketch DB design).
+//! Summary-storage components.
 //!
-//! See [`docs/design-sketch-db.md`](../../../../../docs/design-sketch-db.md)
-//! for the full architecture. This module houses the components that live
+//! See [`summary-storage.md`](../../../../../docs/design_docs/summary-storage.md)
+//! for the semantic contract. This module houses the components that live
 //! "above" the existing `SketchStore` and turn it into a sketch-aware
 //! storage engine over time:
 //!
