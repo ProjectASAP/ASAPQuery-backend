@@ -48,7 +48,7 @@ pub struct PrometheusResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub infos: Vec<String>,
     /// ASAP extension: theoretical accuracy envelope for the
-    /// answer (§6.4 of docs/design-sketch-db.md). Unknown to
+    /// answer (see docs/design_docs/summary-storage.md). Unknown to
     /// standard Prometheus clients (they ignore unknown fields),
     /// consumed by Grafana panels / paper artifacts that want
     /// the machine-readable (ε, δ) bound.

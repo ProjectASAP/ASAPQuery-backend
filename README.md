@@ -130,7 +130,7 @@ spin up ASAPCollector + ASAPQuery-backend + Grafana together — live in
 [ASAPCollector](https://github.com/ProjectASAP/ASAPCollector). The
 full multi-stage MVP demo (10 producers / 2 agents / 1 gateway / 1
 backend / Thanos store-gateway / MinIO) is documented in its
-[`docs/mvp-demo-runbook.md`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/mvp-demo-runbook.md).
+[`mvp-demo-runbook.md`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/user_guide/mvp-demo-runbook.md).
 
 To build and run just this backend, see **Building from source** below.
 
@@ -192,7 +192,7 @@ backend surfaces in every response's `infos` field.
 The wire format is documented in
 [`asap_otel_proto`](crates/asap_otel_proto/) and
 the cross-language byte-parity gate is described in
-[ASAPCollector's edge-framework design](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design-asap-edge-framework.md).
+[ASAPCollector's system design](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/system-overview.md).
 
 ## Query response shape
 
@@ -231,9 +231,9 @@ that produced the current architecture:
 - **Sketch placement planner** — moved into [`ASAPCollector/controller/`](https://github.com/ProjectASAP/ASAPCollector/tree/main/controller)
 - **PromQL pattern matchers for the planner** — migrated into the
   controller's L3 `intent_algebra` + L4 `sketch_algebra`
-- **JSONL cold-fallback path** — deleted; the archive tier replaces
-  it. See ASAPCollector's
-  [`docs/design-jsonl-deprecation-and-gorilla-promql-completeness.md`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design-jsonl-deprecation-and-gorilla-promql-completeness.md)
+- **JSONL cold-fallback path** — deleted; the configured exact backend is the
+  explicit fallback described by
+  [`query-execution.md`](data_plane/docs/query-execution.md).
 - **`StorageBackend::ColdJsonlFallback`** enum variant — removed
 - **Backend-local cost-model line item for cold-tier scan bytes** —
   removed (controller's tier-spanning cost model is the source of

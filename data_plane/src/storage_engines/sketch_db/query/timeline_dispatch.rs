@@ -1,5 +1,5 @@
 //! Cross-schema result combination for the §7 schema-timeline query
-//! dispatch ([`design-sketch-db.md`](../../../../docs/design-sketch-db.md)).
+//! dispatch ([`summary-storage.md`](../../../../docs/design_docs/summary-storage.md)).
 //!
 //! When a metric-range query spans a reconfigure boundary, the
 //! `SchemaRegistry::timeline_for_metric` call returns multiple

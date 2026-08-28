@@ -22,7 +22,7 @@
 //! internal/series/dictionary.go`.
 //!
 //! See design doc §5.4 ("Idempotency invariant on `ResolveSeriesIDs`")
-//! at `docs/design-controller-into-backend.md`.
+//! in `docs/design_docs/series-identity.md`.
 
 use dashmap::DashMap;
 use std::fs::{File, OpenOptions};

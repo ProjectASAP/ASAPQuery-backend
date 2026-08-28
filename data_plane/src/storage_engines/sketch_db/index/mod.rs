@@ -17,7 +17,7 @@
 //! and falls through to Thanos archive (Phase 6).
 //!
 //! See design doc §4.6 ("OTLP metadata model + backend store layout") at
-//! `docs/design-controller-into-backend.md`.
+//! `docs/design_docs/series-identity.md`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};

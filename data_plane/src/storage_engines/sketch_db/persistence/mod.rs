@@ -1,6 +1,6 @@
 //! Persistence layer for `SketchStorePerKey`.
 //!
-//! See `docs/design-simple-map-store-persistence.md` for the design rationale.
+//! See `docs/design_docs/future-storage-and-compression.md` for the design scope.
 //!
 //! ## Structure
 //!

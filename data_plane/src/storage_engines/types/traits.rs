@@ -80,7 +80,7 @@ pub trait AggregateCore: SerializableToSink + Send + Sync {
     /// `query_statistic` method.
     ///
     /// This is the phase-1 piece of the sketch DB design
-    /// (docs/design-sketch-db.md §5.1 / §16 Phase 1).
+    /// (docs/design_docs/summary-storage.md).
     fn aux_stats(&self) -> AuxStats {
         AuxStats::empty()
     }

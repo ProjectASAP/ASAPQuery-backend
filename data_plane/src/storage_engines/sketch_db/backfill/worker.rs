@@ -2,7 +2,7 @@
 //! registry state machine.
 //!
 //! Implements §10.3 (refresh as a separate worker pool) of the
-//! sketch DB design ([`design-sketch-db.md`](../../../../../docs/design-sketch-db.md)).
+//! future storage scope ([`future-storage-and-compression.md`](../../../../../docs/design_docs/future-storage-and-compression.md)).
 //! Phase 5c scope: one job at a time, synchronous windowing loop,
 //! pluggable processor. The multi-worker pool with priority +
 //! isolation from live ingest (§11.4) lands in a follow-up.
