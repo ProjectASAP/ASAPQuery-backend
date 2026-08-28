@@ -422,7 +422,7 @@ next person trying to add another one:
 | `ASAPQuery-backend docs/design-sketch-db.md §19.9` | The theoretical accuracy bound formula for `Foo` |
 | `ASAPQuery-backend docs/design-sketch-db.md §19.10` | The merge propagation rule for `Foo` |
 | Shared design doc for `Foo` | A short rationale: what query class, why this sketch over alternatives, what the trade-off is |
-| `DataCollector controller/docs/query-to-sketch-translation.md` | Where in the five-layer plan `Foo` shows up as a candidate |
+| [ASAPPlanner](https://github.com/ProjectASAP/ASAPPlanner) | How `Foo` is represented and selected as a logical summary candidate |
 
 ---
 
