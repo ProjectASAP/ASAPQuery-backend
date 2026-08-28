@@ -22,6 +22,11 @@ designs; they are intentionally not repeated here.
 | [Physical planning](physical-planning.md) | Placement, windows, representation, transmission, and compilation into matching collector and backend plans. |
 | [BackendPlan](backend-plan.md) | Versioned contract installed and executed by the ASAPQuery data plane. |
 
+## Developer documentation
+
+- [Planner adapter and physical compiler](developer_docs/planner-and-physical-compiler.md)
+- [Runtime plan publication](developer_docs/runtime-plan-publication.md)
+
 The corresponding collector-facing plan is documented by
 [ASAPCollector](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/opamp-config-push.md).
 

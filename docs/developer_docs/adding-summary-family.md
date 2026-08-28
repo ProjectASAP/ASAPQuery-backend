@@ -1,54 +1,138 @@
-# Adding a summary family to ASAPQuery-backend
+# Adding a summary family
 
-## TL;DR
+> Interface status: cross-repository developer workflow. ASAPQuery-backend
+> implements runtime capabilities; ASAPPlanner and summary libraries own logical
+> semantics and algorithm guarantees.
 
-ASAPQuery-backend adds runtime support for a summary family only after
-ASAPPlanner defines its logical query mapping and guarantee, and the producing
-collector/library defines compatible state semantics. The backend must not
-invent those contracts locally.
+## 1. Code architecture
 
-## Ownership prerequisites
+```text
+ASAPPlanner public summary/readout types
+                  |
+                  v
+PhysicalCompiler capability match
+            /                 \
+CollectorPlan                 BackendPlan
+      |                           |
+ASAPCollector                 SummaryDecoder
+update + encode        ->     SummaryStore -> SummaryReader
+```
 
-Before changing this repository, confirm:
+A family is supported only when the same public semantic contract crosses all
+components. A decoder or enum variant by itself is not pipeline support.
 
-- [ASAPPlanner](https://github.com/ProjectASAP/ASAPPlanner) can represent and
-  select the family for concrete PromQL examples;
-- the summary library defines parameters, update, merge/readout, encoding, and
-  accuracy behavior; and
-- [ASAPCollector](https://github.com/ProjectASAP/ASAPCollector) can advertise,
-  configure, construct, and transmit the same family/version.
+## 2. Public interfaces and definitions
 
-## Backend work
+The following public structures must describe the same family/version:
 
-Backend support covers four boundaries:
+```rust
+pub struct SummaryCapability {
+    pub family: SummaryFamily,
+    pub algorithm: SummaryAlgorithm,
+    pub parameter_schema: ParameterSchema,
+    pub encodings: Vec<SummaryEncoding>,
+    pub operations: SummaryOperations,
+    pub readouts: Vec<ReadoutCapability>,
+    pub guarantee_kinds: Vec<GuaranteeKind>,
+}
 
-1. **Capability:** advertise the exact family, algorithm, parameter, readout,
-   merge, representation, and full/delta support implemented.
-2. **Physical compilation:** accept only selected Planner nodes that can be
-   assigned to compatible collector and backend executors.
-3. **BackendPlan and ingestion:** preserve the selected contract and reject
-   incompatible payloads.
-4. **Readout:** execute the declared operation and return aligned
-   Prometheus-compatible labels, timestamps, values, and errors.
+pub struct SummaryOperations {
+    pub update: bool,
+    pub merge: bool,
+    pub subtract: bool,
+    pub delete: bool,
+    pub full_state: bool,
+    pub delta_state: bool,
+}
+```
 
-For example, support for a new quantile family is incomplete until this query
-can be planned, produced, ingested, and read end to end:
+```rust
+pub trait SummaryDecoder {
+    type Error;
+    fn decode(&self, request: OtlpMetricsRequest)
+        -> Result<Vec<ReceivedSummary>, Self::Error>;
+}
+
+pub trait SummaryStore {
+    type Error;
+    fn register(&self, contract: ValidatedMaterialization)
+        -> Result<MaterializationState, Self::Error>;
+    fn apply(&self, update: ValidatedSummary)
+        -> Result<StoreWriteResult, Self::Error>;
+}
+
+pub trait SummaryReader {
+    type Error;
+    fn read(
+        &self,
+        request: &QueryRequest,
+        route: &SummaryRoute,
+        plan: &BackendPlanSnapshot,
+    ) -> Result<SummaryReadout, Self::Error>;
+}
+```
+
+Definitions:
+
+| Interface | Input | Output |
+| --- | --- | --- |
+| Planner mapping | PromQL workload and constraints | Selected logical summary producer/readout and guarantee |
+| Capability | Family/algorithm/version | Supported parameters, encodings, operations, readouts, guarantees |
+| Decoder | OTLP request | Untrusted `ReceivedSummary` values |
+| Validator | Received summary + active plan | `ValidatedSummary` or structured error |
+| Store | Validated materialization/update | Lifecycle/write result |
+| Reader | Query + selected route + plan snapshot | Summary readout with coverage/guarantee |
+
+Why these interfaces exist: every stage can compare exact typed semantics and
+reject unsupported combinations instead of mapping a new family to a similar
+legacy one.
+
+## 3. Adding and verifying a family
+
+### Step 1: define logical semantics outside this repository
+
+Add the query mapping, readout, composability, and guarantee to ASAPPlanner.
+Add update/merge/encoding behavior and mathematical guarantee to the owning
+summary library. Record concrete PromQL examples.
+
+### Step 2: advertise runtime capability
+
+Add `SummaryCapability` values for collector and backend. Declare only the
+parameter ranges, encodings, operations, and readouts actually implemented.
+Verify the physical compiler rejects a candidate if either side lacks one
+required capability.
+
+### Step 3: ingest and store
+
+Implement decode to `ReceivedSummary`, validation to `ValidatedSummary`, and
+store application through public interfaces. Include family, algorithm,
+canonical parameters, encoding version, grouping, and window in compatibility
+identity.
+
+### Step 4: execute readout
+
+Implement `SummaryReader::read` for the Planner-selected readout. Preserve
+labels, timestamps, result type, logical coverage, and guarantee. Do not choose
+the family again from query text.
+
+### Step 5: interpret and verify output
+
+For a quantile family, an end-to-end example is:
 
 ```promql
 quantile_over_time(0.95, request_duration_seconds[5m])
 ```
 
-## Validation
+Verify:
 
-The cross-repository test must cover:
+- output series align with exact results by labels and timestamps;
+- reported guarantee matches the selected parameterization;
+- errors satisfy the predeclared SLA over identical input;
+- full and delta state have equivalent query semantics when delta is claimed;
+- corrupt, mismatched, stale, gapped, or unsupported input returns a structured
+  failure and does not change queryable state; and
+- `QueryResponse.source`, plan/materialization IDs, coverage, and freshness
+  prove which implementation produced the answer.
 
-- supported and deliberately unsupported parameters;
-- full-state transmission and delta transmission when claimed;
-- duplicate, missing, reordered, stale, and incompatible payloads;
-- merge across every claimed grouping/window shape;
-- aligned comparison with an identical exact input stream;
-- the declared accuracy and freshness SLA; and
-- capability downgrade and exact fallback behavior.
-
-Unit tests for serialization or a local readout alone do not establish pipeline
+Unit tests for serialization are necessary but do not establish cross-repository
 support.

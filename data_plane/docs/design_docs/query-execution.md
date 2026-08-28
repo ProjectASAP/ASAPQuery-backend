@@ -4,6 +4,11 @@
 >
 > MVP relation: required for every summary-backed query and exact fallback.
 
+Developer guides:
+[BackendPlan runtime](../developer_docs/backend-plan-runtime.md),
+[OTLP summary ingestion](../developer_docs/otlp-summary-ingestion.md), and
+[query routing/readout](../developer_docs/query-routing-and-readout.md).
+
 ## TL;DR
 
 The data plane accepts only state compatible with its active BackendPlan. At

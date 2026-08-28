@@ -9,6 +9,10 @@
 > plane tells its data plane what summary materializations exist, how they
 > are ingested, and which query capabilities they serve.
 
+Developer guides:
+[runtime plan publication](developer_docs/runtime-plan-publication.md) and
+[BackendPlan installation](../../data_plane/docs/developer_docs/backend-plan-runtime.md).
+
 ## TL;DR
 
 Planning chooses once; serving reuses that exact decision.

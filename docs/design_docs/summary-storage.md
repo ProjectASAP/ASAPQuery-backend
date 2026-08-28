@@ -4,6 +4,9 @@
 >
 > MVP relation: stores the state needed for summary-backed query execution.
 
+Developer guide:
+[Summary storage and series identity](../../data_plane/docs/developer_docs/summary-storage-and-series-identity.md).
+
 ## TL;DR
 
 Summary storage is a plan-aware materialized-state store. It accepts only state
