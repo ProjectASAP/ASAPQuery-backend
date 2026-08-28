@@ -75,19 +75,11 @@ pub trait SeriesIdentityResolver {
     fn resolve(&self, key: CanonicalSeriesKey)
         -> Result<ResolvedSeries, Self::Error>;
 }
-
-pub struct CanonicalSeriesKey {
-    pub tenant: String,
-    pub metric_name: String,
-    pub identifying_labels: BTreeMap<String, String>,
-}
-
-pub struct ResolvedSeries {
-    pub sid: u64,
-    pub canonical_key: CanonicalSeriesKey,
-    pub namespace_version: String,
-}
 ```
+
+`SeriesId`, `SeriesIdNamespace`, `CanonicalSeriesKey`, and `ResolvedSeries` have
+one public definition in
+[Summary storage and series identity](summary-storage-and-series-identity.md#sid-definition).
 
 ```rust
 pub trait SummaryValidator {
@@ -123,7 +115,7 @@ pub struct IngestResult {
     pub disposition: IngestDisposition,
     pub plan_id: String,
     pub materialization_id: String,
-    pub sid: u64,
+    pub series_id: SeriesId,
     pub window: LogicalWindow,
     pub queryable_at: Option<Timestamp>,
 }
@@ -168,7 +160,7 @@ recovery full state. Verify `AppliedDelta`, `Duplicate`, and
 
 ### Add series identity behavior
 
-Add canonical input fields to `CanonicalSeriesKey`, never to the numeric SID
+Add canonical input fields to `CanonicalSeriesKey`, never to `SeriesId.value`
 alone. Verify label-order independence, tenant isolation, cached-ID conflict
 recovery, and stable namespace reporting.
 

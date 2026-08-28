@@ -15,6 +15,11 @@ identity namespace. The backend registry assigns or validates this mapping;
 collectors may cache it, but payload labels remain the recovery evidence needed
 to detect stale or unknown IDs.
 
+Formally, SID is the pair `(namespace, numeric_value)`, not a globally meaningful
+integer. The namespace contains the tenant/isolation domain and a registry
+version. Its public data structures and registry interfaces are defined in the
+[developer guide](../../data_plane/docs/developer_docs/summary-storage-and-series-identity.md#sid-definition).
+
 ## Identity contract
 
 The canonical series key consists of:

@@ -22,20 +22,62 @@ identities remain distinct.
 ## 2. Public interfaces and definitions
 
 ```rust
+pub struct SeriesId {
+    pub namespace: SeriesIdNamespace,
+    pub value: u64,
+}
+
+pub struct SeriesIdNamespace {
+    pub tenant: String,
+    pub version: String,
+}
+
+pub struct CanonicalSeriesKey {
+    pub tenant: String,
+    pub metric_name: String,
+    pub identifying_labels: BTreeMap<String, String>,
+}
+
+pub struct ResolvedSeries {
+    pub id: SeriesId,
+    pub canonical_key: CanonicalSeriesKey,
+}
+
 pub trait SeriesRegistry: Send + Sync {
     type Error;
 
     fn resolve(&self, key: CanonicalSeriesKey)
         -> Result<ResolvedSeries, Self::Error>;
 
-    fn lookup(&self, sid: u64, namespace_version: &str)
+    fn lookup(&self, id: &SeriesId)
         -> Result<Option<ResolvedSeries>, Self::Error>;
 }
 ```
 
-`CanonicalSeriesKey` and `ResolvedSeries` are defined by the ingestion public
-interface. `resolve` is idempotent. A sender-provided SID never overrides a
-conflicting canonical key.
+### SID definition
+
+`SeriesId` (`sid`) is an opaque numeric identifier scoped by exactly one
+`SeriesIdNamespace`. The namespace contains the tenant/isolation domain and a
+version that changes whenever the authoritative registry is rebuilt without
+preserving its previous assignments.
+
+```text
+(SeriesIdNamespace, SeriesId.value) <-> CanonicalSeriesKey
+```
+
+Within one namespace this mapping is one-to-one:
+
+- the same canonical key always resolves to the same SID;
+- two different canonical keys never resolve to the same SID; and
+- the same numeric value in two namespaces is not the same SID.
+
+`identifying_labels` is ordered by label name before lookup or hashing, so input
+label order does not affect identity. Summary family, parameters, aggregation
+group, window, materialization ID, and plan ID are excluded because they
+identify maintained state, not the source metric series.
+
+`SeriesRegistry::resolve` is idempotent. A sender-provided SID is only a lookup
+shortcut; it never overrides a conflicting canonical key.
 
 ```rust
 pub struct MaterializationKey {
