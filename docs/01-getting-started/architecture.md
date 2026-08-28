@@ -60,7 +60,7 @@ coverage, freshness, and state compatibility before execution. If the selected
 logical plan requires exact execution, the request is sent to the configured
 exact backend.
 
-See [plan-aware query execution](../../data_plane/docs/query-execution.md).
+See [plan-aware query execution](../../data_plane/docs/design_docs/query-execution.md).
 
 ## State and identity
 

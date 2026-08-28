@@ -1,35 +1,40 @@
 # ASAPQuery data-plane documentation
 
-> Status: active
+The data plane ingests state produced under an active BackendPlan, stores that
+state, answers supported PromQL queries, and uses an explicit exact fallback
+for unsupported queries. It executes plans; it does not choose summary families
+or re-plan queries.
 
-## TL;DR
+## Design documents
 
-The ASAPQuery data plane ingests state produced under an active BackendPlan,
-stores that state, answers supported PromQL queries, and uses an explicit exact
-fallback for unsupported queries. It executes plans; it does not choose summary
-families or re-plan queries.
+- [Plan-aware query execution](design_docs/query-execution.md) — ingestion,
+  routing, readiness, summary readout, and exact fallback contracts.
+- [Repository-wide summary storage](../../docs/design_docs/summary-storage.md) —
+  materialization state, lifecycle, and query consistency.
+- [BackendPlan](../../control_plane/docs/backend-plan.md) — the control-plane
+  contract installed by the data plane.
 
-## Documents
+## Developer documentation
 
-| Document | Scope |
-| --- | --- |
-| [Query execution](query-execution.md) | Ingestion, plan-aware routing, summary readout, freshness, and exact fallback. |
-| [Extension points](extension-points.md) | Stable responsibilities of protocol adapters, protocol servers, and fallback clients. |
+- [Extension boundaries](developer_docs/extension-points.md) — responsibilities
+  of protocol servers, adapters, and fallback clients.
+- [Adding a summary family](../../docs/developer_docs/adding-summary-family.md) —
+  cross-repository prerequisites and backend validation.
 
-Storage and identity designs live in the repository-wide
-[design documents](../../docs/design_docs/README.md). The control-plane to
-data-plane contract is [BackendPlan](../../control_plane/docs/backend-plan.md).
+## User guide
 
-## Ownership rule
+- [Querying ASAP](user_guide/querying-asap.md) — PromQL behavior, planned
+  summary execution, exact fallback, freshness, and errors.
+
+## Ownership
 
 - [ASAPPlanner](https://github.com/ProjectASAP/ASAPPlanner) owns logical query
   planning, query-to-summary mapping, and accuracy reasoning.
 - The ASAPQuery control plane owns physical compilation and BackendPlan.
 - The data plane owns ingestion, storage, readout, query execution, and exact
-  fallback under that installed plan.
+  fallback under the installed plan.
 - [ASAPCollector](https://github.com/ProjectASAP/ASAPCollector) owns summary
   construction and transmission at the edge.
 
-Documents in this directory describe only the data-plane boundary. Historical
-ingestion paths, file-by-file migrations, and configuration walkthroughs are
-not design contracts.
+Historical ingestion paths, file-by-file migrations, and configuration
+walkthroughs are not data-plane design contracts.

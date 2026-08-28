@@ -17,7 +17,8 @@
 ## Developer guides
 
 - [Adding a summary family](developer_docs/adding-summary-family.md)
-- [Data-plane extension boundaries](../data_plane/docs/extension-points.md)
+- [Data-plane extension boundaries](../data_plane/docs/developer_docs/extension-points.md)
+- [Querying ASAP](../data_plane/docs/user_guide/querying-asap.md)
 
 ## Documentation ownership
 
