@@ -5,6 +5,9 @@
 
 The query backend of the **ASAP** observability system.
 
+Design documents, developer workflows, and user guides are indexed in the
+[ASAPQuery-backend documentation](docs/README.md).
+
 ASAPQuery-backend exposes a **single PromQL HTTP surface** that
 internally dispatches to one of two engines based on the control plane's
 plan and the query's shape:

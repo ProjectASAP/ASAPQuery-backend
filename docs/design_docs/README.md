@@ -13,6 +13,7 @@ query serving lives in [data-plane docs](../../data_plane/docs/README.md).
 | [Summary storage](summary-storage.md) | Materialization state, windows, ingest/query consistency, and lifecycle. | Active MVP design |
 | [Series identity](series-identity.md) | Canonical metric-series identity and recovery behavior. | Active MVP design |
 | [Future storage and compression](future-storage-and-compression.md) | Persistence tiers, compaction, pluggable service mode, backfill, compression, and profiling. | Dormant/future |
+| [Backend service runtime](service-runtime.md) | End-to-end control/data-plane flow, ownership, failure behavior, and acceptance evidence. | Active MVP design |
 
 Logical planning and summary accuracy algebra are owned by
 [ASAPPlanner](https://github.com/ProjectASAP/ASAPPlanner) and the relevant
