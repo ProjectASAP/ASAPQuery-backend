@@ -38,7 +38,7 @@ owns logical parsing, summary alternatives, accuracy reasoning, and selection.
 The ASAPQuery control plane owns deployment capabilities, physical placement,
 windows, transmission, matching runtime plans, and activation.
 
-See the [control-plane physical-planning design](../developer_docs/control-plane/physical-planning-design.md).
+See the [control-plane physical-planning design](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/control-plane/physical-planning.md).
 
 ## Ingestion path
 
@@ -60,7 +60,7 @@ coverage, freshness, and state compatibility before execution. If the selected
 logical plan requires exact execution, the request is sent to the configured
 exact backend.
 
-See [plan-aware query execution](../developer_docs/query-engine/design.md).
+See [plan-aware query execution](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/asapquery-backend/query-query-engine.md).
 
 ## State and identity
 
@@ -71,8 +71,8 @@ Three identities remain distinct:
 - a **series identity (`sid`)** identifies one canonical metric series.
 
 Conflating them can cause incompatible state reuse. The storage and identity
-contracts are described in [summary storage](../developer_docs/summary-store-engine/design.md)
-and [series identity](../developer_docs/summary-series-id/design.md).
+contracts are described in [summary storage](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/asapquery-backend/query-summary-store-engine.md)
+and [series identity](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/cross-cutting/summary-series-id.md).
 
 ## Component failure behavior
 

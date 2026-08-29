@@ -64,7 +64,7 @@ pub struct ExactBackendCapabilities {
 ```
 
 `QueryRequest` and `QueryResponse` are defined in
-[Query routing and readout](routing-and-readout.md). They preserve tenant,
+[Query routing and readout](query-engine.md). They preserve tenant,
 query language/expression, logical evaluation range, requested accuracy,
 result labels/timestamps/type, source, guarantee, and coverage.
 

@@ -25,7 +25,7 @@ CollectorReport BackendPlanReport
 
 `CollectorClient` is the ASAPQuery-side counterpart of ASAPCollector's
 authoritative
-[`opamp-config-push.md`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/opamp-config-push.md).
+[`opamp-config-push.md`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/asapcollector/opamp-config-push.md).
 This repository does not redefine CollectorPlan fields.
 
 ## 2. Public interfaces and definitions

@@ -35,4 +35,4 @@ value in multiple authorities.
 Test label-order stability, kind/config separation, concurrent idempotent
 resolve, conflict handling, ID-only unknown rejection, WAL replay/torn tail,
 Collector eviction/relearning, and query label reconstruction. See the
-[cross-repository design](design.md).
+[cross-repository design](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/cross-cutting/summary-series-id.md).

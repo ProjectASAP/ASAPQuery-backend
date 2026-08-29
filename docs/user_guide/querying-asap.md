@@ -78,6 +78,6 @@ incompatible materialization, or exact-backend failure.
 
 ## Related documentation
 
-- [Data-plane design](../developer_docs/query-engine/design.md)
-- [Summary storage](../developer_docs/summary-store-engine/design.md)
+- [Data-plane design](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/asapquery-backend/query-query-engine.md)
+- [Summary storage](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/asapquery-backend/query-summary-store-engine.md)
 - [ASAPCollector MVP demo runbook](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/user_guide/mvp-demo-runbook.md)

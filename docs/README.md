@@ -19,12 +19,11 @@ backend operation material.
 ## Backend implementation
 
 - [Developer guide](developer_docs/README.md)
-- [Summary store engine](developer_docs/summary-store-engine/README.md)
-- [Query engine](developer_docs/query-engine/README.md)
-- [Ingest engine](developer_docs/ingest-engine/README.md)
-- [Summary series ID resolver](developer_docs/summary-series-id/README.md)
+- [Summary store engine](developer_docs/summary-store-engine/implementation.md)
+- [Query engine](developer_docs/query-engine/query-engine.md)
+- [Ingest engine](developer_docs/ingest-engine/ingest-engine.md)
+- [Summary series ID resolver](developer_docs/summary-series-id/resolver.md)
 - [Control plane](developer_docs/control-plane/physical-compiler.md)
-- [Runtime](developer_docs/runtime/service-runtime-design.md)
 
 ## User guide
 
