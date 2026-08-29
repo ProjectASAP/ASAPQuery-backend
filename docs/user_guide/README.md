@@ -7,7 +7,7 @@ PromQL-compatible query surface, not private Rust interfaces.
 
 - [Run and verify the backend](running-and-verifying.md) — build prerequisites,
   component startup, health checks, and troubleshooting.
-- [Querying ASAP](../../data_plane/docs/user_guide/querying-asap.md) — supported
+- [Querying ASAP](../../docs/user_guide/querying-asap.md) — supported
   query behavior, accuracy, freshness, fallback, and errors.
 
 For the complete multi-node demonstration, use

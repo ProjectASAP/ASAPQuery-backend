@@ -4,7 +4,7 @@
 >
 > MVP relation: required for query planning and control-plane decisions.
 
-Developer guide: [Planner adapter and physical compiler](developer_docs/planner-and-physical-compiler.md).
+Developer guide: [Planner adapter and physical compiler](../developer_docs/control-plane-physical-compiler.md).
 
 ## TL;DR
 
@@ -66,13 +66,13 @@ The control plane owns:
 - staging, activating, retiring, and rolling back plan versions; and
 - exposing planning and activation status to operators.
 
-These decisions are described in [physical planning](physical-planning.md).
+These decisions are described in [physical planning](control-plane-physical-planning.md).
 
 ### ASAPQuery data plane
 
 The data plane owns:
 
-- installing [BackendPlan](backend-plan.md);
+- installing [BackendPlan](control-plane-backend-plan.md);
 - validating, ingesting, storing, and merging summary state;
 - applying the selected readout and remaining backend-side operators;
 - enforcing readiness, freshness, and plan identity; and

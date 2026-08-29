@@ -10,8 +10,8 @@
 > are ingested, and which query capabilities they serve.
 
 Developer guides:
-[runtime plan publication](developer_docs/runtime-plan-publication.md) and
-[BackendPlan installation](../../data_plane/docs/developer_docs/backend-plan-runtime.md).
+[runtime plan publication](../developer_docs/control-plane-plan-publication.md) and
+[BackendPlan installation](../../docs/developer_docs/query-engine-backend-plan.md).
 
 ## TL;DR
 
@@ -62,7 +62,7 @@ compiler creates:
 - BackendPlan, which validates, stores, routes, merges, and reads them.
 
 The two are defined together in
-[`physical-planning.md`](physical-planning.md).
+[`physical-planning.md`](control-plane-physical-planning.md).
 
 BackendPlan is not:
 

@@ -6,7 +6,7 @@
 > Collector export, backend storage, and query readout.
 
 Developer guide:
-[Summary storage and series identity](../../data_plane/docs/developer_docs/summary-storage-and-series-identity.md).
+[Summary storage and series identity](../../docs/developer_docs/summary-store-and-series-id.md).
 
 ## TL;DR
 

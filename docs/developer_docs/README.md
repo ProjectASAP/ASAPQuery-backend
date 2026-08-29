@@ -73,13 +73,18 @@ the documented environment variables and component deployment files.
 ## Extension guides
 
 - [Adding a summary family](adding-summary-family.md)
-- [Planner adapter and physical compiler](../../control_plane/docs/developer_docs/planner-and-physical-compiler.md)
-- [Runtime plan publication](../../control_plane/docs/developer_docs/runtime-plan-publication.md)
-- [BackendPlan runtime](../../data_plane/docs/developer_docs/backend-plan-runtime.md)
-- [OTLP summary ingestion](../../data_plane/docs/developer_docs/otlp-summary-ingestion.md)
-- [Query routing and readout](../../data_plane/docs/developer_docs/query-routing-and-readout.md)
-- [Summary storage and series identity](../../data_plane/docs/developer_docs/summary-storage-and-series-identity.md)
-- [Protocol and fallback extensions](../../data_plane/docs/developer_docs/extension-points.md)
+- [Summary store engine](summary-store-engine.md)
+- [Query engine](query-engine.md)
+- [Ingest engine](ingest-engine.md)
+- [Summary series ID](summary-series-id.md)
+- [Planner adapter and physical compiler](control-plane-physical-compiler.md)
+- [Planner workload inputs](control-plane-workload-inputs.md)
+- [Runtime accuracy feedback](control-plane-runtime-accuracy-feedback.md)
+
+Focused implementation references cover [runtime plan publication](control-plane-plan-publication.md),
+[BackendPlan installation](query-engine-backend-plan.md), [OTLP ingest](ingest-engine-otlp.md),
+[query routing and readout](query-engine-routing-and-readout.md), and
+[extension boundaries](query-engine-extension-points.md).
 
 When extending a public contract, update its focused guide and verify both
 producer and consumer. Private helpers are intentionally not documented as

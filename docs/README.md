@@ -8,10 +8,14 @@
 
 ## Component design
 
-- [Control plane](../control_plane/docs/README.md)
-- [Data plane](../data_plane/docs/README.md)
-- [Summary storage](design_docs/summary-storage.md)
-- [Series identity](design_docs/series-identity.md)
+- [Design document index](design_docs/README.md)
+- [Summary store engine](design_docs/summary-store-engine.md)
+- [Query engine](design_docs/query-engine.md)
+- [Ingest engine](design_docs/ingest-engine.md)
+- [Summary series ID](design_docs/summary-series-id.md)
+- [Control-plane physical planning](design_docs/control-plane-physical-planning.md)
+- [Planner workload inputs](design_docs/control-plane-workload-inputs.md)
+- [Runtime accuracy feedback](design_docs/control-plane-runtime-accuracy-feedback.md)
 - [Future storage and compression](design_docs/future-storage-and-compression.md)
 - [Backend service runtime](design_docs/service-runtime.md)
 
@@ -19,19 +23,19 @@
 
 - [Developer guide](developer_docs/README.md)
 - [Adding a summary family](developer_docs/adding-summary-family.md)
-- [Data-plane extension boundaries](../data_plane/docs/developer_docs/extension-points.md)
-- [Planner adapter and physical compiler](../control_plane/docs/developer_docs/planner-and-physical-compiler.md)
-- [Runtime plan publication](../control_plane/docs/developer_docs/runtime-plan-publication.md)
-- [BackendPlan runtime](../data_plane/docs/developer_docs/backend-plan-runtime.md)
-- [OTLP summary ingestion](../data_plane/docs/developer_docs/otlp-summary-ingestion.md)
-- [Query routing and readout](../data_plane/docs/developer_docs/query-routing-and-readout.md)
-- [Summary storage and series identity](../data_plane/docs/developer_docs/summary-storage-and-series-identity.md)
+- [Summary store engine](developer_docs/summary-store-engine.md)
+- [Query engine](developer_docs/query-engine.md)
+- [Ingest engine](developer_docs/ingest-engine.md)
+- [Summary series ID](developer_docs/summary-series-id.md)
+- [Control-plane physical compiler](developer_docs/control-plane-physical-compiler.md)
+- [Planner workload inputs](developer_docs/control-plane-workload-inputs.md)
+- [Runtime accuracy feedback](developer_docs/control-plane-runtime-accuracy-feedback.md)
 
 ## User guide
 
 - [User guide index](user_guide/README.md)
 - [Run and verify the backend](user_guide/running-and-verifying.md)
-- [Querying ASAP](../data_plane/docs/user_guide/querying-asap.md)
+- [Querying ASAP](user_guide/querying-asap.md)
 
 ## Documentation ownership
 

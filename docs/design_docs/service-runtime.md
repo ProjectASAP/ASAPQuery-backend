@@ -99,8 +99,8 @@ accuracy, and freshness are observable for the same run.
 
 ## Related documents
 
-- [Physical planning](../../control_plane/docs/physical-planning.md)
-- [BackendPlan contract](../../control_plane/docs/backend-plan.md)
-- [Plan-aware query execution](../../data_plane/docs/design_docs/query-execution.md)
-- [Summary storage](summary-storage.md)
-- [Series identity](series-identity.md)
+- [Physical planning](../../docs/design_docs/control-plane-physical-planning.md)
+- [BackendPlan contract](../../docs/design_docs/control-plane-backend-plan.md)
+- [Plan-aware query execution](../../docs/design_docs/query-engine.md)
+- [Summary storage](summary-store-engine.md)
+- [Series identity](summary-series-id.md)

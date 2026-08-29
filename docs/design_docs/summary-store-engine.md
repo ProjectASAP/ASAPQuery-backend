@@ -6,7 +6,7 @@
 > ASAP warm query tier.
 
 Developer guide:
-[Summary storage and series identity](../../data_plane/docs/developer_docs/summary-storage-and-series-identity.md).
+[Summary storage and series identity](../../docs/developer_docs/summary-store-and-series-id.md).
 
 ## TL;DR
 
@@ -101,7 +101,7 @@ DDSketch α=0.02, KLL k=200, or a different filter gets another SID even with
 the same metric and labels. A raw materialization likewise needs its own kind,
 so the same identity contract can name a raw sample series without conflating
 it with the summary. See
-[series identity](series-identity.md).
+[series identity](summary-series-id.md).
 
 ### Instance metadata
 
