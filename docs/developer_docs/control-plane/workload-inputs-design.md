@@ -50,4 +50,4 @@ horizon, the adapter emits deterministic input. Tests distinguish one-time from
 recurring queries, historical from continuously arriving data, stale from fresh
 evidence, and unknown from zero.
 
-See [Developing workload inputs](../developer_docs/control-plane-workload-inputs.md).
+See [Developing workload inputs](workload-inputs.md).

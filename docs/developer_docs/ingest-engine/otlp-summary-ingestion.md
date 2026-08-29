@@ -79,7 +79,7 @@ pub trait SeriesIdentityResolver {
 
 `SeriesId`, `SeriesIdNamespace`, `CanonicalSeriesKey`, and `ResolvedSeries` have
 one public definition in
-[Summary storage and series identity](summary-store-and-series-id.md#sid-definition).
+[Summary storage and series identity](../summary-store-engine/storage-and-series-id.md#sid-definition).
 
 ```rust
 pub trait SummaryValidator {

@@ -75,4 +75,4 @@ start from Collector-produced OTLP and prove the stored windows and query result
 match the physical plan.
 
 Developer implementation details are in
-[Developing the ingest engine](../developer_docs/ingest-engine.md).
+[Developing the ingest engine](README.md).

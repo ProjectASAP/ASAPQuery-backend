@@ -27,7 +27,7 @@ configuration, `SeriesIdResolver`, and `SketchStore`.
 - `SketchStoreSink` writes completed outputs to the SID-keyed store.
 
 The detailed modified-OTLP contract remains in
-[OTLP summary ingestion](ingest-engine-otlp.md).
+[OTLP summary ingestion](otlp-summary-ingestion.md).
 
 ## Extension workflow
 

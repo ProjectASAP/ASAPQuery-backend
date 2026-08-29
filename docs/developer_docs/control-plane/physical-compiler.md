@@ -29,7 +29,7 @@ PhysicalCompiler -------> CompiledPlanBundle
 
 Logical query parsing, summary alternatives, guarantees, and candidate search
 remain public ASAPPlanner interfaces. Runtime publication is documented in
-[Runtime plan publication](control-plane-plan-publication.md).
+[Runtime plan publication](plan-publication.md).
 
 ## 2. Public interfaces and definitions
 

@@ -10,8 +10,8 @@
 > ASAPCollector and the ASAPQuery data plane.
 
 Developer guides:
-[Planner adapter and physical compiler](../developer_docs/control-plane-physical-compiler.md)
-and [runtime plan publication](../developer_docs/control-plane-plan-publication.md).
+[Planner adapter and physical compiler](physical-compiler.md)
+and [runtime plan publication](plan-publication.md).
 
 ## TL;DR
 
@@ -182,7 +182,7 @@ collector's complete bootstrap configuration.
 ## 6. Backend subplan
 
 The backend subplan follows
-[`backend-plan.md`](control-plane-backend-plan.md).
+[`backend-plan.md`](backend-plan-design.md).
 
 It specifies:
 

@@ -50,4 +50,4 @@ sample handling, stale evidence, plan-version isolation, violation-triggered
 replanning, and failure to publish the replacement plan. The multi-node harness
 provides end-to-end accuracy, freshness, latency, and cost evidence.
 
-See [Developing runtime feedback](../developer_docs/control-plane-runtime-accuracy-feedback.md).
+See [Developing runtime feedback](runtime-accuracy-feedback.md).

@@ -63,7 +63,7 @@ summary or exact-aggregate series. The same target model can identify a raw
 sample series under a distinct raw materialization kind, but current raw samples
 are served through the configured archive/pass-through path rather than a
 `SketchStore` raw payload variant. See the
-[cross-repository identity design](../design_docs/summary-series-id.md).
+[cross-repository identity design](../summary-series-id/design.md).
 
 `SeriesId` (`sid`) is an opaque numeric identifier scoped by exactly one
 `SeriesIdNamespace`. The namespace contains the tenant/isolation domain and a
@@ -168,9 +168,9 @@ pub enum CoverageResult {
 
 Supporting types `ValidatedMaterialization`, `ValidatedSummary`, and
 `IngestDisposition` are defined by
-[OTLP summary ingestion](ingest-engine-otlp.md). `EvaluationRange`,
+[OTLP summary ingestion](../ingest-engine/otlp-summary-ingestion.md). `EvaluationRange`,
 `SummaryRoute`, and `LogicalCoverage` are defined by
-[Query routing and readout](query-engine-routing-and-readout.md).
+[Query routing and readout](../query-engine/routing-and-readout.md).
 
 Why these interfaces exist: callers receive typed completeness/failure rather
 than interpreting an empty collection as “no data,” and storage cannot accept

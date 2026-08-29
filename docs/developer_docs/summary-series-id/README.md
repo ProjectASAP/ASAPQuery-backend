@@ -35,4 +35,4 @@ value in multiple authorities.
 Test label-order stability, kind/config separation, concurrent idempotent
 resolve, conflict handling, ID-only unknown rejection, WAL replay/torn tail,
 Collector eviction/relearning, and query label reconstruction. See the
-[cross-repository design](../design_docs/summary-series-id.md).
+[cross-repository design](design.md).

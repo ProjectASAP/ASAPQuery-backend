@@ -21,4 +21,4 @@ and deterministic normalization. Tests cover one-time/recurring demand,
 historical/live data, unknown versus zero, stale evidence, duplicate
 registrations, and fixed-snapshot reproducibility.
 
-See [workload input design](../design_docs/control-plane-workload-inputs.md).
+See [workload input design](workload-inputs-design.md).

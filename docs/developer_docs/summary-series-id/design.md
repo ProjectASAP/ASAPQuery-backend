@@ -6,7 +6,7 @@
 > Collector export, backend storage, and query readout.
 
 Developer guide:
-[Summary storage and series identity](../../docs/developer_docs/summary-store-and-series-id.md).
+[Summary storage and series identity](../summary-store-engine/storage-and-series-id.md).
 
 ## TL;DR
 

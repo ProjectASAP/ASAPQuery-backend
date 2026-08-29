@@ -46,4 +46,4 @@ Test instance registration, incompatible SID separation, concurrent per-SID
 append, exact/overlap reads, delta carry-in, retirement, epoch rotation,
 flush-before-evict, memory/disk union, TTL, corrupt/orphan recovery, and restart
 discovery. The detailed target interfaces remain in
-[summary store and series ID](summary-store-and-series-id.md).
+[summary store and series ID](storage-and-series-id.md).

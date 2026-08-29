@@ -32,9 +32,9 @@ query request/result contract.
 
 Detailed guides:
 
-- [Routing and readout](query-engine-routing-and-readout.md)
-- [BackendPlan runtime](query-engine-backend-plan.md)
-- [Extension points](query-engine-extension-points.md)
+- [Routing and readout](routing-and-readout.md)
+- [BackendPlan runtime](backend-plan-runtime.md)
+- [Extension points](extension-points.md)
 
 ## Verification
 

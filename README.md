@@ -236,7 +236,7 @@ that produced the current architecture:
   controller's L3 `intent_algebra` + L4 `sketch_algebra`
 - **JSONL cold-fallback path** — deleted; the configured exact backend is the
   explicit fallback described by
-  [query-engine design](docs/design_docs/query-engine.md).
+  [query-engine implementation design](docs/developer_docs/query-engine/design.md).
 - **`StorageBackend::ColdJsonlFallback`** enum variant — removed
 - **Backend-local cost-model line item for cold-tier scan bytes** —
   removed (controller's tier-spanning cost model is the source of

@@ -22,4 +22,4 @@ stale, under-sampled, wrong-version, or incomparable evidence. Replanning tests
 verify a new plan version and fail-safe publication/rollback, not in-place
 mutation of an active SID.
 
-See [runtime feedback design](../design_docs/control-plane-runtime-accuracy-feedback.md).
+See [runtime feedback design](runtime-accuracy-feedback-design.md).
