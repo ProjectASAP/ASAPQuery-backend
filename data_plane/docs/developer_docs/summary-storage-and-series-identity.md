@@ -56,6 +56,15 @@ pub trait SeriesRegistry: Send + Sync {
 
 ### SID definition
 
+The interfaces below are the target public namespace model. The current
+implementation uses a backend-allocated `u64` keyed by `(canonical metric,
+canonical stored labels, agg_kind_canonical)`. It therefore identifies a stored
+summary or exact-aggregate series. The same target model can identify a raw
+sample series under a distinct raw materialization kind, but current raw samples
+are served through the configured archive/pass-through path rather than a
+`SketchStore` raw payload variant. See the
+[cross-repository identity design](../../../docs/design_docs/series-identity.md).
+
 `SeriesId` (`sid`) is an opaque numeric identifier scoped by exactly one
 `SeriesIdNamespace`. The namespace contains the tenant/isolation domain and a
 version that changes whenever the authoritative registry is rebuilt without
