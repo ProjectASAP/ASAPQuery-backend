@@ -64,11 +64,24 @@ See [plan-aware query execution](https://github.com/ProjectASAP/ASAPCollector/bl
 
 ## State and identity
 
-Three identities remain distinct:
+The three levels are related but must not be collapsed:
 
 - a **plan identity** versions one deployed physical decision;
-- a **materialization identity** describes maintained summary semantics; and
-- a **series identity (`sid`)** identifies one canonical metric series.
+- a **materialization identity** is the stable descriptor/fingerprint for the
+  maintained summary semantics: bound source/filter, summarized value,
+  reduction and retained grouping keys, aggregation family/algorithm and
+  parameters, accuracy contract, window semantics, and compatible state schema;
+  and
+- a **summary series identity (`sid`)** identifies one canonical materialized
+  metric series under that descriptor, including the canonical metric and the
+  concrete retained label values. A raw materialization may likewise allocate
+  a distinct SID for its raw sample series.
+
+For example, “DDSketch over `request_duration_seconds`, grouped by `service`,
+alpha 0.01, one-minute panes” is one materialization definition. Its
+`service=checkout` and `service=payments` outputs are two materialized series
+and therefore have different SIDs. Changing alpha or retained grouping keys
+creates a different materialization definition and cannot reuse either SID.
 
 Conflating them can cause incompatible state reuse. The storage and identity
 contracts are described in [summary storage](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/asapquery-backend/query-summary-store-engine.md)

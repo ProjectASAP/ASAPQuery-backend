@@ -72,12 +72,12 @@ pub enum SummaryFrame {
 ```rust
 pub trait SeriesIdentityResolver {
     type Error;
-    fn resolve(&self, key: CanonicalSeriesKey)
+    fn resolve(&self, key: CanonicalMaterializedSeriesKey)
         -> Result<ResolvedSeries, Self::Error>;
 }
 ```
 
-`SeriesId`, `SeriesIdNamespace`, `CanonicalSeriesKey`, and `ResolvedSeries` have
+`SeriesId`, `SeriesIdNamespace`, `CanonicalMaterializedSeriesKey`, and `ResolvedSeries` have
 one public definition in
 [Summary storage and series identity](../summary-store-engine/implementation.md#sid-definition).
 
@@ -160,7 +160,7 @@ recovery full state. Verify `AppliedDelta`, `Duplicate`, and
 
 ### Add series identity behavior
 
-Add canonical input fields to `CanonicalSeriesKey`, never to `SeriesId.value`
+Add canonical input fields to `CanonicalMaterializedSeriesKey`, never to `SeriesId.value`
 alone. Verify label-order independence, tenant isolation, cached-ID conflict
 recovery, and stable namespace reporting.
 

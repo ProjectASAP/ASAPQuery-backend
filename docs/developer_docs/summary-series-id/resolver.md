@@ -5,7 +5,8 @@
 The Backend is the SID authority. `drivers/ingest/series_resolver.rs` maps:
 
 ```text
-(canonical metric, attributes fingerprint, agg-kind canonical string) -> u64
+(canonical metric, retained-attributes fingerprint,
+ materialization/agg-kind canonical string) -> u64
 ```
 
 The OTLP receiver handles attribute-bearing registration, ID-only lookup,

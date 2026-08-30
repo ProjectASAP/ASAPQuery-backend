@@ -143,6 +143,102 @@ Output definitions:
 | `collector_plans` | One plan per targeted collector, following ASAPCollector's public CollectorPlan schema. |
 | `backend_plan` | Matching data-plane materialization and routing contract. |
 
+### What the compiler puts in CollectorPlan
+
+Each targeted Collector receives a complete executable projection of the
+physical decision. It is not a Planner DAG and not a pointer requiring the
+Collector to recover missing semantics.
+
+| CollectorPlan section | Required content | Consuming ASAPCollector component |
+| --- | --- | --- |
+| envelope | Schema version, kind, shared plan ID/version, generation/activation/expiry, backend compatibility, Planner revision, candidate/query traceability | OpAMP receiver and plan validator |
+| target | Collector instance UID, edge assignment, capability snapshot hash | Control-plane agent and capability validator |
+| materialization reference | Content fingerprint describing maintained semantics plus logical-node traceability | Plan applier and materialization registry |
+| input | Source metric, canonical matchers, and whether the summarized input is sample value or a named label | OTLP/OTAP metric adapter and observation router |
+| summary | Raw, exact-aggregation, or sketch kind; concrete algorithm; typed parameters; requested accuracy | Precompute factory and accumulator/sketch implementation |
+| reduction/grouping | Per-entity or reduction semantics, retained/excluded labels, and independent or shared grouping layout | Series-key builder and aggregation state manager |
+| window | Kind, size, slide/anchor, allowed lateness, flush behavior | Window manager |
+| placement | Collector stage and local shard assignment | Processor topology/runtime |
+| transmission | Raw/full/delta mode, encoding and schema version, emission cadence, checkpoint interval and sequence scope | Envelope encoder and delta sender |
+| output/lifecycle | Backend endpoint reference, unsupported behavior, drain/retirement policy | Exporter, plan lifecycle manager, and application reporter |
+
+For a Collector-side DDSketch materialization, the relevant projection is
+conceptually:
+
+```yaml
+materializations:
+  - id: mat:sha256:98f1...
+    input:
+      metric: request_duration_seconds
+      matchers: [{label: region, op: eq, value: us-east}]
+      value: sample_value
+    summary:
+      family: sketch
+      algorithm: ddsketch
+      parameters: {alpha: 0.01}
+      accuracy: {kind: epsilon, epsilon: 0.01}
+    reduction: {kind: reduce, by: [service], without: false}
+    grouping: {kind: per_subpopulation_instance}
+    window: {kind: tumbling, size: 1m, slide: 1m, allowed_lateness: 10s}
+    placement: {stage: collector, shards: 1}
+    transmission:
+      mode: delta
+      encoding: ddsketch-v1
+      schema_version: 1
+      emit_every: 10s
+      full_checkpoint_every: 1m
+      sequence_scope: materialization_window_producer
+    output: {endpoint_ref: asapquery-primary}
+```
+
+The materialization `id` above identifies the maintained summary definition.
+It is not the SID. During collection and ingest, each concrete canonical label
+set under that definition resolves to its own SID.
+
+### What the compiler puts in BackendPlan
+
+The matching BackendPlan is the consumer and query-serving projection of the
+same decision:
+
+| BackendPlan section | Required content | Consuming ASAPQuery-backend component |
+| --- | --- | --- |
+| envelope | The same plan ID/version, activation/expiry, compatibility identity and Planner revision | Backend plan manager |
+| materialization descriptor | Same materialization fingerprint, canonical metric, retained grouping keys, capability, aggregation kind/parameters, accuracy, policy fingerprint and lifecycle | SID resolver and instance-metadata registry |
+| producers/ingest | Expected Collector/producer IDs, input payload kind, state schema, full/delta lineage and optional backend-precompute placement | OTLP ingest engine and precompute engine |
+| window/coverage | Pane/window compatibility, lateness, expected coverage and merge rules | Ingest validation and summary store |
+| storage | Warm/archive/remote route, retention, retirement and expiry | Summary store engine and archive adapter |
+| query routes | Query IDs or canonical capability match, materialization reference, readout/operator, grouping/window composition and remaining backend operators | Query classifier, router and readout engine |
+| guarantee/fallback | Selected guarantee and explicit exact/archive fallback behavior | Query engine and response metadata |
+
+The backend declaration does not contain a pre-enumerated SID for every label
+value. It installs immutable metadata for the materialization; the ingest/SID
+resolver then binds each canonical materialized series to an SID and the store
+indexes its windows under that SID.
+
+### One decision, two component graphs
+
+```text
+CollectorPlan
+  -> plan validator
+  -> source matcher / collection router
+  -> windowed raw, exact-aggregation, or sketch state
+  -> full/delta encoder + SID dictionary
+  -> exporter
+
+BackendPlan
+  -> plan installer
+  -> ingest validator / optional backend precompute
+  -> SID resolver + instance metadata
+  -> summary store
+  -> query route + readout / explicit exact fallback
+```
+
+Cross-plan validation proves that every Collector-produced materialization has
+one compatible backend ingest/storage declaration and that every planned query
+route references a declared materialization. A Backend-only precompute has a
+BackendPlan producer but no Collector materialization; a raw pass-through has
+matching raw transmission and ingest/archive declarations.
+
 The compiler error must identify an unsupported capability, invalid placement,
 window incompatibility, identity conflict, or invalid selected guarantee. It
 must not silently substitute another logical summary.

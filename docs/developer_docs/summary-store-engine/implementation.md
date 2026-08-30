@@ -6,18 +6,20 @@
 ## 1. Code architecture
 
 ```text
-CanonicalSeriesKey -> SeriesRegistry -> SeriesId
-                                         |
-ValidatedMaterialization ----------------+
+CanonicalMaterializedSeriesKey -> SeriesRegistry -> SeriesId
+              ^                                      |
+ValidatedMaterialization ----------------------------+
              |
              v
          SummaryStore
        write / coverage / read / retire
 ```
 
-The series registry owns only canonical metric-series identity. The summary
-store owns materialization/group/window state. Plan, materialization, and SID
-identities remain distinct.
+The series registry owns canonical **materialized-series** identity. Its key
+combines the materialization definition with the canonical metric and concrete
+retained label values. The summary store owns the windows and payload state
+under the resulting SID. Plan, materialization, and SID identities remain
+distinct but related.
 
 ## 2. Public interfaces and definitions
 
@@ -32,21 +34,22 @@ pub struct SeriesIdNamespace {
     pub version: String,
 }
 
-pub struct CanonicalSeriesKey {
+pub struct CanonicalMaterializedSeriesKey {
     pub tenant: String,
+    pub materialization_fingerprint: String,
     pub metric_name: String,
     pub identifying_labels: BTreeMap<String, String>,
 }
 
 pub struct ResolvedSeries {
     pub id: SeriesId,
-    pub canonical_key: CanonicalSeriesKey,
+    pub canonical_key: CanonicalMaterializedSeriesKey,
 }
 
 pub trait SeriesRegistry: Send + Sync {
     type Error;
 
-    fn resolve(&self, key: CanonicalSeriesKey)
+    fn resolve(&self, key: CanonicalMaterializedSeriesKey)
         -> Result<ResolvedSeries, Self::Error>;
 
     fn lookup(&self, id: &SeriesId)
@@ -71,7 +74,7 @@ version that changes whenever the authoritative registry is rebuilt without
 preserving its previous assignments.
 
 ```text
-(SeriesIdNamespace, SeriesId.value) <-> CanonicalSeriesKey
+(SeriesIdNamespace, SeriesId.value) <-> CanonicalMaterializedSeriesKey
 ```
 
 Within one namespace this mapping is one-to-one:
