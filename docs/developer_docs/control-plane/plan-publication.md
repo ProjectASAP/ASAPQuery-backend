@@ -25,8 +25,12 @@ CollectorReport BackendPlanReport
 
 `CollectorClient` is the ASAPQuery-side counterpart of ASAPCollector's
 authoritative
-[`opamp-config-push.md`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/opamp-config-push.md).
+[`opamp-config-push.md`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/asapcollector/opamp-config-push.md).
 This repository does not redefine CollectorPlan fields.
+
+Publication also does not reinterpret either plan. The physical compiler owns
+their contents; the publisher owns delivery, staging, activation barriers,
+report correlation, and rollback.
 
 ## 2. Public interfaces and definitions
 
@@ -41,6 +45,20 @@ pub trait CollectorPlanClient {
         target: CollectorTarget,
         plan: CollectorPlan,
     ) -> Result<CollectorApplicationReport, Self::Error>;
+
+    async fn activate(
+        &self,
+        target: CollectorTarget,
+        plan_id: &str,
+        plan_version: u64,
+    ) -> Result<CollectorApplicationReport, Self::Error>;
+
+    async fn abort(
+        &self,
+        target: CollectorTarget,
+        plan_id: &str,
+        plan_version: u64,
+    ) -> Result<CollectorApplicationReport, Self::Error>;
 }
 
 pub trait BackendPlanClient {
@@ -50,6 +68,20 @@ pub trait BackendPlanClient {
         &self,
         target: BackendTarget,
         plan: BackendPlan,
+    ) -> Result<BackendApplicationReport, Self::Error>;
+
+    async fn activate(
+        &self,
+        target: BackendTarget,
+        plan_id: &str,
+        plan_version: u64,
+    ) -> Result<BackendApplicationReport, Self::Error>;
+
+    async fn abort(
+        &self,
+        target: BackendTarget,
+        plan_id: &str,
+        plan_version: u64,
     ) -> Result<BackendApplicationReport, Self::Error>;
 }
 ```
@@ -63,6 +95,20 @@ ASAPCollector interface:
 - OpAMP `config_hash` identifies bytes, not cross-runtime plan semantics; and
 - `RemoteConfigStatus.APPLIED` is delivery/application evidence, not semantic
   activation evidence.
+
+The payload delivered to each target is different even though it shares one
+bundle envelope:
+
+| Target | Published artifact | Components that must stage it |
+| --- | --- | --- |
+| Each ASAPCollector | That target's `CollectorPlan` YAML in `asap-collector-plan.yaml` | OpAMP receiver, plan validator, collection/precompute runtime, window manager, transmission/export pipeline |
+| ASAPQuery data plane | One typed `BackendPlan` | Plan manager, ingest/precompute engine, SID/metadata registry, summary store, query router/readout and fallback adapter |
+
+The Collector report proves the expected materialization definitions are
+installed and executable. It does not enumerate future per-label SIDs. The
+Backend report proves matching descriptors, ingest/storage routes, and query
+routes are staged. SIDs are allocated or resolved later as concrete
+materialized series arrive.
 
 ### Application reports
 
@@ -144,6 +190,41 @@ pub struct ActivationResult {
 plan/version/compatibility and expected materializations. Partial staging is an
 error result and keeps the prior valid plan authoritative.
 
+### Publication and activation sequence
+
+```text
+1. validate complete CompiledPlanBundle
+2. stage BackendPlan (ingest/store/query routes not yet authoritative)
+3. stage every CollectorPlan (collection/export not yet authoritative)
+4. correlate reports with envelope, targets, capabilities, and expected materializations
+5. wait for the common activation time and all readiness conditions
+6. issue activation for the common time; install backend routing before allowing Collector export
+7. observe emitted plan/materialization IDs and retain the previous version for drain/rollback
+```
+
+Backend staging precedes Collector staging so the consumer can validate the
+contract before new producers are allowed to emit. Staging order alone is not
+activation: both sides remain gated by the shared activation time and the
+publisher's readiness decision. If any required target rejects or times out,
+the publisher aborts the new version on every staged target; the previous
+unexpired bundle remains authoritative.
+
+`stage`, `activate`, and `abort` are distinct semantic operations even when a
+transport implements them as versioned remote-config updates. An `APPLIED`
+transport acknowledgement for staged bytes must not be mapped directly to
+`Active`. Distributed activation cannot be literally instantaneous, so the
+backend installs the accepting ingest view first, both sides use the common
+activation timestamp, and query routing becomes authoritative only after the
+required active reports correlate. During that bounded transition the backend
+may accept new-version payloads without serving queries from an incomplete
+new-version view.
+
+For replacement, Collector state created under the old materialization drains
+according to its lifecycle policy, while the backend retains the corresponding
+SID metadata and query route for the declared drain horizon. A changed summary
+semantic produces a new materialization identity and new SIDs; publication
+must not relabel old state into the new definition.
+
 ## 3. Adding and verifying functionality
 
 ### Add another collector transport
@@ -177,4 +258,11 @@ Interpretation: a successful `stage` report is not global activation; only
 - stale/expired/conflicting versions fail;
 - collector-only or backend-only success never returns `Active`;
 - report artifacts are machine-readable by the MVP harness; and
-- post-activation emitted state carries the activated identities.
+- post-activation emitted state carries the activated identities;
+- the BackendPlan declares ingest/storage for every CollectorPlan output;
+- every backend query route references a staged materialization descriptor;
+- Collector reports refer to materialization definitions, not runtime SIDs;
+- no Collector begins new-version export before compatible backend readiness;
+  and
+- failed activation sends an abort/rollback action to every target that staged
+  the candidate version.

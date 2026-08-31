@@ -38,7 +38,7 @@ owns logical parsing, summary alternatives, accuracy reasoning, and selection.
 The ASAPQuery control plane owns deployment capabilities, physical placement,
 windows, transmission, matching runtime plans, and activation.
 
-See the [control-plane design](../../control_plane/docs/README.md).
+See the [control-plane physical-planning design](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/control-plane/physical-planning.md).
 
 ## Ingestion path
 
@@ -60,19 +60,32 @@ coverage, freshness, and state compatibility before execution. If the selected
 logical plan requires exact execution, the request is sent to the configured
 exact backend.
 
-See [plan-aware query execution](../../data_plane/docs/design_docs/query-execution.md).
+See [plan-aware query execution](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/asapquery-backend/query-query-engine.md).
 
 ## State and identity
 
-Three identities remain distinct:
+The three levels are related but must not be collapsed:
 
 - a **plan identity** versions one deployed physical decision;
-- a **materialization identity** describes maintained summary semantics; and
-- a **series identity (`sid`)** identifies one canonical metric series.
+- a **materialization identity** is the stable descriptor/fingerprint for the
+  maintained summary semantics: bound source/filter, summarized value,
+  reduction and retained grouping keys, aggregation family/algorithm and
+  parameters, accuracy contract, window semantics, and compatible state schema;
+  and
+- a **summary series identity (`sid`)** identifies one canonical materialized
+  metric series under that descriptor, including the canonical metric and the
+  concrete retained label values. A raw materialization may likewise allocate
+  a distinct SID for its raw sample series.
+
+For example, “DDSketch over `request_duration_seconds`, grouped by `service`,
+alpha 0.01, one-minute panes” is one materialization definition. Its
+`service=checkout` and `service=payments` outputs are two materialized series
+and therefore have different SIDs. Changing alpha or retained grouping keys
+creates a different materialization definition and cannot reuse either SID.
 
 Conflating them can cause incompatible state reuse. The storage and identity
-contracts are described in [summary storage](../design_docs/summary-storage.md)
-and [series identity](../design_docs/series-identity.md).
+contracts are described in [summary storage](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/asapquery-backend/query-summary-store-engine.md)
+and [series identity](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/cross-cutting/summary-series-id.md).
 
 ## Component failure behavior
 

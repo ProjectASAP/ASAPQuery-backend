@@ -5,6 +5,9 @@
 
 The query backend of the **ASAP** observability system.
 
+Design documents, developer workflows, and user guides are indexed in the
+[ASAPQuery-backend documentation](docs/README.md).
+
 ASAPQuery-backend exposes a **single PromQL HTTP surface** that
 internally dispatches to one of two engines based on the control plane's
 plan and the query's shape:
@@ -233,7 +236,7 @@ that produced the current architecture:
   controller's L3 `intent_algebra` + L4 `sketch_algebra`
 - **JSONL cold-fallback path** — deleted; the configured exact backend is the
   explicit fallback described by
-  [`query-execution.md`](data_plane/docs/design_docs/query-execution.md).
+  [query-engine implementation design](docs/developer_docs/query-engine/design.md).
 - **`StorageBackend::ColdJsonlFallback`** enum variant — removed
 - **Backend-local cost-model line item for cold-tier scan bytes** —
   removed (controller's tier-spanning cost model is the source of
