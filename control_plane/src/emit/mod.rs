@@ -1214,16 +1214,9 @@ mod runtime_tests {
             mk(AggType::Cardinality, Some(SketchType::HLL), Vec::new()),
             WorkloadCharacteristics::default(),
         );
-        // TopK → CountSketch-with-heap. Not plain `Frequency, None`
-        // (capability-matched CMS default) any more — `Frequency`'s
-        // capability-matched default is `AggIntent::Extension`-shaped,
-        // which `asap_aware_mapping::boundary::implementation_for` maps to
-        // `PassThrough` unconditionally (ASAPController#150), so it no
-        // longer contributes a family to the union at all. Use a
-        // `CountSketch` override instead — it re-derives the statistic to
-        // `TopK` (not `Extension`-shaped), so it still binds, and still
-        // exercises "3 distinct capabilities on one metric → union of 3
-        // distinct families".
+        // Frequency → CMS. This deployment's capability catalog exposes
+        // CountSketch only for TopK, so the incompatible override is ignored;
+        // importantly it does not rewrite this workload into TopK.
         store.set(
             METRIC,
             AggRole::Other,
@@ -1245,7 +1238,7 @@ mod runtime_tests {
             BTreeSet::from([
                 SketchKind::DDSketch,
                 SketchKind::Hll,
-                SketchKind::CountSketchWithHeap
+                SketchKind::Cms
             ]),
             "a metric queried by 3 capabilities must accumulate 3 families (UNION, not first-wins)\nmap: {map:?}"
         );

@@ -93,45 +93,18 @@ pub fn bind_workload_typed_with_item_filter(
     // Priority: workload-spec metric-name match → AggType-driven
     // default. The metric-name match owns the demo contract rows; the
     // AggType fallback covers everything else.
-    let (mut statistic, mut accuracy_pref) =
+    let (statistic, accuracy_pref) =
         classify_demo_metric(&w.metric_name).unwrap_or_else(|| match w.aggregations[0] {
             AggType::Quantile => (StatisticClass::Quantile, AccuracyPreference::RelativeError),
             AggType::Cardinality => (StatisticClass::Cardinality, AccuracyPreference::default()),
             AggType::Frequency => (StatisticClass::Frequency, AccuracyPreference::default()),
         });
 
-    // An explicit `sketch_family_override` is authoritative for the FAMILY
-    // — and therefore for the STATISTIC CLASS it answers. The query-derived
-    // statistic above only covers Quantile/Cardinality/Frequency from
-    // `AggType`; a `count(...)` / `topk(...)` / `count_over_time(...)`
-    // query can classify as the wrong class, so without this an HLL /
-    // CountMinSketch / CountSketch override would mismatch the derived
-    // statistic, be rejected by `is_valid_pair` below, and silently fall
-    // back to the catalog default (DDSketch) — the controller would then
-    // emit `family: ddsketch` for an HLL/CMS/CountSketch metric. Re-derive
-    // the statistic from the override whenever the derived one is
-    // incompatible, so the override drives both family and statistic.
-    if let Some(st) = w.sketch_type_override.as_ref() {
-        let ov = SketchKind::from(st.clone());
-        if !is_valid_pair(ov.clone(), statistic) {
-            let (s, ap) = match ov {
-                SketchKind::DDSketch | SketchKind::Kll => {
-                    (StatisticClass::Quantile, AccuracyPreference::RelativeError)
-                }
-                SketchKind::Hll => (StatisticClass::Cardinality, AccuracyPreference::default()),
-                SketchKind::Cms => (StatisticClass::Frequency, AccuracyPreference::default()),
-                SketchKind::CountSketch => (StatisticClass::TopK, AccuracyPreference::default()),
-                // `ov` always comes from `SketchKind::from(SketchType)`
-                // (`w.sketch_type_override` is the legacy 5-family enum),
-                // so only these 5 canonical families are ever reachable.
-                other => unreachable!(
-                    "sketch_type_override resolved to an unsupported SketchKind {other:?}"
-                ),
-            };
-            statistic = s;
-            accuracy_pref = ap;
-        }
-    }
+    // The query/operator owns the statistic. An override may select a
+    // compatible implementation (for example KLL instead of DDSketch for a
+    // quantile), but must never rewrite query semantics merely to make an
+    // incompatible family fit. Contract-row classification above handles the
+    // MVP's count/topk/frequency metrics before this compatibility check.
 
     // SumRateCount → no sketch (raw passthrough). Decline the typed
     // binding so the caller falls back to the legacy raw plan.
@@ -466,30 +439,19 @@ mod tests {
         assert_eq!(plan.agent_config.sketch_type, SketchType::CountSketch);
     }
 
-    /// Regression: an explicit `sketch_family_override` must pin the family
-    /// (and statistic) even when the query's `AggType` classifies as a
-    /// different/incompatible class. Without the override re-deriving the
-    /// statistic, `is_valid_pair` rejected HLL/CMS/CountSketch overrides
-    /// against a Quantile-classified query and fell back to DDSketch, so
-    /// the controller emitted `family: ddsketch` for those metrics.
+    /// An override chooses an implementation; it cannot change a query's
+    /// statistic just to make an incompatible family appear valid.
     #[test]
-    fn override_pins_nonquantile_family_over_misclassified_query() {
+    fn incompatible_override_does_not_rewrite_query_semantics() {
         use crate::emit::extract_root_sketch_kind;
         use planner_types::post_asap::SketchKind;
         for (ov, expect) in [
             (SketchType::DDSketch, SketchKind::DDSketch),
             (SketchType::KLL, SketchKind::Kll),
-            (SketchType::HLL, SketchKind::Hll),
-            // CountSketch override re-derives statistic as TopK (see the
-            // override arm below), and `bind_cms_topk` always binds the
-            // heap-bearing kind for a top-k intent — matches this
-            // fixture's pre-`SketchKind`-split expectation, when
-            // `with_heap: true` was a params flag rather than kind
-            // identity.
-            (SketchType::CountSketch, SketchKind::CountSketchWithHeap),
+            (SketchType::HLL, SketchKind::DDSketch),
+            (SketchType::CountSketch, SketchKind::DDSketch),
+            (SketchType::CountMinSketch, SketchKind::DDSketch),
         ] {
-            // Query classifies as Quantile (the mis-derived case observed
-            // live for count()/topk()/count_over_time()); the override must win.
             let mut w = workload(vec![AggType::Quantile]);
             w.sketch_type_override = Some(ov.clone());
             let pe = bind_workload_typed(&w)
@@ -497,26 +459,9 @@ mod tests {
             assert_eq!(
                 extract_root_sketch_kind(&pe),
                 Some(expect.clone()),
-                "override {ov:?} should pin family {expect:?}, not fall back to DDSketch",
+                "override {ov:?} must not change Quantile semantics",
             );
         }
-
-        // `CountMinSketch` re-derives statistic to `Frequency`, which is
-        // `AggIntent::Extension`-shaped (this deployment's point-frequency
-        // query). `ControlPlaneCostModel::realize_extension`/
-        // `readout_extension` (ASAPController#150) now realize it as
-        // `SketchKind::Cms` — matching `capability_matching::pick_family`'s
-        // own `Frequency -> Cms` mapping — so this override binds like any
-        // other now.
-        let mut w = workload(vec![AggType::Quantile]);
-        w.sketch_type_override = Some(SketchType::CountMinSketch);
-        let pe = bind_workload_typed(&w)
-            .unwrap_or_else(|| panic!("CountMinSketch override should bind (ASAPController#150)"));
-        assert_eq!(
-            extract_root_sketch_kind(&pe),
-            Some(SketchKind::Cms),
-            "CountMinSketch override should pin Cms (Frequency's family), not decline",
-        );
     }
 
     #[test]
