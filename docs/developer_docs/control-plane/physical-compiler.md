@@ -1,16 +1,16 @@
 # Developing the Planner adapter and physical compiler
 
-> Interface status: target public API. Existing migration modules must converge
-> on this boundary.
+> Interface status: implemented MVP API in
+> `control_plane::physical::compiler`.
 
 ## Current implementation boundary
 
-The production path has not yet converged on the public interfaces below. It
-currently consumes ASAPPlanner types pinned in `control_plane/Cargo.toml`, then
-uses `physical::colored_dag::StageAllocator`, `ThreeStageEmitter`, and
-`backend_plan::from_stage_config` to produce agent YAML and `BackendPlan`.
-Callers must not treat the target `PlanningRequest`, `PhysicalCompiler`, or
-`CompiledPlanBundle` examples below as implemented Rust APIs.
+The compiler consumes ASAPPlanner types pinned to revision `3afcba6`, selects
+from Planner's legal candidate space with backend-owned cost and evidence
+inputs, and emits one `CompiledPlanBundle`. The bundle contains a CollectorPlan
+for every target collector and the matching BackendPlan. Legacy
+`StageAllocator`/`ThreeStageEmitter` paths remain for older publication flows;
+they are not a second semantic planner.
 
 ASAPPlanner owns logical semantics and summary selection. In particular, a
 deployment override may choose only a family compatible with the selected
@@ -27,17 +27,18 @@ The control plane has three public layers:
 PlanningRequest
       |
       v
-PlannerAdapter ----------> SelectedLogicalPlan
-                                  |
-                                  v
+ASAPPlanner candidate selection
+      |
+      v
 PhysicalCompiler -------> CompiledPlanBundle
                             |             |
                             v             v
                        CollectorPlan   BackendPlan
 ```
 
-- **Planner adapter** owns the typed call to ASAPPlanner. It supplies the whole
-  workload and receives one selected logical plan without copying Planner IR.
+- **Planner selection boundary** is
+  `planner_selection::select_summary_with_evidence`. It enumerates Planner's
+  candidates and commits only a legal candidate.
 - **Physical compiler** adds backend-owned placement, windows, transport, and
   runtime capabilities without changing logical semantics.
 - **Plan bundle** is the only output passed to publication. CollectorPlan and
@@ -49,28 +50,15 @@ remain public ASAPPlanner interfaces. Runtime publication is documented in
 
 ## 2. Public interfaces and definitions
 
-### Planner adapter
-
-```rust
-pub trait PlannerAdapter {
-    type Error;
-
-    fn select(
-        &self,
-        request: PlanningRequest,
-    ) -> Result<SelectedLogicalPlan, Self::Error>;
-}
-```
+### Planning request
 
 `PlanningRequest` is backend-owned request context around Planner's canonical
-workload value:
+per-query IR:
 
 ```rust
 pub struct PlanningRequest {
-    pub workload: asap_planner::Workload,
-    pub schema: asap_planner::SchemaCatalog,
-    pub constraints: asap_planner::PlanningConstraints,
-    pub cost_inputs: asap_planner::CostInputs,
+    pub queries: Vec<PlanningQuery>,
+    pub evidence: HashMap<String, TopKMembershipEvidence>,
     pub planner_revision: String,
 }
 ```
@@ -79,20 +67,21 @@ Input definitions:
 
 | Field | Definition |
 | --- | --- |
-| `workload` | Complete workload; shared queries must not be split into independent calls. |
-| `schema` | Source/label/type information required to bind queries. |
-| `constraints` | Accuracy and logical requirements supplied by the caller. |
-| `cost_inputs` | Measured/declared logical cost inputs; unknown values stay unknown. |
+| `queries` | Canonical `QueryExpr`, source, window, grouping labels, accuracy, and stable query ID. |
+| `evidence` | Optional typed TopK membership certificates keyed by query ID. |
 | `planner_revision` | Immutable Planner build/revision used for reproducibility. |
 
-`SelectedLogicalPlan` wraps Planner's public selected post-ASAP workload plan
-and correlation metadata; it does not define another DAG:
+TopK evidence is accepted only when its selected lower bound is strictly above
+the excluded upper bound, its failure probability is valid, its source is
+non-empty, and its observation is fresh under `DeploymentEnvironment`.
 
 ```rust
-pub struct SelectedLogicalPlan {
-    pub workload_plan: asap_planner::SelectedWorkloadPlan,
-    pub planner_revision: String,
-    pub query_ids: Vec<String>,
+pub struct TopKMembershipEvidence {
+    pub selected_lower_bound: f64,
+    pub excluded_upper_bound: f64,
+    pub interval_failure_probability: f64,
+    pub observed_at_unix_ms: u64,
+    pub source: String,
 }
 ```
 
@@ -102,37 +91,26 @@ planning from each implementing their own query-to-summary mapping.
 ### Physical compiler
 
 ```rust
-pub trait PhysicalCompiler {
-    type Error;
-
-    fn compile(
+impl PhysicalCompiler {
+    pub fn compile(
         &self,
-        selected: SelectedLogicalPlan,
+        request: PlanningRequest,
         environment: DeploymentEnvironment,
-        policy: RuntimePolicy,
-    ) -> Result<CompiledPlanBundle, Self::Error>;
+    ) -> Result<CompiledPlanBundle, CompileError>;
 }
 ```
 
 ```rust
 pub struct DeploymentEnvironment {
-    pub topology: DeploymentTopology,
-    pub collectors: Vec<CollectorTarget>,
-    pub backend: BackendTarget,
+    pub collector_ids: Vec<String>,
     pub capability_snapshot_id: String,
-}
-
-pub struct RuntimePolicy {
-    pub activation: Timestamp,
-    pub expiry: Option<Timestamp>,
-    pub freshness: FreshnessPolicy,
-    pub retention: RetentionPolicy,
-    pub transmission: TransmissionPolicy,
+    pub observed_at_unix_ms: u64,
+    pub max_evidence_age_ms: u64,
 }
 
 pub struct CompiledPlanBundle {
     pub envelope: PlanEnvelope,
-    pub collector_plans: Vec<CollectorPlan>,
+    pub collector_plans: Vec<CollectorPlan>, // complete per-target projections
     pub backend_plan: BackendPlan,
 }
 ```
@@ -141,15 +119,15 @@ Supporting public types:
 
 | Type | Definition |
 | --- | --- |
-| `DeploymentTopology` | Runtime stages, network relationships, and isolation boundaries available for placement. |
-| `CollectorTarget` | Collector identity, edge assignment, endpoint reference, and advertised capability snapshot. |
-| `BackendTarget` | Data-plane identity, endpoint reference, storage routes, and advertised capabilities. |
-| `FreshnessPolicy` | Maximum readiness lag, watermark, and allowed-lateness requirements. |
-| `RetentionPolicy` | Duration and lifecycle rules for active/draining materializations. |
-| `TransmissionPolicy` | Allowed raw/full/delta modes, cadence, encoding, and checkpoint limits. |
-| `PlanEnvelope` | Shared `plan_id`, `plan_version`, activation/expiry, backend compatibility, and Planner revision. |
-| `CollectorPlan` | Versioned public YAML execution contract owned by ASAPCollector. |
+| `DeploymentEnvironment` | Target collector IDs, capability snapshot identity, planning time, and evidence freshness policy. |
+| `PlanEnvelope` | Shared deterministic `plan_id`, generation time, capability snapshot, and Planner revision. |
+| `CollectorPlan` | Serializable execution projection consumed by ASAPCollector. |
 | `BackendPlan` | Versioned public data-plane materialization/routing contract defined in this repository. |
+
+Current MVP limits are explicit: time-series sources and sketch
+materializations are supported; table sources and non-sketch selected families
+return `CompileError`. Runtime activation/expiry and richer topology placement
+remain publication-layer work and are not claimed by this compiler API.
 
 Output definitions:
 
