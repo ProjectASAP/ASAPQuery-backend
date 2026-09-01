@@ -157,12 +157,12 @@ fn root_scan_schema(qe: &QueryExpr) -> Option<&crate::intent_algebra::Schema> {
         | QueryExpr::TimeRange { child, .. }
         | QueryExpr::TimeShift { child, .. }
         | QueryExpr::Aggregate { child, .. }
-        | QueryExpr::Distinct { child, .. }
+        | QueryExpr::Dedup { child, .. }
         | QueryExpr::Project { child, .. }
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. }
-        | QueryExpr::Subquery { child, .. } => root_scan_schema(child),
-        QueryExpr::Merge { children } => children.iter().find_map(root_scan_schema),
+        | QueryExpr::PromqlSubquery { child, .. } => root_scan_schema(child),
+        QueryExpr::Concat { children } => children.iter().find_map(root_scan_schema),
         QueryExpr::Join { left, right, .. }
         | QueryExpr::SetOp { left, right, .. }
         | QueryExpr::BinaryOp {
@@ -271,8 +271,8 @@ impl QeCollector {
                 }
                 self.visit(child, schema);
             }
-            QueryExpr::Distinct { child, .. } => self.visit(child, schema),
-            QueryExpr::Merge { children } => {
+            QueryExpr::Dedup { child, .. } => self.visit(child, schema),
+            QueryExpr::Concat { children } => {
                 for c in children {
                     self.visit(c, schema);
                 }
@@ -280,7 +280,7 @@ impl QeCollector {
             QueryExpr::Project { child, .. }
             | QueryExpr::Sort { child, .. }
             | QueryExpr::Limit { child, .. }
-            | QueryExpr::Subquery { child, .. } => self.visit(child, schema),
+            | QueryExpr::PromqlSubquery { child, .. } => self.visit(child, schema),
             QueryExpr::Join { left, right, .. }
             | QueryExpr::SetOp { left, right, .. }
             | QueryExpr::BinaryOp {
@@ -518,7 +518,7 @@ mod tests {
         let expr =
             parse_query_expr_canonical("avg_over_time(cpu_seconds_total[10m])", ACC).unwrap();
         match expr {
-            CQueryExpr::Aggregate { child, .. } => match *child {
+            CQueryExpr::Aggregate { child, .. } => match (*child).clone() {
                 CQueryExpr::TimeRange { child, .. } => {
                     assert!(matches!(*child, CQueryExpr::Scan { .. }));
                 }

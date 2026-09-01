@@ -35,9 +35,9 @@
 
 #![allow(dead_code)]
 
-use asap_aware_mapping::boundary::Implementation;
 use asap_aware_mapping::CostModel;
-use planner_types::post_asap::{SketchKind, SketchParams, SketchQuery};
+use asap_aware_mapping::Implementation;
+use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams, SketchQuery};
 use planner_types::pre_asap::expr_ir::ColumnRef;
 
 use crate::intent_algebra::agg_intent::FREQUENCY_EXT_KIND;
@@ -180,7 +180,21 @@ impl CostModel for ControlPlaneCostModel {
                 }
                 v
             }
-            AggIntent::TopK { .. } => self.topk_family_order(&intent_accuracy(intent)),
+            AggIntent::TopK { .. } => {
+                let preferred = self.topk_family_order(&intent_accuracy(intent));
+                let mut ranked = Vec::with_capacity(candidates.len());
+                for kind in preferred {
+                    if candidates.contains(&kind) && !ranked.contains(&kind) {
+                        ranked.push(kind);
+                    }
+                }
+                for kind in candidates {
+                    if !ranked.contains(kind) {
+                        ranked.push(kind.clone());
+                    }
+                }
+                ranked
+            }
             // Cardinality → Hll, Count → Cms: control_plane only ever
             // binds one family for each; asap-plan's static order already
             // puts it first (`summary_candidates`), nothing to reorder.
@@ -225,9 +239,8 @@ impl CostModel for ControlPlaneCostModel {
                     // reaches `bind_summary_with` upstream — see
                     // `implementation_for_with`'s `Exact => exact_realization`
                     // arm), kept as a safe fallback rather than a panic.
-                    return asap_aware_mapping::boundary::default_size_params(
-                        kind, intent, eps, delta,
-                    );
+                    return asap_aware_mapping::DefaultCostModel
+                        .size_params(kind, intent, eps, delta);
                 };
                 match kind {
                     SketchKind::Kll => SketchParams::Kll {
@@ -244,7 +257,7 @@ impl CostModel for ControlPlaneCostModel {
                         SketchParams::Cms { width: w, depth: d }
                     }
                     other => {
-                        asap_aware_mapping::boundary::default_size_params(other, intent, eps, delta)
+                        asap_aware_mapping::DefaultCostModel.size_params(other, intent, eps, delta)
                     }
                 }
             }
@@ -281,13 +294,13 @@ impl CostModel for ControlPlaneCostModel {
             return Implementation::PassThrough;
         };
         let (width, depth) = Self::cms_width_depth(eps, delta);
-        Implementation::Sketch {
-            kind: SketchKind::Cms,
-            params: SketchParams::Cms {
+        Implementation::Sketch(planner_types::post_asap::SketchKind::new(
+            SketchKind::Cms,
+            SketchParams::Cms {
                 width: width.next_power_of_two(),
                 depth,
             },
-        }
+        ))
     }
 
     /// Build the `SketchQuery` readout for `Frequency`. `item_label`/
@@ -346,8 +359,13 @@ impl ForcedFamilyCostModel {
 }
 
 impl CostModel for ForcedFamilyCostModel {
-    fn rank_candidates(&self, _intent: &AggIntent, _candidates: &[SketchKind]) -> Vec<SketchKind> {
-        vec![self.forced.clone()]
+    fn rank_candidates(&self, intent: &AggIntent, candidates: &[SketchKind]) -> Vec<SketchKind> {
+        let mut ranked = self.inner.rank_candidates(intent, candidates);
+        if let Some(pos) = ranked.iter().position(|kind| kind == &self.forced) {
+            let forced = ranked.remove(pos);
+            ranked.insert(0, forced);
+        }
+        ranked
     }
 
     fn size_params(
@@ -357,7 +375,11 @@ impl CostModel for ForcedFamilyCostModel {
         eps: f64,
         delta: f64,
     ) -> SketchParams {
-        self.inner.size_params(kind, intent, eps, delta)
+        // Latest Planner validates the selected candidate against its own
+        // accuracy algebra.  Reuse its sizing formula for an explicitly
+        // forced family so the override changes only algorithm preference,
+        // never weakens the requested guarantee.
+        asap_aware_mapping::DefaultCostModel.size_params(kind, intent, eps, delta)
     }
 
     // `realize_extension`/`readout_extension` delegate to `inner` rather
@@ -428,7 +450,16 @@ impl ObservedFamilyCostModel {
 impl CostModel for ObservedFamilyCostModel {
     fn rank_candidates(&self, intent: &AggIntent, candidates: &[SketchKind]) -> Vec<SketchKind> {
         match &self.observed {
-            Some((kind, _)) if candidates.contains(kind) => vec![kind.clone()],
+            Some((kind, _)) if candidates.contains(kind) => {
+                let mut ranked = self.inner.rank_candidates(intent, candidates);
+                let pos = ranked
+                    .iter()
+                    .position(|candidate| candidate == kind)
+                    .expect("observed candidate was present before ranking");
+                let observed = ranked.remove(pos);
+                ranked.insert(0, observed);
+                ranked
+            }
             _ => self.inner.rank_candidates(intent, candidates),
         }
     }
@@ -551,7 +582,10 @@ mod tests {
             &intent,
             &[SketchKind::CmsWithHeap, SketchKind::CountSketchWithHeap],
         );
-        assert_eq!(ranked, vec![SketchKind::CountSketchWithHeap]);
+        assert_eq!(
+            ranked,
+            vec![SketchKind::CountSketchWithHeap, SketchKind::CmsWithHeap]
+        );
     }
 
     #[test]

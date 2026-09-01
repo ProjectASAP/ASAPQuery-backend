@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::time::Duration;
 
 // Sub-modules — formerly siblings of `planner/cost_model.rs` (now
 // `optimizer/cost/mod.rs`); the 2026-05 refactor pulled each into a
@@ -333,6 +332,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn workload(aggs: Vec<AggType>) -> QueryWorkload {
         QueryWorkload {

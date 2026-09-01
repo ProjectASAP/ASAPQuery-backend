@@ -50,7 +50,7 @@
 
 #![allow(dead_code)]
 
-use planner_types::post_asap::SketchKind;
+use planner_types::post_asap::SketchAlgorithm as SketchKind;
 
 /// Query intent the user is expressing — abstracted away from the L1
 /// language (PromQL `quantile_over_time`, SQL `PERCENTILE_CONT`, etc.) and

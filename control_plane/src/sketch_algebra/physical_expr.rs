@@ -46,7 +46,7 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use planner_types::post_asap::{SketchKind, SketchParams, SummaryNode};
+use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams, SummaryNode};
 
 use crate::types_v2::BindingName;
 
@@ -196,7 +196,7 @@ mod tests {
     fn windowed_scan() -> QueryExpr {
         QueryExpr::TimeRange {
             range: Duration::from_secs(300),
-            child: Box::new(ts_scan()),
+            child: Rc::new(ts_scan()),
         }
     }
 
@@ -211,9 +211,9 @@ mod tests {
             }],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(windowed_scan()),
+            child: Rc::new(windowed_scan()),
         };
-        let node = asap_aware_mapping::bind::implement_tree(&q).expect("implements");
+        let node = crate::planner_selection::select_summary_default(&q).expect("implements");
         let e = PhysicalExpr::committed(node);
         match e {
             PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
@@ -231,13 +231,16 @@ mod tests {
                             assert_eq!(
                                 family,
                                 &planner_types::post_asap::SummaryFamilyType::Sketch(
-                                    SketchKind::Kll,
-                                    SketchParams::Kll { k: 200 }
+                                    planner_types::post_asap::SketchKind::new(
+                                        SketchKind::Kll,
+                                        SketchParams::Kll { k: 269 },
+                                    ),
+                                    planner_types::post_asap::GroupingStrategy::default(),
                                 )
                             );
                             assert!(matches!(
                                 child.expr,
-                                planner_types::post_asap::SummaryExpr::Logical(_)
+                                planner_types::post_asap::SummaryExpr::KeepPreAsap(_)
                             ));
                         }
                         other => panic!("expected SummaryAgg, got {other:?}"),

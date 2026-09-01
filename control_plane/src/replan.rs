@@ -655,7 +655,7 @@ impl Replanner {
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendStageConfig,
         };
-        use planner_types::post_asap::{SketchKind, SketchParams};
+        use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams};
         let window_secs = workload.time_window.as_secs().max(1);
         Some(BackendStageConfig {
             aggregations: vec![BackendAggregation {
@@ -1254,7 +1254,7 @@ mod tests {
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendStageConfig,
         };
-        use planner_types::post_asap::{SketchKind, SketchParams};
+        use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams};
 
         let (url, hits) = start_repost_mock().await;
         let client = StdArc::new(BackendClient::new(url));

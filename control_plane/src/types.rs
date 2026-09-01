@@ -207,9 +207,9 @@ impl std::fmt::Display for SketchType {
 // approximate-sketch families (no exact-accumulator kind is ever passed
 // here, so the post-split `SketchKind` — never `ExactKind` — is the right
 // upstream type to convert from/to).
-impl From<planner_types::post_asap::SketchKind> for SketchType {
-    fn from(k: planner_types::post_asap::SketchKind) -> Self {
-        use planner_types::post_asap::SketchKind;
+impl From<planner_types::post_asap::SketchAlgorithm> for SketchType {
+    fn from(k: planner_types::post_asap::SketchAlgorithm) -> Self {
+        use planner_types::post_asap::SketchAlgorithm as SketchKind;
         match k {
             SketchKind::Kll => SketchType::KLL,
             SketchKind::DDSketch => SketchType::DDSketch,
@@ -226,9 +226,9 @@ impl From<planner_types::post_asap::SketchKind> for SketchType {
 
 /// Inverse of `From<SketchKind> for SketchType`. Round-trippable for the 5
 /// canonical families: `SketchKind::from(SketchType::from(k)) == k`.
-impl From<SketchType> for planner_types::post_asap::SketchKind {
+impl From<SketchType> for planner_types::post_asap::SketchAlgorithm {
     fn from(t: SketchType) -> Self {
-        use planner_types::post_asap::SketchKind;
+        use planner_types::post_asap::SketchAlgorithm as SketchKind;
         match t {
             SketchType::KLL => SketchKind::Kll,
             SketchType::DDSketch => SketchKind::DDSketch,

@@ -146,7 +146,7 @@ pub fn execute<E: SummaryExecutor>(
     exec: &E,
 ) -> Result<ExecOutcome<E>, ExecError<E::Error>> {
     match &node.expr {
-        SummaryExpr::Logical(qe) => Ok(ExecOutcome::Value(vec![(
+        SummaryExpr::KeepPreAsap(qe) => Ok(ExecOutcome::Value(vec![(
             E::GroupKey::default(),
             exec.logical(qe)?,
         )])),
@@ -156,6 +156,7 @@ pub fn execute<E: SummaryExecutor>(
             family,
             col,
             reduction,
+            ..
         } => {
             let tagged = exec.find_candidates(family, col, reduction, child)?;
             if tagged.is_empty() {
@@ -301,8 +302,9 @@ mod tests {
 
     fn logical_node() -> Rc<SummaryNode> {
         Rc::new(SummaryNode {
-            expr: SummaryExpr::Logical(Box::new(scan())),
+            expr: SummaryExpr::KeepPreAsap(Rc::new(scan())),
             schema: lift(vec!["ts", "value"]),
+            guarantee: None,
         })
     }
 
@@ -325,8 +327,10 @@ mod tests {
                 family,
                 col: ColumnRef::SampleValue,
                 reduction,
+                grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
             schema: lift(vec!["value"]),
+            guarantee: None,
         })
     }
 
@@ -337,6 +341,7 @@ mod tests {
                 query,
             },
             schema: lift(vec!["value"]),
+            guarantee: None,
         })
     }
 
@@ -344,6 +349,7 @@ mod tests {
         Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryMerge { children },
             schema: lift(vec!["value"]),
+            guarantee: None,
         })
     }
 
@@ -440,8 +446,13 @@ mod tests {
     }
 
     fn kll() -> SummaryFamilyType {
-        use planner_types::post_asap::{SketchKind, SketchParams};
-        SummaryFamilyType::Sketch(SketchKind::Kll, SketchParams::Kll { k: 200 })
+        use planner_types::post_asap::{
+            GroupingStrategy, SketchAlgorithm, SketchKind, SketchParams,
+        };
+        SummaryFamilyType::Sketch(
+            SketchKind::new(SketchAlgorithm::Kll, SketchParams::Kll { k: 200 }),
+            GroupingStrategy::default(),
+        )
     }
 
     fn sum() -> SummaryFamilyType {

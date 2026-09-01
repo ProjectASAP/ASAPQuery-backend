@@ -38,7 +38,7 @@
 //! `storage_engines/sketch_db/query/sketch_reducer.rs`. Restored in full.
 
 use asap_aware_mapping::{Implementation, Matcher};
-use planner_types::post_asap::SketchKind;
+use planner_types::post_asap::SketchAlgorithm as SketchKind;
 
 /// [`Matcher`] impl covering pure sketch-family compatibility. See the
 /// module doc for what this deliberately does not cover.
@@ -78,10 +78,9 @@ impl Matcher for SummaryFamilyMatcher {
                 Implementation::ExactAggregate { kind: required, .. },
                 Implementation::ExactAggregate { kind: have, .. },
             ) => required == have,
-            (
-                Implementation::Sketch { kind: required, .. },
-                Implementation::Sketch { kind: have, .. },
-            ) => sketch_family_satisfied(required, have),
+            (Implementation::Sketch(required), Implementation::Sketch(have)) => {
+                sketch_family_satisfied(required.algorithm(), have.algorithm())
+            }
             _ => false,
         }
     }
@@ -189,7 +188,7 @@ mod tests {
 
     fn sketch(kind: SketchKind) -> Implementation {
         let params = params_for(&kind);
-        Implementation::Sketch { kind, params }
+        Implementation::Sketch(planner_types::post_asap::SketchKind::new(kind, params))
     }
 
     fn accumulator(kind: ExactKind) -> Implementation {

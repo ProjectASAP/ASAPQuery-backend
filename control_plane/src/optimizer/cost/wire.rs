@@ -31,7 +31,7 @@
 //! agent telemetry once the OnlineMetricsStore feeds back into the
 //! planner.
 
-use planner_types::post_asap::SketchKind;
+use planner_types::post_asap::SketchAlgorithm as SketchKind;
 
 // ── Wire-cost table ──────────────────────────────────────────────────────────
 

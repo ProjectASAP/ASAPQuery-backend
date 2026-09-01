@@ -724,7 +724,7 @@ mod tests {
             AggregationInput, BackendAggregation, BackendReadout,
         };
         use planner_types::post_asap::SketchQuery;
-        use planner_types::post_asap::{SketchKind, SketchParams};
+        use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams};
         BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 aggregation_id: agg_id.to_string(),

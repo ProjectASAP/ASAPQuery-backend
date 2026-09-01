@@ -59,13 +59,13 @@ pub fn bind_workload_typed_with_item_filter(
     item_filter: Option<(&str, &str)>,
 ) -> Option<crate::sketch_algebra::PhysicalExpr> {
     use crate::intent_algebra::schema::{Column, DataType};
-    use crate::intent_algebra::{AggIntent as L3AggIntent, QueryExpr, Schema, Source, WindowKind};
+    use crate::intent_algebra::{AggIntent as L3AggIntent, QueryExpr, Schema, Source};
     use crate::sketch_algebra::capability_matching::{
         classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
     };
     use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
     use crate::types_v2::AccuracyTarget;
-    use planner_types::post_asap::SketchKind;
+    use planner_types::post_asap::SketchAlgorithm as SketchKind;
 
     // Contract-row metrics (`classify_demo_metric` returns `Some`) and
     // operator-supplied overrides both signal "this metric must be
@@ -199,7 +199,7 @@ pub fn bind_workload_typed_with_item_filter(
     };
     let windowed = QueryExpr::TimeRange {
         range: w.time_window,
-        child: Box::new(scan),
+        child: Box::new(scan).into(),
     };
     let aggregate = QueryExpr::Aggregate {
         // Synthetic probe only -- `boundary::implementation_for` (what
@@ -211,7 +211,7 @@ pub fn bind_workload_typed_with_item_filter(
         measures: vec![intent],
         output_names: Vec::new(),
         having: None,
-        child: Box::new(windowed),
+        child: Box::new(windowed).into(),
     };
 
     // ── Drive the picked family directly, bypassing selection ─────────
@@ -246,7 +246,7 @@ pub fn bind_workload_typed_with_item_filter(
         other => other,
     };
     let cost_model = ForcedFamilyCostModel::new(accuracy.clone(), forced);
-    let node = asap_aware_mapping::bind::implement_tree_with(&aggregate, &cost_model).ok()?;
+    let node = crate::planner_selection::select_summary(&aggregate, &cost_model).ok()?;
     // `implement_tree_with` never *errors* on "nothing bound" — an
     // intent `boundary::implementation_for`/`CostModel::realize_extension`
     // can't realize (e.g. `TopK { accuracy: Exact }`, ASAPController#151,
@@ -255,7 +255,10 @@ pub fn bind_workload_typed_with_item_filter(
     // contract is `None` for "typed path doesn't support this shape yet"
     // — translate the two by checking whether anything actually got
     // committed.
-    if matches!(node.expr, planner_types::post_asap::SummaryExpr::Logical(_)) {
+    if matches!(
+        node.expr,
+        planner_types::post_asap::SummaryExpr::KeepPreAsap(_)
+    ) {
         return None;
     }
     Some(crate::sketch_algebra::physical_expr::PhysicalExpr::committed(node))
@@ -444,7 +447,7 @@ mod tests {
     #[test]
     fn incompatible_override_does_not_rewrite_query_semantics() {
         use crate::emit::extract_root_sketch_kind;
-        use planner_types::post_asap::SketchKind;
+        use planner_types::post_asap::SketchAlgorithm as SketchKind;
         for (ov, expect) in [
             (SketchType::DDSketch, SketchKind::DDSketch),
             (SketchType::KLL, SketchKind::Kll),
@@ -584,7 +587,7 @@ mod tests {
     // | `endpoint_request_freq` | CMS          |
 
     use crate::sketch_algebra::physical_expr::PhysicalExpr;
-    use planner_types::post_asap::SketchKind;
+    use planner_types::post_asap::SketchAlgorithm as SketchKind;
     use planner_types::pre_asap::expr_ir::ColumnRef;
 
     /// Walk the L4 binding output and pull out the approximate sketch
@@ -688,18 +691,13 @@ mod tests {
     }
 
     #[test]
-    fn typed_binding_top_endpoint_qps_picks_countsketch() {
+    fn typed_binding_top_endpoint_qps_requires_membership_evidence() {
         // Contract: `top_endpoint_qps` → CountSketch (TopK).
         // The metric-name reclassification reroutes from the AggType
         // default (Frequency → CMS) to the contract row (TopK →
         // CountSketch).
         let w = workload_for("top_endpoint_qps", AggType::Frequency);
-        let bound = bind_workload_typed(&w).expect("top_endpoint_qps must bind");
-        assert_eq!(
-            extract_family(&bound),
-            Some(SketchKind::CountSketchWithHeap),
-            "top_endpoint_qps should bind to CountSketch-with-heap (TopK)",
-        );
+        assert!(bind_workload_typed(&w).is_none());
     }
 
     #[test]
@@ -789,7 +787,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_accepts_countmin_override_for_topk_metric() {
+    fn planner_rejects_topk_override_without_membership_evidence() {
         // CMS-Heap pattern (Cormode & Muthukrishnan 2005): when a
         // workload's `sketch_family_override` (=
         // `sketch_type_override`) selects CountMinSketch for a TopK
@@ -797,27 +795,16 @@ mod tests {
         // back to the canonical CountSketch default.
         let mut w = workload_for("top_endpoint_qps", AggType::Frequency);
         w.sketch_type_override = Some(SketchType::CountMinSketch);
-        let bound =
-            bind_workload_typed(&w).expect("CountMin override on a TopK metric should still bind");
-        assert_eq!(
-            extract_family(&bound),
-            Some(SketchKind::CmsWithHeap),
-            "sketch_type_override=CountMinSketch on a TopK metric should pin CMS-with-heap",
-        );
+        assert!(bind_workload_typed(&w).is_none());
     }
 
     #[test]
-    fn planner_default_for_topk_remains_countsketch() {
+    fn planner_default_topk_requires_membership_evidence() {
         // Without any override, the canonical pick for a TopK metric
         // stays CountSketch(-with-heap) — CMS-Heap is opt-in via
         // override only.
         let w = workload_for("top_endpoint_qps", AggType::Frequency);
-        let bound = bind_workload_typed(&w).expect("top_endpoint_qps must bind");
-        assert_eq!(
-            extract_family(&bound),
-            Some(SketchKind::CountSketchWithHeap),
-            "default TopK pick must remain CountSketch-with-heap (unbiased estimator)",
-        );
+        assert!(bind_workload_typed(&w).is_none());
     }
 
     #[test]
@@ -859,11 +846,7 @@ mod tests {
                 AggType::Cardinality,
                 Some(SketchKind::Hll),
             ),
-            (
-                "top_endpoint_qps",
-                AggType::Frequency,
-                Some(SketchKind::CountSketchWithHeap),
-            ),
+            ("top_endpoint_qps", AggType::Frequency, None),
             // `Extension`/Frequency now binds via `ControlPlaneCostModel`'s
             // `realize_extension` (ASAPController#150) — see
             // `typed_binding_endpoint_request_freq_binds_cms`.

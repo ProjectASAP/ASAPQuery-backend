@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 
 use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, EdgeStageConfig, ExportTarget};
 use crate::physical::colored_dag::stage_id::StageId;
-use planner_types::post_asap::{SketchKind, SketchParams};
+use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams};
 
 /// Default URL for Prometheus's native OTLP HTTP receiver.
 /// Matches `super::stage_config::emit_edge_yaml`'s placeholder so the
@@ -357,7 +357,7 @@ fn sketch_kind_tag(kind: &SketchKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, PrometheusArchiveMetric};
-    use planner_types::post_asap::{SketchKind, SketchParams};
+    use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams};
 
     /// Minimal struct-stub used to validate the emitted DAG parses as the
     /// otap-dataflow schema. We don't pull in the otap-df-config crate

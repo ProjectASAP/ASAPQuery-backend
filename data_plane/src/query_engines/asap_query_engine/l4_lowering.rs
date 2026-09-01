@@ -40,7 +40,9 @@
 
 use std::rc::Rc;
 
-use planner_types::post_asap::{SketchKind, SketchParams, SummaryExpr, SummaryNode};
+use planner_types::post_asap::{
+    SketchAlgorithm as SketchKind, SketchParams, SummaryExpr, SummaryNode,
+};
 
 use control_plane::sketch_algebra::capability::{OuterFn, SketchKindHandle};
 use control_plane::sketch_algebra::cost_model::ObservedFamilyCostModel;
@@ -280,7 +282,7 @@ pub fn lower_promql_to_l4node(
 
     match physical {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => {
-            if matches!(node.expr, SummaryExpr::Logical(_)) {
+            if matches!(node.expr, SummaryExpr::KeepPreAsap(_)) {
                 Err(LoweringSkip::NotRealized)
             } else {
                 Ok(node)
@@ -381,7 +383,7 @@ mod tests {
         )
         .expect("Frequency intent must realize via bind_query_expr/ControlPlaneCostModel");
         assert!(
-            !matches!(node.expr, SummaryExpr::Logical(_)),
+            !matches!(node.expr, SummaryExpr::KeepPreAsap(_)),
             "expected a real SummaryAgg/SummaryEstimate binding, got Logical (the gap \
              this module exists to avoid): {:?}",
             node.expr
@@ -419,7 +421,7 @@ mod tests {
         use std::collections::HashMap;
 
         fn register_kll(idx: &SketchStore, metric: &str) {
-            let cfg = SketchConfig::Kll { k: 200 };
+            let cfg = SketchConfig::Kll { k: 269 };
             idx.register(SketchInstanceMetadata {
                 sid: 1,
                 metric_name: metric.to_string(),
@@ -485,9 +487,9 @@ mod tests {
             match &node.expr {
                 SummaryExpr::SummaryEstimate { summary_input, .. } => match &summary_input.expr {
                     SummaryExpr::SummaryAgg {
-                        family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, params),
+                        family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, _),
                         ..
-                    } => (kind.clone(), params.clone()),
+                    } => (kind.algorithm().clone(), kind.params().clone()),
                     other => panic!("expected a Sketch SummaryAgg, got {other:?}"),
                 },
                 other => panic!("expected SummaryEstimate, got {other:?}"),

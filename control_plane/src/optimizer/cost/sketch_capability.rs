@@ -22,7 +22,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use planner_types::post_asap::SketchKind;
+use planner_types::post_asap::SketchAlgorithm as SketchKind;
 
 /// Performance and capability profile for a single sketch family.
 ///

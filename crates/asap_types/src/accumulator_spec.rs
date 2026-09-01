@@ -210,7 +210,24 @@ impl From<planner_types::post_asap::ExactParams> for SummaryParams {
 /// known-sketch. See the module doc for why the flat type exists.
 impl From<planner_types::post_asap::SketchKind> for SummaryKind {
     fn from(k: planner_types::post_asap::SketchKind) -> Self {
-        use planner_types::post_asap::SketchKind as K;
+        use planner_types::post_asap::SketchAlgorithm as K;
+        match k.algorithm() {
+            K::Kll => SummaryKind::Kll,
+            K::Cms => SummaryKind::Cms,
+            K::Hll => SummaryKind::Hll,
+            K::DDSketch => SummaryKind::DDSketch,
+            K::CmsWithHeap => SummaryKind::CmsWithHeap,
+            K::Kmv => SummaryKind::Kmv,
+            K::Theta => SummaryKind::Theta,
+            K::CountSketch => SummaryKind::CountSketch,
+            K::CountSketchWithHeap => SummaryKind::CountSketchWithHeap,
+        }
+    }
+}
+
+impl From<planner_types::post_asap::SketchAlgorithm> for SummaryKind {
+    fn from(k: planner_types::post_asap::SketchAlgorithm) -> Self {
+        use planner_types::post_asap::SketchAlgorithm as K;
         match k {
             K::Kll => SummaryKind::Kll,
             K::Cms => SummaryKind::Cms,
@@ -231,8 +248,8 @@ impl From<planner_types::post_asap::SketchKind> for SummaryKind {
 /// which have no `SketchKind` equivalent -- the inverse of the widening
 /// [`From`] impl above, fallible because that direction isn't total.
 impl SummaryKind {
-    pub fn as_sketch_kind(&self) -> Option<planner_types::post_asap::SketchKind> {
-        use planner_types::post_asap::SketchKind as K;
+    pub fn as_sketch_kind(&self) -> Option<planner_types::post_asap::SketchAlgorithm> {
+        use planner_types::post_asap::SketchAlgorithm as K;
         Some(match self {
             SummaryKind::Kll => K::Kll,
             SummaryKind::Cms => K::Cms,

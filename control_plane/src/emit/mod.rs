@@ -50,7 +50,7 @@ use crate::sketch_algebra::physical_expr::L4Plan;
 use crate::sketch_algebra::PhysicalExpr;
 use crate::store::WorkloadStore;
 use anyhow::Result;
-use planner_types::post_asap::{SketchKind, SummaryExpr, SummaryNode};
+use planner_types::post_asap::{SketchAlgorithm as SketchKind, SummaryExpr, SummaryNode};
 use std::rc::Rc;
 
 /// Phase ε.1.5 — which edge runtime an agent identifies as.
@@ -315,7 +315,7 @@ fn extract_from_node(node: &Rc<SummaryNode>) -> Option<SketchKind> {
         SummaryExpr::SummaryAgg {
             family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, _),
             ..
-        } => Some(kind.clone()),
+        } => Some(kind.algorithm().clone()),
         // An exact accumulator has no sketch family beneath it (its own
         // child is always a plain `Logical` leaf) — same as the old
         // `ExactAgg` case.
@@ -327,7 +327,7 @@ fn extract_from_node(node: &Rc<SummaryNode>) -> Option<SketchKind> {
         SummaryExpr::SummaryJoin { .. }
         | SummaryExpr::SummarySubtract { .. }
         | SummaryExpr::SummaryDelete { .. }
-        | SummaryExpr::Logical(_) => None,
+        | SummaryExpr::KeepPreAsap(_) => None,
     }
 }
 
@@ -950,7 +950,7 @@ mod runtime_tests {
 
     #[test]
     fn collect_metric_to_family_binds_all_six_contract_metrics_from_live_yaml() {
-        use planner_types::post_asap::SketchKind;
+        use planner_types::post_asap::SketchAlgorithm as SketchKind;
 
         // The 6 contract metrics reproduced inline (mirrors
         // deploy/configs/mvp-workload.yaml entries 1, 5, 6, 7, 8 plus the
@@ -1018,10 +1018,7 @@ mod runtime_tests {
                 "unique_users_per_min",
                 Some(BTreeSet::from([SketchKind::Hll])),
             ),
-            (
-                "top_endpoint_qps",
-                Some(BTreeSet::from([SketchKind::CountSketchWithHeap])),
-            ),
+            ("top_endpoint_qps", None),
             // `CountMinSketch` override re-derives statistic to
             // `Frequency`, `AggIntent::Extension`-shaped — now binds via
             // `ControlPlaneCostModel::realize_extension` (ASAPController#150,
@@ -1039,12 +1036,12 @@ mod runtime_tests {
                  full map: {map:?}",
             );
         }
-        // Routing table covers the 5 sketched metrics (only
-        // http_requests_total declines, as raw passthrough).
+        // TopK also declines until a fresh membership-margin certificate is
+        // supplied to the physical compiler.
         assert_eq!(
             map.len(),
-            5,
-            "routing table should have 5 entries (5 sketches; only raw passthrough declines), got: {map:?}"
+            4,
+            "routing table should have 4 evidence-valid sketch entries; raw passthrough and uncertified TopK decline, got: {map:?}"
         );
     }
 
@@ -1160,7 +1157,7 @@ mod runtime_tests {
     fn collect_metric_to_family_unions_multiple_capabilities_per_metric() {
         use crate::types::{AggType, QueryWorkload, SketchType, WorkloadCharacteristics};
         use crate::workload::AggRole;
-        use planner_types::post_asap::SketchKind;
+        use planner_types::post_asap::SketchAlgorithm as SketchKind;
         use std::collections::BTreeSet;
         use std::time::Duration;
 
@@ -1306,7 +1303,7 @@ mod runtime_tests {
         let _env = crate::test_support::env_lock();
         use crate::physical::colored_dag::emitter::{EdgeStageConfig, ExportTarget};
         use crate::physical::colored_dag::stage_id::StageId;
-        use planner_types::post_asap::SketchKind;
+        use planner_types::post_asap::SketchAlgorithm as SketchKind;
 
         let yaml = r#"
 - metric_name: http_requests_total_latency_ms

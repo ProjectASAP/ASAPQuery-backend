@@ -24,7 +24,7 @@ use crate::intent_algebra::agg_intent::AggIntent;
 use crate::sketch_algebra::matcher::sketch_family_satisfied;
 use crate::types_v2::AccuracyTarget;
 use asap_types::AggregationType;
-use planner_types::post_asap::SketchKind;
+use planner_types::post_asap::SketchAlgorithm as SketchKind;
 
 // ── Query-side capability tag ────────────────────────────────────────────────
 
@@ -559,7 +559,28 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
             Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
         };
     }
-    implementation_to_capability(asap_aware_mapping::boundary::implementation_for(intent))
+    match intent {
+        AggIntent::Sum { .. } => Some(Capability::ExactAgg(AggregationType::Sum)),
+        AggIntent::Min { .. } | AggIntent::Max { .. } => {
+            Some(Capability::ExactAgg(AggregationType::MinMax))
+        }
+        AggIntent::Increase | AggIntent::Rate => {
+            Some(Capability::ExactAgg(AggregationType::Increase))
+        }
+        AggIntent::Quantile { accuracy, .. } if !is_exact(accuracy) => {
+            Some(Capability::QuantileApprox(SketchKindHandle::Any))
+        }
+        AggIntent::Cardinality { accuracy, .. } if !is_exact(accuracy) => {
+            Some(Capability::CardinalityApprox)
+        }
+        AggIntent::TopK { accuracy, .. } if !is_exact(accuracy) => {
+            Some(Capability::FrequencyTopk(SketchKindHandle::Any))
+        }
+        AggIntent::Count { accuracy } if !is_exact(accuracy) => {
+            Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
+        }
+        _ => None,
+    }
 }
 
 /// Translate `asap-aware-mapping`'s per-intent implementation decision
@@ -585,7 +606,7 @@ fn implementation_to_capability(
     implementation: asap_aware_mapping::Implementation,
 ) -> Option<Capability> {
     use asap_aware_mapping::Implementation;
-    use planner_types::post_asap::{ExactKind, SketchKind};
+    use planner_types::post_asap::{ExactKind, SketchAlgorithm as SketchKind};
 
     match implementation {
         Implementation::PassThrough => None,
@@ -608,7 +629,7 @@ fn implementation_to_capability(
             // `None` (archive) until a real `SumCountAccumulator` lands.
             ExactKind::Count => None,
         },
-        Implementation::Sketch { kind, .. } => match kind {
+        Implementation::Sketch(kind) => match kind.algorithm() {
             SketchKind::Kll | SketchKind::DDSketch => {
                 Some(Capability::QuantileApprox(SketchKindHandle::Any))
             }

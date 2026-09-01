@@ -73,7 +73,7 @@
 
 use std::rc::Rc;
 
-use asap_aware_mapping::{implement_tree_with, DefaultCostModel, ImplementError};
+use asap_aware_mapping::DefaultCostModel;
 use planner_types::post_asap::SummaryNode;
 
 use crate::intent_algebra::query_expr::QueryExpr;
@@ -130,11 +130,11 @@ fn collect_aggregate_roots<'a>(expr: &'a QueryExpr, out: &mut Vec<&'a QueryExpr>
         // at construction time (`intent_algebra::lower`).
         QueryExpr::Filter { child, .. }
         | QueryExpr::Project { child, .. }
-        | QueryExpr::Distinct { child, .. }
+        | QueryExpr::Dedup { child, .. }
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. }
-        | QueryExpr::Subquery { child, .. } => collect_aggregate_roots(child, out),
-        QueryExpr::Merge { children } => {
+        | QueryExpr::PromqlSubquery { child, .. } => collect_aggregate_roots(child, out),
+        QueryExpr::Concat { children } => {
             for c in children {
                 collect_aggregate_roots(c, out);
             }
@@ -165,7 +165,7 @@ pub enum ImplementPromqlError {
     UnparseableMetricsql(String),
     /// L3→L4 implementation failed for a found `Aggregate` root (schema
     /// derivation error — see `asap_aware_mapping::bind::ImplementError`).
-    Implement(ImplementError),
+    Implement(crate::planner_selection::SelectionError),
 }
 
 /// Parse `metricsql`, find every independently-realizable `Aggregate`
@@ -194,7 +194,8 @@ pub fn implement_promql_for_asap_tier(
     roots
         .into_iter()
         .map(|root| {
-            implement_tree_with(root, &DefaultCostModel).map_err(ImplementPromqlError::Implement)
+            crate::planner_selection::select_summary(root, &DefaultCostModel)
+                .map_err(ImplementPromqlError::Implement)
         })
         .collect()
 }
@@ -268,7 +269,7 @@ mod tests {
             .expect("parses and implements");
         assert_eq!(roots.len(), 1);
         assert!(
-            matches!(roots[0].expr, SummaryExpr::Logical(_)),
+            matches!(roots[0].expr, SummaryExpr::KeepPreAsap(_)),
             "Avg has no ASAP-tier realization yet on either path: {:?}",
             roots[0].expr,
         );

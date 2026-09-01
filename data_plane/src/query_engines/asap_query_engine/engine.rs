@@ -2193,7 +2193,8 @@ mod asap_tier_classify_tests {
     // live MVP workload: the agent emits a bare-named KLL sketch
     // (`http_requests_total_latency_ms`) into the SketchStore.
     fn kll_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
-        let cfg = SketchConfig::Kll { k: 200 };
+        // Latest ASAPPlanner sizes an epsilon=0.01 KLL at k=269.
+        let cfg = SketchConfig::Kll { k: 269 };
         SketchInstanceMetadata {
             sid,
             metric_name: metric.to_string(),
@@ -2230,7 +2231,8 @@ mod asap_tier_classify_tests {
     }
 
     fn hll_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
-        let cfg = SketchConfig::Hll { precision: 10 };
+        // Latest ASAPPlanner requires p=14 for a 1% HLL error target.
+        let cfg = SketchConfig::Hll { precision: 14 };
         SketchInstanceMetadata {
             sid,
             metric_name: metric.to_string(),
@@ -2302,7 +2304,7 @@ mod asap_tier_classify_tests {
             BTreeMap::new(),
             (now_ms.saturating_sub(3_000), now_ms.saturating_sub(2_000)),
             SketchSampleState {
-                bytes: encode_hll_with_cardinality(10, 500),
+                bytes: encode_hll_with_cardinality(14, 500),
                 encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
             },
         );
@@ -2382,7 +2384,7 @@ mod asap_tier_classify_tests {
 
         // Series A: items 0..600. Series B: items 400..1000.
         // Overlap = [400,600) = 200 items; true union = [0,1000) = 1000.
-        let precision = 12u32; // ~1.6% standard error
+        let precision = 14u32; // ~0.8% standard error; legal for epsilon=0.01
         let a_items: Vec<String> = (0..600).map(|i| format!("u-{i}")).collect();
         let b_items: Vec<String> = (400..1000).map(|i| format!("u-{i}")).collect();
         let true_union = 1000.0_f64;
@@ -2470,7 +2472,7 @@ mod asap_tier_classify_tests {
         let window_end = now_ms.saturating_sub(5_000);
 
         let items: Vec<f64> = (1..=50).map(|i| i as f64).collect();
-        let bytes = encode_kll_items_proto(200, &items);
+        let bytes = encode_kll_items_proto(269, &items);
         idx.append_sample(
             sid,
             BTreeMap::new(),
@@ -2557,7 +2559,7 @@ mod asap_tier_classify_tests {
             BTreeMap::new(),
             (now_ms.saturating_sub(60_000), now_ms.saturating_sub(55_000)),
             SketchSampleState {
-                bytes: encode_kll_items_proto(200, &items),
+                bytes: encode_kll_items_proto(269, &items),
                 encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoFull,
             },
         );
@@ -2567,7 +2569,7 @@ mod asap_tier_classify_tests {
             BTreeMap::new(),
             (now_ms.saturating_sub(15_000), now_ms.saturating_sub(5_000)),
             SketchSampleState {
-                bytes: encode_kll_items_proto(200, &items),
+                bytes: encode_kll_items_proto(269, &items),
                 encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoDelta,
             },
         );
@@ -2609,7 +2611,7 @@ mod asap_tier_classify_tests {
             BTreeMap::new(),
             (now_ms.saturating_sub(15_000), now_ms.saturating_sub(5_000)),
             SketchSampleState {
-                bytes: encode_kll_items_proto(200, &items),
+                bytes: encode_kll_items_proto(269, &items),
                 encoding: crate::storage_engines::sketch_db::index::SketchEncoding::ProtoDelta,
             },
         );
@@ -3154,7 +3156,8 @@ mod asap_tier_classify_tests {
         total_inserts: i64,
         now_ms: u64,
     ) {
-        let cfg = SketchConfig::CountMin { rows: 2, cols: 4 };
+        // Matches ControlPlaneCostModel's epsilon=0.01 CMS sizing.
+        let cfg = SketchConfig::CountMin { rows: 5, cols: 512 };
         idx.register(SketchInstanceMetadata {
             sid,
             metric_name: metric.to_string(),
@@ -3176,7 +3179,7 @@ mod asap_tier_classify_tests {
         });
         // Build a CountMinState PROTO_FULL frame whose row 0 sums to
         // `total_inserts` (decode_frequency_total reads row 0's sum).
-        let bytes = encode_cms_state_proto(2, 4, total_inserts);
+        let bytes = encode_cms_state_proto(5, 512, total_inserts);
         let window_start = now_ms.saturating_sub(60_000);
         let window_end = now_ms.saturating_sub(30_000);
         idx.append_sample(
@@ -3742,7 +3745,7 @@ mod range_stitch_tests {
     /// PER-WINDOW sample (not a single cumulative scalar), which is what the
     /// range stitch needs so warm contributes one value per covered window.
     fn cms_meta(sid: u64, metric: &str) -> SketchInstanceMetadata {
-        let cfg = SketchConfig::CountMin { rows: 2, cols: 4 };
+        let cfg = SketchConfig::CountMin { rows: 5, cols: 512 };
         SketchInstanceMetadata {
             sid,
             metric_name: metric.to_string(),

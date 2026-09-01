@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 
 use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, EdgeStageConfig, ExportTarget};
 use crate::physical::colored_dag::stage_id::StageId;
-use planner_types::post_asap::{SketchKind, SketchParams};
+use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams};
 
 /// Default Prometheus remote-write URL for Mode 3 — Telegraf doesn't
 /// support OTLP-HTTP egress, so we land in the same Prometheus archive
@@ -318,7 +318,7 @@ mod toml_minimal {
 mod tests {
     use super::*;
     use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, PrometheusArchiveMetric};
-    use planner_types::post_asap::{SketchKind, SketchParams};
+    use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams};
 
     fn ddsketch_edge_cfg_mode1() -> EdgeStageConfig {
         EdgeStageConfig {

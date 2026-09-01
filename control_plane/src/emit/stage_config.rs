@@ -64,7 +64,7 @@ use crate::physical::colored_dag::emitter::{
 // test module's `use super::*` instead (P2-5).
 use crate::intent_algebra::ColumnRef;
 use crate::physical::colored_dag::stage_id::StageId;
-use planner_types::post_asap::{SketchKind, SketchParams, SketchQuery};
+use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams, SketchQuery};
 // `BackendAggregation.sketch_kind`/`.sketch_params` span both exact
 // accumulators and approximate sketches -- see
 // `physical::colored_dag::emitter`'s `use asap_types::{...}` note.
@@ -1048,7 +1048,7 @@ fn emit_edge_yaml_5sketch_routing(
     opamp_endpoint: &str,
     agent_id: &str,
 ) -> Result<String> {
-    use planner_types::post_asap::SketchKind;
+    use planner_types::post_asap::SketchAlgorithm as SketchKind;
 
     let otlp_receiver: Value = serde_yaml::from_str(
         "protocols:\n  grpc:\n    endpoint: \"0.0.0.0:4317\"\n    max_recv_msg_size_mib: 64\n  http:\n    endpoint: \"0.0.0.0:4318\"\n",
@@ -1705,7 +1705,7 @@ fn emit_edge_yaml_asap_edge(
     _opamp_endpoint: &str,
     _agent_id: &str,
 ) -> Result<String> {
-    use planner_types::post_asap::SketchKind;
+    use planner_types::post_asap::SketchAlgorithm as SketchKind;
 
     // ── Receivers ──────────────────────────────────────────────────────────
     // OTLP gRPC on 4317 + HTTP on 4318 — same as every other edge emit.

@@ -31,7 +31,8 @@
 
 #![allow(dead_code)]
 
-use asap_aware_mapping::bind::implement_tree_with;
+use std::rc::Rc;
+
 use asap_aware_mapping::cost_model::CostModel;
 use thiserror::Error;
 
@@ -46,7 +47,7 @@ pub enum BindingError {
     /// L3 schema derivation failed while lifting an edge to `SummarySchema` —
     /// forwarded from `asap_aware_mapping::bind`.
     #[error("L3->L4 implementation failed: {0}")]
-    Implement(#[from] asap_aware_mapping::ImplementError),
+    Implement(#[from] crate::planner_selection::SelectionError),
 }
 
 /// Lower an L3 `QueryExpr` to L4/L5 under the supplied workload-level
@@ -117,7 +118,7 @@ fn bind_recursive(expr: &QueryExpr, cost_model: &dyn CostModel) -> Result<L4Plan
                 measures: aggs.clone(),
                 output_names: output_names.clone(),
                 having: having.clone(),
-                child: Box::new(QueryExpr::TimeRange {
+                child: Rc::new(QueryExpr::TimeRange {
                     range: *range,
                     child: agg_child.clone(),
                 }),
@@ -147,12 +148,14 @@ fn bind_recursive(expr: &QueryExpr, cost_model: &dyn CostModel) -> Result<L4Plan
             }]
         ) =>
         {
-            Ok(L4Plan::Summary(asap_aware_mapping::bind::logical(expr)?))
+            Ok(L4Plan::Summary(
+                crate::planner_selection::select_summary_or_keep(expr, cost_model)?,
+            ))
         }
 
         _ => {
             let rewritten = rewrite_rate_to_increase(expr);
-            let node = implement_tree_with(&rewritten, cost_model)?;
+            let node = crate::planner_selection::select_summary_or_keep(&rewritten, cost_model)?;
             Ok(L4Plan::Summary(node))
         }
     }
@@ -193,7 +196,7 @@ fn rewrite_rate_to_increase(expr: &QueryExpr) -> QueryExpr {
                 .collect(),
             output_names: output_names.clone(),
             having: having.clone(),
-            child: Box::new(rewrite_rate_to_increase(child)),
+            child: Rc::new(rewrite_rate_to_increase(child)),
         },
         other => other.clone(),
     }

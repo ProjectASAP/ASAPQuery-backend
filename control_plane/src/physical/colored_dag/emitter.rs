@@ -35,7 +35,9 @@ use crate::physical::colored_dag::dag::ColoredDag;
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
 use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
 use crate::types_v2::BindingName;
-use planner_types::post_asap::{SketchKind, SketchParams, SketchQuery, SummaryExpr};
+use planner_types::post_asap::{
+    SketchAlgorithm as SketchKind, SketchParams, SketchQuery, SummaryExpr,
+};
 // `BackendAggregation.sketch_kind`/`.sketch_params` (below) span BOTH
 // exact accumulators (Sum/Count/MinMax/Increase/Rate, via
 // `agg_type_override`) and approximate sketches -- unlike
@@ -96,7 +98,7 @@ enum NodeKind<'a> {
 fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
     match expr {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
-            SummaryExpr::Logical(qe) => NodeKind::Logical(qe),
+            SummaryExpr::KeepPreAsap(qe) => NodeKind::Logical(qe),
             // `SummaryAgg`'s `kind`/`params` fields collapsed into one
             // `family: SummaryFamilyType` field (ASAPPlanner#218 --
             // see control_plane/docs/design-asapplanner-pin-migration.md);
@@ -108,11 +110,11 @@ fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
                 ..
             } => NodeKind::ExactAgg,
             SummaryExpr::SummaryAgg {
-                family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, params),
+                family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, _),
                 ..
             } => NodeKind::SketchAgg {
-                sketch_type: kind,
-                params,
+                sketch_type: kind.algorithm(),
+                params: kind.params(),
             },
             // `Plain`/`Sample`/`Wavelet`/`StatModel` never occur on a real
             // `SummaryAgg` (never `Plain` by construction; `Sample`/
@@ -1149,11 +1151,11 @@ fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStag
         // filters, window size) from any leaves below.
         QE::Filter { child, .. }
         | QE::Project { child, .. }
-        | QE::Distinct { child, .. }
+        | QE::Dedup { child, .. }
         | QE::Sort { child, .. }
         | QE::Limit { child, .. }
-        | QE::Subquery { child, .. } => extract_edge_facts(child, edge),
-        QE::Merge { children } => {
+        | QE::PromqlSubquery { child, .. } => extract_edge_facts(child, edge),
+        QE::Concat { children } => {
             for c in children {
                 extract_edge_facts(c, edge);
             }

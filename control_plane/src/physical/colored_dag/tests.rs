@@ -11,8 +11,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use planner_types::post_asap::{
-    SketchKind, SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType, SummaryNode,
-    SummarySchema,
+    GroupingStrategy, SketchAlgorithm as SketchKind, SketchKind as CommittedSketchKind,
+    SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType, SummaryNode, SummarySchema,
 };
 
 use crate::intent_algebra::schema::{Column, DataType};
@@ -74,7 +74,7 @@ fn ts_scan(metric: &str, label: Option<(&str, &str)>) -> QueryExpr {
 fn windowed_scan() -> QueryExpr {
     QueryExpr::TimeRange {
         range: Duration::from_secs(300),
-        child: Box::new(ts_scan(
+        child: Rc::new(ts_scan(
             "http_request_duration_seconds",
             Some(("service", "api")),
         )),
@@ -96,7 +96,7 @@ fn dummy_l4_schema() -> SummarySchema {
 /// Wrap `qe` as an unbound `Logical` L4 leaf — mirrors the old
 /// `PhysicalExpr::Logical(qe)` construction for hand-built fixtures.
 fn logical_l4(qe: QueryExpr) -> Rc<SummaryNode> {
-    asap_aware_mapping::bind::logical(&qe).unwrap()
+    crate::planner_selection::keep_pre_asap(&qe).unwrap()
 }
 
 /// Hand-build a `SummaryAgg` node — mirrors the old
@@ -111,11 +111,16 @@ fn sketch_agg_l4(
     Rc::new(SummaryNode {
         expr: SummaryExpr::SummaryAgg {
             child,
-            family: SummaryFamilyType::Sketch(kind, params),
+            family: SummaryFamilyType::Sketch(
+                CommittedSketchKind::new(kind, params),
+                GroupingStrategy::default(),
+            ),
             col: ColumnRef::SampleValue,
             reduction: Reduction::by(vec![]),
+            grouping: GroupingStrategy::default(),
         },
         schema: dummy_l4_schema(),
+        guarantee: None,
     })
 }
 
@@ -128,6 +133,7 @@ fn estimate_l4(query: SketchQuery, summary_input: Rc<SummaryNode>) -> Rc<Summary
             query,
         },
         schema: dummy_l4_schema(),
+        guarantee: None,
     })
 }
 
@@ -140,6 +146,7 @@ fn merge_l4(children: Vec<Rc<SummaryNode>>) -> Rc<SummaryNode> {
     Rc::new(SummaryNode {
         expr: SummaryExpr::SummaryMerge { children },
         schema: dummy_l4_schema(),
+        guarantee: None,
     })
 }
 
@@ -147,7 +154,7 @@ fn is_sketch_agg(expr: &PhysicalExpr) -> bool {
     matches!(expr, PhysicalExpr::Committed(L4Plan::Summary(n)) if matches!(n.expr, SummaryExpr::SummaryAgg { .. }))
 }
 fn is_logical(expr: &PhysicalExpr) -> bool {
-    matches!(expr, PhysicalExpr::Committed(L4Plan::Summary(n)) if matches!(n.expr, SummaryExpr::Logical(_)))
+    matches!(expr, PhysicalExpr::Committed(L4Plan::Summary(n)) if matches!(n.expr, SummaryExpr::KeepPreAsap(_)))
 }
 fn is_sketch_estimate(expr: &PhysicalExpr) -> bool {
     matches!(expr, PhysicalExpr::Committed(L4Plan::Summary(n)) if matches!(n.expr, SummaryExpr::SummaryEstimate { .. }))
@@ -177,9 +184,9 @@ fn quantile_kll_dag() -> PhysicalExpr {
         }],
         output_names: Vec::new(),
         having: None,
-        child: Box::new(windowed_scan()),
+        child: Rc::new(windowed_scan()),
     };
-    PhysicalExpr::committed(asap_aware_mapping::bind::implement_tree(&q).unwrap())
+    PhysicalExpr::committed(crate::planner_selection::select_summary_default(&q).unwrap())
 }
 
 // ── Allocator: per-rule + edge-case tests ─────────────────────────────────────

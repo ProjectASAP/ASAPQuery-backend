@@ -356,11 +356,11 @@ pub(crate) fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
         // at construction time (`intent_algebra::lower`).
         QueryExpr::Filter { child, .. }
         | QueryExpr::Project { child, .. }
-        | QueryExpr::Distinct { child, .. }
+        | QueryExpr::Dedup { child, .. }
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. }
-        | QueryExpr::Subquery { child, .. } => collect_agg_intents(child, out),
-        QueryExpr::Merge { children } => {
+        | QueryExpr::PromqlSubquery { child, .. } => collect_agg_intents(child, out),
+        QueryExpr::Concat { children } => {
             for c in children {
                 collect_agg_intents(c, out);
             }
