@@ -1,268 +1,80 @@
-# Developing runtime plan publication
+# MVP physical-plan publication
 
-> Interface status: target public API. OpAMP transport exists today; semantic
-> CollectorPlan application/reporting is still incomplete.
+This page describes the implemented MVP contract. The control plane compiles
+ASAPPlanner's selected post-ASAP IR once and projects that decision into one
+typed `BackendPlan` plus one target-specific `CollectorPlan` per Collector.
 
-## 1. Code architecture
+## API
 
-Publication begins only after physical compilation returns a complete bundle:
+`POST /api/v1/physical-plan/compile-and-publish` accepts:
 
-```text
-CompiledPlanBundle
-      |
-      v
-PlanPublisher
-  |             |
-  v             v
-CollectorClient BackendPlanClient
-  |             |
-  v             v
-CollectorReport BackendPlanReport
-       \         /
-        v       v
-      ActivationResult
-```
+- `queries`: query ID, PromQL, metric, window seconds, grouping labels, and a
+  typed `AccuracyTarget`;
+- `collector_ids`: the required OpAMP agent IDs;
+- `capability_snapshot_id` and the exact `planner_revision`;
+- optional per-query TopK evidence, with `max_evidence_age_ms`; and
+- `apply_timeout_ms` (default 10000).
 
-`CollectorClient` is the ASAPQuery-side counterpart of ASAPCollector's
-authoritative
-[`opamp-config-push.md`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/developer_docs/asapcollector/opamp-config-push.md).
-This repository does not redefine CollectorPlan fields.
+Unknown JSON fields, empty target/query sets, zero windows/timeouts, stale
+evidence, and a Planner revision mismatch are rejected. The response is only
+successful after every target has applied the same generated `plan_id`.
 
-Publication also does not reinterpret either plan. The physical compiler owns
-their contents; the publisher owns delivery, staging, activation barriers,
-report correlation, and rollback.
-
-## 2. Public interfaces and definitions
-
-### Runtime clients
-
-```rust
-pub trait CollectorPlanClient {
-    type Error;
-
-    async fn stage(
-        &self,
-        target: CollectorTarget,
-        plan: CollectorPlan,
-    ) -> Result<CollectorApplicationReport, Self::Error>;
-
-    async fn activate(
-        &self,
-        target: CollectorTarget,
-        plan_id: &str,
-        plan_version: u64,
-    ) -> Result<CollectorApplicationReport, Self::Error>;
-
-    async fn abort(
-        &self,
-        target: CollectorTarget,
-        plan_id: &str,
-        plan_version: u64,
-    ) -> Result<CollectorApplicationReport, Self::Error>;
-}
-
-pub trait BackendPlanClient {
-    type Error;
-
-    async fn stage(
-        &self,
-        target: BackendTarget,
-        plan: BackendPlan,
-    ) -> Result<BackendApplicationReport, Self::Error>;
-
-    async fn activate(
-        &self,
-        target: BackendTarget,
-        plan_id: &str,
-        plan_version: u64,
-    ) -> Result<BackendApplicationReport, Self::Error>;
-
-    async fn abort(
-        &self,
-        target: BackendTarget,
-        plan_id: &str,
-        plan_version: u64,
-    ) -> Result<BackendApplicationReport, Self::Error>;
-}
-```
-
-Collector transport requirements come directly from the corresponding
-ASAPCollector interface:
-
-- OpAMP `AgentRemoteConfig`/`AgentConfigMap`;
-- exact entry name `asap-collector-plan.yaml`;
-- YAML CollectorPlan with `content_type: application/yaml`;
-- OpAMP `config_hash` identifies bytes, not cross-runtime plan semantics; and
-- `RemoteConfigStatus.APPLIED` is delivery/application evidence, not semantic
-  activation evidence.
-
-The payload delivered to each target is different even though it shares one
-bundle envelope:
-
-| Target | Published artifact | Components that must stage it |
-| --- | --- | --- |
-| Each ASAPCollector | That target's `CollectorPlan` YAML in `asap-collector-plan.yaml` | OpAMP receiver, plan validator, collection/precompute runtime, window manager, transmission/export pipeline |
-| ASAPQuery data plane | One typed `BackendPlan` | Plan manager, ingest/precompute engine, SID/metadata registry, summary store, query router/readout and fallback adapter |
-
-The Collector report proves the expected materialization definitions are
-installed and executable. It does not enumerate future per-label SIDs. The
-Backend report proves matching descriptors, ingest/storage routes, and query
-routes are staged. SIDs are allocated or resolved later as concrete
-materialized series arrive.
-
-### Application reports
-
-```rust
-pub enum ApplicationStatus {
-    Rejected,
-    Staged,
-    Active,
-    Expired,
-    Failed,
-}
-
-pub struct ApplicationError {
-    pub code: String,
-    pub path: String,
-    pub message: String,
-}
-
-pub struct CollectorApplicationReport {
-    pub plan_id: String,
-    pub plan_version: u64,
-    pub backend_compat: String,
-    pub remote_config_hash: Vec<u8>,
-    pub status: ApplicationStatus,
-    pub active_materialization_ids: Vec<String>,
-    pub effective_capability_hash: String,
-    pub observed_at: Timestamp,
-    pub activated_at: Option<Timestamp>,
-    pub errors: Vec<ApplicationError>,
-}
-
-pub struct BackendApplicationReport {
-    pub plan_id: String,
-    pub plan_version: u64,
-    pub backend_compat: String,
-    pub status: ApplicationStatus,
-    pub active_materialization_ids: Vec<String>,
-    pub observed_at: Timestamp,
-    pub activated_at: Option<Timestamp>,
-    pub errors: Vec<ApplicationError>,
-}
-```
-
-The collector report corresponds to capability
-`io.asap.collector.plan.v1`, message type `application_report`. Unknown report
-versions or missing required fields are errors.
-
-Why reports are separate from transport acknowledgement: the MVP must prove the
-runtime applied the intended semantic plan, not merely that bytes arrived.
-
-### Publisher
-
-```rust
-pub trait PlanPublisher {
-    type Error;
-
-    async fn publish(
-        &self,
-        bundle: CompiledPlanBundle,
-    ) -> Result<ActivationResult, Self::Error>;
-
-    async fn rollback(
-        &self,
-        plan_id: &str,
-        plan_version: u64,
-    ) -> Result<ActivationResult, Self::Error>;
-}
-
-pub struct ActivationResult {
-    pub plan_id: String,
-    pub plan_version: u64,
-    pub status: ApplicationStatus,
-    pub collector_reports: Vec<CollectorApplicationReport>,
-    pub backend_report: BackendApplicationReport,
-}
-```
-
-`publish` returns `Active` only when every required runtime reports the same
-plan/version/compatibility and expected materializations. Partial staging is an
-error result and keeps the prior valid plan authoritative.
-
-### Publication and activation sequence
+## Installation order and failure semantics
 
 ```text
-1. validate complete CompiledPlanBundle
-2. stage BackendPlan (ingest/store/query routes not yet authoritative)
-3. stage every CollectorPlan (collection/export not yet authoritative)
-4. correlate reports with envelope, targets, capabilities, and expected materializations
-5. wait for the common activation time and all readiness conditions
-6. issue activation for the common time; install backend routing before allowing Collector export
-7. observe emitted plan/materialization IDs and retain the previous version for drain/rollback
+validate request and compile one bundle
+              |
+              v
+preflight every Collector capability
+              |
+              v
+POST typed BackendPlan protobuf; require 2xx
+              |
+              v
+publish target-specific CollectorPlans over OpAMP
+              |
+              v
+require exact (agent_id, plan_id, APPLIED) from every target
 ```
 
-Backend staging precedes Collector staging so the consumer can validate the
-contract before new producers are allowed to emit. Staging order alone is not
-activation: both sides remain gated by the shared activation time and the
-publisher's readiness decision. If any required target rejects or times out,
-the publisher aborts the new version on every staged target; the previous
-unexpired bundle remains authoritative.
+Preflight happens before backend mutation. Publication repeats capability
+validation to close disconnect races. A missing backend endpoint, backend
+non-2xx, Collector disconnect, timeout, malformed report, wrong plan ID, or
+`FAILED` status fails the request. This path intentionally does not inherit the
+legacy replanner's best-effort behavior.
 
-`stage`, `activate`, and `abort` are distinct semantic operations even when a
-transport implements them as versioned remote-config updates. An `APPLIED`
-transport acknowledgement for staged bytes must not be mapped directly to
-`Active`. Distributed activation cannot be literally instantaneous, so the
-backend installs the accepting ingest view first, both sides use the common
-activation timestamp, and query routing becomes authoritative only after the
-required active reports correlate. During that bounded transition the backend
-may accept new-version payloads without serving queries from an incomplete
-new-version view.
+The MVP endpoint installs the backend before enabling new producers. It does
+not claim distributed atomic activation or rollback; those remain post-MVP
+work. If a Collector fails after backend installation, the backend has a
+superset accepting view but the request fails and no success is reported.
 
-For replacement, Collector state created under the old materialization drains
-according to its lifecycle policy, while the backend retains the corresponding
-SID metadata and query route for the declared drain horizon. A changed summary
-semantic produces a new materialization identity and new SIDs; publication
-must not relabel old state into the new definition.
+## OpAMP custom capability
 
-## 3. Adding and verifying functionality
+The exact capability and message types shared with ASAPCollector are:
 
-### Add another collector transport
+| Field | Value |
+| --- | --- |
+| capability | `io.projectasap.collector-plan.v1` |
+| server-to-agent message type | `collector_plan` |
+| agent-to-server message type | `plan_status` |
+| payload encoding | UTF-8 JSON |
 
-1. Implement `CollectorPlanClient`; keep CollectorPlan unchanged.
-2. Preserve plan identity separately from transport byte identity.
-3. Map transport errors to structured client errors.
-4. Verify identical re-delivery is idempotent and conflicting bytes for the same
-   plan/version are rejected.
+`collector_plan` is the serialized `physical::compiler::CollectorPlan`. A
+status payload is strict JSON:
 
-Interpretation: a successful `stage` report is not global activation; only
-`PlanPublisher::publish` can return an active bundle.
+```json
+{"plan_id": 42, "status": "APPLIED", "error": null}
+```
 
-### Add an application status or report field
+`status` is exactly `APPLIED` or `FAILED`. Transport/config acknowledgements
+are not accepted as semantic plan evidence. Reports are scoped to the agent ID
+of the WebSocket connection, preventing one Collector from acknowledging
+another Collector's plan.
 
-1. Version the public report schema/capability.
-2. Define required/optional behavior and compatibility.
-3. Update collector and backend clients together.
-4. Verify older readers reject unknown required semantics rather than defaulting.
+## Backend wire contract
 
-### Add rollback policy
-
-1. Select only a retained complete bundle through `rollback`.
-2. Stage both runtime sides like a normal publication.
-3. Verify the result reports the restored version and all materializations.
-4. Verify failed rollback leaves the current active bundle unchanged.
-
-### Required output checks
-
-- reports match bundle identity and expected materialization sets;
-- stale/expired/conflicting versions fail;
-- collector-only or backend-only success never returns `Active`;
-- report artifacts are machine-readable by the MVP harness; and
-- post-activation emitted state carries the activated identities;
-- the BackendPlan declares ingest/storage for every CollectorPlan output;
-- every backend query route references a staged materialization descriptor;
-- Collector reports refer to materialization definitions, not runtime SIDs;
-- no Collector begins new-version export before compatible backend readiness;
-  and
-- failed activation sends an abort/rollback action to every target that staged
-  the candidate version.
+The matching `BackendPlan` uses the protobuf contract documented in
+`control_plane/docs/design-backend-plan-wire-format.md` and is sent to
+`POST /api/v1/backend-plan` with `application/x-protobuf`. Both projections
+carry the same numeric `plan_id`; the compiler, not either transport, owns the
+materialization choice.

@@ -366,6 +366,7 @@ dependencies = [
  "asap_sketchlib",
  "prost",
  "serde",
+ "serde_json",
  "thiserror 1.0.69",
 ]
 

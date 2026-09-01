@@ -1,4 +1,3 @@
-use control_plane::accuracy;
 use control_plane::backend_client;
 use control_plane::emit;
 use control_plane::epsilon_alloc;
@@ -25,6 +24,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -552,6 +552,10 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/v1/plan", post(handle_plan))
+        .route(
+            "/api/v1/physical-plan/compile-and-publish",
+            post(handle_compile_and_publish_physical_plan),
+        )
         .route("/api/v1/plan/auto", post(handle_plan_auto))
         .route("/api/v1/plan/pareto", post(handle_pareto))
         .route("/api/v1/plan/:metric", get(handle_get_plan))
@@ -571,6 +575,180 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&api_addr).await.unwrap();
     info!("control plane API listening on {api_addr}");
     axum::serve(listener, app).await.unwrap();
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PhysicalPlanQueryRequest {
+    query_id: String,
+    query_string: String,
+    metric: String,
+    window_secs: u64,
+    #[serde(default)]
+    group_by: Vec<String>,
+    accuracy: types_v2::AccuracyTarget,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CompileAndPublishPhysicalPlanRequest {
+    queries: Vec<PhysicalPlanQueryRequest>,
+    collector_ids: Vec<String>,
+    capability_snapshot_id: String,
+    #[serde(default)]
+    evidence: HashMap<String, physical::compiler::TopKMembershipEvidence>,
+    planner_revision: String,
+    max_evidence_age_ms: u64,
+    #[serde(default = "default_physical_plan_timeout_ms")]
+    apply_timeout_ms: u64,
+}
+
+fn default_physical_plan_timeout_ms() -> u64 {
+    10_000
+}
+
+#[derive(Debug, Serialize)]
+struct CompileAndPublishPhysicalPlanResponse {
+    plan_id: u64,
+    generated_at_unix_ms: u64,
+    collector_ids: Vec<String>,
+}
+
+/// Compile one Planner IR decision into the matching backend/Collector views
+/// and install them in dependency order. Unlike the legacy planning endpoint,
+/// this MVP boundary is fail-closed: the Collector plan is never published
+/// unless the backend accepted the exact matching BackendPlan first.
+async fn handle_compile_and_publish_physical_plan(
+    State(st): State<AppState>,
+    Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
+) -> impl IntoResponse {
+    let (bundle, collector_ids, apply_timeout) = match compile_physical_plan_request(request) {
+        Ok(compiled) => compiled,
+        Err(response) => return response.into_response(),
+    };
+
+    let Some(backend) = st.backend_client.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "CONTROLLER_BACKEND_ENDPOINT is required for physical-plan publication".to_string(),
+        )
+            .into_response();
+    };
+    if let Err(error) = st
+        .opamp
+        .ensure_collector_plan_targets(&bundle.collector_plans, apply_timeout)
+        .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("collector physical-plan preflight failed: {error}"),
+        )
+            .into_response();
+    }
+    if let Err(error) = backend
+        .post_backend_plan_typed(bundle.backend_plan.encode_to_vec())
+        .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("backend rejected physical plan: {error}"),
+        )
+            .into_response();
+    }
+    if let Err(error) = st
+        .opamp
+        .publish_collector_plans(&bundle.collector_plans, apply_timeout)
+        .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("collector physical-plan publication failed: {error}"),
+        )
+            .into_response();
+    }
+
+    Json(CompileAndPublishPhysicalPlanResponse {
+        plan_id: bundle.envelope.plan_id,
+        generated_at_unix_ms: bundle.envelope.generated_at_unix_ms,
+        collector_ids,
+    })
+    .into_response()
+}
+
+// Keep Planner's Rc-backed rewrite DAG outside the async handler's future.
+// Only the Send-safe compiled bundle crosses an await point.
+fn compile_physical_plan_request(
+    request: CompileAndPublishPhysicalPlanRequest,
+) -> Result<
+    (
+        physical::compiler::CompiledPlanBundle,
+        Vec<String>,
+        Duration,
+    ),
+    (StatusCode, String),
+> {
+    if request.queries.is_empty() || request.collector_ids.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "queries and collector_ids must both be non-empty".to_string(),
+        ));
+    }
+    if request.max_evidence_age_ms == 0 || request.apply_timeout_ms == 0 {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "max_evidence_age_ms and apply_timeout_ms must be non-zero".to_string(),
+        ));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let mut queries = Vec::with_capacity(request.queries.len());
+    for query in request.queries {
+        if query.query_id.trim().is_empty()
+            || query.metric.trim().is_empty()
+            || query.window_secs == 0
+        {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "query_id, metric, and window_secs must be non-empty/non-zero".to_string(),
+            ));
+        }
+        let expr = match parse_query_expr_canonical(&query.query_string, query.accuracy.clone()) {
+            Ok(expr) => expr,
+            Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
+        };
+        queries.push(physical::compiler::PlanningQuery {
+            query_id: query.query_id,
+            expr,
+            source: intent_algebra::Source::TimeSeries {
+                metric: query.metric,
+            },
+            window_secs: query.window_secs,
+            group_by: query.group_by,
+            accuracy: query.accuracy,
+        });
+    }
+
+    let bundle = match physical::compiler::PhysicalCompiler.compile(
+        physical::compiler::PlanningRequest {
+            queries,
+            evidence: request.evidence,
+            planner_revision: request.planner_revision,
+        },
+        physical::compiler::DeploymentEnvironment {
+            collector_ids: request.collector_ids.clone(),
+            capability_snapshot_id: request.capability_snapshot_id,
+            observed_at_unix_ms: now,
+            max_evidence_age_ms: request.max_evidence_age_ms,
+        },
+    ) {
+        Ok(bundle) => bundle,
+        Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
+    };
+    let apply_timeout = Duration::from_millis(request.apply_timeout_ms);
+    Ok((bundle, request.collector_ids, apply_timeout))
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -2864,17 +3042,18 @@ mod api_tests {
     }
 
     /// Acceptance test: PR #339 (planner) ↔ PR #340 (emitter) stitch
-    /// produces the 5-sketch routing-connector wire shape when the
-    /// workload registry covers the six MVP §46 contract metrics.
+    /// produces the evidence-safe routing-connector wire shape. TopK is
+    /// intentionally absent here: the bootstrap path has no membership
+    /// evidence and the latest Planner contract fails it closed.
     ///
     /// Asserts:
-    ///   - All 5 sketch processors loaded under `processors:`.
+    ///   - All four evidence-safe sketch processors are loaded.
     ///   - `routing` lives in `connectors:` (NOT `processors:`).
     ///   - All 6 named pipelines emitted (raw_passthrough + 5 sketches).
     ///   - Each metric routed to its expected pipeline via
     ///     `name == "..."`.
     #[tokio::test]
-    async fn bootstrap_emits_5sketch_routing_for_six_contract_metrics() {
+    async fn bootstrap_omits_topk_without_membership_evidence() {
         let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
 
         let (_, app, tmp) = test_app_with_six_contract_metrics();
@@ -2888,13 +3067,14 @@ mod api_tests {
         let yaml = String::from_utf8(body.to_vec()).unwrap();
         std::fs::remove_file(&tmp).ok();
 
-        // ── Contract 1: all 5 sketch processors loaded ────────────────────
-        for proc in ["ddsketch:", "KLL:", "HLL:", "countsketch:", "countmin:"] {
+        // ── Contract 1: all evidence-safe sketch processors loaded ────────
+        for proc in ["ddsketch:", "KLL:", "HLL:", "countmin:"] {
             assert!(
                 yaml.contains(proc),
                 "missing top-level sketch processor `{proc}`\n{yaml}"
             );
         }
+        assert!(!yaml.contains("countsketch:"));
 
         // ── Contract 2: routing in connectors, not processors ─────────────
         let connectors_idx = yaml
@@ -2926,14 +3106,13 @@ mod api_tests {
             "metrics/ddsketch_path:",       // http_latency_ms
             "metrics/kll_path:",            // request_size_bytes
             "metrics/hll_path:",            // unique_users_per_min
-            "metrics/countsketch_path:",    // top_endpoint_qps
             "metrics/countminsketch_path:", // endpoint_request_freq
         ] {
             assert!(yaml.contains(pl), "missing pipeline `{pl}`\n{yaml}");
         }
 
         // ── Contract 4: each sketched metric carries an OTTL condition ──
-        // The 5 sketched metrics must each have a `name == "..."`
+        // Each evidence-safe sketched metric must have a routing rule.
         // rule in the routing connector.
         // `http_requests_total` (raw) does NOT need a rule — it falls
         // through to the default `metrics/raw_passthrough` pipeline.
@@ -2941,7 +3120,6 @@ mod api_tests {
             "http_latency_ms",
             "request_size_bytes",
             "unique_users_per_min",
-            "top_endpoint_qps",
             "endpoint_request_freq",
         ] {
             let needle = format!("name == \\\"{sketched}\\\"");
@@ -2954,7 +3132,7 @@ mod api_tests {
         }
     }
 
-    // ── Stitching-gap regression: live mvp-workload.yaml binds all 5 sketches ──
+    // ── Bootstrap respects the latest Planner evidence gate ──────────────
     //
     // Reproduces the live demo gap (3 of 6 contract metrics silently dropped
     // because `WorkloadEntry` didn't carry `sketch_family_override` and
@@ -3049,26 +3227,25 @@ mod api_tests {
         (state, router, tmp_path)
     }
 
-    /// Pinning regression: the routing table emitted by the bootstrap
-    /// endpoint must cover all 5 sketched contract metrics — DDSketch
-    /// (`http_requests_total_latency_ms`), KLL (`request_size_bytes`),
-    /// HLL (`unique_users_per_min`), CountSketch (`top_endpoint_qps`),
-    /// CountMinSketch (`endpoint_request_freq`).
+    /// The legacy bootstrap input has no TopK separation evidence, so the
+    /// latest Planner contract must omit CountSketch while retaining the four
+    /// independently executable materializations.
     ///
     /// Without the fix, this test fails with only 2 sketched routes
     /// (DDSketch + KLL); HLL / CountSketch / CountMinSketch silently drop.
     #[tokio::test]
-    async fn bootstrap_routing_table_covers_all_five_sketches_for_live_mvp_yaml() {
+    async fn bootstrap_routing_table_excludes_unevidenced_topk() {
         let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
 
         let (state, app, tmp) = test_app_with_live_mvp_workload_metrics();
 
-        // ── Direct check: collect_metric_to_family produces 5 entries ────
+        // TopK has no membership-separation evidence in this legacy
+        // bootstrap input, so only four materializations are executable.
         let map = emit::collect_metric_to_family(&state.workload_registry, &state.workload_store);
         assert_eq!(
             map.len(),
-            5,
-            "metric_to_family should have 5 sketched entries (raw declines), got {map:?}",
+            4,
+            "metric_to_family should have 4 evidence-safe entries, got {map:?}",
         );
         // ASAPCollector#400: values are now SETs of families. For the
         // demo workload each metric is queried by exactly one capability,
@@ -3077,7 +3254,6 @@ mod api_tests {
             ("http_requests_total_latency_ms", "{DDSketch}"),
             ("request_size_bytes", "{Kll}"),
             ("unique_users_per_min", "{Hll}"),
-            ("top_endpoint_qps", "{CountSketch}"),
             ("endpoint_request_freq", "{Cms}"),
         ] {
             let got = map
@@ -3105,7 +3281,6 @@ mod api_tests {
             "http_requests_total_latency_ms",
             "request_size_bytes",
             "unique_users_per_min",
-            "top_endpoint_qps",
             "endpoint_request_freq",
         ] {
             let needle = format!("name == \\\"{sketched}\\\"");
@@ -3116,6 +3291,7 @@ mod api_tests {
                 "missing routing rule for `{sketched}`\n{yaml}"
             );
         }
+        assert!(!yaml.contains("name == \"top_endpoint_qps\""));
     }
 
     // ── Regression: archive tier covers all 5 sketched metrics ────────────────
@@ -3138,7 +3314,7 @@ mod api_tests {
     // against a mock backend, captures every body, and asserts the
     // final swap covers all 5 sketched metrics simultaneously.
     #[tokio::test]
-    async fn storage_routing_cumulative_push_covers_all_5_sketched_metrics() {
+    async fn storage_routing_cumulative_push_covers_all_planned_metrics() {
         // Activate the typed-stage-split path (the only path that
         // emits storage-routing JSON; the legacy path no-ops).
         let _env = EnvVarGuard::set(physical::stage_split::ENV_USE_TYPED_STAGE_SPLIT, "1");
@@ -3182,14 +3358,13 @@ mod api_tests {
             .route("/api/v1/plan", axum::routing::post(handle_plan))
             .with_state(state.clone());
 
-        // The 5 sketched contract metrics from MVP §46. Each gets a
+        // The four evidence-safe sketched contract metrics. Each gets a
         // separate POST /api/v1/plan, mirroring the demo's
         // per-workload plan-emit cycle.
         let sketched = [
             "http_requests_total_latency_ms", // DDSketch
             "request_size_bytes",             // KLL
             "unique_users_per_min",           // HLL
-            "top_endpoint_qps",               // CountSketch
             "endpoint_request_freq",          // CountMinSketch
         ];
 
@@ -3210,7 +3385,7 @@ mod api_tests {
         }
 
         // Drain the mock sink: every plan-emit must have produced
-        // exactly one body (5 plans → 5 bodies).
+        // exactly one body.
         let bodies = sink.lock().unwrap().clone();
         assert_eq!(
             bodies.len(),
@@ -3221,7 +3396,7 @@ mod api_tests {
 
         // The LAST captured body is the one the backend will leave
         // installed (the swap is destructive — last write wins). It
-        // MUST list ALL 5 sketched metrics, otherwise the swap would
+        // MUST list all planned metrics, otherwise the swap would
         // erase the routing entries for the metrics planned earlier
         // in the sequence and the backend would default them to
         // `sketch_store` → archive_miss for those metrics' archive
@@ -3342,7 +3517,7 @@ mod api_tests {
             .route("/api/v1/plan", axum::routing::post(handle_plan))
             .with_state(state.clone());
 
-        // The 5 sketched contract metrics from MVP §46 — the SAME
+        // The evidence-safe sketched contract metrics — the same
         // set the sibling `storage_routing_cumulative_push_...` test
         // exercises. Each gets a separate `POST /api/v1/plan` with
         // the metric-name → classified sketch family from
@@ -3355,7 +3530,6 @@ mod api_tests {
             "http_requests_total_latency_ms",
             "request_size_bytes",
             "unique_users_per_min",
-            "top_endpoint_qps",
             "endpoint_request_freq",
         ];
 
@@ -3376,7 +3550,7 @@ mod api_tests {
         }
 
         // Drain the mock sink: every plan-emit must have produced
-        // exactly one streaming-config body (5 plans → 5 bodies).
+        // exactly one streaming-config body.
         let bodies = sink.lock().unwrap().clone();
         assert_eq!(
             bodies.len(),
@@ -3387,7 +3561,7 @@ mod api_tests {
 
         // The LAST body is the one the data plane's swap installs
         // (the swap is destructive — last write wins). It MUST list
-        // aggregations for ALL 5 sketched metrics, otherwise the
+        // aggregations for all planned metrics, otherwise the
         // swap erases the earlier metrics' rows and queries against
         // them fail with `…capability not satisfied` — the
         // streaming-config analogue of the storage-routing
