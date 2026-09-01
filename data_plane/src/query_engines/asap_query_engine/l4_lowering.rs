@@ -257,6 +257,9 @@ pub fn lower_promql_to_l4node(
 
     let qe = control_plane::query_parser::parse_query_expr_canonical(query, accuracy.clone())
         .map_err(|e| LoweringSkip::ParseFailed(e.to_string()))?;
+    if analysis.candidates.is_empty() {
+        return Err(LoweringSkip::NotRealized);
+    }
 
     // Serving time must reproduce the REAL planning decision, not
     // independently re-derive one -- see this module's docs. Prefer

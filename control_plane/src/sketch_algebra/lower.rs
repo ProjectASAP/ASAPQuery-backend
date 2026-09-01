@@ -148,14 +148,14 @@ fn bind_recursive(expr: &QueryExpr, cost_model: &dyn CostModel) -> Result<L4Plan
             }]
         ) =>
         {
-            Ok(L4Plan::Summary(
-                crate::planner_selection::select_summary_or_keep(expr, cost_model)?,
-            ))
+            Ok(L4Plan::Summary(crate::planner_selection::select_summary(
+                expr, cost_model,
+            )?))
         }
 
         _ => {
             let rewritten = rewrite_rate_to_increase(expr);
-            let node = crate::planner_selection::select_summary_or_keep(&rewritten, cost_model)?;
+            let node = crate::planner_selection::select_summary(&rewritten, cost_model)?;
             Ok(L4Plan::Summary(node))
         }
     }
