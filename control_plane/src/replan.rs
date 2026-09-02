@@ -655,7 +655,7 @@ impl Replanner {
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendStageConfig,
         };
-        use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams};
+        use planner_types::post_asap::{SketchAlgorithm, SketchParams};
         let window_secs = workload.time_window.as_secs().max(1);
         Some(BackendStageConfig {
             aggregations: vec![BackendAggregation {
@@ -667,8 +667,8 @@ impl Replanner {
                 // these are not emitted on the wire. DDSketch is the
                 // chosen sentinel because every backend that recognises
                 // `AggregationType::FromStr` also accepts DDSketch (and
-                // we don't have a `SketchKind::None` variant today).
-                sketch_kind: SketchKind::DDSketch.into(),
+                // we don't have a `SketchAlgorithm::None` variant today).
+                sketch_kind: SketchAlgorithm::DDSketch.into(),
                 sketch_params: SketchParams::DDSketch { alpha: 0.01 }.into(),
                 window_secs,
                 spatial_filter: String::new(),
@@ -1254,7 +1254,7 @@ mod tests {
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendStageConfig,
         };
-        use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams};
+        use planner_types::post_asap::{SketchAlgorithm, SketchParams};
 
         let (url, hits) = start_repost_mock().await;
         let client = StdArc::new(BackendClient::new(url));
@@ -1304,7 +1304,7 @@ mod tests {
                         item_label: None,
                         aggregation_id: "exact-http_requests_total-sum".to_string(),
                         metric_name: "http_requests_total".to_string(),
-                        sketch_kind: SketchKind::DDSketch.into(),
+                        sketch_kind: SketchAlgorithm::DDSketch.into(),
                         sketch_params: SketchParams::DDSketch { alpha: 0.01 }.into(),
                         grouping: vec!["zone".to_string()],
                         spatial_filter: String::new(),

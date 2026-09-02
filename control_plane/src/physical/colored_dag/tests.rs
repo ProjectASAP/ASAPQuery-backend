@@ -11,8 +11,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use planner_types::post_asap::{
-    GroupingStrategy, SketchAlgorithm as SketchKind, SketchKind as CommittedSketchKind,
-    SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType, SummaryNode, SummarySchema,
+    GroupingStrategy, SketchAlgorithm, SketchKind, SketchParams, SketchQuery, SummaryExpr,
+    SummaryFamilyType, SummaryNode, SummarySchema,
 };
 
 use crate::intent_algebra::schema::{Column, DataType};
@@ -104,7 +104,7 @@ fn logical_l4(qe: QueryExpr) -> Rc<SummaryNode> {
 /// for fixtures that need a specific family without going through
 /// `implement_tree`'s cost-model selection.
 fn sketch_agg_l4(
-    kind: SketchKind,
+    kind: SketchAlgorithm,
     params: SketchParams,
     child: Rc<SummaryNode>,
 ) -> Rc<SummaryNode> {
@@ -112,7 +112,7 @@ fn sketch_agg_l4(
         expr: SummaryExpr::SummaryAgg {
             child,
             family: SummaryFamilyType::Sketch(
-                CommittedSketchKind::new(kind, params),
+                SketchKind::new(kind, params),
                 GroupingStrategy::default(),
             ),
             col: ColumnRef::SampleValue,
@@ -228,7 +228,7 @@ fn allocator_sketch_agg_under_scan_pinned_edge() {
     // Exact design.md §6 invariant: a SummaryAgg whose child is a Scan
     // (wrapped in Logical) MUST land on Edge.
     let expr = PhysicalExpr::committed(sketch_agg_l4(
-        SketchKind::Hll,
+        SketchAlgorithm::Hll,
         SketchParams::Hll { precision: 14 },
         logical_l4(ts_scan("events", None)),
     ));
@@ -270,7 +270,7 @@ fn allocator_let_binding_color_propagates() {
     // with the `child` position held by a bare `Ref` instead of a
     // `SketchEstimate{child: Ref}`.
     let inner_agg = sketch_agg_l4(
-        SketchKind::Kll,
+        SketchAlgorithm::Kll,
         SketchParams::Kll { k: 200 },
         logical_l4(windowed_scan()),
     );
@@ -300,7 +300,7 @@ fn allocator_ref_resolves_to_binding_stage() {
     // note there); the Ref child of the LetBinding must color Edge (the
     // binding's stage).
     let inner_agg = sketch_agg_l4(
-        SketchKind::Kll,
+        SketchAlgorithm::Kll,
         SketchParams::Kll { k: 200 },
         logical_l4(windowed_scan()),
     );
@@ -327,7 +327,7 @@ fn allocator_sketch_merge_lands_gateway() {
     // SummaryMerge over edge-built KLL sketches → Gateway.
     let one_agg = || {
         sketch_agg_l4(
-            SketchKind::Kll,
+            SketchAlgorithm::Kll,
             SketchParams::Kll { k: 200 },
             logical_l4(windowed_scan()),
         )
@@ -357,7 +357,7 @@ fn emitter_three_stage_emits_three_configs() {
     // SummaryMerge over two SummaryAggs.
     let one_agg = || {
         sketch_agg_l4(
-            SketchKind::Kll,
+            SketchAlgorithm::Kll,
             SketchParams::Kll { k: 200 },
             logical_l4(windowed_scan()),
         )
@@ -384,7 +384,7 @@ fn emitter_edge_config_has_correct_processor_kll() {
         StageConfig::Edge(e) => {
             assert_eq!(e.sketch_processors.len(), 1);
             assert_eq!(e.sketch_processors[0].processor_name, "KLL");
-            assert_eq!(e.sketch_processors[0].sketch_kind, SketchKind::Kll);
+            assert_eq!(e.sketch_processors[0].sketch_kind, SketchAlgorithm::Kll);
             assert_eq!(
                 e.source_metric.as_deref(),
                 Some("http_request_duration_seconds")
@@ -400,7 +400,7 @@ fn emitter_edge_config_has_correct_processor_ddsketch() {
     let expr = PhysicalExpr::committed(estimate_l4(
         SketchQuery::Quantile { q: 0.99 },
         sketch_agg_l4(
-            SketchKind::DDSketch,
+            SketchAlgorithm::DDSketch,
             SketchParams::DDSketch { alpha: 0.01 },
             logical_l4(windowed_scan()),
         ),
@@ -431,7 +431,7 @@ fn emitter_backend_config_routes_aggregation_id() {
         StageConfig::Backend(b) => {
             assert_eq!(b.aggregations.len(), 1);
             assert_eq!(b.aggregations[0].aggregation_id, edge_aid);
-            assert_eq!(b.aggregations[0].sketch_kind, SketchKind::Kll.into());
+            assert_eq!(b.aggregations[0].sketch_kind, SketchAlgorithm::Kll.into());
             assert_eq!(b.readouts.len(), 1);
             assert_eq!(b.readouts[0].aggregation_id, edge_aid);
             // `SketchQuery` has no `PartialEq` upstream — destructure
@@ -482,7 +482,7 @@ fn end_to_end_quantile_workload() {
     // root).
     let agg = || {
         sketch_agg_l4(
-            SketchKind::Kll,
+            SketchAlgorithm::Kll,
             SketchParams::Kll { k: 200 },
             logical_l4(windowed_scan()),
         )
@@ -514,7 +514,7 @@ fn end_to_end_quantile_workload() {
         StageConfig::Gateway(g) => {
             assert!(!g.merge_processors.is_empty());
             assert_eq!(g.merge_processors[0].processor_name, "sketchmergeprocessor");
-            assert_eq!(g.merge_processors[0].sketch_kind, SketchKind::Kll);
+            assert_eq!(g.merge_processors[0].sketch_kind, SketchAlgorithm::Kll);
         }
         _ => unreachable!(),
     }

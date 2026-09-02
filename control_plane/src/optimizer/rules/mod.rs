@@ -65,7 +65,7 @@ pub fn bind_workload_typed_with_item_filter(
     };
     use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
     use crate::types_v2::AccuracyTarget;
-    use planner_types::post_asap::SketchAlgorithm as SketchKind;
+    use planner_types::post_asap::SketchAlgorithm;
 
     // Contract-row metrics (`classify_demo_metric` returns `Some`) and
     // operator-supplied overrides both signal "this metric must be
@@ -112,7 +112,7 @@ pub fn bind_workload_typed_with_item_filter(
         return None;
     }
 
-    // ── Resolve the SketchKind (override > capability-matched default) ─
+    // ── Resolve the SketchAlgorithm (override > capability-matched default) ─
     //
     // The workload-spec's `sketch_type_override` (= the spec's
     // `sketch_family_override` per orchestrator contract) wins over the
@@ -121,10 +121,10 @@ pub fn bind_workload_typed_with_item_filter(
     // workload) is silently dropped — the catalog-default family runs
     // instead so the binding never produces a nonsense (sketch, stat)
     // pair.
-    let override_kind: Option<SketchKind> = w
+    let override_kind: Option<SketchAlgorithm> = w
         .sketch_type_override
         .as_ref()
-        .map(|st| SketchKind::from(st.clone()));
+        .map(|st| SketchAlgorithm::from(st.clone()));
     let kind = match override_kind {
         Some(k) if is_valid_pair(k.clone(), statistic) => k,
         _ => pick_family(statistic, accuracy_pref)?,
@@ -223,7 +223,7 @@ pub fn bind_workload_typed_with_item_filter(
     // dispatcher's tie-break (DDSketch p=6 vs KLL p=5) cannot accidentally
     // flip `request_size_bytes`'s KLL pick to DDSketch.
     //
-    // CMS+TopK note: when the picker selected `SketchKind::Cms` for a
+    // CMS+TopK note: when the picker selected `SketchAlgorithm::Cms` for a
     // TopK statistic (only reachable today via a `sketch_family_override:
     // CountMinSketch` on a TopK metric), this forces the CMS-with-heap
     // variant. The CMS-Heap pattern (Cormode & Muthukrishnan 2005) gives
@@ -241,8 +241,8 @@ pub fn bind_workload_typed_with_item_filter(
     // delegate to `ControlPlaneCostModel`'s own `"frequency"` handling,
     // this contract row commits like any other.
     let forced = match kind {
-        SketchKind::CountSketch => SketchKind::CountSketchWithHeap,
-        SketchKind::Cms if statistic == StatisticClass::TopK => SketchKind::CmsWithHeap,
+        SketchAlgorithm::CountSketch => SketchAlgorithm::CountSketchWithHeap,
+        SketchAlgorithm::Cms if statistic == StatisticClass::TopK => SketchAlgorithm::CmsWithHeap,
         other => other,
     };
     let cost_model = ForcedFamilyCostModel::new(accuracy.clone(), forced);
@@ -447,13 +447,13 @@ mod tests {
     #[test]
     fn incompatible_override_does_not_rewrite_query_semantics() {
         use crate::emit::extract_root_sketch_kind;
-        use planner_types::post_asap::SketchAlgorithm as SketchKind;
+        use planner_types::post_asap::SketchAlgorithm;
         for (ov, expect) in [
-            (SketchType::DDSketch, SketchKind::DDSketch),
-            (SketchType::KLL, SketchKind::Kll),
-            (SketchType::HLL, SketchKind::DDSketch),
-            (SketchType::CountSketch, SketchKind::DDSketch),
-            (SketchType::CountMinSketch, SketchKind::DDSketch),
+            (SketchType::DDSketch, SketchAlgorithm::DDSketch),
+            (SketchType::KLL, SketchAlgorithm::Kll),
+            (SketchType::HLL, SketchAlgorithm::DDSketch),
+            (SketchType::CountSketch, SketchAlgorithm::DDSketch),
+            (SketchType::CountMinSketch, SketchAlgorithm::DDSketch),
         ] {
             let mut w = workload(vec![AggType::Quantile]);
             w.sketch_type_override = Some(ov.clone());
@@ -587,14 +587,14 @@ mod tests {
     // | `endpoint_request_freq` | CMS          |
 
     use crate::sketch_algebra::physical_expr::PhysicalExpr;
-    use planner_types::post_asap::SketchAlgorithm as SketchKind;
+    use planner_types::post_asap::SketchAlgorithm;
     use planner_types::pre_asap::expr_ir::ColumnRef;
 
     /// Walk the L4 binding output and pull out the approximate sketch
     /// family. Returns `None` if no sketch node is present (raw / pure
     /// logical pass-through, or an exact accumulator — see
     /// `emit::extract_root_sketch_kind`, whose logic this mirrors).
-    fn extract_family(expr: &PhysicalExpr) -> Option<SketchKind> {
+    fn extract_family(expr: &PhysicalExpr) -> Option<SketchAlgorithm> {
         crate::emit::extract_root_sketch_kind(expr)
     }
 
@@ -658,7 +658,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("http_latency_ms must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::DDSketch),
+            Some(SketchAlgorithm::DDSketch),
             "http_latency_ms should bind to DDSketch (Quantile, rel-err)",
         );
     }
@@ -673,7 +673,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("request_size_bytes must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::Kll),
+            Some(SketchAlgorithm::Kll),
             "request_size_bytes should bind to KLL (Quantile, rank-err)",
         );
     }
@@ -685,7 +685,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("unique_users_per_min must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::Hll),
+            Some(SketchAlgorithm::Hll),
             "unique_users_per_min should bind to HLL (Cardinality)",
         );
     }
@@ -714,7 +714,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("endpoint_request_freq must bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::Cms),
+            Some(SketchAlgorithm::Cms),
             "endpoint_request_freq should bind to Cms (Frequency)",
         );
     }
@@ -767,7 +767,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("override should still bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::Kll),
+            Some(SketchAlgorithm::Kll),
             "sketch_type_override=KLL should pin KLL despite the contract's DDSketch default",
         );
     }
@@ -781,7 +781,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("override should still bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::DDSketch),
+            Some(SketchAlgorithm::DDSketch),
             "sketch_type_override=DDSketch should pin DDSketch despite the contract's KLL default",
         );
     }
@@ -817,7 +817,7 @@ mod tests {
         let bound = bind_workload_typed(&w).expect("fallback should bind");
         assert_eq!(
             extract_family(&bound),
-            Some(SketchKind::DDSketch),
+            Some(SketchAlgorithm::DDSketch),
             "invalid (HLL, Quantile) override should be rejected; planner falls back to DDSketch",
         );
     }
@@ -829,22 +829,22 @@ mod tests {
         // Single test that drives the full contract row set through
         // `bind_workload_typed` — this is the per-task acceptance test
         // ("verify each produces the expected `PhysicalExpr` family").
-        let cases: Vec<(&str, AggType, Option<SketchKind>)> = vec![
+        let cases: Vec<(&str, AggType, Option<SketchAlgorithm>)> = vec![
             ("http_requests_total", AggType::Frequency, None),
             (
                 "http_latency_ms",
                 AggType::Quantile,
-                Some(SketchKind::DDSketch),
+                Some(SketchAlgorithm::DDSketch),
             ),
             (
                 "request_size_bytes",
                 AggType::Quantile,
-                Some(SketchKind::Kll),
+                Some(SketchAlgorithm::Kll),
             ),
             (
                 "unique_users_per_min",
                 AggType::Cardinality,
-                Some(SketchKind::Hll),
+                Some(SketchAlgorithm::Hll),
             ),
             ("top_endpoint_qps", AggType::Frequency, None),
             // `Extension`/Frequency now binds via `ControlPlaneCostModel`'s
@@ -853,7 +853,7 @@ mod tests {
             (
                 "endpoint_request_freq",
                 AggType::Frequency,
-                Some(SketchKind::Cms),
+                Some(SketchAlgorithm::Cms),
             ),
         ];
         for (metric, agg, expected) in cases {
