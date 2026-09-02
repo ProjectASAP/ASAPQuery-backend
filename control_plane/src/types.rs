@@ -201,7 +201,7 @@ impl std::fmt::Display for SketchType {
 // SketchAlgorithm` once ASAPPlanner split the old flat `SummaryKind` per-family —
 // see control_plane/docs/design-asapplanner-pin-migration.md). `SketchType::
 // from(SketchAlgorithm)` only covers the 5 canonical families this legacy type has
-// room for — callers (`optimizer::engine::load_sketch_capabilities`) only
+// room for — physical deployment callers only
 // ever feed it kinds sourced from `default_capability_table`/
 // `load_capability_overrides`, which are exhaustively those 5, all
 // approximate-sketch families (no exact-accumulator kind is ever passed

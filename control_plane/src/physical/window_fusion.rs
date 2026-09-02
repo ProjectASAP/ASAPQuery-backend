@@ -29,9 +29,9 @@ use std::time::Duration;
 use crate::physical::planner::{
     decide_sketch_placement, resolve, PhysicalOp, PhysicalPlannerConfig, PhysicalWindow, Placement,
 };
+use asap_types::enums::WindowKind;
 use planner_types::pre_asap::AggIntent;
 use planner_types::pre_asap::ColumnId;
-use asap_types::enums::WindowKind;
 use planner_types::pre_asap::QueryExpr;
 
 /// Canonical-shape view of a fused window-over-sketch — the canonical
@@ -188,7 +188,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::optimizer::engine::DeploymentConstraints;
+    use crate::physical::deployment::DeploymentConstraints;
     use crate::physical::planner::{plan, PhysicalOp};
     use crate::planner_selection::default_frequency;
     use crate::types::StageResourceBudgets;
