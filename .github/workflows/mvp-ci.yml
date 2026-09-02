@@ -28,6 +28,7 @@ jobs:
         with:
           repository: ProjectASAP/ASAPCollector
           path: ASAPCollector
+          token: ${{ secrets.ASAP_CI_REPO_TOKEN }}
 
       - name: Checkout asap_sketchlib dependency
         uses: actions/checkout@v4
