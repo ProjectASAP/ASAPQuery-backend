@@ -20,11 +20,11 @@
 
 use control_plane::types_v2::AccuracyTarget;
 
-use crate::query_engines::asap_query_engine::l4_readout::execute_l4_readout;
+use crate::query_engines::asap_query_engine::post_asap_readout::execute_post_asap_readout;
 use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::sketch_db::query::ASAPTierResult;
 
-/// Fallback accuracy target used only when `l4_lowering.rs`'s
+/// Fallback accuracy target used only when `post_asap_planner.rs`'s
 /// observed-family lookup finds nothing registered for the query's
 /// metric (in which case no family/params choice here can matter — the
 /// query can't be served either way). `data_plane` doesn't carry a
@@ -66,7 +66,7 @@ pub fn summary_executor_live_enabled() -> bool {
 /// (ASAPController#163). That gate is gone — `Reduction`
 /// (ASAPController#165) lets `summary_executor.rs` resolve both halves of
 /// the ambiguity correctly on its own, so there is no longer a shape to
-/// decline. See `L4ReadoutOutcome`'s doc for the full reasoning.
+/// decline. See `PostAsapReadoutOutcome`'s doc for the full reasoning.
 pub fn try_serve_from_summary_executor(
     index: &SketchStore,
     query: &str,
@@ -79,7 +79,7 @@ pub fn try_serve_from_summary_executor(
         return None;
     }
 
-    let outcome = match execute_l4_readout(
+    let outcome = match execute_post_asap_readout(
         index,
         query,
         t0_ms,

@@ -454,7 +454,7 @@ impl CostModel for ForcedFamilyCostModel {
 /// observed for the candidates on offer.
 ///
 /// This is the seam `data_plane`'s live-serving re-binding path
-/// (`l4_lowering.rs`) needs: planning already decided a family + params
+/// (`post_asap_planner.rs`) needs: planning already decided a family + params
 /// for a metric (that decision is what's actually registered in the
 /// `SketchStore`), so serving-time re-parsing the same query must
 /// reproduce EXACTLY that plan, not size a fresh one from a guessed
@@ -469,7 +469,7 @@ impl CostModel for ForcedFamilyCostModel {
 /// (`find_candidates` finds nothing) is unchanged.
 ///
 /// **Fallback status (design-backend-plan-wire-format.md §5):**
-/// `l4_lowering.rs` prefers reading planning's decision directly off an
+/// `post_asap_planner.rs` prefers reading planning's decision directly off an
 /// installed `BackendPlan`'s materializations (no reconstruction needed
 /// there — `Materialization.kind`/`.params` already ARE the pair
 /// `observed` needs). This type's caller

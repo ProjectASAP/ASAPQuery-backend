@@ -57,7 +57,7 @@ pub struct ASAPQueryEngine {
     archive_engine:
         Option<Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>>,
     /// BackendPlan wire format (design-backend-plan-wire-format.md). When
-    /// `Some`, `l4_lowering.rs`'s serving-time family/params lookup
+    /// `Some`, `post_asap_planner.rs`'s serving-time family/params lookup
     /// prefers reading the installed plan's materializations directly
     /// over reconstructing from `SketchStore` metadata
     /// (`ObservedFamilyCostModel`). `None` when not wired up (unit

@@ -1,7 +1,5 @@
 //! PromQL string → `planner_types::post_asap::SummaryNode` bridge, shared by the actual
-//! serving cutover (`live_serve.rs`, via `l4_readout.rs`). See
-//! `data_plane/docs/l4node-plan-executor-design.md`'s "Rollout" section
-//! for the general design.
+//! serving cutover (`live_serve.rs`, via `post_asap_readout.rs`).
 //!
 //! `control_plane` runs in-process with `data_plane` in this deployment
 //! (see `data_plane/Cargo.toml`'s "Phase 9" comment), so this is a
@@ -10,10 +8,10 @@
 //!
 //! ## Serving time must not re-plan
 //!
-//! `parse_query_expr_canonical` (L1→L2→L3) is safe to re-run at serving
-//! time — it's a pure, deterministic canonicalization of the query text,
-//! not a decision. Binding L3→L4 (which sketch family, what parameters)
-//! is a genuine PLANNING decision, and planning already made it once, for
+//! Parsing and canonicalization are safe to re-run at serving time: they are
+//! pure, deterministic transformations of the query text. Selecting the
+//! post-ASAP implementation (which summary family and parameters to use) is
+//! a genuine planning decision, and planning already made it once, for
 //! real, when this metric's workload was planned — that decision is what
 //! `data_plane`'s ingest path actually registered in the `SketchStore`
 //! (`AggKind::Sketch { kind, config, .. }`). Serving time must reproduce
@@ -27,7 +25,7 @@
 //! chose strict equality over silently serving an answer under a looser
 //! guarantee than what was planned).
 //!
-//! So before binding, [`lower_promql_to_l4node`] looks up what's actually
+//! So before binding, [`plan_promql_to_post_asap`] looks up what's actually
 //! registered for the query's target metric and constructs an
 //! [`ObservedFamilyCostModel`] that echoes that back — the resulting
 //! `SummaryNode` matches reality by construction, not by a coincidental
@@ -54,8 +52,8 @@ use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig};
 use crate::storage_engines::sketch_db::index::SketchStore;
 
 /// Why a query couldn't be answered through the `SummaryNode`/`SummaryExecutor`
-/// path — covers both `lower_promql_to_l4node`'s own failure to produce a
-/// tree, AND (via `l4_readout.rs`'s `execute_l4_readout`) a failure of
+/// path — covers both `plan_promql_to_post_asap`'s own failure to produce a
+/// tree, AND (via `post_asap_readout.rs`'s `execute_post_asap_readout`) a failure of
 /// `crate::query_engines::asap_query_engine::summary_exec::execute()` on a tree that DID lower successfully.
 /// None of these are errors in the alarming sense — every variant is an
 /// expected, frequent outcome for *some* fraction of live traffic; the
@@ -77,10 +75,10 @@ pub enum LoweringSkip {
     /// calling into `control_plane`'s binder, not just deprioritized.
     RateShape,
     /// `bind_query_expr` itself failed (a genuine `BindingError`, e.g.
-    /// L3→L4 schema-derivation failure).
+    /// post-ASAP implementation/schema-derivation failure).
     Implement(String),
     /// `bind_query_expr` returned a `PhysicalExpr` variant other than
-    /// `Committed(L4Plan::Summary(_))`. Per `bind_query_expr`'s own doc
+    /// a committed post-ASAP summary. Per `bind_query_expr`'s own doc
     /// this shouldn't happen in practice (it never picks a Phase ε.1
     /// placement), but the match is kept exhaustive and defensive rather
     /// than assuming.
@@ -104,6 +102,10 @@ pub enum LoweringSkip {
     /// `(SketchAlgorithm, SketchParams)` match), never "answered wrong."
     ExecuteFailed(String),
 }
+
+// `L4Plan` and `PhysicalExpr` are backend compatibility/placement wrappers.
+// The semantic tree returned by ASAPPlanner is `post_asap::SummaryNode`; this
+// module does not claim or recreate an ASAPPlanner "L4" IR.
 
 /// Map a registered sid's `(SketchKindHandle, SketchConfig)` — the
 /// durable record of what planning actually decided for this metric — to
@@ -233,7 +235,7 @@ fn observed_family_for_metric_from_plan(
 /// shouldn't attempt (parse failure, `rate()`, or anything that doesn't
 /// realize to a concrete sketch/exact-agg binding) — see
 /// `LoweringSkip`'s variants.
-pub fn lower_promql_to_l4node(
+pub fn plan_promql_to_post_asap(
     index: &SketchStore,
     query: &str,
     accuracy: AccuracyTarget,
@@ -314,7 +316,7 @@ mod tests {
     fn rate_query_is_skipped_before_binding() {
         let idx = empty_index();
         let result =
-            lower_promql_to_l4node(&idx, "rate(http_requests_total[5m])", accuracy(), None);
+            plan_promql_to_post_asap(&idx, "rate(http_requests_total[5m])", accuracy(), None);
         assert!(
             matches!(result, Err(LoweringSkip::RateShape)),
             "expected RateShape, got {result:?}"
@@ -325,7 +327,7 @@ mod tests {
     fn irate_query_is_skipped_before_binding() {
         let idx = empty_index();
         let result =
-            lower_promql_to_l4node(&idx, "irate(http_requests_total[5m])", accuracy(), None);
+            plan_promql_to_post_asap(&idx, "irate(http_requests_total[5m])", accuracy(), None);
         assert!(
             matches!(result, Err(LoweringSkip::RateShape)),
             "expected RateShape, got {result:?}"
@@ -335,7 +337,7 @@ mod tests {
     #[test]
     fn unparseable_query_is_skipped() {
         let idx = empty_index();
-        let result = lower_promql_to_l4node(&idx, "this is not promql (((", accuracy(), None);
+        let result = plan_promql_to_post_asap(&idx, "this is not promql (((", accuracy(), None);
         assert!(
             matches!(result, Err(LoweringSkip::ParseFailed(_))),
             "expected ParseFailed, got {result:?}"
@@ -355,7 +357,7 @@ mod tests {
         // expression stays one opaque `Logical` blob, which this module
         // surfaces as `NotRealized`.
         let idx = empty_index();
-        let result = lower_promql_to_l4node(&idx, "http_requests_total", accuracy(), None);
+        let result = plan_promql_to_post_asap(&idx, "http_requests_total", accuracy(), None);
         assert!(
             matches!(result, Err(LoweringSkip::NotRealized)),
             "expected NotRealized, got {result:?}"
@@ -376,7 +378,7 @@ mod tests {
         // falls back to the accuracy-driven default -- same outcome as
         // before this module started consulting the `SketchStore`.
         let idx = empty_index();
-        let node = lower_promql_to_l4node(
+        let node = plan_promql_to_post_asap(
             &idx,
             "count_over_time(http_requests_total[5m])",
             accuracy(),
@@ -398,7 +400,7 @@ mod tests {
         // one opaque `Logical` blob -- self-excludes via `NotRealized`,
         // no special-case detection needed for this shape specifically.
         let idx = empty_index();
-        let result = lower_promql_to_l4node(
+        let result = plan_promql_to_post_asap(
             &idx,
             "topk(5, sum by (host) (rate(http_requests_total[5m])))",
             accuracy(),
@@ -506,7 +508,7 @@ mod tests {
             let idx = SketchStore::new();
             register_kll(&idx, "m");
             let node =
-                lower_promql_to_l4node(&idx, "quantile_over_time(0.99, m[1m])", accuracy(), None)
+                plan_promql_to_post_asap(&idx, "quantile_over_time(0.99, m[1m])", accuracy(), None)
                     .expect("should lower");
             assert_eq!(bound_family(&node).0, SketchAlgorithm::Kll);
         }
@@ -522,7 +524,7 @@ mod tests {
             let idx = SketchStore::new();
             register_kll(&idx, "m");
             let plan = plan_with_ddsketch_materialization("m");
-            let node = lower_promql_to_l4node(
+            let node = plan_promql_to_post_asap(
                 &idx,
                 "quantile_over_time(0.99, m[1m])",
                 accuracy(),
@@ -545,7 +547,7 @@ mod tests {
             let idx = SketchStore::new();
             register_kll(&idx, "m");
             let plan = plan_with_ddsketch_materialization("some_other_metric");
-            let node = lower_promql_to_l4node(
+            let node = plan_promql_to_post_asap(
                 &idx,
                 "quantile_over_time(0.99, m[1m])",
                 accuracy(),
