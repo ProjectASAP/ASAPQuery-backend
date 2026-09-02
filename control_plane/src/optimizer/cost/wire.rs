@@ -31,7 +31,7 @@
 //! agent telemetry once the OnlineMetricsStore feeds back into the
 //! planner.
 
-use planner_types::post_asap::SketchAlgorithm as SketchKind;
+use planner_types::post_asap::SketchAlgorithm;
 
 // ── Wire-cost table ──────────────────────────────────────────────────────────
 
@@ -105,11 +105,11 @@ impl WireCostTable {
 
     /// Lookup the per-flush cost for a sketch family.
     ///
-    /// `SketchKind` (unlike the retired `sketch_algebra::SketchKind`)
+    /// `SketchAlgorithm` (unlike the retired `sketch_algebra::SketchAlgorithm`)
     /// distinguishes heap-bearing from bare frequency sketches at the
     /// kind level rather than via a `with_heap` param flag. This table
     /// never modeled the heap's extra bytes separately (the old
-    /// `for_kind` took a bare `SketchKind` with no visibility into
+    /// `for_kind` took a bare `SketchAlgorithm` with no visibility into
     /// `with_heap` at all) — `CmsWithHeap`/`CountSketchWithHeap` reuse
     /// their bare counterpart's cost to preserve that exact behavior.
     /// `Kmv`/`Theta` have no established cost number (nothing in this
@@ -117,22 +117,22 @@ impl WireCostTable {
     /// list stays `Hll`-only, see `capability.rs`); they reuse `hll_delta`
     /// as a same-order-of-magnitude placeholder pending real numbers if
     /// this repo ever adopts them.
-    // Exhaustive over `SketchKind` alone now (ASAPPlanner#218 split the
-    // old flat `SummaryKind` into `SketchKind`/`ExactKind` -- the exact-
+    // Exhaustive over `SketchAlgorithm` alone now (ASAPPlanner#218 split the
+    // old flat `SummaryKind` into `SketchAlgorithm`/`ExactKind` -- the exact-
     // accumulator arm this match used to need, and its
     // "exact accumulators have no sketch wire-state cost" panic, are
     // unreachable by construction now instead of at runtime; see
     // control_plane/docs/design-asapplanner-pin-migration.md).
-    pub const fn for_kind(&self, kind: &SketchKind) -> SketchWireCost {
+    pub const fn for_kind(&self, kind: &SketchAlgorithm) -> SketchWireCost {
         match kind {
-            SketchKind::DDSketch => self.ddsketch_delta,
-            SketchKind::Kll => self.kll_full,
-            SketchKind::Hll => self.hll_delta,
-            SketchKind::Kmv | SketchKind::Theta => self.hll_delta,
-            SketchKind::Cms => self.count_min_delta,
-            SketchKind::CmsWithHeap => self.count_min_delta,
-            SketchKind::CountSketch => self.count_sketch_delta,
-            SketchKind::CountSketchWithHeap => self.count_sketch_delta,
+            SketchAlgorithm::DDSketch => self.ddsketch_delta,
+            SketchAlgorithm::Kll => self.kll_full,
+            SketchAlgorithm::Hll => self.hll_delta,
+            SketchAlgorithm::Kmv | SketchAlgorithm::Theta => self.hll_delta,
+            SketchAlgorithm::Cms => self.count_min_delta,
+            SketchAlgorithm::CmsWithHeap => self.count_min_delta,
+            SketchAlgorithm::CountSketch => self.count_sketch_delta,
+            SketchAlgorithm::CountSketchWithHeap => self.count_sketch_delta,
         }
     }
 }

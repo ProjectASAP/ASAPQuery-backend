@@ -73,7 +73,7 @@ pub trait CostModel: Send + Sync {
 
 /// Load sketch capabilities from a YAML file. Thin shim — the real
 /// loader lives in `optimizer::cost::sketch_capability::load_capability_overrides`
-/// and is keyed by `SketchKind`. This shim translates the result to the
+/// and is keyed by `SketchAlgorithm`. This shim translates the result to the
 /// legacy `SketchType` key used by call sites that haven't migrated.
 ///
 /// Falls back to built-in defaults if the file is missing or malformed.
@@ -92,11 +92,11 @@ pub fn load_sketch_capabilities(
 /// Built-in capability profile for a known sketch type. Thin shim —
 /// the real defaults live in `optimizer::cost::sketch_capability::default_capability_table`.
 pub fn sketch_capability(st: &crate::types::SketchType) -> SketchCapability {
-    use planner_types::post_asap::SketchAlgorithm as SketchKind;
-    let kind: SketchKind = st.clone().into();
+    use planner_types::post_asap::SketchAlgorithm;
+    let kind: SketchAlgorithm = st.clone().into();
     default_capability_table()
         .remove(&kind)
-        .expect("default_capability_table covers every SketchKind variant")
+        .expect("default_capability_table covers every SketchAlgorithm variant")
 }
 
 // ── Stage budgets ───────────────────────────────────────────────────────────

@@ -41,7 +41,7 @@ use anyhow::{Context, Result};
 
 use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, EdgeStageConfig, ExportTarget};
 use crate::physical::colored_dag::stage_id::StageId;
-use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams};
+use planner_types::post_asap::{SketchAlgorithm, SketchParams};
 
 /// Default Prometheus remote-write URL for Mode 3 — Telegraf doesn't
 /// support OTLP-HTTP egress, so we land in the same Prometheus archive
@@ -180,7 +180,7 @@ fn emit_processors_allsketches(
         }
         // Heap-bearing width/depth extraction is identical to the bare
         // kind — this path never distinguished `with_heap` even before
-        // `SketchKind` split it into its own variant.
+        // `SketchAlgorithm` split it into its own variant.
         SketchParams::Cms { width, depth } | SketchParams::CmsWithHeap { width, depth, .. } => {
             out.push_str(&format!("  rows = {depth}\n"));
             out.push_str(&format!("  columns = {width}\n"));
@@ -199,7 +199,7 @@ fn emit_processors_allsketches(
         // `ExactParams`, a distinct type post ASAPPlanner#218's split.
         SketchParams::Kmv { .. } | SketchParams::Theta { .. } => {
             unreachable!(
-                "edge sketch processor config requested for an unsupported SketchKind; \
+                "edge sketch processor config requested for an unsupported SketchAlgorithm; \
                  no Bind* rule in this repo produces one"
             )
         }
@@ -207,17 +207,17 @@ fn emit_processors_allsketches(
     out.push('\n');
 }
 
-fn sketch_kind_tag(kind: &SketchKind) -> &'static str {
+fn sketch_kind_tag(kind: &SketchAlgorithm) -> &'static str {
     match kind {
-        SketchKind::Kll => "kll",
-        SketchKind::DDSketch => "ddsketch",
-        SketchKind::Hll => "hll",
-        SketchKind::Cms | SketchKind::CmsWithHeap => "cms",
-        SketchKind::CountSketch | SketchKind::CountSketchWithHeap => "count_sketch",
-        SketchKind::Kmv | SketchKind::Theta => {
+        SketchAlgorithm::Kll => "kll",
+        SketchAlgorithm::DDSketch => "ddsketch",
+        SketchAlgorithm::Hll => "hll",
+        SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap => "cms",
+        SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap => "count_sketch",
+        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => {
             unreachable!(
                 "edge sketch processor config requested for an unsupported \
-                 SketchKind; no Bind* rule in this repo produces one"
+                 SketchAlgorithm; no Bind* rule in this repo produces one"
             )
         }
     }
@@ -318,7 +318,7 @@ mod toml_minimal {
 mod tests {
     use super::*;
     use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, PrometheusArchiveMetric};
-    use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams};
+    use planner_types::post_asap::{SketchAlgorithm, SketchParams};
 
     fn ddsketch_edge_cfg_mode1() -> EdgeStageConfig {
         EdgeStageConfig {
@@ -327,7 +327,7 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "ddsketch".to_string(),
-                sketch_kind: SketchKind::DDSketch,
+                sketch_kind: SketchAlgorithm::DDSketch,
                 sketch_params: SketchParams::DDSketch { alpha: 0.01 },
                 aggregation_id: "agg0".to_string(),
             }],
@@ -536,7 +536,7 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "KLL".to_string(),
-                sketch_kind: SketchKind::Kll,
+                sketch_kind: SketchAlgorithm::Kll,
                 sketch_params: SketchParams::Kll { k: 200 },
                 aggregation_id: "agg0".to_string(),
             }],

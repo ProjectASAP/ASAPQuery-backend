@@ -196,45 +196,45 @@ impl std::fmt::Display for SketchType {
 
 // Moved from the retired `sketch_algebra::sketch_params` (Stage 3 of the
 // sketch-identity unification — see
-// scratchpad/artifacts/enum-unification-plan.md) when `sketch_algebra::SketchKind`
+// scratchpad/artifacts/enum-unification-plan.md) when `sketch_algebra::SketchAlgorithm`
 // was replaced by `planner_types::post_asap::SummaryKind` (later `planner_types::post_asap::
-// SketchKind` once ASAPPlanner split the old flat `SummaryKind` per-family —
+// SketchAlgorithm` once ASAPPlanner split the old flat `SummaryKind` per-family —
 // see control_plane/docs/design-asapplanner-pin-migration.md). `SketchType::
-// from(SketchKind)` only covers the 5 canonical families this legacy type has
+// from(SketchAlgorithm)` only covers the 5 canonical families this legacy type has
 // room for — callers (`optimizer::engine::load_sketch_capabilities`) only
 // ever feed it kinds sourced from `default_capability_table`/
 // `load_capability_overrides`, which are exhaustively those 5, all
 // approximate-sketch families (no exact-accumulator kind is ever passed
-// here, so the post-split `SketchKind` — never `ExactKind` — is the right
+// here, so the post-split `SketchAlgorithm` — never `ExactKind` — is the right
 // upstream type to convert from/to).
 impl From<planner_types::post_asap::SketchAlgorithm> for SketchType {
     fn from(k: planner_types::post_asap::SketchAlgorithm) -> Self {
-        use planner_types::post_asap::SketchAlgorithm as SketchKind;
+        use planner_types::post_asap::SketchAlgorithm;
         match k {
-            SketchKind::Kll => SketchType::KLL,
-            SketchKind::DDSketch => SketchType::DDSketch,
-            SketchKind::Hll => SketchType::HLL,
-            SketchKind::Cms => SketchType::CountMinSketch,
-            SketchKind::CountSketch => SketchType::CountSketch,
+            SketchAlgorithm::Kll => SketchType::KLL,
+            SketchAlgorithm::DDSketch => SketchType::DDSketch,
+            SketchAlgorithm::Hll => SketchType::HLL,
+            SketchAlgorithm::Cms => SketchType::CountMinSketch,
+            SketchAlgorithm::CountSketch => SketchType::CountSketch,
             other => unreachable!(
-                "SketchType::from(SketchKind): no legacy equivalent for {other:?} \
+                "SketchType::from(SketchAlgorithm): no legacy equivalent for {other:?} \
                  (callers only pass the 5 canonical families)"
             ),
         }
     }
 }
 
-/// Inverse of `From<SketchKind> for SketchType`. Round-trippable for the 5
-/// canonical families: `SketchKind::from(SketchType::from(k)) == k`.
+/// Inverse of `From<SketchAlgorithm> for SketchType`. Round-trippable for the 5
+/// canonical families: `SketchAlgorithm::from(SketchType::from(k)) == k`.
 impl From<SketchType> for planner_types::post_asap::SketchAlgorithm {
     fn from(t: SketchType) -> Self {
-        use planner_types::post_asap::SketchAlgorithm as SketchKind;
+        use planner_types::post_asap::SketchAlgorithm;
         match t {
-            SketchType::KLL => SketchKind::Kll,
-            SketchType::DDSketch => SketchKind::DDSketch,
-            SketchType::HLL => SketchKind::Hll,
-            SketchType::CountMinSketch => SketchKind::Cms,
-            SketchType::CountSketch => SketchKind::CountSketch,
+            SketchType::KLL => SketchAlgorithm::Kll,
+            SketchType::DDSketch => SketchAlgorithm::DDSketch,
+            SketchType::HLL => SketchAlgorithm::Hll,
+            SketchType::CountMinSketch => SketchAlgorithm::Cms,
+            SketchType::CountSketch => SketchAlgorithm::CountSketch,
         }
     }
 }

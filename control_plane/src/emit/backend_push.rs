@@ -724,12 +724,12 @@ mod tests {
             AggregationInput, BackendAggregation, BackendReadout,
         };
         use planner_types::post_asap::SketchQuery;
-        use planner_types::post_asap::{SketchAlgorithm as SketchKind, SketchParams};
+        use planner_types::post_asap::{SketchAlgorithm, SketchParams};
         BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 aggregation_id: agg_id.to_string(),
                 metric_name: metric.to_string(),
-                sketch_kind: SketchKind::DDSketch.into(),
+                sketch_kind: SketchAlgorithm::DDSketch.into(),
                 sketch_params: SketchParams::DDSketch { alpha: 0.01 }.into(),
                 grouping: vec![],
                 item_label: None,
