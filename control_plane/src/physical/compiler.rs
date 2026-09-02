@@ -538,18 +538,7 @@ mod tests {
         };
         let parsed = crate::query_parser::parse_query_expr_canonical(promql, accuracy.clone())
             .expect("canonical query");
-        let expr = if promql.starts_with("topk(") {
-            use crate::optimizer::engine::{DefaultCostModel, RewriteRule, TopKFusion};
-            let cost = DefaultCostModel {
-                raw_bytes_per_sec: 1.0,
-                deployment: None,
-            };
-            TopKFusion
-                .try_rewrite(parsed.clone(), &cost)
-                .unwrap_or(parsed)
-        } else {
-            parsed
-        };
+        let expr = parsed;
         PlanningRequest {
             queries: vec![PlanningQuery {
                 query_id: query_id.into(),
@@ -632,7 +621,7 @@ mod tests {
 
     #[test]
     fn stale_topk_evidence_is_rejected_before_planner_selection() {
-        let mut request = request("q-topk", "topk(5, m)");
+        let mut request = request("q-topk", "topk(5, count_over_time(m[1m]))");
         request.evidence.insert(
             "q-topk".into(),
             TopKMembershipEvidence {
@@ -651,7 +640,7 @@ mod tests {
 
     #[test]
     fn fresh_topk_evidence_enables_physical_compilation() {
-        let mut request = request("q-topk", "topk(5, m)");
+        let mut request = request("q-topk", "topk(5, count_over_time(m[1m]))");
         request.evidence.insert(
             "q-topk".into(),
             TopKMembershipEvidence {
