@@ -176,7 +176,7 @@ impl ThreeStageWalker {
             // `Aggregate{exact}` lands on edge if its child is an edge
             // (scrape locality); `Ref` resolves through the lexical
             // scope map.
-            SummaryExpr::Logical(qe) => self.colour_logical(qe)?,
+            SummaryExpr::KeepPreAsap(qe) => self.colour_logical(qe)?,
 
             // ── SummaryAgg: always edge per design.md §6 batched-queries
             // table — true for both approximate sketches (the old
@@ -274,9 +274,9 @@ impl ThreeStageWalker {
     /// `LetBinding`/`Ref` at the L3 level reuse the same scope map.
     fn colour_logical(
         &mut self,
-        qe: &crate::intent_algebra::QueryExpr,
+        qe: &planner_types::pre_asap::QueryExpr,
     ) -> Result<StageId, AllocateError> {
-        use crate::intent_algebra::QueryExpr as QE;
+        use planner_types::pre_asap::QueryExpr as QE;
         match qe {
             QE::Scan { .. } => Ok(StageId::Edge),
             QE::TimeRange { .. } => Ok(StageId::Edge),
@@ -305,7 +305,7 @@ impl ThreeStageWalker {
             // follow-up batches. `Partition` no longer exists in the
             // canonical IR — its keys fold into `Aggregate.by` at
             // construction time (`intent_algebra::lower`).
-            QE::Merge { .. } | QE::Join { .. } | QE::SetOp { .. } | QE::BinaryOp { .. } => {
+            QE::Concat { .. } | QE::Join { .. } | QE::SetOp { .. } | QE::BinaryOp { .. } => {
                 Ok(StageId::Backend)
             }
             // Filter/Project/Distinct/Sort/Limit/Subquery, plus the
@@ -330,8 +330,8 @@ pub(crate) fn binding_stage(dag: &ColoredDag, name: &BindingName) -> Option<Stag
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::schema::{Column, DataType};
-    use crate::intent_algebra::{QueryExpr, Schema, Source};
+    use planner_types::pre_asap::{Column, DataType};
+    use planner_types::pre_asap::{QueryExpr, Schema, Source};
     use std::time::Duration;
 
     fn ts_scan() -> QueryExpr {
@@ -364,13 +364,14 @@ mod tests {
     fn windowed_scan() -> QueryExpr {
         QueryExpr::TimeRange {
             range: Duration::from_secs(300),
-            child: Box::new(ts_scan()),
+            child: Rc::new(ts_scan()),
         }
     }
 
     #[test]
     fn allocate_unsupported_topology_errors() {
-        let leaf = PhysicalExpr::committed(asap_aware_mapping::bind::logical(&ts_scan()).unwrap());
+        let leaf =
+            PhysicalExpr::committed(crate::planner_selection::keep_pre_asap(&ts_scan()).unwrap());
         let err = StageAllocator
             .allocate(&leaf, Topology::SingleStage)
             .unwrap_err();
@@ -383,17 +384,17 @@ mod tests {
     #[test]
     fn three_stage_quantile_dag_basic() {
         let q = QueryExpr::Aggregate {
-            reduction: crate::intent_algebra::Reduction::PerEntity,
-            measures: vec![crate::intent_algebra::AggIntent::Quantile {
+            reduction: planner_types::pre_asap::Reduction::PerEntity,
+            measures: vec![planner_types::pre_asap::AggIntent::Quantile {
                 col: None,
                 q: 0.99,
                 accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
             }],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(windowed_scan()),
+            child: Rc::new(windowed_scan()),
         };
-        let node = asap_aware_mapping::bind::implement_tree(&q).unwrap();
+        let node = crate::planner_selection::select_summary_default(&q).unwrap();
         let expr = PhysicalExpr::committed(node);
         let dag = StageAllocator
             .allocate(&expr, Topology::ThreeStage)

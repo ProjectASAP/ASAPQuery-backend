@@ -20,11 +20,11 @@
 
 #![allow(dead_code)]
 
-use crate::intent_algebra::agg_intent::AggIntent;
 use crate::sketch_algebra::matcher::sketch_family_satisfied;
 use crate::types_v2::AccuracyTarget;
 use asap_types::AggregationType;
-use planner_types::post_asap::SketchKind;
+use planner_types::post_asap::SketchAlgorithm;
+use planner_types::pre_asap::AggIntent;
 
 // ── Query-side capability tag ────────────────────────────────────────────────
 
@@ -335,14 +335,14 @@ impl Capability {
     /// delegate their family-compatibility logic to
     /// [`sketch_family_satisfied`] (`enum-unification-plan.md`
     /// §5/§8 Step 4) — via [`resolve_handle`], which picks a concrete
-    /// per-family stand-in for the `Any` wildcard since `SketchKind`
+    /// per-family stand-in for the `Any` wildcard since `SketchAlgorithm`
     /// has no wildcard concept of its own; family-matching subsumes it.
     /// `ExactAgg` is intentionally NOT routed through this path — see
     /// [`multi_pop_satisfies_single`]'s doc for why.
     pub fn is_satisfied_by(&self, indexed: &Capability) -> bool {
         match (self, indexed) {
             (Capability::QuantileApprox(req), Capability::QuantileApprox(have)) => {
-                sketch_kinds_compatible(*req, SketchKind::Kll, *have, SketchKind::Kll)
+                sketch_kinds_compatible(*req, SketchAlgorithm::Kll, *have, SketchAlgorithm::Kll)
             }
             // Cardinality has no inner handle; family match is total.
             (Capability::CardinalityApprox, Capability::CardinalityApprox) => true,
@@ -353,9 +353,9 @@ impl Capability {
             (Capability::FrequencyTopk(req), Capability::FrequencyTopk(have)) => {
                 sketch_kinds_compatible(
                     *req,
-                    SketchKind::CmsWithHeap,
+                    SketchAlgorithm::CmsWithHeap,
                     *have,
-                    SketchKind::CmsWithHeap,
+                    SketchAlgorithm::CmsWithHeap,
                 )
             }
             // Bare frequency: any frequency-family handle works on the
@@ -365,10 +365,15 @@ impl Capability {
             // the sketch matrix). A heap-bearing `FrequencyTopk` indexed
             // capability ALSO satisfies a bare-frequency required capability.
             (Capability::FrequencyEstimate(req), Capability::FrequencyEstimate(have)) => {
-                sketch_kinds_compatible(*req, SketchKind::Cms, *have, SketchKind::Cms)
+                sketch_kinds_compatible(*req, SketchAlgorithm::Cms, *have, SketchAlgorithm::Cms)
             }
             (Capability::FrequencyEstimate(req), Capability::FrequencyTopk(have)) => {
-                sketch_kinds_compatible(*req, SketchKind::Cms, *have, SketchKind::CmsWithHeap)
+                sketch_kinds_compatible(
+                    *req,
+                    SketchAlgorithm::Cms,
+                    *have,
+                    SketchAlgorithm::CmsWithHeap,
+                )
             }
             // Exact-aggregation family: the agg_type must match
             // exactly OR be the single-pop ⇆ multi-pop equivalent. A
@@ -394,19 +399,19 @@ impl Capability {
     }
 }
 
-/// Map a concrete [`SketchKindHandle`] to its [`SketchKind`]
+/// Map a concrete [`SketchKindHandle`] to its [`SketchAlgorithm`]
 /// equivalent. `Any` has no single equivalent by design — resolve it to
 /// a concrete per-family stand-in via [`resolve_handle`] before calling
 /// this.
-fn to_summary_kind(h: SketchKindHandle) -> Option<SketchKind> {
+fn to_summary_kind(h: SketchKindHandle) -> Option<SketchAlgorithm> {
     match h {
-        SketchKindHandle::DDSketch => Some(SketchKind::DDSketch),
-        SketchKindHandle::Kll => Some(SketchKind::Kll),
-        SketchKindHandle::Hll => Some(SketchKind::Hll),
-        SketchKindHandle::CountSketch => Some(SketchKind::CountSketch),
-        SketchKindHandle::CountMin => Some(SketchKind::Cms),
-        SketchKindHandle::CmsWithHeap => Some(SketchKind::CmsWithHeap),
-        SketchKindHandle::CountSketchWithHeap => Some(SketchKind::CountSketchWithHeap),
+        SketchKindHandle::DDSketch => Some(SketchAlgorithm::DDSketch),
+        SketchKindHandle::Kll => Some(SketchAlgorithm::Kll),
+        SketchKindHandle::Hll => Some(SketchAlgorithm::Hll),
+        SketchKindHandle::CountSketch => Some(SketchAlgorithm::CountSketch),
+        SketchKindHandle::CountMin => Some(SketchAlgorithm::Cms),
+        SketchKindHandle::CmsWithHeap => Some(SketchAlgorithm::CmsWithHeap),
+        SketchKindHandle::CountSketchWithHeap => Some(SketchAlgorithm::CountSketchWithHeap),
         // Defensive: `Any` should never reach this function directly —
         // every call site resolves it via `resolve_handle` first. `None`
         // here means "does not satisfy anything", the safe default.
@@ -414,11 +419,11 @@ fn to_summary_kind(h: SketchKindHandle) -> Option<SketchKind> {
     }
 }
 
-/// Resolve a [`SketchKindHandle`] to the [`SketchKind`] fed into
+/// Resolve a [`SketchKindHandle`] to the [`SketchAlgorithm`] fed into
 /// [`sketch_family_satisfied`]. `Any` (the query-side "any
 /// implementation in this family satisfies" wildcard) resolves to
 /// `any_stand_in` — a concrete per-family placeholder — because
-/// `SketchKind` has no wildcard concept of its own;
+/// `SketchAlgorithm` has no wildcard concept of its own;
 /// `sketch_family_satisfied`'s same-family-satisfies rule already
 /// treats every member of a family as interchangeable, so picking ANY
 /// concrete family member as the stand-in reproduces the wildcard's
@@ -430,9 +435,9 @@ fn to_summary_kind(h: SketchKindHandle) -> Option<SketchKind> {
 /// related by the asymmetric "heap satisfies bare" rule, not equal), so a
 /// bare stand-in would let a heap-less available sketch wrongly satisfy a
 /// top-k requirement. Every `FrequencyTopk` call site in this module
-/// passes `SketchKind::CmsWithHeap` as `any_stand_in` for exactly this
+/// passes `SketchAlgorithm::CmsWithHeap` as `any_stand_in` for exactly this
 /// reason.
-fn resolve_handle(h: SketchKindHandle, any_stand_in: SketchKind) -> Option<SketchKind> {
+fn resolve_handle(h: SketchKindHandle, any_stand_in: SketchAlgorithm) -> Option<SketchAlgorithm> {
     match h {
         SketchKindHandle::Any => Some(any_stand_in),
         other => to_summary_kind(other),
@@ -445,9 +450,9 @@ fn resolve_handle(h: SketchKindHandle, any_stand_in: SketchKind) -> Option<Sketc
 /// since `resolve_handle` always resolves `Any`).
 fn sketch_kinds_compatible(
     required: SketchKindHandle,
-    required_any_stand_in: SketchKind,
+    required_any_stand_in: SketchAlgorithm,
     available: SketchKindHandle,
-    available_any_stand_in: SketchKind,
+    available_any_stand_in: SketchAlgorithm,
 ) -> bool {
     match (
         resolve_handle(required, required_any_stand_in),
@@ -522,28 +527,11 @@ fn sum_satisfies_increase(required: AggregationType, available: AggregationType)
 /// (Sum / Min / Max / Avg / Rate / Increase / every archive-only intent
 /// — see [`AggIntent::archive_only`]).
 ///
-/// This is the **single bridge** between the L3 intent vocabulary and
-/// the L4/Q1 sketch-capability vocabulary. Both the ASAP-tier analyzer
-/// and the optimizer's binding rules read it. PromQL function-name
-/// string matching does NOT happen here — it happens in the lowerer
-/// (`intent_algebra::lower::lower_parsed_query`), which is the single
-/// owner of "what does this PromQL function mean".
-///
-/// ## Delegation to `asap-plan`
-///
-/// Beyond the `Extension`/`Frequency` special case (deployment-specific,
-/// see below — `asap-plan` deliberately has no opinion on a shape it
-/// can't see into), every other `AggIntent` variant's capability is
-/// derived from [`asap_aware_mapping::boundary::implementation_for`] — the single
-/// upstream authority for "how would this intent be realized" — rather
-/// than a second, hand-maintained, parallel judgment kept in sync by
-/// hand. See [`implementation_to_capability`] for the
-/// `planner_types::post_asap::SummaryKind` → `Capability` family translation this
-/// still requires (the two crates' capability vocabularies aren't the
-/// same *shape*, even once they agree on substance), and its doc comment
-/// for the one deliberate override (`Count{Exact}`).
+/// This is a runtime routing requirement, not a summary-selection rule.
+/// ASAPPlanner owns legal implementations and candidate enumeration; this
+/// adapter describes which already-deployed SID the data plane may read.
 pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
-    if let Some(accuracy) = crate::intent_algebra::as_frequency(intent) {
+    if let Some(accuracy) = crate::planner_selection::as_frequency(intent) {
         return if is_exact(&accuracy) {
             // Exact aggregation — sketch fallback is only meaningful
             // when raw counters aren't kept at the ingest tier; with
@@ -559,80 +547,27 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
             Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
         };
     }
-    implementation_to_capability(asap_aware_mapping::boundary::implementation_for(intent))
-}
-
-/// Translate `asap-aware-mapping`'s per-intent implementation decision
-/// into this repo's own [`Capability`] vocabulary.
-///
-/// `Implementation` used to carry one merged `Summary { kind, params }`
-/// variant for both the approximate-sketch and exact-accumulator cases
-/// (told apart via `kind.is_exact()`, ASAPController#170); ASAPPlanner
-/// split them back into distinct `Sketch { kind: SketchKind, .. }` /
-/// `ExactAggregate { kind: ExactKind, .. }` variants (ASAPPlanner#218) —
-/// see control_plane/docs/design-asapplanner-pin-migration.md. This
-/// repo's `Capability` groups those into coarser families
-/// (`QuantileApprox`/`CardinalityApprox`/`FrequencyEstimate`/
-/// `FrequencyTopk` for sketches; `ExactAgg(AggregationType)` for
-/// accumulators) because that's the granularity the sketch index
-/// (`is_satisfied_by`) and the wire-shared `sketch_index::Capability`
-/// actually match on — the required side never pins a *specific*
-/// concrete implementation (`Any`), only the family. Both match arms are
-/// exhaustive over their respective kind enum (no wildcard fallthrough),
-/// so a new variant on either side fails to compile here until given an
-/// explicit mapping.
-fn implementation_to_capability(
-    implementation: asap_aware_mapping::Implementation,
-) -> Option<Capability> {
-    use asap_aware_mapping::Implementation;
-    use planner_types::post_asap::{ExactKind, SketchKind};
-
-    match implementation {
-        Implementation::PassThrough => None,
-        Implementation::ExactAggregate { kind, .. } => match kind {
-            ExactKind::Sum => Some(Capability::ExactAgg(AggregationType::Sum)),
-            ExactKind::MinMax => Some(Capability::ExactAgg(AggregationType::MinMax)),
-            ExactKind::Increase | ExactKind::Rate => {
-                Some(Capability::ExactAgg(AggregationType::Increase))
-            }
-            // `AggregationType` (this repo's own exact-accumulator-family
-            // enum) has no `Count` variant — the data plane has no
-            // working count accumulator (`SumAccumulator` returns `sum`
-            // for both `Statistic::Sum` and `Statistic::Count`, so a
-            // `count_over_time` query matched against a `Sum` policy
-            // would silently return sum-of-values, not sample-count).
-            // `asap_aware_mapping::boundary::implementation_for` still
-            // reports `Count{Exact}` as exact (it assumes a real count
-            // accumulator exists, which is true in ASAPController's own
-            // reference implementation) — deliberately overridden here to
-            // `None` (archive) until a real `SumCountAccumulator` lands.
-            ExactKind::Count => None,
-        },
-        Implementation::Sketch { kind, .. } => match kind {
-            SketchKind::Kll | SketchKind::DDSketch => {
-                Some(Capability::QuantileApprox(SketchKindHandle::Any))
-            }
-            SketchKind::Hll | SketchKind::Theta | SketchKind::Kmv => {
-                Some(Capability::CardinalityApprox)
-            }
-            SketchKind::Cms | SketchKind::CountSketch => {
-                Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
-            }
-            SketchKind::CmsWithHeap | SketchKind::CountSketchWithHeap => {
-                Some(Capability::FrequencyTopk(SketchKindHandle::Any))
-            }
-        },
-        // `Sample`/`Wavelet`/`StatModel`: no core `AggIntent` dispatch
-        // produces these today (only a deployment's own
-        // `CostModel::realize_extension` for an `AggIntent::Extension`
-        // could), and `ControlPlaneCostModel::realize_extension` (this
-        // repo's own impl, `sketch_algebra/cost_model.rs`) only ever
-        // returns `Sketch`/`PassThrough` for the `Frequency` extension —
-        // never reachable via this repo's own dispatch, same status as
-        // the sibling families had before the ASAPPlanner#218 split.
-        Implementation::Sample { .. }
-        | Implementation::Wavelet { .. }
-        | Implementation::StatModel { .. } => None,
+    match intent {
+        AggIntent::Sum { .. } => Some(Capability::ExactAgg(AggregationType::Sum)),
+        AggIntent::Min { .. } | AggIntent::Max { .. } => {
+            Some(Capability::ExactAgg(AggregationType::MinMax))
+        }
+        AggIntent::Increase | AggIntent::Rate => {
+            Some(Capability::ExactAgg(AggregationType::Increase))
+        }
+        AggIntent::Quantile { accuracy, .. } if !is_exact(accuracy) => {
+            Some(Capability::QuantileApprox(SketchKindHandle::Any))
+        }
+        AggIntent::Cardinality { accuracy, .. } if !is_exact(accuracy) => {
+            Some(Capability::CardinalityApprox)
+        }
+        AggIntent::TopK { accuracy, .. } if !is_exact(accuracy) => {
+            Some(Capability::FrequencyTopk(SketchKindHandle::Any))
+        }
+        AggIntent::Count { accuracy } if !is_exact(accuracy) => {
+            Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
+        }
+        _ => None,
     }
 }
 
@@ -815,7 +750,7 @@ mod tests {
 
     #[test]
     fn frequency_estimate_with_epsilon_returns_frequency_estimate_approx() {
-        let intent = crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01), None);
+        let intent = crate::planner_selection::frequency(AccuracyTarget::Epsilon(0.01), None);
         assert_eq!(
             capability_for(&intent),
             Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
@@ -824,7 +759,7 @@ mod tests {
 
     #[test]
     fn frequency_estimate_with_epsilon_delta_returns_frequency_estimate_approx() {
-        let intent = crate::intent_algebra::frequency(
+        let intent = crate::planner_selection::frequency(
             AccuracyTarget::EpsilonDelta {
                 epsilon: 0.01,
                 delta: 0.001,
@@ -841,7 +776,7 @@ mod tests {
     fn frequency_estimate_with_exact_returns_none() {
         // Exact aggregation routes to archive (sketch fallback only
         // meaningful when raw counters aren't kept).
-        let intent = crate::intent_algebra::frequency(AccuracyTarget::Exact, None);
+        let intent = crate::planner_selection::frequency(AccuracyTarget::Exact, None);
         assert_eq!(capability_for(&intent), None);
     }
 

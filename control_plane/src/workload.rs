@@ -7,8 +7,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use tracing::{info, warn};
 
-use crate::intent_algebra::agg_intent::AggIntent;
 use crate::types::SketchType;
+use planner_types::pre_asap::AggIntent;
 
 /// Aggregation role a single (metric, query-shape) pair plays in the planner.
 ///
@@ -142,15 +142,8 @@ pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
     }
 
     // 2. Real AggIntent classification via the canonical parse/lower
-    //    pipeline — the same one `capability_for`/serving uses. Also runs
-    //    the L3 rule-based optimizer (as `main.rs`'s live plan pipeline
-    //    does, unlike the narrower `asap_tier_analysis` hot path) so
-    //    `TopKFusion` (R5) folds a raw `Limit(Sort DESC)` into an
-    //    `Aggregate { AggIntent::TopK }` before classification —
-    //    otherwise a bare `topk(k, m)` never reaches an `Aggregate` node
-    //    at all and would misclassify as a bare selector. `TopKFusion`
-    //    is a pure structural rewrite (ignores the cost model), so the
-    //    placeholder `0.0` throughput here doesn't affect the outcome.
+    //    pipeline — the same one `capability_for`/serving uses. Canonical
+    //    structural lowering is owned by ASAPPlanner's frontend.
     let Some(qs) = entry.query_string.as_ref() else {
         return AggRole::Other;
     };
@@ -158,7 +151,6 @@ pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
     let Ok(expr) = crate::query_parser::parse_query_expr_canonical(qs, accuracy) else {
         return AggRole::Other;
     };
-    let (expr, _) = crate::optimizer::engine::QueryOptimizer::new(0.0).optimize(expr);
     let mut intents: Vec<AggIntent> = Vec::new();
     crate::asap_tier_analysis::collect_agg_intents(&expr, &mut intents);
     let Some(outer) = intents.first() else {
@@ -172,7 +164,7 @@ pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
         }
         return AggRole::Other;
     };
-    if crate::intent_algebra::as_frequency(outer).is_some() {
+    if crate::planner_selection::as_frequency(outer).is_some() {
         return AggRole::Count;
     }
     match outer {
@@ -926,7 +918,9 @@ mod tests {
         // in the real pipeline too (main.rs's handle_plan included), so
         // the old string-sniffing heuristic classifying it as Topk was
         // itself the bug, not something this test should keep pinning.
-        for q in ["topk(5, m)"] {
+        // ASAPPlanner distinguishes heavy-hitter TopK from generic PromQL
+        // ranking. Only the former is a sketchable TopK intent.
+        for q in ["topk(5, count_over_time(m[1m]))"] {
             assert_eq!(
                 derive_agg_role(&entry("m", Some(q), None)),
                 AggRole::Topk,

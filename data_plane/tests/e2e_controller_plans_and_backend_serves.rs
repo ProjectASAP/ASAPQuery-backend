@@ -2765,10 +2765,6 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
 // over the real data instead of being merged with it. Tracked as
 // https://github.com/ProjectASAP/ASAPQuery-backend/issues/431.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known gap, exposed (not caused) by sketch_reducer.rs's retirement -- see the \
-    module comment immediately above this test for the full root cause \
-    (effective_is_cumulative misclassifies bare count(), previously masked by the \
-    legacy reducer fallback). Tracked as ASAPQuery-backend#431."]
 async fn live_serve_hll_global_count_merges_across_sids() {
     let _live = LiveServeEnvGuard::enable();
 

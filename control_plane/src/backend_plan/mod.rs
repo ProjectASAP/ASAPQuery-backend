@@ -38,8 +38,9 @@ use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::intent_algebra::{ColumnRef, Source, WindowKind};
 use crate::sketch_algebra::capability::{Capability, SketchKindHandle};
+use asap_types::enums::WindowKind;
+use planner_types::pre_asap::{ColumnRef, Source};
 
 /// Errors decoding a `BackendPlan` (or one of its parts) from its proto
 /// wire form. Encoding (`From<&T> for proto::T`) is always infallible —
@@ -55,6 +56,8 @@ pub enum DecodeError {
     MissingOneof(&'static str),
     #[error("unspecified/unknown enum value {value} for {field}")]
     UnknownEnumValue { field: &'static str, value: i32 },
+    #[error("unsupported summary-maintenance lifecycle: {0}")]
+    UnsupportedLifecycle(String),
 }
 
 // ── WindowSpec ───────────────────────────────────────────────────────────────
@@ -575,6 +578,37 @@ pub struct Materialization {
     pub params: SummaryParams,
     pub col: ColumnRef,
     pub retention: Option<RetentionPolicy>,
+    pub lifecycle: Option<SummaryMaintenanceLifecycle>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryMaintenanceLifecycle {
+    pub kind: String,
+    pub maintenance_mode: String,
+    pub evaluation_schedule: String,
+    pub output_representation: String,
+}
+
+impl From<&SummaryMaintenanceLifecycle> for proto::SummaryMaintenanceLifecycle {
+    fn from(value: &SummaryMaintenanceLifecycle) -> Self {
+        Self {
+            kind: value.kind.clone(),
+            maintenance_mode: value.maintenance_mode.clone(),
+            evaluation_schedule: value.evaluation_schedule.clone(),
+            output_representation: value.output_representation.clone(),
+        }
+    }
+}
+
+impl From<proto::SummaryMaintenanceLifecycle> for SummaryMaintenanceLifecycle {
+    fn from(value: proto::SummaryMaintenanceLifecycle) -> Self {
+        Self {
+            kind: value.kind,
+            maintenance_mode: value.maintenance_mode,
+            evaluation_schedule: value.evaluation_schedule,
+            output_representation: value.output_representation,
+        }
+    }
 }
 
 impl From<&Materialization> for proto::Materialization {
@@ -588,6 +622,7 @@ impl From<&Materialization> for proto::Materialization {
             params: Some((&m.params).into()),
             col: Some((&m.col).into()),
             retention: m.retention.as_ref().map(Into::into),
+            lifecycle: m.lifecycle.as_ref().map(Into::into),
         }
     }
 }
@@ -599,6 +634,22 @@ impl TryFrom<proto::Materialization> for Materialization {
             m.params
                 .ok_or(DecodeError::MissingOneof("Materialization.params"))?,
         )?;
+        let lifecycle = m.lifecycle.map(SummaryMaintenanceLifecycle::from);
+        if let Some(lifecycle) = &lifecycle {
+            if lifecycle.kind != "continuously_maintained"
+                || lifecycle.maintenance_mode != "incremental"
+                || lifecycle.evaluation_schedule != "per_update"
+                || lifecycle.output_representation != "summary_state"
+            {
+                return Err(DecodeError::UnsupportedLifecycle(format!(
+                    "{}/{}/{}/{}",
+                    lifecycle.kind,
+                    lifecycle.maintenance_mode,
+                    lifecycle.evaluation_schedule,
+                    lifecycle.output_representation
+                )));
+            }
+        }
         Ok(Materialization {
             fingerprint: PolicyFingerprint(m.fingerprint),
             source: m
@@ -618,6 +669,7 @@ impl TryFrom<proto::Materialization> for Materialization {
                 .ok_or(DecodeError::MissingOneof("Materialization.col"))?
                 .try_into()?,
             retention: m.retention.map(Into::into),
+            lifecycle,
         })
     }
 }
@@ -760,6 +812,12 @@ mod tests {
             retention: Some(RetentionPolicy {
                 num_aggregates_to_retain: Some(1000),
             }),
+            lifecycle: Some(SummaryMaintenanceLifecycle {
+                kind: "continuously_maintained".into(),
+                maintenance_mode: "incremental".into(),
+                evaluation_schedule: "per_update".into(),
+                output_representation: "summary_state".into(),
+            }),
         }
     }
 
@@ -805,6 +863,23 @@ mod tests {
                 mode: String::new(),
             }],
         }
+    }
+
+    #[test]
+    fn unsupported_lifecycle_fails_closed_on_decode() {
+        let mut plan = sample_plan();
+        plan.materializations
+            .values_mut()
+            .next()
+            .unwrap()
+            .lifecycle
+            .as_mut()
+            .unwrap()
+            .kind = "ephemeral".into();
+        assert!(matches!(
+            BackendPlan::decode(&plan.encode_to_vec()),
+            Err(DecodeError::UnsupportedLifecycle(_))
+        ));
     }
 
     #[test]

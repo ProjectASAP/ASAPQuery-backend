@@ -22,7 +22,7 @@
 //! accuracy-driven cost model prefers in the abstract (e.g. DDSketch
 //! over Kll for quantiles, unconditionally), with no guarantee it matches
 //! what's actually registered — and `SummaryExecutor::find_candidates`
-//! requires an exact `(SketchKind, SketchParams)` match, by design (see
+//! requires an exact `(SketchAlgorithm, SketchParams)` match, by design (see
 //! `summary_executor.rs::summary_params_match`'s doc: this deployment
 //! chose strict equality over silently serving an answer under a looser
 //! guarantee than what was planned).
@@ -40,7 +40,7 @@
 
 use std::rc::Rc;
 
-use planner_types::post_asap::{SketchKind, SketchParams, SummaryExpr, SummaryNode};
+use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryExpr, SummaryNode};
 
 use control_plane::sketch_algebra::capability::{OuterFn, SketchKindHandle};
 use control_plane::sketch_algebra::cost_model::ObservedFamilyCostModel;
@@ -101,13 +101,13 @@ pub enum LoweringSkip {
     /// a decode/merge failure surfaced from `summary_executor.rs`, ...).
     /// Always safe to just fall back — this means "can't answer this way
     /// right now" (e.g. the sid catalog doesn't have an exact
-    /// `(SketchKind, SketchParams)` match), never "answered wrong."
+    /// `(SketchAlgorithm, SketchParams)` match), never "answered wrong."
     ExecuteFailed(String),
 }
 
 /// Map a registered sid's `(SketchKindHandle, SketchConfig)` — the
 /// durable record of what planning actually decided for this metric — to
-/// the `(SketchKind, SketchParams)` pair `ObservedFamilyCostModel`
+/// the `(SketchAlgorithm, SketchParams)` pair `ObservedFamilyCostModel`
 /// needs to reproduce that decision exactly. `None` for shapes this
 /// deployment doesn't map (e.g. `SketchKindHandle::Any`, which is an
 /// analysis-time wildcard that's never actually registered on a sid).
@@ -121,33 +121,33 @@ pub enum LoweringSkip {
 fn observed_summary_params(
     kind: SketchKindHandle,
     config: &SketchConfig,
-) -> Option<(SketchKind, SketchParams)> {
+) -> Option<(SketchAlgorithm, SketchParams)> {
     const PLACEHOLDER_HEAP_SIZE: u32 = 100;
     match (kind, config) {
         (SketchKindHandle::DDSketch, SketchConfig::DDSketch { relative_accuracy }) => Some((
-            SketchKind::DDSketch,
+            SketchAlgorithm::DDSketch,
             SketchParams::DDSketch {
                 alpha: *relative_accuracy,
             },
         )),
         (SketchKindHandle::Kll, SketchConfig::Kll { k }) => {
-            Some((SketchKind::Kll, SketchParams::Kll { k: *k }))
+            Some((SketchAlgorithm::Kll, SketchParams::Kll { k: *k }))
         }
         (SketchKindHandle::Hll, SketchConfig::Hll { precision }) => Some((
-            SketchKind::Hll,
+            SketchAlgorithm::Hll,
             SketchParams::Hll {
                 precision: *precision as u8,
             },
         )),
         (SketchKindHandle::CountMin, SketchConfig::CountMin { rows, cols }) => Some((
-            SketchKind::Cms,
+            SketchAlgorithm::Cms,
             SketchParams::Cms {
                 width: *cols as u32,
                 depth: *rows as u32,
             },
         )),
         (SketchKindHandle::CmsWithHeap, SketchConfig::CountMin { rows, cols }) => Some((
-            SketchKind::CmsWithHeap,
+            SketchAlgorithm::CmsWithHeap,
             SketchParams::CmsWithHeap {
                 width: *cols as u32,
                 depth: *rows as u32,
@@ -155,7 +155,7 @@ fn observed_summary_params(
             },
         )),
         (SketchKindHandle::CountSketch, SketchConfig::CountSketch { rows, cols }) => Some((
-            SketchKind::CountSketch,
+            SketchAlgorithm::CountSketch,
             SketchParams::CountSketch {
                 width: *cols as u32,
                 depth: *rows as u32,
@@ -163,7 +163,7 @@ fn observed_summary_params(
         )),
         (SketchKindHandle::CountSketchWithHeap, SketchConfig::CountSketch { rows, cols }) => {
             Some((
-                SketchKind::CountSketchWithHeap,
+                SketchAlgorithm::CountSketchWithHeap,
                 SketchParams::CountSketchWithHeap {
                     width: *cols as u32,
                     depth: *rows as u32,
@@ -187,7 +187,7 @@ fn observed_summary_params(
 fn observed_family_for_metric(
     index: &SketchStore,
     metric: &str,
-) -> Option<(SketchKind, SketchParams)> {
+) -> Option<(SketchAlgorithm, SketchParams)> {
     for sid in index.instances_matching(metric, &Default::default()) {
         let found = index.with_instance(sid, |m| match &m.agg_kind {
             AggKind::Sketch { kind, config, .. } => observed_summary_params(*kind, config),
@@ -212,9 +212,9 @@ fn observed_family_for_metric(
 fn observed_family_for_metric_from_plan(
     plan: &control_plane::backend_plan::BackendPlan,
     metric: &str,
-) -> Option<(SketchKind, SketchParams)> {
+) -> Option<(SketchAlgorithm, SketchParams)> {
     plan.materializations.values().find_map(|m| {
-        if !matches!(&m.source, control_plane::intent_algebra::Source::TimeSeries { metric: mm } if mm == metric)
+        if !matches!(&m.source, planner_types::pre_asap::Source::TimeSeries { metric: mm } if mm == metric)
         {
             return None;
         }
@@ -255,13 +255,16 @@ pub fn lower_promql_to_l4node(
 
     let qe = control_plane::query_parser::parse_query_expr_canonical(query, accuracy.clone())
         .map_err(|e| LoweringSkip::ParseFailed(e.to_string()))?;
+    if analysis.candidates.is_empty() {
+        return Err(LoweringSkip::NotRealized);
+    }
 
     // Serving time must reproduce the REAL planning decision, not
     // independently re-derive one -- see this module's docs. Prefer
     // reading it straight off an installed `BackendPlan`'s
     // materializations when one covers this metric --
     // `Materialization.kind`/`.params` already ARE the
-    // `(SketchKind, SketchParams)` pair this needs, no
+    // `(SketchAlgorithm, SketchParams)` pair this needs, no
     // `AggregationConfig` reconstruction required (design-backend-plan-wire-format.md
     // §5). Otherwise fall back to the `SketchStore`-reconstruction path
     // (`observed_family_for_metric`), which is `None` when this metric
@@ -280,7 +283,7 @@ pub fn lower_promql_to_l4node(
 
     match physical {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => {
-            if matches!(node.expr, SummaryExpr::Logical(_)) {
+            if matches!(node.expr, SummaryExpr::KeepPreAsap(_)) {
                 Err(LoweringSkip::NotRealized)
             } else {
                 Ok(node)
@@ -381,7 +384,7 @@ mod tests {
         )
         .expect("Frequency intent must realize via bind_query_expr/ControlPlaneCostModel");
         assert!(
-            !matches!(node.expr, SummaryExpr::Logical(_)),
+            !matches!(node.expr, SummaryExpr::KeepPreAsap(_)),
             "expected a real SummaryAgg/SummaryEstimate binding, got Logical (the gap \
              this module exists to avoid): {:?}",
             node.expr
@@ -414,12 +417,13 @@ mod tests {
         use crate::storage_engines::sketch_db::index::{
             AccuracyBound, Capability, SketchInstanceMetadata, SketchKindHandle,
         };
+        use asap_types::enums::WindowKind;
         use control_plane::backend_plan::{BackendPlan, Materialization, WindowSpec};
-        use control_plane::intent_algebra::{ColumnRef, Source, WindowKind};
+        use planner_types::pre_asap::{ColumnRef, Source};
         use std::collections::HashMap;
 
         fn register_kll(idx: &SketchStore, metric: &str) {
-            let cfg = SketchConfig::Kll { k: 200 };
+            let cfg = SketchConfig::Kll { k: 269 };
             idx.register(SketchInstanceMetadata {
                 sid: 1,
                 metric_name: metric.to_string(),
@@ -458,13 +462,14 @@ mod tests {
                     // `Materialization.kind`/`.params` span both exact
                     // accumulators and sketches -- the flat
                     // `asap_types::SummaryKind`, not this file's own
-                    // `planner_types::post_asap::SketchKind` import (see
+                    // `planner_types::post_asap::SketchAlgorithm` import (see
                     // `physical::colored_dag::emitter`'s `use
                     // asap_types::{...}` note in control_plane).
                     kind: asap_types::SummaryKind::DDSketch,
                     params: asap_types::SummaryParams::DDSketch { alpha: 0.01 },
                     col: ColumnRef::SampleValue,
                     retention: None,
+                    lifecycle: None,
                 },
             );
             BackendPlan {
@@ -476,18 +481,18 @@ mod tests {
             }
         }
 
-        /// Extract the bound `(SketchKind, SketchParams)` from the
+        /// Extract the bound `(SketchAlgorithm, SketchParams)` from the
         /// `SummaryEstimate { summary_input: SummaryNode { expr: SummaryAgg {
         /// summary, params, .. }, .. }, .. }` shape a bare
         /// `quantile_over_time` query lowers to (confirmed by inspecting
         /// the tree directly).
-        fn bound_family(node: &SummaryNode) -> (SketchKind, SketchParams) {
+        fn bound_family(node: &SummaryNode) -> (SketchAlgorithm, SketchParams) {
             match &node.expr {
                 SummaryExpr::SummaryEstimate { summary_input, .. } => match &summary_input.expr {
                     SummaryExpr::SummaryAgg {
-                        family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, params),
+                        family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, _),
                         ..
-                    } => (kind.clone(), params.clone()),
+                    } => (kind.algorithm().clone(), kind.params().clone()),
                     other => panic!("expected a Sketch SummaryAgg, got {other:?}"),
                 },
                 other => panic!("expected SummaryEstimate, got {other:?}"),
@@ -503,7 +508,7 @@ mod tests {
             let node =
                 lower_promql_to_l4node(&idx, "quantile_over_time(0.99, m[1m])", accuracy(), None)
                     .expect("should lower");
-            assert_eq!(bound_family(&node).0, SketchKind::Kll);
+            assert_eq!(bound_family(&node).0, SketchAlgorithm::Kll);
         }
 
         #[test]
@@ -526,7 +531,7 @@ mod tests {
             .expect("should lower");
             assert_eq!(
                 bound_family(&node).0,
-                SketchKind::DDSketch,
+                SketchAlgorithm::DDSketch,
                 "BackendPlan's materialization must take priority over SketchStore reconstruction"
             );
         }
@@ -547,7 +552,7 @@ mod tests {
                 Some(&plan),
             )
             .expect("should lower");
-            assert_eq!(bound_family(&node).0, SketchKind::Kll);
+            assert_eq!(bound_family(&node).0, SketchAlgorithm::Kll);
         }
     }
 }

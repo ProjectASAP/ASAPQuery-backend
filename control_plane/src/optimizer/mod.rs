@@ -1,9 +1,11 @@
-//! L4 — **sketch-binding optimizer** framework.
+//! Legacy flat-plan cost APIs retained for `/plan`, Pareto, and TCO
+//! compatibility. Canonical query optimization belongs to ASAPPlanner;
+//! physical CTSA placement lives under [`crate::physical`].
 //!
 //! Per `control_plane/docs/design.md` §3/§5/§6 `core::optimizer`: this is
 //! the rule engine driver + cost-model trait + rule library that takes
-//! L3 [`crate::intent_algebra::relational::QueryExpr`] / canonical
-//! [`crate::intent_algebra::QueryExpr`] inputs and produces L4
+//! L3 [`planner_types::pre_asap::QueryExpr`] / canonical
+//! [`planner_types::pre_asap::QueryExpr`] inputs and produces L4
 //! sketch-bound output (in the legacy path: an annotated `QueryExpr`
 //! with `SketchAgg` nodes; in the canonical path: a
 //! [`crate::sketch_algebra::PhysicalExpr`] DAG).
@@ -14,7 +16,6 @@
 //!
 //! | Old path | New path |
 //! |---|---|
-//! | `algebra/optimizer.rs` | [`engine`] (rule driver + `QueryOptimizer` + `DeploymentConstraints`) |
 //! | `planner/cost_model.rs` | [`cost`] (cost model trait + per-strategy impls) |
 //! | `planner/delta_cost_model.rs` | [`cost::delta`] |
 //! | `planner/online_cost_model.rs` | [`cost::online`] |
@@ -26,7 +27,6 @@
 
 pub mod baseline;
 pub mod cost;
-pub mod engine;
 pub mod rules;
 
 // `cse` (workload-level CSE via `QueryExpr::Ref`/`LetBinding`) was deleted
@@ -41,7 +41,3 @@ pub mod rules;
 // workload-level CSE needs a representation that doesn't ride on
 // `QueryExpr::Ref`/`LetBinding`, tracked as a follow-up rather than
 // invented here.
-
-// Re-exports — preserve the surface that `crate::algebra::QueryOptimizer`
-// and `crate::planner::*` consumers historically relied on.
-pub use engine::{DeploymentConstraints, QueryOptimizer};

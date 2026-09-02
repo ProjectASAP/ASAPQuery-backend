@@ -28,11 +28,11 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::query_expr::{Predicate, QueryExpr, Source};
-use crate::intent_algebra::{ColumnId, CompareOp, L3Expr, L3Scalar};
 use crate::types::AggType;
 use crate::types_v2::AccuracyTarget;
+use planner_types::pre_asap::AggIntent;
+use planner_types::pre_asap::{ColumnId, CompareOpKind, ScalarValue};
+use planner_types::pre_asap::{Predicate, QueryExpr, Source};
 
 // ── Output types (legacy — consumed by analyzer and planner) ──────────────────
 
@@ -85,7 +85,7 @@ pub enum QueryHint {
 // ── Public entry points ───────────────────────────────────────────────────────
 
 /// Parse a PromQL query string into the **canonical** L3
-/// [`query_expr::QueryExpr`](crate::intent_algebra::query_expr::QueryExpr) IR.
+/// [`query_expr::QueryExpr`](planner_types::pre_asap::QueryExpr) IR.
 ///
 /// This is the single public algebra-IR entry point — a direct call into
 /// `asap_frontend_promql::lower_promql`, which does the full L1 parse →
@@ -96,7 +96,7 @@ pub enum QueryHint {
 pub fn parse_query_expr_canonical(
     query: &str,
     accuracy: AccuracyTarget,
-) -> anyhow::Result<crate::intent_algebra::query_expr::QueryExpr> {
+) -> anyhow::Result<planner_types::pre_asap::QueryExpr> {
     let canonical = asap_frontend_promql::lower_promql(query.trim(), accuracy)?;
     Ok(canonical)
 }
@@ -147,7 +147,7 @@ fn qe_to_parsed_query(qe: &QueryExpr) -> ParsedQuery {
 /// Find the schema carried by the tree's first `Scan` leaf. Every `Scan`
 /// in a converted tree carries the same Binder schema, so the first one
 /// found is representative.
-fn root_scan_schema(qe: &QueryExpr) -> Option<&crate::intent_algebra::Schema> {
+fn root_scan_schema(qe: &QueryExpr) -> Option<&planner_types::pre_asap::Schema> {
     match qe {
         QueryExpr::Scan { schema, .. } => Some(schema),
         QueryExpr::Filter { child, .. }
@@ -157,12 +157,12 @@ fn root_scan_schema(qe: &QueryExpr) -> Option<&crate::intent_algebra::Schema> {
         | QueryExpr::TimeRange { child, .. }
         | QueryExpr::TimeShift { child, .. }
         | QueryExpr::Aggregate { child, .. }
-        | QueryExpr::Distinct { child, .. }
+        | QueryExpr::Dedup { child, .. }
         | QueryExpr::Project { child, .. }
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. }
-        | QueryExpr::Subquery { child, .. } => root_scan_schema(child),
-        QueryExpr::Merge { children } => children.iter().find_map(root_scan_schema),
+        | QueryExpr::PromqlSubquery { child, .. } => root_scan_schema(child),
+        QueryExpr::Concat { children } => children.iter().find_map(root_scan_schema),
         QueryExpr::Join { left, right, .. }
         | QueryExpr::SetOp { left, right, .. }
         | QueryExpr::BinaryOp {
@@ -197,7 +197,7 @@ impl QeCollector {
     /// `schema` is the Binder-built `Scan.schema` — the complete column
     /// universe `Aggregate.by` positional ids index into. Threaded
     /// unchanged through the walk; only the `Aggregate` arm reads it.
-    fn visit(&mut self, expr: &QueryExpr, schema: Option<&crate::intent_algebra::Schema>) {
+    fn visit(&mut self, expr: &QueryExpr, schema: Option<&planner_types::pre_asap::Schema>) {
         match expr {
             QueryExpr::Scan {
                 source,
@@ -211,7 +211,7 @@ impl QeCollector {
                     });
                 }
                 // Canonical `Scan.predicates` carries equality label
-                // filters as typed `Predicate(L3Expr::Compare{Column, Eq,
+                // filters as typed `Predicate(QueryExpr::Compare{Column, Eq,
                 // Literal(Utf8)})` trees (the shape
                 // `query_expr::label_filter_to_predicate` builds) — resolve
                 // each `Column` id back to its name via the Scan's own
@@ -271,8 +271,8 @@ impl QeCollector {
                 }
                 self.visit(child, schema);
             }
-            QueryExpr::Distinct { child, .. } => self.visit(child, schema),
-            QueryExpr::Merge { children } => {
+            QueryExpr::Dedup { child, .. } => self.visit(child, schema),
+            QueryExpr::Concat { children } => {
                 for c in children {
                     self.visit(c, schema);
                 }
@@ -280,7 +280,7 @@ impl QeCollector {
             QueryExpr::Project { child, .. }
             | QueryExpr::Sort { child, .. }
             | QueryExpr::Limit { child, .. }
-            | QueryExpr::Subquery { child, .. } => self.visit(child, schema),
+            | QueryExpr::PromqlSubquery { child, .. } => self.visit(child, schema),
             QueryExpr::Join { left, right, .. }
             | QueryExpr::SetOp { left, right, .. }
             | QueryExpr::BinaryOp {
@@ -308,7 +308,7 @@ impl QeCollector {
                     self.agg_types.push(AggType::Cardinality);
                 }
             }
-            op if crate::intent_algebra::as_frequency(op).is_some() => {
+            op if crate::planner_selection::as_frequency(op).is_some() => {
                 if !self.agg_types.contains(&AggType::Frequency) {
                     self.agg_types.push(AggType::Frequency);
                 }
@@ -373,28 +373,28 @@ impl QeCollector {
 
 fn collect_filters_from_scalar(
     pred: &Predicate,
-    schema: Option<&crate::intent_algebra::Schema>,
+    schema: Option<&planner_types::pre_asap::Schema>,
     out: &mut HashMap<String, String>,
 ) {
     collect_filters_from_expr(&pred.0, schema, out);
 }
 
-/// Recover a flat name/value equality map from a canonical `L3Expr`
+/// Recover a flat name/value equality map from a canonical `QueryExpr`
 /// predicate tree — `Column(id) == Literal(Utf8(v))` conjuncts, `id`
 /// resolved back to a name via `schema` (positional `Column` carries no
 /// name of its own, unlike the pre-merge name-based `Predicate::Column`).
 fn collect_filters_from_expr(
-    expr: &L3Expr,
-    schema: Option<&crate::intent_algebra::Schema>,
+    expr: &QueryExpr,
+    schema: Option<&planner_types::pre_asap::Schema>,
     out: &mut HashMap<String, String>,
 ) {
     match expr {
-        L3Expr::Compare {
+        QueryExpr::Compare {
             left,
-            op: CompareOp::Eq,
+            op: CompareOpKind::Eq,
             right,
         } => {
-            if let (L3Expr::Column(id), L3Expr::Literal(L3Scalar::Utf8(v))) =
+            if let (QueryExpr::Column(id), QueryExpr::Literal(ScalarValue::Utf8(v))) =
                 (left.as_ref(), right.as_ref())
             {
                 if let Some(col) = schema.and_then(|s| s.columns.get(*id)) {
@@ -402,7 +402,7 @@ fn collect_filters_from_expr(
                 }
             }
         }
-        L3Expr::BoolAnd(parts) => {
+        QueryExpr::BoolAnd(parts) => {
             for p in parts {
                 collect_filters_from_expr(p, schema, out);
             }
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn canonical_promql_quantile_yields_aggregate_over_time_range() {
-        use crate::intent_algebra::query_expr::QueryExpr as CQueryExpr;
+        use planner_types::pre_asap::QueryExpr as CQueryExpr;
         // `asap_l2::lower` models a range-vector selector (`m[5m]`) as
         // `TimeRange`, not `Window` -- `Window` is reserved for real
         // streaming/tumbling windows. `Aggregate` sits directly on top,
@@ -512,13 +512,13 @@ mod tests {
 
     #[test]
     fn canonical_promql_avg_over_time_yields_aggregate_over_time_range() {
-        use crate::intent_algebra::query_expr::QueryExpr as CQueryExpr;
+        use planner_types::pre_asap::QueryExpr as CQueryExpr;
         // A bare `avg_over_time(m[w])` (no `by`) lowers to canonical
         // `Aggregate { child: TimeRange { child: Scan } }`.
         let expr =
             parse_query_expr_canonical("avg_over_time(cpu_seconds_total[10m])", ACC).unwrap();
         match expr {
-            CQueryExpr::Aggregate { child, .. } => match *child {
+            CQueryExpr::Aggregate { child, .. } => match (*child).clone() {
                 CQueryExpr::TimeRange { child, .. } => {
                     assert!(matches!(*child, CQueryExpr::Scan { .. }));
                 }
@@ -535,9 +535,9 @@ mod doc_verify_all {
     // `asap_frontend_promql::lower_promql` produces — the only algebra IR
     // the parse path now emits.
     use super::parse_query_expr_canonical;
-    use crate::intent_algebra::query_expr::QueryExpr;
-    use crate::intent_algebra::{AggIntent, Reduction};
     use crate::types_v2::AccuracyTarget;
+    use planner_types::pre_asap::QueryExpr;
+    use planner_types::pre_asap::{AggIntent, Reduction};
 
     const ACC: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
 

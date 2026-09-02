@@ -1,6 +1,6 @@
 //! Annotated plan nodes — the output of the [`super::allocator::SketchAllocator`].
 //!
-//! After the optimizer rewrites a [`QueryExpr`](crate::intent_algebra::QueryExpr) tree,
+//! After the optimizer rewrites a [`QueryExpr`](planner_types::pre_asap::QueryExpr) tree,
 //! the allocator wraps every node in a [`PlanNode`] that carries:
 //!
 //! * **`stage`** — which pipeline component executes this operator.
@@ -15,7 +15,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::intent_algebra::QueryExpr;
+use planner_types::pre_asap::QueryExpr;
 
 // ── Pipeline stages ───────────────────────────────────────────────────────────
 
@@ -277,7 +277,7 @@ impl PlanNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::{QueryExpr, Schema, Source};
+    use planner_types::pre_asap::{QueryExpr, Schema, Source};
 
     /// Canonical `Scan` leaf — the L3 counterpart of the legacy
     /// `QueryExpr::Source(SourceSpec { .. })`.

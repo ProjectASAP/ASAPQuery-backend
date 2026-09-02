@@ -167,6 +167,14 @@ message Materialization {
   SummaryParams params = 6;
   ColumnRef col = 7;
   optional RetentionPolicy retention = 8;
+  optional SummaryMaintenanceLifecycle lifecycle = 9;
+}
+
+message SummaryMaintenanceLifecycle {
+  string kind = 1;
+  string maintenance_mode = 2;
+  string evaluation_schedule = 3;
+  string output_representation = 4;
 }
 
 message RoutingEntry {

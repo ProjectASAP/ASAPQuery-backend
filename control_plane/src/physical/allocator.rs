@@ -38,11 +38,13 @@
 //! window-defines-sketch-lifecycle fusion that *does* matter is a
 //! `physical::planner` concern — see `physical::window_fusion`.
 
+use std::rc::Rc;
+
 use super::plan::{CostEstimate, ExecutionMode, NodeAnnotation, PipelineStage, PlanNode};
-use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::relational::agg_is_exact;
-use crate::intent_algebra::{QueryExpr, Reduction};
 use crate::types::{SketchType, StageResourceBudgets};
+use planner_types::pre_asap::agg_is_exact;
+use planner_types::pre_asap::AggIntent;
+use planner_types::pre_asap::{QueryExpr, Reduction};
 
 // ── Resource budget tracker ───────────────────────────────────────────────────
 
@@ -128,11 +130,11 @@ impl SketchAllocator {
 
             // ── Structural / filter nodes — always Agent ──────────────────
             QueryExpr::Filter { pred, child } => {
-                let child = self.alloc_node(*child, budget);
+                let child = self.alloc_node((*child).clone(), budget);
                 PlanNode {
                     expr: QueryExpr::Filter {
                         pred,
-                        child: Box::new(child.expr.clone()),
+                        child: Rc::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Agent,
                     mode: ExecutionMode::Passthrough,
@@ -155,11 +157,11 @@ impl SketchAllocator {
             // passthrough and the inner `Aggregate` arm does the sketch
             // placement.
             QueryExpr::TimeRange { range, child } => {
-                let child = self.alloc_node(*child, budget);
+                let child = self.alloc_node((*child).clone(), budget);
                 PlanNode {
                     expr: QueryExpr::TimeRange {
                         range,
-                        child: Box::new(child.expr.clone()),
+                        child: Rc::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Agent,
                     mode: ExecutionMode::Passthrough,
@@ -172,12 +174,12 @@ impl SketchAllocator {
                 }
             }
 
-            QueryExpr::Distinct { cols, child } => {
-                let child = self.alloc_node(*child, budget);
+            QueryExpr::Dedup { cols, child } => {
+                let child = self.alloc_node((*child).clone(), budget);
                 PlanNode {
-                    expr: QueryExpr::Distinct {
+                    expr: QueryExpr::Dedup {
                         cols,
-                        child: Box::new(child.expr.clone()),
+                        child: Rc::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Agent,
                     mode: ExecutionMode::Passthrough,
@@ -205,14 +207,14 @@ impl SketchAllocator {
                 if aggs.len() == 1 && having.is_none() {
                     if let AggIntent::TopK { k, .. } = &aggs[0] {
                         let k = *k;
-                        let child = self.alloc_node(*child, budget);
+                        let child = self.alloc_node((*child).clone(), budget);
                         return PlanNode {
                             expr: QueryExpr::Aggregate {
                                 reduction,
                                 measures: aggs,
                                 output_names,
                                 having,
-                                child: Box::new(child.expr.clone()),
+                                child: Rc::new(child.expr.clone()),
                             },
                             stage: PipelineStage::Precompute,
                             mode: ExecutionMode::Sketch,
@@ -232,11 +234,11 @@ impl SketchAllocator {
                         };
                     }
                     // Single non-TopK intent → budget-driven sketch agg.
-                    let child = self.alloc_node(*child, budget);
+                    let child = self.alloc_node((*child).clone(), budget);
                     return self.alloc_sketch_agg(reduction, aggs, output_names, child, budget);
                 }
                 // General multi-intent / HAVING aggregate → Db (exact).
-                let child = self.alloc_node(*child, budget);
+                let child = self.alloc_node((*child).clone(), budget);
                 let kinds: Vec<&'static str> = aggs.iter().map(canonical_intent_kind_str).collect();
                 PlanNode {
                     expr: QueryExpr::Aggregate {
@@ -244,7 +246,7 @@ impl SketchAllocator {
                         measures: aggs,
                         output_names,
                         having,
-                        child: Box::new(child.expr.clone()),
+                        child: Rc::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Db,
                     mode: ExecutionMode::Exact,
@@ -261,14 +263,14 @@ impl SketchAllocator {
             }
 
             // ── Merge — Backend ───────────────────────────────────────────
-            QueryExpr::Merge { children: inputs } => {
+            QueryExpr::Concat { children: inputs } => {
                 let children: Vec<PlanNode> = inputs
                     .into_iter()
                     .map(|inp| self.alloc_node(inp, budget))
                     .collect();
                 let mem: f64 = children.iter().map(|c| c.cost.memory_bytes).sum();
                 PlanNode {
-                    expr: QueryExpr::Merge {
+                    expr: QueryExpr::Concat {
                         children: children.iter().map(|c| c.expr.clone()).collect(),
                     },
                     stage: PipelineStage::Backend,
@@ -292,12 +294,12 @@ impl SketchAllocator {
                 qualifier,
                 child,
             } => {
-                let child = self.alloc_node(*child, budget);
+                let child = self.alloc_node((*child).clone(), budget);
                 PlanNode {
                     expr: QueryExpr::Project {
                         cols,
                         qualifier,
-                        child: Box::new(child.expr.clone()),
+                        child: Rc::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Db,
                     mode: ExecutionMode::Exact,
@@ -315,12 +317,12 @@ impl SketchAllocator {
                 partition_by,
                 child,
             } => {
-                let child = self.alloc_node(*child, budget);
+                let child = self.alloc_node((*child).clone(), budget);
                 PlanNode {
                     expr: QueryExpr::Sort {
                         keys,
                         partition_by,
-                        child: Box::new(child.expr.clone()),
+                        child: Rc::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Db,
                     mode: ExecutionMode::Exact,
@@ -334,12 +336,12 @@ impl SketchAllocator {
             }
 
             QueryExpr::Limit { n, offset, child } => {
-                let child = self.alloc_node(*child, budget);
+                let child = self.alloc_node((*child).clone(), budget);
                 PlanNode {
                     expr: QueryExpr::Limit {
                         n,
                         offset,
-                        child: Box::new(child.expr.clone()),
+                        child: Rc::new(child.expr.clone()),
                     },
                     stage: PipelineStage::Db,
                     mode: ExecutionMode::Exact,
@@ -358,14 +360,14 @@ impl SketchAllocator {
                 left,
                 right,
             } => {
-                let left_node = self.alloc_node(*left, budget);
-                let right_node = self.alloc_node(*right, budget);
+                let left_node = self.alloc_node((*left).clone(), budget);
+                let right_node = self.alloc_node((*right).clone(), budget);
                 PlanNode {
                     expr: QueryExpr::Join {
                         kind,
                         pred,
-                        left: Box::new(left_node.expr.clone()),
-                        right: Box::new(right_node.expr.clone()),
+                        left: Rc::new(left_node.expr.clone()),
+                        right: Rc::new(right_node.expr.clone()),
                     },
                     stage: PipelineStage::Db,
                     mode: ExecutionMode::Exact,
@@ -387,14 +389,14 @@ impl SketchAllocator {
                 left,
                 right,
             } => {
-                let left_node = self.alloc_node(*left, budget);
-                let right_node = self.alloc_node(*right, budget);
+                let left_node = self.alloc_node((*left).clone(), budget);
+                let right_node = self.alloc_node((*right).clone(), budget);
                 PlanNode {
                     expr: QueryExpr::SetOp {
                         kind,
                         all,
-                        left: Box::new(left_node.expr.clone()),
-                        right: Box::new(right_node.expr.clone()),
+                        left: Rc::new(left_node.expr.clone()),
+                        right: Rc::new(right_node.expr.clone()),
                     },
                     stage: PipelineStage::Db,
                     mode: ExecutionMode::Exact,
@@ -408,12 +410,12 @@ impl SketchAllocator {
             }
 
             // ── PromQL sub-query ──────────────────────────────────────────
-            QueryExpr::Subquery {
+            QueryExpr::PromqlSubquery {
                 range,
                 resolution,
                 child,
             } => {
-                let child = self.alloc_node(*child, budget);
+                let child = self.alloc_node((*child).clone(), budget);
                 let stage = if child.mode == ExecutionMode::Sketch {
                     PipelineStage::Precompute
                 } else {
@@ -421,10 +423,10 @@ impl SketchAllocator {
                 };
                 let rationale = format!("PromQL subquery at {stage}");
                 PlanNode {
-                    expr: QueryExpr::Subquery {
+                    expr: QueryExpr::PromqlSubquery {
                         range,
                         resolution,
-                        child: Box::new(child.expr.clone()),
+                        child: Rc::new(child.expr.clone()),
                     },
                     stage,
                     mode: child.mode.clone(),
@@ -443,8 +445,8 @@ impl SketchAllocator {
                 rhs,
                 vector_match,
             } => {
-                let left_node = self.alloc_node(*lhs, budget);
-                let right_node = self.alloc_node(*rhs, budget);
+                let left_node = self.alloc_node((*lhs).clone(), budget);
+                let right_node = self.alloc_node((*rhs).clone(), budget);
                 let has_sketch = left_node.mode == ExecutionMode::Sketch
                     || right_node.mode == ExecutionMode::Sketch;
                 let stage = if has_sketch {
@@ -457,8 +459,8 @@ impl SketchAllocator {
                     expr: QueryExpr::BinaryOp {
                         op,
                         vector_match,
-                        lhs: Box::new(left_node.expr.clone()),
-                        rhs: Box::new(right_node.expr.clone()),
+                        lhs: Rc::new(left_node.expr.clone()),
+                        rhs: Rc::new(right_node.expr.clone()),
                     },
                     stage,
                     mode: if has_sketch {
@@ -486,60 +488,68 @@ impl SketchAllocator {
             // variant wraps exactly one child, recursed into and staged
             // as an Agent passthrough (mirroring `Filter`/`Window` above)
             // until a real rule is written for them.
-            QueryExpr::Scalar(_) | QueryExpr::EvalTime => {
+            QueryExpr::PromqlScalarBridge(_) | QueryExpr::EvalTimestamp => {
                 PlanNode::leaf(expr, PipelineStage::Agent, ExecutionMode::Passthrough)
             }
-            QueryExpr::VectorFromScalar(child) => {
+            QueryExpr::PromqlVectorFromScalar(child) => {
                 self.alloc_passthrough_child(child, "VectorFromScalar", budget, |c| {
-                    QueryExpr::VectorFromScalar(Box::new(c))
+                    QueryExpr::PromqlVectorFromScalar(Rc::new(c))
                 })
             }
-            QueryExpr::ScalarFromVector(child) => {
+            QueryExpr::PromqlScalarFromVector(child) => {
                 self.alloc_passthrough_child(child, "ScalarFromVector", budget, |c| {
-                    QueryExpr::ScalarFromVector(Box::new(c))
+                    QueryExpr::PromqlScalarFromVector(Rc::new(c))
                 })
             }
-            QueryExpr::Relabel { dst, value, child } => {
-                self.alloc_passthrough_child(child, "Relabel", budget, |c| QueryExpr::Relabel {
-                    dst,
-                    value,
-                    child: Box::new(c),
+            QueryExpr::PromqlRelabel { dst, value, child } => {
+                self.alloc_passthrough_child(child, "Relabel", budget, |c| {
+                    QueryExpr::PromqlRelabel {
+                        dst,
+                        value,
+                        child: Rc::new(c),
+                    }
                 })
             }
-            QueryExpr::InfoJoin { selector, child } => {
-                self.alloc_passthrough_child(child, "InfoJoin", budget, |c| QueryExpr::InfoJoin {
-                    selector,
-                    child: Box::new(c),
+            QueryExpr::PromqlInfoEnrich { selector, child } => {
+                self.alloc_passthrough_child(child, "InfoJoin", budget, |c| {
+                    QueryExpr::PromqlInfoEnrich {
+                        selector,
+                        child: Rc::new(c),
+                    }
                 })
             }
-            QueryExpr::Sample { by, kind, child } => {
-                self.alloc_passthrough_child(child, "Sample", budget, |c| QueryExpr::Sample {
-                    by,
-                    kind,
-                    child: Box::new(c),
+            QueryExpr::PromqlSeriesSample { by, kind, child } => {
+                self.alloc_passthrough_child(child, "Sample", budget, |c| {
+                    QueryExpr::PromqlSeriesSample {
+                        by,
+                        kind,
+                        child: Rc::new(c),
+                    }
                 })
             }
             QueryExpr::TimeShift { shift, child } => {
                 self.alloc_passthrough_child(child, "TimeShift", budget, |c| QueryExpr::TimeShift {
                     shift,
-                    child: Box::new(c),
+                    child: Rc::new(c),
                 })
             }
-            QueryExpr::WindowFunc {
+            QueryExpr::SQLWindowFunc {
                 func,
                 args,
                 partition_by,
                 order_by,
                 output_name,
+                frame,
                 child,
             } => self.alloc_passthrough_child(child, "WindowFunc", budget, |c| {
-                QueryExpr::WindowFunc {
+                QueryExpr::SQLWindowFunc {
                     func,
                     args,
                     partition_by,
                     order_by,
                     output_name,
-                    child: Box::new(c),
+                    frame,
+                    child: Rc::new(c),
                 }
             }),
             // Scalar-expression node (Column/Literal/Compare/BoolAnd/
@@ -561,12 +571,12 @@ impl SketchAllocator {
     /// as an informational Agent passthrough carrying the child's cost.
     fn alloc_passthrough_child(
         &self,
-        child: Box<QueryExpr>,
+        child: Rc<QueryExpr>,
         label: &'static str,
         budget: &mut BudgetState,
         rebuild: impl FnOnce(QueryExpr) -> QueryExpr,
     ) -> PlanNode {
-        let child_node = self.alloc_node(*child, budget);
+        let child_node = self.alloc_node((*child).clone(), budget);
         PlanNode {
             expr: rebuild(child_node.expr.clone()),
             stage: PipelineStage::Agent,
@@ -604,7 +614,7 @@ impl SketchAllocator {
                     measures: aggs,
                     output_names,
                     having: None,
-                    child: Box::new(child.expr.clone()),
+                    child: Rc::new(child.expr.clone()),
                 },
                 stage: PipelineStage::Db,
                 mode: ExecutionMode::Exact,
@@ -628,7 +638,7 @@ impl SketchAllocator {
                     measures: aggs,
                     output_names,
                     having: None,
-                    child: Box::new(child.expr.clone()),
+                    child: Rc::new(child.expr.clone()),
                 },
                 stage: PipelineStage::Backend,
                 mode: ExecutionMode::Exact,
@@ -658,7 +668,7 @@ impl SketchAllocator {
                     measures: aggs,
                     output_names,
                     having: None,
-                    child: Box::new(child.expr.clone()),
+                    child: Rc::new(child.expr.clone()),
                 },
                 stage: PipelineStage::Agent,
                 mode: ExecutionMode::Sketch,
@@ -686,7 +696,7 @@ impl SketchAllocator {
                     measures: aggs,
                     output_names,
                     having: None,
-                    child: Box::new(child.expr.clone()),
+                    child: Rc::new(child.expr.clone()),
                 },
                 stage: PipelineStage::Backend,
                 mode: ExecutionMode::Sketch,
@@ -714,7 +724,7 @@ impl SketchAllocator {
                 measures: aggs,
                 output_names,
                 having: None,
-                child: Box::new(child.expr.clone()),
+                child: Rc::new(child.expr.clone()),
             },
             stage: PipelineStage::Precompute,
             mode: ExecutionMode::Sketch,
@@ -746,7 +756,7 @@ fn estimated_sketch_memory(op: &AggIntent) -> f64 {
 /// Map a canonical [`AggIntent`] to a short stable kind string for
 /// annotation rationale text.
 fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
-    if crate::intent_algebra::as_frequency(intent).is_some() {
+    if crate::planner_selection::as_frequency(intent).is_some() {
         return "frequency";
     }
     match intent {
@@ -800,13 +810,12 @@ fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::relational::{
-        default_cardinality, default_frequency, default_quantile,
-    };
-    use crate::intent_algebra::{JoinKind, L3Expr, L3Scalar, Predicate, QueryExpr, Schema, Source};
     use crate::physical::plan::{ExecutionMode, PipelineStage};
+    use crate::planner_selection::default_frequency;
     use crate::types::{SketchType, StageResourceBudgets};
     use crate::types_v2::AccuracyTarget;
+    use planner_types::pre_asap::{default_cardinality, default_quantile};
+    use planner_types::pre_asap::{JoinKind, Predicate, QueryExpr, ScalarValue, Schema, Source};
 
     /// Canonical `Scan` leaf — the L3 counterpart of the legacy
     /// `QueryExpr::Source(SourceSpec { .. })`.
@@ -828,7 +837,7 @@ mod tests {
             measures: vec![intent],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(scan("m")),
+            child: Rc::new(scan("m")),
         }
     }
 
@@ -869,8 +878,8 @@ mod tests {
     #[test]
     fn filter_at_agent() {
         let expr = QueryExpr::Filter {
-            pred: Predicate(Box::new(L3Expr::Literal(L3Scalar::Boolean(true)))),
-            child: Box::new(scan("m")),
+            pred: Predicate(Rc::new(QueryExpr::Literal(ScalarValue::Boolean(true)))),
+            child: Rc::new(scan("m")),
         };
         let node = alloc(unlimited(), expr);
         assert_eq!(node.stage, PipelineStage::Agent);
@@ -941,7 +950,7 @@ mod tests {
 
     #[test]
     fn merge_goes_to_backend() {
-        let expr = QueryExpr::Merge {
+        let expr = QueryExpr::Concat {
             children: vec![scan("a"), scan("b")],
         };
         let node = alloc(unlimited(), expr);
@@ -972,9 +981,9 @@ mod tests {
     fn join_goes_to_db() {
         let expr = QueryExpr::Join {
             kind: JoinKind::Inner,
-            pred: Predicate(Box::new(L3Expr::Literal(L3Scalar::Boolean(true)))),
-            left: Box::new(scan("orders")),
-            right: Box::new(scan("items")),
+            pred: Predicate(Rc::new(QueryExpr::Literal(ScalarValue::Boolean(true)))),
+            left: Rc::new(scan("orders")),
+            right: Rc::new(scan("items")),
         };
         let node = alloc(unlimited(), expr);
         assert_eq!(node.stage, PipelineStage::Db);
@@ -989,7 +998,7 @@ mod tests {
             measures: vec![AggIntent::Sum { col: None }, AggIntent::Min { col: None }],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(scan("m")),
+            child: Rc::new(scan("m")),
         };
         let node = alloc(unlimited(), expr);
         assert_eq!(node.stage, PipelineStage::Db);
@@ -1004,7 +1013,7 @@ mod tests {
         // Agent, inner Aggregate does the sketch placement.
         let expr = QueryExpr::TimeRange {
             range: std::time::Duration::from_secs(300),
-            child: Box::new(agg(default_quantile(0.5))),
+            child: Rc::new(agg(default_quantile(0.5))),
         };
         let node = alloc(unlimited(), expr);
         assert_eq!(node.stage, PipelineStage::Agent);

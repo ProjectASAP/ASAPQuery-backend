@@ -63,13 +63,13 @@ pub mod backend_client;
 pub mod backend_plan;
 pub mod emit;
 pub mod epsilon_alloc;
-pub mod intent_algebra;
 pub mod metrics_exposer;
 pub mod monitor;
 pub mod opamp;
 pub mod optimizer;
 pub mod physical;
 pub mod pipeline;
+pub mod planner_selection;
 pub mod query_parser;
 pub mod query_planning;
 pub mod replan;
@@ -123,7 +123,23 @@ pub mod asap_tier_implement;
 /// drop (panic-safe), preventing state from leaking between tests.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::rc::Rc;
     use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use planner_types::pre_asap::{CompareOpKind, Predicate, QueryExpr, ScalarValue, Schema};
+
+    pub(crate) fn label_eq_predicate(
+        label: &str,
+        value: &str,
+        schema: &Schema,
+    ) -> Option<Predicate> {
+        let column = schema.column_id(label)?;
+        Some(Predicate(Rc::new(QueryExpr::Compare {
+            left: Rc::new(QueryExpr::Column(column)),
+            op: CompareOpKind::Eq,
+            right: Rc::new(QueryExpr::Literal(ScalarValue::Utf8(value.to_string()))),
+        })))
+    }
 
     /// The one shared lock guarding all process-global env access across
     /// every test module in this crate. Lazily initialised so it can be a

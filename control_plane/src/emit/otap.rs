@@ -42,7 +42,7 @@ use std::collections::BTreeMap;
 
 use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, EdgeStageConfig, ExportTarget};
 use crate::physical::colored_dag::stage_id::StageId;
-use planner_types::post_asap::{SketchKind, SketchParams};
+use planner_types::post_asap::{SketchAlgorithm, SketchParams};
 
 /// Default URL for Prometheus's native OTLP HTTP receiver.
 /// Matches `super::stage_config::emit_edge_yaml`'s placeholder so the
@@ -310,7 +310,7 @@ fn build_asap_sketches_config(sp: &EdgeSketchProcessor, window_secs: Option<u64>
         }
         // Heap-bearing width/depth extraction is identical to the bare
         // kind — this path never distinguished `with_heap` even before
-        // `SketchKind` split it into its own variant (heap_size wasn't
+        // `SketchAlgorithm` split it into its own variant (heap_size wasn't
         // emitted here either way).
         SketchParams::Cms { width, depth } | SketchParams::CmsWithHeap { width, depth, .. } => {
             m.insert("rows".into(), Value::Number((*depth as u64).into()));
@@ -328,24 +328,24 @@ fn build_asap_sketches_config(sp: &EdgeSketchProcessor, window_secs: Option<u64>
         SketchParams::Kmv { .. } | SketchParams::Theta { .. } => {
             unreachable!(
                 "edge sketch processor config requested for a non-sketch or unsupported \
-                 SketchKind; no Bind* rule in this repo produces one"
+                 SketchAlgorithm; no Bind* rule in this repo produces one"
             )
         }
     }
     Value::Mapping(m)
 }
 
-fn sketch_kind_tag(kind: &SketchKind) -> &'static str {
+fn sketch_kind_tag(kind: &SketchAlgorithm) -> &'static str {
     match kind {
-        SketchKind::Kll => "kll",
-        SketchKind::DDSketch => "ddsketch",
-        SketchKind::Hll => "hll",
-        SketchKind::Cms | SketchKind::CmsWithHeap => "cms",
-        SketchKind::CountSketch | SketchKind::CountSketchWithHeap => "count_sketch",
-        SketchKind::Kmv | SketchKind::Theta => {
+        SketchAlgorithm::Kll => "kll",
+        SketchAlgorithm::DDSketch => "ddsketch",
+        SketchAlgorithm::Hll => "hll",
+        SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap => "cms",
+        SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap => "count_sketch",
+        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => {
             unreachable!(
                 "edge sketch processor config requested for a non-sketch or unsupported \
-                 SketchKind; no Bind* rule in this repo produces one"
+                 SketchAlgorithm; no Bind* rule in this repo produces one"
             )
         }
     }
@@ -357,7 +357,7 @@ fn sketch_kind_tag(kind: &SketchKind) -> &'static str {
 mod tests {
     use super::*;
     use crate::physical::colored_dag::emitter::{EdgeSketchProcessor, PrometheusArchiveMetric};
-    use planner_types::post_asap::{SketchKind, SketchParams};
+    use planner_types::post_asap::{SketchAlgorithm, SketchParams};
 
     /// Minimal struct-stub used to validate the emitted DAG parses as the
     /// otap-dataflow schema. We don't pull in the otap-df-config crate
@@ -404,7 +404,7 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "ddsketch".to_string(),
-                sketch_kind: SketchKind::DDSketch,
+                sketch_kind: SketchAlgorithm::DDSketch,
                 sketch_params: SketchParams::DDSketch { alpha: 0.01 },
                 aggregation_id: "agg0".to_string(),
             }],

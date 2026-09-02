@@ -9,8 +9,9 @@
 ///
 /// The server pushes `RemoteConfig` as an OpAMP `ServerToAgent.remote_config`
 /// message (protobuf binary frame) and receives `AgentToServer` status reports.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -20,7 +21,7 @@ use futures_util::sink::SinkExt;
 use futures_util::stream::StreamExt;
 use prost::Message as ProstMessage;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 use tracing::{info, warn};
 
 /// Generated OpAMP protobuf types (from proto/opamp.proto).
@@ -44,6 +45,50 @@ pub struct AgentStatus {
     pub config_hash: String,
     pub healthy: bool,
     pub error: Option<String>,
+}
+
+pub const COLLECTOR_PLAN_CAPABILITY: &str = "io.projectasap.collector-plan.v1";
+pub const COLLECTOR_PLAN_MESSAGE: &str = "collector_plan";
+pub const PLAN_STATUS_MESSAGE: &str = "plan_status";
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CollectorPlanStatusKind {
+    Applied,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CollectorPlanStatus {
+    pub plan_id: u64,
+    pub status: CollectorPlanStatusKind,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CollectorPlanPublishError {
+    #[error("collector {collector_id} did not advertise {COLLECTOR_PLAN_CAPABILITY}")]
+    CapabilityTimeout { collector_id: String },
+    #[error("collector {collector_id} disconnected before plan publication")]
+    Disconnected { collector_id: String },
+    #[error("compiled bundle contains duplicate collector target {collector_id}")]
+    DuplicateTarget { collector_id: String },
+    #[error("collector {collector_id} plan serialization failed: {source}")]
+    Serialize {
+        collector_id: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("collector {collector_id} did not report plan {plan_id} before timeout")]
+    StatusTimeout { collector_id: String, plan_id: u64 },
+    #[error("collector {collector_id} rejected plan {plan_id}: {error}")]
+    Rejected {
+        collector_id: String,
+        plan_id: u64,
+        error: String,
+    },
 }
 
 // ── Role ──────────────────────────────────────────────────────────────────────
@@ -79,13 +124,28 @@ impl AgentRole {
 
 // ── Server ────────────────────────────────────────────────────────────────────
 
-type AgentMap = HashMap<String, (mpsc::Sender<RemoteConfig>, AgentRole)>;
+#[derive(Debug, Clone)]
+enum OutboundMessage {
+    RemoteConfig(RemoteConfig),
+    CollectorPlan(Vec<u8>),
+}
+
+struct AgentConnection {
+    tx: mpsc::Sender<OutboundMessage>,
+    role: AgentRole,
+    custom_capabilities: HashSet<String>,
+}
+
+type AgentMap = HashMap<String, AgentConnection>;
+type PlanStatusMap = HashMap<(String, u64), CollectorPlanStatus>;
 
 pub type OnConnectFn = Arc<dyn Fn(String, AgentRole) + Send + Sync>;
 pub type OnDisconnectFn = Arc<dyn Fn(String) + Send + Sync>;
 
 pub struct OpampServer {
     agents: Arc<RwLock<AgentMap>>,
+    plan_statuses: Arc<RwLock<PlanStatusMap>>,
+    state_changed: Arc<Notify>,
     on_connect: Option<OnConnectFn>,
     on_disconnect: Option<OnDisconnectFn>,
 }
@@ -94,6 +154,8 @@ impl Default for OpampServer {
     fn default() -> Self {
         Self {
             agents: Arc::new(RwLock::new(HashMap::new())),
+            plan_statuses: Arc::new(RwLock::new(HashMap::new())),
+            state_changed: Arc::new(Notify::new()),
             on_connect: None,
             on_disconnect: None,
         }
@@ -104,6 +166,8 @@ impl Clone for OpampServer {
     fn clone(&self) -> Self {
         Self {
             agents: Arc::clone(&self.agents),
+            plan_statuses: Arc::clone(&self.plan_statuses),
+            state_changed: Arc::clone(&self.state_changed),
             on_connect: self.on_connect.clone(),
             on_disconnect: self.on_disconnect.clone(),
         }
@@ -160,10 +224,15 @@ impl OpampServer {
 
     /// Pushes a config to a specific agent. Returns false if not connected.
     pub async fn push(&self, agent_id: &str, cfg: RemoteConfig) -> bool {
-        if let Some((tx, _)) = self.agents.read().await.get(agent_id) {
-            tx.send(cfg).await.is_ok()
-        } else {
-            false
+        let tx = self
+            .agents
+            .read()
+            .await
+            .get(agent_id)
+            .map(|connection| connection.tx.clone());
+        match tx {
+            Some(tx) => tx.send(OutboundMessage::RemoteConfig(cfg)).await.is_ok(),
+            None => false,
         }
     }
 
@@ -182,7 +251,7 @@ impl OpampServer {
             .read()
             .await
             .iter()
-            .filter(|(_, (_, r))| *r == role)
+            .filter(|(_, connection)| connection.role == role)
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
@@ -201,8 +270,149 @@ impl OpampServer {
             .read()
             .await
             .iter()
-            .map(|(id, (_, role))| (id.clone(), role.clone()))
+            .map(|(id, connection)| (id.clone(), connection.role.clone()))
             .collect()
+    }
+
+    /// Publish all per-target physical plans and require an exact semantic
+    /// APPLIED report from every Collector. Config hashes are deliberately not
+    /// accepted as plan activation evidence.
+    pub async fn publish_collector_plans(
+        &self,
+        plans: &[crate::physical::compiler::CollectorPlan],
+        timeout: Duration,
+    ) -> Result<Vec<CollectorPlanStatus>, CollectorPlanPublishError> {
+        self.ensure_collector_plan_targets(plans, timeout).await?;
+
+        for plan in plans {
+            let body = serde_json::to_vec(plan).map_err(|source| {
+                CollectorPlanPublishError::Serialize {
+                    collector_id: plan.collector_id.clone(),
+                    source,
+                }
+            })?;
+            self.plan_statuses
+                .write()
+                .await
+                .remove(&(plan.collector_id.clone(), plan.envelope.plan_id));
+            let sent = self.send_collector_plan(&plan.collector_id, body).await;
+            if !sent {
+                return Err(CollectorPlanPublishError::Disconnected {
+                    collector_id: plan.collector_id.clone(),
+                });
+            }
+        }
+
+        let mut reports = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let report = self
+                .wait_for_plan_status(&plan.collector_id, plan.envelope.plan_id, timeout)
+                .await
+                .ok_or_else(|| CollectorPlanPublishError::StatusTimeout {
+                    collector_id: plan.collector_id.clone(),
+                    plan_id: plan.envelope.plan_id,
+                })?;
+            if report.status != CollectorPlanStatusKind::Applied {
+                return Err(CollectorPlanPublishError::Rejected {
+                    collector_id: plan.collector_id.clone(),
+                    plan_id: report.plan_id,
+                    error: report.error.clone().unwrap_or_else(|| "unspecified".into()),
+                });
+            }
+            reports.push(report);
+        }
+        Ok(reports)
+    }
+
+    /// Validate target uniqueness and wait for every target to advertise the
+    /// physical-plan capability. The orchestrator calls this before changing
+    /// backend state, then publication repeats it to close disconnect races.
+    pub async fn ensure_collector_plan_targets(
+        &self,
+        plans: &[crate::physical::compiler::CollectorPlan],
+        timeout: Duration,
+    ) -> Result<(), CollectorPlanPublishError> {
+        let mut targets = HashSet::with_capacity(plans.len());
+        for plan in plans {
+            if !targets.insert(plan.collector_id.as_str()) {
+                return Err(CollectorPlanPublishError::DuplicateTarget {
+                    collector_id: plan.collector_id.clone(),
+                });
+            }
+        }
+        for plan in plans {
+            if !self
+                .wait_for_capability(&plan.collector_id, COLLECTOR_PLAN_CAPABILITY, timeout)
+                .await
+            {
+                return Err(CollectorPlanPublishError::CapabilityTimeout {
+                    collector_id: plan.collector_id.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_collector_plan(&self, agent_id: &str, body: Vec<u8>) -> bool {
+        let agents = self.agents.read().await;
+        let Some(connection) = agents.get(agent_id) else {
+            return false;
+        };
+        if !connection
+            .custom_capabilities
+            .contains(COLLECTOR_PLAN_CAPABILITY)
+        {
+            return false;
+        }
+        let tx = connection.tx.clone();
+        drop(agents);
+        tx.send(OutboundMessage::CollectorPlan(body)).await.is_ok()
+    }
+
+    async fn wait_for_capability(
+        &self,
+        agent_id: &str,
+        capability: &str,
+        timeout: Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let changed = self.state_changed.notified();
+            if self
+                .agents
+                .read()
+                .await
+                .get(agent_id)
+                .is_some_and(|agent| agent.custom_capabilities.contains(capability))
+            {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, changed).await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    async fn wait_for_plan_status(
+        &self,
+        agent_id: &str,
+        plan_id: u64,
+        timeout: Duration,
+    ) -> Option<CollectorPlanStatus> {
+        let key = (agent_id.to_string(), plan_id);
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let changed = self.state_changed.notified();
+            if let Some(status) = self.plan_statuses.read().await.get(&key).cloned() {
+                return Some(status);
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() || tokio::time::timeout(remaining, changed).await.is_err() {
+                return None;
+            }
+        }
     }
 }
 
@@ -212,11 +422,16 @@ async fn handle_socket(
     role: AgentRole,
     srv: Arc<OpampServer>,
 ) {
-    let (tx, mut rx) = mpsc::channel::<RemoteConfig>(16);
-    srv.agents
-        .write()
-        .await
-        .insert(agent_id.clone(), (tx, role.clone()));
+    let (tx, mut rx) = mpsc::channel::<OutboundMessage>(16);
+    srv.agents.write().await.insert(
+        agent_id.clone(),
+        AgentConnection {
+            tx,
+            role: role.clone(),
+            custom_capabilities: HashSet::new(),
+        },
+    );
+    srv.state_changed.notify_waiters();
     info!(agent = %agent_id, ?role, "agent connected");
 
     if let Some(cb) = &srv.on_connect {
@@ -235,9 +450,17 @@ async fn handle_socket(
     // conformance so the agent never has to take the legacy path.
     let writer_id = agent_id.clone();
     let write_task = tokio::spawn(async move {
-        while let Some(cfg) = rx.recv().await {
-            // Build standard OpAMP ServerToAgent with RemoteConfig.
-            let server_to_agent = encode_remote_config(&cfg);
+        while let Some(message) = rx.recv().await {
+            let (server_to_agent, description) = match message {
+                OutboundMessage::RemoteConfig(cfg) => (
+                    encode_remote_config(&cfg),
+                    format!("remote config hash={}", cfg.config_hash),
+                ),
+                OutboundMessage::CollectorPlan(body) => (
+                    encode_collector_plan(body),
+                    "typed CollectorPlan".to_string(),
+                ),
+            };
             let mut payload = Vec::new();
             if server_to_agent.encode(&mut payload).is_err() {
                 warn!(agent = %writer_id, "failed to encode OpAMP protobuf");
@@ -251,7 +474,7 @@ async fn handle_socket(
             if ws_tx.send(Message::Binary(buf.into())).await.is_err() {
                 break;
             }
-            info!(agent = %writer_id, hash = %cfg.config_hash, "config pushed (OpAMP protobuf)");
+            info!(agent = %writer_id, message = %description, "message pushed (OpAMP protobuf)");
         }
     });
 
@@ -290,6 +513,33 @@ async fn handle_socket(
                 match opamp_proto::AgentToServer::decode(payload) {
                     Ok(ats) => {
                         info!(agent = %agent_id, "received AgentToServer (OpAMP protobuf)");
+                        if let Some(capabilities) = &ats.custom_capabilities {
+                            if let Some(connection) = srv.agents.write().await.get_mut(&agent_id) {
+                                connection.custom_capabilities =
+                                    capabilities.capabilities.iter().cloned().collect();
+                            }
+                            srv.state_changed.notify_waiters();
+                        }
+                        if let Some(message) = &ats.custom_message {
+                            if message.capability == COLLECTOR_PLAN_CAPABILITY
+                                && message.r#type == PLAN_STATUS_MESSAGE
+                            {
+                                match serde_json::from_slice::<CollectorPlanStatus>(&message.data) {
+                                    Ok(status) => {
+                                        srv.plan_statuses
+                                            .write()
+                                            .await
+                                            .insert((agent_id.clone(), status.plan_id), status);
+                                        srv.state_changed.notify_waiters();
+                                    }
+                                    Err(error) => warn!(
+                                        agent = %agent_id,
+                                        %error,
+                                        "invalid typed CollectorPlan status"
+                                    ),
+                                }
+                            }
+                        }
                         // Log effective config if reported. Triggered by
                         // the `ReportFullState` flag on our outgoing
                         // ServerToAgent (see `encode_remote_config`).
@@ -377,6 +627,7 @@ async fn handle_socket(
 
     write_task.abort();
     srv.agents.write().await.remove(&agent_id);
+    srv.state_changed.notify_waiters();
     info!(agent = %agent_id, "agent disconnected");
 
     if let Some(cb) = &srv.on_disconnect {
@@ -453,13 +704,27 @@ fn encode_remote_config(cfg: &RemoteConfig) -> opamp_proto::ServerToAgent {
     }
 }
 
+fn encode_collector_plan(body: Vec<u8>) -> opamp_proto::ServerToAgent {
+    opamp_proto::ServerToAgent {
+        capabilities: 0x01,
+        custom_capabilities: Some(opamp_proto::CustomCapabilities {
+            capabilities: vec![COLLECTOR_PLAN_CAPABILITY.into()],
+        }),
+        custom_message: Some(opamp_proto::CustomMessage {
+            capability: COLLECTOR_PLAN_CAPABILITY.into(),
+            r#type: COLLECTOR_PLAN_MESSAGE.into(),
+            data: body,
+        }),
+        ..Default::default()
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::{routing::get, Router};
-    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn no_agents_push_returns_false() {
@@ -714,5 +979,147 @@ mod tests {
             backend_result.is_err(),
             "backend-role client must not receive agent-role push"
         );
+    }
+
+    fn test_collector_plan(
+        collector_id: &str,
+        plan_id: u64,
+    ) -> crate::physical::compiler::CollectorPlan {
+        crate::physical::compiler::CollectorPlan {
+            collector_id: collector_id.into(),
+            envelope: crate::physical::compiler::PlanEnvelope {
+                plan_id,
+                generated_at_unix_ms: 1,
+                planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
+                capability_snapshot_id: "caps-1".into(),
+            },
+            materializations: vec![crate::physical::compiler::CollectorMaterialization {
+                query_id: "q".into(),
+                metric: "requests".into(),
+                algorithm: "hll".into(),
+                parameters: serde_json::json!({"precision": 14}),
+                group_by: vec!["service".into()],
+                window_secs: 60,
+                evidence_source: None,
+                lifecycle: crate::physical::compiler::CollectorLifecycle {
+                    kind: "continuously_maintained".into(),
+                    maintenance_mode: "incremental".into(),
+                    evaluation_schedule: "per_update".into(),
+                    output_representation: "summary_state".into(),
+                },
+            }],
+        }
+    }
+
+    async fn send_agent_message(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        message: opamp_proto::AgentToServer,
+    ) {
+        use futures_util::SinkExt;
+        let mut protobuf = Vec::new();
+        message.encode(&mut protobuf).unwrap();
+        let mut frame = vec![0];
+        frame.extend(protobuf);
+        ws.send(tokio_tungstenite::tungstenite::Message::Binary(frame))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_plan_publication_waits_for_capability_and_exact_applied_status() {
+        let (srv, addr) = start_server().await;
+        let mut agent_ws = connect_ws_client(addr, "edge-a", "agent").await;
+
+        send_agent_message(
+            &mut agent_ws,
+            opamp_proto::AgentToServer {
+                custom_capabilities: Some(opamp_proto::CustomCapabilities {
+                    capabilities: vec![COLLECTOR_PLAN_CAPABILITY.into()],
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let publisher = Arc::clone(&srv);
+        let plan = test_collector_plan("edge-a", 42);
+        let publish = tokio::spawn(async move {
+            publisher
+                .publish_collector_plans(&[plan], Duration::from_secs(2))
+                .await
+        });
+
+        let frame = tokio::time::timeout(Duration::from_secs(2), agent_ws.next())
+            .await
+            .expect("typed plan timed out")
+            .unwrap()
+            .unwrap();
+        let message = decode_server_to_agent_frame(&frame.into_data());
+        let custom = message.custom_message.expect("custom message");
+        assert_eq!(custom.capability, COLLECTOR_PLAN_CAPABILITY);
+        assert_eq!(custom.r#type, COLLECTOR_PLAN_MESSAGE);
+        let wire_plan: crate::physical::compiler::CollectorPlan =
+            serde_json::from_slice(&custom.data).unwrap();
+        assert_eq!(wire_plan.collector_id, "edge-a");
+        assert_eq!(wire_plan.envelope.plan_id, 42);
+
+        let status = serde_json::to_vec(&CollectorPlanStatus {
+            plan_id: 42,
+            status: CollectorPlanStatusKind::Applied,
+            error: None,
+        })
+        .unwrap();
+        send_agent_message(
+            &mut agent_ws,
+            opamp_proto::AgentToServer {
+                custom_message: Some(opamp_proto::CustomMessage {
+                    capability: COLLECTOR_PLAN_CAPABILITY.into(),
+                    r#type: PLAN_STATUS_MESSAGE.into(),
+                    data: status,
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let reports = publish.await.unwrap().unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].plan_id, 42);
+        assert_eq!(reports[0].status, CollectorPlanStatusKind::Applied);
+    }
+
+    #[tokio::test]
+    async fn typed_plan_publication_fails_without_advertised_capability() {
+        let (srv, addr) = start_server().await;
+        let _agent_ws = connect_ws_client(addr, "edge-a", "agent").await;
+        let error = srv
+            .publish_collector_plans(
+                &[test_collector_plan("edge-a", 42)],
+                Duration::from_millis(30),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CollectorPlanPublishError::CapabilityTimeout { collector_id }
+                if collector_id == "edge-a"
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_plan_publication_rejects_duplicate_targets_before_sending() {
+        let srv = OpampServer::new();
+        let plan = test_collector_plan("edge-a", 42);
+        let error = srv
+            .publish_collector_plans(&[plan.clone(), plan], Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CollectorPlanPublishError::DuplicateTarget { collector_id }
+                if collector_id == "edge-a"
+        ));
     }
 }
