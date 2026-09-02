@@ -6,9 +6,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use planner_types::post_asap::{
-    ExactKind, ExactParams, GroupingStrategy, SketchAlgorithm as SketchKind,
-    SketchKind as CommittedSketchKind, SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType,
-    SummaryNode,
+    ExactKind, ExactParams, GroupingStrategy, SketchAlgorithm, SketchKind, SketchParams,
+    SketchQuery, SummaryExpr, SummaryFamilyType, SummaryNode,
 };
 use planner_types::pre_asap::expr_ir::ColumnRef;
 
@@ -19,11 +18,8 @@ use crate::sketch_algebra::lower::bind_query_expr;
 use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
 use crate::types_v2::AccuracyTarget;
 
-fn sketch_family(kind: SketchKind, params: SketchParams) -> SummaryFamilyType {
-    SummaryFamilyType::Sketch(
-        CommittedSketchKind::new(kind, params),
-        GroupingStrategy::default(),
-    )
+fn sketch_family(kind: SketchAlgorithm, params: SketchParams) -> SummaryFamilyType {
+    SummaryFamilyType::Sketch(SketchKind::new(kind, params), GroupingStrategy::default())
 }
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
@@ -138,7 +134,8 @@ fn bind_kll_quantile_basic() {
     // tie-break exercised separately by
     // `bind_picks_ddsketch_over_kll_when_eps_explicit` below.
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
-    let cost_model = ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SketchKind::Kll);
+    let cost_model =
+        ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SketchAlgorithm::Kll);
     let node = crate::planner_selection::select_summary(&expr, &cost_model)
         .expect("KLL should bind a Quantile{0.99, ε=0.01}");
     match &node.expr {
@@ -151,7 +148,7 @@ fn bind_kll_quantile_basic() {
                 SummaryExpr::SummaryAgg { family, child, .. } => {
                     assert_eq!(
                         family,
-                        &sketch_family(SketchKind::Kll, SketchParams::Kll { k: 269 })
+                        &sketch_family(SketchAlgorithm::Kll, SketchParams::Kll { k: 269 })
                     );
                     assert!(matches!(child.expr, SummaryExpr::KeepPreAsap(_)));
                 }
@@ -168,7 +165,7 @@ fn bind_ddsketch_quantile_basic() {
     // of the retired `BindDDSketchOnQuantile` rule struct.
     let expr = agg_quantile(0.99, AccuracyTarget::Epsilon(0.01));
     let cost_model =
-        ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SketchKind::DDSketch);
+        ForcedFamilyCostModel::new(AccuracyTarget::Epsilon(0.01), SketchAlgorithm::DDSketch);
     let node = crate::planner_selection::select_summary(&expr, &cost_model)
         .expect("DDSketch should bind a Quantile{0.99, ε=0.01}");
     match &node.expr {
@@ -180,7 +177,7 @@ fn bind_ddsketch_quantile_basic() {
             match &summary_input.expr {
                 SummaryExpr::SummaryAgg { family, .. } => match family {
                     SummaryFamilyType::Sketch(kind, _)
-                        if kind.algorithm() == &SketchKind::DDSketch
+                        if kind.algorithm() == &SketchAlgorithm::DDSketch
                             && matches!(kind.params(), SketchParams::DDSketch { .. }) =>
                     {
                         let SketchParams::DDSketch { alpha } = kind.params() else {
@@ -211,7 +208,7 @@ fn bind_picks_ddsketch_over_kll_when_eps_explicit() {
             SummaryExpr::SummaryEstimate { summary_input, .. } => match &summary_input.expr {
                 SummaryExpr::SummaryAgg { family, .. } => {
                     assert!(
-                        matches!(family, SummaryFamilyType::Sketch(kind, _) if kind.algorithm() == &SketchKind::DDSketch),
+                        matches!(family, SummaryFamilyType::Sketch(kind, _) if kind.algorithm() == &SketchAlgorithm::DDSketch),
                         "dispatcher should pick DDSketch over KLL on ε-driven Quantile, got {family:?}"
                     );
                 }
@@ -236,12 +233,12 @@ fn agg_topk(k: usize, accuracy: AccuracyTarget) -> QueryExpr {
     }
 }
 
-/// Pull the bound `(SketchKind, w, d)` out of a top-k binding.
-/// `SketchKind` promotes `with_heap` to kind identity — the top-k cost
+/// Pull the bound `(SketchAlgorithm, w, d)` out of a top-k binding.
+/// `SketchAlgorithm` promotes `with_heap` to kind identity — the top-k cost
 /// model always binds `CmsWithHeap`/`CountSketchWithHeap` for a top-k
 /// intent, never the bare kind, so there's no separate heap flag to
 /// return anymore.
-fn topk_binding_family(bound: &PhysicalExpr) -> (SketchKind, u32, u32) {
+fn topk_binding_family(bound: &PhysicalExpr) -> (SketchAlgorithm, u32, u32) {
     match bound {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryEstimate {
@@ -254,7 +251,7 @@ fn topk_binding_family(bound: &PhysicalExpr) -> (SketchKind, u32, u32) {
                         SummaryFamilyType::Sketch(kind, _)
                             if matches!(
                                 kind.algorithm(),
-                                SketchKind::CmsWithHeap | SketchKind::CountSketchWithHeap
+                                SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap
                             ) =>
                         {
                             match kind.params() {
@@ -326,8 +323,8 @@ fn bind_cms_topk_tight_recall_picks_countsketch() {
 fn bind_cms_topk_picks_cost_min_meeting_sla() {
     use crate::optimizer::cost::wire::WireCostTable;
     let table = WireCostTable::default();
-    let cms = table.for_kind(&SketchKind::Cms).per_flush();
-    let cs = table.for_kind(&SketchKind::CountSketch).per_flush();
+    let cms = table.for_kind(&SketchAlgorithm::Cms).per_flush();
+    let cs = table.for_kind(&SketchAlgorithm::CountSketch).per_flush();
     assert!(
         cms < cs,
         "CMS-heap ({cms} B) must be cheaper than CountSketch ({cs} B) on the wire"
@@ -367,7 +364,7 @@ fn bind_hll_cardinality_basic() {
                 match &summary_input.expr {
                     SummaryExpr::SummaryAgg { family, .. } => match family {
                         SummaryFamilyType::Sketch(kind, _)
-                            if kind.algorithm() == &SketchKind::Hll =>
+                            if kind.algorithm() == &SketchAlgorithm::Hll =>
                         {
                             let SketchParams::Hll { precision } = kind.params() else {
                                 panic!("HLL algorithm has mismatched params")
@@ -478,7 +475,7 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
                         assert!(matches!(
                             family,
                             SummaryFamilyType::Sketch(kind, _)
-                                if matches!(kind.algorithm(), SketchKind::Kll | SketchKind::DDSketch)
+                                if matches!(kind.algorithm(), SketchAlgorithm::Kll | SketchAlgorithm::DDSketch)
                         ));
                     }
                     other => panic!("expected SummaryAgg under SummaryEstimate, got {other:?}"),
@@ -674,7 +671,10 @@ fn phase_b_e2e_quantile_over_time_binds_to_quantile_sketch() {
     );
     let kind = crate::emit::extract_root_sketch_kind(&bound);
     assert!(
-        matches!(kind, Some(SketchKind::Kll) | Some(SketchKind::DDSketch)),
+        matches!(
+            kind,
+            Some(SketchAlgorithm::Kll) | Some(SketchAlgorithm::DDSketch)
+        ),
         "expected quantile summary family, got {kind:?}"
     );
     assert!(
@@ -906,7 +906,7 @@ fn frequency_extension_binds_cms() {
                     SummaryExpr::SummaryAgg {
                         family: SummaryFamilyType::Sketch(kind, _),
                         ..
-                    } if kind.algorithm() == &SketchKind::Cms
+                    } if kind.algorithm() == &SketchAlgorithm::Cms
                 ),
                 "expected a Cms SummaryAgg, got {:?}",
                 summary_input.expr
