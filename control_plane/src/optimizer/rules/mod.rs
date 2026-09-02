@@ -5,6 +5,34 @@ use crate::types::*;
 
 pub const DEFAULT_VALID_FOR: Duration = Duration::from_secs(10 * 60);
 
+/// MVP fixture classification used only to translate the demo workload into
+/// Planner intents. Sketch legality and candidate enumeration remain owned by
+/// ASAPPlanner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeploymentIntent {
+    Quantile,
+    Cardinality,
+    TopK,
+    Frequency,
+    RawPassthrough,
+}
+
+fn mvp_deployment_policy(
+    metric_name: &str,
+) -> Option<(DeploymentIntent, planner_types::post_asap::SketchAlgorithm)> {
+    use planner_types::post_asap::SketchAlgorithm;
+
+    Some(match metric_name {
+        "http_requests_total" => (DeploymentIntent::RawPassthrough, SketchAlgorithm::DDSketch),
+        "http_latency_ms" => (DeploymentIntent::Quantile, SketchAlgorithm::DDSketch),
+        "request_size_bytes" => (DeploymentIntent::Quantile, SketchAlgorithm::Kll),
+        "unique_users_per_min" => (DeploymentIntent::Cardinality, SketchAlgorithm::Hll),
+        "top_endpoint_qps" => (DeploymentIntent::TopK, SketchAlgorithm::CountSketch),
+        "endpoint_request_freq" => (DeploymentIntent::Frequency, SketchAlgorithm::Cms),
+        _ => return None,
+    })
+}
+
 /// Bind a `QueryWorkload` into the typed L4 [`crate::sketch_algebra::PhysicalExpr`]
 /// IR, when callers want to inspect the typed binding alongside the
 /// legacy `CollectionPlan` output.
@@ -13,8 +41,7 @@ pub const DEFAULT_VALID_FOR: Duration = Duration::from_secs(10 * 60);
 /// six metric→family rows (`http_latency_ms` → DDSketch, `request_size_bytes`
 /// → KLL, `unique_users_per_min` → HLL, `top_endpoint_qps` → CountSketch,
 /// `endpoint_request_freq` → CMS, `http_requests_total` → raw). The
-/// matching is done by [`sketch_algebra::capability_matching::
-/// classify_demo_metric`] for the contract rows, and falls back to the
+/// deployment policy below handles the contract rows and falls back to the
 /// `AggType`-driven default (Quantile→DDSketch, Cardinality→HLL,
 /// Frequency→CMS) for any other metric name.
 ///
@@ -58,9 +85,6 @@ pub fn bind_workload_typed_with_item_filter(
     w: &QueryWorkload,
     item_filter: Option<(&str, &str)>,
 ) -> Option<crate::sketch_algebra::PhysicalExpr> {
-    use crate::sketch_algebra::capability_matching::{
-        classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
-    };
     use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
     use crate::types_v2::AccuracyTarget;
     use planner_types::post_asap::SketchAlgorithm;
@@ -78,8 +102,7 @@ pub fn bind_workload_typed_with_item_filter(
     // `top_endpoint_qps` / `endpoint_request_freq`) parse to
     // `exact_required: true` and the typed binder declines, so the
     // 5-sketch routing emitter never sees them.
-    let metric_is_contract_row =
-        crate::sketch_algebra::capability_matching::classify_demo_metric(&w.metric_name).is_some();
+    let metric_is_contract_row = mvp_deployment_policy(&w.metric_name).is_some();
     let operator_pinned_sketch = w.sketch_type_override.is_some();
     if w.exact_required && !metric_is_contract_row && !operator_pinned_sketch {
         return None;
@@ -93,11 +116,11 @@ pub fn bind_workload_typed_with_item_filter(
     // Priority: workload-spec metric-name match → AggType-driven
     // default. The metric-name match owns the demo contract rows; the
     // AggType fallback covers everything else.
-    let (statistic, accuracy_pref) =
-        classify_demo_metric(&w.metric_name).unwrap_or_else(|| match w.aggregations[0] {
-            AggType::Quantile => (StatisticClass::Quantile, AccuracyPreference::RelativeError),
-            AggType::Cardinality => (StatisticClass::Cardinality, AccuracyPreference::default()),
-            AggType::Frequency => (StatisticClass::Frequency, AccuracyPreference::default()),
+    let (statistic, default_kind) =
+        mvp_deployment_policy(&w.metric_name).unwrap_or_else(|| match w.aggregations[0] {
+            AggType::Quantile => (DeploymentIntent::Quantile, SketchAlgorithm::DDSketch),
+            AggType::Cardinality => (DeploymentIntent::Cardinality, SketchAlgorithm::Hll),
+            AggType::Frequency => (DeploymentIntent::Frequency, SketchAlgorithm::Cms),
         });
 
     // The query/operator owns the statistic. An override may select a
@@ -108,7 +131,7 @@ pub fn bind_workload_typed_with_item_filter(
 
     // SumRateCount → no sketch (raw passthrough). Decline the typed
     // binding so the caller falls back to the legacy raw plan.
-    if statistic == StatisticClass::SumRateCount {
+    if statistic == DeploymentIntent::RawPassthrough {
         return None;
     }
 
@@ -125,10 +148,9 @@ pub fn bind_workload_typed_with_item_filter(
         .sketch_type_override
         .as_ref()
         .map(|st| SketchAlgorithm::from(st.clone()));
-    let kind = match override_kind {
-        Some(k) if is_valid_pair(k.clone(), statistic) => k,
-        _ => pick_family(statistic, accuracy_pref)?,
-    };
+    // ASAPPlanner is the authority on whether this forced family is legal for
+    // the intent. An invalid override produces no candidate below.
+    let kind = override_kind.unwrap_or(default_kind);
 
     // QueryWorkload::accuracy_sla in the legacy planner is interpreted
     // directly as the ε bound (e.g. `0.01` ⇒ ε=0.01). The L3/L4 typed
@@ -146,25 +168,25 @@ pub fn bind_workload_typed_with_item_filter(
     // so we synthesize a default k=10 — the same value the legacy
     // PromQL `topk(10, …)` lowering uses.
     let intent = match statistic {
-        StatisticClass::Quantile => L3AggIntent::Quantile {
+        DeploymentIntent::Quantile => L3AggIntent::Quantile {
             col: None,
             q: w.quantiles.first().copied().unwrap_or(0.99),
             accuracy: intent_accuracy,
         },
-        StatisticClass::Cardinality => L3AggIntent::Cardinality {
+        DeploymentIntent::Cardinality => L3AggIntent::Cardinality {
             col: None,
             accuracy: intent_accuracy,
         },
-        StatisticClass::Frequency => crate::planner_selection::frequency(
+        DeploymentIntent::Frequency => crate::planner_selection::frequency(
             intent_accuracy,
             item_filter.map(|(label, value)| (label.to_string(), value.to_string())),
         ),
-        StatisticClass::TopK => L3AggIntent::TopK {
+        DeploymentIntent::TopK => L3AggIntent::TopK {
             k: 10,
             accuracy: intent_accuracy,
         },
         // SumRateCount handled above (early return).
-        StatisticClass::SumRateCount => unreachable!(),
+        DeploymentIntent::RawPassthrough => unreachable!(),
     };
 
     let scan = QueryExpr::Scan {
@@ -242,7 +264,7 @@ pub fn bind_workload_typed_with_item_filter(
     // this contract row commits like any other.
     let forced = match kind {
         SketchAlgorithm::CountSketch => SketchAlgorithm::CountSketchWithHeap,
-        SketchAlgorithm::Cms if statistic == StatisticClass::TopK => SketchAlgorithm::CmsWithHeap,
+        SketchAlgorithm::Cms if statistic == DeploymentIntent::TopK => SketchAlgorithm::CmsWithHeap,
         other => other,
     };
     let cost_model = ForcedFamilyCostModel::new(accuracy.clone(), forced);
