@@ -1013,7 +1013,6 @@ fn default_rules() -> Vec<Box<dyn RewriteRule>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asap_types::enums::WindowKind;
     use planner_types::pre_asap::{default_cardinality, default_quantile};
     use planner_types::pre_asap::{BinaryOpKind, QueryExpr, ScalarValue, Schema, SortKey, Source};
     use planner_types::pre_asap::{GroupKeys, Predicate};

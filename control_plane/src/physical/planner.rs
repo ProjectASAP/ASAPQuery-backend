@@ -592,7 +592,8 @@ mod tests {
 
     use super::*;
     use crate::types_v2::AccuracyTarget;
-    use planner_types::pre_asap::{default_cardinality, default_frequency, default_quantile};
+    use crate::planner_selection::default_frequency;
+    use planner_types::pre_asap::{default_cardinality, default_quantile};
     use planner_types::pre_asap::{Reduction, Schema, Source};
 
     fn default_config() -> PhysicalPlannerConfig {

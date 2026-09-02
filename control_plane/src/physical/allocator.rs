@@ -813,7 +813,8 @@ mod tests {
     use crate::physical::plan::{ExecutionMode, PipelineStage};
     use crate::types::{SketchType, StageResourceBudgets};
     use crate::types_v2::AccuracyTarget;
-    use planner_types::pre_asap::{default_cardinality, default_frequency, default_quantile};
+    use crate::planner_selection::default_frequency;
+    use planner_types::pre_asap::{default_cardinality, default_quantile};
     use planner_types::pre_asap::{JoinKind, Predicate, QueryExpr, ScalarValue, Schema, Source};
 
     /// Canonical `Scan` leaf — the L3 counterpart of the legacy
