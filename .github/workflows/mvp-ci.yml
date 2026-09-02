@@ -57,16 +57,16 @@ jobs:
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo check --locked -p control_plane -p data_plane
+        run: cargo check -p control_plane -p data_plane
 
       - name: Lint control plane and data plane
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo clippy --locked -p control_plane -p data_plane --all-targets
+        run: cargo clippy -p control_plane -p data_plane --all-targets
 
       - name: Test MVP control plane
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo test --locked -p control_plane
+        run: cargo test -p control_plane
