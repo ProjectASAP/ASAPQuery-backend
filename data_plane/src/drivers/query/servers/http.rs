@@ -5615,7 +5615,12 @@ async fn handle_post_backend_plan(
     let materialization_count = new_plan.materializations.len();
     let routing_count = new_plan.routing.len();
     let plan_id = new_plan.plan_id;
-    handle.swap(new_plan);
+    if let Err(error) = handle.install(new_plan) {
+        let body = serde_json::json!({
+            "status": "error",
+            "error": format!("BackendPlan validation error: {error}")});
+        return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(body)).into_response();
+    }
 
     let body = serde_json::json!({
         "status": "success",

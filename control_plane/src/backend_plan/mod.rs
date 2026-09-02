@@ -60,6 +60,18 @@ pub enum DecodeError {
     UnsupportedLifecycle(String),
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ValidationError {
+    #[error("materialization map key {key} does not match embedded fingerprint {embedded}")]
+    FingerprintMismatch { key: u64, embedded: u64 },
+    #[error("materialization {fingerprint} has a zero-sized window")]
+    ZeroWindow { fingerprint: u64 },
+    #[error("materialization {fingerprint} has a zero slide")]
+    ZeroSlide { fingerprint: u64 },
+    #[error("route references unknown materialization {fingerprint}")]
+    UnknownMaterialization { fingerprint: u64 },
+}
+
 // ── WindowSpec ───────────────────────────────────────────────────────────────
 
 /// `kind`/`size`/`slide` triple — mirrors `QueryExpr::Window`'s fields
@@ -781,6 +793,33 @@ impl BackendPlan {
     /// an enum value this build doesn't recognize).
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         BackendPlan::try_from(proto::BackendPlan::decode(bytes)?)
+    }
+
+    /// Validate cross-references and invariants required before a decoded
+    /// plan may become visible to ingest or query readers.
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        for (key, materialization) in &self.materializations {
+            if *key != materialization.fingerprint {
+                return Err(ValidationError::FingerprintMismatch {
+                    key: key.0,
+                    embedded: materialization.fingerprint.0,
+                });
+            }
+            if materialization.window.size_ms == 0 {
+                return Err(ValidationError::ZeroWindow { fingerprint: key.0 });
+            }
+            if materialization.window.slide_ms == Some(0) {
+                return Err(ValidationError::ZeroSlide { fingerprint: key.0 });
+            }
+        }
+        for route in &self.routing {
+            if !self.materializations.contains_key(&route.materialization) {
+                return Err(ValidationError::UnknownMaterialization {
+                    fingerprint: route.materialization.0,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
