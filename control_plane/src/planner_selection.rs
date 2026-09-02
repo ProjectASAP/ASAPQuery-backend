@@ -7,7 +7,8 @@
 use std::rc::Rc;
 
 use asap_aware_mapping::{
-    CostModel, Replacement, ReplacementStrategy, SketchAlgorithmStrategy, TargetSubDAG,
+    AccuracyBudgetAllocator, AccuracyEvidenceProvider, AccuracyModel, CostModel, Replacement,
+    ReplacementStrategy, SketchAlgorithmStrategy, TargetSubDAG,
 };
 use planner_types::post_asap::{
     SummaryExpr, SummaryFamilyType, SummaryField, SummaryNode, SummarySchema,
@@ -67,6 +68,33 @@ pub fn select_summary(
 
 pub fn select_summary_default(expr: &QueryExpr) -> Result<Rc<SummaryNode>, SelectionError> {
     select_summary(expr, &asap_aware_mapping::DefaultCostModel)
+}
+
+/// Select from Planner's legal candidates with deployment-supplied accuracy
+/// models and typed evidence (for example a TopK membership certificate).
+pub fn select_summary_with_evidence(
+    expr: &QueryExpr,
+    cost_model: &dyn CostModel,
+    accuracy_model: &dyn AccuracyModel,
+    allocator: &dyn AccuracyBudgetAllocator,
+    evidence: &dyn AccuracyEvidenceProvider,
+) -> Result<Rc<SummaryNode>, SelectionError> {
+    let root = Rc::new(expr.clone());
+    let strategy = SketchAlgorithmStrategy::with_models_and_evidence(
+        cost_model,
+        accuracy_model,
+        allocator,
+        evidence,
+    );
+    let candidate = strategy
+        .replacements(&TargetSubDAG::new(&root))
+        .into_iter()
+        .next()
+        .ok_or(SelectionError::NoLegalCandidate)?;
+    match candidate.replacement {
+        Replacement::Summary(node) => Ok(node),
+        Replacement::Rewrite(_) => Err(SelectionError::UnexpectedRewrite),
+    }
 }
 
 /// Select a legal summary when Planner offers one, otherwise preserve the
