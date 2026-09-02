@@ -43,7 +43,6 @@ use optimizer::cost::online::{init_store as init_online_store, OnlineMetricsStor
 use optimizer::cost::pareto::{pareto_frontier, select_best, ObjectiveWeights};
 use optimizer::cost::tco;
 use optimizer::cost::CostModelPlanner;
-use optimizer::engine::QueryOptimizer;
 use physical::allocator::SketchAllocator;
 use physical::colored_dag::emitter::BackendStageConfig;
 use pipeline::{Analyzer, QuerySpec};
@@ -799,10 +798,6 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                     warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping algebra pipeline")
                 }
                 Ok(qe) => {
-                    let constraints =
-                        optimizer::engine::DeploymentConstraints::from_budgets(&budgets);
-                    let (opt_qe, _) =
-                        QueryOptimizer::with_constraints(raw_bps, constraints).optimize(qe);
                     // L4 sketch binding: lower the optimised L3 tree to the
                     // sketch-bound `PhysicalExpr` IR — the typed L5's input.
                     let accuracy = if workload.accuracy_sla >= 1.0 {
@@ -813,9 +808,9 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                         )
                     };
                     bound_physical =
-                        control_plane::sketch_algebra::bind_query_expr(&opt_qe, accuracy).ok();
+                        control_plane::sketch_algebra::bind_query_expr(&qe, accuracy).ok();
                     // Cost summary for the JSON response.
-                    let plan_node = SketchAllocator::new(budgets.clone(), raw_bps).allocate(opt_qe);
+                    let plan_node = SketchAllocator::new(budgets.clone(), raw_bps).allocate(qe);
                     plan_summary = Some(plan_node.summarise(raw_bps));
                 }
             }
