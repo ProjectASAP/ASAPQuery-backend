@@ -23,6 +23,7 @@
 pub mod allocator;
 pub mod colored_dag;
 pub mod compiler;
+pub mod deployment;
 pub mod plan;
 pub mod planner;
 pub mod sketch_catalog;

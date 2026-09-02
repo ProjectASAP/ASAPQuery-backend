@@ -193,7 +193,7 @@ pub struct PhysicalCost {
 
 // ── Physical planner ────────────────────────────────────────────────────────
 
-use crate::optimizer::engine::DeploymentConstraints;
+use crate::physical::deployment::DeploymentConstraints;
 use crate::types::StageResourceBudgets;
 
 /// Physical planner configuration.
@@ -483,7 +483,7 @@ pub(crate) fn decide_sketch_placement(
     resolved: &PhysicalAggOp,
     config: &PhysicalPlannerConfig,
 ) -> Placement {
-    use crate::optimizer::engine::sketch_capability;
+    use crate::physical::deployment::sketch_capability;
 
     let cap = sketch_capability(&resolved.sketch_type);
 
@@ -591,8 +591,8 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::types_v2::AccuracyTarget;
     use crate::planner_selection::default_frequency;
+    use crate::types_v2::AccuracyTarget;
     use planner_types::pre_asap::{default_cardinality, default_quantile};
     use planner_types::pre_asap::{Reduction, Schema, Source};
 
