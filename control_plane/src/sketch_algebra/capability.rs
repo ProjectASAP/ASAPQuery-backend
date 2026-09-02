@@ -527,26 +527,9 @@ fn sum_satisfies_increase(required: AggregationType, available: AggregationType)
 /// (Sum / Min / Max / Avg / Rate / Increase / every archive-only intent
 /// — see [`AggIntent::archive_only`]).
 ///
-/// This is the **single bridge** between the L3 intent vocabulary and
-/// the L4/Q1 sketch-capability vocabulary. Both the ASAP-tier analyzer
-/// and the optimizer's binding rules read it. PromQL function-name
-/// string matching does NOT happen here — it happens in the lowerer
-/// (`intent_algebra::lower::lower_parsed_query`), which is the single
-/// owner of "what does this PromQL function mean".
-///
-/// ## Delegation to `asap-plan`
-///
-/// Beyond the `Extension`/`Frequency` special case (deployment-specific,
-/// see below — `asap-plan` deliberately has no opinion on a shape it
-/// can't see into), every other `AggIntent` variant's capability is
-/// derived from [`asap_aware_mapping::boundary::implementation_for`] — the single
-/// upstream authority for "how would this intent be realized" — rather
-/// than a second, hand-maintained, parallel judgment kept in sync by
-/// hand. See [`implementation_to_capability`] for the
-/// `planner_types::post_asap::SummaryKind` → `Capability` family translation this
-/// still requires (the two crates' capability vocabularies aren't the
-/// same *shape*, even once they agree on substance), and its doc comment
-/// for the one deliberate override (`Count{Exact}`).
+/// This is a runtime routing requirement, not a summary-selection rule.
+/// ASAPPlanner owns legal implementations and candidate enumeration; this
+/// adapter describes which already-deployed SID the data plane may read.
 pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
     if let Some(accuracy) = crate::planner_selection::as_frequency(intent) {
         return if is_exact(&accuracy) {
@@ -585,80 +568,6 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
             Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
         }
         _ => None,
-    }
-}
-
-/// Translate `asap-aware-mapping`'s per-intent implementation decision
-/// into this repo's own [`Capability`] vocabulary.
-///
-/// `Implementation` used to carry one merged `Summary { kind, params }`
-/// variant for both the approximate-sketch and exact-accumulator cases
-/// (told apart via `kind.is_exact()`, ASAPController#170); ASAPPlanner
-/// split them back into distinct `Sketch { kind: SketchAlgorithm, .. }` /
-/// `ExactAggregate { kind: ExactKind, .. }` variants (ASAPPlanner#218) —
-/// see control_plane/docs/design-asapplanner-pin-migration.md. This
-/// repo's `Capability` groups those into coarser families
-/// (`QuantileApprox`/`CardinalityApprox`/`FrequencyEstimate`/
-/// `FrequencyTopk` for sketches; `ExactAgg(AggregationType)` for
-/// accumulators) because that's the granularity the sketch index
-/// (`is_satisfied_by`) and the wire-shared `sketch_index::Capability`
-/// actually match on — the required side never pins a *specific*
-/// concrete implementation (`Any`), only the family. Both match arms are
-/// exhaustive over their respective kind enum (no wildcard fallthrough),
-/// so a new variant on either side fails to compile here until given an
-/// explicit mapping.
-fn implementation_to_capability(
-    implementation: asap_aware_mapping::Implementation,
-) -> Option<Capability> {
-    use asap_aware_mapping::Implementation;
-    use planner_types::post_asap::{ExactKind, SketchAlgorithm};
-
-    match implementation {
-        Implementation::PassThrough => None,
-        Implementation::ExactAggregate { kind, .. } => match kind {
-            ExactKind::Sum => Some(Capability::ExactAgg(AggregationType::Sum)),
-            ExactKind::MinMax => Some(Capability::ExactAgg(AggregationType::MinMax)),
-            ExactKind::Increase | ExactKind::Rate => {
-                Some(Capability::ExactAgg(AggregationType::Increase))
-            }
-            // `AggregationType` (this repo's own exact-accumulator-family
-            // enum) has no `Count` variant — the data plane has no
-            // working count accumulator (`SumAccumulator` returns `sum`
-            // for both `Statistic::Sum` and `Statistic::Count`, so a
-            // `count_over_time` query matched against a `Sum` policy
-            // would silently return sum-of-values, not sample-count).
-            // `asap_aware_mapping::boundary::implementation_for` still
-            // reports `Count{Exact}` as exact (it assumes a real count
-            // accumulator exists, which is true in ASAPController's own
-            // reference implementation) — deliberately overridden here to
-            // `None` (archive) until a real `SumCountAccumulator` lands.
-            ExactKind::Count => None,
-        },
-        Implementation::Sketch(kind) => match kind.algorithm() {
-            SketchAlgorithm::Kll | SketchAlgorithm::DDSketch => {
-                Some(Capability::QuantileApprox(SketchKindHandle::Any))
-            }
-            SketchAlgorithm::Hll | SketchAlgorithm::Theta | SketchAlgorithm::Kmv => {
-                Some(Capability::CardinalityApprox)
-            }
-            SketchAlgorithm::Cms | SketchAlgorithm::CountSketch => {
-                Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
-            }
-            SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap => {
-                Some(Capability::FrequencyTopk(SketchKindHandle::Any))
-            }
-        },
-        // `Sample`/`Wavelet`/`StatModel`: no core `AggIntent` dispatch
-        // produces these today (only a deployment's own
-        // `CostModel::realize_extension` for an `AggIntent::Extension`
-        // could), and `ControlPlaneCostModel::realize_extension` (this
-        // repo's own impl, `sketch_algebra/cost_model.rs`) only ever
-        // returns `Sketch`/`PassThrough` for the `Frequency` extension —
-        // never reachable via this repo's own dispatch, same status as
-        // the sibling families had before the ASAPPlanner#218 split.
-        Implementation::Sample { .. }
-        | Implementation::Wavelet { .. }
-        | Implementation::StatModel { .. } => None,
     }
 }
 
