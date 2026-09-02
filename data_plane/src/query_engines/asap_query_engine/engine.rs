@@ -605,9 +605,15 @@ fn effective_sketch_function(
 fn effective_is_cumulative(
     candidate: &control_plane::asap_tier_analysis::ASAPTierCandidate,
 ) -> bool {
+    use crate::storage_engines::sketch_db::index::Capability;
+    use control_plane::asap_tier_analysis::OuterAgg;
+
     matches!(
         effective_sketch_function(candidate),
         "quantile_over_time" | "count_distinct_over_time" | "topk_over_time"
+    ) || matches!(
+        (&candidate.required_capability, &candidate.outer_agg),
+        (Capability::CardinalityApprox, OuterAgg::Count(_))
     )
 }
 

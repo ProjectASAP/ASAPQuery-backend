@@ -3,6 +3,22 @@
 > Interface status: target public API. Existing migration modules must converge
 > on this boundary.
 
+## Current implementation boundary
+
+The production path has not yet converged on the public interfaces below. It
+currently consumes ASAPPlanner types pinned in `control_plane/Cargo.toml`, then
+uses `physical::colored_dag::StageAllocator`, `ThreeStageEmitter`, and
+`backend_plan::from_stage_config` to produce agent YAML and `BackendPlan`.
+Callers must not treat the target `PlanningRequest`, `PhysicalCompiler`, or
+`CompiledPlanBundle` examples below as implemented Rust APIs.
+
+ASAPPlanner owns logical semantics and summary selection. In particular, a
+deployment override may choose only a family compatible with the selected
+statistic; the physical compiler must reject or ignore an incompatible
+override, never change the statistic to make the override fit. Upgrading the
+Planner pin is a whole-interface migration because newer Planner revisions
+change the post-ASAP family, reduction, grouping, and maintenance types.
+
 ## 1. Code architecture
 
 The control plane has three public layers:
