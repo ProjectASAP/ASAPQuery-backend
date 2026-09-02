@@ -1050,7 +1050,7 @@ mod tests {
     #[test]
     fn parse_vector_extracts_value_and_timestamp() {
         let raw: Value = serde_json::from_str(
-            r#"[{"metric":{"__name__":"x","job":"a"},"value":[1700000000.5,"3.14"]}]"#,
+            r#"[{"metric":{"__name__":"x","job":"a"},"value":[1700000000.5,"3.125"]}]"#,
         )
         .unwrap();
         let arr = raw.as_array().unwrap().clone();
@@ -1058,7 +1058,7 @@ mod tests {
         match result {
             QueryResult::Vector(iv) => {
                 assert_eq!(iv.values.len(), 1);
-                assert!((iv.values[0].value - 3.14).abs() < 1e-9);
+                assert!((iv.values[0].value - 3.125).abs() < 1e-9);
                 assert_eq!(iv.timestamp, 1_700_000_000_500);
             }
             other => panic!("expected Vector, got {other:?}"),
