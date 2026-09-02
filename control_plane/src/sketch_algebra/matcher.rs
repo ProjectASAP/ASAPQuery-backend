@@ -38,7 +38,7 @@
 //! `storage_engines/sketch_db/query/sketch_reducer.rs`. Restored in full.
 
 use asap_aware_mapping::{Implementation, Matcher};
-use planner_types::post_asap::SketchKind;
+use planner_types::post_asap::SketchAlgorithm;
 
 /// [`Matcher`] impl covering pure sketch-family compatibility. See the
 /// module doc for what this deliberately does not cover.
@@ -78,16 +78,15 @@ impl Matcher for SummaryFamilyMatcher {
                 Implementation::ExactAggregate { kind: required, .. },
                 Implementation::ExactAggregate { kind: have, .. },
             ) => required == have,
-            (
-                Implementation::Sketch { kind: required, .. },
-                Implementation::Sketch { kind: have, .. },
-            ) => sketch_family_satisfied(required, have),
+            (Implementation::Sketch(required), Implementation::Sketch(have)) => {
+                sketch_family_satisfied(required.algorithm(), have.algorithm())
+            }
             _ => false,
         }
     }
 }
 
-/// Pure `SketchKind`-to-`SketchKind` family-compatibility check — the
+/// Pure `SketchAlgorithm`-to-`SketchAlgorithm` family-compatibility check — the
 /// same rule [`SummaryFamilyMatcher::is_satisfied_by`] applies in its
 /// `Sketch` arm, exposed directly for callers that only have bare kinds
 /// (no [`planner_types::post_asap::SketchParams`]) to compare.
@@ -98,14 +97,14 @@ impl Matcher for SummaryFamilyMatcher {
 /// would mean fabricating meaningless param values. See that module's
 /// doc for why `Capability`/`SketchKindHandle` themselves aren't deleted
 /// outright (`scratchpad/artifacts/enum-unification-plan.md` §8 Step 4).
-pub fn sketch_family_satisfied(required: &SketchKind, available: &SketchKind) -> bool {
+pub fn sketch_family_satisfied(required: &SketchAlgorithm, available: &SketchAlgorithm) -> bool {
     let req_family = summary_family(required);
     let have_family = summary_family(available);
     req_family.satisfied_by(have_family)
 }
 
-/// The family a [`SketchKind`] belongs to, for [`SummaryFamilyMatcher`].
-/// Total now (every `SketchKind` variant is an approximate-sketch family
+/// The family a [`SketchAlgorithm`] belongs to, for [`SummaryFamilyMatcher`].
+/// Total now (every `SketchAlgorithm` variant is an approximate-sketch family
 /// by construction, post ASAPPlanner#218's split — the exact-accumulator
 /// kinds this used to also cover live in `ExactKind` now, a distinct type
 /// this function never sees).
@@ -130,12 +129,16 @@ impl SummaryFamily {
     }
 }
 
-fn summary_family(kind: &SketchKind) -> SummaryFamily {
+fn summary_family(kind: &SketchAlgorithm) -> SummaryFamily {
     match kind {
-        SketchKind::Kll | SketchKind::DDSketch => SummaryFamily::Quantile,
-        SketchKind::Hll | SketchKind::Theta | SketchKind::Kmv => SummaryFamily::Cardinality,
-        SketchKind::Cms | SketchKind::CountSketch => SummaryFamily::Frequency,
-        SketchKind::CmsWithHeap | SketchKind::CountSketchWithHeap => SummaryFamily::FrequencyTopk,
+        SketchAlgorithm::Kll | SketchAlgorithm::DDSketch => SummaryFamily::Quantile,
+        SketchAlgorithm::Hll | SketchAlgorithm::Theta | SketchAlgorithm::Kmv => {
+            SummaryFamily::Cardinality
+        }
+        SketchAlgorithm::Cms | SketchAlgorithm::CountSketch => SummaryFamily::Frequency,
+        SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap => {
+            SummaryFamily::FrequencyTopk
+        }
     }
 }
 
@@ -149,27 +152,27 @@ mod tests {
     /// real, constructible `(kind, params)` pairs rather than nonsense
     /// combinations (e.g. `Hll` paired with `Kll`'s params) that could
     /// never arise from real code.
-    fn params_for(kind: &SketchKind) -> SketchParams {
+    fn params_for(kind: &SketchAlgorithm) -> SketchParams {
         match kind {
-            SketchKind::Kll => SketchParams::Kll { k: 200 },
-            SketchKind::Cms => SketchParams::Cms {
+            SketchAlgorithm::Kll => SketchParams::Kll { k: 200 },
+            SketchAlgorithm::Cms => SketchParams::Cms {
                 width: 100,
                 depth: 5,
             },
-            SketchKind::Hll => SketchParams::Hll { precision: 14 },
-            SketchKind::DDSketch => SketchParams::DDSketch { alpha: 0.01 },
-            SketchKind::CmsWithHeap => SketchParams::CmsWithHeap {
+            SketchAlgorithm::Hll => SketchParams::Hll { precision: 14 },
+            SketchAlgorithm::DDSketch => SketchParams::DDSketch { alpha: 0.01 },
+            SketchAlgorithm::CmsWithHeap => SketchParams::CmsWithHeap {
                 width: 100,
                 depth: 5,
                 heap_size: 10,
             },
-            SketchKind::Kmv => SketchParams::Kmv { k: 1024 },
-            SketchKind::Theta => SketchParams::Theta { k: 1024 },
-            SketchKind::CountSketch => SketchParams::CountSketch {
+            SketchAlgorithm::Kmv => SketchParams::Kmv { k: 1024 },
+            SketchAlgorithm::Theta => SketchParams::Theta { k: 1024 },
+            SketchAlgorithm::CountSketch => SketchParams::CountSketch {
                 width: 100,
                 depth: 5,
             },
-            SketchKind::CountSketchWithHeap => SketchParams::CountSketchWithHeap {
+            SketchAlgorithm::CountSketchWithHeap => SketchParams::CountSketchWithHeap {
                 width: 100,
                 depth: 5,
                 heap_size: 10,
@@ -187,9 +190,9 @@ mod tests {
         }
     }
 
-    fn sketch(kind: SketchKind) -> Implementation {
+    fn sketch(kind: SketchAlgorithm) -> Implementation {
         let params = params_for(&kind);
-        Implementation::Sketch { kind, params }
+        Implementation::Sketch(planner_types::post_asap::SketchKind::new(kind, params))
     }
 
     fn accumulator(kind: ExactKind) -> Implementation {
@@ -200,26 +203,32 @@ mod tests {
     #[test]
     fn same_sketch_kind_satisfies_itself() {
         let m = SummaryFamilyMatcher;
-        assert!(m.is_satisfied_by(&sketch(SketchKind::Kll), &sketch(SketchKind::Kll)));
-        assert!(m.is_satisfied_by(&sketch(SketchKind::Hll), &sketch(SketchKind::Hll)));
+        assert!(m.is_satisfied_by(&sketch(SketchAlgorithm::Kll), &sketch(SketchAlgorithm::Kll)));
+        assert!(m.is_satisfied_by(&sketch(SketchAlgorithm::Hll), &sketch(SketchAlgorithm::Hll)));
     }
 
     #[test]
     fn same_family_alternate_kind_satisfies() {
         let m = SummaryFamilyMatcher;
         // Kll / DDSketch are interchangeable quantile answers.
-        assert!(m.is_satisfied_by(&sketch(SketchKind::Kll), &sketch(SketchKind::DDSketch)));
+        assert!(m.is_satisfied_by(
+            &sketch(SketchAlgorithm::Kll),
+            &sketch(SketchAlgorithm::DDSketch)
+        ));
         // Hll / Theta / Kmv are interchangeable cardinality answers.
-        assert!(m.is_satisfied_by(&sketch(SketchKind::Hll), &sketch(SketchKind::Theta)));
-        assert!(m.is_satisfied_by(&sketch(SketchKind::Hll), &sketch(SketchKind::Kmv)));
+        assert!(m.is_satisfied_by(
+            &sketch(SketchAlgorithm::Hll),
+            &sketch(SketchAlgorithm::Theta)
+        ));
+        assert!(m.is_satisfied_by(&sketch(SketchAlgorithm::Hll), &sketch(SketchAlgorithm::Kmv)));
     }
 
     #[test]
     fn cross_family_never_satisfies() {
         let m = SummaryFamilyMatcher;
-        assert!(!m.is_satisfied_by(&sketch(SketchKind::Kll), &sketch(SketchKind::Hll)));
-        assert!(!m.is_satisfied_by(&sketch(SketchKind::Hll), &sketch(SketchKind::Kll)));
-        assert!(!m.is_satisfied_by(&sketch(SketchKind::Kll), &sketch(SketchKind::Cms)));
+        assert!(!m.is_satisfied_by(&sketch(SketchAlgorithm::Kll), &sketch(SketchAlgorithm::Hll)));
+        assert!(!m.is_satisfied_by(&sketch(SketchAlgorithm::Hll), &sketch(SketchAlgorithm::Kll)));
+        assert!(!m.is_satisfied_by(&sketch(SketchAlgorithm::Kll), &sketch(SketchAlgorithm::Cms)));
     }
 
     #[test]
@@ -227,10 +236,13 @@ mod tests {
         let m = SummaryFamilyMatcher;
         // A CmsWithHeap instance already carries the plain CMS matrix, so
         // it answers a bare frequency point-query too.
-        assert!(m.is_satisfied_by(&sketch(SketchKind::Cms), &sketch(SketchKind::CmsWithHeap)));
         assert!(m.is_satisfied_by(
-            &sketch(SketchKind::CountSketch),
-            &sketch(SketchKind::CountSketchWithHeap)
+            &sketch(SketchAlgorithm::Cms),
+            &sketch(SketchAlgorithm::CmsWithHeap)
+        ));
+        assert!(m.is_satisfied_by(
+            &sketch(SketchAlgorithm::CountSketch),
+            &sketch(SketchAlgorithm::CountSketchWithHeap)
         ));
     }
 
@@ -239,20 +251,26 @@ mod tests {
         let m = SummaryFamilyMatcher;
         // The reverse does not hold: a heap-less sketch never tracked the
         // heavy-hitter heap, so it cannot enumerate top-k items.
-        assert!(!m.is_satisfied_by(&sketch(SketchKind::CmsWithHeap), &sketch(SketchKind::Cms)));
         assert!(!m.is_satisfied_by(
-            &sketch(SketchKind::CountSketchWithHeap),
-            &sketch(SketchKind::CountSketch)
+            &sketch(SketchAlgorithm::CmsWithHeap),
+            &sketch(SketchAlgorithm::Cms)
+        ));
+        assert!(!m.is_satisfied_by(
+            &sketch(SketchAlgorithm::CountSketchWithHeap),
+            &sketch(SketchAlgorithm::CountSketch)
         ));
     }
 
     #[test]
     fn cms_and_count_sketch_are_the_same_frequency_family() {
         let m = SummaryFamilyMatcher;
-        assert!(m.is_satisfied_by(&sketch(SketchKind::Cms), &sketch(SketchKind::CountSketch)));
         assert!(m.is_satisfied_by(
-            &sketch(SketchKind::CmsWithHeap),
-            &sketch(SketchKind::CountSketchWithHeap)
+            &sketch(SketchAlgorithm::Cms),
+            &sketch(SketchAlgorithm::CountSketch)
+        ));
+        assert!(m.is_satisfied_by(
+            &sketch(SketchAlgorithm::CmsWithHeap),
+            &sketch(SketchAlgorithm::CountSketchWithHeap)
         ));
     }
 
@@ -273,14 +291,14 @@ mod tests {
     #[test]
     fn sketch_and_accumulator_never_satisfy_each_other() {
         let m = SummaryFamilyMatcher;
-        assert!(!m.is_satisfied_by(&sketch(SketchKind::Kll), &accumulator(ExactKind::Sum)));
-        assert!(!m.is_satisfied_by(&accumulator(ExactKind::Sum), &sketch(SketchKind::Kll)));
+        assert!(!m.is_satisfied_by(&sketch(SketchAlgorithm::Kll), &accumulator(ExactKind::Sum)));
+        assert!(!m.is_satisfied_by(&accumulator(ExactKind::Sum), &sketch(SketchAlgorithm::Kll)));
     }
 
     #[test]
     fn pass_through_required_is_vacuously_satisfied() {
         let m = SummaryFamilyMatcher;
-        assert!(m.is_satisfied_by(&Implementation::PassThrough, &sketch(SketchKind::Kll)));
+        assert!(m.is_satisfied_by(&Implementation::PassThrough, &sketch(SketchAlgorithm::Kll)));
         assert!(m.is_satisfied_by(&Implementation::PassThrough, &accumulator(ExactKind::Sum)));
         assert!(m.is_satisfied_by(&Implementation::PassThrough, &Implementation::PassThrough));
     }
@@ -288,7 +306,7 @@ mod tests {
     #[test]
     fn pass_through_available_never_satisfies_a_real_requirement() {
         let m = SummaryFamilyMatcher;
-        assert!(!m.is_satisfied_by(&sketch(SketchKind::Kll), &Implementation::PassThrough));
+        assert!(!m.is_satisfied_by(&sketch(SketchAlgorithm::Kll), &Implementation::PassThrough));
         assert!(!m.is_satisfied_by(&accumulator(ExactKind::Sum), &Implementation::PassThrough));
     }
 
@@ -300,24 +318,27 @@ mod tests {
         // `SummaryFamilyMatcher::is_satisfied_by` applies to its `Sketch`
         // arm, just without needing `SketchParams` to call it.
         assert!(sketch_family_satisfied(
-            &SketchKind::Kll,
-            &SketchKind::DDSketch
+            &SketchAlgorithm::Kll,
+            &SketchAlgorithm::DDSketch
         ));
         assert!(sketch_family_satisfied(
-            &SketchKind::Cms,
-            &SketchKind::CmsWithHeap
+            &SketchAlgorithm::Cms,
+            &SketchAlgorithm::CmsWithHeap
         ));
         assert!(!sketch_family_satisfied(
-            &SketchKind::CmsWithHeap,
-            &SketchKind::Cms
+            &SketchAlgorithm::CmsWithHeap,
+            &SketchAlgorithm::Cms
         ));
-        assert!(!sketch_family_satisfied(&SketchKind::Kll, &SketchKind::Hll));
+        assert!(!sketch_family_satisfied(
+            &SketchAlgorithm::Kll,
+            &SketchAlgorithm::Hll
+        ));
     }
 
     // The old `sketch_family_satisfied_rejects_exact_accumulator_kinds`
     // test (passing `SummaryKind::Sum` -- an exact-accumulator kind -- to
     // this sketch-only function) no longer type-checks at all post
-    // ASAPPlanner#218's split: `SketchKind` has no exact-accumulator
+    // ASAPPlanner#218's split: `SketchAlgorithm` has no exact-accumulator
     // variants to construct in the first place, so the property that test
     // asserted is now enforced by the type system instead of at runtime.
 }

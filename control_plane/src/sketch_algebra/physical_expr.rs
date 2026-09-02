@@ -9,7 +9,7 @@
 //! `SketchEstimate` / `SketchMerge` / `ExactAgg` variants) in favor of
 //! ASAPController's canonical L4 IR, `planner_types::post_asap::{SummaryExpr, SummaryNode}`
 //! — the same move Step 3 of the enum-unification made for
-//! `SketchKind → SketchKind`, one layer up. `implement_promql_for_asap_tier`
+//! `SketchAlgorithm → SketchAlgorithm`, one layer up. `implement_promql_for_asap_tier`
 //! (`asap_tier_implement.rs`, Step A) already builds `Rc<SummaryNode>` trees via
 //! `asap_aware_mapping::bind::implement_tree_in_with`; this module gives the rest of
 //! the crate (optimizer, physical, emit) the same IR shape.
@@ -46,7 +46,7 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use planner_types::post_asap::{SketchKind, SketchParams, SummaryNode};
+use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryNode};
 
 use crate::types_v2::BindingName;
 
@@ -100,7 +100,7 @@ pub enum PhysicalExpr {
     /// this metric.
     RawAtEdgeSketchAtBackend {
         /// Sketch family the backend will build at ingest.
-        family: SketchKind,
+        family: SketchAlgorithm,
         /// Sketch parameters (validated by the catalog at bind time).
         params: SketchParams,
         /// Input sub-tree — typically `Summary(Logical(Window{...}))` or
@@ -196,7 +196,7 @@ mod tests {
     fn windowed_scan() -> QueryExpr {
         QueryExpr::TimeRange {
             range: Duration::from_secs(300),
-            child: Box::new(ts_scan()),
+            child: Rc::new(ts_scan()),
         }
     }
 
@@ -211,9 +211,9 @@ mod tests {
             }],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(windowed_scan()),
+            child: Rc::new(windowed_scan()),
         };
-        let node = asap_aware_mapping::bind::implement_tree(&q).expect("implements");
+        let node = crate::planner_selection::select_summary_default(&q).expect("implements");
         let e = PhysicalExpr::committed(node);
         match e {
             PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
@@ -231,13 +231,16 @@ mod tests {
                             assert_eq!(
                                 family,
                                 &planner_types::post_asap::SummaryFamilyType::Sketch(
-                                    SketchKind::Kll,
-                                    SketchParams::Kll { k: 200 }
+                                    planner_types::post_asap::SketchKind::new(
+                                        SketchAlgorithm::Kll,
+                                        SketchParams::Kll { k: 269 },
+                                    ),
+                                    planner_types::post_asap::GroupingStrategy::default(),
                                 )
                             );
                             assert!(matches!(
                                 child.expr,
-                                planner_types::post_asap::SummaryExpr::Logical(_)
+                                planner_types::post_asap::SummaryExpr::KeepPreAsap(_)
                             ));
                         }
                         other => panic!("expected SummaryAgg, got {other:?}"),

@@ -28,6 +28,8 @@
 //! `WindowedAgg` into `Window { Aggregate }`, and `TopK` into an
 //! `Aggregate` carrying an `AggIntent::TopK`.
 
+use std::rc::Rc;
+
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::query_expr::{QueryExpr, Reduction, SetOpKind, Source};
 use crate::intent_algebra::relational::{agg_is_exact, agg_is_mergeable};
@@ -71,7 +73,7 @@ pub trait CostModel: Send + Sync {
 
 /// Load sketch capabilities from a YAML file. Thin shim — the real
 /// loader lives in `optimizer::cost::sketch_capability::load_capability_overrides`
-/// and is keyed by `SketchKind`. This shim translates the result to the
+/// and is keyed by `SketchAlgorithm`. This shim translates the result to the
 /// legacy `SketchType` key used by call sites that haven't migrated.
 ///
 /// Falls back to built-in defaults if the file is missing or malformed.
@@ -90,11 +92,11 @@ pub fn load_sketch_capabilities(
 /// Built-in capability profile for a known sketch type. Thin shim —
 /// the real defaults live in `optimizer::cost::sketch_capability::default_capability_table`.
 pub fn sketch_capability(st: &crate::types::SketchType) -> SketchCapability {
-    use planner_types::post_asap::SketchKind;
-    let kind: SketchKind = st.clone().into();
+    use planner_types::post_asap::SketchAlgorithm;
+    let kind: SketchAlgorithm = st.clone().into();
     default_capability_table()
         .remove(&kind)
-        .expect("default_capability_table covers every SketchKind variant")
+        .expect("default_capability_table covers every SketchAlgorithm variant")
 }
 
 // ── Stage budgets ───────────────────────────────────────────────────────────
@@ -223,9 +225,9 @@ impl CostModel for DefaultCostModel {
                 op if agg_is_exact(op) => 1.0,
                 _ => 0.1,
             },
-            QueryExpr::Merge { children } => 1.0 / (children.len().max(1) as f64),
+            QueryExpr::Concat { children } => 1.0 / (children.len().max(1) as f64),
             QueryExpr::Filter { .. } => 0.5,
-            QueryExpr::Distinct { .. } => 0.9,
+            QueryExpr::Dedup { .. } => 0.9,
             _ => 1.0,
         };
 
@@ -265,8 +267,8 @@ impl CostModel for DefaultCostModel {
                 }
                 // Multi-intent / HAVING aggregate → exact original DB.
                 QueryExpr::Aggregate { .. } => &dc.original_db,
-                QueryExpr::Merge { .. } | QueryExpr::Distinct { .. } => &dc.backend_collector,
-                QueryExpr::BinaryOp { .. } | QueryExpr::Subquery { .. } => &dc.backend_db,
+                QueryExpr::Concat { .. } | QueryExpr::Dedup { .. } => &dc.backend_collector,
+                QueryExpr::BinaryOp { .. } | QueryExpr::PromqlSubquery { .. } => &dc.backend_db,
                 _ => &dc.agent,
             };
 
@@ -346,7 +348,7 @@ impl RewriteRule for PredicatePushDown {
 
     fn try_rewrite(&self, expr: QueryExpr, _model: &dyn CostModel) -> Option<QueryExpr> {
         match expr {
-            QueryExpr::Filter { pred, child } => match *child {
+            QueryExpr::Filter { pred, child } => match (*child).clone() {
                 // Filter below TimeRange (the canonical range-vector-selector
                 // node -- see control_plane/docs/design-asapplanner-pin-migration.md).
                 QueryExpr::TimeRange {
@@ -354,7 +356,7 @@ impl RewriteRule for PredicatePushDown {
                     child: inner,
                 } => Some(QueryExpr::TimeRange {
                     range,
-                    child: Box::new(QueryExpr::Filter { pred, child: inner }),
+                    child: Rc::new(QueryExpr::Filter { pred, child: inner }),
                 }),
                 // Filter below Sort (safe when pred references input columns only)
                 QueryExpr::Sort {
@@ -364,12 +366,12 @@ impl RewriteRule for PredicatePushDown {
                 } => Some(QueryExpr::Sort {
                     keys,
                     partition_by,
-                    child: Box::new(QueryExpr::Filter { pred, child: inner }),
+                    child: Rc::new(QueryExpr::Filter { pred, child: inner }),
                 }),
                 // Not applicable — reconstruct
                 other => Some(QueryExpr::Filter {
                     pred,
-                    child: Box::new(other),
+                    child: Rc::new(other),
                 }),
             },
             _ => None,
@@ -401,7 +403,7 @@ impl RewriteRule for MergeLifting {
                 ref child,
                 ..
             } if aggs.len() == 1 && having.is_none() && agg_is_mergeable(&aggs[0]) => {
-                if let QueryExpr::Merge { children } = child.as_ref() {
+                if let QueryExpr::Concat { children } = child.as_ref() {
                     let new_children: Vec<QueryExpr> = children
                         .iter()
                         .map(|branch| QueryExpr::Aggregate {
@@ -409,10 +411,10 @@ impl RewriteRule for MergeLifting {
                             measures: aggs.clone(),
                             output_names: Vec::new(),
                             having: None,
-                            child: Box::new(branch.clone()),
+                            child: Rc::new(branch.clone()),
                         })
                         .collect();
-                    return Some(QueryExpr::Merge {
+                    return Some(QueryExpr::Concat {
                         children: new_children,
                     });
                 }
@@ -445,13 +447,13 @@ impl RewriteRule for HLLDedupElim {
                 having: None,
                 child,
             } if aggs.len() == 1 && matches!(&aggs[0], AggIntent::Cardinality { .. }) => {
-                if let QueryExpr::Distinct { child: inner, .. } = *child {
+                if let QueryExpr::Dedup { child: inner, .. } = child.as_ref() {
                     return Some(QueryExpr::Aggregate {
                         reduction,
                         measures: aggs,
                         output_names,
                         having: None,
-                        child: inner,
+                        child: inner.clone(),
                     });
                 }
                 None
@@ -478,11 +480,11 @@ impl RewriteRule for FilterWindowSwap {
                 if let QueryExpr::TimeRange {
                     range,
                     child: inner,
-                } = *child
+                } = (*child).clone()
                 {
                     return Some(QueryExpr::TimeRange {
                         range,
-                        child: Box::new(QueryExpr::Filter { pred, child: inner }),
+                        child: Rc::new(QueryExpr::Filter { pred, child: inner }),
                     });
                 }
                 None
@@ -513,7 +515,7 @@ impl RewriteRule for TopKFusion {
             } => {
                 if let QueryExpr::Sort {
                     keys, child: inner, ..
-                } = *child
+                } = (*child).clone()
                 {
                     // Only fuse when all keys are DESC (top-k semantics).
                     if !keys.is_empty() && keys.iter().all(|k| !k.ascending) {
@@ -637,7 +639,7 @@ impl RewriteRule for WindowMerge {
                 if let QueryExpr::TimeRange {
                     range: inner_range,
                     child: inner_child,
-                } = *child
+                } = (*child).clone()
                 {
                     if range == inner_range {
                         return Some(QueryExpr::TimeRange {
@@ -676,16 +678,19 @@ impl RewriteRule for SetOpFusion {
                 all: true,
                 left,
                 right,
-            } => match (*left, *right) {
-                (QueryExpr::Merge { children: mut lc }, QueryExpr::Merge { children: mut rc }) => {
+            } => match ((*left).clone(), (*right).clone()) {
+                (
+                    QueryExpr::Concat { children: mut lc },
+                    QueryExpr::Concat { children: mut rc },
+                ) => {
                     lc.append(&mut rc);
-                    Some(QueryExpr::Merge { children: lc })
+                    Some(QueryExpr::Concat { children: lc })
                 }
                 (l, r) => Some(QueryExpr::SetOp {
                     kind: SetOpKind::Union,
                     all: true,
-                    left: Box::new(l),
-                    right: Box::new(r),
+                    left: Rc::new(l),
+                    right: Rc::new(r),
                 }),
             },
             _ => None,
@@ -788,8 +793,8 @@ impl QueryOptimizer {
     fn recurse_children(&self, expr: QueryExpr) -> (QueryExpr, bool) {
         macro_rules! recurse {
             ($child:expr) => {{
-                let (e, c) = self.apply_all(*$child);
-                (Box::new(e), c)
+                let (e, c) = self.apply_all((*$child).clone());
+                (Rc::new(e), c)
             }};
         }
         match expr {
@@ -852,10 +857,10 @@ impl QueryOptimizer {
                     c,
                 )
             }
-            QueryExpr::Distinct { cols, child } => {
+            QueryExpr::Dedup { cols, child } => {
                 let (new_child, c) = recurse!(child);
                 (
-                    QueryExpr::Distinct {
+                    QueryExpr::Dedup {
                         cols,
                         child: new_child,
                     },
@@ -888,14 +893,14 @@ impl QueryOptimizer {
                     c,
                 )
             }
-            QueryExpr::Subquery {
+            QueryExpr::PromqlSubquery {
                 range,
                 resolution,
                 child,
             } => {
                 let (new_child, c) = recurse!(child);
                 (
-                    QueryExpr::Subquery {
+                    QueryExpr::PromqlSubquery {
                         range,
                         resolution,
                         child: new_child,
@@ -903,11 +908,11 @@ impl QueryOptimizer {
                     c,
                 )
             }
-            QueryExpr::Merge { children } => {
+            QueryExpr::Concat { children } => {
                 let (new_children, changed): (Vec<_>, Vec<_>) =
                     children.into_iter().map(|inp| self.apply_all(inp)).unzip();
                 (
-                    QueryExpr::Merge {
+                    QueryExpr::Concat {
                         children: new_children,
                     },
                     changed.into_iter().any(|c| c),
@@ -1034,12 +1039,12 @@ mod tests {
             measures: vec![intent],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(child),
+            child: Rc::new(child),
         }
     }
 
     fn true_pred() -> Predicate {
-        Predicate(Box::new(L3Expr::Literal(L3Scalar::Boolean(true))))
+        Predicate(Rc::new(L3Expr::Literal(L3Scalar::Boolean(true))))
     }
 
     fn opt() -> QueryOptimizer {
@@ -1054,15 +1059,15 @@ mod tests {
     /// in a tree these helpers construct.
     fn contains_distinct(qe: &QueryExpr) -> bool {
         match qe {
-            QueryExpr::Distinct { .. } => true,
+            QueryExpr::Dedup { .. } => true,
             QueryExpr::Filter { child, .. }
             | QueryExpr::Project { child, .. }
             | QueryExpr::Aggregate { child, .. }
             | QueryExpr::TimeRange { child, .. }
             | QueryExpr::Sort { child, .. }
             | QueryExpr::Limit { child, .. }
-            | QueryExpr::Subquery { child, .. } => contains_distinct(child),
-            QueryExpr::Merge { children } => children.iter().any(contains_distinct),
+            | QueryExpr::PromqlSubquery { child, .. } => contains_distinct(child),
+            QueryExpr::Concat { children } => children.iter().any(contains_distinct),
             QueryExpr::Join { left, right, .. }
             | QueryExpr::SetOp { left, right, .. }
             | QueryExpr::BinaryOp {
@@ -1080,9 +1085,9 @@ mod tests {
     fn r1_pushes_filter_below_window() {
         let expr = QueryExpr::Filter {
             pred: true_pred(),
-            child: Box::new(QueryExpr::TimeRange {
+            child: Rc::new(QueryExpr::TimeRange {
                 range: Duration::from_secs(60),
-                child: Box::new(scan("m")),
+                child: Rc::new(scan("m")),
             }),
         };
         let (result, _) = opt().optimize(expr);
@@ -1097,14 +1102,14 @@ mod tests {
     fn r1_pushes_filter_below_sort() {
         let expr = QueryExpr::Filter {
             pred: true_pred(),
-            child: Box::new(QueryExpr::Sort {
+            child: Rc::new(QueryExpr::Sort {
                 keys: vec![SortKey {
                     expr: L3Expr::Column(0),
                     ascending: true,
                     nulls_first: false,
                 }],
                 partition_by: GroupKeys::none(),
-                child: Box::new(scan("cpu")),
+                child: Rc::new(scan("cpu")),
             }),
         };
         let (result, _) = opt().optimize(expr);
@@ -1118,9 +1123,9 @@ mod tests {
     fn r3_removes_dedup_before_hll() {
         let expr = sketch_agg(
             default_cardinality(),
-            QueryExpr::Distinct {
+            QueryExpr::Dedup {
                 cols: vec![0],
-                child: Box::new(scan("events")),
+                child: Rc::new(scan("events")),
             },
         );
         let (result, _) = opt().optimize(expr);
@@ -1137,14 +1142,14 @@ mod tests {
         let expr = QueryExpr::Limit {
             n: 10,
             offset: 0,
-            child: Box::new(QueryExpr::Sort {
+            child: Rc::new(QueryExpr::Sort {
                 keys: vec![SortKey {
                     expr: L3Expr::Column(0),
                     ascending: false,
                     nulls_first: false,
                 }],
                 partition_by: GroupKeys::none(),
-                child: Box::new(scan("events")),
+                child: Rc::new(scan("events")),
             }),
         };
         let (result, _) = opt().optimize(expr);
@@ -1160,14 +1165,14 @@ mod tests {
         let expr = QueryExpr::Limit {
             n: 10,
             offset: 0,
-            child: Box::new(QueryExpr::Sort {
+            child: Rc::new(QueryExpr::Sort {
                 keys: vec![SortKey {
                     expr: L3Expr::Column(0),
                     ascending: true,
                     nulls_first: false,
                 }],
                 partition_by: GroupKeys::none(),
-                child: Box::new(scan("events")),
+                child: Rc::new(scan("events")),
             }),
         };
         let (result, _) = opt().optimize(expr);
@@ -1184,9 +1189,9 @@ mod tests {
     fn r10_merges_duplicate_windows() {
         let expr = QueryExpr::TimeRange {
             range: Duration::from_secs(300),
-            child: Box::new(QueryExpr::TimeRange {
+            child: Rc::new(QueryExpr::TimeRange {
                 range: Duration::from_secs(300),
-                child: Box::new(scan("m")),
+                child: Rc::new(scan("m")),
             }),
         };
         let (result, _) = opt().optimize(expr);
@@ -1213,13 +1218,13 @@ mod tests {
         //   R3: Window(Filter(Aggregate[Cardinality](Scan)))
         let expr = QueryExpr::Filter {
             pred: true_pred(),
-            child: Box::new(QueryExpr::TimeRange {
+            child: Rc::new(QueryExpr::TimeRange {
                 range: Duration::from_secs(60),
-                child: Box::new(sketch_agg(
+                child: Rc::new(sketch_agg(
                     default_cardinality(),
-                    QueryExpr::Distinct {
+                    QueryExpr::Dedup {
                         cols: vec![0],
-                        child: Box::new(scan("events")),
+                        child: Rc::new(scan("events")),
                     },
                 )),
             }),
@@ -1237,13 +1242,13 @@ mod tests {
     fn r2_lifts_mergeable_sketch_above_merge() {
         let expr = sketch_agg(
             default_cardinality(),
-            QueryExpr::Merge {
+            QueryExpr::Concat {
                 children: vec![scan("shard_a"), scan("shard_b")],
             },
         );
         let (result, _) = opt().optimize(expr);
         assert!(
-            matches!(&result, QueryExpr::Merge { children }
+            matches!(&result, QueryExpr::Concat { children }
                 if children.iter().all(|c| matches!(c, QueryExpr::Aggregate { .. }))),
             "cardinality aggregate should be pushed into each Merge branch: {result:?}"
         );
@@ -1256,16 +1261,16 @@ mod tests {
         let expr = QueryExpr::SetOp {
             kind: SetOpKind::Union,
             all: true,
-            left: Box::new(QueryExpr::Merge {
+            left: Rc::new(QueryExpr::Concat {
                 children: vec![scan("a"), scan("b")],
             }),
-            right: Box::new(QueryExpr::Merge {
+            right: Rc::new(QueryExpr::Concat {
                 children: vec![scan("c")],
             }),
         };
         let (result, _) = opt().optimize(expr);
         match result {
-            QueryExpr::Merge { children } => assert_eq!(children.len(), 3),
+            QueryExpr::Concat { children } => assert_eq!(children.len(), 3),
             other => panic!("expected Merge(3), got {other:?}"),
         }
     }
@@ -1277,12 +1282,12 @@ mod tests {
         // `CommonSubexprElim` always returns `None` now (no `LetBinding`/
         // `Ref` to hoist into) -- the tree comes back unchanged rather
         // than with duplicate scans hoisted into a shared binding.
-        let expr = QueryExpr::Merge {
+        let expr = QueryExpr::Concat {
             children: vec![scan("dup"), scan("dup"), scan("other")],
         };
         let (result, _) = opt().optimize(expr);
         match result {
-            QueryExpr::Merge { children } => assert_eq!(children.len(), 3),
+            QueryExpr::Concat { children } => assert_eq!(children.len(), 3),
             other => panic!("expected Merge(3), got {other:?}"),
         }
     }

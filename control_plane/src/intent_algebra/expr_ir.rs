@@ -28,7 +28,9 @@
 //! sites), so this is the only file that needs to know the upstream
 //! names changed.
 
-pub use planner_types::pre_asap::{ArithOp, ColumnRef, CompareOp, ScalarValue as L3Scalar};
+pub use planner_types::pre_asap::{
+    ArithmeticOpKind as ArithOp, ColumnRef, CompareOpKind as CompareOp, ScalarValue as L3Scalar,
+};
 use planner_types::pre_asap::{QueryExpr, UnresolvedQueryExpr};
 
 /// The front-end-emitted, name-based scalar/relational tree — was a

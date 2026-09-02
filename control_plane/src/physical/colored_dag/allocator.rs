@@ -176,7 +176,7 @@ impl ThreeStageWalker {
             // `Aggregate{exact}` lands on edge if its child is an edge
             // (scrape locality); `Ref` resolves through the lexical
             // scope map.
-            SummaryExpr::Logical(qe) => self.colour_logical(qe)?,
+            SummaryExpr::KeepPreAsap(qe) => self.colour_logical(qe)?,
 
             // ── SummaryAgg: always edge per design.md §6 batched-queries
             // table — true for both approximate sketches (the old
@@ -305,7 +305,7 @@ impl ThreeStageWalker {
             // follow-up batches. `Partition` no longer exists in the
             // canonical IR — its keys fold into `Aggregate.by` at
             // construction time (`intent_algebra::lower`).
-            QE::Merge { .. } | QE::Join { .. } | QE::SetOp { .. } | QE::BinaryOp { .. } => {
+            QE::Concat { .. } | QE::Join { .. } | QE::SetOp { .. } | QE::BinaryOp { .. } => {
                 Ok(StageId::Backend)
             }
             // Filter/Project/Distinct/Sort/Limit/Subquery, plus the
@@ -364,13 +364,14 @@ mod tests {
     fn windowed_scan() -> QueryExpr {
         QueryExpr::TimeRange {
             range: Duration::from_secs(300),
-            child: Box::new(ts_scan()),
+            child: Rc::new(ts_scan()),
         }
     }
 
     #[test]
     fn allocate_unsupported_topology_errors() {
-        let leaf = PhysicalExpr::committed(asap_aware_mapping::bind::logical(&ts_scan()).unwrap());
+        let leaf =
+            PhysicalExpr::committed(crate::planner_selection::keep_pre_asap(&ts_scan()).unwrap());
         let err = StageAllocator
             .allocate(&leaf, Topology::SingleStage)
             .unwrap_err();
@@ -391,9 +392,9 @@ mod tests {
             }],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(windowed_scan()),
+            child: Rc::new(windowed_scan()),
         };
-        let node = asap_aware_mapping::bind::implement_tree(&q).unwrap();
+        let node = crate::planner_selection::select_summary_default(&q).unwrap();
         let expr = PhysicalExpr::committed(node);
         let dag = StageAllocator
             .allocate(&expr, Topology::ThreeStage)

@@ -351,7 +351,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         // (`intent_algebra::lower`), so the `HashAggregate { keys }` this
         // arm used to build now comes straight out of the `Aggregate`
         // arm above.
-        QueryExpr::Merge { children } => {
+        QueryExpr::Concat { children } => {
             let children: Vec<PhysicalNode> =
                 children.iter().map(|c| plan_node(c, config)).collect();
             let sketch_type = children
@@ -372,7 +372,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
             }
         }
 
-        QueryExpr::Distinct { cols, child } => {
+        QueryExpr::Dedup { cols, child } => {
             let child = plan_node(child, config);
             let pred = format!("distinct({})", display_distinct_cols(cols));
             let mut node = PhysicalNode {
@@ -397,7 +397,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
             }
         }
 
-        QueryExpr::Subquery { child, .. } => {
+        QueryExpr::PromqlSubquery { child, .. } => {
             let child = plan_node(child, config);
             let mut node = PhysicalNode {
                 op: PhysicalOp::Passthrough,
@@ -441,19 +441,19 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         // leaves; every other new variant wraps exactly one child —
         // inherit its placement, mirroring the Sort/Limit/Project arm
         // above, until a dedicated physical op is written.
-        QueryExpr::Scalar(_) | QueryExpr::EvalTime => PhysicalNode {
+        QueryExpr::PromqlScalarBridge(_) | QueryExpr::EvalTimestamp => PhysicalNode {
             op: PhysicalOp::Passthrough,
             placement: Placement::QueryEngine,
             cost: PhysicalCost::default(),
             children: vec![],
         },
-        QueryExpr::VectorFromScalar(child)
-        | QueryExpr::ScalarFromVector(child)
-        | QueryExpr::Relabel { child, .. }
-        | QueryExpr::InfoJoin { child, .. }
-        | QueryExpr::Sample { child, .. }
+        QueryExpr::PromqlVectorFromScalar(child)
+        | QueryExpr::PromqlScalarFromVector(child)
+        | QueryExpr::PromqlRelabel { child, .. }
+        | QueryExpr::PromqlInfoEnrich { child, .. }
+        | QueryExpr::PromqlSeriesSample { child, .. }
         | QueryExpr::TimeShift { child, .. }
-        | QueryExpr::WindowFunc { child, .. } => {
+        | QueryExpr::SQLWindowFunc { child, .. } => {
             let child = plan_node(child, config);
             PhysicalNode {
                 op: PhysicalOp::Passthrough,
@@ -588,6 +588,8 @@ impl PhysicalNode {
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::*;
     use crate::intent_algebra::relational::{
         default_cardinality, default_frequency, default_quantile,
@@ -621,7 +623,7 @@ mod tests {
             measures: vec![intent],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(scan(metric)),
+            child: Rc::new(scan(metric)),
         }
     }
 
@@ -630,7 +632,7 @@ mod tests {
     fn windowed_agg(intent: AggIntent, size_secs: u64, metric: &str) -> QueryExpr {
         QueryExpr::TimeRange {
             range: Duration::from_secs(size_secs),
-            child: Box::new(sketch_agg(intent, metric)),
+            child: Rc::new(sketch_agg(intent, metric)),
         }
     }
 
@@ -704,7 +706,7 @@ mod tests {
             }],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(sketch_agg(default_frequency(), "m")),
+            child: Rc::new(sketch_agg(default_frequency(), "m")),
         };
         let node = plan(&expr, &default_config());
         assert_eq!(node.placement, Placement::QueryEngine);
@@ -723,7 +725,7 @@ mod tests {
             }],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(sketch_agg(default_frequency(), "m")),
+            child: Rc::new(sketch_agg(default_frequency(), "m")),
         };
         let node = plan(&expr, &default_config());
         assert!(
@@ -750,7 +752,7 @@ mod tests {
             measures: vec![AggIntent::Sum { col: None }, AggIntent::Min { col: None }],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(scan("trades")),
+            child: Rc::new(scan("trades")),
         };
         let node = plan(&expr, &default_config());
         assert_eq!(node.placement, Placement::QueryEngine);
@@ -771,9 +773,10 @@ mod tests {
             }],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(QueryExpr::Merge {
+            child: QueryExpr::Concat {
                 children: vec![windowed_agg(default_frequency(), 60, "requests")],
-            }),
+            }
+            .into(),
         };
         let node = plan(&expr, &default_config());
         let placements = node.placements();

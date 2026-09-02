@@ -184,6 +184,8 @@ pub fn fused_sketch_decision(
 
 #[cfg(test)]
 mod tests {
+    use std::rc::Rc;
+
     use super::*;
     use crate::intent_algebra::query_expr::Source;
     use crate::intent_algebra::schema::Schema;
@@ -224,12 +226,12 @@ mod tests {
     fn windowed_sketch(agg: AggIntent, size: Duration) -> QueryExpr {
         QueryExpr::TimeRange {
             range: size,
-            child: Box::new(QueryExpr::Aggregate {
+            child: Rc::new(QueryExpr::Aggregate {
                 reduction: crate::intent_algebra::Reduction::by(vec![]),
                 measures: vec![agg],
                 output_names: Vec::new(),
                 having: None,
-                child: Box::new(canonical_scan("m")),
+                child: Rc::new(canonical_scan("m")),
             }),
         }
     }
@@ -308,7 +310,7 @@ mod tests {
             measures: vec![AggIntent::Sum { col: None }],
             output_names: Vec::new(),
             having: None,
-            child: Box::new(canonical_scan("m")),
+            child: Rc::new(canonical_scan("m")),
         };
         assert!(recognize_windowed_sketch(&canonical).is_none());
     }
@@ -318,7 +320,7 @@ mod tests {
         // `TimeRange` directly over a `Scan` — no inner `Aggregate` to fuse.
         let canonical = QueryExpr::TimeRange {
             range: Duration::from_secs(60),
-            child: Box::new(canonical_scan("m")),
+            child: Rc::new(canonical_scan("m")),
         };
         assert!(recognize_windowed_sketch(&canonical).is_none());
     }

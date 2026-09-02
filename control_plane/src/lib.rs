@@ -70,6 +70,7 @@ pub mod opamp;
 pub mod optimizer;
 pub mod physical;
 pub mod pipeline;
+pub mod planner_selection;
 pub mod query_parser;
 pub mod query_planning;
 pub mod replan;

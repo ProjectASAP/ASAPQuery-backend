@@ -349,7 +349,9 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
             SummaryFamilyType::ExactAggregate(kind, params) => {
                 (kind.clone().into(), params.clone().into())
             }
-            SummaryFamilyType::Sketch(kind, params) => (kind.clone().into(), params.clone().into()),
+            SummaryFamilyType::Sketch(kind, _) => {
+                (kind.clone().into(), kind.params().clone().into())
+            }
             SummaryFamilyType::Plain(_)
             | SummaryFamilyType::Sample(..)
             | SummaryFamilyType::Wavelet(..)
@@ -941,7 +943,7 @@ fn to_delta_kind(kind: SketchKindHandle, config: &SketchConfig) -> Option<DeltaS
 /// "collect Aggregate roots" for "find the first Scan".
 fn find_metric(node: &SummaryNode) -> Option<String> {
     match &node.expr {
-        SummaryExpr::Logical(qe) => find_metric_in_query_expr(qe),
+        SummaryExpr::KeepPreAsap(qe) => find_metric_in_query_expr(qe),
         SummaryExpr::SummaryAgg { child, .. } => find_metric(child),
         SummaryExpr::SummaryEstimate { summary_input, .. } => find_metric(summary_input),
         SummaryExpr::SummaryMerge { children } => children.first().and_then(|c| find_metric(c)),
@@ -963,14 +965,14 @@ pub(crate) fn find_metric_in_query_expr(qe: &QueryExpr) -> Option<String> {
         QueryExpr::Filter { child, .. }
         | QueryExpr::Project { child, .. }
         | QueryExpr::Aggregate { child, .. }
-        | QueryExpr::Distinct { child, .. }
+        | QueryExpr::Dedup { child, .. }
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. }
-        | QueryExpr::Subquery { child, .. }
+        | QueryExpr::PromqlSubquery { child, .. }
         | QueryExpr::TimeRange { child, .. }
         | QueryExpr::TimeShift { child, .. }
-        | QueryExpr::WindowFunc { child, .. } => find_metric_in_query_expr(child),
-        QueryExpr::Merge { children } => children.iter().find_map(find_metric_in_query_expr),
+        | QueryExpr::SQLWindowFunc { child, .. } => find_metric_in_query_expr(child),
+        QueryExpr::Concat { children } => children.iter().find_map(find_metric_in_query_expr),
         QueryExpr::Join { left, .. } | QueryExpr::SetOp { left, .. } => {
             find_metric_in_query_expr(left)
         }
@@ -993,6 +995,16 @@ mod tests {
     use planner_types::post_asap::{SummaryField, SummarySchema};
     use planner_types::pre_asap::{Column, DataType, Schema};
     use std::rc::Rc;
+
+    fn sketch_family(
+        algorithm: planner_types::post_asap::SketchAlgorithm,
+        params: planner_types::post_asap::SketchParams,
+    ) -> SummaryFamilyType {
+        SummaryFamilyType::Sketch(
+            planner_types::post_asap::SketchKind::new(algorithm, params),
+            planner_types::post_asap::GroupingStrategy::default(),
+        )
+    }
 
     fn scan_node(metric: &str, group_by_field: Option<&str>) -> Rc<SummaryNode> {
         let qe = QueryExpr::Scan {
@@ -1022,11 +1034,12 @@ mod tests {
             });
         }
         Rc::new(SummaryNode {
-            expr: SummaryExpr::Logical(Box::new(qe)),
+            expr: SummaryExpr::KeepPreAsap(Rc::new(qe)),
             schema: SummarySchema {
                 fields,
                 time_index: None,
             },
+            guarantee: None,
         })
     }
 
@@ -1034,17 +1047,19 @@ mod tests {
         Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                family: SummaryFamilyType::Sketch(
-                    planner_types::post_asap::SketchKind::Kll,
+                family: sketch_family(
+                    planner_types::post_asap::SketchAlgorithm::Kll,
                     planner_types::post_asap::SketchParams::Kll { k: 200 },
                 ),
                 col: ColumnRef::SampleValue,
                 reduction,
+                grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
             schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
+            guarantee: None,
         })
     }
 
@@ -1056,17 +1071,19 @@ mod tests {
         Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                family: SummaryFamilyType::Sketch(
-                    planner_types::post_asap::SketchKind::Hll,
+                family: sketch_family(
+                    planner_types::post_asap::SketchAlgorithm::Hll,
                     planner_types::post_asap::SketchParams::Hll { precision: 10 },
                 ),
                 col: ColumnRef::SampleValue,
                 reduction,
+                grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
             schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
+            guarantee: None,
         })
     }
 
@@ -1080,6 +1097,7 @@ mod tests {
                 fields: vec![],
                 time_index: None,
             },
+            guarantee: None,
         })
     }
 
@@ -1200,8 +1218,8 @@ mod tests {
         Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                family: SummaryFamilyType::Sketch(
-                    planner_types::post_asap::SketchKind::Cms,
+                family: sketch_family(
+                    planner_types::post_asap::SketchAlgorithm::Cms,
                     planner_types::post_asap::SketchParams::Cms {
                         width: 256,
                         depth: 4,
@@ -1209,11 +1227,13 @@ mod tests {
                 ),
                 col: ColumnRef::SampleValue,
                 reduction: Reduction::by(vec![]),
+                grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
             schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
+            guarantee: None,
         })
     }
 
@@ -1258,8 +1278,8 @@ mod tests {
         Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                family: SummaryFamilyType::Sketch(
-                    planner_types::post_asap::SketchKind::CmsWithHeap,
+                family: sketch_family(
+                    planner_types::post_asap::SketchAlgorithm::CmsWithHeap,
                     planner_types::post_asap::SketchParams::CmsWithHeap {
                         width: 256,
                         depth: 4,
@@ -1268,11 +1288,13 @@ mod tests {
                 ),
                 col: ColumnRef::SampleValue,
                 reduction: Reduction::by(vec![]),
+                grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
             schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
+            guarantee: None,
         })
     }
 
@@ -1313,11 +1335,13 @@ mod tests {
                 // `by` always means "reduce fully," never `PerEntity` (see
                 // `resolve_group_key`'s doc).
                 reduction: Reduction::by(by),
+                grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
             schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
+            guarantee: None,
         })
     }
 
@@ -2095,17 +2119,19 @@ mod tests {
         let mismatched = Rc::new(SummaryNode {
             expr: SummaryExpr::SummaryAgg {
                 child,
-                family: SummaryFamilyType::Sketch(
-                    planner_types::post_asap::SketchKind::Kll,
+                family: sketch_family(
+                    planner_types::post_asap::SketchAlgorithm::Kll,
                     planner_types::post_asap::SketchParams::Kll { k: 500 },
                 ),
                 col: ColumnRef::SampleValue,
                 reduction: Reduction::by(vec![]),
+                grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
             schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
+            guarantee: None,
         });
         let tree = estimate_node(mismatched, SketchQuery::Quantile { q: 0.5 });
         let exec = ctx(&idx);
@@ -2469,8 +2495,8 @@ mod tests {
         // this tree resolves to a real Sketch Value above).
         let handles = exec
             .find_candidates(
-                &SummaryFamilyType::Sketch(
-                    planner_types::post_asap::SketchKind::Kll,
+                &sketch_family(
+                    planner_types::post_asap::SketchAlgorithm::Kll,
                     planner_types::post_asap::SketchParams::Kll { k: 200 },
                 ),
                 &ColumnRef::SampleValue,
@@ -2560,11 +2586,13 @@ mod tests {
                 ),
                 col: ColumnRef::SampleValue,
                 reduction: Reduction::by(vec![]),
+                grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
             schema: SummarySchema {
                 fields: vec![],
                 time_index: None,
             },
+            guarantee: None,
         });
         let exec = ctx(&idx);
         match execute(&tree, &exec) {

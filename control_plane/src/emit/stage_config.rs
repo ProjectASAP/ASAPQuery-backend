@@ -64,7 +64,7 @@ use crate::physical::colored_dag::emitter::{
 // test module's `use super::*` instead (P2-5).
 use crate::intent_algebra::ColumnRef;
 use crate::physical::colored_dag::stage_id::StageId;
-use planner_types::post_asap::{SketchKind, SketchParams, SketchQuery};
+use planner_types::post_asap::{SketchAlgorithm, SketchParams, SketchQuery};
 // `BackendAggregation.sketch_kind`/`.sketch_params` span both exact
 // accumulators and approximate sketches -- see
 // `physical::colored_dag::emitter`'s `use asap_types::{...}` note.
@@ -227,7 +227,7 @@ pub fn emit_edge_yaml(
     // ── MVP §46: 5-sketch routing-connector dispatch ───────────────────────
     //
     // When the planner has populated `cfg.metric_to_family` (the per-metric
-    // → SketchKind table sourced from the workload spec), we switch to the
+    // → SketchAlgorithm table sourced from the workload spec), we switch to the
     // canonical 5-sketch routing-connector wire shape: all referenced
     // sketch processors live at the top level, the OTel `routing`
     // *connector* (NOT the deprecated routing processor) lives under
@@ -596,11 +596,11 @@ pub fn emit_gateway_yaml(
 
     // Processors — one merge processor per merge entry. Naming
     // convention matches the patched contrib build:
-    //   * SketchKind::DDSketch    → `ddsketchmerge`
-    //   * SketchKind::Kll         → `kllmerge`
-    //   * SketchKind::Hll         → `hllmerge`
-    //   * SketchKind::Cms         → `countminsketchmerge`
-    //   * SketchKind::CountSketch → `countsketchmerge`
+    //   * SketchAlgorithm::DDSketch    → `ddsketchmerge`
+    //   * SketchAlgorithm::Kll         → `kllmerge`
+    //   * SketchAlgorithm::Hll         → `hllmerge`
+    //   * SketchAlgorithm::Cms         → `countminsketchmerge`
+    //   * SketchAlgorithm::CountSketch → `countsketchmerge`
     //
     // We honour `GatewayMergeProcessor::processor_name` if non-empty
     // (the typed emitter today populates it as `"sketchmergeprocessor"`
@@ -1048,7 +1048,7 @@ fn emit_edge_yaml_5sketch_routing(
     opamp_endpoint: &str,
     agent_id: &str,
 ) -> Result<String> {
-    use planner_types::post_asap::SketchKind;
+    use planner_types::post_asap::SketchAlgorithm;
 
     let otlp_receiver: Value = serde_yaml::from_str(
         "protocols:\n  grpc:\n    endpoint: \"0.0.0.0:4317\"\n    max_recv_msg_size_mib: 64\n  http:\n    endpoint: \"0.0.0.0:4318\"\n",
@@ -1067,14 +1067,14 @@ fn emit_edge_yaml_5sketch_routing(
     // The canonical 5-family order below is the iteration order for
     // every emit (processors, pipelines, hints) so the YAML is stable
     // across controller runs regardless of HashMap iteration order.
-    const FAMILY_ORDER: [SketchKind; 5] = [
-        SketchKind::DDSketch,
-        SketchKind::Kll,
-        SketchKind::Hll,
-        SketchKind::CountSketch,
-        SketchKind::Cms,
+    const FAMILY_ORDER: [SketchAlgorithm; 5] = [
+        SketchAlgorithm::DDSketch,
+        SketchAlgorithm::Kll,
+        SketchAlgorithm::Hll,
+        SketchAlgorithm::CountSketch,
+        SketchAlgorithm::Cms,
     ];
-    let mut needed_families: std::collections::BTreeSet<SketchKind> =
+    let mut needed_families: std::collections::BTreeSet<SketchAlgorithm> =
         std::collections::BTreeSet::new();
     for families in cfg.metric_to_family.values() {
         for kind in families {
@@ -1098,10 +1098,10 @@ fn emit_edge_yaml_5sketch_routing(
     // (so the params flow through), otherwise we synthesise a
     // default-param block. Keyed by `base_family` — `FAMILY_ORDER` is a
     // fixed 5-bare-family list with no heap-bearing entries, exactly
-    // matching pre-`SketchKind`-split behavior (heap-bearing-ness was
+    // matching pre-`SketchAlgorithm`-split behavior (heap-bearing-ness was
     // never visible to this bare-kind lookup even when it lived as a
     // `with_heap` params flag).
-    let mut family_to_proc: HashMap<SketchKind, &EdgeSketchProcessor> = HashMap::new();
+    let mut family_to_proc: HashMap<SketchAlgorithm, &EdgeSketchProcessor> = HashMap::new();
     for sp in &cfg.sketch_processors {
         family_to_proc.insert(base_family(&sp.sketch_kind), sp);
     }
@@ -1280,7 +1280,7 @@ fn emit_edge_yaml_5sketch_routing(
     // connector fans its samples into both pipelines. Family order
     // within each metric's pipeline list follows the canonical
     // `FAMILY_ORDER` so the YAML is stable.
-    let mut metric_family_pairs: Vec<(&String, &std::collections::BTreeSet<SketchKind>)> =
+    let mut metric_family_pairs: Vec<(&String, &std::collections::BTreeSet<SketchAlgorithm>)> =
         cfg.metric_to_family.iter().collect();
     metric_family_pairs.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -1310,7 +1310,7 @@ fn emit_edge_yaml_5sketch_routing(
     // added to EACH of its families' pipelines (the `where metric.name
     // == "<metric>"` guard makes it a no-op on the family's other
     // metrics).
-    let mut family_to_keep_processors: HashMap<SketchKind, Vec<String>> = HashMap::new();
+    let mut family_to_keep_processors: HashMap<SketchAlgorithm, Vec<String>> = HashMap::new();
     for (metric, families) in &metric_family_pairs {
         let Some(labels) = cfg.metric_to_grouping_labels.get(*metric) else {
             continue;
@@ -1622,19 +1622,19 @@ fn emit_edge_yaml_5sketch_routing(
     serde_yaml::to_string(&doc).context("serialize edge stage config (5-sketch)")
 }
 
-/// Map a `SketchKind` to the `family:` token the fused `asap_edge`
+/// Map a `SketchAlgorithm` to the `family:` token the fused `asap_edge`
 /// processor's `metrics[]` list expects. These differ from the OTel
 /// component-id processor names (`KLL`, `countmin`, …) used by the
 /// routing-connector path — the fused processor takes a lower-case
 /// family discriminant per entry, matching the hand-written contract in
 /// `asap-otel-agent-b6-asap-single-sketch.yaml`.
-fn sketch_kind_to_asap_edge_family(kind: &SketchKind) -> &'static str {
+fn sketch_kind_to_asap_edge_family(kind: &SketchAlgorithm) -> &'static str {
     match kind {
-        SketchKind::DDSketch => "ddsketch",
-        SketchKind::Kll => "kll",
-        SketchKind::Hll => "hll",
-        SketchKind::CountSketch => "countsketch",
-        SketchKind::Cms => "countminsketch",
+        SketchAlgorithm::DDSketch => "ddsketch",
+        SketchAlgorithm::Kll => "kll",
+        SketchAlgorithm::Hll => "hll",
+        SketchAlgorithm::CountSketch => "countsketch",
+        SketchAlgorithm::Cms => "countminsketch",
         // Every caller iterates the fixed 5-bare-family `FAMILY_ORDER`
         // list (heap-bearing kinds normalize through `base_family`
         // before reaching here), and no Bind* rule in this repo
@@ -1705,7 +1705,7 @@ fn emit_edge_yaml_asap_edge(
     _opamp_endpoint: &str,
     _agent_id: &str,
 ) -> Result<String> {
-    use planner_types::post_asap::SketchKind;
+    use planner_types::post_asap::SketchAlgorithm;
 
     // ── Receivers ──────────────────────────────────────────────────────────
     // OTLP gRPC on 4317 + HTTP on 4318 — same as every other edge emit.
@@ -1884,18 +1884,18 @@ fn emit_edge_yaml_asap_edge(
     // (keyed by family) so the per-metric param block mirrors the
     // routing path; fall back to catalog defaults when the planner
     // mapped a family with no enumerated processor.
-    let mut family_to_proc: HashMap<SketchKind, &EdgeSketchProcessor> = HashMap::new();
+    let mut family_to_proc: HashMap<SketchAlgorithm, &EdgeSketchProcessor> = HashMap::new();
     for sp in &cfg.sketch_processors {
         family_to_proc.insert(base_family(&sp.sketch_kind), sp);
     }
-    const FAMILY_ORDER: [SketchKind; 5] = [
-        SketchKind::DDSketch,
-        SketchKind::Kll,
-        SketchKind::Hll,
-        SketchKind::CountSketch,
-        SketchKind::Cms,
+    const FAMILY_ORDER: [SketchAlgorithm; 5] = [
+        SketchAlgorithm::DDSketch,
+        SketchAlgorithm::Kll,
+        SketchAlgorithm::Hll,
+        SketchAlgorithm::CountSketch,
+        SketchAlgorithm::Cms,
     ];
-    let mut metric_family_pairs: Vec<(&String, &std::collections::BTreeSet<SketchKind>)> =
+    let mut metric_family_pairs: Vec<(&String, &std::collections::BTreeSet<SketchAlgorithm>)> =
         cfg.metric_to_family.iter().collect();
     metric_family_pairs.sort_by(|a, b| a.0.cmp(b.0));
     for (metric, families) in &metric_family_pairs {
@@ -1903,7 +1903,7 @@ fn emit_edge_yaml_asap_edge(
         // `FAMILY_ORDER` list — same reasoning as `family_to_proc` above:
         // a committed heap-bearing kind (`CmsWithHeap`/`CountSketchWithHeap`)
         // must still match its bare `FAMILY_ORDER` entry.
-        let bare_families: std::collections::BTreeSet<SketchKind> =
+        let bare_families: std::collections::BTreeSet<SketchAlgorithm> =
             families.iter().map(base_family).collect();
         for kind in FAMILY_ORDER.iter().filter(|k| bare_families.contains(*k)) {
             let mut e = Mapping::new();
@@ -1998,7 +1998,7 @@ fn emit_edge_yaml_asap_edge(
             let whole_stream = effective_by.is_empty()
                 && matches!(
                     kind,
-                    SketchKind::Hll | SketchKind::Cms | SketchKind::CountSketch
+                    SketchAlgorithm::Hll | SketchAlgorithm::Cms | SketchAlgorithm::CountSketch
                 );
             if whole_stream {
                 e.insert("mode".into(), Value::String("whole_stream".to_string()));
@@ -2045,7 +2045,7 @@ fn emit_edge_yaml_asap_edge(
             // lossless and serializes byte-identically to dense). We emit the
             // flag ONLY for the HLL family; non-HLL families carry no
             // `hll_sparse` key.
-            if matches!(kind, SketchKind::Hll) {
+            if matches!(kind, SketchAlgorithm::Hll) {
                 let hll_sparse = if whole_stream {
                     false
                 } else {
@@ -2073,7 +2073,7 @@ fn emit_edge_yaml_asap_edge(
             // its params.
             let mut countsketch_with_heap = family_to_proc
                 .get(kind)
-                .is_some_and(|sp| matches!(sp.sketch_kind, SketchKind::CountSketchWithHeap));
+                .is_some_and(|sp| matches!(sp.sketch_kind, SketchAlgorithm::CountSketchWithHeap));
             match family_to_proc.get(kind).map(|sp| &sp.sketch_params) {
                 Some(SketchParams::DDSketch { alpha }) => {
                     e.insert("relative_accuracy".into(), Value::Number((*alpha).into()));
@@ -2100,14 +2100,14 @@ fn emit_edge_yaml_asap_edge(
                     // Family with no enumerated processor — emit catalog
                     // defaults so the entry is still well-formed.
                     match kind {
-                        SketchKind::DDSketch => {
+                        SketchAlgorithm::DDSketch => {
                             e.insert("relative_accuracy".into(), Value::Number(0.01.into()));
                         }
-                        SketchKind::Kll => {
+                        SketchAlgorithm::Kll => {
                             e.insert("k".into(), Value::Number(200u64.into()));
                         }
-                        SketchKind::Hll => {}
-                        SketchKind::CountSketch => {
+                        SketchAlgorithm::Hll => {}
+                        SketchAlgorithm::CountSketch => {
                             e.insert("rows".into(), Value::Number(5u64.into()));
                             e.insert("cols".into(), Value::Number(2048u64.into()));
                             // P1-4: NO enumerated EdgeSketchProcessor for this
@@ -2131,7 +2131,7 @@ fn emit_edge_yaml_asap_edge(
                             // step with the backend `with_heap` registration.
                             countsketch_with_heap = cfg.metric_to_item_label.contains_key(*metric);
                         }
-                        SketchKind::Cms => {
+                        SketchAlgorithm::Cms => {
                             e.insert("rows".into(), Value::Number(5u64.into()));
                             e.insert("cols".into(), Value::Number(2048u64.into()));
                         }
@@ -2147,7 +2147,7 @@ fn emit_edge_yaml_asap_edge(
             // families (CMS / HLL) only when `p < 1.0`. Mirrors
             // `build_edge_processor_block`'s guarded emit so an unset /
             // 1.0 probability keeps the fused entry byte-identical.
-            if matches!(kind, SketchKind::Cms | SketchKind::Hll) {
+            if matches!(kind, SketchAlgorithm::Cms | SketchAlgorithm::Hll) {
                 insert_sample_p(&mut e, cfg.metric_to_sample_p.get(*metric).copied());
             }
 
@@ -2168,7 +2168,10 @@ fn emit_edge_yaml_asap_edge(
             // depending on that default.
             if matches!(
                 kind,
-                SketchKind::DDSketch | SketchKind::Hll | SketchKind::CountSketch | SketchKind::Cms
+                SketchAlgorithm::DDSketch
+                    | SketchAlgorithm::Hll
+                    | SketchAlgorithm::CountSketch
+                    | SketchAlgorithm::Cms
             ) {
                 e.insert("delta_transmission".into(), Value::Bool(true));
             }
@@ -2199,7 +2202,7 @@ fn emit_edge_yaml_asap_edge(
             // that lands — `mapstructure` ignores unknown keys by default —
             // but the warm-topk behaviour only activates once the asapedge
             // build carries the fields. See the report's cross-repo note.
-            if matches!(kind, SketchKind::CountSketch) && countsketch_with_heap {
+            if matches!(kind, SketchAlgorithm::CountSketch) && countsketch_with_heap {
                 e.insert("emit_heap".into(), Value::Bool(true));
                 e.insert("heap_size".into(), Value::Number(100u64.into()));
                 // Prefer the workload-declared inner dimension
@@ -2243,7 +2246,7 @@ fn emit_edge_yaml_asap_edge(
             // pure YAML text here (`mapstructure` ignores unknown keys), so
             // emitting it is safe even before that lands; the corrected
             // keying only activates once the asapedge build carries it.
-            if matches!(kind, SketchKind::Hll | SketchKind::Cms) {
+            if matches!(kind, SketchAlgorithm::Hll | SketchAlgorithm::Cms) {
                 if let Some(item_label) = cfg.metric_to_item_label.get(*metric) {
                     if !item_label.is_empty() {
                         e.insert("item_label".into(), Value::String(item_label.clone()));
@@ -2450,30 +2453,30 @@ tsdb_block_duration: {window_secs}s\n",
     )
 }
 
-/// Map a `SketchKind` to the OTel processor name registered by the
+/// Map a `SketchAlgorithm` to the OTel processor name registered by the
 /// patched contrib build's factory. Keep in sync with
 /// `crate::physical::colored_dag::emitter::edge_processor_name`.
-fn sketch_kind_to_processor_name(kind: &SketchKind) -> &'static str {
+fn sketch_kind_to_processor_name(kind: &SketchAlgorithm) -> &'static str {
     match kind {
-        SketchKind::DDSketch => "ddsketch",
-        SketchKind::Kll => "KLL",
-        SketchKind::Hll => "HLL",
-        SketchKind::CountSketch => "countsketch",
-        SketchKind::Cms => "countmin",
+        SketchAlgorithm::DDSketch => "ddsketch",
+        SketchAlgorithm::Kll => "KLL",
+        SketchAlgorithm::Hll => "HLL",
+        SketchAlgorithm::CountSketch => "countsketch",
+        SketchAlgorithm::Cms => "countmin",
         // Callers only ever pass a bare `FAMILY_ORDER` entry.
         other => unreachable!("sketch_kind_to_processor_name: unexpected kind {other:?}"),
     }
 }
 
-/// Map a `SketchKind` to its per-family pipeline name in the routing
+/// Map a `SketchAlgorithm` to its per-family pipeline name in the routing
 /// connector layout.
-fn sketch_kind_to_pipeline_name(kind: &SketchKind) -> &'static str {
+fn sketch_kind_to_pipeline_name(kind: &SketchAlgorithm) -> &'static str {
     match kind {
-        SketchKind::DDSketch => "metrics/ddsketch_path",
-        SketchKind::Kll => "metrics/kll_path",
-        SketchKind::Hll => "metrics/hll_path",
-        SketchKind::CountSketch => "metrics/countsketch_path",
-        SketchKind::Cms => "metrics/countminsketch_path",
+        SketchAlgorithm::DDSketch => "metrics/ddsketch_path",
+        SketchAlgorithm::Kll => "metrics/kll_path",
+        SketchAlgorithm::Hll => "metrics/hll_path",
+        SketchAlgorithm::CountSketch => "metrics/countsketch_path",
+        SketchAlgorithm::Cms => "metrics/countminsketch_path",
         // Callers only ever pass a bare `FAMILY_ORDER` entry.
         other => unreachable!("sketch_kind_to_pipeline_name: unexpected kind {other:?}"),
     }
@@ -2611,14 +2614,14 @@ fn build_transform_keep_processor_block(metric: &str, labels: &[String]) -> Valu
     serde_yaml::from_str(&yaml).expect("transform/keep_for_* yaml is well-formed by construction")
 }
 
-/// Build a default-parameter processor block for a `SketchKind` when
+/// Build a default-parameter processor block for a `SketchAlgorithm` when
 /// the planner's `metric_to_family` references a family that
 /// `cfg.sketch_processors` didn't enumerate. Defaults match the catalog
 /// values used by the planner's L4 rules so the wire shape is what the
 /// rest of the system expects when a metric is later re-routed onto
 /// this family.
 fn build_default_edge_processor_block(
-    kind: &SketchKind,
+    kind: &SketchAlgorithm,
     window_secs: Option<u64>,
     metric_name_hint: Option<&str>,
     sample_p: Option<f64>,
@@ -2628,23 +2631,26 @@ fn build_default_edge_processor_block(
     // the tag/processor-name lookups below, which are keyed on the bare
     // family. `stored_kind`/`params` are what actually land on the
     // synthesized processor; `CountSketch`'s default stays heap-bearing
-    // (matching this function's pre-`SketchKind`-split default of
+    // (matching this function's pre-`SketchAlgorithm`-split default of
     // `with_heap: true` — `Cms`'s default was `with_heap: false` and
     // stays bare).
     let (stored_kind, params) = match kind {
-        SketchKind::DDSketch => (SketchKind::DDSketch, SketchParams::DDSketch { alpha: 0.01 }),
-        SketchKind::Kll => (SketchKind::Kll, SketchParams::Kll { k: 200 }),
-        SketchKind::Hll => (SketchKind::Hll, SketchParams::Hll { precision: 14 }),
-        SketchKind::CountSketch => (
-            SketchKind::CountSketchWithHeap,
+        SketchAlgorithm::DDSketch => (
+            SketchAlgorithm::DDSketch,
+            SketchParams::DDSketch { alpha: 0.01 },
+        ),
+        SketchAlgorithm::Kll => (SketchAlgorithm::Kll, SketchParams::Kll { k: 200 }),
+        SketchAlgorithm::Hll => (SketchAlgorithm::Hll, SketchParams::Hll { precision: 14 }),
+        SketchAlgorithm::CountSketch => (
+            SketchAlgorithm::CountSketchWithHeap,
             SketchParams::CountSketchWithHeap {
                 width: 2048,
                 depth: 5,
                 heap_size: 10,
             },
         ),
-        SketchKind::Cms => (
-            SketchKind::Cms,
+        SketchAlgorithm::Cms => (
+            SketchAlgorithm::Cms,
             SketchParams::Cms {
                 width: 4096,
                 depth: 4,
@@ -2852,7 +2858,7 @@ fn build_edge_processor_block(
         }
         SketchParams::Kmv { .. } | SketchParams::Theta { .. } => unreachable!(
             "edge sketch processor config requested for a non-sketch or unsupported \
-             SketchKind; no Bind* rule in this repo produces one"
+             SketchAlgorithm; no Bind* rule in this repo produces one"
         ),
     }
 
@@ -2886,13 +2892,15 @@ fn insert_sample_p(m: &mut Mapping, sample_p: Option<f64>) {
 /// here so the emitted YAML round-trips through the patched build.
 fn gateway_merge_processor_name(mp: &GatewayMergeProcessor) -> String {
     match mp.sketch_kind {
-        SketchKind::Kll => "kllmerge".to_string(),
-        SketchKind::DDSketch => "ddsketchmerge".to_string(),
-        SketchKind::Hll => "hllmerge".to_string(),
-        SketchKind::Cms | SketchKind::CmsWithHeap => "countminsketchmerge".to_string(),
-        SketchKind::CountSketch | SketchKind::CountSketchWithHeap => "countsketchmerge".to_string(),
-        SketchKind::Kmv | SketchKind::Theta => unreachable!(
-            "gateway_merge_processor_name: non-sketch or unsupported SketchKind; \
+        SketchAlgorithm::Kll => "kllmerge".to_string(),
+        SketchAlgorithm::DDSketch => "ddsketchmerge".to_string(),
+        SketchAlgorithm::Hll => "hllmerge".to_string(),
+        SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap => "countminsketchmerge".to_string(),
+        SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap => {
+            "countsketchmerge".to_string()
+        }
+        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => unreachable!(
+            "gateway_merge_processor_name: non-sketch or unsupported SketchAlgorithm; \
              no Bind* rule in this repo produces one"
         ),
     }
@@ -3042,34 +3050,34 @@ fn column_ref_to_wire_key(col: &ColumnRef) -> String {
     }
 }
 
-/// Collapse a heap-bearing `SketchKind` to its bare counterpart.
+/// Collapse a heap-bearing `SketchAlgorithm` to its bare counterpart.
 /// Identity for every other kind.
 ///
 /// The 5-sketch routing-connector edge YAML path (`emit_edge_yaml`'s
 /// `USE_5SKETCH_ROUTING` branch and its `metric_to_family` sibling)
 /// keys its fixed `FAMILY_ORDER` list and lookup maps on the 5 bare
-/// families only — matching the retired `sketch_algebra::SketchKind`,
+/// families only — matching the retired `sketch_algebra::SketchAlgorithm`,
 /// which had no heap-bearing variant at all (`with_heap` was a
 /// `SketchParams` field, invisible to anything keying on kind alone).
 /// A committed heap-bearing kind (`CmsWithHeap`/`CountSketchWithHeap`,
 /// from a topk binding) needs to normalize through this before it's
 /// used as a key or set member in that path, or it silently fails to
 /// match its bare `FAMILY_ORDER` entry.
-fn base_family(kind: &SketchKind) -> SketchKind {
+fn base_family(kind: &SketchAlgorithm) -> SketchAlgorithm {
     match kind {
-        SketchKind::CmsWithHeap => SketchKind::Cms,
-        SketchKind::CountSketchWithHeap => SketchKind::CountSketch,
+        SketchAlgorithm::CmsWithHeap => SketchAlgorithm::Cms,
+        SketchAlgorithm::CountSketchWithHeap => SketchAlgorithm::CountSketch,
         other => other.clone(),
     }
 }
 
-/// Map a `SketchKind` to the backend's `AggregationType::Display`
+/// Map a `SketchAlgorithm` to the backend's `AggregationType::Display`
 /// string — the same mapping
 /// [`crate::config::asapquery_backend::map_sketch_type_to_agg_type`] uses
 /// (the strings must match `AggregationType::FromStr` in the backend's
 /// `promql_utilities::query_logics::enums`).
 ///
-/// Heap-bearing is now identity, not a params flag (`SketchKind::CmsWithHeap`
+/// Heap-bearing is now identity, not a params flag (`SketchAlgorithm::CmsWithHeap`
 /// / `CountSketchWithHeap`, set by `BindCountSketchOnTopK` — see
 /// `sketch_algebra::rules::bind_cms_topk`), so this maps on `kind` alone;
 /// `params` is unused but kept for call-site stability. This is what
@@ -3101,20 +3109,20 @@ fn sketch_kind_to_backend_type(kind: &SummaryKind, _params: &SummaryParams) -> &
     }
 }
 
-/// Stable lowercase tag for a `SketchKind` — used as a passthrough
+/// Stable lowercase tag for a `SketchAlgorithm` — used as a passthrough
 /// `sketch_kind` field in YAML so downstream consumers can dispatch
 /// without round-tripping through serde. Heap-bearing kinds reuse their
 /// bare counterpart's tag — this field never distinguished `with_heap`
-/// even before `SketchKind` split it into its own variant.
-fn sketch_kind_tag(kind: &SketchKind) -> &'static str {
+/// even before `SketchAlgorithm` split it into its own variant.
+fn sketch_kind_tag(kind: &SketchAlgorithm) -> &'static str {
     match kind {
-        SketchKind::Kll => "kll",
-        SketchKind::DDSketch => "ddsketch",
-        SketchKind::Hll => "hll",
-        SketchKind::Cms | SketchKind::CmsWithHeap => "cms",
-        SketchKind::CountSketch | SketchKind::CountSketchWithHeap => "count_sketch",
-        SketchKind::Kmv | SketchKind::Theta => unreachable!(
-            "sketch_kind_tag: non-sketch or unsupported SketchKind; \
+        SketchAlgorithm::Kll => "kll",
+        SketchAlgorithm::DDSketch => "ddsketch",
+        SketchAlgorithm::Hll => "hll",
+        SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap => "cms",
+        SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap => "count_sketch",
+        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => unreachable!(
+            "sketch_kind_tag: non-sketch or unsupported SketchAlgorithm; \
              no Bind* rule in this repo produces one"
         ),
     }
@@ -3177,7 +3185,7 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "ddsketch".to_string(),
-                sketch_kind: SketchKind::DDSketch,
+                sketch_kind: SketchAlgorithm::DDSketch,
                 sketch_params: SketchParams::DDSketch { alpha: 0.01 },
                 aggregation_id: "agg0".to_string(),
             }],
@@ -3262,7 +3270,7 @@ mod tests {
         let mut cfg = ddsketch_edge_cfg();
         cfg.sketch_processors[0] = EdgeSketchProcessor {
             processor_name: "KLL".to_string(),
-            sketch_kind: SketchKind::Kll,
+            sketch_kind: SketchAlgorithm::Kll,
             sketch_params: SketchParams::Kll { k: 200 },
             aggregation_id: "agg7".to_string(),
         };
@@ -3297,13 +3305,17 @@ mod tests {
         // flag (see `edge_yaml_kll_uses_k_param`).
         for (kind, processor_name, params) in [
             (
-                SketchKind::DDSketch,
+                SketchAlgorithm::DDSketch,
                 "ddsketch",
                 SketchParams::DDSketch { alpha: 0.01 },
             ),
-            (SketchKind::Hll, "HLL", SketchParams::Hll { precision: 14 }),
             (
-                SketchKind::CountSketch,
+                SketchAlgorithm::Hll,
+                "HLL",
+                SketchParams::Hll { precision: 14 },
+            ),
+            (
+                SketchAlgorithm::CountSketch,
                 "countsketch",
                 SketchParams::CountSketchWithHeap {
                     width: 2048,
@@ -3312,7 +3324,7 @@ mod tests {
                 },
             ),
             (
-                SketchKind::Cms,
+                SketchAlgorithm::Cms,
                 "countmin",
                 SketchParams::Cms {
                     width: 4096,
@@ -3342,7 +3354,7 @@ mod tests {
         cfg.source_metric = Some("endpoint_request_freq".to_string());
         cfg.sketch_processors[0] = EdgeSketchProcessor {
             processor_name: "countmin".to_string(),
-            sketch_kind: SketchKind::Cms,
+            sketch_kind: SketchAlgorithm::Cms,
             sketch_params: SketchParams::Cms {
                 width: 4096,
                 depth: 4,
@@ -3375,7 +3387,7 @@ mod tests {
             otlp_receiver_port: 4317,
             merge_processors: vec![GatewayMergeProcessor {
                 processor_name: "sketchmergeprocessor".to_string(),
-                sketch_kind: SketchKind::DDSketch,
+                sketch_kind: SketchAlgorithm::DDSketch,
                 aggregation_id: "agg0".to_string(),
             }],
             exporter_target: ExportTarget::Stage(StageId::Backend),
@@ -3419,12 +3431,12 @@ mod tests {
             merge_processors: vec![
                 GatewayMergeProcessor {
                     processor_name: "x".into(),
-                    sketch_kind: SketchKind::Kll,
+                    sketch_kind: SketchAlgorithm::Kll,
                     aggregation_id: "agg0".into(),
                 },
                 GatewayMergeProcessor {
                     processor_name: "x".into(),
-                    sketch_kind: SketchKind::Hll,
+                    sketch_kind: SketchAlgorithm::Hll,
                     aggregation_id: "agg1".into(),
                 },
             ],
@@ -3624,23 +3636,26 @@ mod tests {
     /// requested kind. `aggregation_id` is hard-coded — the routing
     /// emitter doesn't care about it. Accepts the 5 canonical bare
     /// families callers actually pass; `CountSketch` stores as the
-    /// heap-bearing variant (matching this fixture's pre-`SketchKind`-split
+    /// heap-bearing variant (matching this fixture's pre-`SketchAlgorithm`-split
     /// behavior, when `with_heap: true` was a `CountSketchParams` field
     /// rather than a distinct kind).
-    fn backend_cfg_with_kind(kind: SketchKind) -> BackendStageConfig {
+    fn backend_cfg_with_kind(kind: SketchAlgorithm) -> BackendStageConfig {
         let (stored_kind, params) = match kind {
-            SketchKind::DDSketch => (SketchKind::DDSketch, SketchParams::DDSketch { alpha: 0.01 }),
-            SketchKind::Kll => (SketchKind::Kll, SketchParams::Kll { k: 200 }),
-            SketchKind::Hll => (SketchKind::Hll, SketchParams::Hll { precision: 14 }),
-            SketchKind::Cms => (
-                SketchKind::Cms,
+            SketchAlgorithm::DDSketch => (
+                SketchAlgorithm::DDSketch,
+                SketchParams::DDSketch { alpha: 0.01 },
+            ),
+            SketchAlgorithm::Kll => (SketchAlgorithm::Kll, SketchParams::Kll { k: 200 }),
+            SketchAlgorithm::Hll => (SketchAlgorithm::Hll, SketchParams::Hll { precision: 14 }),
+            SketchAlgorithm::Cms => (
+                SketchAlgorithm::Cms,
                 SketchParams::Cms {
                     width: 4096,
                     depth: 4,
                 },
             ),
-            SketchKind::CountSketch => (
-                SketchKind::CountSketchWithHeap,
+            SketchAlgorithm::CountSketch => (
+                SketchAlgorithm::CountSketchWithHeap,
                 SketchParams::CountSketchWithHeap {
                     width: 2048,
                     depth: 5,
@@ -3665,10 +3680,12 @@ mod tests {
             readouts: vec![BackendReadout {
                 aggregation_id: "agg0".into(),
                 op: match kind {
-                    SketchKind::DDSketch | SketchKind::Kll => SketchQuery::Quantile { q: 0.99 },
-                    SketchKind::Hll => SketchQuery::Cardinality,
-                    SketchKind::CountSketch => SketchQuery::TopK { k: 10 },
-                    SketchKind::Cms => SketchQuery::PointCount {
+                    SketchAlgorithm::DDSketch | SketchAlgorithm::Kll => {
+                        SketchQuery::Quantile { q: 0.99 }
+                    }
+                    SketchAlgorithm::Hll => SketchQuery::Cardinality,
+                    SketchAlgorithm::CountSketch => SketchQuery::TopK { k: 10 },
+                    SketchAlgorithm::Cms => SketchQuery::PointCount {
                         key: ColumnRef::Named("user_42".into()),
                         value: None,
                     },
@@ -3682,7 +3699,7 @@ mod tests {
 
     #[test]
     fn storage_routing_emits_default_engine_and_metrics_array() {
-        let ddsketch = backend_cfg_with_kind(SketchKind::DDSketch);
+        let ddsketch = backend_cfg_with_kind(SketchAlgorithm::DDSketch);
         let plans: Vec<(String, &BackendStageConfig)> =
             vec![("http_request_duration_seconds".to_string(), &ddsketch)];
         let v = emit_backend_storage_routing(&plans).expect("emit ok");
@@ -3700,7 +3717,7 @@ mod tests {
     /// byte-compatible (modulo the new `tenant` field appearing).
     #[test]
     fn storage_routing_default_tenant_for_single_tenant_emit() {
-        let ddsketch = backend_cfg_with_kind(SketchKind::DDSketch);
+        let ddsketch = backend_cfg_with_kind(SketchAlgorithm::DDSketch);
         let v = emit_backend_storage_routing(&[("latency".into(), &ddsketch)]).expect("emit ok");
         assert_eq!(v["tenant"], DEFAULT_TENANT);
     }
@@ -3712,7 +3729,7 @@ mod tests {
     /// body-tenant precedence rule.
     #[test]
     fn storage_routing_for_tenant_emits_explicit_tenant_field() {
-        let ddsketch = backend_cfg_with_kind(SketchKind::DDSketch);
+        let ddsketch = backend_cfg_with_kind(SketchAlgorithm::DDSketch);
         let v =
             emit_backend_storage_routing_for_tenant("tenant-a", &[("latency".into(), &ddsketch)])
                 .expect("emit ok");
@@ -3739,7 +3756,7 @@ mod tests {
 
     #[test]
     fn storage_routing_ddasap_query_serves_quantile_archive_serves_others() {
-        let ddsketch = backend_cfg_with_kind(SketchKind::DDSketch);
+        let ddsketch = backend_cfg_with_kind(SketchAlgorithm::DDSketch);
         let v = emit_backend_storage_routing(&[("latency".into(), &ddsketch)]).expect("emit ok");
         let metric = &v["metrics"][0];
         let targets = metric["targets"].as_array().expect("targets array");
@@ -3781,7 +3798,7 @@ mod tests {
 
     #[test]
     fn storage_routing_count_sketch_pulls_topk_off_archive() {
-        let cs = backend_cfg_with_kind(SketchKind::CountSketch);
+        let cs = backend_cfg_with_kind(SketchAlgorithm::CountSketch);
         let v = emit_backend_storage_routing(&[("requests".into(), &cs)]).expect("emit ok");
         let archive_shapes: Vec<String> = v["metrics"][0]["targets"][1]["applies_to_query_shape"]
             .as_array()
@@ -3801,7 +3818,7 @@ mod tests {
 
     #[test]
     fn storage_routing_hll_pulls_count_off_archive() {
-        let hll = backend_cfg_with_kind(SketchKind::Hll);
+        let hll = backend_cfg_with_kind(SketchAlgorithm::Hll);
         let v = emit_backend_storage_routing(&[("active_users".into(), &hll)]).expect("emit ok");
         let archive_shapes: Vec<String> = v["metrics"][0]["targets"][1]["applies_to_query_shape"]
             .as_array()
@@ -3826,9 +3843,9 @@ mod tests {
         // runs (HashMap iteration order can drift, but our impl
         // stages everything through a Vec so order matches input
         // order).
-        let ddsketch = backend_cfg_with_kind(SketchKind::DDSketch);
-        let hll = backend_cfg_with_kind(SketchKind::Hll);
-        let cs = backend_cfg_with_kind(SketchKind::CountSketch);
+        let ddsketch = backend_cfg_with_kind(SketchAlgorithm::DDSketch);
+        let hll = backend_cfg_with_kind(SketchAlgorithm::Hll);
+        let cs = backend_cfg_with_kind(SketchAlgorithm::CountSketch);
         let plans: Vec<(String, &BackendStageConfig)> = vec![
             ("http_requests_total".into(), &cs),
             ("active_users".into(), &hll),
@@ -3993,20 +4010,24 @@ mod tests {
     /// silently break the backend.
     #[test]
     fn phase_b_backend_agg_type_strings_for_every_sketch_kind() {
-        let cases: Vec<(SketchKind, SketchParams, &str)> = vec![
+        let cases: Vec<(SketchAlgorithm, SketchParams, &str)> = vec![
             (
-                SketchKind::Kll,
+                SketchAlgorithm::Kll,
                 SketchParams::Kll { k: 200 },
                 "DatasketchesKLL",
             ),
             (
-                SketchKind::DDSketch,
+                SketchAlgorithm::DDSketch,
                 SketchParams::DDSketch { alpha: 0.01 },
                 "DDSketch",
             ),
-            (SketchKind::Hll, SketchParams::Hll { precision: 14 }, "HLL"),
             (
-                SketchKind::Cms,
+                SketchAlgorithm::Hll,
+                SketchParams::Hll { precision: 14 },
+                "HLL",
+            ),
+            (
+                SketchAlgorithm::Cms,
                 SketchParams::Cms {
                     width: 4096,
                     depth: 4,
@@ -4014,7 +4035,7 @@ mod tests {
                 "CountMinSketch",
             ),
             (
-                SketchKind::CmsWithHeap,
+                SketchAlgorithm::CmsWithHeap,
                 SketchParams::CmsWithHeap {
                     width: 4096,
                     depth: 4,
@@ -4023,7 +4044,7 @@ mod tests {
                 "CountMinSketchWithHeap",
             ),
             (
-                SketchKind::CountSketch,
+                SketchAlgorithm::CountSketch,
                 SketchParams::CountSketch {
                     width: 2048,
                     depth: 5,
@@ -4031,7 +4052,7 @@ mod tests {
                 "CountSketch",
             ),
             (
-                SketchKind::CountSketchWithHeap,
+                SketchAlgorithm::CountSketchWithHeap,
                 SketchParams::CountSketchWithHeap {
                     width: 2048,
                     depth: 5,
@@ -4100,7 +4121,7 @@ mod tests {
     /// producing aggregation. Pins the sort order + key names. Phase β
     /// uses this as the wire-format anchor for the wider intent set —
     /// the JSON shape is intent-orthogonal, so adding new intents to L3
-    /// can't drift this off so long as they bind through SketchKind /
+    /// can't drift this off so long as they bind through SketchAlgorithm /
     /// SketchParams.
     #[test]
     fn phase_b_backend_json_aggregation_readout_alias_snapshot() {
@@ -4223,7 +4244,7 @@ mod tests {
     /// Prometheus-archive metric coexist in one routing JSON.
     #[test]
     fn phase_eps1_mixed_mode1_and_mode3_share_one_routing_table() {
-        let ddsketch = backend_cfg_with_kind(SketchKind::DDSketch);
+        let ddsketch = backend_cfg_with_kind(SketchAlgorithm::DDSketch);
         let plans: Vec<(String, &BackendStageConfig)> = vec![("latency_seconds".into(), &ddsketch)];
         let mode3 = vec!["http_requests_total".to_string()];
         let v = emit_backend_storage_routing_with_prometheus(&plans, &mode3).expect("emit ok");
@@ -4589,7 +4610,7 @@ mod tests {
     /// (ASAPCollector#400). Most fixtures map each metric to exactly one
     /// family — this keeps them concise while exercising the SET-shaped
     /// `metric_to_family`.
-    fn one(kind: SketchKind) -> std::collections::BTreeSet<SketchKind> {
+    fn one(kind: SketchAlgorithm) -> std::collections::BTreeSet<SketchAlgorithm> {
         std::collections::BTreeSet::from([kind])
     }
 
@@ -4598,16 +4619,16 @@ mod tests {
     /// metric maps to a single-family set (this workload's per-metric set
     /// size is 1; see `mvp46_multi_family_metric_*` for the size>1 case).
     fn five_sketch_edge_cfg() -> EdgeStageConfig {
-        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchAlgorithm>> =
             HashMap::new();
         metric_to_family.insert(
             "http_requests_total_latency_ms".into(),
-            one(SketchKind::DDSketch),
+            one(SketchAlgorithm::DDSketch),
         );
-        metric_to_family.insert("request_size_bytes".into(), one(SketchKind::Kll));
-        metric_to_family.insert("unique_users_per_min".into(), one(SketchKind::Hll));
-        metric_to_family.insert("top_endpoint_qps".into(), one(SketchKind::CountSketch));
-        metric_to_family.insert("endpoint_request_freq".into(), one(SketchKind::Cms));
+        metric_to_family.insert("request_size_bytes".into(), one(SketchAlgorithm::Kll));
+        metric_to_family.insert("unique_users_per_min".into(), one(SketchAlgorithm::Hll));
+        metric_to_family.insert("top_endpoint_qps".into(), one(SketchAlgorithm::CountSketch));
+        metric_to_family.insert("endpoint_request_freq".into(), one(SketchAlgorithm::Cms));
         // `http_requests_total` is intentionally NOT in this map — it
         // falls through to the `metrics/raw_passthrough` default.
         EdgeStageConfig {
@@ -4962,7 +4983,7 @@ mod tests {
     /// Helper: build an `EdgeStageConfig` whose `metric_to_family` is the
     /// given metric→set map, with sensible defaults for the other fields.
     fn edge_cfg_with_families(
-        metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>>,
+        metric_to_family: HashMap<String, std::collections::BTreeSet<SketchAlgorithm>>,
     ) -> EdgeStageConfig {
         EdgeStageConfig {
             source_metric: None,
@@ -4994,7 +5015,7 @@ mod tests {
         // families — this is the core bandwidth fix.
         let cfg = edge_cfg_with_families(HashMap::from([(
             "latency_ms".to_string(),
-            one(SketchKind::DDSketch),
+            one(SketchAlgorithm::DDSketch),
         )]));
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
@@ -5035,8 +5056,8 @@ mod tests {
         // HLL). Exactly those two pipelines/processors must be emitted;
         // KLL/CountSketch/CMS pruned.
         let cfg = edge_cfg_with_families(HashMap::from([
-            ("latency_ms".to_string(), one(SketchKind::DDSketch)),
-            ("uniques".to_string(), one(SketchKind::Hll)),
+            ("latency_ms".to_string(), one(SketchAlgorithm::DDSketch)),
+            ("uniques".to_string(), one(SketchAlgorithm::Hll)),
         ]));
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
@@ -5074,7 +5095,7 @@ mod tests {
         // them).
         let cfg = edge_cfg_with_families(HashMap::from([(
             "http_requests".to_string(),
-            std::collections::BTreeSet::from([SketchKind::DDSketch, SketchKind::Hll]),
+            std::collections::BTreeSet::from([SketchAlgorithm::DDSketch, SketchAlgorithm::Hll]),
         )]));
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "test-agent").expect("emit ok");
 
@@ -6078,40 +6099,40 @@ mod tests {
     /// tier (cold), and the counter-shaped sketch inputs in the
     /// cumulativetodelta list.
     fn fused_asap_edge_cfg() -> EdgeStageConfig {
-        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchAlgorithm>> =
             HashMap::new();
         metric_to_family.insert(
             "http_requests_total_latency_ms".into(),
-            one(SketchKind::DDSketch),
+            one(SketchAlgorithm::DDSketch),
         );
-        metric_to_family.insert("request_size_bytes".into(), one(SketchKind::Kll));
-        metric_to_family.insert("unique_users_per_min".into(), one(SketchKind::Hll));
-        metric_to_family.insert("top_endpoint_qps".into(), one(SketchKind::CountSketch));
-        metric_to_family.insert("endpoint_request_freq".into(), one(SketchKind::Cms));
+        metric_to_family.insert("request_size_bytes".into(), one(SketchAlgorithm::Kll));
+        metric_to_family.insert("unique_users_per_min".into(), one(SketchAlgorithm::Hll));
+        metric_to_family.insert("top_endpoint_qps".into(), one(SketchAlgorithm::CountSketch));
+        metric_to_family.insert("endpoint_request_freq".into(), one(SketchAlgorithm::Cms));
 
         // Per-family params, mirroring the target config's per-entry knobs.
         let sketch_processors = vec![
             EdgeSketchProcessor {
                 processor_name: "ddsketch".into(),
-                sketch_kind: SketchKind::DDSketch,
+                sketch_kind: SketchAlgorithm::DDSketch,
                 sketch_params: SketchParams::DDSketch { alpha: 0.01 },
                 aggregation_id: "agg0".into(),
             },
             EdgeSketchProcessor {
                 processor_name: "KLL".into(),
-                sketch_kind: SketchKind::Kll,
+                sketch_kind: SketchAlgorithm::Kll,
                 sketch_params: SketchParams::Kll { k: 200 },
                 aggregation_id: "agg1".into(),
             },
             EdgeSketchProcessor {
                 processor_name: "HLL".into(),
-                sketch_kind: SketchKind::Hll,
+                sketch_kind: SketchAlgorithm::Hll,
                 sketch_params: SketchParams::Hll { precision: 14 },
                 aggregation_id: "agg2".into(),
             },
             EdgeSketchProcessor {
                 processor_name: "countsketch".into(),
-                sketch_kind: SketchKind::CountSketchWithHeap,
+                sketch_kind: SketchAlgorithm::CountSketchWithHeap,
                 sketch_params: SketchParams::CountSketchWithHeap {
                     width: 2048,
                     depth: 5,
@@ -6121,7 +6142,7 @@ mod tests {
             },
             EdgeSketchProcessor {
                 processor_name: "countmin".into(),
-                sketch_kind: SketchKind::Cms,
+                sketch_kind: SketchAlgorithm::Cms,
                 sketch_params: SketchParams::Cms {
                     width: 2048,
                     depth: 5,
@@ -6552,9 +6573,9 @@ mod tests {
     fn fused_asap_edge_per_group_hll_is_per_series_and_sparse() {
         let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
 
-        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchAlgorithm>> =
             HashMap::new();
-        metric_to_family.insert("distinct_users_by_region".into(), one(SketchKind::Hll));
+        metric_to_family.insert("distinct_users_by_region".into(), one(SketchAlgorithm::Hll));
 
         let mut metric_to_grouping_labels: HashMap<String, Vec<String>> = HashMap::new();
         metric_to_grouping_labels.insert("distinct_users_by_region".into(), vec!["region".into()]);
@@ -6573,7 +6594,7 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "HLL".into(),
-                sketch_kind: SketchKind::Hll,
+                sketch_kind: SketchAlgorithm::Hll,
                 sketch_params: SketchParams::Hll { precision: 14 },
                 aggregation_id: "agg0".into(),
             }],
@@ -6650,9 +6671,9 @@ mod tests {
     fn fused_asap_edge_per_series_hll_high_cardinality_hint_is_dense() {
         let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
 
-        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchAlgorithm>> =
             HashMap::new();
-        metric_to_family.insert("distinct_users_by_region".into(), one(SketchKind::Hll));
+        metric_to_family.insert("distinct_users_by_region".into(), one(SketchAlgorithm::Hll));
 
         let mut metric_to_grouping_labels: HashMap<String, Vec<String>> = HashMap::new();
         metric_to_grouping_labels.insert("distinct_users_by_region".into(), vec!["region".into()]);
@@ -6670,7 +6691,7 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "HLL".into(),
-                sketch_kind: SketchKind::Hll,
+                sketch_kind: SketchAlgorithm::Hll,
                 sketch_params: SketchParams::Hll { precision: 14 },
                 aggregation_id: "agg0".into(),
             }],
@@ -6725,9 +6746,9 @@ mod tests {
     fn fused_asap_edge_whole_stream_hll_is_dense_regardless_of_hint() {
         let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
 
-        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchAlgorithm>> =
             HashMap::new();
-        metric_to_family.insert("distinct_users_global".into(), one(SketchKind::Hll));
+        metric_to_family.insert("distinct_users_global".into(), one(SketchAlgorithm::Hll));
 
         // No grouping label + an item_label ⇒ effective aggregate_by empty ⇒
         // whole-stream HLL.
@@ -6744,7 +6765,7 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "HLL".into(),
-                sketch_kind: SketchKind::Hll,
+                sketch_kind: SketchAlgorithm::Hll,
                 sketch_params: SketchParams::Hll { precision: 14 },
                 aggregation_id: "agg0".into(),
             }],
@@ -6799,10 +6820,10 @@ mod tests {
     fn fused_asap_edge_quantile_only_omits_mode_and_sparse() {
         let _env = crate::test_support::EnvVarGuard::set("ASAP_EDGE_FUSED", "1");
 
-        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchAlgorithm>> =
             HashMap::new();
-        metric_to_family.insert("latency_ms".into(), one(SketchKind::DDSketch));
-        metric_to_family.insert("payload_bytes".into(), one(SketchKind::Kll));
+        metric_to_family.insert("latency_ms".into(), one(SketchAlgorithm::DDSketch));
+        metric_to_family.insert("payload_bytes".into(), one(SketchAlgorithm::Kll));
 
         let cfg = EdgeStageConfig {
             source_metric: None,
@@ -6811,13 +6832,13 @@ mod tests {
             sketch_processors: vec![
                 EdgeSketchProcessor {
                     processor_name: "ddsketch".into(),
-                    sketch_kind: SketchKind::DDSketch,
+                    sketch_kind: SketchAlgorithm::DDSketch,
                     sketch_params: SketchParams::DDSketch { alpha: 0.01 },
                     aggregation_id: "agg0".into(),
                 },
                 EdgeSketchProcessor {
                     processor_name: "KLL".into(),
-                    sketch_kind: SketchKind::Kll,
+                    sketch_kind: SketchAlgorithm::Kll,
                     sketch_params: SketchParams::Kll { k: 200 },
                     aggregation_id: "agg1".into(),
                 },
@@ -6972,10 +6993,10 @@ mod tests {
         // Two metrics: a sketch-only one (warm) and one that is BOTH
         // sketched AND archived (both). The archive set is the precise
         // plan signal — only `archived_metric` is in it.
-        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchAlgorithm>> =
             HashMap::new();
-        metric_to_family.insert("sketch_only_metric".into(), [SketchKind::Kll].into());
-        metric_to_family.insert("archived_metric".into(), [SketchKind::DDSketch].into());
+        metric_to_family.insert("sketch_only_metric".into(), [SketchAlgorithm::Kll].into());
+        metric_to_family.insert("archived_metric".into(), [SketchAlgorithm::DDSketch].into());
 
         let cfg = EdgeStageConfig {
             source_metric: None,
@@ -7051,7 +7072,7 @@ mod tests {
         let mut cfg = fused_asap_edge_cfg();
         cfg.metric_to_family.insert(
             "http_requests_total_latency_ms".into(),
-            one(SketchKind::Kll),
+            one(SketchAlgorithm::Kll),
         );
 
         let yaml = emit_edge_yaml(&cfg, "ws://c/", "agent-1").expect("emit ok");
@@ -7299,7 +7320,7 @@ mod tests {
         for &(w, d) in &[(2048u32, 5u32), (1024, 4), (4096, 6), (2, 1), (256, 3)] {
             let sp = EdgeSketchProcessor {
                 processor_name: "countsketch".into(),
-                sketch_kind: SketchKind::CountSketch,
+                sketch_kind: SketchAlgorithm::CountSketch,
                 sketch_params: SketchParams::CountSketch { width: w, depth: d },
                 aggregation_id: "agg-cs".into(),
             };
@@ -7345,11 +7366,14 @@ mod tests {
     /// `metric_to_family` but provides NO matching `EdgeSketchProcessor`,
     /// driving the fused emit into the catalog-default (`None`) arm.
     fn fused_cfg_countsketch_no_processor() -> EdgeStageConfig {
-        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchKind>> =
+        let mut metric_to_family: HashMap<String, std::collections::BTreeSet<SketchAlgorithm>> =
             HashMap::new();
         // CountSketch family declared, but `sketch_processors` is EMPTY for
         // it — the `family_to_proc.get(kind)` lookup returns None.
-        metric_to_family.insert("endpoint_request_freq".into(), one(SketchKind::CountSketch));
+        metric_to_family.insert(
+            "endpoint_request_freq".into(),
+            one(SketchAlgorithm::CountSketch),
+        );
 
         EdgeStageConfig {
             source_metric: None,
@@ -7407,10 +7431,10 @@ mod tests {
         let mut cfg = fused_cfg_countsketch_no_processor();
         cfg.metric_to_family.clear();
         cfg.metric_to_family
-            .insert("top_endpoint_qps".into(), one(SketchKind::CountSketch));
+            .insert("top_endpoint_qps".into(), one(SketchAlgorithm::CountSketch));
         cfg.sketch_processors = vec![EdgeSketchProcessor {
             processor_name: "countsketch".into(),
-            sketch_kind: SketchKind::CountSketchWithHeap,
+            sketch_kind: SketchAlgorithm::CountSketchWithHeap,
             sketch_params: SketchParams::CountSketchWithHeap {
                 width: 2048,
                 depth: 5,

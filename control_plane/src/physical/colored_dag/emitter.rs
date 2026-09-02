@@ -35,7 +35,7 @@ use crate::physical::colored_dag::dag::ColoredDag;
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
 use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
 use crate::types_v2::BindingName;
-use planner_types::post_asap::{SketchKind, SketchParams, SketchQuery, SummaryExpr};
+use planner_types::post_asap::{SketchAlgorithm, SketchParams, SketchQuery, SummaryExpr};
 // `BackendAggregation.sketch_kind`/`.sketch_params` (below) span BOTH
 // exact accumulators (Sum/Count/MinMax/Increase/Rate, via
 // `agg_type_override`) and approximate sketches -- unlike
@@ -61,7 +61,7 @@ enum NodeKind<'a> {
     /// (Sum/Count/MinMax/Increase/Rate) are classified as [`Self::ExactAgg`]
     /// instead, matching the old `PhysicalExpr::ExactAgg`'s separate shape.
     SketchAgg {
-        sketch_type: &'a SketchKind,
+        sketch_type: &'a SketchAlgorithm,
         params: &'a SketchParams,
     },
     /// An exact accumulator — the old `PhysicalExpr::ExactAgg`. This
@@ -80,7 +80,7 @@ enum NodeKind<'a> {
         name: &'a BindingName,
     },
     RawAtEdgeSketchAtBackend {
-        family: &'a SketchKind,
+        family: &'a SketchAlgorithm,
         params: &'a SketchParams,
     },
     RawAtEdgePrometheusArchive {
@@ -96,7 +96,7 @@ enum NodeKind<'a> {
 fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
     match expr {
         PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
-            SummaryExpr::Logical(qe) => NodeKind::Logical(qe),
+            SummaryExpr::KeepPreAsap(qe) => NodeKind::Logical(qe),
             // `SummaryAgg`'s `kind`/`params` fields collapsed into one
             // `family: SummaryFamilyType` field (ASAPPlanner#218 --
             // see control_plane/docs/design-asapplanner-pin-migration.md);
@@ -108,11 +108,11 @@ fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
                 ..
             } => NodeKind::ExactAgg,
             SummaryExpr::SummaryAgg {
-                family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, params),
+                family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, _),
                 ..
             } => NodeKind::SketchAgg {
-                sketch_type: kind,
-                params,
+                sketch_type: kind.algorithm(),
+                params: kind.params(),
             },
             // `Plain`/`Sample`/`Wavelet`/`StatModel` never occur on a real
             // `SummaryAgg` (never `Plain` by construction; `Sample`/
@@ -152,10 +152,10 @@ pub enum EmitError {
     #[error("unsupported topology for this emitter: {0:?} (expected {1:?})")]
     UnsupportedTopology(Topology, Topology),
     /// A sketch processor name could not be derived for the supplied
-    /// `SketchKind`. Should not occur with the catalog ranges shipped
+    /// `SketchAlgorithm`. Should not occur with the catalog ranges shipped
     /// in Phase C — kept as a defensive error for future kinds.
     #[error("no edge processor known for sketch kind {0:?}")]
-    NoEdgeProcessor(SketchKind),
+    NoEdgeProcessor(SketchAlgorithm),
     /// Backend would emit an empty StreamingConfig because no sketch
     /// state ever reaches it (e.g. a colouring with only `Logical`
     /// nodes). Surfaced as a clean error so callers can fall back to
@@ -287,7 +287,7 @@ pub struct EdgeStageConfig {
     /// because different planned queries on the same metric require
     /// different capabilities (e.g. `quantile_over_time` → DDSketch,
     /// `count`-distinct → HLL, `topk` → CountSketch all on one metric).
-    /// The value type is therefore a `BTreeSet<SketchKind>` (the UNION
+    /// The value type is therefore a `BTreeSet<SketchAlgorithm>` (the UNION
     /// of capabilities across all of that metric's workload entries),
     /// not a single family. A metric in two families produces two
     /// routing-connector OTTL conditions → its samples fan into both
@@ -300,11 +300,11 @@ pub struct EdgeStageConfig {
     /// This eliminates the prior multi-family fan-out (every metric
     /// shipped sketch state through all 5 families regardless of need).
     ///
-    /// `SketchFamily` is a control-plane-side alias for `planner_types::post_asap::SketchKind`.
+    /// `SketchFamily` is a control-plane-side alias for `planner_types::post_asap::SketchAlgorithm`.
     /// Empty map ⇒ legacy single-pipeline /
     /// Mode-3 / warm-passthrough wire shapes are emitted unchanged
     /// (backward-compat).
-    pub metric_to_family: HashMap<String, BTreeSet<SketchKind>>,
+    pub metric_to_family: HashMap<String, BTreeSet<SketchAlgorithm>>,
     /// MVP blocker B3 — per-metric attribute allowlist the agent must
     /// reduce wire attrs to BEFORE the sketch processor sees them.
     /// Maps each metric to its grouping-label list; the 5-sketch routing
@@ -571,16 +571,16 @@ pub struct PrometheusArchiveMetric {
 /// One sketch processor configured at an edge agent.
 ///
 /// Not `Serialize`/`Deserialize` (see `PhysicalExpr`'s doc for why —
-/// `SketchKind`/`SketchParams` have no serde impl, and nothing on the
+/// `SketchAlgorithm`/`SketchParams` have no serde impl, and nothing on the
 /// real emit path ever whole-struct-serialized this type; every actual
 /// YAML/JSON payload goes through a hand-written builder).
 #[derive(Debug, Clone, PartialEq)]
 pub struct EdgeSketchProcessor {
     /// OTel processor component id — `KLL`, `ddsketch`, `HLL`,
-    /// `countmin`, etc. Maps 1:1 from `SketchKind`.
+    /// `countmin`, etc. Maps 1:1 from `SketchAlgorithm`.
     pub processor_name: String,
     /// Sketch family (mirror of the `SketchAgg::sketch_type` field).
-    pub sketch_kind: SketchKind,
+    pub sketch_kind: SketchAlgorithm,
     /// Sketch parameters (mirror of the `SketchAgg::params` field).
     pub sketch_params: SketchParams,
     /// Internal emitter plumbing — threads `EdgeSketchProcessor` →
@@ -623,7 +623,7 @@ pub struct GatewayMergeProcessor {
     pub processor_name: String,
     /// Sketch family being merged. All inputs to the merge agree on
     /// this (L4 type checker enforces it; design.md §6.4).
-    pub sketch_kind: SketchKind,
+    pub sketch_kind: SketchAlgorithm,
     /// Aggregation id — matches the upstream edge's
     /// `EdgeSketchProcessor::aggregation_id` so the gateway routes
     /// streams correctly.
@@ -666,7 +666,7 @@ pub struct BackendStageConfig {
 /// `sketch_kind`, `sketch_params`, grouping labels, and `spatial_filter`).
 ///
 /// Not `Serialize`/`Deserialize` — same reason as `EdgeSketchProcessor`:
-/// `SketchKind`/`SketchParams` have no serde impl, and the real wire
+/// `SketchAlgorithm`/`SketchParams` have no serde impl, and the real wire
 /// payload is built by `emit::stage_config::build_backend_aggregation_json`
 /// (a hand-written JSON builder reading these fields), never a whole-struct
 /// serialize.
@@ -680,7 +680,7 @@ pub struct BackendAggregation {
     pub metric_name: String,
     /// Accumulator family -- exact (Sum/Count/MinMax/Increase/Rate) or
     /// approximate sketch (see this file's `use asap_types::{...}` note
-    /// above for why this is the flat type, not `SketchKind`).
+    /// above for why this is the flat type, not `SketchAlgorithm`).
     pub sketch_kind: BackendSketchKind,
     /// Accumulator parameters — the backend uses these to build its
     /// per-aggregation instance (KLL with the right `k`, DDSketch with
@@ -1063,12 +1063,12 @@ impl Emitter for ThreeStageEmitter {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Map a `SketchKind` to the OTel collector processor name. Mirrors the
+/// Map a `SketchAlgorithm` to the OTel collector processor name. Mirrors the
 /// names the existing OpAMP YAML emitter (and the per-sketch processor
 /// crates in `opentelemetry-collector-contrib`) already use.
 ///
 /// Heap-bearing kinds (`CmsWithHeap`/`CountSketchWithHeap`) reuse their
-/// bare counterpart's processor name — the retired `sketch_algebra::SketchKind`
+/// bare counterpart's processor name — the retired `sketch_algebra::SketchAlgorithm`
 /// this replaces had no heap-bearing variant at all (`with_heap` was a
 /// `SketchParams` field this function never received), so heap-bearing
 /// and bare CMS/CountSketch already mapped to the identical processor
@@ -1076,18 +1076,22 @@ impl Emitter for ThreeStageEmitter {
 /// have no OTel edge processor — nothing in this repo's binding rules
 /// constructs a `SketchAgg`/`RawAtEdgeSketchAtBackend` with one of these
 /// kinds today, but the match must stay exhaustive.
-pub(crate) fn edge_processor_name(kind: &SketchKind) -> Result<String, EmitError> {
+pub(crate) fn edge_processor_name(kind: &SketchAlgorithm) -> Result<String, EmitError> {
     match kind {
-        SketchKind::Kll => Ok("KLL".into()),
-        SketchKind::DDSketch => Ok("ddsketch".into()),
-        SketchKind::Hll => Ok("HLL".into()),
-        SketchKind::Cms | SketchKind::CmsWithHeap => Ok("countmin".into()),
-        SketchKind::CountSketch | SketchKind::CountSketchWithHeap => Ok("countsketch".into()),
+        SketchAlgorithm::Kll => Ok("KLL".into()),
+        SketchAlgorithm::DDSketch => Ok("ddsketch".into()),
+        SketchAlgorithm::Hll => Ok("HLL".into()),
+        SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap => Ok("countmin".into()),
+        SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap => {
+            Ok("countsketch".into())
+        }
         // Exact-accumulator kinds (Sum/Count/MinMax/Increase/Rate) aren't
         // representable here anymore -- they're `ExactKind`, a distinct
-        // type post ASAPPlanner#218's split, not a `SketchKind` variant
+        // type post ASAPPlanner#218's split, not a `SketchAlgorithm` variant
         // this function could even be called with.
-        SketchKind::Kmv | SketchKind::Theta => Err(EmitError::NoEdgeProcessor(kind.clone())),
+        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => {
+            Err(EmitError::NoEdgeProcessor(kind.clone()))
+        }
     }
 }
 
@@ -1149,11 +1153,11 @@ fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStag
         // filters, window size) from any leaves below.
         QE::Filter { child, .. }
         | QE::Project { child, .. }
-        | QE::Distinct { child, .. }
+        | QE::Dedup { child, .. }
         | QE::Sort { child, .. }
         | QE::Limit { child, .. }
-        | QE::Subquery { child, .. } => extract_edge_facts(child, edge),
-        QE::Merge { children } => {
+        | QE::PromqlSubquery { child, .. } => extract_edge_facts(child, edge),
+        QE::Concat { children } => {
             for c in children {
                 extract_edge_facts(c, edge);
             }
@@ -1208,7 +1212,7 @@ fn first_sketch_child_via_edges(
     dag: &ColoredDag,
     parent: crate::physical::colored_dag::dag::NodeId,
     sketch_agg_ids: &HashMap<usize, String>,
-) -> Option<(SketchKind, String)> {
+) -> Option<(SketchAlgorithm, String)> {
     for cid in children_of(dag, parent) {
         let cnode = dag.nodes.get(cid.0)?;
         match classify(&cnode.expr) {

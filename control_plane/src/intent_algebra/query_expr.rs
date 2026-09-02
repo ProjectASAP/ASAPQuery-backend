@@ -57,6 +57,8 @@
 //! `label_filter_to_predicate` below (`asap_ir`'s `Scan` takes typed
 //! `Predicate`s, not a separate label-filter list).
 
+use std::rc::Rc;
+
 use planner_types::pre_asap::schema::ColumnId;
 pub use planner_types::pre_asap::{
     aggregate_output_schema, AtModifier, BinaryOpKind, DataModel, GroupKeys, GroupSide,
@@ -64,7 +66,9 @@ pub use planner_types::pre_asap::{
     SampleKind, SetOpKind, SortKey, Source, TimeShift, VectorGrouping, VectorMatch,
     VectorMatchKind, WindowFuncKind,
 };
-pub use planner_types::pre_asap::{ArithOp, ColumnRef, CompareOp};
+pub use planner_types::pre_asap::{
+    ArithmeticOpKind as ArithOp, ColumnRef, CompareOpKind as CompareOp,
+};
 // `L3Scalar`/`L3Expr`/`L2Expr` and `WindowKind`: see `expr_ir.rs`'s and
 // `crates/asap_types/src/enums.rs`'s module docs respectively --
 // ASAPPlanner deleted its `WindowKind` (no `QueryExpr::Window` producer
@@ -92,10 +96,10 @@ pub struct LabelFilter {
 /// to the schema; this is a defensive fallback, not the primary path).
 pub fn label_filter_to_predicate(lf: &LabelFilter, schema: &Schema) -> Option<Predicate> {
     let id = schema.column_id(&lf.label)?;
-    Some(Predicate(Box::new(L3Expr::Compare {
-        left: Box::new(L3Expr::Column(id)),
+    Some(Predicate(Rc::new(L3Expr::Compare {
+        left: Rc::new(L3Expr::Column(id)),
         op: CompareOp::Eq,
-        right: Box::new(L3Expr::Literal(L3Scalar::Utf8(lf.equals.clone()))),
+        right: Rc::new(L3Expr::Literal(L3Scalar::Utf8(lf.equals.clone()))),
     })))
 }
 
@@ -104,11 +108,11 @@ pub fn label_filter_to_predicate(lf: &LabelFilter, schema: &Schema) -> Option<Pr
 /// single tree, so most callers won't need this — provided for the few
 /// call sites that want one combined predicate (e.g. `Filter.pred`).
 pub fn conjoin(predicates: Vec<Predicate>) -> Option<Predicate> {
-    let mut exprs: Vec<L3Expr> = predicates.into_iter().map(|p| *p.0).collect();
+    let mut exprs: Vec<L3Expr> = predicates.into_iter().map(|p| (*p.0).clone()).collect();
     match exprs.len() {
         0 => None,
-        1 => Some(Predicate(Box::new(exprs.remove(0)))),
-        _ => Some(Predicate(Box::new(L3Expr::BoolAnd(exprs)))),
+        1 => Some(Predicate(Rc::new(exprs.remove(0)))),
+        _ => Some(Predicate(Rc::new(L3Expr::BoolAnd(exprs)))),
     }
 }
 
@@ -118,17 +122,17 @@ pub fn conjoin(predicates: Vec<Predicate>) -> Option<Predicate> {
 /// this is the one real construction site's replacement (`lower.rs`).
 pub fn between(expr: L3Expr, low: L3Expr, high: L3Expr, negated: bool) -> L3Expr {
     let ge = L3Expr::Compare {
-        left: Box::new(expr.clone()),
+        left: Rc::new(expr.clone()),
         op: CompareOp::Ge,
-        right: Box::new(low),
+        right: Rc::new(low),
     };
     let le = L3Expr::Compare {
-        left: Box::new(expr),
+        left: Rc::new(expr),
         op: CompareOp::Le,
-        right: Box::new(high),
+        right: Rc::new(high),
     };
     if negated {
-        L3Expr::Not(Box::new(L3Expr::BoolAnd(vec![ge, le])))
+        L3Expr::Not(Rc::new(L3Expr::BoolAnd(vec![ge, le])))
     } else {
         L3Expr::BoolAnd(vec![ge, le])
     }
