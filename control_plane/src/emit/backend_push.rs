@@ -184,16 +184,12 @@ where
 /// same cumulative state.
 pub type BackendRoutingCache = Mutex<HashMap<(String, AggRole), BackendStageConfig>>;
 
-/// Combined outcome of one cumulative push cycle (P2-3).
+/// Combined outcome of one cumulative publication cycle.
 ///
-/// The streaming-config and storage-routing documents are TWO independent
-/// HTTP POSTs to the backend. Before P2-3 they were retried separately and
-/// the function returned `()`, so a cycle where one POST succeeded and the
-/// other exhausted its retries left the backend running a streaming-config
-/// that disagreed with its storage-routing table until the next replan
-/// re-pushed both. This enum surfaces the coupled result so callers (and
-/// tests) can observe a partial-failure desync rather than silently
-/// proceeding.
+/// Streaming config, storage routing and BackendPlan are independent HTTP
+/// POSTs. The outcome records all three so callers never treat a generation
+/// with a missing authoritative plan as successfully published. It surfaces
+/// partial failure so the next replan can republish the complete generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushOutcome {
     /// No backend client configured — nothing was POSTed. Cache was still
@@ -201,17 +197,16 @@ pub enum PushOutcome {
     Skipped,
     /// A document failed to even serialise; nothing was POSTed.
     EmitFailed,
-    /// Both documents were accepted by the backend (each on a 2xx). The
-    /// backend's streaming-config and storage-routing are consistent.
-    BothApplied,
-    /// At least one document failed to land after retries. The two
-    /// documents may now disagree on the backend; the next replan cycle
-    /// re-POSTs both cumulatively (idempotent swap) to restore
+    /// All three documents were accepted by the backend.
+    AllApplied,
+    /// At least one document failed to land. The documents may now disagree
+    /// on the backend; the next replan cycle re-POSTs them to restore
     /// consistency. The carried flags say which succeeded so logs / tests
     /// can tell which side is stale.
     Desynced {
         streaming_ok: bool,
         routing_ok: bool,
+        plan_ok: bool,
     },
 }
 
@@ -294,26 +289,27 @@ async fn push_documents_coupled(
     (streaming_ok, routing_ok, RETRY_MAX_ATTEMPTS)
 }
 
-/// Best-effort, single-attempt push of the encoded `BackendPlan` — no
+/// Required push of the encoded `BackendPlan` — no
 /// in-function retry loop, unlike [`push_documents_coupled`]. A dropped
 /// push just leaves `data_plane`'s serving-time lookup falling back to
 /// `SketchStore` reconstruction until the next replan cycle re-pushes,
 /// so the next cycle is itself the retry backstop — same contract
 /// [`push_or_log`] already establishes for the legacy YAML path. Logs at
-/// WARN on failure; never affects [`PushOutcome`], which real callers
-/// key legacy-path behavior on.
-async fn push_backend_plan_best_effort(client: &Arc<BackendClient>, bytes: Vec<u8>) {
+/// WARN on failure and return it to the coupled publication outcome.
+async fn push_backend_plan_required(client: &Arc<BackendClient>, bytes: Vec<u8>) -> bool {
     match client.post_backend_plan_typed(bytes).await {
         Ok(()) => {
             debug!(stage = "backend", endpoint = %client.endpoint(), "BackendPlan push succeeded");
+            true
         }
         Err(e) => {
             warn!(
                 stage = "backend",
                 endpoint = %client.endpoint(),
                 error = %e,
-                "BackendPlan push failed; next replan cycle will retry"
+                "BackendPlan push failed; publication generation is incomplete"
             );
+            false
         }
     }
 }
@@ -475,21 +471,19 @@ async fn push_cumulative_entries(
 
     // BackendPlan (design-backend-plan-wire-format.md): built from the
     // SAME `cumulative_be` snapshot as the legacy documents above, so all
-    // three describe one consistent generation of planning state. This
-    // is a dual-push, alongside (not instead of) the legacy
-    // streaming-config / storage-routing documents — a failure here must
-    // never affect `PushOutcome`, which existing callers key real
-    // behavior on.
+    // three describe one consistent generation of planning state. Until
+    // BackendPlan fully replaces the compatibility documents, publication
+    // succeeds only when all three are accepted.
     let plan_bytes = match crate::backend_plan::from_stage_config(
         &cumulative_be,
         monitors,
         PLAN_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         now_unix_ms(),
     ) {
-        Ok(plan) => Some(plan.encode_to_vec()),
+        Ok(plan) => plan.encode_to_vec(),
         Err(e) => {
-            warn!(error = %e, "backend_plan::from_stage_config failed; skipping BackendPlan push (legacy push unaffected)");
-            None
+            warn!(error = %e, "backend_plan::from_stage_config failed; refusing partial publication");
+            return PushOutcome::EmitFailed;
         }
     };
 
@@ -553,21 +547,16 @@ async fn push_cumulative_entries(
     let (streaming_ok, routing_ok, attempts) =
         push_documents_coupled(client, streaming_body, routing_body).await;
 
-    // Best-effort BackendPlan push — same backoff schedule as the legacy
-    // documents, but its own outcome never feeds into `PushOutcome` (see
-    // this function's doc above `plan_bytes`).
-    if let Some(bytes) = plan_bytes {
-        push_backend_plan_best_effort(client, bytes).await;
-    }
+    let plan_ok = push_backend_plan_required(client, plan_bytes).await;
 
-    if streaming_ok && routing_ok {
+    if streaming_ok && routing_ok && plan_ok {
         info!(
             stage = "backend",
             endpoint = %client.endpoint(),
             attempts,
             "[USE_TYPED_STAGE_SPLIT] coupled backend JSON push succeeded (both documents applied)"
         );
-        PushOutcome::BothApplied
+        PushOutcome::AllApplied
     } else {
         warn!(
             stage = "backend",
@@ -575,6 +564,7 @@ async fn push_cumulative_entries(
             attempts,
             streaming_ok,
             routing_ok,
+            plan_ok,
             "[USE_TYPED_STAGE_SPLIT] coupled backend JSON push DESYNCED after retries \
              (one document landed, the other did not); next replan cycle re-POSTs both \
              cumulatively to restore consistency"
@@ -582,6 +572,7 @@ async fn push_cumulative_entries(
         PushOutcome::Desynced {
             streaming_ok,
             routing_ok,
+            plan_ok,
         }
     }
 }
@@ -907,7 +898,7 @@ mod tests {
             &[],
         )
         .await;
-        assert_eq!(outcome, PushOutcome::BothApplied);
+        assert_eq!(outcome, PushOutcome::AllApplied);
         assert_eq!(mock.streaming_hits.load(StdOrdering::SeqCst), 1);
         assert_eq!(mock.routing_hits.load(StdOrdering::SeqCst), 1);
     }
@@ -929,15 +920,14 @@ mod tests {
             &[],
         )
         .await;
-        assert_eq!(outcome, PushOutcome::BothApplied);
+        assert_eq!(outcome, PushOutcome::AllApplied);
         assert_eq!(mock.plan_hits.load(StdOrdering::SeqCst), 1);
     }
 
-    /// A BackendPlan push failure (backend doesn't implement the
-    /// endpoint yet, or returns an error) must NOT affect `PushOutcome`
-    /// — nothing depends on the plan push succeeding in this phase.
+    /// A BackendPlan push failure makes the publication generation
+    /// explicitly incomplete even if both compatibility documents landed.
     #[tokio::test]
-    async fn backend_plan_push_failure_does_not_affect_push_outcome() {
+    async fn backend_plan_push_failure_is_reported_as_desync() {
         // A mock that only serves the legacy endpoints (no
         // `/api/v1/backend-plan` route) — the plan push 404s.
         let app = Router::new()
@@ -971,8 +961,12 @@ mod tests {
         .await;
         assert_eq!(
             outcome,
-            PushOutcome::BothApplied,
-            "legacy documents must still report success even though the plan push 404s"
+            PushOutcome::Desynced {
+                streaming_ok: true,
+                routing_ok: true,
+                plan_ok: false,
+            },
+            "publication must not report success when the authoritative plan is missing"
         );
     }
 
@@ -1004,7 +998,8 @@ mod tests {
             outcome,
             PushOutcome::Desynced {
                 streaming_ok: true,
-                routing_ok: false
+                routing_ok: false,
+                plan_ok: true,
             },
             "one-sided failure must surface as Desynced, not silent success"
         );
@@ -1048,7 +1043,7 @@ mod tests {
 
         // The periodic re-POST reads the SAME cache and re-pushes everything.
         let outcome = repost_cumulative_backend_config(Some(&client2), &cache, &[]).await;
-        assert_eq!(outcome, PushOutcome::BothApplied);
+        assert_eq!(outcome, PushOutcome::AllApplied);
         assert_eq!(
             mock2.streaming_hits.load(StdOrdering::SeqCst),
             1,

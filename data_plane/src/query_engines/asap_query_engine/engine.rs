@@ -115,7 +115,10 @@ impl ASAPQueryEngine {
     /// handle is wired up. `None` otherwise — callers fall back to the
     /// `SketchStore`-reconstruction path.
     fn backend_plan_snapshot(&self) -> Option<Arc<control_plane::backend_plan::BackendPlan>> {
-        self.hot_reload_backend_plan.as_ref().map(|h| h.snapshot())
+        self.hot_reload_backend_plan
+            .as_ref()
+            .map(|h| h.snapshot())
+            .filter(|plan| plan.plan_id != 0)
     }
 
     /// Phase-5 hybrid-stitch builder — attach an archive engine the
