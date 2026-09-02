@@ -79,6 +79,16 @@ pub fn execute_post_asap_readout(
         t0_ms,
         t1_ms,
         is_cumulative,
+        allowed_materializations: backend_plan.map(|plan| {
+            plan.routing
+                .iter()
+                .filter(|route| {
+                    route.storage_backend
+                        == control_plane::backend_plan::StorageBackend::SketchStore
+                })
+                .map(|route| route.materialization)
+                .collect()
+        }),
     };
 
     match execute(&node, &ctx) {

@@ -101,6 +101,10 @@ pub struct QueryExecutionContext<'a> {
     /// `readout_cumulative`); `false` for a per-window matrix (one merged
     /// answer per window, via `readout_per_window`).
     pub is_cumulative: bool,
+    /// Materializations authorized by the active BackendPlan's warm routes.
+    /// `None` is the explicit legacy/no-plan mode; `Some` fails closed and
+    /// excludes stale or unrelated SIDs even when their metric/family match.
+    pub allowed_materializations: Option<BTreeSet<asap_types::PolicyFingerprint>>,
 }
 
 /// One candidate sid, already carrying its `[t0, t1]` data and decode
@@ -388,16 +392,25 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         for sid in candidate_sids {
             let candidate = self
                 .index
-                .with_instance(sid, |m| match &m.agg_kind {
-                    AggKind::Sketch { kind, config, .. } => {
-                        summary_params_match(sketch, params, *kind, config)
-                            .then(|| to_delta_kind(*kind, config))
-                            .flatten()
-                            .map(Candidate::Sketch)
+                .with_instance(sid, |m| {
+                    if self
+                        .allowed_materializations
+                        .as_ref()
+                        .is_some_and(|allowed| !allowed.contains(&m.policy_fp))
+                    {
+                        return None;
                     }
-                    AggKind::ExactAgg { agg_type, .. } => {
-                        exact_agg_kind_match(sketch, params, *agg_type)
-                            .then_some(Candidate::ExactAgg(*agg_type))
+                    match &m.agg_kind {
+                        AggKind::Sketch { kind, config, .. } => {
+                            summary_params_match(sketch, params, *kind, config)
+                                .then(|| to_delta_kind(*kind, config))
+                                .flatten()
+                                .map(Candidate::Sketch)
+                        }
+                        AggKind::ExactAgg { agg_type, .. } => {
+                            exact_agg_kind_match(sketch, params, *agg_type)
+                                .then_some(Candidate::ExactAgg(*agg_type))
+                        }
                     }
                 })
                 .flatten();
@@ -1358,6 +1371,7 @@ mod tests {
             t0_ms: T0,
             t1_ms: T1,
             is_cumulative: true,
+            allowed_materializations: None,
         }
     }
 
@@ -1367,7 +1381,38 @@ mod tests {
             t0_ms: T0,
             t1_ms: T1,
             is_cumulative: false,
+            allowed_materializations: None,
         }
+    }
+
+    #[test]
+    fn backend_plan_materialization_filter_excludes_stale_sid() {
+        let idx = SketchStore::new();
+        let mut stale = kll_meta(1, "latency_ms", &[]);
+        stale.policy_fp = asap_types::PolicyFingerprint(10);
+        idx.register(stale);
+        let exec = QueryExecutionContext {
+            index: &idx,
+            t0_ms: T0,
+            t1_ms: T1,
+            is_cumulative: true,
+            allowed_materializations: Some(
+                [asap_types::PolicyFingerprint(20)].into_iter().collect(),
+            ),
+        };
+        let family = sketch_family(
+            planner_types::post_asap::SketchAlgorithm::Kll,
+            planner_types::post_asap::SketchParams::Kll { k: 200 },
+        );
+        let result = exec
+            .find_candidates(
+                &family,
+                &ColumnRef::SampleValue,
+                &Reduction::PerEntity,
+                &scan_node("latency_ms", None),
+            )
+            .expect("candidate lookup");
+        assert!(result.is_empty());
     }
 
     #[test]
