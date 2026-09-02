@@ -36,7 +36,7 @@ use crate::physical::colored_dag::emitter::{
 use crate::sketch_algebra::cost_model::ControlPlaneCostModel;
 use crate::types_v2::AccuracyTarget;
 
-pub const PLANNER_REVISION: &str = "6a2e26f0a9c9d0cecbe8492185db7ad5ed994019";
+pub const PLANNER_REVISION: &str = "5d0b6f6edcac65edc89a72051f37977ab0c83031";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {

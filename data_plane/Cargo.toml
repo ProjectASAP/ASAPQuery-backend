@@ -38,7 +38,7 @@ control_plane = { path = "../control_plane" }
 # reduction: Reduction, .. }`) are `pre_asap` types, in the same crate now
 # (not a separate `asap-ir` import) -- `find_candidates` still needs to
 # walk/match them directly.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "6a2e26f0a9c9d0cecbe8492185db7ad5ed994019" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "5d0b6f6edcac65edc89a72051f37977ab0c83031" }
 
 # Shared external (workspace)
 serde.workspace = true
