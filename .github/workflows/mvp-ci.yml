@@ -39,6 +39,11 @@ jobs:
       - name: Install Rust components
         run: rustup component add rustfmt clippy
 
+      - name: Configure private Cargo dependencies
+        env:
+          ASAP_CI_REPO_TOKEN: ${{ secrets.ASAP_CI_REPO_TOKEN }}
+        run: git config --global url."https://x-access-token:${ASAP_CI_REPO_TOKEN}@github.com/".insteadOf "https://github.com/"
+
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
         with:
@@ -49,13 +54,19 @@ jobs:
         run: cargo fmt -p control_plane -p data_plane -- --check
 
       - name: Check control plane and data plane
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
         run: cargo check --locked -p control_plane -p data_plane
 
       - name: Lint control plane and data plane
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
         run: cargo clippy --locked -p control_plane -p data_plane --all-targets
 
       - name: Test MVP control plane
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
         run: cargo test --locked -p control_plane
