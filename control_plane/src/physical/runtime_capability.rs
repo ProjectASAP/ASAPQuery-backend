@@ -1,5 +1,4 @@
-//! Query-side capability tag + the semantic `AggIntent` → `Capability`
-//! dispatch bridge.
+//! Runtime SID capability tag and query-to-deployed-state routing adapter.
 //!
 //! Step 2a of the architectural refactor originally consolidated four
 //! overlapping capability tables into this module. The performance /

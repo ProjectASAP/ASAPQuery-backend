@@ -28,6 +28,7 @@ pub mod deployment_cost;
 pub mod plan;
 pub mod plan_cache;
 pub mod planner;
+pub mod runtime_capability;
 pub mod sketch_catalog;
 pub mod stage_split;
 pub mod topology;

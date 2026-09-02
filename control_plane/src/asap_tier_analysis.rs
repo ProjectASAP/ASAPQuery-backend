@@ -21,7 +21,7 @@
 //! ```
 //!
 //! The lowerer is the **single owner** of "what does this PromQL function
-//! mean"; `sketch_algebra::capability_for` is the **single owner** of
+//! mean"; `physical::runtime_capability::capability_for` is the single runtime adapter for
 //! "what sketch can answer this intent". This module just glues the two.
 //!
 //! ## What's still here
@@ -54,7 +54,7 @@ use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::AggIntent;
 use planner_types::pre_asap::QueryExpr;
 
-pub use crate::sketch_algebra::capability::{
+pub use crate::physical::runtime_capability::{
     capability_for, Capability, OuterAgg, OuterFn, SketchKindHandle,
 };
 
@@ -689,7 +689,7 @@ fn duration_to_seconds(d: Duration) -> u64 {
 /// wrappers, etc.) — callers MUST treat `None` as "policy doesn't
 /// serve any ASAP-tier candidate" and skip.
 pub fn policy_capability(cfg: &asap_types::AggregationConfig) -> Option<Capability> {
-    use crate::sketch_algebra::capability::SketchKindHandle;
+    use crate::physical::runtime_capability::SketchKindHandle;
     use asap_types::AggregationType;
     match cfg.aggregation_type {
         // Exact-aggregation families — the ASAP-tier ExactAgg path.
@@ -1655,7 +1655,7 @@ mod tests {
 
         #[test]
         fn policy_capability_maps_ddsketch_to_quantile_approx() {
-            use crate::sketch_algebra::capability::SketchKindHandle;
+            use crate::physical::runtime_capability::SketchKindHandle;
             let c = cfg("m", AggregationType::DDSketch, vec![], 60, "");
             assert_eq!(
                 policy_capability(&c),
@@ -1764,7 +1764,7 @@ mod tests {
         #[test]
         fn does_not_match_incompatible_capability() {
             // Policy is Sum (ExactAgg); candidate asks for QuantileApprox.
-            use crate::sketch_algebra::capability::SketchKindHandle;
+            use crate::physical::runtime_capability::SketchKindHandle;
             let policies = vec![cfg("http_lat", AggregationType::Sum, vec![], 60, "")];
             let registry = RoutingIndex::build(PolicyRegistry::from_configs(policies));
             let cand = candidate(

@@ -192,7 +192,7 @@ pub struct WorkloadEntry {
     pub assign_to_role: String,
     /// Optional explicit sketch family override. When set, the planner pins
     /// this family for the metric (modulo `(sketch, statistic)` validity
-    /// per `sketch_algebra::capability_matching::is_valid_pair`). Threaded
+    /// by ASAPPlanner's legal candidate enumeration). Threaded
     /// into `QueryWorkload::sketch_type_override` by the registry pre-pop
     /// path so the typed L4 binding (`bind_workload_typed`) honours it.
     ///

@@ -117,7 +117,7 @@ fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
             // `Plain`/`Sample`/`Wavelet`/`StatModel` never occur on a real
             // `SummaryAgg` (never `Plain` by construction; `Sample`/
             // `Wavelet`/`StatModel` are unreachable via this deployment's
-            // own `CostModel` -- see `sketch_algebra::capability`'s
+            // own `CostModel` -- see `physical::runtime_capability`'s
             // `implementation_to_capability` doc for the same reasoning).
             SummaryExpr::SummaryAgg { .. } => NodeKind::Other,
             SummaryExpr::SummaryEstimate { query, .. } => NodeKind::SketchEstimate { query },

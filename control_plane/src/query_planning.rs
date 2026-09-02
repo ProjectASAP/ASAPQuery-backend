@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use crate::asap_tier_analysis::{analyze_promql_for_asap_tier, UnsupportedReason};
-use crate::sketch_algebra::Capability;
+use crate::physical::runtime_capability::Capability;
 use crate::sketch_selection::required_sketches_for_capabilities;
 use crate::types::SketchType;
 

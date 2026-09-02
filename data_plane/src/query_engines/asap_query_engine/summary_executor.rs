@@ -75,7 +75,7 @@ use planner_types::pre_asap::{ColumnId, ColumnRef, QueryExpr, Reduction, Source}
 // control_plane/docs/design-asapplanner-pin-migration.md.
 use asap_types::{SummaryKind, SummaryParams};
 
-use control_plane::sketch_algebra::capability::SketchKindHandle;
+use control_plane::physical::runtime_capability::SketchKindHandle;
 
 use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig, SketchTimeSeries};
 use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
@@ -343,7 +343,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         // `Wavelet`/`StatModel` never occur on a real `SummaryAgg` (never
         // `Plain` by construction; the others are unreachable via this
         // deployment's own `CostModel` -- see
-        // `sketch_algebra::capability`'s `implementation_to_capability`
+        // the physical runtime-capability adapter
         // doc for the same reasoning), so there's no candidate to find.
         let (sketch, params): (SummaryKind, SummaryParams) = match family {
             SummaryFamilyType::ExactAggregate(kind, params) => {

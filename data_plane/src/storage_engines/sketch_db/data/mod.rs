@@ -51,12 +51,12 @@
 // ── Capability re-exports ────────────────────────────────────────────────────
 //
 // Step 2a consolidated all capability state into
-// `control_plane::sketch_algebra::capability`. The backend re-exports the
+// `control_plane::physical::runtime_capability`. The backend re-exports the
 // canonical types so there's exactly one definition in the codebase.
 // `is_satisfied_by` (used by the engine ASAP-tier hook) lives on the
 // control-plane-side `Capability` impl.
 
-pub use control_plane::sketch_algebra::{Capability, SketchKindHandle};
+pub use control_plane::physical::runtime_capability::{Capability, SketchKindHandle};
 
 /// Re-export so callers don't need to depend on promql_utilities
 /// directly for the agg_type tag.
