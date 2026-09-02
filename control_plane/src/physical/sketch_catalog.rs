@@ -9,8 +9,16 @@
 //!
 //! All callers now go through this module.
 
-use crate::intent_algebra::relational::{agg_accuracy, AggIntent, PerPartitionWrap};
+use crate::planner_selection::agg_accuracy;
 use crate::types::{AggType, SketchDefaults, SketchParams, SketchType};
+use planner_types::pre_asap::AggIntent;
+
+/// Physical sizing input for one independently maintained partition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerPartitionWrap {
+    pub inner: AggIntent,
+    pub keys: Vec<String>,
+}
 
 // ── AggType → candidate SketchTypes ──────────────────────────────────────────
 
@@ -67,7 +75,7 @@ pub fn sketch_type_for_agg(aggs: &[AggType]) -> SketchType {
 
 /// Resolve the concrete [`SketchType`] for an [`AggIntent`] IR node.
 pub fn sketch_type_for_op(op: &AggIntent) -> SketchType {
-    if crate::intent_algebra::as_frequency(op).is_some() {
+    if crate::planner_selection::as_frequency(op).is_some() {
         return SketchType::CountSketch;
     }
     match op {
@@ -93,7 +101,7 @@ pub fn sketch_type_for_per_partition(wrap: &PerPartitionWrap) -> SketchType {
 
 /// Derive [`SketchParams`] from an [`AggIntent`] IR node.
 pub fn sketch_params_for_op(op: &AggIntent) -> SketchParams {
-    if crate::intent_algebra::as_frequency(op).is_some() {
+    if crate::planner_selection::as_frequency(op).is_some() {
         let acc = agg_accuracy(op);
         return SketchParams::CountSketch {
             epsilon: acc,
@@ -147,7 +155,7 @@ pub fn sketch_type_and_params(op: &AggIntent) -> (SketchType, SketchParams) {
 /// Used by the physical planner's placement decision to defer a sketch
 /// build off a stage when its budget would be exceeded.
 pub fn estimated_sketch_memory_bytes(op: &AggIntent) -> u64 {
-    if crate::intent_algebra::as_frequency(op).is_some() {
+    if crate::planner_selection::as_frequency(op).is_some() {
         let acc = agg_accuracy(op).max(f64::MIN_POSITIVE);
         // CMS: width ≈ e/accuracy, depth ≈ 5, memory = width*depth*8
         let width = (std::f64::consts::E / acc) as u64;
@@ -283,20 +291,20 @@ mod tests {
 
     #[test]
     fn op_cardinality_yields_hll_type() {
-        let op = crate::intent_algebra::relational::default_cardinality();
+        let op = planner_types::pre_asap::default_cardinality();
         assert_eq!(sketch_type_for_op(&op), SketchType::HLL);
     }
 
     #[test]
     fn op_frequency_yields_countsketch() {
-        let op = crate::intent_algebra::relational::default_frequency();
+        let op = crate::planner_selection::default_frequency();
         assert_eq!(sketch_type_for_op(&op), SketchType::CountSketch);
     }
 
     #[test]
     fn per_partition_delegates_to_inner() {
         let wrap = PerPartitionWrap {
-            inner: crate::intent_algebra::relational::default_cardinality(),
+            inner: planner_types::pre_asap::default_cardinality(),
             keys: vec!["k".into()],
         };
         assert_eq!(sketch_type_for_per_partition(&wrap), SketchType::HLL);
@@ -315,7 +323,7 @@ mod tests {
 
     #[test]
     fn memory_per_partition_scales_by_keys() {
-        let inner = crate::intent_algebra::relational::default_cardinality();
+        let inner = planner_types::pre_asap::default_cardinality();
         let base_mem = estimated_sketch_memory_bytes(&inner);
         let wrap = PerPartitionWrap {
             inner,

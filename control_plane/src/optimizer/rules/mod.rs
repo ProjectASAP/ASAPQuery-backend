@@ -58,13 +58,13 @@ pub fn bind_workload_typed_with_item_filter(
     w: &QueryWorkload,
     item_filter: Option<(&str, &str)>,
 ) -> Option<crate::sketch_algebra::PhysicalExpr> {
-    use crate::intent_algebra::{AggIntent as L3AggIntent, QueryExpr, Schema, Source};
     use crate::sketch_algebra::capability_matching::{
         classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
     };
     use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
     use crate::types_v2::AccuracyTarget;
     use planner_types::post_asap::SketchAlgorithm;
+    use planner_types::pre_asap::{AggIntent as L3AggIntent, QueryExpr, Schema, Source};
     use planner_types::pre_asap::{Column, DataType};
 
     // Contract-row metrics (`classify_demo_metric` returns `Some`) and
@@ -155,7 +155,7 @@ pub fn bind_workload_typed_with_item_filter(
             col: None,
             accuracy: intent_accuracy,
         },
-        StatisticClass::Frequency => crate::intent_algebra::frequency(
+        StatisticClass::Frequency => crate::planner_selection::frequency(
             intent_accuracy,
             item_filter.map(|(label, value)| (label.to_string(), value.to_string())),
         ),
@@ -207,7 +207,7 @@ pub fn bind_workload_typed_with_item_filter(
         // never `Reduction`, so this value doesn't affect the family pick.
         // `PerEntity` is the representative choice for a windowed shape
         // with no `by` (ASAPController#163/#165).
-        reduction: crate::intent_algebra::Reduction::PerEntity,
+        reduction: planner_types::pre_asap::Reduction::PerEntity,
         measures: vec![intent],
         output_names: Vec::new(),
         having: None,

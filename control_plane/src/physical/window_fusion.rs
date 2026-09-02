@@ -26,12 +26,13 @@
 
 use std::time::Duration;
 
-use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::query_expr::{QueryExpr, WindowKind};
 use crate::physical::planner::{
     decide_sketch_placement, resolve, PhysicalOp, PhysicalPlannerConfig, PhysicalWindow, Placement,
 };
+use planner_types::pre_asap::AggIntent;
 use planner_types::pre_asap::ColumnId;
+use asap_types::enums::WindowKind;
+use planner_types::pre_asap::QueryExpr;
 
 /// Canonical-shape view of a fused window-over-sketch — the canonical
 /// counterpart of a legacy `WindowedAgg` node, recognized out of the
@@ -187,12 +188,13 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::intent_algebra::query_expr::Source;
-    use crate::intent_algebra::{default_cardinality, default_frequency, default_quantile};
     use crate::optimizer::engine::DeploymentConstraints;
     use crate::physical::planner::{plan, PhysicalOp};
+    use crate::planner_selection::default_frequency;
     use crate::types::StageResourceBudgets;
     use planner_types::pre_asap::Schema;
+    use planner_types::pre_asap::Source;
+    use planner_types::pre_asap::{default_cardinality, default_quantile};
 
     fn config() -> PhysicalPlannerConfig {
         PhysicalPlannerConfig {
@@ -227,7 +229,7 @@ mod tests {
         QueryExpr::TimeRange {
             range: size,
             child: Rc::new(QueryExpr::Aggregate {
-                reduction: crate::intent_algebra::Reduction::by(vec![]),
+                reduction: planner_types::pre_asap::Reduction::by(vec![]),
                 measures: vec![agg],
                 output_names: Vec::new(),
                 having: None,
@@ -306,7 +308,7 @@ mod tests {
         // A canonical `Aggregate` with no enclosing `TimeRange` is the
         // unfused sketch case — not a windowed sketch.
         let canonical = QueryExpr::Aggregate {
-            reduction: crate::intent_algebra::Reduction::by(vec![]),
+            reduction: planner_types::pre_asap::Reduction::by(vec![]),
             measures: vec![AggIntent::Sum { col: None }],
             output_names: Vec::new(),
             having: None,

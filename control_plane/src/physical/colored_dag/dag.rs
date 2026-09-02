@@ -146,9 +146,9 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::intent_algebra::{QueryExpr, Schema, Source};
     use crate::sketch_algebra::PhysicalExpr;
     use planner_types::pre_asap::{Column, DataType};
+    use planner_types::pre_asap::{QueryExpr, Schema, Source};
 
     // These three dummies only need to be *structurally valid* and
     // distinct `PhysicalExpr` values — the tests below only inspect
@@ -186,8 +186,8 @@ mod tests {
 
     fn dummy_agg() -> PhysicalExpr {
         let q = QueryExpr::Aggregate {
-            reduction: crate::intent_algebra::Reduction::by(vec![]),
-            measures: vec![crate::intent_algebra::AggIntent::Sum { col: None }],
+            reduction: planner_types::pre_asap::Reduction::by(vec![]),
+            measures: vec![planner_types::pre_asap::AggIntent::Sum { col: None }],
             output_names: Vec::new(),
             having: None,
             child: Rc::new(dummy_scan()),
@@ -197,8 +197,8 @@ mod tests {
 
     fn dummy_estimate() -> PhysicalExpr {
         let q = QueryExpr::Aggregate {
-            reduction: crate::intent_algebra::Reduction::by(vec![]),
-            measures: vec![crate::intent_algebra::AggIntent::Quantile {
+            reduction: planner_types::pre_asap::Reduction::by(vec![]),
+            measures: vec![planner_types::pre_asap::AggIntent::Quantile {
                 col: None,
                 q: 0.99,
                 accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),

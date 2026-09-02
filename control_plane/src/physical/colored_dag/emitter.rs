@@ -56,7 +56,7 @@ use asap_types::{SummaryKind as BackendSketchKind, SummaryParams as BackendSketc
 /// `planner_types::post_asap::SummaryExpr` — see `sketch_algebra::physical_expr`'s
 /// module docs.
 enum NodeKind<'a> {
-    Logical(&'a crate::intent_algebra::QueryExpr),
+    Logical(&'a planner_types::pre_asap::QueryExpr),
     /// An approximate sketch — the old `SketchAgg`. Exact accumulators
     /// (Sum/Count/MinMax/Increase/Rate) are classified as [`Self::ExactAgg`]
     /// instead, matching the old `PhysicalExpr::ExactAgg`'s separate shape.
@@ -1095,13 +1095,13 @@ pub(crate) fn edge_processor_name(kind: &SketchAlgorithm) -> Result<String, Emit
     }
 }
 
-/// Recursively descend an L3 [`crate::intent_algebra::QueryExpr`]
+/// Recursively descend an L3 [`planner_types::pre_asap::QueryExpr`]
 /// gathering edge-stage facts (source metric name, label filters,
 /// window size). The L3 sub-tree wrapped in a `PhysicalExpr::Logical`
 /// can be `Scan`, `Window{Scan}`, `Aggregate{Window{Scan}}`, etc.,
 /// so a recursive descent is necessary to surface the leaf metric.
-fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStageConfig) {
-    use crate::intent_algebra::{QueryExpr as QE, Source};
+fn extract_edge_facts(qe: &planner_types::pre_asap::QueryExpr, edge: &mut EdgeStageConfig) {
+    use planner_types::pre_asap::{QueryExpr as QE, Source};
     match qe {
         QE::Scan {
             source,
@@ -1117,7 +1117,7 @@ fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStag
             // as typed `Predicate(QueryExpr::Compare{Column, Eq,
             // Literal(Utf8)})` trees — resolve each `Column` id back to
             // its name via the Scan's own schema.
-            use crate::intent_algebra::{CompareOpKind, QueryExpr, ScalarValue};
+            use planner_types::pre_asap::{CompareOpKind, QueryExpr, ScalarValue};
             for p in predicates {
                 if let QueryExpr::Compare {
                     left,

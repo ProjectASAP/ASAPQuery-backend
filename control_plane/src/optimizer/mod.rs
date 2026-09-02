@@ -2,8 +2,8 @@
 //!
 //! Per `control_plane/docs/design.md` §3/§5/§6 `core::optimizer`: this is
 //! the rule engine driver + cost-model trait + rule library that takes
-//! L3 [`crate::intent_algebra::relational::QueryExpr`] / canonical
-//! [`crate::intent_algebra::QueryExpr`] inputs and produces L4
+//! L3 [`planner_types::pre_asap::QueryExpr`] / canonical
+//! [`planner_types::pre_asap::QueryExpr`] inputs and produces L4
 //! sketch-bound output (in the legacy path: an annotated `QueryExpr`
 //! with `SketchAgg` nodes; in the canonical path: a
 //! [`crate::sketch_algebra::PhysicalExpr`] DAG).

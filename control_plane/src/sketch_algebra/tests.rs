@@ -11,11 +11,11 @@ use planner_types::post_asap::{
 };
 use planner_types::pre_asap::expr_ir::ColumnRef;
 
-use crate::intent_algebra::{AggIntent, LabelFilter, QueryExpr, Reduction, Schema, Source};
 use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
 use crate::sketch_algebra::lower::bind_query_expr;
 use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
 use crate::types_v2::AccuracyTarget;
+use planner_types::pre_asap::{AggIntent, QueryExpr, Reduction, Schema, Source};
 use planner_types::pre_asap::{Column, DataType};
 
 fn sketch_family(kind: SketchAlgorithm, params: SketchParams) -> SummaryFamilyType {
@@ -43,11 +43,7 @@ fn ts_scan() -> QueryExpr {
         0,
         vec![vec![0, 1]],
     );
-    let lf = LabelFilter {
-        label: "service".into(),
-        equals: "api".into(),
-    };
-    let pred = crate::intent_algebra::label_filter_to_predicate(&lf, &schema)
+    let pred = crate::test_support::label_eq_predicate("service", "api", &schema)
         .expect("service column present in schema");
     QueryExpr::Scan {
         source: Source::TimeSeries {
@@ -107,7 +103,7 @@ fn node_is_archive(node: &Rc<SummaryNode>) -> bool {
     match &node.expr {
         SummaryExpr::KeepPreAsap(qe) => match qe.as_ref() {
             QueryExpr::Aggregate { measures: aggs, .. } => {
-                aggs.iter().any(crate::intent_algebra::archive_only)
+                aggs.iter().any(crate::planner_selection::archive_only)
             }
             _ => false,
         },
@@ -606,7 +602,7 @@ fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
 fn phase_b_pattern_archive_only_routes_to_archive() {
     let intent = AggIntent::Absent;
     assert!(
-        crate::intent_algebra::archive_only(&intent),
+        crate::planner_selection::archive_only(&intent),
         "Phase β intent must flag archive"
     );
     let expr = QueryExpr::Aggregate {
@@ -850,7 +846,7 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
                     QueryExpr::Aggregate { measures: aggs, .. } => {
                         assert_eq!(aggs.len(), 1);
                         assert!(
-                            crate::intent_algebra::archive_only(&aggs[0]),
+                            crate::planner_selection::archive_only(&aggs[0]),
                             "{intent:?} should preserve archive_only() flag through bind"
                         );
                     }
@@ -866,7 +862,7 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
 // ── Deliberate behavior changes (ASAPController#150 / #151) ──────────────────
 //
 // `AggIntent::Extension` (this deployment's `Frequency` point-query,
-// built via `crate::intent_algebra::frequency(accuracy, item)`) now binds to a
+// built via `crate::planner_selection::frequency(accuracy, item)`) now binds to a
 // real `Cms` summary via `ControlPlaneCostModel::realize_extension`/
 // `readout_extension` (ASAPController#150) — see `frequency_extension_binds_cms`
 // below and `optimizer::rules::mod::tests::typed_binding_endpoint_request_freq_binds_cms`.
@@ -882,7 +878,7 @@ fn frequency_extension_binds_cms() {
     // `ControlPlaneCostModel::realize_extension`/`readout_extension`
     // (ASAPController#150) now realize `AggIntent::Extension{"frequency"}`
     // as a real `Cms` summary instead of declining to `Logical`.
-    let intent = crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01), None);
+    let intent = crate::planner_selection::frequency(AccuracyTarget::Epsilon(0.01), None);
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::PerEntity,
         measures: vec![intent],

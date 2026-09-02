@@ -15,13 +15,13 @@ use planner_types::post_asap::{
     SummaryFamilyType, SummaryNode, SummarySchema,
 };
 
-use crate::intent_algebra::{ColumnRef, LabelFilter, QueryExpr, Reduction, Schema, Source};
 use crate::physical::colored_dag::allocator::StageAllocator;
 use crate::physical::colored_dag::emitter::{EmitError, Emitter, StageConfig, ThreeStageEmitter};
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
 use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
 use crate::types_v2::{AccuracyTarget, BindingName};
 use planner_types::pre_asap::{Column, DataType};
+use planner_types::pre_asap::{ColumnRef, QueryExpr, Reduction, Schema, Source};
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
 
@@ -52,14 +52,8 @@ fn ts_scan(metric: &str, label: Option<(&str, &str)>) -> QueryExpr {
     );
     let predicates = label
         .map(|(k, v)| {
-            let lf = LabelFilter {
-                label: k.into(),
-                equals: v.into(),
-            };
-            vec![
-                crate::intent_algebra::label_filter_to_predicate(&lf, &schema)
-                    .expect("label column present in schema"),
-            ]
+            vec![crate::test_support::label_eq_predicate(k, v, &schema)
+                .expect("label column present in schema")]
         })
         .unwrap_or_default();
     QueryExpr::Scan {
@@ -177,7 +171,7 @@ fn is_ref(expr: &PhysicalExpr) -> bool {
 fn quantile_kll_dag() -> PhysicalExpr {
     let q = QueryExpr::Aggregate {
         reduction: Reduction::by(vec![]),
-        measures: vec![crate::intent_algebra::AggIntent::Quantile {
+        measures: vec![planner_types::pre_asap::AggIntent::Quantile {
             col: None,
             q: 0.99,
             accuracy: AccuracyTarget::Epsilon(0.01),

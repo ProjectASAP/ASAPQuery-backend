@@ -29,12 +29,12 @@ use thiserror::Error;
 
 use crate::backend_plan::{self, BackendPlan};
 use crate::emit::monitor::MonitorIntent;
-use crate::intent_algebra::Source;
 use crate::physical::colored_dag::emitter::{
     AggregationInput, BackendAggregation, BackendReadout, BackendStageConfig,
 };
 use crate::sketch_algebra::cost_model::ControlPlaneCostModel;
 use crate::types_v2::AccuracyTarget;
+use planner_types::pre_asap::Source;
 
 pub const PLANNER_REVISION: &str = "5d0b6f6edcac65edc89a72051f37977ab0c83031";
 

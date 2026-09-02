@@ -49,10 +49,10 @@ use std::time::Duration;
 
 use promql_parser::parser::{self, Expr, VectorSelector};
 
-use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::query_expr::QueryExpr;
 use crate::query_parser::{parse_query_expr_canonical, parsed_query_from_canonical};
 use crate::types_v2::AccuracyTarget;
+use planner_types::pre_asap::AggIntent;
+use planner_types::pre_asap::QueryExpr;
 
 pub use crate::sketch_algebra::capability::{
     capability_for, Capability, OuterAgg, OuterFn, SketchKindHandle,
@@ -392,7 +392,7 @@ pub(crate) fn collect_agg_intents(expr: &QueryExpr, out: &mut Vec<AggIntent>) {
 /// the AST walker can recover them; this fallback runs when the AST
 /// walk fails.
 fn intent_kind_label(intent: &AggIntent) -> &'static str {
-    if crate::intent_algebra::as_frequency(intent).is_some() {
+    if crate::planner_selection::as_frequency(intent).is_some() {
         return "frequency";
     }
     match intent {

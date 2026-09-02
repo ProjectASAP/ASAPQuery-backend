@@ -214,7 +214,7 @@ fn observed_family_for_metric_from_plan(
     metric: &str,
 ) -> Option<(SketchAlgorithm, SketchParams)> {
     plan.materializations.values().find_map(|m| {
-        if !matches!(&m.source, control_plane::intent_algebra::Source::TimeSeries { metric: mm } if mm == metric)
+        if !matches!(&m.source, planner_types::pre_asap::Source::TimeSeries { metric: mm } if mm == metric)
         {
             return None;
         }
@@ -417,8 +417,9 @@ mod tests {
         use crate::storage_engines::sketch_db::index::{
             AccuracyBound, Capability, SketchInstanceMetadata, SketchKindHandle,
         };
+        use asap_types::enums::WindowKind;
         use control_plane::backend_plan::{BackendPlan, Materialization, WindowSpec};
-        use control_plane::intent_algebra::{ColumnRef, Source, WindowKind};
+        use planner_types::pre_asap::{ColumnRef, Source};
         use std::collections::HashMap;
 
         fn register_kll(idx: &SketchStore, metric: &str) {

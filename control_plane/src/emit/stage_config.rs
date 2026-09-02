@@ -62,9 +62,9 @@ use crate::physical::colored_dag::emitter::{
 // archive-tier metric lists). Importing them at module scope produced an
 // unused-import warning on every non-test build, so they're scoped into the
 // test module's `use super::*` instead (P2-5).
-use crate::intent_algebra::ColumnRef;
 use crate::physical::colored_dag::stage_id::StageId;
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SketchQuery};
+use planner_types::pre_asap::ColumnRef;
 // `BackendAggregation.sketch_kind`/`.sketch_params` span both exact
 // accumulators and approximate sketches -- see
 // `physical::colored_dag::emitter`'s `use asap_types::{...}` note.

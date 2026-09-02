@@ -42,10 +42,10 @@ use asap_aware_mapping::{
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SketchQuery};
 use planner_types::pre_asap::expr_ir::ColumnRef;
 
-use crate::intent_algebra::agg_intent::FREQUENCY_EXT_KIND;
-use crate::intent_algebra::AggIntent;
 use crate::optimizer::cost::wire::WireCostTable;
+use crate::planner_selection::FREQUENCY_EXT_KIND;
 use crate::types_v2::AccuracyTarget;
+use planner_types::pre_asap::AggIntent;
 
 /// See module docs.
 pub struct ControlPlaneCostModel {
@@ -582,7 +582,7 @@ fn hll_precision_for_eps(eps: f64) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::{default_cardinality, default_quantile};
+    use planner_types::pre_asap::{default_cardinality, default_quantile};
 
     fn eps(e: f64) -> AccuracyTarget {
         AccuracyTarget::Epsilon(e)
@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(params, SketchParams::Kll { k: 200 });
 
         let model = ControlPlaneCostModel::new(AccuracyTarget::Epsilon(1.0));
-        let tight = crate::intent_algebra::AggIntent::Quantile {
+        let tight = planner_types::pre_asap::AggIntent::Quantile {
             col: None,
             q: 0.99,
             accuracy: eps(0.001),
@@ -627,7 +627,7 @@ mod tests {
     #[test]
     fn topk_tight_tier_forces_countsketch_even_when_ranked_from_cms() {
         let model = ControlPlaneCostModel::new(AccuracyTarget::Exact);
-        let intent = crate::intent_algebra::AggIntent::TopK {
+        let intent = planner_types::pre_asap::AggIntent::TopK {
             k: 5,
             accuracy: eps(0.01),
         };
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn topk_loose_tier_prefers_cheaper_cms_heap() {
         let model = ControlPlaneCostModel::new(AccuracyTarget::Epsilon(0.1));
-        let intent = crate::intent_algebra::AggIntent::TopK {
+        let intent = planner_types::pre_asap::AggIntent::TopK {
             k: 5,
             accuracy: eps(0.01),
         };
@@ -667,7 +667,7 @@ mod tests {
     #[test]
     fn topk_width_is_rounded_up_to_a_power_of_two() {
         let model = ControlPlaneCostModel::new(AccuracyTarget::Epsilon(0.1));
-        let intent = crate::intent_algebra::AggIntent::TopK {
+        let intent = planner_types::pre_asap::AggIntent::TopK {
             k: 5,
             accuracy: eps(0.01),
         };

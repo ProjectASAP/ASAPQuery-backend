@@ -41,10 +41,10 @@
 use std::rc::Rc;
 
 use super::plan::{CostEstimate, ExecutionMode, NodeAnnotation, PipelineStage, PlanNode};
-use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::relational::agg_is_exact;
-use crate::intent_algebra::{QueryExpr, Reduction};
 use crate::types::{SketchType, StageResourceBudgets};
+use planner_types::pre_asap::agg_is_exact;
+use planner_types::pre_asap::AggIntent;
+use planner_types::pre_asap::{QueryExpr, Reduction};
 
 // ── Resource budget tracker ───────────────────────────────────────────────────
 
@@ -756,7 +756,7 @@ fn estimated_sketch_memory(op: &AggIntent) -> f64 {
 /// Map a canonical [`AggIntent`] to a short stable kind string for
 /// annotation rationale text.
 fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
-    if crate::intent_algebra::as_frequency(intent).is_some() {
+    if crate::planner_selection::as_frequency(intent).is_some() {
         return "frequency";
     }
     match intent {
@@ -810,13 +810,11 @@ fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::relational::{
-        default_cardinality, default_frequency, default_quantile,
-    };
-    use crate::intent_algebra::{JoinKind, Predicate, QueryExpr, ScalarValue, Schema, Source};
     use crate::physical::plan::{ExecutionMode, PipelineStage};
     use crate::types::{SketchType, StageResourceBudgets};
     use crate::types_v2::AccuracyTarget;
+    use planner_types::pre_asap::{default_cardinality, default_frequency, default_quantile};
+    use planner_types::pre_asap::{JoinKind, Predicate, QueryExpr, ScalarValue, Schema, Source};
 
     /// Canonical `Scan` leaf — the L3 counterpart of the legacy
     /// `QueryExpr::Source(SourceSpec { .. })`.
