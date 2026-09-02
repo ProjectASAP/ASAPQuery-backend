@@ -468,6 +468,7 @@ mod tests {
                     params: asap_types::SummaryParams::DDSketch { alpha: 0.01 },
                     col: ColumnRef::SampleValue,
                     retention: None,
+                    lifecycle: None,
                 },
             );
             BackendPlan {

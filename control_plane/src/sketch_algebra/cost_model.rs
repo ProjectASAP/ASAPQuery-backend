@@ -35,8 +35,10 @@
 
 #![allow(dead_code)]
 
-use asap_aware_mapping::CostModel;
-use asap_aware_mapping::Implementation;
+use asap_aware_mapping::{
+    CostModel, Implementation, SummaryMaintenanceCapabilities,
+    SummaryMaintenanceLifecycleCostInputs,
+};
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SketchQuery};
 use planner_types::pre_asap::expr_ir::ColumnRef;
 
@@ -51,11 +53,27 @@ pub struct ControlPlaneCostModel {
     /// intent's own accuracy field, matching every `bind_*.rs` rule's old
     /// `accuracy: &AccuracyTarget` parameter.
     pub workload_accuracy: AccuracyTarget,
+    lifecycle_costs: SummaryMaintenanceLifecycleCostInputs,
+    summary_maintenance: SummaryMaintenanceCapabilities,
 }
 
 impl ControlPlaneCostModel {
     pub fn new(workload_accuracy: AccuracyTarget) -> Self {
-        Self { workload_accuracy }
+        Self {
+            workload_accuracy,
+            lifecycle_costs: SummaryMaintenanceLifecycleCostInputs::default(),
+            summary_maintenance: SummaryMaintenanceCapabilities::default(),
+        }
+    }
+
+    pub fn with_summary_maintenance(
+        mut self,
+        lifecycle_costs: SummaryMaintenanceLifecycleCostInputs,
+        capabilities: SummaryMaintenanceCapabilities,
+    ) -> Self {
+        self.lifecycle_costs = lifecycle_costs;
+        self.summary_maintenance = capabilities;
+        self
     }
 
     /// The tighter (lower) of the workload policy and an intent's own
@@ -170,6 +188,20 @@ fn intent_accuracy(intent: &AggIntent) -> AccuracyTarget {
 }
 
 impl CostModel for ControlPlaneCostModel {
+    fn summary_maintenance_lifecycle_cost_inputs(
+        &self,
+        _summary: &planner_types::post_asap::SummaryNode,
+    ) -> SummaryMaintenanceLifecycleCostInputs {
+        self.lifecycle_costs.clone()
+    }
+
+    fn summary_maintenance_capabilities(
+        &self,
+        _summary: &planner_types::post_asap::SummaryNode,
+    ) -> SummaryMaintenanceCapabilities {
+        self.summary_maintenance
+    }
+
     fn rank_candidates(
         &self,
         intent: &AggIntent,

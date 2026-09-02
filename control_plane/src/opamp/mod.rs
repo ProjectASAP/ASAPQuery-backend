@@ -1001,6 +1001,12 @@ mod tests {
                 group_by: vec!["service".into()],
                 window_secs: 60,
                 evidence_source: None,
+                lifecycle: crate::physical::compiler::CollectorLifecycle {
+                    kind: "continuously_maintained".into(),
+                    maintenance_mode: "incremental".into(),
+                    evaluation_schedule: "per_update".into(),
+                    output_representation: "summary_state".into(),
+                },
             }],
         }
     }

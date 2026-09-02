@@ -74,6 +74,7 @@ pub fn from_stage_config(
                 params,
                 col: ColumnRef::SampleValue,
                 retention: None,
+                lifecycle: None,
             },
         );
     }

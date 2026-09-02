@@ -8,8 +8,9 @@ typed `BackendPlan` plus one target-specific `CollectorPlan` per Collector.
 
 `POST /api/v1/physical-plan/compile-and-publish` accepts:
 
-- `queries`: query ID, PromQL, metric, window seconds, grouping labels, and a
-  typed `AccuracyTarget`;
+- `queries`: query ID, PromQL, metric, window seconds, grouping labels, a
+  typed `AccuracyTarget`, and lifecycle evidence (evaluation interval,
+  ingestion rate/freshness, optimization horizon, and primitive state costs);
 - `collector_ids`: the required OpAMP agent IDs;
 - `capability_snapshot_id` and the exact `planner_revision`;
 - optional per-query TopK evidence, with `max_evidence_age_ms`; and
@@ -18,6 +19,13 @@ typed `BackendPlan` plus one target-specific `CollectorPlan` per Collector.
 Unknown JSON fields, empty target/query sets, zero windows/timeouts, stale
 evidence, and a Planner revision mismatch are rejected. The response is only
 successful after every target has applied the same generated `plan_id`.
+
+The physical compiler passes normalized recurrence, data-arrival evidence,
+runtime capabilities, and costs to ASAPPlanner's summary-maintenance lifecycle
+planner. The selected guarantee is copied into each Collector materialization.
+For the current tumbling-window Collector runtime the executable commitment is
+`continuously_maintained / incremental / per_update / summary_state`; missing
+or stale lifecycle evidence and any unexecutable lifecycle fail closed.
 
 ## Installation order and failure semantics
 
