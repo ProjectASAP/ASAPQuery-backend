@@ -1,4 +1,4 @@
-/// Baseline planner.
+/// Cached physical deployment-plan compiler.
 ///
 /// A *baseline* is the cost-optimised `CollectionPlan` established on the
 /// **first** `POST /api/v1/plan` request for a metric.  Once set, the same
@@ -11,21 +11,21 @@
 /// would break downstream aggregation pipelines.
 ///
 /// To replace the baseline (e.g. after an SLA violation or explicit rollback)
-/// call [`BaselinePlanner::reset`] for the metric.  The next plan request will
+/// call [`CachedDeploymentPlanner::reset`] for the metric.  The next plan request will
 /// run the cost model afresh and lock in a new baseline.
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::optimizer::cost::CostModelPlanner;
+use crate::physical::deployment_cost::DeploymentCostPlanner;
 use crate::types::{CollectionPlan, QueryWorkload, WorkloadCharacteristics};
 
-pub struct BaselinePlanner {
-    inner: CostModelPlanner,
+pub struct CachedDeploymentPlanner {
+    inner: DeploymentCostPlanner,
     cache: Arc<RwLock<HashMap<String, CollectionPlan>>>,
 }
 
-impl BaselinePlanner {
-    pub fn new(inner: CostModelPlanner) -> Self {
+impl CachedDeploymentPlanner {
+    pub fn new(inner: DeploymentCostPlanner) -> Self {
         Self {
             inner,
             cache: Arc::new(RwLock::new(HashMap::new())),
@@ -96,8 +96,8 @@ mod tests {
         }
     }
 
-    fn planner() -> BaselinePlanner {
-        BaselinePlanner::new(CostModelPlanner::new())
+    fn planner() -> CachedDeploymentPlanner {
+        CachedDeploymentPlanner::new(DeploymentCostPlanner::new())
     }
 
     #[test]
@@ -106,7 +106,7 @@ mod tests {
         let plan = p.plan(&workload("latency"), None);
         // Cost model picks the cheapest sketch that meets the SLA; verify
         // we got a valid plan.  transmit_sketch defaults to false (enabled
-        // by CostModelPlanner when appropriate).
+        // by DeploymentCostPlanner when appropriate).
         assert!(!plan.agent_config.transmit_sketch);
     }
 

@@ -1,4 +1,4 @@
-//! SP-5 online profiling — EMA-adjusted cost model constants.
+//! SP-5 online profiling — EMA-adjusted physical cost constants.
 //!
 //! The static benchmark table in [`cost_model`] seeds initial estimates.
 //! As [`monitor::Scraper`] collects actual observations from running agents,
@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 
-use crate::optimizer::cost::{benchmark_table_pub, SketchCosts};
+use crate::physical::deployment_cost::{benchmark_table_pub, SketchCosts};
 use crate::types::SketchType;
 
 // ── Tuning constants ──────────────────────────────────────────────────────────
@@ -85,7 +85,7 @@ impl OnlineSketchCosts {
 // ── Store ─────────────────────────────────────────────────────────────────────
 
 /// Thread-safe map of sketch type → online EMA costs.
-/// Shared between the `Scraper`'s `on_metrics` callback and `CostModelPlanner`.
+/// Shared between the `Scraper`'s `on_metrics` callback and `DeploymentCostPlanner`.
 pub type OnlineMetricsStore = Arc<RwLock<HashMap<SketchType, OnlineSketchCosts>>>;
 
 /// Initialise the store from the static benchmark table.

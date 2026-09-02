@@ -1,4 +1,4 @@
-//! SP-6 Pareto frontier planner.
+//! SP-6 Pareto frontier reporting for physical plans.
 //!
 //! The cost-model planner minimises bandwidth while meeting the accuracy SLA.
 //! This module extends it by enumerating **all** Pareto-optimal plans across
@@ -23,10 +23,12 @@
 
 use std::collections::HashMap;
 
-use crate::optimizer::cost::delta::decide_delta;
-use crate::optimizer::cost::online;
-use crate::optimizer::cost::{benchmark_table_pub, score_with, SketchCosts};
-use crate::optimizer::rules::{default_sketch_params, select_window_strategy, RulesPlanner};
+use crate::physical::deployment_cost::delta::decide_delta;
+use crate::physical::deployment_cost::online;
+use crate::physical::deployment_cost::{benchmark_table_pub, score_with, SketchCosts};
+use crate::physical::workload_planner::{
+    default_sketch_params, select_window_strategy, DeploymentPlanCompiler,
+};
 use crate::types::*;
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -104,7 +106,7 @@ pub fn pareto_frontier(
     };
 
     let candidates = all_sketch_types();
-    let rules = RulesPlanner::new();
+    let rules = DeploymentPlanCompiler::new();
     let mut points: Vec<ParetoPoint> = Vec::new();
 
     for st in candidates {

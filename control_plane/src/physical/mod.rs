@@ -24,12 +24,15 @@ pub mod allocator;
 pub mod colored_dag;
 pub mod compiler;
 pub mod deployment;
+pub mod deployment_cost;
 pub mod plan;
+pub mod plan_cache;
 pub mod planner;
 pub mod sketch_catalog;
 pub mod stage_split;
 pub mod topology;
 pub mod window_fusion;
+pub mod workload_planner;
 
 // Convenience re-exports — preserve the surface that consumers of the
 // former `algebra` module relied on.

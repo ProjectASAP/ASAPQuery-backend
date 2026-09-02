@@ -1,4 +1,4 @@
-//! Sketch wire-cost table — per-family OTLP wire footprint.
+//! Physical sketch wire-cost table — per-family OTLP wire footprint.
 //!
 //! Retirement note (2026-07): this file originally also carried a
 //! Phase ε.1 three-mode bind-placement selector (`BindMode` +

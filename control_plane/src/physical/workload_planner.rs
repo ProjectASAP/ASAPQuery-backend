@@ -1,3 +1,6 @@
+//! Compatibility compiler from legacy flat workloads to physical deployment
+//! plans. Summary selection delegates to ASAPPlanner.
+
 use chrono::Utc;
 use std::time::Duration;
 
@@ -286,12 +289,12 @@ pub fn bind_workload_typed_with_item_filter(
     Some(crate::sketch_algebra::physical_expr::PhysicalExpr::committed(node))
 }
 
-pub struct RulesPlanner {
+pub struct DeploymentPlanCompiler {
     pub valid_for: Duration,
     pub sketch_defaults: SketchDefaults,
 }
 
-impl RulesPlanner {
+impl DeploymentPlanCompiler {
     pub fn new() -> Self {
         Self {
             valid_for: DEFAULT_VALID_FOR,
@@ -347,7 +350,7 @@ impl RulesPlanner {
                 transmit_sketch: false,
                 drop_original: true,
                 // Delta fields are left as disabled defaults here; the
-                // CostModelPlanner overwrites them via decide_delta().
+                // DeploymentCostPlanner overwrites them via decide_delta().
                 delta_transmission: false,
                 delta_threshold: 0.0,
                 gos: None,
@@ -448,19 +451,19 @@ mod tests {
 
     #[test]
     fn quantile_selects_ddsketch() {
-        let plan = RulesPlanner::new().plan(&workload(vec![AggType::Quantile]));
+        let plan = DeploymentPlanCompiler::new().plan(&workload(vec![AggType::Quantile]));
         assert_eq!(plan.agent_config.sketch_type, SketchType::DDSketch);
     }
 
     #[test]
     fn cardinality_selects_hll() {
-        let plan = RulesPlanner::new().plan(&workload(vec![AggType::Cardinality]));
+        let plan = DeploymentPlanCompiler::new().plan(&workload(vec![AggType::Cardinality]));
         assert_eq!(plan.agent_config.sketch_type, SketchType::HLL);
     }
 
     #[test]
     fn frequency_selects_countsketch() {
-        let plan = RulesPlanner::new().plan(&workload(vec![AggType::Frequency]));
+        let plan = DeploymentPlanCompiler::new().plan(&workload(vec![AggType::Frequency]));
         assert_eq!(plan.agent_config.sketch_type, SketchType::CountSketch);
     }
 
@@ -491,8 +494,8 @@ mod tests {
 
     #[test]
     fn quantile_priority_wins() {
-        let plan =
-            RulesPlanner::new().plan(&workload(vec![AggType::Quantile, AggType::Cardinality]));
+        let plan = DeploymentPlanCompiler::new()
+            .plan(&workload(vec![AggType::Quantile, AggType::Cardinality]));
         assert_eq!(
             plan.agent_config.sketch_type,
             SketchType::DDSketch,
@@ -504,7 +507,7 @@ mod tests {
     fn window_mode_when_latency_geq_time_window() {
         let mut w = workload(vec![AggType::Quantile]);
         w.latency_sla = Some(Duration::from_secs(600)); // 10m >= 5m
-        let plan = RulesPlanner::new().plan(&w);
+        let plan = DeploymentPlanCompiler::new().plan(&w);
         assert_eq!(plan.agent_config.mode, ProcessorMode::Window);
         assert_eq!(
             plan.agent_config.window_duration,
@@ -516,7 +519,7 @@ mod tests {
     fn batch_mode_when_latency_lt_time_window() {
         let mut w = workload(vec![AggType::Quantile]);
         w.latency_sla = Some(Duration::from_secs(60)); // 1m < 5m
-        let plan = RulesPlanner::new().plan(&w);
+        let plan = DeploymentPlanCompiler::new().plan(&w);
         assert_eq!(plan.agent_config.mode, ProcessorMode::Batch);
         assert_eq!(plan.agent_config.window_duration, None);
     }
@@ -525,7 +528,7 @@ mod tests {
     fn no_latency_sla_defaults_to_window() {
         let mut w = workload(vec![AggType::Quantile]);
         w.latency_sla = None;
-        let plan = RulesPlanner::new().plan(&w);
+        let plan = DeploymentPlanCompiler::new().plan(&w);
         assert_eq!(plan.agent_config.mode, ProcessorMode::Window);
     }
 
@@ -533,7 +536,7 @@ mod tests {
     fn aggregate_by_sorted() {
         let mut w = workload(vec![AggType::Quantile]);
         w.group_by_labels = vec!["zone".into(), "host.name".into(), "service".into()];
-        let plan = RulesPlanner::new().plan(&w);
+        let plan = DeploymentPlanCompiler::new().plan(&w);
         assert_eq!(
             plan.agent_config.aggregate_by,
             vec!["host.name", "service", "zone"]
@@ -548,7 +551,7 @@ mod tests {
             ("service".into(), "web".into()),
         ]
         .into();
-        let plan = RulesPlanner::new().plan(&w);
+        let plan = DeploymentPlanCompiler::new().plan(&w);
         assert_eq!(plan.agent_config.label_matchers.len(), 2);
     }
 
@@ -556,7 +559,7 @@ mod tests {
     fn ddsketch_accuracy_params() {
         let mut w = workload(vec![AggType::Quantile]);
         w.accuracy_sla = 0.005;
-        let plan = RulesPlanner::new().plan(&w);
+        let plan = DeploymentPlanCompiler::new().plan(&w);
         match &plan.agent_config.sketch_params {
             SketchParams::DDSketch {
                 relative_accuracy, ..
@@ -569,7 +572,7 @@ mod tests {
     fn hll_precision_coarse_sla() {
         let mut w = workload(vec![AggType::Cardinality]);
         w.accuracy_sla = 0.03;
-        let plan = RulesPlanner::new().plan(&w);
+        let plan = DeploymentPlanCompiler::new().plan(&w);
         match &plan.agent_config.sketch_params {
             SketchParams::HLL { precision } => {
                 assert_eq!(*precision, 10, "coarse SLA should use lower precision")
@@ -580,7 +583,7 @@ mod tests {
 
     #[test]
     fn valid_until_in_future() {
-        let plan = RulesPlanner::new().plan(&workload(vec![AggType::Quantile]));
+        let plan = DeploymentPlanCompiler::new().plan(&workload(vec![AggType::Quantile]));
         assert!(
             plan.valid_until > Utc::now(),
             "valid_until should be in the future"
@@ -589,7 +592,7 @@ mod tests {
 
     #[test]
     fn gateway_passthrough() {
-        let plan = RulesPlanner::new().plan(&workload(vec![AggType::Quantile]));
+        let plan = DeploymentPlanCompiler::new().plan(&workload(vec![AggType::Quantile]));
         assert!(plan.gateway_config.passthrough);
     }
 

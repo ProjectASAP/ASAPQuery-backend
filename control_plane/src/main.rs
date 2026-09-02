@@ -4,7 +4,6 @@ use control_plane::epsilon_alloc;
 use control_plane::metrics_exposer;
 use control_plane::monitor;
 use control_plane::opamp;
-use control_plane::optimizer;
 use control_plane::physical;
 use control_plane::pipeline;
 use control_plane::query_parser;
@@ -37,14 +36,14 @@ use emit::{
 use emit::{emit_for_runtime, AgentRuntime};
 use monitor::{Endpoint, ScrapedData, Scraper, Thresholds, Violation};
 use opamp::{AgentRole, OpampServer, RemoteConfig};
-use optimizer::baseline::BaselinePlanner;
-use optimizer::cost::online as online_cost_model;
-use optimizer::cost::online::{init_store as init_online_store, OnlineMetricsStore};
-use optimizer::cost::pareto::{pareto_frontier, select_best, ObjectiveWeights};
-use optimizer::cost::tco;
-use optimizer::cost::CostModelPlanner;
 use physical::allocator::SketchAllocator;
 use physical::colored_dag::emitter::BackendStageConfig;
+use physical::deployment_cost::online as online_cost_model;
+use physical::deployment_cost::online::{init_store as init_online_store, OnlineMetricsStore};
+use physical::deployment_cost::pareto::{pareto_frontier, select_best, ObjectiveWeights};
+use physical::deployment_cost::tco;
+use physical::deployment_cost::DeploymentCostPlanner;
+use physical::plan_cache::CachedDeploymentPlanner;
 use pipeline::{Analyzer, QuerySpec};
 use query_parser::parse_query_expr_canonical;
 use replan::Replanner;
@@ -59,7 +58,7 @@ use workload::WorkloadRegistry;
 #[derive(Clone)]
 struct AppState {
     analyzer: Arc<Analyzer>,
-    planner: Arc<BaselinePlanner>,
+    planner: Arc<CachedDeploymentPlanner>,
     store: Arc<PlanStore>,
     workload_store: Arc<WorkloadStore>,
     opamp: Arc<OpampServer>,
@@ -267,12 +266,12 @@ async fn main() {
     let sketch_defaults = types::SketchDefaults::load(&sketch_defaults_path);
     info!(path = %sketch_defaults_path, "loaded sketch defaults");
 
-    // ── BaselinePlanner backed by live EMA data ─────────────────────────────
+    // ── CachedDeploymentPlanner backed by live EMA data ─────────────────────────────
     // Runs the full cost-model optimisation once per metric on the first
     // request, then locks in that plan as the baseline.  The Replanner resets
     // and re-optimises on SLA violation or plan expiry.
-    let planner = Arc::new(BaselinePlanner::new(
-        CostModelPlanner::new()
+    let planner = Arc::new(CachedDeploymentPlanner::new(
+        DeploymentCostPlanner::new()
             .with_sketch_defaults(sketch_defaults)
             .with_online_store(Arc::clone(&online_store)),
     ));
@@ -822,8 +821,8 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                 crate::physical::colored_dag::StageConfig,
             >,
         > = if physical::stage_split::typed_stage_split_enabled() {
-            let physical_expr =
-                bound_physical.or_else(|| optimizer::rules::bind_workload_typed(&workload));
+            let physical_expr = bound_physical
+                .or_else(|| physical::workload_planner::bind_workload_typed(&workload));
             physical_expr.and_then(|pe| physical::stage_split::split_typed_three_stage(&pe))
         } else {
             None
@@ -1620,7 +1619,7 @@ async fn emit_bootstrap_typed(
     let mut chosen: Option<(String, crate::sketch_algebra::PhysicalExpr)> = None;
     'outer: for cand in &candidates {
         for (_, wl, _) in st.workload_store.get_all_for_metric(cand) {
-            if let Some(expr) = optimizer::rules::bind_workload_typed(&wl) {
+            if let Some(expr) = physical::workload_planner::bind_workload_typed(&wl) {
                 chosen = Some((cand.clone(), expr));
                 break 'outer;
             }
@@ -1900,8 +1899,8 @@ fn test_app_with_backend(backend_url: Option<String>) -> (AppState, axum::Router
         Arc::new(|_| {}),
         Duration::from_secs(60),
     ));
-    let planner = Arc::new(BaselinePlanner::new(
-        CostModelPlanner::new().with_online_store(Arc::clone(&online_store)),
+    let planner = Arc::new(CachedDeploymentPlanner::new(
+        DeploymentCostPlanner::new().with_online_store(Arc::clone(&online_store)),
     ));
     let replanner = Arc::new(Replanner::new(
         Arc::clone(&planner),
@@ -2089,7 +2088,7 @@ mod api_tests {
     async fn rollback_no_previous_returns_400() {
         let (st, app) = test_app();
         // Seed one plan directly.
-        use crate::optimizer::rules::RulesPlanner;
+        use crate::physical::workload_planner::DeploymentPlanCompiler;
         let wl = crate::types::QueryWorkload {
             metric_name: "m".into(),
             label_filters: std::collections::HashMap::new(),
@@ -2106,7 +2105,7 @@ mod api_tests {
         st.store.set(
             "m",
             control_plane::workload::AggRole::Quantile,
-            RulesPlanner::new().plan(&wl),
+            DeploymentPlanCompiler::new().plan(&wl),
         );
         let req = Request::builder()
             .method("POST")
@@ -2337,8 +2336,8 @@ mod api_tests {
             Arc::new(|_| {}),
             Duration::from_secs(60),
         ));
-        let planner = Arc::new(BaselinePlanner::new(
-            CostModelPlanner::new().with_online_store(Arc::clone(&online_store)),
+        let planner = Arc::new(CachedDeploymentPlanner::new(
+            DeploymentCostPlanner::new().with_online_store(Arc::clone(&online_store)),
         ));
 
         // Pre-populate plan store (simulating what main() does with workload registry).
@@ -2482,8 +2481,8 @@ mod api_tests {
             Arc::new(|_| {}),
             Duration::from_secs(60),
         ));
-        let planner = Arc::new(BaselinePlanner::new(
-            CostModelPlanner::new().with_online_store(Arc::clone(&online_store)),
+        let planner = Arc::new(CachedDeploymentPlanner::new(
+            DeploymentCostPlanner::new().with_online_store(Arc::clone(&online_store)),
         ));
 
         // Seed workload + plan for "metric_a".

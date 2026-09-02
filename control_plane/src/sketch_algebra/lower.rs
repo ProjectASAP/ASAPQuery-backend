@@ -55,7 +55,7 @@ pub enum BindingError {
 /// planning-time family/sizing preferences). The result is always
 /// [`PhysicalExpr::Committed`] — this walk never picks a Phase ε.1
 /// backend/archive placement; that's a separate, later L5 decision
-/// (`optimizer::cost::wire`).
+/// (`physical::deployment_cost::wire`).
 pub fn bind_query_expr(
     expr: &QueryExpr,
     accuracy: AccuracyTarget,

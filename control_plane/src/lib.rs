@@ -66,7 +66,6 @@ pub mod epsilon_alloc;
 pub mod metrics_exposer;
 pub mod monitor;
 pub mod opamp;
-pub mod optimizer;
 pub mod physical;
 pub mod pipeline;
 pub mod planner_selection;

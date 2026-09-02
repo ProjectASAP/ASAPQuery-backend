@@ -478,7 +478,7 @@ impl SketchAllocator {
             }
 
             // `LetBinding`/`Ref` don't exist in the canonical `QueryExpr`
-            // anymore (see `optimizer::engine::CommonSubexprElim`'s doc).
+            // anymore; canonical rewrite ownership lives in ASAPPlanner.
 
             // `asap_ir`'s PromQL-surface superset (Scalar / EvalTime /
             // VectorFromScalar / ScalarFromVector / Relabel / InfoJoin /
@@ -1024,7 +1024,7 @@ mod tests {
     }
 
     // `LetBinding` doesn't exist in the canonical `QueryExpr` anymore
-    // (see `optimizer::engine::CommonSubexprElim`'s doc) -- the
+    // (canonical rewrite ownership lives in ASAPPlanner) -- the
     // `let_binding_inherits_body_stage` test that used to exercise it
     // is gone with it.
 

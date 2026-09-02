@@ -311,13 +311,13 @@ fn bind_cms_topk_tight_recall_picks_countsketch() {
 }
 
 /// (c) The chosen family is the **cost-minimal one that meets the recall
-/// SLA**, per the `optimizer::cost::wire` table — the same "min cost s.t.
+/// SLA**, per the `physical::deployment_cost::wire` table — the same "min cost s.t.
 /// SLA" the oracle uses. Loose → both families clear the bar → cheapest
 /// (CMS, ~4 KB) wins; the CountSketch alternative (~250 KB) is ~66×
 /// costlier.
 #[test]
 fn bind_cms_topk_picks_cost_min_meeting_sla() {
-    use crate::optimizer::cost::wire::WireCostTable;
+    use crate::physical::deployment_cost::wire::WireCostTable;
     let table = WireCostTable::default();
     let cms = table.for_kind(&SketchAlgorithm::Cms).per_flush();
     let cs = table.for_kind(&SketchAlgorithm::CountSketch).per_flush();
@@ -865,7 +865,7 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
 // built via `crate::planner_selection::frequency(accuracy, item)`) now binds to a
 // real `Cms` summary via `ControlPlaneCostModel::realize_extension`/
 // `readout_extension` (ASAPController#150) — see `frequency_extension_binds_cms`
-// below and `optimizer::rules::mod::tests::typed_binding_endpoint_request_freq_binds_cms`.
+// below and `physical::workload_planner::mod::tests::typed_binding_endpoint_request_freq_binds_cms`.
 // `AggIntent::TopK { accuracy: Exact }` still declines to bind
 // (`SummaryExpr::KeepPreAsap`) rather than summary — a REAL, accepted
 // behavior change from this migration that remains open

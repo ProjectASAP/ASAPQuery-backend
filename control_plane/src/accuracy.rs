@@ -14,7 +14,7 @@
 //! approximates the bound inline in a few places
 //! (`cost_model.rs:156-158`). Centralising the derivation here:
 //!
-//! * lets `RulesPlanner` / `CostModelPlanner` / any future
+//! * lets `DeploymentPlanCompiler` / `DeploymentCostPlanner` / any future
 //!   planner compute the post-hoc ε of the chosen plan and
 //!   verify it actually meets the SLA.
 //! * surfaces the bound to downstream systems (backend via
