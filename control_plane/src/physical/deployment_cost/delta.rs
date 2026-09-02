@@ -1,6 +1,6 @@
 // planner/delta_cost_model.rs
 //
-// Delta transmission cost model.
+// Delta transmission deployment cost model.
 //
 // Compares three transmission strategies for a given workload and sketch plan:
 //
@@ -470,7 +470,7 @@ pub fn decide_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::optimizer::rules::default_sketch_params;
+    use crate::physical::workload_planner::default_sketch_params;
     use chrono::Utc;
     use std::collections::HashMap;
 

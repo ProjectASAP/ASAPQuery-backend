@@ -1,3 +1,5 @@
+//! Physical deployment cost model and reporting helpers.
+
 use std::collections::HashMap;
 
 // Sub-modules — formerly siblings of `planner/cost_model.rs` (now
@@ -11,7 +13,9 @@ pub mod tco;
 pub mod wire;
 
 use self::delta::decide_delta;
-use crate::optimizer::rules::{default_sketch_params, select_window_strategy, RulesPlanner};
+use crate::physical::workload_planner::{
+    default_sketch_params, select_window_strategy, DeploymentPlanCompiler,
+};
 use crate::types::*;
 
 // ── Benchmark-derived cost table ──────────────────────────────────────────────
@@ -180,23 +184,23 @@ fn estimate_error(_st: &SketchType, p: &SketchParams, costs: SketchCosts) -> f64
     }
 }
 
-// ── CostModelPlanner ──────────────────────────────────────────────────────────
+// ── DeploymentCostPlanner ──────────────────────────────────────────────────────────
 
 /// Extends the rule-based planner by scoring all valid sketch candidates and
 /// choosing the one with the lowest bandwidth that still meets the AccuracySLA.
 ///
-/// When an [`OnlineMetricsStore`] is attached (via [`CostModelPlanner::with_online_store`])
+/// When an [`OnlineMetricsStore`] is attached (via [`DeploymentCostPlanner::with_online_store`])
 /// the planner blends live EMA observations into the cost table used for scoring,
 /// so that real-world behaviour gradually supersedes the static benchmark defaults.
-pub struct CostModelPlanner {
-    inner: RulesPlanner,
+pub struct DeploymentCostPlanner {
+    inner: DeploymentPlanCompiler,
     online_store: Option<online::OnlineMetricsStore>,
 }
 
-impl CostModelPlanner {
+impl DeploymentCostPlanner {
     pub fn new() -> Self {
         Self {
-            inner: RulesPlanner::new(),
+            inner: DeploymentPlanCompiler::new(),
             online_store: None,
         }
     }
@@ -429,7 +433,7 @@ mod tests {
             ],
             ..workload(vec![AggType::Quantile])
         };
-        let pl = RulesPlanner::new();
+        let pl = DeploymentPlanCompiler::new();
         let s_few = score(&pl.plan(&w_few), &w_few);
         let s_many = score(&pl.plan(&w_many), &w_many);
         assert!(s_many.bandwidth_bytes_per_sec > s_few.bandwidth_bytes_per_sec);
@@ -452,7 +456,7 @@ mod tests {
 
     #[test]
     fn cost_model_planner_meets_sla_for_all_agg_types() {
-        let pl = CostModelPlanner::new();
+        let pl = DeploymentCostPlanner::new();
         for (agg, sla) in [
             (AggType::Quantile, 0.01),
             (AggType::Cardinality, 0.01),
@@ -478,7 +482,7 @@ mod tests {
             accuracy_sla: 0.02,
             ..workload(vec![AggType::Cardinality])
         };
-        let plan = CostModelPlanner::new().plan(&w, None);
+        let plan = DeploymentCostPlanner::new().plan(&w, None);
         assert_eq!(
             plan.agent_config.sketch_type,
             SketchType::HLL,
@@ -488,7 +492,7 @@ mod tests {
 
     #[test]
     fn cost_model_valid_until_in_future() {
-        let plan = CostModelPlanner::new().plan(&workload(vec![AggType::Quantile]), None);
+        let plan = DeploymentCostPlanner::new().plan(&workload(vec![AggType::Quantile]), None);
         assert!(plan.valid_until > Utc::now());
     }
 }

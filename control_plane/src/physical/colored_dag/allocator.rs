@@ -292,7 +292,7 @@ impl ThreeStageWalker {
             // `Logical(Merge)` PhysicalExpr variant for the gateway hop.
             QE::Aggregate { .. } => Ok(StageId::Edge),
             // `LetBinding`/`Ref` don't exist in the canonical `QueryExpr`
-            // anymore -- see `optimizer::engine::CommonSubexprElim`'s doc.
+            // anymore; canonical rewrite ownership lives in ASAPPlanner.
             // A-variants lifted in Batch 2 of the relational migration.
             // No colored-DAG consumer constructs them today; conservatively
             // route to the Edge stage (matches the per-row Scan/Window

@@ -389,10 +389,12 @@ pub fn collect_metric_to_family(
                     .get(label)
                     .map(|v| (label, v.as_str()))
             });
-            let Some(physical_expr) = crate::optimizer::rules::bind_workload_typed_with_item_filter(
-                &workload,
-                item_filter,
-            ) else {
+            let Some(physical_expr) =
+                crate::physical::workload_planner::bind_workload_typed_with_item_filter(
+                    &workload,
+                    item_filter,
+                )
+            else {
                 continue;
             };
             if let Some(kind) = extract_root_sketch_kind(&physical_expr) {
@@ -1022,7 +1024,7 @@ mod runtime_tests {
             // `CountMinSketch` override re-derives statistic to
             // `Frequency`, `AggIntent::Extension`-shaped — now binds via
             // `ControlPlaneCostModel::realize_extension` (ASAPController#150,
-            // see `optimizer::rules::tests::typed_binding_endpoint_request_freq_binds_cms`).
+            // see `physical::workload_planner::tests::typed_binding_endpoint_request_freq_binds_cms`).
             (
                 "endpoint_request_freq",
                 Some(BTreeSet::from([SketchAlgorithm::Cms])),

@@ -5,7 +5,7 @@
 //! overlapping capability tables into this module. The performance /
 //! cost-model half of that consolidation — [`SketchCapability`] /
 //! `SupportedIntent` / `default_capability_table` / `load_capability_overrides`
-//! — moved to `crate::optimizer::cost::sketch_capability` (Stage 4 of the
+//! — moved to `crate::physical::deployment_cost::sketch_capability` (Stage 4 of the
 //! `sketch_algebra` re-layering): it's a cost-model concern read by the
 //! optimizer and physical planner, not L4 IR. What's left here:
 //!

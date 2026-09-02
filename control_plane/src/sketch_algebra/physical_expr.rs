@@ -27,7 +27,7 @@
 //!   hence `L4Plan` rather than `PhysicalExpr`.
 //! - **`RawAtEdgeSketchAtBackend` / `RawAtEdgePrometheusArchive`** — Phase
 //!   ε.1's placement decisions (where the sketch gets built, not what it
-//!   is). Genuinely L5. `optimizer::cost::wire` once named the same three
+//!   is). Genuinely L5. `physical::deployment_cost::wire` once named the same three
 //!   modes as `BindMode` with a `select_bind_mode` chooser, but that
 //!   selector was never wired to a caller (`bind_query_expr` always
 //!   produces `Committed`) and was removed in the 2026-07 retirement

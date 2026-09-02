@@ -1,6 +1,8 @@
 //! Physical deployment constraints used by CTSA stage placement.
 
-use crate::optimizer::cost::sketch_capability::{default_capability_table, SketchCapability};
+use crate::physical::deployment_cost::sketch_capability::{
+    default_capability_table, SketchCapability,
+};
 
 /// Built-in physical resource profile for a sketch implementation.
 pub fn sketch_capability(st: &crate::types::SketchType) -> SketchCapability {

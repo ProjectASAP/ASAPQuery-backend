@@ -103,7 +103,7 @@ mod l5_walk_propagation_tests {
     fn l5_walk_surfaces_metric_name_for_bind_workload_typed_output() {
         let w = workload("http_latency_ms", Vec::new(), Duration::from_secs(60));
         let physical_expr =
-            crate::optimizer::rules::bind_workload_typed(&w).expect("bind produced expr");
+            crate::physical::workload_planner::bind_workload_typed(&w).expect("bind produced expr");
         let configs = super::split_typed_three_stage(&physical_expr).expect("split ok");
         let backend_cfg = configs
             .into_values()
@@ -127,7 +127,7 @@ mod l5_walk_propagation_tests {
     fn l5_walk_surfaces_window_secs_for_bind_workload_typed_output() {
         let w = workload("http_latency_ms", Vec::new(), Duration::from_secs(120));
         let physical_expr =
-            crate::optimizer::rules::bind_workload_typed(&w).expect("bind produced expr");
+            crate::physical::workload_planner::bind_workload_typed(&w).expect("bind produced expr");
         let configs = super::split_typed_three_stage(&physical_expr).expect("split ok");
         let backend_cfg = configs
             .into_values()
@@ -162,7 +162,7 @@ mod l5_walk_propagation_tests {
             Duration::from_secs(60),
         );
         let physical_expr =
-            crate::optimizer::rules::bind_workload_typed(&w).expect("bind produced expr");
+            crate::physical::workload_planner::bind_workload_typed(&w).expect("bind produced expr");
         let configs = super::split_typed_three_stage(&physical_expr).expect("split ok");
         let backend_cfg = configs
             .into_values()

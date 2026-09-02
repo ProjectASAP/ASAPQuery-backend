@@ -28,10 +28,10 @@ use crate::emit::{
 };
 use crate::monitor::Scraper;
 use crate::opamp::{OpampServer, RemoteConfig};
-use crate::optimizer::baseline::BaselinePlanner;
-use crate::optimizer::rules;
 use crate::physical::colored_dag::emitter::BackendStageConfig;
+use crate::physical::plan_cache::CachedDeploymentPlanner;
 use crate::physical::stage_split;
+use crate::physical::workload_planner as rules;
 use crate::store::{PlanStore, WorkloadStore};
 use crate::types::QueryWorkload;
 use crate::workload::AggRole;
@@ -47,7 +47,7 @@ fn short_hash(s: &str) -> String {
 // ── Replanner ─────────────────────────────────────────────────────────────────
 
 pub struct Replanner {
-    planner: Arc<BaselinePlanner>,
+    planner: Arc<CachedDeploymentPlanner>,
     plan_store: Arc<PlanStore>,
     workload_store: Arc<WorkloadStore>,
     opamp: Arc<OpampServer>,
@@ -94,7 +94,7 @@ pub struct Replanner {
 
 impl Replanner {
     pub fn new(
-        planner: Arc<BaselinePlanner>,
+        planner: Arc<CachedDeploymentPlanner>,
         plan_store: Arc<PlanStore>,
         workload_store: Arc<WorkloadStore>,
         opamp: Arc<OpampServer>,
@@ -855,15 +855,15 @@ mod tests {
 
     use chrono::Utc;
 
-    use crate::optimizer::baseline::BaselinePlanner;
-    use crate::optimizer::cost::CostModelPlanner;
+    use crate::physical::deployment_cost::DeploymentCostPlanner;
+    use crate::physical::plan_cache::CachedDeploymentPlanner;
     use crate::store::{PlanStore, WorkloadStore};
     use crate::types::*;
 
     fn make_replanner() -> Arc<Replanner> {
         let plan_store = Arc::new(PlanStore::new());
         let workload_store = Arc::new(WorkloadStore::new());
-        let planner = Arc::new(BaselinePlanner::new(CostModelPlanner::new()));
+        let planner = Arc::new(CachedDeploymentPlanner::new(DeploymentCostPlanner::new()));
         let opamp = Arc::new(crate::opamp::OpampServer::new());
         let scraper = Arc::new(crate::monitor::Scraper::new(
             vec![],
@@ -1264,7 +1264,7 @@ mod tests {
         // Build a Replanner wired to the mock backend + the shared cache.
         let plan_store = Arc::new(PlanStore::new());
         let workload_store = Arc::new(WorkloadStore::new());
-        let planner = Arc::new(BaselinePlanner::new(CostModelPlanner::new()));
+        let planner = Arc::new(CachedDeploymentPlanner::new(DeploymentCostPlanner::new()));
         let opamp = Arc::new(crate::opamp::OpampServer::new());
         let scraper = Arc::new(crate::monitor::Scraper::new(
             vec![],

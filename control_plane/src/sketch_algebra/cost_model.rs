@@ -42,7 +42,7 @@ use asap_aware_mapping::{
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SketchQuery};
 use planner_types::pre_asap::expr_ir::ColumnRef;
 
-use crate::optimizer::cost::wire::WireCostTable;
+use crate::physical::deployment_cost::wire::WireCostTable;
 use crate::planner_selection::FREQUENCY_EXT_KIND;
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::AggIntent;
@@ -382,7 +382,7 @@ impl CostModel for ControlPlaneCostModel {
 
 /// A `CostModel` that forces a single family for whichever intent it's
 /// asked to rank, delegating parameter sizing to an inner
-/// [`ControlPlaneCostModel`]. Used by `optimizer::rules::bind_workload_typed`,
+/// [`ControlPlaneCostModel`]. Used by `physical::workload_planner::bind_workload_typed`,
 /// which already has a definitive family pick from the capability matrix
 /// (or a `sketch_type_override`) and just needs the matching binding, not
 /// a fresh selection decision.

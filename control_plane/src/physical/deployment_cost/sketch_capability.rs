@@ -1,4 +1,4 @@
-//! Per-sketch performance / capability profile — the optimizer's cost-model
+//! Per-sketch performance / capability profile — the physical cost-model
 //! surface.
 //!
 //! Moved out of `sketch_algebra::capability` (Stage 4 of the
@@ -200,7 +200,7 @@ pub fn default_capability_table() -> HashMap<SketchAlgorithm, SketchCapability> 
 
 /// Load sketch capability overrides from a YAML file. Falls back to
 /// [`default_capability_table`] if the file is missing or malformed.
-/// Replaces `algebra::optimizer::load_sketch_capabilities`.
+/// Physical replacement for the retired logical capability loader.
 ///
 /// Env var: `CONTROLLER_SKETCH_CAPABILITIES=path/to/this/file.yml`.
 pub fn load_capability_overrides(path: &str) -> HashMap<SketchAlgorithm, SketchCapability> {

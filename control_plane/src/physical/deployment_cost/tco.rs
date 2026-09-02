@@ -1,3 +1,5 @@
+//! Physical deployment total-cost-of-ownership estimator.
+
 use serde::{Deserialize, Serialize};
 
 /// Cloud pricing configuration (loaded from YAML or defaults).

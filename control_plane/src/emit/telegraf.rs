@@ -26,7 +26,7 @@
 //!
 //! Three modes (the placement decision itself is made upstream in
 //! `stage_split`; the `BindMode`-shaped selector Phase ε.1 sketched out
-//! in `optimizer::cost::wire` was never wired in and was removed in the
+//! in `physical::deployment_cost::wire` was never wired in and was removed in the
 //! 2026-07 retirement pass — see that module's doc):
 //!
 //! 1. `SketchAtEdge` — `[[processors.allsketches]]` between
