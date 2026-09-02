@@ -1,4 +1,4 @@
-//! Inverse of [`capability_for`](crate::sketch_algebra::capability::capability_for):
+//! Inverse of [`capability_for`](crate::physical::runtime_capability::capability_for):
 //! given a required [`Capability`], enumerate the concrete [`SketchType`]
 //! families that can satisfy it.
 //!
@@ -9,7 +9,7 @@
 //! without a hand-written workload YAML.
 //!
 //! Policy encoded here (matches `Capability::is_satisfied_by` on the matching
-//! side, `sketch_algebra::capability`):
+//! side, `physical::runtime_capability`):
 //!   * `QuantileApprox`   → DDSketch | KLL
 //!   * `CardinalityApprox`→ HLL
 //!   * `FrequencyEstimate`→ CountSketch | CountMinSketch   (heap-less point query)
@@ -23,7 +23,7 @@
 //! re-layering) — this is a query-planning concern (its one caller is
 //! [`crate::query_planning`]), not L4 IR.
 
-use crate::sketch_algebra::capability::{Capability, SketchKindHandle};
+use crate::physical::runtime_capability::{Capability, SketchKindHandle};
 use crate::types::SketchType;
 
 /// Map a sketch handle to the allocatable control-plane [`SketchType`].

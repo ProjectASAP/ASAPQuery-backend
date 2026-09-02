@@ -11,7 +11,7 @@
 //! for the materialization payload (no separate `ExactAggregate` variant —
 //! see the design doc §3 for why), `asap_ir`/`crate::intent_algebra`'s
 //! `Source`/`ColumnRef`/`WindowKind` for the L3 IR fragments,
-//! `crate::sketch_algebra::capability::Capability` for routing, and
+//! `crate::physical::runtime_capability::Capability` for routing, and
 //! `asap_types::{PolicyFingerprint, MonitorSpec}` for the two types
 //! already shared with `data_plane` for exactly this cross-crate reason.
 //!
@@ -38,7 +38,7 @@ use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::sketch_algebra::capability::{Capability, SketchKindHandle};
+use crate::physical::runtime_capability::{Capability, SketchKindHandle};
 use asap_types::enums::WindowKind;
 use planner_types::pre_asap::{ColumnRef, Source};
 

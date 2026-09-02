@@ -255,7 +255,7 @@ pub fn bind_workload_typed_with_item_filter(
     // a valid heavy-hitter sketch; the unbiased CountSketch remains the
     // canonical pick when no override is supplied. The backend's "top-K
     // from CountMin state" readout path is a separate workstream — see
-    // `sketch_algebra::capability_matching` module docs for the gap note.
+    // Planner validates the forced family before this physical adapter commits it.
     //
     // `StatisticClass::Frequency` (the `endpoint_request_freq` contract
     // row) is `AggIntent::Extension`-shaped. This used to always decline

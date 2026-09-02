@@ -90,7 +90,7 @@ impl Matcher for SummaryFamilyMatcher {
 /// same rule [`SummaryFamilyMatcher::is_satisfied_by`] applies in its
 /// `Sketch` arm, exposed directly for callers that only have bare kinds
 /// (no [`planner_types::post_asap::SketchParams`]) to compare.
-/// `control_plane::sketch_algebra::capability::Capability::is_satisfied_by`
+/// `control_plane::physical::runtime_capability::Capability::is_satisfied_by`
 /// is the first such caller: its `SketchKindHandle` query-side dispatch
 /// tag never carries params, so constructing a full
 /// `Implementation::Sketch{kind, params}` just to discard the params

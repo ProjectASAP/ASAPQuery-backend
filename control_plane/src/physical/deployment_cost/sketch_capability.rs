@@ -1,7 +1,7 @@
 //! Per-sketch performance / capability profile — the physical cost-model
 //! surface.
 //!
-//! Moved out of `sketch_algebra::capability` (Stage 4 of the
+//! Moved out of `physical::runtime_capability` (Stage 4 of the
 //! `promql_utilities` retirement / `sketch_algebra` re-layering): this is a
 //! cost-model concern (insert/query throughput, memory, CPU, transmission
 //! size, which intents each sketch family serves), read by the optimizer

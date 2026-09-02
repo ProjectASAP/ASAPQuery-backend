@@ -42,7 +42,7 @@ use std::rc::Rc;
 
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryExpr, SummaryNode};
 
-use control_plane::sketch_algebra::capability::{OuterFn, SketchKindHandle};
+use control_plane::physical::runtime_capability::{OuterFn, SketchKindHandle};
 use control_plane::sketch_algebra::cost_model::ObservedFamilyCostModel;
 use control_plane::sketch_algebra::{
     bind_query_expr_with_cost_model, BindingError, L4Plan, PhysicalExpr,

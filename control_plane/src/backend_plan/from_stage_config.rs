@@ -26,7 +26,7 @@ use asap_types::{AggregationConfig, MonitorSpec, PolicyFingerprint, QueryLanguag
 use crate::emit::monitor::{agg_id_for_metric, MonitorIntent};
 use crate::emit::stage_config::build_backend_aggregation_json;
 use crate::physical::colored_dag::emitter::{BackendAggregation, BackendStageConfig};
-use crate::sketch_algebra::capability::{Capability, SketchKindHandle};
+use crate::physical::runtime_capability::{Capability, SketchKindHandle};
 use asap_types::enums::WindowKind;
 use planner_types::pre_asap::{ColumnRef, Source};
 
@@ -168,7 +168,7 @@ fn exact_kind_params_for_override(
 /// (mirrors the wire's `aggregationType` bypass — see
 /// `BackendAggregation::agg_type_override`'s doc); otherwise derive from
 /// the sketch family + readout op, matching
-/// `sketch_algebra::capability::Capability`'s variant-per-query-shape
+/// `physical::runtime_capability::Capability`'s variant-per-query-shape
 /// design.
 fn capability_for_readout(
     agg: &BackendAggregation,
