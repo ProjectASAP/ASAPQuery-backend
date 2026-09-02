@@ -1,7 +1,6 @@
 use control_plane::backend_client;
 use control_plane::emit;
 use control_plane::epsilon_alloc;
-use control_plane::intent_algebra;
 use control_plane::metrics_exposer;
 use control_plane::monitor;
 use control_plane::opamp;
@@ -723,7 +722,7 @@ fn compile_physical_plan_request(
         queries.push(physical::compiler::PlanningQuery {
             query_id: query.query_id,
             expr,
-            source: intent_algebra::Source::TimeSeries {
+            source: planner_types::pre_asap::Source::TimeSeries {
                 metric: query.metric,
             },
             window_secs: query.window_secs,

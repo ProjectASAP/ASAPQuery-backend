@@ -36,10 +36,10 @@ use std::rc::Rc;
 use asap_aware_mapping::cost_model::CostModel;
 use thiserror::Error;
 
-use crate::intent_algebra::{AggIntent, QueryExpr};
 use crate::sketch_algebra::cost_model::ControlPlaneCostModel;
 use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
 use crate::types_v2::AccuracyTarget;
+use planner_types::pre_asap::{AggIntent, QueryExpr};
 
 /// Errors surfaced by the `bind_query_expr` lowering.
 #[derive(Debug, Error)]

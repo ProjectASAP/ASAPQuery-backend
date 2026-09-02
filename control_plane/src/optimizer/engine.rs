@@ -1,7 +1,7 @@
 //! Cost-based fixed-point query optimizer.
 //!
 //! The optimizer applies a set of algebraic rewrite rules to a canonical
-//! [`QueryExpr`](crate::intent_algebra::QueryExpr) tree until no rule fires
+//! [`QueryExpr`](planner_types::pre_asap::QueryExpr) tree until no rule fires
 //! (fixed point).  Each rule is a pure function `QueryExpr → Option<QueryExpr>`:
 //! returning `None` means "this rule does not apply here".
 //!
@@ -30,13 +30,13 @@
 
 use std::rc::Rc;
 
-use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::query_expr::{QueryExpr, Reduction, SetOpKind, Source};
-use crate::intent_algebra::relational::{agg_is_exact, agg_is_mergeable};
 use crate::optimizer::cost::sketch_capability::{
     default_capability_table, load_capability_overrides, SketchCapability,
 };
 use crate::types_v2::AccuracyTarget;
+use planner_types::pre_asap::AggIntent;
+use planner_types::pre_asap::{agg_is_exact, agg_is_mergeable};
+use planner_types::pre_asap::{QueryExpr, Reduction, SetOpKind, Source};
 
 // ── Cost model interface ──────────────────────────────────────────────────────
 
@@ -220,7 +220,7 @@ impl CostModel for DefaultCostModel {
             } if aggs.len() == 1 && having.is_none() => match &aggs[0] {
                 AggIntent::Quantile { .. } => 0.05,
                 AggIntent::Cardinality { .. } => 0.02,
-                op if crate::intent_algebra::as_frequency(op).is_some() => 0.03,
+                op if crate::planner_selection::as_frequency(op).is_some() => 0.03,
                 AggIntent::TopK { k, .. } => (*k as f64).recip().min(0.1),
                 op if agg_is_exact(op) => 1.0,
                 _ => 0.1,
@@ -548,7 +548,7 @@ impl RewriteRule for TopKFusion {
 // R7 (retired): `SubqueryDecorrelation` used to hoist a `ScalarSubquery`
 // predicate into a `LetBinding`, pattern-matching the old `Predicate`
 // enum's `BinaryOp` / `ScalarSubquery` / `Column(ColumnRef::Named(_))`
-// variants directly. The canonical `Predicate(L3Expr)` merge (see
+// variants directly. The canonical `Predicate(QueryExpr)` merge (see
 // `intent_algebra::lower` module docs) rejects `ScalarSubquery` at
 // construction time instead of lowering it, so this rule has no
 // construction site left to fire against — deleted rather than ported.
@@ -1013,11 +1013,9 @@ fn default_rules() -> Vec<Box<dyn RewriteRule>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::query_expr::{GroupKeys, Predicate};
-    use crate::intent_algebra::relational::{default_cardinality, default_quantile};
-    use crate::intent_algebra::{
-        BinaryOpKind, L3Expr, L3Scalar, Schema, SortKey, Source, WindowKind,
-    };
+    use planner_types::pre_asap::{default_cardinality, default_quantile};
+    use planner_types::pre_asap::{BinaryOpKind, QueryExpr, ScalarValue, Schema, SortKey, Source};
+    use planner_types::pre_asap::{GroupKeys, Predicate};
     use std::time::Duration;
 
     /// Canonical `Scan` leaf.
@@ -1044,7 +1042,7 @@ mod tests {
     }
 
     fn true_pred() -> Predicate {
-        Predicate(Rc::new(L3Expr::Literal(L3Scalar::Boolean(true))))
+        Predicate(Rc::new(QueryExpr::Literal(ScalarValue::Boolean(true))))
     }
 
     fn opt() -> QueryOptimizer {
@@ -1104,7 +1102,7 @@ mod tests {
             pred: true_pred(),
             child: Rc::new(QueryExpr::Sort {
                 keys: vec![SortKey {
-                    expr: L3Expr::Column(0),
+                    expr: QueryExpr::Column(0),
                     ascending: true,
                     nulls_first: false,
                 }],
@@ -1144,7 +1142,7 @@ mod tests {
             offset: 0,
             child: Rc::new(QueryExpr::Sort {
                 keys: vec![SortKey {
-                    expr: L3Expr::Column(0),
+                    expr: QueryExpr::Column(0),
                     ascending: false,
                     nulls_first: false,
                 }],
@@ -1167,7 +1165,7 @@ mod tests {
             offset: 0,
             child: Rc::new(QueryExpr::Sort {
                 keys: vec![SortKey {
-                    expr: L3Expr::Column(0),
+                    expr: QueryExpr::Column(0),
                     ascending: true,
                     nulls_first: false,
                 }],

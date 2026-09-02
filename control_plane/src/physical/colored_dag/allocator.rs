@@ -274,9 +274,9 @@ impl ThreeStageWalker {
     /// `LetBinding`/`Ref` at the L3 level reuse the same scope map.
     fn colour_logical(
         &mut self,
-        qe: &crate::intent_algebra::QueryExpr,
+        qe: &planner_types::pre_asap::QueryExpr,
     ) -> Result<StageId, AllocateError> {
-        use crate::intent_algebra::QueryExpr as QE;
+        use planner_types::pre_asap::QueryExpr as QE;
         match qe {
             QE::Scan { .. } => Ok(StageId::Edge),
             QE::TimeRange { .. } => Ok(StageId::Edge),
@@ -330,8 +330,8 @@ pub(crate) fn binding_stage(dag: &ColoredDag, name: &BindingName) -> Option<Stag
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::schema::{Column, DataType};
-    use crate::intent_algebra::{QueryExpr, Schema, Source};
+    use planner_types::pre_asap::{Column, DataType};
+    use planner_types::pre_asap::{QueryExpr, Schema, Source};
     use std::time::Duration;
 
     fn ts_scan() -> QueryExpr {
@@ -384,8 +384,8 @@ mod tests {
     #[test]
     fn three_stage_quantile_dag_basic() {
         let q = QueryExpr::Aggregate {
-            reduction: crate::intent_algebra::Reduction::PerEntity,
-            measures: vec![crate::intent_algebra::AggIntent::Quantile {
+            reduction: planner_types::pre_asap::Reduction::PerEntity,
+            measures: vec![planner_types::pre_asap::AggIntent::Quantile {
                 col: None,
                 q: 0.99,
                 accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),

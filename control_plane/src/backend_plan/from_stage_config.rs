@@ -25,9 +25,10 @@ use asap_types::{AggregationConfig, MonitorSpec, PolicyFingerprint, QueryLanguag
 
 use crate::emit::monitor::{agg_id_for_metric, MonitorIntent};
 use crate::emit::stage_config::build_backend_aggregation_json;
-use crate::intent_algebra::{ColumnRef, Source, WindowKind};
 use crate::physical::colored_dag::emitter::{BackendAggregation, BackendStageConfig};
 use crate::sketch_algebra::capability::{Capability, SketchKindHandle};
+use asap_types::enums::WindowKind;
+use planner_types::pre_asap::{ColumnRef, Source};
 
 use super::{BackendPlan, Materialization, RoutingEntry, StorageBackend, WindowSpec};
 

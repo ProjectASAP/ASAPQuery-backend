@@ -20,11 +20,11 @@
 
 #![allow(dead_code)]
 
-use crate::intent_algebra::agg_intent::AggIntent;
 use crate::sketch_algebra::matcher::sketch_family_satisfied;
 use crate::types_v2::AccuracyTarget;
 use asap_types::AggregationType;
 use planner_types::post_asap::SketchAlgorithm;
+use planner_types::pre_asap::AggIntent;
 
 // ── Query-side capability tag ────────────────────────────────────────────────
 
@@ -548,7 +548,7 @@ fn sum_satisfies_increase(required: AggregationType, available: AggregationType)
 /// same *shape*, even once they agree on substance), and its doc comment
 /// for the one deliberate override (`Count{Exact}`).
 pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
-    if let Some(accuracy) = crate::intent_algebra::as_frequency(intent) {
+    if let Some(accuracy) = crate::planner_selection::as_frequency(intent) {
         return if is_exact(&accuracy) {
             // Exact aggregation — sketch fallback is only meaningful
             // when raw counters aren't kept at the ingest tier; with
@@ -841,7 +841,7 @@ mod tests {
 
     #[test]
     fn frequency_estimate_with_epsilon_returns_frequency_estimate_approx() {
-        let intent = crate::intent_algebra::frequency(AccuracyTarget::Epsilon(0.01), None);
+        let intent = crate::planner_selection::frequency(AccuracyTarget::Epsilon(0.01), None);
         assert_eq!(
             capability_for(&intent),
             Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn frequency_estimate_with_epsilon_delta_returns_frequency_estimate_approx() {
-        let intent = crate::intent_algebra::frequency(
+        let intent = crate::planner_selection::frequency(
             AccuracyTarget::EpsilonDelta {
                 epsilon: 0.01,
                 delta: 0.001,
@@ -867,7 +867,7 @@ mod tests {
     fn frequency_estimate_with_exact_returns_none() {
         // Exact aggregation routes to archive (sketch fallback only
         // meaningful when raw counters aren't kept).
-        let intent = crate::intent_algebra::frequency(AccuracyTarget::Exact, None);
+        let intent = crate::planner_selection::frequency(AccuracyTarget::Exact, None);
         assert_eq!(capability_for(&intent), None);
     }
 

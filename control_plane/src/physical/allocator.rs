@@ -41,10 +41,10 @@
 use std::rc::Rc;
 
 use super::plan::{CostEstimate, ExecutionMode, NodeAnnotation, PipelineStage, PlanNode};
-use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::relational::agg_is_exact;
-use crate::intent_algebra::{QueryExpr, Reduction};
 use crate::types::{SketchType, StageResourceBudgets};
+use planner_types::pre_asap::agg_is_exact;
+use planner_types::pre_asap::AggIntent;
+use planner_types::pre_asap::{QueryExpr, Reduction};
 
 // ── Resource budget tracker ───────────────────────────────────────────────────
 
@@ -756,7 +756,7 @@ fn estimated_sketch_memory(op: &AggIntent) -> f64 {
 /// Map a canonical [`AggIntent`] to a short stable kind string for
 /// annotation rationale text.
 fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
-    if crate::intent_algebra::as_frequency(intent).is_some() {
+    if crate::planner_selection::as_frequency(intent).is_some() {
         return "frequency";
     }
     match intent {
@@ -810,13 +810,12 @@ fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::relational::{
-        default_cardinality, default_frequency, default_quantile,
-    };
-    use crate::intent_algebra::{JoinKind, L3Expr, L3Scalar, Predicate, QueryExpr, Schema, Source};
     use crate::physical::plan::{ExecutionMode, PipelineStage};
     use crate::types::{SketchType, StageResourceBudgets};
     use crate::types_v2::AccuracyTarget;
+    use crate::planner_selection::default_frequency;
+    use planner_types::pre_asap::{default_cardinality, default_quantile};
+    use planner_types::pre_asap::{JoinKind, Predicate, QueryExpr, ScalarValue, Schema, Source};
 
     /// Canonical `Scan` leaf — the L3 counterpart of the legacy
     /// `QueryExpr::Source(SourceSpec { .. })`.
@@ -879,7 +878,7 @@ mod tests {
     #[test]
     fn filter_at_agent() {
         let expr = QueryExpr::Filter {
-            pred: Predicate(Rc::new(L3Expr::Literal(L3Scalar::Boolean(true)))),
+            pred: Predicate(Rc::new(QueryExpr::Literal(ScalarValue::Boolean(true)))),
             child: Rc::new(scan("m")),
         };
         let node = alloc(unlimited(), expr);
@@ -982,7 +981,7 @@ mod tests {
     fn join_goes_to_db() {
         let expr = QueryExpr::Join {
             kind: JoinKind::Inner,
-            pred: Predicate(Rc::new(L3Expr::Literal(L3Scalar::Boolean(true)))),
+            pred: Predicate(Rc::new(QueryExpr::Literal(ScalarValue::Boolean(true)))),
             left: Rc::new(scan("orders")),
             right: Rc::new(scan("items")),
         };

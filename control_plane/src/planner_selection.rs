@@ -6,6 +6,7 @@
 
 use std::rc::Rc;
 
+use crate::types_v2::AccuracyTarget;
 use asap_aware_mapping::{
     AccuracyBudgetAllocator, AccuracyEvidenceProvider, AccuracyModel, CostModel, Replacement,
     ReplacementStrategy, SketchAlgorithmStrategy, TargetSubDAG,
@@ -13,6 +14,7 @@ use asap_aware_mapping::{
 use planner_types::post_asap::{
     SummaryExpr, SummaryFamilyType, SummaryField, SummaryNode, SummarySchema,
 };
+use planner_types::pre_asap::{agg_accuracy as planner_agg_accuracy, AggIntent};
 use planner_types::pre_asap::{QueryExpr, QueryExprError};
 use thiserror::Error;
 
@@ -24,6 +26,83 @@ pub enum SelectionError {
     NoLegalCandidate,
     #[error("ASAPPlanner sketch strategy produced a logical rewrite instead of a summary")]
     UnexpectedRewrite,
+}
+
+/// Deployment extension tag for keyed point-frequency queries. ASAPPlanner
+/// intentionally treats extension payloads as opaque; this adapter is the one
+/// backend-owned interpretation point.
+pub(crate) const FREQUENCY_EXT_KIND: &str = "frequency";
+
+pub fn frequency(accuracy: AccuracyTarget, item: Option<(String, String)>) -> AggIntent {
+    let mut payload = serde_json::json!({ "accuracy": accuracy });
+    if let Some((label, value)) = item {
+        payload["item_label"] = serde_json::Value::String(label);
+        payload["item_value"] = serde_json::Value::String(value);
+    }
+    AggIntent::Extension {
+        ext_kind: FREQUENCY_EXT_KIND.to_string(),
+        payload,
+    }
+}
+
+pub fn default_frequency() -> AggIntent {
+    frequency(AccuracyTarget::Epsilon(std::f64::consts::E / 2000.0), None)
+}
+
+pub fn as_frequency(intent: &AggIntent) -> Option<AccuracyTarget> {
+    match intent {
+        AggIntent::Extension { ext_kind, payload } if ext_kind == FREQUENCY_EXT_KIND => {
+            serde_json::from_value(payload.get("accuracy")?.clone()).ok()
+        }
+        _ => None,
+    }
+}
+
+pub fn agg_accuracy(intent: &AggIntent) -> f64 {
+    match as_frequency(intent) {
+        Some(AccuracyTarget::Exact) => 0.0,
+        Some(AccuracyTarget::Epsilon(epsilon))
+        | Some(AccuracyTarget::EpsilonDelta { epsilon, .. }) => epsilon,
+        None => planner_agg_accuracy(intent),
+    }
+}
+
+pub fn archive_only(intent: &AggIntent) -> bool {
+    if as_frequency(intent).is_some() {
+        return false;
+    }
+    matches!(
+        intent,
+        AggIntent::Absent
+            | AggIntent::AbsentOverTime
+            | AggIntent::PresentOverTime
+            | AggIntent::Delta
+            | AggIntent::Deriv
+            | AggIntent::PredictLinear { .. }
+            | AggIntent::DoubleExpSmoothing { .. }
+            | AggIntent::IDelta
+            | AggIntent::Resets
+            | AggIntent::Changes
+            | AggIntent::HistogramCount
+            | AggIntent::HistogramSum
+            | AggIntent::HistogramAvg
+            | AggIntent::HistogramStdDev
+            | AggIntent::HistogramStdVar
+            | AggIntent::HistogramFraction { .. }
+            | AggIntent::HistogramQuantile { .. }
+            | AggIntent::Math(_)
+            | AggIntent::TimeFn(_)
+            | AggIntent::Group
+            | AggIntent::CountValues { .. }
+            | AggIntent::LastOverTime
+            | AggIntent::FirstOverTime
+            | AggIntent::MadOverTime
+            | AggIntent::TsOfMinOverTime
+            | AggIntent::TsOfMaxOverTime
+            | AggIntent::TsOfFirstOverTime
+            | AggIntent::TsOfLastOverTime
+            | AggIntent::Extension { .. }
+    )
 }
 
 /// Preserve an unsupported subtree explicitly at the post-ASAP boundary.

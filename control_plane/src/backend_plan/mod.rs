@@ -38,8 +38,9 @@ use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::intent_algebra::{ColumnRef, Source, WindowKind};
 use crate::sketch_algebra::capability::{Capability, SketchKindHandle};
+use asap_types::enums::WindowKind;
+use planner_types::pre_asap::{ColumnRef, Source};
 
 /// Errors decoding a `BackendPlan` (or one of its parts) from its proto
 /// wire form. Encoding (`From<&T> for proto::T`) is always infallible —

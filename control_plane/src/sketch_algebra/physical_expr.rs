@@ -149,8 +149,8 @@ impl PhysicalExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::schema::{Column, DataType};
-    use crate::intent_algebra::{LabelFilter, QueryExpr, Schema, Source, WindowKind};
+    use asap_types::enums::WindowKind;
+    use planner_types::pre_asap::{Column, DataType, QueryExpr, Schema, Source};
     use std::time::Duration;
 
     fn ts_scan() -> QueryExpr {
@@ -178,11 +178,7 @@ mod tests {
             0,
             vec![vec![0, 1]],
         );
-        let lf = LabelFilter {
-            label: "service".into(),
-            equals: "api".into(),
-        };
-        let pred = crate::intent_algebra::label_filter_to_predicate(&lf, &schema)
+        let pred = crate::test_support::label_eq_predicate("service", "api", &schema)
             .expect("service column present in schema");
         QueryExpr::Scan {
             source: Source::TimeSeries {
@@ -203,8 +199,8 @@ mod tests {
     #[test]
     fn committed_wraps_an_implement_tree_result() {
         let q = QueryExpr::Aggregate {
-            reduction: crate::intent_algebra::Reduction::by(vec![]),
-            measures: vec![crate::intent_algebra::AggIntent::Quantile {
+            reduction: planner_types::pre_asap::Reduction::by(vec![]),
+            measures: vec![planner_types::pre_asap::AggIntent::Quantile {
                 col: None,
                 q: 0.99,
                 accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),

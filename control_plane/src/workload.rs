@@ -7,8 +7,8 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use tracing::{info, warn};
 
-use crate::intent_algebra::agg_intent::AggIntent;
 use crate::types::SketchType;
+use planner_types::pre_asap::AggIntent;
 
 /// Aggregation role a single (metric, query-shape) pair plays in the planner.
 ///
@@ -172,7 +172,7 @@ pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
         }
         return AggRole::Other;
     };
-    if crate::intent_algebra::as_frequency(outer).is_some() {
+    if crate::planner_selection::as_frequency(outer).is_some() {
         return AggRole::Count;
     }
     match outer {

@@ -22,12 +22,12 @@
 
 use std::time::Duration;
 
-use crate::intent_algebra::agg_intent::AggIntent;
-use crate::intent_algebra::query_expr::QueryExpr;
-use crate::intent_algebra::schema::ColumnId;
 use crate::physical::sketch_catalog;
 use crate::physical::window_fusion::{fused_sketch_decision, recognize_windowed_sketch};
 use crate::types::{SketchParams, SketchType};
+use planner_types::pre_asap::AggIntent;
+use planner_types::pre_asap::ColumnId;
+use planner_types::pre_asap::QueryExpr;
 
 // ── PhysicalAggOp (resolved sketch intent) ──────────────────────────────────
 
@@ -591,11 +591,10 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::intent_algebra::relational::{
-        default_cardinality, default_frequency, default_quantile,
-    };
-    use crate::intent_algebra::{Reduction, Schema, Source};
     use crate::types_v2::AccuracyTarget;
+    use crate::planner_selection::default_frequency;
+    use planner_types::pre_asap::{default_cardinality, default_quantile};
+    use planner_types::pre_asap::{Reduction, Schema, Source};
 
     fn default_config() -> PhysicalPlannerConfig {
         PhysicalPlannerConfig {
