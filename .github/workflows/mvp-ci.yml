@@ -1,0 +1,60 @@
+name: MVP CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mvp-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: MVP backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout ASAPQuery-backend
+        uses: actions/checkout@v4
+        with:
+          path: ASAPQuery-backend
+
+      - name: Checkout ASAPCollector dependency
+        uses: actions/checkout@v4
+        with:
+          repository: ProjectASAP/ASAPCollector
+          path: ASAPCollector
+
+      - name: Checkout asap_sketchlib dependency
+        uses: actions/checkout@v4
+        with:
+          repository: ProjectASAP/asap_sketchlib
+          path: asap_sketchlib
+
+      - name: Install Rust components
+        run: rustup component add rustfmt clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ASAPQuery-backend
+
+      - name: Check formatting
+        working-directory: ASAPQuery-backend
+        run: cargo fmt -p control_plane -p data_plane -- --check
+
+      - name: Check control plane and data plane
+        working-directory: ASAPQuery-backend
+        run: cargo check --locked -p control_plane -p data_plane
+
+      - name: Lint control plane and data plane
+        working-directory: ASAPQuery-backend
+        run: cargo clippy --locked -p control_plane -p data_plane --all-targets
+
+      - name: Test MVP control plane
+        working-directory: ASAPQuery-backend
+        run: cargo test --locked -p control_plane
