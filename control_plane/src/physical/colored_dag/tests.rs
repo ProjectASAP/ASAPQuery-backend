@@ -15,13 +15,13 @@ use planner_types::post_asap::{
     SummaryFamilyType, SummaryNode, SummarySchema,
 };
 
-use crate::intent_algebra::schema::{Column, DataType};
 use crate::intent_algebra::{ColumnRef, LabelFilter, QueryExpr, Reduction, Schema, Source};
 use crate::physical::colored_dag::allocator::StageAllocator;
 use crate::physical::colored_dag::emitter::{EmitError, Emitter, StageConfig, ThreeStageEmitter};
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
 use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
 use crate::types_v2::{AccuracyTarget, BindingName};
+use planner_types::pre_asap::{Column, DataType};
 
 // ── Test fixtures ─────────────────────────────────────────────────────────────
 

@@ -11,12 +11,12 @@ use planner_types::post_asap::{
 };
 use planner_types::pre_asap::expr_ir::ColumnRef;
 
-use crate::intent_algebra::schema::{Column, DataType};
 use crate::intent_algebra::{AggIntent, LabelFilter, QueryExpr, Reduction, Schema, Source};
 use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
 use crate::sketch_algebra::lower::bind_query_expr;
 use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
 use crate::types_v2::AccuracyTarget;
+use planner_types::pre_asap::{Column, DataType};
 
 fn sketch_family(kind: SketchAlgorithm, params: SketchParams) -> SummaryFamilyType {
     SummaryFamilyType::Sketch(SketchKind::new(kind, params), GroupingStrategy::default())

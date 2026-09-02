@@ -77,14 +77,12 @@
 
 pub mod agg_intent;
 pub mod query_expr;
-pub mod schema;
 
 // The **Layer-2 relational IR** — the `QueryExpr` tree the `query_parser`
 // front ends emit (`promql.rs` / `sql.rs`). Formerly `legacy_expr`; it is
 // the real, current L2 IR, not legacy debt. The planner / allocator /
 // physical planner still consume it directly while their migration onto
 // the canonical L3 `query_expr` types is in progress.
-pub mod column_resolution;
 pub mod relational;
 
 // `lower` (the L2 -> canonical-L3 conversion, `convert`/`convert_root`)
@@ -99,8 +97,6 @@ pub mod relational;
 // `convert_root` runs it so positional resolution is total. The
 // `SchemaCatalog` seam (design.md §6 "three metadata sources") makes the
 // schema source pluggable — usage-derived today, registry-backed later.
-pub mod binder;
-pub use binder::{Binder, SchemaCatalog, UsageDerivedCatalog};
 
 // Re-exports for the canonical surface — `crate::intent_algebra::*` for
 // downstream callers that don't want to chase sub-module paths.
@@ -109,21 +105,14 @@ pub use agg_intent::{
     default_frequency, default_quantile, frequency, is_frequency_heavy_hitter, output_column,
     ranking_measure, AggIntent, MathFunc, RankingMeasure, TimeFunc,
 };
+pub use planner_types::pre_asap::{
+    output_schema_for_aggregate, resolve_column_ref, resolve_column_refs, resolve_expr, Binder,
+    Column, ColumnId, DataType, ResolveError, Schema, SchemaCatalog, UsageDerivedCatalog,
+};
 pub use query_expr::{
     aggregate_output_schema, between, conjoin, label_filter_to_predicate, ArithmeticOpKind,
     AtModifier, BinaryOpKind, ColumnRef, CompareOpKind, DataModel, GroupKeys, GroupSide,
     InfoMatcher, JoinKind, LabelFilter, Predicate, ProjectItem, QueryExpr, QueryExprError,
     Reduction, SampleKind, ScalarValue, SetOpKind, SortKey, Source, TimeShift, UnresolvedQueryExpr,
     VectorGrouping, VectorMatch, VectorMatchKind, WindowFuncKind, WindowKind,
-};
-pub use schema::{Column, ColumnId, DataType, Schema};
-
-// Schema-driven column-resolution helpers used by the planning stack
-// (`optimizer/engine.rs`, `physical/{allocator,planner,stage_split}.rs`,
-// `query_parser/*`) to carry an inherited `Schema` alongside a
-// `relational::QueryExpr` traversal. Consumers call `resolve_column_ref`
-// at the point where they need a positional `ColumnId`.
-pub use column_resolution::{
-    output_schema_for_aggregate, resolve_column_ref, resolve_column_refs, resolve_expr,
-    resolve_group_keys_promql, ResolveError,
 };

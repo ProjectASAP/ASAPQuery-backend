@@ -149,8 +149,8 @@ impl PhysicalExpr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::intent_algebra::schema::{Column, DataType};
     use crate::intent_algebra::{LabelFilter, QueryExpr, Schema, Source, WindowKind};
+    use planner_types::pre_asap::{Column, DataType};
     use std::time::Duration;
 
     fn ts_scan() -> QueryExpr {

@@ -24,10 +24,10 @@ use std::time::Duration;
 
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::query_expr::QueryExpr;
-use crate::intent_algebra::schema::ColumnId;
 use crate::physical::sketch_catalog;
 use crate::physical::window_fusion::{fused_sketch_decision, recognize_windowed_sketch};
 use crate::types::{SketchParams, SketchType};
+use planner_types::pre_asap::ColumnId;
 
 // ── PhysicalAggOp (resolved sketch intent) ──────────────────────────────────
 

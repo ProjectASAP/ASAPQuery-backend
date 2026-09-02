@@ -146,9 +146,9 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::intent_algebra::schema::{Column, DataType};
     use crate::intent_algebra::{QueryExpr, Schema, Source};
     use crate::sketch_algebra::PhysicalExpr;
+    use planner_types::pre_asap::{Column, DataType};
 
     // These three dummies only need to be *structurally valid* and
     // distinct `PhysicalExpr` values — the tests below only inspect

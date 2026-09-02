@@ -58,7 +58,6 @@ pub fn bind_workload_typed_with_item_filter(
     w: &QueryWorkload,
     item_filter: Option<(&str, &str)>,
 ) -> Option<crate::sketch_algebra::PhysicalExpr> {
-    use crate::intent_algebra::schema::{Column, DataType};
     use crate::intent_algebra::{AggIntent as L3AggIntent, QueryExpr, Schema, Source};
     use crate::sketch_algebra::capability_matching::{
         classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
@@ -66,6 +65,7 @@ pub fn bind_workload_typed_with_item_filter(
     use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
     use crate::types_v2::AccuracyTarget;
     use planner_types::post_asap::SketchAlgorithm;
+    use planner_types::pre_asap::{Column, DataType};
 
     // Contract-row metrics (`classify_demo_metric` returns `Some`) and
     // operator-supplied overrides both signal "this metric must be

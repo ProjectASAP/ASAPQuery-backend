@@ -54,8 +54,8 @@ pub use planner_types::pre_asap::{
     is_frequency_heavy_hitter, ranking_measure, AggIntent, MathFunc, RankingMeasure, TimeFunc,
 };
 
-use crate::intent_algebra::schema::{Column, DataType};
 use crate::types_v2::AccuracyTarget;
+use planner_types::pre_asap::{Column, DataType};
 
 /// `ext_kind` tag for control_plane's point-frequency-via-CMS intent.
 /// `pub(crate)` (not just module-private) so

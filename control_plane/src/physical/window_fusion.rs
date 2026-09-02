@@ -28,10 +28,10 @@ use std::time::Duration;
 
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::query_expr::{QueryExpr, WindowKind};
-use crate::intent_algebra::schema::ColumnId;
 use crate::physical::planner::{
     decide_sketch_placement, resolve, PhysicalOp, PhysicalPlannerConfig, PhysicalWindow, Placement,
 };
+use planner_types::pre_asap::ColumnId;
 
 /// Canonical-shape view of a fused window-over-sketch — the canonical
 /// counterpart of a legacy `WindowedAgg` node, recognized out of the
@@ -188,11 +188,11 @@ mod tests {
 
     use super::*;
     use crate::intent_algebra::query_expr::Source;
-    use crate::intent_algebra::schema::Schema;
     use crate::intent_algebra::{default_cardinality, default_frequency, default_quantile};
     use crate::optimizer::engine::DeploymentConstraints;
     use crate::physical::planner::{plan, PhysicalOp};
     use crate::types::StageResourceBudgets;
+    use planner_types::pre_asap::Schema;
 
     fn config() -> PhysicalPlannerConfig {
         PhysicalPlannerConfig {
