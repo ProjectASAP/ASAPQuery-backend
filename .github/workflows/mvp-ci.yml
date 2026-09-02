@@ -39,6 +39,9 @@ jobs:
       - name: Install Rust components
         run: rustup component add rustfmt clippy
 
+      - name: Install protobuf compiler
+        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+
       - name: Configure private Cargo dependencies
         env:
           ASAP_CI_REPO_TOKEN: ${{ secrets.ASAP_CI_REPO_TOKEN }}
