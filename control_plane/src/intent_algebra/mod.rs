@@ -76,7 +76,6 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod agg_intent;
-pub mod expr_ir;
 pub mod query_expr;
 pub mod schema;
 
@@ -110,11 +109,11 @@ pub use agg_intent::{
     default_frequency, default_quantile, frequency, is_frequency_heavy_hitter, output_column,
     ranking_measure, AggIntent, MathFunc, RankingMeasure, TimeFunc,
 };
-pub use expr_ir::{ArithOp, ColumnRef, CompareOp, L2Expr, L3Expr, L3Scalar};
 pub use query_expr::{
-    aggregate_output_schema, between, conjoin, label_filter_to_predicate, AtModifier, BinaryOpKind,
-    DataModel, GroupKeys, GroupSide, InfoMatcher, JoinKind, LabelFilter, Predicate, ProjectItem,
-    QueryExpr, QueryExprError, Reduction, SampleKind, SetOpKind, SortKey, Source, TimeShift,
+    aggregate_output_schema, between, conjoin, label_filter_to_predicate, ArithmeticOpKind,
+    AtModifier, BinaryOpKind, ColumnRef, CompareOpKind, DataModel, GroupKeys, GroupSide,
+    InfoMatcher, JoinKind, LabelFilter, Predicate, ProjectItem, QueryExpr, QueryExprError,
+    Reduction, SampleKind, ScalarValue, SetOpKind, SortKey, Source, TimeShift, UnresolvedQueryExpr,
     VectorGrouping, VectorMatch, VectorMatchKind, WindowFuncKind, WindowKind,
 };
 pub use schema::{Column, ColumnId, DataType, Schema};

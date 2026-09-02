@@ -1114,18 +1114,18 @@ fn extract_edge_facts(qe: &crate::intent_algebra::QueryExpr, edge: &mut EdgeStag
                 }
             }
             // Canonical `Scan.predicates` carries equality label filters
-            // as typed `Predicate(L3Expr::Compare{Column, Eq,
+            // as typed `Predicate(QueryExpr::Compare{Column, Eq,
             // Literal(Utf8)})` trees — resolve each `Column` id back to
             // its name via the Scan's own schema.
-            use crate::intent_algebra::{CompareOp, L3Expr, L3Scalar};
+            use crate::intent_algebra::{CompareOpKind, QueryExpr, ScalarValue};
             for p in predicates {
-                if let L3Expr::Compare {
+                if let QueryExpr::Compare {
                     left,
-                    op: CompareOp::Eq,
+                    op: CompareOpKind::Eq,
                     right,
                 } = p.0.as_ref()
                 {
-                    if let (L3Expr::Column(id), L3Expr::Literal(L3Scalar::Utf8(v))) =
+                    if let (QueryExpr::Column(id), QueryExpr::Literal(ScalarValue::Utf8(v))) =
                         (left.as_ref(), right.as_ref())
                     {
                         if let Some(col) = schema.columns.get(*id) {

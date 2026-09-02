@@ -813,7 +813,7 @@ mod tests {
     use crate::intent_algebra::relational::{
         default_cardinality, default_frequency, default_quantile,
     };
-    use crate::intent_algebra::{JoinKind, L3Expr, L3Scalar, Predicate, QueryExpr, Schema, Source};
+    use crate::intent_algebra::{JoinKind, Predicate, QueryExpr, ScalarValue, Schema, Source};
     use crate::physical::plan::{ExecutionMode, PipelineStage};
     use crate::types::{SketchType, StageResourceBudgets};
     use crate::types_v2::AccuracyTarget;
@@ -879,7 +879,7 @@ mod tests {
     #[test]
     fn filter_at_agent() {
         let expr = QueryExpr::Filter {
-            pred: Predicate(Rc::new(L3Expr::Literal(L3Scalar::Boolean(true)))),
+            pred: Predicate(Rc::new(QueryExpr::Literal(ScalarValue::Boolean(true)))),
             child: Rc::new(scan("m")),
         };
         let node = alloc(unlimited(), expr);
@@ -982,7 +982,7 @@ mod tests {
     fn join_goes_to_db() {
         let expr = QueryExpr::Join {
             kind: JoinKind::Inner,
-            pred: Predicate(Rc::new(L3Expr::Literal(L3Scalar::Boolean(true)))),
+            pred: Predicate(Rc::new(QueryExpr::Literal(ScalarValue::Boolean(true)))),
             left: Rc::new(scan("orders")),
             right: Rc::new(scan("items")),
         };

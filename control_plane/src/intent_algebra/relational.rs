@@ -32,12 +32,11 @@
 //! real, live consumers (`physical::sketch_catalog`) and doesn't touch
 //! the deleted L2 tree at all.
 
-pub use crate::intent_algebra::expr_ir::L2Expr;
-pub use planner_types::pre_asap::expr_ir::ColumnRef;
 pub use planner_types::pre_asap::query_expr::{
     BinaryOpKind, GroupSide, JoinKind, SampleKind, SetOpKind, VectorGrouping, VectorMatch,
     VectorMatchKind, WindowFuncKind,
 };
+pub use planner_types::pre_asap::{ColumnRef, UnresolvedQueryExpr};
 
 /// Canonical L3 aggregation intent. Re-exported here so existing
 /// `relational::AggIntent` references keep working — the type is the
@@ -62,9 +61,9 @@ pub struct PerPartitionWrap {
 }
 
 /// A single filter predicate pushed down to the collector — used by
-/// `query_parser::promql::apply_qe_filters` to build an `L2Expr` tree
+/// `query_parser::promql::apply_qe_filters` to build an `UnresolvedQueryExpr` tree
 /// from a flat label-matcher list. Control_plane-only: no upstream
-/// equivalent (its front end builds `L2Expr` directly, never through an
+/// equivalent (its front end builds `UnresolvedQueryExpr` directly, never through an
 /// intermediate flat predicate list). No live constructor today (see
 /// module doc) — kept as a self-contained, dependency-free type.
 #[derive(Debug, Clone)]

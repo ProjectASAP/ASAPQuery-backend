@@ -548,7 +548,7 @@ impl RewriteRule for TopKFusion {
 // R7 (retired): `SubqueryDecorrelation` used to hoist a `ScalarSubquery`
 // predicate into a `LetBinding`, pattern-matching the old `Predicate`
 // enum's `BinaryOp` / `ScalarSubquery` / `Column(ColumnRef::Named(_))`
-// variants directly. The canonical `Predicate(L3Expr)` merge (see
+// variants directly. The canonical `Predicate(QueryExpr)` merge (see
 // `intent_algebra::lower` module docs) rejects `ScalarSubquery` at
 // construction time instead of lowering it, so this rule has no
 // construction site left to fire against — deleted rather than ported.
@@ -1016,7 +1016,7 @@ mod tests {
     use crate::intent_algebra::query_expr::{GroupKeys, Predicate};
     use crate::intent_algebra::relational::{default_cardinality, default_quantile};
     use crate::intent_algebra::{
-        BinaryOpKind, L3Expr, L3Scalar, Schema, SortKey, Source, WindowKind,
+        BinaryOpKind, QueryExpr, ScalarValue, Schema, SortKey, Source, WindowKind,
     };
     use std::time::Duration;
 
@@ -1044,7 +1044,7 @@ mod tests {
     }
 
     fn true_pred() -> Predicate {
-        Predicate(Rc::new(L3Expr::Literal(L3Scalar::Boolean(true))))
+        Predicate(Rc::new(QueryExpr::Literal(ScalarValue::Boolean(true))))
     }
 
     fn opt() -> QueryOptimizer {
@@ -1104,7 +1104,7 @@ mod tests {
             pred: true_pred(),
             child: Rc::new(QueryExpr::Sort {
                 keys: vec![SortKey {
-                    expr: L3Expr::Column(0),
+                    expr: QueryExpr::Column(0),
                     ascending: true,
                     nulls_first: false,
                 }],
@@ -1144,7 +1144,7 @@ mod tests {
             offset: 0,
             child: Rc::new(QueryExpr::Sort {
                 keys: vec![SortKey {
-                    expr: L3Expr::Column(0),
+                    expr: QueryExpr::Column(0),
                     ascending: false,
                     nulls_first: false,
                 }],
@@ -1167,7 +1167,7 @@ mod tests {
             offset: 0,
             child: Rc::new(QueryExpr::Sort {
                 keys: vec![SortKey {
-                    expr: L3Expr::Column(0),
+                    expr: QueryExpr::Column(0),
                     ascending: true,
                     nulls_first: false,
                 }],

@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use crate::intent_algebra::agg_intent::AggIntent;
 use crate::intent_algebra::query_expr::{Predicate, QueryExpr, Source};
-use crate::intent_algebra::{ColumnId, CompareOp, L3Expr, L3Scalar};
+use crate::intent_algebra::{ColumnId, CompareOpKind, ScalarValue};
 use crate::types::AggType;
 use crate::types_v2::AccuracyTarget;
 
@@ -211,7 +211,7 @@ impl QeCollector {
                     });
                 }
                 // Canonical `Scan.predicates` carries equality label
-                // filters as typed `Predicate(L3Expr::Compare{Column, Eq,
+                // filters as typed `Predicate(QueryExpr::Compare{Column, Eq,
                 // Literal(Utf8)})` trees (the shape
                 // `query_expr::label_filter_to_predicate` builds) — resolve
                 // each `Column` id back to its name via the Scan's own
@@ -379,22 +379,22 @@ fn collect_filters_from_scalar(
     collect_filters_from_expr(&pred.0, schema, out);
 }
 
-/// Recover a flat name/value equality map from a canonical `L3Expr`
+/// Recover a flat name/value equality map from a canonical `QueryExpr`
 /// predicate tree — `Column(id) == Literal(Utf8(v))` conjuncts, `id`
 /// resolved back to a name via `schema` (positional `Column` carries no
 /// name of its own, unlike the pre-merge name-based `Predicate::Column`).
 fn collect_filters_from_expr(
-    expr: &L3Expr,
+    expr: &QueryExpr,
     schema: Option<&crate::intent_algebra::Schema>,
     out: &mut HashMap<String, String>,
 ) {
     match expr {
-        L3Expr::Compare {
+        QueryExpr::Compare {
             left,
-            op: CompareOp::Eq,
+            op: CompareOpKind::Eq,
             right,
         } => {
-            if let (L3Expr::Column(id), L3Expr::Literal(L3Scalar::Utf8(v))) =
+            if let (QueryExpr::Column(id), QueryExpr::Literal(ScalarValue::Utf8(v))) =
                 (left.as_ref(), right.as_ref())
             {
                 if let Some(col) = schema.and_then(|s| s.columns.get(*id)) {
@@ -402,7 +402,7 @@ fn collect_filters_from_expr(
                 }
             }
         }
-        L3Expr::BoolAnd(parts) => {
+        QueryExpr::BoolAnd(parts) => {
             for p in parts {
                 collect_filters_from_expr(p, schema, out);
             }

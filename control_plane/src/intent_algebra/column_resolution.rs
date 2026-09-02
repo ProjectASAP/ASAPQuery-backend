@@ -9,8 +9,8 @@
 //!
 //! Two capabilities this repo's pre-merge version didn't have:
 //!
-//! - [`resolve_expr`] resolves a whole `L2Expr` tree (name-based) into an
-//!   `L3Expr` (positional) in one pass — this repo's `ScalarExpr` is gone
+//! - [`resolve_expr`] resolves a whole `UnresolvedQueryExpr` tree (name-based) into an
+//!   `QueryExpr` (positional) in one pass — this repo's `ScalarExpr` is gone
 //!   (see `relational.rs`'s module doc), so `lower.rs`'s `convert_scalar`
 //!   now calls this directly instead of hand-matching every `Expr`
 //!   variant itself.

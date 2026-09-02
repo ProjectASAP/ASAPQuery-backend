@@ -16,8 +16,8 @@
 //! be missing capability — `asap_ir` represents the same things more
 //! consolidated, just under different names:
 //!
-//! - **`Predicate`** is now `L3Expr` (`expr_ir.rs`, landed previously) —
-//!   `struct Predicate(pub L3Expr)`, not this repo's own 8-variant enum.
+//! - **`Predicate`** is now `QueryExpr` (`expr_ir.rs`, landed previously) —
+//!   `struct Predicate(pub QueryExpr)`, not this repo's own 8-variant enum.
 //!   Six of the eight variants map directly. `Between` desugars to
 //!   `Expr::BoolAnd([Compare(Ge), Compare(Le)])` (verified: one real
 //!   construction site, nothing downstream pattern-matches on the shape).
@@ -48,7 +48,7 @@
 //!   `Aggregate.by` directly instead.
 //!
 //! `LiteralValue` (this repo's narrow 5-variant literal enum) is replaced
-//! by `L3Scalar` (same five cases, `expr_ir.rs`). `ColumnRef` here
+//! by `ScalarValue` (same five cases, `expr_ir.rs`). `ColumnRef` here
 //! (this repo's `Named`/`SampleValue`/`Wildcard`) is gone — L3 is fully
 //! positional (`ColumnId`) in `asap_ir`; the name-based form only exists
 //! at L2 now (`expr_ir::ColumnRef`, used by `relational.rs`, not yet
@@ -61,29 +61,25 @@ use std::rc::Rc;
 
 use planner_types::pre_asap::schema::ColumnId;
 pub use planner_types::pre_asap::{
-    aggregate_output_schema, AtModifier, BinaryOpKind, DataModel, GroupKeys, GroupSide,
-    InfoMatcher, JoinKind, Predicate, ProjectItem, QueryExpr, QueryExprError, Reduction,
-    SampleKind, SetOpKind, SortKey, Source, TimeShift, VectorGrouping, VectorMatch,
-    VectorMatchKind, WindowFuncKind,
+    aggregate_output_schema, ArithmeticOpKind, AtModifier, BinaryOpKind, ColumnRef, CompareOpKind,
+    DataModel, GroupKeys, GroupSide, InfoMatcher, JoinKind, Predicate, ProjectItem, QueryExpr,
+    QueryExprError, Reduction, SampleKind, ScalarValue, SetOpKind, SortKey, Source, TimeShift,
+    UnresolvedQueryExpr, VectorGrouping, VectorMatch, VectorMatchKind, WindowFuncKind,
 };
-pub use planner_types::pre_asap::{
-    ArithmeticOpKind as ArithOp, ColumnRef, CompareOpKind as CompareOp,
-};
-// `L3Scalar`/`L3Expr`/`L2Expr` and `WindowKind`: see `expr_ir.rs`'s and
+// `ScalarValue`/`QueryExpr`/`UnresolvedQueryExpr` and `WindowKind`: see `expr_ir.rs`'s and
 // `crates/asap_types/src/enums.rs`'s module docs respectively --
 // ASAPPlanner deleted its `WindowKind` (no `QueryExpr::Window` producer
 // left to need it) and folded the old standalone `Expr<C>` into
 // `QueryExpr` itself, renaming its scalar-literal type `ScalarValue`.
-pub use crate::intent_algebra::expr_ir::{L2Expr, L3Expr, L3Scalar};
 pub use asap_types::enums::WindowKind;
 
-use crate::intent_algebra::schema::Schema;
+use planner_types::pre_asap::Schema;
 
 /// Equality label filter on a `Scan`. PromQL `{service="api"}` — kept as
 /// ergonomic sugar for the parser; converted to a typed `Predicate` via
 /// [`label_filter_to_predicate`] when building the `Scan` node itself.
 /// Richer match operators (`!=`, `=~`, `!~`) go through
-/// [`CompareOp::Regex`]/[`CompareOp::NotRegex`] the same way.
+/// [`CompareOpKind::Regex`]/[`CompareOpKind::NotRegex`] the same way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelFilter {
     pub label: String,
@@ -96,10 +92,10 @@ pub struct LabelFilter {
 /// to the schema; this is a defensive fallback, not the primary path).
 pub fn label_filter_to_predicate(lf: &LabelFilter, schema: &Schema) -> Option<Predicate> {
     let id = schema.column_id(&lf.label)?;
-    Some(Predicate(Rc::new(L3Expr::Compare {
-        left: Rc::new(L3Expr::Column(id)),
-        op: CompareOp::Eq,
-        right: Rc::new(L3Expr::Literal(L3Scalar::Utf8(lf.equals.clone()))),
+    Some(Predicate(Rc::new(QueryExpr::Compare {
+        left: Rc::new(QueryExpr::Column(id)),
+        op: CompareOpKind::Eq,
+        right: Rc::new(QueryExpr::Literal(ScalarValue::Utf8(lf.equals.clone()))),
     })))
 }
 
@@ -108,11 +104,11 @@ pub fn label_filter_to_predicate(lf: &LabelFilter, schema: &Schema) -> Option<Pr
 /// single tree, so most callers won't need this — provided for the few
 /// call sites that want one combined predicate (e.g. `Filter.pred`).
 pub fn conjoin(predicates: Vec<Predicate>) -> Option<Predicate> {
-    let mut exprs: Vec<L3Expr> = predicates.into_iter().map(|p| (*p.0).clone()).collect();
+    let mut exprs: Vec<QueryExpr> = predicates.into_iter().map(|p| (*p.0).clone()).collect();
     match exprs.len() {
         0 => None,
         1 => Some(Predicate(Rc::new(exprs.remove(0)))),
-        _ => Some(Predicate(Rc::new(L3Expr::BoolAnd(exprs)))),
+        _ => Some(Predicate(Rc::new(QueryExpr::BoolAnd(exprs)))),
     }
 }
 
@@ -120,20 +116,20 @@ pub fn conjoin(predicates: Vec<Predicate>) -> Option<Predicate> {
 /// to `Compare(expr >= low) AND Compare(expr <= high)` (De Morgan's for
 /// the negated form). No `Expr<C>` variant models `BETWEEN` directly —
 /// this is the one real construction site's replacement (`lower.rs`).
-pub fn between(expr: L3Expr, low: L3Expr, high: L3Expr, negated: bool) -> L3Expr {
-    let ge = L3Expr::Compare {
+pub fn between(expr: QueryExpr, low: QueryExpr, high: QueryExpr, negated: bool) -> QueryExpr {
+    let ge = QueryExpr::Compare {
         left: Rc::new(expr.clone()),
-        op: CompareOp::Ge,
+        op: CompareOpKind::Ge,
         right: Rc::new(low),
     };
-    let le = L3Expr::Compare {
+    let le = QueryExpr::Compare {
         left: Rc::new(expr),
-        op: CompareOp::Le,
+        op: CompareOpKind::Le,
         right: Rc::new(high),
     };
     if negated {
-        L3Expr::Not(Rc::new(L3Expr::BoolAnd(vec![ge, le])))
+        QueryExpr::Not(Rc::new(QueryExpr::BoolAnd(vec![ge, le])))
     } else {
-        L3Expr::BoolAnd(vec![ge, le])
+        QueryExpr::BoolAnd(vec![ge, le])
     }
 }
