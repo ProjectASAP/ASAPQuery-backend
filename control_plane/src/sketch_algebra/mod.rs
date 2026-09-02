@@ -30,7 +30,6 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod capability;
-pub mod capability_matching;
 pub mod cost_model;
 pub mod lower;
 pub mod matcher;
@@ -41,9 +40,6 @@ mod tests;
 
 // Re-exports — `crate::sketch_algebra::*` for downstream callers.
 pub use capability::{capability_for, Capability, SketchKindHandle};
-pub use capability_matching::{
-    classify_demo_metric, is_valid_pair, pick_family, AccuracyPreference, StatisticClass,
-};
 pub use lower::{bind_query_expr, bind_query_expr_with_cost_model, BindingError};
 pub use matcher::SummaryFamilyMatcher;
 pub use physical_expr::{L4Plan, PhysicalExpr};
