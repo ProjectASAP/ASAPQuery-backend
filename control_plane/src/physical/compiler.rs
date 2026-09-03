@@ -595,6 +595,10 @@ pub struct SummaryFrameIdentity {
     pub schema_id: String,
     pub producer_id: String,
     pub producer_epoch: String,
+    /// Canonical identity of the output series inside the materialization.
+    /// This remains stable when the sender switches between attribute-bearing
+    /// and SID-only frames, and prevents two series from sharing a receipt.
+    pub series_fingerprint: String,
     pub window_start_unix_nano: u64,
     pub window_end_unix_nano: u64,
     pub sequence: u64,
@@ -721,6 +725,7 @@ impl TransmissionPlan {
             || frame.plan_version != self.envelope.plan_version
             || frame.backend_compat != self.envelope.backend_compat
             || frame.producer_epoch.is_empty()
+            || frame.series_fingerprint.is_empty()
             || frame.sequence == 0
             || frame.window_start_unix_nano >= frame.window_end_unix_nano
             || (frame.kind == SummaryFrameKind::Full
@@ -1574,6 +1579,7 @@ mod tests {
             schema_id: rule.schema_id.clone(),
             producer_id: rule.producer_id.clone(),
             producer_epoch: "boot-1".into(),
+            series_fingerprint: "service=api".into(),
             window_start_unix_nano: 1,
             window_end_unix_nano: 2,
             sequence: 1,

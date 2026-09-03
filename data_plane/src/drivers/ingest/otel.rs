@@ -30,8 +30,8 @@ use crate::precompute_engine::IngestState;
 use crate::query_engines::routing::FreshnessProbeCache;
 use crate::storage_engines::types::AggregateCore;
 use asap_otel_proto::tonic::collector::metrics::v1::{
-    metrics_service_server::MetricsService, ExportMetricsPartialSuccess,
-    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
+    metrics_service_server::MetricsService, ExportMetricsServiceRequest,
+    ExportMetricsServiceResponse,
 };
 use asap_otel_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use asap_otel_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
@@ -212,14 +212,16 @@ impl MetricsService for MetricsServiceImpl {
         let mut outcome = IngestOutcome::default();
         if let Some(state) = &self.shared.ingest_state {
             route_otlp_to_precompute(&points, &sketch_payloads, state).await;
-            outcome = route_modified_otlp_sketches_to_precompute(&req, state).await;
+            outcome = route_modified_otlp_sketches_to_precompute(&req, state)
+                .await
+                .map_err(Status::invalid_argument)?;
         }
         debug!("OTLP sending response via gRPC");
         Ok(Response::new(ExportMetricsServiceResponse {
-            partial_success: (outcome.rejected_frames > 0).then(|| ExportMetricsPartialSuccess {
-                rejected_data_points: outcome.rejected_frames as i64,
-                error_message: "summary frame identity rejected by active TransmissionPlan".into(),
-            }),
+            // A successful RPC is the transport ACK: every summary frame
+            // passed the active-plan gate and was applied. Contract failures
+            // return a non-OK gRPC status before any frame is written.
+            partial_success: None,
             // Sid bindings the sender should cache. Each entry maps an
             // `attributes_fingerprint` to the canonical sid the backend's
             // `SeriesIdResolver` minted (or returned from its cache). The
@@ -320,7 +322,9 @@ async fn handle_otlp_http(
     let mut outcome = IngestOutcome::default();
     if let Some(state) = &shared.ingest_state {
         route_otlp_to_precompute(&points, &sketch_payloads, state).await;
-        outcome = route_modified_otlp_sketches_to_precompute(&req, state).await;
+        outcome = route_modified_otlp_sketches_to_precompute(&req, state)
+            .await
+            .map_err(|error| (axum::http::StatusCode::UNPROCESSABLE_ENTITY, error))?;
     }
     debug!("OTLP sending response via HTTP");
     // HTTP OTLP exporters don't generally read `series_assignments`
@@ -331,7 +335,7 @@ async fn handle_otlp_http(
     // are the universal recovery primitive (see proto comment on
     // `ExportMetricsServiceResponse.unknown_series_ids`).
     Ok(Json(serde_json::json!({
-        "rejected": outcome.rejected_frames,
+        "rejected": 0,
         "unknown_series_ids": outcome.unknown_series_ids,
         "series_assignments_count": outcome.series_assignments.len(),
     })))
@@ -860,13 +864,12 @@ async fn route_otlp_to_precompute(
 pub(crate) struct IngestOutcome {
     pub unknown_series_ids: Vec<u64>,
     pub series_assignments: Vec<asap_otel_proto::tonic::collector::metrics::v1::SeriesAssignment>,
-    pub rejected_frames: u64,
 }
 
 async fn route_modified_otlp_sketches_to_precompute(
     request: &ExportMetricsServiceRequest,
     ingest_state: &Arc<IngestState>,
-) -> IngestOutcome {
+) -> Result<IngestOutcome, String> {
     use asap_otel_proto::tonic::metrics::v1::metric::Data;
 
     let ingest_received_at = Instant::now();
@@ -874,6 +877,13 @@ async fn route_modified_otlp_sketches_to_precompute(
     let active_physical_plan = ingest_state
         .physical_plan_snapshot()
         .filter(|plan| plan.backend_plan.plan_id != 0);
+    if let Some(active) = active_physical_plan.as_ref() {
+        // Validate the complete request before mutating the SID registry,
+        // sketch store, snapshot cache, or worker queues. This makes the
+        // OTLP request the atomic full-frame publication unit: 2xx/OK means
+        // the batch was accepted, while a contract error applies none of it.
+        preflight_summary_frames(request, ingest_state, active)?;
+    }
     let agg_configs = snap.get_all_aggregation_configs();
     // Schema retirement #5 — agg_id-keyed registry retired; sid-level
     // reconcile is the only path going forward. See the raw-OTLP
@@ -888,7 +898,6 @@ async fn route_modified_otlp_sketches_to_precompute(
     let mut routed = 0usize;
     let mut decoded_failed = 0usize;
     let mut unconfigured = 0usize;
-    let mut rejected_frames = 0u64;
     // CQ-2 — the legacy routing-side WorkerMessage push (the DEPRECATED
     // dual-write that clones the accumulator into the worker under a
     // bucket-sid, in tandem with the Phase-5 SketchStore append above) is
@@ -1086,11 +1095,9 @@ async fn route_modified_otlp_sketches_to_precompute(
                             Ok(frame)
                         }) {
                             Ok(frame) => Some(frame),
-                            Err(error) => {
-                                rejected_frames = rejected_frames.saturating_add(1);
-                                warn!(metric = %metric.name, %error, "rejected summary frame");
-                                continue;
-                            }
+                            Err(error) => unreachable!(
+                                "summary frame changed after successful request preflight: {error}"
+                            ),
                         }
                     } else {
                         None
@@ -1261,14 +1268,9 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 )
                             });
                         if observed_policy != frame.materialization {
-                            rejected_frames = rejected_frames.saturating_add(1);
-                            warn!(
-                                sid,
-                                declared = frame.materialization.0,
-                                observed = observed_policy.0,
-                                "rejected summary frame with mismatched materialization"
+                            unreachable!(
+                                "materialization changed after successful request preflight"
                             );
-                            continue;
                         }
                     }
 
@@ -1770,11 +1772,10 @@ async fn route_modified_otlp_sketches_to_precompute(
         );
     }
 
-    IngestOutcome {
+    Ok(IngestOutcome {
         unknown_series_ids: unknown_sids,
         series_assignments: new_assignments,
-        rejected_frames,
-    }
+    })
 }
 
 /// Map `SketchAlgorithm` to the corresponding wire-format
@@ -2081,6 +2082,173 @@ struct ModifiedOtlpSketchDp {
     container_config: crate::storage_engines::sketch_db::index::SketchConfig,
 }
 
+/// Validate every first-class summary frame in an OTLP request before the
+/// ingest loop performs any externally visible mutation. The transport
+/// response is therefore the acknowledgement boundary; there is no second
+/// application-level ACK protocol.
+fn preflight_summary_frames(
+    request: &ExportMetricsServiceRequest,
+    ingest_state: &IngestState,
+    active: &crate::storage_engines::types::ActivePhysicalPlan,
+) -> Result<(), String> {
+    use asap_otel_proto::tonic::metrics::v1::metric::Data;
+
+    fn validate_one(
+        metric_name: &str,
+        mut dp: ModifiedOtlpSketchDp,
+        ingest_state: &IngestState,
+        active: &crate::storage_engines::types::ActivePhysicalPlan,
+    ) -> Result<(), String> {
+        let canonical_name = canonical_sketch_metric_name(metric_name, dp.kind);
+        let frame =
+            take_summary_frame_identity(&mut dp.attrs, dp.start_time_unix_nano, dp.time_unix_nano)?;
+        if state_encoding_for_wire(dp.encoding) != Some(frame.encoding.clone()) {
+            return Err(format!(
+                "summary frame for {metric_name} declares an encoding different from its payload"
+            ));
+        }
+        active
+            .transmission_plan
+            .validate_frame(&frame)
+            .map_err(|error| error.to_string())?;
+
+        if !dp.attrs.is_empty() {
+            let pairs: Vec<(&str, &str)> = dp
+                .attrs
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            let observed_series = crate::drivers::ingest::canonical_attrs_fingerprint(&pairs);
+            if observed_series != frame.series_fingerprint {
+                return Err(format!(
+                    "summary frame for {metric_name} declares a series fingerprint different from its labels"
+                ));
+            }
+        }
+
+        // A malformed full snapshot must not be discovered after an earlier
+        // frame in the request has already reached SketchStore.
+        if frame.kind == control_plane::physical::compiler::SummaryFrameKind::Full {
+            decode_modified_otlp_sketch_bytes(dp.kind, dp.encoding, &dp.sketch)
+                .map_err(|error| format!("invalid full frame for {metric_name}: {error}"))?;
+        }
+
+        // Attribute-elided retries can recover the policy from their known
+        // SID. Attribute-bearing frames derive it from the active physical
+        // schema. Either route must agree with the declared materialization.
+        let observed = if dp.series_id != 0 && dp.attrs.is_empty() {
+            ingest_state
+                .sketch_index
+                .instance(dp.series_id)
+                .map(|metadata| metadata.policy_fp)
+                .ok_or_else(|| {
+                    format!(
+                        "summary frame for {metric_name} references unknown sid {} without labels",
+                        dp.series_id
+                    )
+                })?
+        } else {
+            derive_sketch_policy_fp(
+                ingest_state,
+                canonical_name,
+                sketch_kind_handle_for(&dp),
+                &dp.container_config,
+                &dp.attrs.keys().cloned().collect(),
+            )
+        };
+        if observed != frame.materialization {
+            return Err(format!(
+                "summary frame for {metric_name} declares materialization {} but active schema resolves {}",
+                frame.materialization.0, observed.0
+            ));
+        }
+        Ok(())
+    }
+
+    for resource_metrics in &request.resource_metrics {
+        let resource_attrs = resource_metrics
+            .resource
+            .as_ref()
+            .map(|resource| attributes_to_map(&resource.attributes))
+            .unwrap_or_default();
+        for scope_metrics in &resource_metrics.scope_metrics {
+            let scope_attrs = scope_metrics
+                .scope
+                .as_ref()
+                .map(|scope| attributes_to_map(&scope.attributes))
+                .unwrap_or_default();
+            for metric in &scope_metrics.metrics {
+                let base_labels: HashMap<String, String> = scope_attrs
+                    .iter()
+                    .chain(resource_attrs.iter())
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                macro_rules! validate_points {
+                    ($points:expr, $kind:expr, $config:expr) => {{
+                        let config = $config;
+                        for point in &$points {
+                            validate_one(
+                                &metric.name,
+                                ModifiedOtlpSketchDp {
+                                    kind: $kind,
+                                    attrs: merge_point_attributes(&base_labels, &point.attributes),
+                                    time_unix_nano: point.time_unix_nano,
+                                    sketch: point.sketch.clone(),
+                                    encoding: point.encoding,
+                                    series_id: point.series_id,
+                                    start_time_unix_nano: point.start_time_unix_nano,
+                                    container_config: config.clone(),
+                                },
+                                ingest_state,
+                                active,
+                            )?;
+                        }
+                    }};
+                }
+                match &metric.data {
+                    Some(Data::Ddsketch(data)) => validate_points!(
+                        data.data_points,
+                        SketchKind::DdSketch,
+                        crate::storage_engines::sketch_db::index::SketchConfig::DDSketch {
+                            relative_accuracy: data.relative_accuracy,
+                        }
+                    ),
+                    Some(Data::Kllsketch(data)) => validate_points!(
+                        data.data_points,
+                        SketchKind::Kll,
+                        crate::storage_engines::sketch_db::index::SketchConfig::Kll { k: data.k }
+                    ),
+                    Some(Data::Countsketch(data)) => validate_points!(
+                        data.data_points,
+                        SketchKind::CountSketch,
+                        crate::storage_engines::sketch_db::index::SketchConfig::CountSketch {
+                            rows: data.rows,
+                            cols: data.cols,
+                        }
+                    ),
+                    Some(Data::Countminsketch(data)) => validate_points!(
+                        data.data_points,
+                        SketchKind::CountMin,
+                        crate::storage_engines::sketch_db::index::SketchConfig::CountMin {
+                            rows: data.rows,
+                            cols: data.cols,
+                        }
+                    ),
+                    Some(Data::Hllsketch(data)) => validate_points!(
+                        data.data_points,
+                        SketchKind::Hll,
+                        crate::storage_engines::sketch_db::index::SketchConfig::Hll {
+                            precision: data.precision,
+                        }
+                    ),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn take_summary_frame_identity(
     attrs: &mut HashMap<String, String>,
     window_start_unix_nano: u64,
@@ -2112,6 +2280,7 @@ fn take_summary_frame_identity(
     let schema_id = required(attrs, "asap.frame.schema_id")?;
     let producer_id = required(attrs, "asap.frame.producer_id")?;
     let producer_epoch = required(attrs, "asap.frame.producer_epoch")?;
+    let series_fingerprint = required(attrs, "asap.frame.series_fingerprint")?;
     let sequence = number(attrs, "asap.frame.sequence")?;
     let kind = match required(attrs, "asap.frame.kind")?.as_str() {
         "full" => SummaryFrameKind::Full,
@@ -2140,6 +2309,7 @@ fn take_summary_frame_identity(
         schema_id,
         producer_id,
         producer_epoch,
+        series_fingerprint,
         window_start_unix_nano,
         window_end_unix_nano,
         sequence,
@@ -3332,7 +3502,9 @@ mod sid_resolution_tests {
         };
         let req = build_request("http_latency_ms", dp);
 
-        let outcome = route_modified_otlp_sketches_to_precompute(&req, &state).await;
+        let outcome = route_modified_otlp_sketches_to_precompute(&req, &state)
+            .await
+            .expect("ingest succeeds");
         assert!(
             outcome.unknown_series_ids.is_empty(),
             "no unknown sids on a fresh-attrs DP"
@@ -3379,7 +3551,9 @@ mod sid_resolution_tests {
         };
         let req = build_request("http_latency_ms", dp);
 
-        let outcome = route_modified_otlp_sketches_to_precompute(&req, &state).await;
+        let outcome = route_modified_otlp_sketches_to_precompute(&req, &state)
+            .await
+            .expect("ingest succeeds");
         assert_eq!(outcome.unknown_series_ids, vec![7777]);
         assert!(
             outcome.series_assignments.is_empty(),
@@ -3410,7 +3584,8 @@ mod sid_resolution_tests {
             &build_request("http_latency_ms", dp_seed),
             &state,
         )
-        .await;
+        .await
+        .expect("seed ingest succeeds");
         let assigned_sid = seed_outcome.series_assignments[0].series_id;
         assert!(
             state.sketch_index.instance(assigned_sid).is_some(),
@@ -3435,7 +3610,8 @@ mod sid_resolution_tests {
             &build_request("http_latency_ms", dp_disagree),
             &state,
         )
-        .await;
+        .await
+        .expect("ingest succeeds");
         assert_eq!(
             outcome.unknown_series_ids,
             vec![stale],
@@ -3517,7 +3693,8 @@ mod sid_resolution_tests {
             ),
             &state,
         )
-        .await;
+        .await
+        .expect("first ingest succeeds");
 
         // ── Window 1: delta (SAME window_start). Adds +3 to bucket 0,
         // +7 to bucket 1. Within the window this accumulates onto the
@@ -3542,7 +3719,8 @@ mod sid_resolution_tests {
             ),
             &state,
         )
-        .await;
+        .await
+        .expect("second ingest succeeds");
 
         {
             let entry = state
@@ -3583,7 +3761,8 @@ mod sid_resolution_tests {
             ),
             &state,
         )
-        .await;
+        .await
+        .expect("ingest succeeds");
 
         {
             let entry = state
@@ -3661,7 +3840,8 @@ mod sid_resolution_tests {
             &build_request("http_latency_ms", dp_first),
             &state,
         )
-        .await;
+        .await
+        .expect("first ingest succeeds");
         let cached_sid = first.series_assignments[0].series_id;
 
         let dp_second = DdSketchDataPoint {
@@ -3678,7 +3858,8 @@ mod sid_resolution_tests {
             &build_request("http_latency_ms", dp_second),
             &state,
         )
-        .await;
+        .await
+        .expect("second ingest succeeds");
         assert!(
             second.unknown_series_ids.is_empty(),
             "cached sid + no attrs hits the same SketchStore instance"
@@ -3827,7 +4008,9 @@ mod sid_resolution_tests {
         );
         // No prior full frame for this series — pre-fix this DP was
         // dropped (decoded_failed). Post-fix it bootstraps + applies.
-        route_modified_otlp_sketches_to_precompute(&req, &state).await;
+        route_modified_otlp_sketches_to_precompute(&req, &state)
+            .await
+            .expect("ingest succeeds");
 
         // The per-series base is now cached, holding the window's
         // reconstructed matrix.
@@ -3901,7 +4084,9 @@ mod sid_resolution_tests {
             WIN_START,
             11_000_000,
         );
-        route_modified_otlp_sketches_to_precompute(&req, &state).await;
+        route_modified_otlp_sketches_to_precompute(&req, &state)
+            .await
+            .expect("ingest succeeds");
 
         let mut attrs = HashMap::new();
         attrs.insert("svc".to_string(), "auth".to_string());
@@ -3965,7 +4150,8 @@ mod sid_resolution_tests {
             series_id: 0,
         };
         route_modified_otlp_sketches_to_precompute(&build_request("dd_latency_ms", dp), &state)
-            .await;
+            .await
+            .expect("ingest succeeds");
 
         let mut attrs = HashMap::new();
         attrs.insert("zone".to_string(), "z0".to_string());
@@ -4019,7 +4205,9 @@ mod sid_resolution_tests {
             1_000_000,
             11_000_000,
         );
-        let out1 = route_modified_otlp_sketches_to_precompute(&req1, &state).await;
+        let out1 = route_modified_otlp_sketches_to_precompute(&req1, &state)
+            .await
+            .expect("ingest succeeds");
         let sid = out1.series_assignments[0].series_id;
         let meta1 = state.sketch_index.instance(sid).expect("sid registered");
         assert_eq!(
@@ -4047,7 +4235,9 @@ mod sid_resolution_tests {
             1_000_000,
             12_000_000,
         );
-        route_modified_otlp_sketches_to_precompute(&req2, &state).await;
+        route_modified_otlp_sketches_to_precompute(&req2, &state)
+            .await
+            .expect("ingest succeeds");
 
         let meta2 = state
             .sketch_index
@@ -4076,7 +4266,9 @@ mod sid_resolution_tests {
             1_000_000,
             13_000_000,
         );
-        route_modified_otlp_sketches_to_precompute(&req3, &state).await;
+        route_modified_otlp_sketches_to_precompute(&req3, &state)
+            .await
+            .expect("ingest succeeds");
         let meta3 = state
             .sketch_index
             .instance(sid)
@@ -4117,7 +4309,8 @@ mod sid_resolution_tests {
             &build_request("global_latency_ms", dp),
             &state,
         )
-        .await;
+        .await
+        .expect("ingest succeeds");
 
         // Pre-fix: dropped (sid=0 + no attrs → None). Post-fix: resolver
         // mints a stable sid for (metric, "", agg_kind) and echoes an
@@ -4409,6 +4602,7 @@ mod sid_bucketing_tests {
             ("asap.frame.schema_id".into(), "schema-99".into()),
             ("asap.frame.producer_id".into(), "edge-a".into()),
             ("asap.frame.producer_epoch".into(), "boot-7".into()),
+            ("asap.frame.series_fingerprint".into(), "service=api".into()),
             ("asap.frame.sequence".into(), "8".into()),
             ("asap.frame.kind".into(), "full".into()),
             ("asap.frame.encoding".into(), "sketchlib_protobuf_v1".into()),

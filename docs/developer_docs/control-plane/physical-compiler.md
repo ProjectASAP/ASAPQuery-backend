@@ -280,10 +280,15 @@ matching raw transmission and ingest/archive declarations.
 Until modified OTLP has dedicated identity fields, Collector attaches reserved
 data-point attributes under `asap.frame.*`: identity version, plan ID/version,
 backend compatibility, materialization and schema IDs, producer ID/epoch,
-sequence, full/delta kind, encoding, and checkpoint/base IDs. Window start/end
+canonical series fingerprint, sequence, full/delta kind, encoding, and
+checkpoint/base IDs. Window start/end
 remain the typed data-point timestamps. The backend removes reserved attributes
-before building the series label key and rejects any frame that does not match
-the active TransmissionPlan.
+before building the series label key and rejects the complete request before
+writing any frame when one identity, schema, encoding, materialization, or full
+payload does not match the active TransmissionPlan. HTTP 2xx / gRPC OK is the
+delivery acknowledgement. Retrying the same full frame is idempotent because
+the identity selects the same SID, label set, and window replacement; no second
+application-level ACK or transport WAL is part of this contract.
 
 The compiler error must identify an unsupported capability, invalid placement,
 window incompatibility, identity conflict, or invalid selected guarantee. It
