@@ -172,6 +172,22 @@ The precompute engine owns series routing, bounded buffering, watermark and
 lateness behavior, window assignment, selected accumulator updates, and writes
 to SummaryStore. The decoder must not choose an aggregation family.
 
+The current ASAPQuery-backend streaming precompute engine is the destination,
+but the ASAPQuery history is a required bug-fix migration source. Before the
+compatibility profile is complete, relevant ASAPQuery precompute fixes must be
+audited commit by commit and either migrated with regression tests or recorded
+as inapplicable because the affected feature was intentionally retired. The
+known audit set includes idle/trailing-window closure, active-ingest wall-clock
+safety, move-out at pane eviction, millisecond windows, value-column routing,
+CMS-with-heap parameter parsing, and accumulator-family routing.
+
+Restoring Remote Write must add an adapter to the current engine; it must not
+restore or fork the historical ASAPQuery engine. In particular, retired
+`SetAggregator` and `DeltaSetAggregator` paths are not restored merely because
+their historical patches touched precompute code. Compatibility tests preserve
+both migrated ASAPQuery fixes and newer backend fixes, and expose any remaining
+semantic mismatch rather than weakening the expected results.
+
 The exact Prometheus stale-NaN bit pattern is a series-staleness event, not a
 numeric accumulator input. Other unsupported NaN encodings are rejected by the
 profile's documented invalid-sample policy.
@@ -241,10 +257,11 @@ fallback is unavailable.
 
 The first compatibility level is intentionally explicit rather than claiming
 all PromQL. It supports raw scalar samples, canonical label grouping, tumbling
-window sum, one sketch-backed quantile operation, and instant and range
-evaluation of those planned summaries. Selectors or expressions outside that
-set exercise the exact Prometheus fallback path. Expanding the accelerated
-surface requires a versioned compatibility-level change and conformance tests.
+window sum, Prometheus `rate` and `increase` over counters, one sketch-backed
+quantile operation, and instant and range evaluation of those planned
+summaries. Selectors or expressions outside that set exercise the exact
+Prometheus fallback path. Expanding the accelerated surface requires a versioned
+compatibility-level change and conformance tests.
 
 ## Planning and activation lifecycle
 
@@ -306,7 +323,7 @@ Against ASAPQuery-backend
 | Area | Reusable today | Required change |
 | --- | --- | --- |
 | Prometheus query adapter and fallback client | Present | Bind them to the compatibility profile and its BackendPlan readiness checks. |
-| Streaming precompute workers and accumulators | Present | Admit raw Remote Write samples through a dedicated adapter. |
+| Streaming precompute workers and accumulators | Present, with substantial divergence and newer backend fixes | Complete the ASAPQuery bug-fix parity audit, migrate applicable fixes with regression tests, and explicitly reject fixes for intentionally retired features. The known missing active-ingest wall-clock fix must measure pane idleness from last touch rather than pane creation. Then admit raw Remote Write samples through a dedicated adapter and add Prometheus semantic conformance coverage. |
 | Hot-reload plan/store/query snapshots | Partial | Install PrecomputePlan and BackendPlan as one atomic version. |
 | Prometheus Remote Write decoder/listener | Removed from the current backend path | Restore the narrow v1 adapter from the reference behavior without restoring other legacy connectors. Preserve stale-marker semantics and retry-safe batch application. |
 | Workload input | Canonical Planner integration is present | Load deterministic `QueryWorkload` and `DataWorkload` snapshots at startup; online observation is optional after the MVP. |
@@ -367,7 +384,8 @@ semantically equivalent parameters and configured request context, and preserve
 Prometheus response types, labels, timestamps, warnings, and errors.
 
 Acceptance: accelerated results satisfy their declared error bound against
-Prometheus, and fallback responses are equivalent to direct Prometheus calls.
+Prometheus, exact operations match Prometheus semantics, and fallback responses
+are equivalent to direct Prometheus calls.
 
 ### Phase F: compatibility demo
 
@@ -385,6 +403,22 @@ Acceptance evidence includes:
 - window coverage and end-to-end freshness;
 - result error against direct Prometheus; and
 - query latency, backend CPU, and backend memory before and after activation.
+
+The E2E query matrix includes all of the following through the backend and
+compares each result with a direct request to the same Prometheus instance:
+
+| PromQL case | Instant `/api/v1/query` | Range `/api/v1/query_range` |
+| --- | --- | --- |
+| `rate(counter[window])` | Required | Required, including every returned step |
+| `increase(counter[window])` | Required | Required, including every returned step |
+| planned sum | Required | Required |
+| planned sketch-backed quantile | Required | Required |
+| unsupported expression | Exact fallback required | Exact fallback required |
+
+The counter fixture includes monotonic input, at least one counter reset,
+irregular sample spacing, and samples near window boundaries. The assertions
+cover values, labels, timestamps, result type, and range-step count. A test that
+only proves that the endpoint returns HTTP success does not satisfy this matrix.
 
 ## Post-MVP compatibility extensions
 
@@ -407,8 +441,10 @@ The profile is complete when a clean checkout can run one documented command
 that starts Prometheus and ASAPQuery-backend without ASAPCollector, ingests only
 through Prometheus Remote Write, plans from the configured workloads, activates a
 backend-local summary, serves both the declared sum and sketch-backed quantile
-compatibility cases from complete summary windows, and transparently falls back
+compatibility cases plus Prometheus `rate` and `increase` through both instant
+and range endpoints from complete summary windows, and transparently falls back
 for an unsupported query. The run must fail if ingestion, planning, activation,
-coverage, accuracy, or fallback evidence is missing.
+coverage, accuracy, counter-reset handling, range-step equivalence, or fallback
+evidence is missing.
 
 Starting the components or exposing `/api/v1/write` alone is not completion.
