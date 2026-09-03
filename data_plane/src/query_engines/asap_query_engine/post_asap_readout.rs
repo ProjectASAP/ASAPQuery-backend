@@ -8,7 +8,7 @@ use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome
 use control_plane::types_v2::AccuracyTarget;
 
 use crate::query_engines::asap_query_engine::post_asap_planner::{
-    plan_promql_to_post_asap, LoweringSkip,
+    execution_hints, plan_promql_to_post_asap, LoweringSkip,
 };
 use crate::query_engines::asap_query_engine::summary_executor::{
     QueryExecutionContext, SummaryValue,
@@ -73,7 +73,46 @@ pub fn execute_post_asap_readout(
     backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
     let node = plan_promql_to_post_asap(index, query, accuracy, backend_plan)?;
+    execute_planned_post_asap(index, &node, t0_ms, t1_ms, is_cumulative, backend_plan)
+}
 
+/// Plan and execute an instant query without consulting the legacy candidate
+/// analyzer. Lookback and cumulative-vs-per-window behavior come from the
+/// post-ASAP DAG itself.
+pub fn execute_post_asap_instant(
+    index: &SketchStore,
+    query: &str,
+    now_ms: u64,
+    accuracy: AccuracyTarget,
+    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
+) -> Result<(PostAsapReadoutOutcome, u64), LoweringSkip> {
+    const DEFAULT_LOOKBACK_MS: u64 = 5 * 60 * 1000;
+    let node = plan_promql_to_post_asap(index, query, accuracy, backend_plan)?;
+    let hints = execution_hints(&node);
+    let t0_ms = if hints.full_history {
+        0
+    } else {
+        now_ms.saturating_sub(hints.lookback_ms.unwrap_or(DEFAULT_LOOKBACK_MS))
+    };
+    let outcome = execute_planned_post_asap(
+        index,
+        &node,
+        t0_ms,
+        now_ms,
+        hints.cumulative_readout,
+        backend_plan,
+    )?;
+    Ok((outcome, t0_ms))
+}
+
+fn execute_planned_post_asap(
+    index: &SketchStore,
+    node: &planner_types::post_asap::SummaryNode,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
+) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
     let ctx = QueryExecutionContext {
         index,
         t0_ms,
@@ -91,7 +130,7 @@ pub fn execute_post_asap_readout(
         }),
     };
 
-    match execute(&node, &ctx) {
+    match execute(node, &ctx) {
         Ok(ExecOutcome::Value(values)) => {
             let mut coverage: Option<(u64, u64)> = None;
             let mut series = Vec::new();
