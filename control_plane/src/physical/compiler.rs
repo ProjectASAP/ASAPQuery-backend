@@ -802,10 +802,6 @@ pub struct SummaryFrameIdentity {
     pub schema_id: String,
     pub producer_id: String,
     pub producer_epoch: String,
-    /// Canonical identity of the output series inside the materialization.
-    /// This remains stable when the sender switches between attribute-bearing
-    /// and SID-only frames, and prevents two series from sharing a receipt.
-    pub series_fingerprint: String,
     pub window_start_unix_nano: u64,
     pub window_end_unix_nano: u64,
     pub sequence: u64,
@@ -875,7 +871,16 @@ impl TransmissionPlan {
                 } else {
                     TransmissionMode::Full
                 };
-                let emit_every_ms = materialization.window_size.saturating_mul(1_000);
+                let window_ms = materialization.window_size.saturating_mul(1_000);
+                // Delta mode emits several increments inside one logical
+                // window and starts each window with a full checkpoint. This
+                // matches the window-scoped sequence contract; carrying one
+                // delta across windows would make its base ambiguous.
+                let emit_every_ms = if mode == TransmissionMode::Delta {
+                    (window_ms / 10).max(1)
+                } else {
+                    window_ms
+                };
                 TransmissionRule {
                     materialization: producer.materialization,
                     producer_id: producer.producer_id.clone(),
@@ -884,7 +889,7 @@ impl TransmissionPlan {
                     encoding: schema.encodings[0].clone(),
                     emit_every_ms,
                     full_checkpoint_every_ms: (mode == TransmissionMode::Delta)
-                        .then(|| emit_every_ms.saturating_mul(10)),
+                        .then_some(window_ms),
                     destination_ref: "asapquery-backend".into(),
                     runtime_policy,
                 }
@@ -934,12 +939,18 @@ impl TransmissionPlan {
             return Err(TransmissionPlanError::ProducerSetMismatch);
         }
         for rule in &self.rules {
+            let valid_checkpoint_cadence = match (rule.mode, rule.full_checkpoint_every_ms) {
+                (TransmissionMode::Full, None) => true,
+                (TransmissionMode::Delta, Some(full_every)) => {
+                    rule.emit_every_ms > 0
+                        && full_every >= rule.emit_every_ms
+                        && full_every % rule.emit_every_ms == 0
+                }
+                _ => false,
+            };
             if rule.emit_every_ms == 0
                 || rule.destination_ref.is_empty()
-                || (rule.mode == TransmissionMode::Delta
-                    && rule
-                        .full_checkpoint_every_ms
-                        .map_or(true, |value| value == 0))
+                || !valid_checkpoint_cadence
             {
                 return Err(TransmissionPlanError::InvalidRule(rule.producer_id.clone()));
             }
@@ -1079,7 +1090,6 @@ impl TransmissionPlan {
             || frame.backend_compat != self.envelope.backend_compat
             || frame.series_identity.is_empty()
             || frame.producer_epoch.is_empty()
-            || frame.series_fingerprint.is_empty()
             || frame.sequence == 0
             || frame.window_start_unix_nano >= frame.window_end_unix_nano
             || (frame.kind == SummaryFrameKind::Full
@@ -2188,7 +2198,6 @@ mod tests {
             schema_id: rule.schema_id.clone(),
             producer_id: rule.producer_id.clone(),
             producer_epoch: "boot-1".into(),
-            series_fingerprint: "service=api".into(),
             window_start_unix_nano: 1,
             window_end_unix_nano: 2,
             sequence: 1,

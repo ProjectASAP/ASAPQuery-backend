@@ -83,9 +83,35 @@ struct FrameLineageState {
 #[derive(Debug, Default)]
 pub struct FrameLineageTracker {
     lineages: dashmap::DashMap<FrameLineageKey, FrameLineageState>,
+    batch_gate: std::sync::Mutex<()>,
 }
 
 impl FrameLineageTracker {
+    /// Serialize validation and application of one OTLP frame batch. The
+    /// caller releases this guard after every frame has reached the store.
+    pub fn lock_batch(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.batch_gate.lock().expect("frame lineage batch lock")
+    }
+
+    /// Dry-run a complete batch against a snapshot of committed lineage.
+    /// This detects duplicates, gaps and checkpoint mismatches before the
+    /// caller applies the first payload in the request.
+    pub fn validate_batch<'a>(
+        &self,
+        frames: impl IntoIterator<Item = &'a SummaryFrameIdentity>,
+    ) -> Result<(), FrameLineageError> {
+        let scratch = FrameLineageTracker::default();
+        for entry in &self.lineages {
+            scratch
+                .lineages
+                .insert(entry.key().clone(), entry.value().clone());
+        }
+        for frame in frames {
+            scratch.observe(frame)?;
+        }
+        Ok(())
+    }
+
     /// Validate and atomically record one frame.
     ///
     /// Full frames establish (or replace) the checkpoint and clear an
@@ -213,6 +239,36 @@ mod tests {
         tracker.observe(&full).unwrap();
         tracker.observe(&delta).unwrap();
         assert_eq!(tracker.observe(&delta), Ok(FrameLineageDecision::Duplicate));
+    }
+
+    #[test]
+    fn batch_validation_is_atomic_and_does_not_commit() {
+        let tracker = FrameLineageTracker::default();
+        let full = frame(1, SummaryFrameKind::Full);
+        let delta = frame(2, SummaryFrameKind::Delta);
+        tracker
+            .validate_batch([&full, &delta])
+            .expect("contiguous batch is valid");
+
+        assert_eq!(
+            tracker.observe(&delta),
+            Err(FrameLineageError::MissingBase),
+            "dry-run validation must not expose an un-applied checkpoint"
+        );
+
+        let gap = frame(3, SummaryFrameKind::Delta);
+        assert!(matches!(
+            tracker.validate_batch([&full, &gap]),
+            Err(FrameLineageError::SequenceGap {
+                expected: 2,
+                received: 3
+            })
+        ));
+        assert_eq!(
+            tracker.observe(&full),
+            Ok(FrameLineageDecision::Apply),
+            "a rejected batch must leave committed lineage unchanged"
+        );
     }
 
     #[test]

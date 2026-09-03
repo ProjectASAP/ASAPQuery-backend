@@ -877,6 +877,9 @@ async fn route_modified_otlp_sketches_to_precompute(
     let active_physical_plan = ingest_state
         .physical_plan_snapshot()
         .filter(|plan| plan.backend_plan.plan_id != 0);
+    let lineage_batch_guard = active_physical_plan
+        .as_ref()
+        .map(|_| ingest_state.observability.frame_lineage.lock_batch());
     if let Some(active) = active_physical_plan.as_ref() {
         // Validate the complete request before mutating the SID registry,
         // sketch store, snapshot cache, or worker queues. This makes the
@@ -1272,51 +1275,6 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 "materialization changed after successful request preflight"
                             );
                         }
-
-                        match ingest_state.observability.frame_lineage.observe(frame) {
-                            Ok(
-                                crate::precompute_engine::frame_lineage::FrameLineageDecision::Apply,
-                            ) => {
-                                if frame.kind
-                                    == control_plane::physical::compiler::SummaryFrameKind::Full
-                                {
-                                    ingest_state
-                                        .sketch_index
-                                        .clear_summary_lineage_incomplete(sid, frame);
-                                }
-                            }
-                            Ok(
-                                crate::precompute_engine::frame_lineage::FrameLineageDecision::Duplicate,
-                            ) => {
-                                debug!(
-                                    plan_id = frame.plan_id,
-                                    plan_version = frame.plan_version,
-                                    materialization = frame.materialization.0,
-                                    producer = %frame.producer_id,
-                                    producer_epoch = %frame.producer_epoch,
-                                    sequence = frame.sequence,
-                                    "ignored duplicate summary frame"
-                                );
-                                continue;
-                            }
-                            Err(error) => {
-                                ingest_state
-                                    .sketch_index
-                                    .mark_summary_lineage_incomplete(sid, frame);
-                                rejected_frames = rejected_frames.saturating_add(1);
-                                warn!(
-                                    plan_id = frame.plan_id,
-                                    plan_version = frame.plan_version,
-                                    materialization = frame.materialization.0,
-                                    producer = %frame.producer_id,
-                                    producer_epoch = %frame.producer_epoch,
-                                    sequence = frame.sequence,
-                                    %error,
-                                    "rejected summary frame lineage"
-                                );
-                                continue;
-                            }
-                        }
                     }
 
                     // Phase 5 — register a `SketchInstanceMetadata` on
@@ -1329,10 +1287,9 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // and its key set IS the group-by KEY set.
                     {
                         use crate::storage_engines::sketch_db::index::{
-                            AccuracyBound, Capability, SketchAlgorithm, SketchEncoding,
-                            SketchInstanceMetadata, SketchSampleState,
+                            AccuracyBound, Capability, SketchAlgorithm, SketchInstanceMetadata,
                         };
-                        use std::collections::{BTreeMap, BTreeSet};
+                        use std::collections::BTreeSet;
 
                         if ingest_state.sketch_index.instance(sid).is_none() {
                             let algorithm = sketch_algorithm_for(&dp);
@@ -1477,27 +1434,6 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 );
                             }
                         }
-
-                        let label_values: BTreeMap<String, String> = dp
-                            .attrs
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect();
-                        let window: crate::storage_engines::sketch_db::index::epoch_columnar::TimestampRange = (
-                            dp.start_time_unix_nano / 1_000_000,
-                            dp.time_unix_nano / 1_000_000,
-                        );
-                        let encoding =
-                            encoding_to_handle(dp.encoding).unwrap_or(SketchEncoding::ProtoFull);
-                        ingest_state.sketch_index.append_sample(
-                            sid,
-                            label_values,
-                            window,
-                            SketchSampleState {
-                                bytes: dp.sketch.clone(),
-                                encoding,
-                            },
-                        );
                     }
 
                     // Encoding dispatch: full frames (PROTO /
@@ -1633,17 +1569,6 @@ async fn route_modified_otlp_sketches_to_precompute(
                             );
                             continue;
                         }
-                        ingest_state.sketch_snapshots.insert(
-                            series_key.clone(),
-                            crate::precompute_engine::ingest_handler::SnapshotCacheEntry {
-                                core: merged.clone_boxed_core(),
-                                window_start: dp.start_time_unix_nano,
-                            },
-                        );
-                        // RES-1 — opportunistic eviction sweep keyed by the
-                        // entry's window_start, bounding cache growth for
-                        // churning high-cardinality series.
-                        ingest_state.note_window_and_sweep(dp.start_time_unix_nano);
                         merged
                     } else {
                         match decode_modified_otlp_sketch_bytes(
@@ -1651,19 +1576,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             dp.encoding,
                             &dp.sketch,
                         ) {
-                            Ok(acc) => {
-                                ingest_state.sketch_snapshots.insert(
-                                    series_key.clone(),
-                                    crate::precompute_engine::ingest_handler::SnapshotCacheEntry {
-                                        core: acc.clone_boxed_core(),
-                                        window_start: dp.start_time_unix_nano,
-                                    },
-                                );
-                                // RES-1 — sweep stale per-series bases on the
-                                // full-frame insert too.
-                                ingest_state.note_window_and_sweep(dp.start_time_unix_nano);
-                                acc
-                            }
+                            Ok(acc) => acc,
                             Err(e) => {
                                 ingest_state
                                     .observability
@@ -1705,6 +1618,91 @@ async fn route_modified_otlp_sketches_to_precompute(
                             }
                         }
                     };
+
+                    // Stateful lineage is committed only after the payload
+                    // has decoded successfully. Everything after this gate
+                    // (snapshot replacement and SketchStore insertion) is
+                    // synchronous/infallible, so an HTTP/gRPC success cannot
+                    // acknowledge a sequence whose payload was never applied.
+                    if let Some(frame) = frame_identity.as_ref() {
+                        match ingest_state.observability.frame_lineage.observe(frame) {
+                            Ok(
+                                crate::precompute_engine::frame_lineage::FrameLineageDecision::Apply,
+                            ) => {
+                                if frame.kind
+                                    == control_plane::physical::compiler::SummaryFrameKind::Full
+                                {
+                                    ingest_state
+                                        .sketch_index
+                                        .clear_summary_lineage_incomplete(sid, frame);
+                                }
+                            }
+                            Ok(
+                                crate::precompute_engine::frame_lineage::FrameLineageDecision::Duplicate,
+                            ) => {
+                                debug!(
+                                    plan_id = frame.plan_id,
+                                    plan_version = frame.plan_version,
+                                    materialization = frame.materialization.0,
+                                    producer = %frame.producer_id,
+                                    producer_epoch = %frame.producer_epoch,
+                                    sequence = frame.sequence,
+                                    "ignored duplicate summary frame"
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                ingest_state
+                                    .sketch_index
+                                    .mark_summary_lineage_incomplete(sid, frame);
+                                warn!(
+                                    plan_id = frame.plan_id,
+                                    plan_version = frame.plan_version,
+                                    materialization = frame.materialization.0,
+                                    producer = %frame.producer_id,
+                                    producer_epoch = %frame.producer_epoch,
+                                    sequence = frame.sequence,
+                                    %error,
+                                    "rejected summary frame lineage"
+                                );
+                                return Err(error.to_string());
+                            }
+                        }
+                    }
+
+                    ingest_state.sketch_snapshots.insert(
+                        series_key.clone(),
+                        crate::precompute_engine::ingest_handler::SnapshotCacheEntry {
+                            core: accumulator.clone_boxed_core(),
+                            window_start: dp.start_time_unix_nano,
+                        },
+                    );
+                    ingest_state.note_window_and_sweep(dp.start_time_unix_nano);
+
+                    use crate::storage_engines::sketch_db::index::{
+                        SketchEncoding, SketchSampleState,
+                    };
+                    use std::collections::BTreeMap;
+                    let label_values: BTreeMap<String, String> = dp
+                        .attrs
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    let window: crate::storage_engines::sketch_db::index::epoch_columnar::TimestampRange = (
+                        dp.start_time_unix_nano / 1_000_000,
+                        dp.time_unix_nano / 1_000_000,
+                    );
+                    let encoding =
+                        encoding_to_handle(dp.encoding).unwrap_or(SketchEncoding::ProtoFull);
+                    ingest_state.sketch_index.append_sample(
+                        sid,
+                        label_values,
+                        window,
+                        SketchSampleState {
+                            bytes: dp.sketch.clone(),
+                            encoding,
+                        },
+                    );
 
                     // Collect the configs whose metric matches this DP.
                     // Detection is independent of the legacy dual-write
@@ -1799,6 +1797,10 @@ async fn route_modified_otlp_sketches_to_precompute(
     }
 
     flush_barrier_drops(ingest_state, &barrier_drops, "otlp-modified-proto");
+
+    // No lineage-protected store mutation occurs after this point. Do not
+    // carry a synchronous mutex guard across the async worker-queue flush.
+    drop(lineage_batch_guard);
 
     if !messages.is_empty() {
         if let Err(e) = ingest_state
@@ -2143,7 +2145,7 @@ fn preflight_summary_frames(
         mut dp: ModifiedOtlpSketchDp,
         ingest_state: &IngestState,
         active: &crate::storage_engines::types::ActivePhysicalPlan,
-    ) -> Result<(), String> {
+    ) -> Result<control_plane::physical::compiler::SummaryFrameIdentity, String> {
         let canonical_name = canonical_sketch_metric_name(metric_name, dp.algorithm.clone());
         let frame =
             take_summary_frame_identity(&mut dp.attrs, dp.start_time_unix_nano, dp.time_unix_nano)?;
@@ -2157,18 +2159,31 @@ fn preflight_summary_frames(
             .validate_frame(&frame)
             .map_err(|error| error.to_string())?;
 
-        if !dp.attrs.is_empty() {
+        let schema = active
+            .precompute_plan
+            .schemas
+            .iter()
+            .find(|schema| schema.materialization == frame.materialization)
+            .ok_or_else(|| format!("summary frame for {metric_name} has no active schema"))?;
+        if dp.attrs.is_empty() && !schema.group_by.is_empty() {
+            return Err(format!(
+                "summary frame for {metric_name} omits labels required by its grouped schema"
+            ));
+        }
+        let observed_series = if dp.attrs.is_empty() {
+            "<global>".to_string()
+        } else {
             let pairs: Vec<(&str, &str)> = dp
                 .attrs
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str()))
                 .collect();
-            let observed_series = crate::drivers::ingest::canonical_attrs_fingerprint(&pairs);
-            if observed_series != frame.series_fingerprint {
-                return Err(format!(
-                    "summary frame for {metric_name} declares a series fingerprint different from its labels"
-                ));
-            }
+            crate::drivers::ingest::canonical_attrs_fingerprint(&pairs)
+        };
+        if observed_series != frame.series_identity {
+            return Err(format!(
+                "summary frame for {metric_name} declares a series identity different from its labels"
+            ));
         }
 
         // A malformed full snapshot must not be discovered after an earlier
@@ -2176,6 +2191,28 @@ fn preflight_summary_frames(
         if frame.kind == control_plane::physical::compiler::SummaryFrameKind::Full {
             decode_modified_otlp_sketch_bytes(dp.algorithm.clone(), dp.encoding, &dp.sketch)
                 .map_err(|error| format!("invalid full frame for {metric_name}: {error}"))?;
+        } else {
+            let series_key = format_series_key(canonical_name, &dp.attrs);
+            let (mut base, base_window_start) = ingest_state
+                .sketch_snapshots
+                .get(&series_key)
+                .map(|entry| (entry.core.clone_boxed_core(), entry.window_start))
+                .or_else(|| {
+                    empty_accumulator_for_delta_bootstrap(
+                        dp.kind,
+                        &dp.container_config,
+                        dp.encoding,
+                    )
+                    .map(|base| (base, dp.start_time_unix_nano))
+                })
+                .ok_or_else(|| {
+                    format!("delta frame for {metric_name} has no reconstructable base")
+                })?;
+            if base_window_start != dp.start_time_unix_nano {
+                base.reset_to_empty();
+            }
+            apply_modified_otlp_delta_bytes(dp.kind, dp.encoding, &mut base, &dp.sketch)
+                .map_err(|error| format!("invalid delta frame for {metric_name}: {error}"))?;
         }
 
         // Attribute-elided retries can recover the policy from their known
@@ -2207,9 +2244,10 @@ fn preflight_summary_frames(
                 frame.materialization.0, observed.0
             ));
         }
-        Ok(())
+        Ok(frame)
     }
 
+    let mut frames = Vec::new();
     for resource_metrics in &request.resource_metrics {
         let resource_attrs = resource_metrics
             .resource
@@ -2232,7 +2270,7 @@ fn preflight_summary_frames(
                     ($points:expr, $algorithm:expr, $config:expr) => {{
                         let config = $config;
                         for point in &$points {
-                            validate_one(
+                            frames.push(validate_one(
                                 &metric.name,
                                 ModifiedOtlpSketchDp {
                                     algorithm: $algorithm,
@@ -2246,7 +2284,7 @@ fn preflight_summary_frames(
                                 },
                                 ingest_state,
                                 active,
-                            )?;
+                            )?);
                         }
                     }};
                 }
@@ -2291,6 +2329,11 @@ fn preflight_summary_frames(
             }
         }
     }
+    ingest_state
+        .observability
+        .frame_lineage
+        .validate_batch(frames.iter())
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -2326,7 +2369,6 @@ fn take_summary_frame_identity(
     let schema_id = required(attrs, "asap.frame.schema_id")?;
     let producer_id = required(attrs, "asap.frame.producer_id")?;
     let producer_epoch = required(attrs, "asap.frame.producer_epoch")?;
-    let series_fingerprint = required(attrs, "asap.frame.series_fingerprint")?;
     let sequence = number(attrs, "asap.frame.sequence")?;
     let kind = match required(attrs, "asap.frame.kind")?.as_str() {
         "full" => SummaryFrameKind::Full,
@@ -2356,7 +2398,6 @@ fn take_summary_frame_identity(
         schema_id,
         producer_id,
         producer_epoch,
-        series_fingerprint,
         window_start_unix_nano,
         window_end_unix_nano,
         sequence,
@@ -4653,7 +4694,6 @@ mod sid_bucketing_tests {
             ("asap.frame.schema_id".into(), "schema-99".into()),
             ("asap.frame.producer_id".into(), "edge-a".into()),
             ("asap.frame.producer_epoch".into(), "boot-7".into()),
-            ("asap.frame.series_fingerprint".into(), "service=api".into()),
             ("asap.frame.sequence".into(), "8".into()),
             ("asap.frame.kind".into(), "full".into()),
             ("asap.frame.encoding".into(), "sketchlib_protobuf_v1".into()),

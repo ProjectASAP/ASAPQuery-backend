@@ -296,19 +296,22 @@ matching raw transmission and ingest/archive declarations.
 Until modified OTLP has dedicated identity fields, Collector attaches reserved
 data-point attributes under `asap.frame.*`: identity version, plan ID/version,
 backend compatibility, materialization and schema IDs, producer ID/epoch,
-canonical series fingerprint, sequence, full/delta kind, encoding, and
+canonical series identity, sequence, full/delta kind, encoding, and
 checkpoint/base IDs. Window start/end
 remain the typed data-point timestamps. The backend removes reserved attributes
 before building the series label key and rejects the complete request before
-writing any frame when one identity, schema, encoding, materialization, or full
+writing any frame when one identity, schema, encoding, materialization, or
 payload does not match the active TransmissionPlan. HTTP 2xx / gRPC OK is the
 delivery acknowledgement. Retrying the same full frame is idempotent because
 the identity selects the same SID, label set, and window replacement; no second
 application-level ACK or transport WAL is part of this contract. Receiver
-lineage is scoped by plan/version,
-materialization, producer and producer epoch, and logical window. Exact retries
+lineage is scoped by plan/version, materialization, concrete series, producer
+and producer epoch, and logical window. Grouped frames must retain their labels;
+the singleton ungrouped series uses `<global>` as its identity. Exact retries
 are ignored idempotently; a missing base or sequence gap leaves the lineage
-incomplete until a newer full checkpoint arrives.
+incomplete until a newer full checkpoint arrives. Lineage receipts are not a
+second durable transport log: after backend restart the receiver safely rejects
+deltas until the producer supplies a new full checkpoint.
 
 The compiler error must identify an unsupported capability, invalid placement,
 window incompatibility, identity conflict, or invalid selected guarantee. It
