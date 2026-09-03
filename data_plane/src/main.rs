@@ -456,7 +456,7 @@ async fn main() -> Result<()> {
         frame_identity: control_plane::physical::compiler::FrameIdentityContract {
             identity_version: 1,
             sequence_scope:
-                control_plane::physical::compiler::SequenceScope::MaterializationSeriesWindowProducerEpoch,
+                control_plane::physical::compiler::SequenceScope::MaterializationSeriesProducerEpoch,
             require_checkpoint_for_full: true,
             require_base_checkpoint_for_delta: true,
         },

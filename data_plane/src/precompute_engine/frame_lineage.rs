@@ -39,7 +39,7 @@ pub enum FrameLineageError {
     Incomplete,
 }
 
-/// Exact scope mandated by `SequenceScope::MaterializationSeriesWindowProducerEpoch`.
+/// Exact scope mandated by `SequenceScope::MaterializationSeriesProducerEpoch`.
 /// `producer_id` is included because epochs are only unique within a producer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FrameLineageKey {
@@ -49,8 +49,6 @@ struct FrameLineageKey {
     series_identity: String,
     producer_id: String,
     producer_epoch: String,
-    window_start_unix_nano: u64,
-    window_end_unix_nano: u64,
 }
 
 impl From<&SummaryFrameIdentity> for FrameLineageKey {
@@ -62,8 +60,6 @@ impl From<&SummaryFrameIdentity> for FrameLineageKey {
             series_identity: frame.series_identity.clone(),
             producer_id: frame.producer_id.clone(),
             producer_epoch: frame.producer_epoch.clone(),
-            window_start_unix_nano: frame.window_start_unix_nano,
-            window_end_unix_nano: frame.window_end_unix_nano,
         }
     }
 }
@@ -336,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_series_epoch_and_window_have_independent_lineages() {
+    fn plan_series_and_epoch_are_independent_but_sequence_crosses_windows() {
         let tracker = FrameLineageTracker::default();
         let first = frame(1, SummaryFrameKind::Full);
         tracker.observe(&first).unwrap();
@@ -359,7 +355,7 @@ mod tests {
             Ok(FrameLineageDecision::Apply)
         );
 
-        let mut next_window = first;
+        let mut next_window = frame(2, SummaryFrameKind::Delta);
         next_window.window_start_unix_nano = 200;
         next_window.window_end_unix_nano = 300;
         assert_eq!(

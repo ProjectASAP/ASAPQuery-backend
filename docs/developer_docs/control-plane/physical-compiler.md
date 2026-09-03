@@ -305,8 +305,9 @@ payload does not match the active TransmissionPlan. HTTP 2xx / gRPC OK is the
 delivery acknowledgement. Retrying the same full frame is idempotent because
 the identity selects the same SID, label set, and window replacement; no second
 application-level ACK or transport WAL is part of this contract. Receiver
-lineage is scoped by plan/version, materialization, concrete series, producer
-and producer epoch, and logical window. Grouped frames must retain their labels;
+lineage is scoped by plan/version, materialization, concrete series, producer,
+and producer epoch; sequence/checkpoint continuity crosses logical windows,
+while every frame still identifies its own window. Grouped frames retain labels;
 the singleton ungrouped series uses `<global>` as its identity. Exact retries
 are ignored idempotently; a missing base or sequence gap leaves the lineage
 incomplete until a newer full checkpoint arrives. Lineage receipts are not a

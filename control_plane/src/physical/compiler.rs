@@ -545,7 +545,7 @@ pub enum TransmissionMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceScope {
-    MaterializationSeriesWindowProducerEpoch,
+    MaterializationSeriesProducerEpoch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -871,16 +871,7 @@ impl TransmissionPlan {
                 } else {
                     TransmissionMode::Full
                 };
-                let window_ms = materialization.window_size.saturating_mul(1_000);
-                // Delta mode emits several increments inside one logical
-                // window and starts each window with a full checkpoint. This
-                // matches the window-scoped sequence contract; carrying one
-                // delta across windows would make its base ambiguous.
-                let emit_every_ms = if mode == TransmissionMode::Delta {
-                    (window_ms / 10).max(1)
-                } else {
-                    window_ms
-                };
+                let emit_every_ms = materialization.window_size.saturating_mul(1_000);
                 TransmissionRule {
                     materialization: producer.materialization,
                     producer_id: producer.producer_id.clone(),
@@ -889,7 +880,7 @@ impl TransmissionPlan {
                     encoding: schema.encodings[0].clone(),
                     emit_every_ms,
                     full_checkpoint_every_ms: (mode == TransmissionMode::Delta)
-                        .then_some(window_ms),
+                        .then(|| emit_every_ms.saturating_mul(10)),
                     destination_ref: "asapquery-backend".into(),
                     runtime_policy,
                 }
@@ -899,7 +890,7 @@ impl TransmissionPlan {
             envelope,
             frame_identity: FrameIdentityContract {
                 identity_version: 1,
-                sequence_scope: SequenceScope::MaterializationSeriesWindowProducerEpoch,
+                sequence_scope: SequenceScope::MaterializationSeriesProducerEpoch,
                 require_checkpoint_for_full: true,
                 require_base_checkpoint_for_delta: true,
             },
