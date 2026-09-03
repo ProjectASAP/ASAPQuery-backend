@@ -532,9 +532,12 @@ impl AccumulatorUpdater for MultipleIncreaseAccumulatorUpdater {
 // CmsAccumulatorUpdater (CountMinSketch)
 // ---------------------------------------------------------------------------
 
-/// Bare CMS realizes canonical `SketchQuery::PointCount` frequency semantics.
-/// Each observation contributes one occurrence regardless of its scalar sample
-/// value. Value-weighted top-k is a separate `CmsHeapAccumulatorUpdater` mode.
+/// Keyed weighted-frequency updater.
+///
+/// A raw Prometheus sample represents the observed metric value, so a bare CMS
+/// adds `value` for its key. Counting each received sample as one is a distinct
+/// event-count operation and requires an explicit typed plan contract; it must
+/// not be inferred from the sketch algorithm alone.
 pub struct CmsAccumulatorUpdater {
     acc: CountMinSketchAccumulator,
     row_num: usize,
@@ -559,8 +562,8 @@ impl AccumulatorUpdater for CmsAccumulatorUpdater {
         );
     }
 
-    fn update_keyed(&mut self, key: &KeyByLabelValues, _value: f64, _timestamp_ms: i64) {
-        self.acc.inner.update(&key.to_semicolon_str(), 1.0);
+    fn update_keyed(&mut self, key: &KeyByLabelValues, value: f64, _timestamp_ms: i64) {
+        self.acc.inner.update(&key.to_semicolon_str(), value);
     }
 
     impl_clone_accumulator_methods!(acc);
@@ -686,9 +689,11 @@ impl AccumulatorUpdater for CmsHeapAccumulatorUpdater {
 /// (signed rows, median-of-rows estimator) — distinct math from
 /// `CmsAccumulatorUpdater`'s CMS (min-of-rows). Closes, on the raw-metric
 /// ingest path, the conflation bug where `SummaryKind::CountSketch` silently
-/// shared `CmsAccumulatorUpdater` with bare CMS. Like bare CMS, each
-/// observation contributes one occurrence; value-weighted top-k uses the
-/// separate heap updater.
+/// shared `CmsAccumulatorUpdater` with bare CMS.
+///
+/// As with bare CMS, each raw Prometheus sample contributes its `value`.
+/// Unit event counting must be selected explicitly by a future typed plan
+/// contract rather than being implied by `SummaryKind::CountSketch`.
 pub struct CountSketchAccumulatorUpdater {
     acc: CountSketchAccumulator,
     row_num: usize,
@@ -713,8 +718,8 @@ impl AccumulatorUpdater for CountSketchAccumulatorUpdater {
         );
     }
 
-    fn update_keyed(&mut self, key: &KeyByLabelValues, _value: f64, _timestamp_ms: i64) {
-        self.acc.inner.update(&key.to_semicolon_str(), 1.0);
+    fn update_keyed(&mut self, key: &KeyByLabelValues, value: f64, _timestamp_ms: i64) {
+        self.acc.inner.update(&key.to_semicolon_str(), value);
     }
 
     impl_clone_accumulator_methods!(acc);
@@ -1174,37 +1179,37 @@ mod tests {
     }
 
     #[test]
-    fn bare_cms_counts_events_instead_of_summing_sample_values() {
+    fn bare_cms_adds_sample_values() {
         let mut updater = CmsAccumulatorUpdater::new(4, 256);
-        let key = KeyByLabelValues::new_with_labels(vec!["checkout".to_string()]);
+        let key = KeyByLabelValues::new_with_labels(vec!["api".to_string()]);
 
-        for value in [1_000.0, -7.0, 42.5, 0.0, 9_999.0] {
-            updater.update_keyed(&key, value, 0);
-        }
+        updater.update_keyed(&key, 2.0, 1000);
+        updater.update_keyed(&key, 3.0, 2000);
+        updater.update_keyed(&key, 5.0, 3000);
 
-        let acc = updater.take_accumulator();
+        let acc = updater.snapshot_accumulator();
         let cms = acc
             .as_any()
             .downcast_ref::<CountMinSketchAccumulator>()
-            .expect("must emit CountMinSketchAccumulator");
-        assert_eq!(cms.query_key(&key), 5.0);
+            .expect("should be a CountMinSketchAccumulator");
+        assert_eq!(cms.query_key(&key), 10.0);
     }
 
     #[test]
-    fn bare_count_sketch_counts_events_instead_of_summing_sample_values() {
+    fn bare_count_sketch_adds_sample_values() {
         let mut updater = CountSketchAccumulatorUpdater::new(5, 256);
-        let key = KeyByLabelValues::new_with_labels(vec!["checkout".to_string()]);
+        let key = KeyByLabelValues::new_with_labels(vec!["api".to_string()]);
 
-        for value in [1_000.0, -7.0, 42.5, 0.0, 9_999.0] {
-            updater.update_keyed(&key, value, 0);
-        }
+        updater.update_keyed(&key, 2.0, 1000);
+        updater.update_keyed(&key, 3.0, 2000);
+        updater.update_keyed(&key, 5.0, 3000);
 
-        let acc = updater.take_accumulator();
+        let acc = updater.snapshot_accumulator();
         let count_sketch = acc
             .as_any()
             .downcast_ref::<CountSketchAccumulator>()
-            .expect("must emit CountSketchAccumulator");
-        assert_eq!(count_sketch.query_key(&key), 5.0);
+            .expect("should be a CountSketchAccumulator");
+        assert_eq!(count_sketch.query_key(&key), 10.0);
     }
 
     #[test]
