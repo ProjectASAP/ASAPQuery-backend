@@ -5354,9 +5354,7 @@ async fn handle_post_physical_plan(
             .into_response();
     }
     let current = active_handle.snapshot();
-    if current.transmission_plan.envelope.plan_id != 0
-        && current.transmission_plan.envelope.plan_id == request.transmission_plan.envelope.plan_id
-    {
+    if current.transmission_plan.envelope.plan_id != 0 {
         if let Err(error) = current.transmission_plan.authorize_successor(
             &request.transmission_plan,
             &request.adaptation_evidence,

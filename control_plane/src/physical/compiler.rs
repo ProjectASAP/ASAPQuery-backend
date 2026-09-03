@@ -442,6 +442,18 @@ impl PrecomputePlan {
                 ));
             }
         }
+        let mut schema_ids = BTreeSet::new();
+        for schema in &self.schemas {
+            if schema.schema_id.trim().is_empty()
+                || !schema_ids.insert(schema.schema_id.as_str())
+                || schema.schema_version == 0
+                || schema.encodings.is_empty()
+            {
+                return Err(PrecomputePlanError::InvalidSchema {
+                    schema_id: schema.schema_id.clone(),
+                });
+            }
+        }
         let schemas: BTreeSet<_> = self
             .schemas
             .iter()
@@ -449,13 +461,6 @@ impl PrecomputePlan {
             .collect();
         if schemas != materializations || schemas.len() != self.schemas.len() {
             return Err(PrecomputePlanError::SchemaSetMismatch);
-        }
-        for schema in &self.schemas {
-            if schema.schema_version == 0 || schema.encodings.is_empty() {
-                return Err(PrecomputePlanError::InvalidSchema {
-                    schema_id: schema.schema_id.clone(),
-                });
-            }
         }
         let schema_by_materialization: BTreeMap<_, _> = self
             .schemas
@@ -945,14 +950,15 @@ impl TransmissionPlan {
             {
                 return Err(TransmissionPlanError::InvalidRule(rule.producer_id.clone()));
             }
-            let family = precompute
+            let schema = precompute
                 .schemas
                 .iter()
                 .find(|schema| schema.materialization == rule.materialization)
-                .expect("producer set validation guarantees a matching schema")
-                .family
-                .clone();
-            validate_runtime_rule_policy(rule, &family)?;
+                .expect("producer set validation guarantees a matching schema");
+            if !schema.encodings.contains(&rule.encoding) {
+                return Err(TransmissionPlanError::InvalidRule(rule.producer_id.clone()));
+            }
+            validate_runtime_rule_policy(rule, &schema.family)?;
         }
         Ok(())
     }
@@ -1031,6 +1037,7 @@ impl TransmissionPlan {
                     && item.schema_id == current.schema_id
                     && !item.producer_version.trim().is_empty()
                     && item.sample_count >= policy.min_evidence_samples
+                    && item.observed_at_unix_ms <= now_unix_ms
                     && now_unix_ms.saturating_sub(item.observed_at_unix_ms)
                         <= policy.max_evidence_age_ms
             });
@@ -1803,7 +1810,8 @@ fn validate_evidence(
     let age = env
         .observed_at_unix_ms
         .saturating_sub(evidence.observed_at_unix_ms);
-    let valid = evidence.selected_lower_bound.is_finite()
+    let valid = evidence.observed_at_unix_ms <= env.observed_at_unix_ms
+        && evidence.selected_lower_bound.is_finite()
         && evidence.excluded_upper_bound.is_finite()
         && evidence.selected_lower_bound > evidence.excluded_upper_bound
         && (0.0..=1.0).contains(&evidence.interval_failure_probability)
@@ -1857,7 +1865,8 @@ fn validate_window_implementations(
         let age = environment
             .observed_at_unix_ms
             .saturating_sub(evidence.observed_at_unix_ms);
-        let valid = !candidate.implementation_id.trim().is_empty()
+        let valid = evidence.observed_at_unix_ms <= environment.observed_at_unix_ms
+            && !candidate.implementation_id.trim().is_empty()
             && ids.insert(candidate.implementation_id.clone())
             && !candidate.state_layout.trim().is_empty()
             && !evidence.model_version.trim().is_empty()
@@ -2353,6 +2362,30 @@ mod tests {
     }
 
     #[test]
+    fn precompute_plan_rejects_empty_or_duplicate_schema_ids() {
+        let bundle = PhysicalCompiler
+            .compile(
+                request("q-quantile", "quantile_over_time(0.99, m[1m])"),
+                environment(10_000),
+            )
+            .expect("compile schema");
+
+        let mut empty = bundle.precompute_plan.clone();
+        empty.schemas[0].schema_id.clear();
+        assert!(matches!(
+            empty.validate(),
+            Err(PrecomputePlanError::InvalidSchema { .. })
+        ));
+
+        let mut duplicate = bundle.precompute_plan;
+        duplicate.schemas.push(duplicate.schemas[0].clone());
+        assert!(matches!(
+            duplicate.validate(),
+            Err(PrecomputePlanError::InvalidSchema { .. })
+        ));
+    }
+
+    #[test]
     fn topk_fails_closed_without_membership_evidence() {
         assert!(request_with_evidence("q-topk", "topk(5, m)", None).is_err());
     }
@@ -2375,6 +2408,35 @@ mod tests {
             .compile(request, environment(100_000))
             .expect_err("stale certificate must fail");
         assert!(matches!(error, CompileError::InvalidEvidence { .. }));
+    }
+
+    #[test]
+    fn future_topk_and_window_evidence_are_rejected() {
+        let topk = request_with_evidence(
+            "q-topk",
+            "topk(5, count_over_time(m[1m]))",
+            Some(TopKMembershipEvidence {
+                selected_lower_bound: 101.0,
+                excluded_upper_bound: 100.0,
+                interval_failure_probability: 0.005,
+                observed_at_unix_ms: 10_001,
+                source: "runtime-margin-monitor".into(),
+            }),
+        )
+        .expect("selection occurs before deployment-time freshness validation");
+        assert!(matches!(
+            PhysicalCompiler.compile(topk, environment(10_000)),
+            Err(CompileError::InvalidEvidence { .. })
+        ));
+
+        let mut window = request("q-window", "quantile_over_time(0.99, m[1m])");
+        window.queries[0].window_implementations[0]
+            .cost
+            .observed_at_unix_ms = 10_001;
+        assert!(matches!(
+            PhysicalCompiler.compile(window, environment(10_000)),
+            Err(CompileError::Lifecycle { .. })
+        ));
     }
 
     #[test]
@@ -2452,6 +2514,12 @@ mod tests {
             )
             .expect("compile");
         let mut rule = bundle.transmission_plan.rules[0].clone();
+        let mut invalid_encoding = bundle.transmission_plan.clone();
+        invalid_encoding.rules[0].encoding = StateEncoding::ExactAccumulatorV1;
+        assert!(matches!(
+            invalid_encoding.validate(&bundle.precompute_plan),
+            Err(TransmissionPlanError::InvalidRule(_))
+        ));
         rule.runtime_policy.sampling = SamplingPolicy::Fixed {
             probability: 0.5,
             estimator: SamplingEstimator::HashThreshold,
@@ -2584,11 +2652,25 @@ mod tests {
         ));
         let stale = RuntimeAdaptationEvidence {
             observed_at_unix_ms: 1,
-            ..evidence
+            ..evidence.clone()
         };
         assert!(matches!(
             current.authorize_successor(&successor, &[stale], 11_000),
             Err(TransmissionPlanError::InvalidAdaptationEvidence(_))
+        ));
+        let future = RuntimeAdaptationEvidence {
+            observed_at_unix_ms: 11_001,
+            ..evidence
+        };
+        assert!(matches!(
+            current.authorize_successor(&successor, &[future], 11_000),
+            Err(TransmissionPlanError::InvalidAdaptationEvidence(_))
+        ));
+        let mut different_plan_id = successor.clone();
+        different_plan_id.envelope.plan_id += 1;
+        assert!(matches!(
+            current.authorize_successor(&different_plan_id, &[], 11_000),
+            Err(TransmissionPlanError::InvalidSuccessor(_))
         ));
         let mut in_place = successor;
         in_place.envelope.plan_version = current.envelope.plan_version;

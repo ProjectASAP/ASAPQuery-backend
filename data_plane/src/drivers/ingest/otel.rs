@@ -873,10 +873,15 @@ async fn route_modified_otlp_sketches_to_precompute(
     use asap_otel_proto::tonic::metrics::v1::metric::Data;
 
     let ingest_received_at = Instant::now();
-    let snap = ingest_state.config_snapshot();
-    let active_physical_plan = ingest_state
-        .physical_plan_snapshot()
-        .filter(|plan| plan.backend_plan.plan_id != 0);
+    // Load the generation exactly once. Deriving both the runtime config and
+    // transmission contract from this Arc prevents an activation between two
+    // independent ArcSwap loads from producing a torn ingest view.
+    let physical_plan_snapshot = ingest_state.physical_plan_snapshot();
+    let snap = physical_plan_snapshot
+        .as_ref()
+        .map(|plan| plan.runtime_config.clone())
+        .unwrap_or_else(|| ingest_state.config_snapshot());
+    let active_physical_plan = physical_plan_snapshot.filter(|plan| plan.backend_plan.plan_id != 0);
     let lineage_batch_guard = active_physical_plan
         .as_ref()
         .map(|_| ingest_state.observability.frame_lineage.lock_batch());
@@ -1350,7 +1355,6 @@ async fn route_modified_otlp_sketches_to_precompute(
                             // below so the query engine can answer per-item estimate(key)
                             // (the CMS/CountSketch FrequencyEstimate gate consults it).
                             let item_label_for_sid: Option<String> = {
-                                let snap = ingest_state.config_snapshot();
                                 snap.get_aggregation_config(policy_fp.as_u64())
                                     .or_else(|| {
                                         snap.get_all_aggregation_configs()
