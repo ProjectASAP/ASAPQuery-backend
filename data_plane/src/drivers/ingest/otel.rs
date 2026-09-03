@@ -30,8 +30,8 @@ use crate::precompute_engine::IngestState;
 use crate::query_engines::routing::FreshnessProbeCache;
 use crate::storage_engines::types::AggregateCore;
 use asap_otel_proto::tonic::collector::metrics::v1::{
-    metrics_service_server::MetricsService, ExportMetricsServiceRequest,
-    ExportMetricsServiceResponse,
+    metrics_service_server::MetricsService, ExportMetricsPartialSuccess,
+    ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
 use asap_otel_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use asap_otel_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
@@ -216,7 +216,10 @@ impl MetricsService for MetricsServiceImpl {
         }
         debug!("OTLP sending response via gRPC");
         Ok(Response::new(ExportMetricsServiceResponse {
-            partial_success: None,
+            partial_success: (outcome.rejected_frames > 0).then(|| ExportMetricsPartialSuccess {
+                rejected_data_points: outcome.rejected_frames as i64,
+                error_message: "summary frame identity rejected by active TransmissionPlan".into(),
+            }),
             // Sid bindings the sender should cache. Each entry maps an
             // `attributes_fingerprint` to the canonical sid the backend's
             // `SeriesIdResolver` minted (or returned from its cache). The
@@ -328,7 +331,7 @@ async fn handle_otlp_http(
     // are the universal recovery primitive (see proto comment on
     // `ExportMetricsServiceResponse.unknown_series_ids`).
     Ok(Json(serde_json::json!({
-        "rejected": 0,
+        "rejected": outcome.rejected_frames,
         "unknown_series_ids": outcome.unknown_series_ids,
         "series_assignments_count": outcome.series_assignments.len(),
     })))
@@ -857,6 +860,7 @@ async fn route_otlp_to_precompute(
 pub(crate) struct IngestOutcome {
     pub unknown_series_ids: Vec<u64>,
     pub series_assignments: Vec<asap_otel_proto::tonic::collector::metrics::v1::SeriesAssignment>,
+    pub rejected_frames: u64,
 }
 
 async fn route_modified_otlp_sketches_to_precompute(
@@ -867,6 +871,9 @@ async fn route_modified_otlp_sketches_to_precompute(
 
     let ingest_received_at = Instant::now();
     let snap = ingest_state.config_snapshot();
+    let active_physical_plan = ingest_state
+        .physical_plan_snapshot()
+        .filter(|plan| plan.backend_plan.plan_id != 0);
     let agg_configs = snap.get_all_aggregation_configs();
     // Schema retirement #5 — agg_id-keyed registry retired; sid-level
     // reconcile is the only path going forward. See the raw-OTLP
@@ -881,6 +888,7 @@ async fn route_modified_otlp_sketches_to_precompute(
     let mut routed = 0usize;
     let mut decoded_failed = 0usize;
     let mut unconfigured = 0usize;
+    let mut rejected_frames = 0u64;
     // CQ-2 — the legacy routing-side WorkerMessage push (the DEPRECATED
     // dual-write that clones the accumulator into the worker under a
     // bucket-sid, in tandem with the Phase-5 SketchStore append above) is
@@ -1059,7 +1067,34 @@ async fn route_modified_otlp_sketches_to_precompute(
                     None => metric.name.clone(),
                 };
 
-                for dp in dps {
+                for mut dp in dps {
+                    let frame_identity = if let Some(active) = active_physical_plan.as_ref() {
+                        match take_summary_frame_identity(
+                            &mut dp.attrs,
+                            dp.start_time_unix_nano,
+                            dp.time_unix_nano,
+                        )
+                        .and_then(|frame| {
+                            if state_encoding_for_wire(dp.encoding) != Some(frame.encoding.clone())
+                            {
+                                return Err("wire encoding differs from frame identity".into());
+                            }
+                            active
+                                .transmission_plan
+                                .validate_frame(&frame)
+                                .map_err(|error| error.to_string())?;
+                            Ok(frame)
+                        }) {
+                            Ok(frame) => Some(frame),
+                            Err(error) => {
+                                rejected_frames = rejected_frames.saturating_add(1);
+                                warn!(metric = %metric.name, %error, "rejected summary frame");
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let series_key = format_series_key(&canonical_name, &dp.attrs);
                     let ts_ms = (dp.time_unix_nano / 1_000_000) as i64;
 
@@ -1210,6 +1245,32 @@ async fn route_modified_otlp_sketches_to_precompute(
                     let Some(sid) = resolved_sid else {
                         continue;
                     };
+
+                    if let Some(frame) = frame_identity.as_ref() {
+                        let observed_policy = ingest_state
+                            .sketch_index
+                            .instance(sid)
+                            .map(|metadata| metadata.policy_fp)
+                            .unwrap_or_else(|| {
+                                derive_sketch_policy_fp(
+                                    ingest_state,
+                                    &canonical_name,
+                                    sketch_kind_handle_for(&dp),
+                                    &dp.container_config,
+                                    &dp.attrs.keys().cloned().collect(),
+                                )
+                            });
+                        if observed_policy != frame.materialization {
+                            rejected_frames = rejected_frames.saturating_add(1);
+                            warn!(
+                                sid,
+                                declared = frame.materialization.0,
+                                observed = observed_policy.0,
+                                "rejected summary frame with mismatched materialization"
+                            );
+                            continue;
+                        }
+                    }
 
                     // Phase 5 — register a `SketchInstanceMetadata` on
                     // first sight of `sid` and append this DP's sketch
@@ -1712,6 +1773,7 @@ async fn route_modified_otlp_sketches_to_precompute(
     IngestOutcome {
         unknown_series_ids: unknown_sids,
         series_assignments: new_assignments,
+        rejected_frames,
     }
 }
 
@@ -2017,6 +2079,86 @@ struct ModifiedOtlpSketchDp {
     /// container. Drives `SketchInstanceMetadata.sketch_config` and the
     /// derived `AccuracyBound`.
     container_config: crate::storage_engines::sketch_db::index::SketchConfig,
+}
+
+fn take_summary_frame_identity(
+    attrs: &mut HashMap<String, String>,
+    window_start_unix_nano: u64,
+    window_end_unix_nano: u64,
+) -> Result<control_plane::physical::compiler::SummaryFrameIdentity, String> {
+    use control_plane::physical::compiler::{
+        StateEncoding, SummaryFrameIdentity, SummaryFrameKind,
+    };
+
+    fn required(attrs: &mut HashMap<String, String>, key: &str) -> Result<String, String> {
+        attrs
+            .remove(key)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("missing {key}"))
+    }
+    fn number(attrs: &mut HashMap<String, String>, key: &str) -> Result<u64, String> {
+        required(attrs, key)?
+            .parse()
+            .map_err(|_| format!("invalid {key}"))
+    }
+
+    let identity_version = u32::try_from(number(attrs, "asap.frame.identity_version")?)
+        .map_err(|_| "invalid asap.frame.identity_version".to_string())?;
+    let plan_id = number(attrs, "asap.frame.plan_id")?;
+    let plan_version = number(attrs, "asap.frame.plan_version")?;
+    let backend_compat = required(attrs, "asap.frame.backend_compat")?;
+    let materialization =
+        asap_types::PolicyFingerprint(number(attrs, "asap.frame.materialization")?);
+    let schema_id = required(attrs, "asap.frame.schema_id")?;
+    let producer_id = required(attrs, "asap.frame.producer_id")?;
+    let producer_epoch = required(attrs, "asap.frame.producer_epoch")?;
+    let sequence = number(attrs, "asap.frame.sequence")?;
+    let kind = match required(attrs, "asap.frame.kind")?.as_str() {
+        "full" => SummaryFrameKind::Full,
+        "delta" => SummaryFrameKind::Delta,
+        _ => return Err("invalid asap.frame.kind".into()),
+    };
+    let encoding = match required(attrs, "asap.frame.encoding")?.as_str() {
+        "sketchlib_protobuf_v1" => StateEncoding::SketchlibProtobufV1,
+        "sketch_core_msgpack_v1" => StateEncoding::SketchCoreMsgpackV1,
+        "exact_accumulator_v1" => StateEncoding::ExactAccumulatorV1,
+        _ => return Err("invalid asap.frame.encoding".into()),
+    };
+    let checkpoint_id = attrs
+        .remove("asap.frame.checkpoint_id")
+        .filter(|value| !value.is_empty());
+    let base_checkpoint_id = attrs
+        .remove("asap.frame.base_checkpoint_id")
+        .filter(|value| !value.is_empty());
+
+    Ok(SummaryFrameIdentity {
+        identity_version,
+        plan_id,
+        plan_version,
+        backend_compat,
+        materialization,
+        schema_id,
+        producer_id,
+        producer_epoch,
+        window_start_unix_nano,
+        window_end_unix_nano,
+        sequence,
+        kind,
+        encoding,
+        checkpoint_id,
+        base_checkpoint_id,
+    })
+}
+
+fn state_encoding_for_wire(
+    encoding: i32,
+) -> Option<control_plane::physical::compiler::StateEncoding> {
+    use control_plane::physical::compiler::StateEncoding;
+    match encoding {
+        ENCODING_PROTO | ENCODING_PROTO_DELTA => Some(StateEncoding::SketchlibProtobufV1),
+        ENCODING_MSGPACK | ENCODING_MSGPACK_DELTA => Some(StateEncoding::SketchCoreMsgpackV1),
+        _ => None,
+    }
 }
 
 /// Decode the typed `sketch` bytes from a modified-OTLP
@@ -4250,5 +4392,32 @@ mod sid_bucketing_tests {
                  resolver mint for (metric={metric}, fp={fp}, agg_kind={agg_kind_canonical})",
             );
         }
+    }
+
+    #[test]
+    fn summary_frame_identity_is_parsed_and_removed_from_series_labels() {
+        let mut attrs = HashMap::from([
+            ("service".into(), "api".into()),
+            ("asap.frame.identity_version".into(), "1".into()),
+            ("asap.frame.plan_id".into(), "42".into()),
+            ("asap.frame.plan_version".into(), "3".into()),
+            (
+                "asap.frame.backend_compat".into(),
+                "asap-query-backend.v1".into(),
+            ),
+            ("asap.frame.materialization".into(), "99".into()),
+            ("asap.frame.schema_id".into(), "schema-99".into()),
+            ("asap.frame.producer_id".into(), "edge-a".into()),
+            ("asap.frame.producer_epoch".into(), "boot-7".into()),
+            ("asap.frame.sequence".into(), "8".into()),
+            ("asap.frame.kind".into(), "full".into()),
+            ("asap.frame.encoding".into(), "sketchlib_protobuf_v1".into()),
+            ("asap.frame.checkpoint_id".into(), "cp-8".into()),
+        ]);
+        let frame = take_summary_frame_identity(&mut attrs, 100, 200).expect("valid identity");
+        assert_eq!(frame.plan_id, 42);
+        assert_eq!(frame.plan_version, 3);
+        assert_eq!(frame.materialization, asap_types::PolicyFingerprint(99));
+        assert_eq!(attrs, HashMap::from([("service".into(), "api".into())]));
     }
 }

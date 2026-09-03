@@ -252,11 +252,22 @@ async fn push_documents_coupled(
             .unwrap_or_default(),
         entries: Default::default(),
     };
+    let transmission_plan = match crate::physical::compiler::TransmissionPlan::build(
+        precompute_plan.envelope.clone(),
+        precompute_plan,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            warn!(%error, "failed to build compatibility TransmissionPlan");
+            return (false, false, 0);
+        }
+    };
 
     for attempt in 1..=RETRY_MAX_ATTEMPTS {
         match client
             .post_physical_plan_typed(
                 precompute_plan,
+                &transmission_plan,
                 plan_bytes.clone(),
                 &query_plan,
                 Some(routing.clone()),

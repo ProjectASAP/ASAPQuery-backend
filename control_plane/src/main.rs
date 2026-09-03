@@ -650,6 +650,7 @@ async fn handle_compile_and_publish_physical_plan(
     if let Err(error) = backend
         .post_physical_plan_typed(
             &bundle.precompute_plan,
+            &bundle.transmission_plan,
             bundle.backend_plan.encode_to_vec(),
             &bundle.query_plan,
             None,

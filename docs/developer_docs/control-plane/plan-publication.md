@@ -39,7 +39,7 @@ validate request and compile one bundle
 preflight every Collector capability
               |
               v
-POST one atomic PrecomputePlan + BackendPlan + QueryPlan bundle (stage)
+POST one atomic PrecomputePlan + TransmissionPlan + BackendPlan + QueryPlan bundle (stage)
               |
               v
 publish target-specific CollectorPlans over OpAMP
@@ -83,8 +83,8 @@ another Collector's plan.
 
 ## Backend wire contract
 
-The matching BackendPlan protobuf is embedded with the typed PrecomputePlan
-and QueryPlan in `POST /api/v1/physical-plan`. The backend validates all shared
+The matching BackendPlan protobuf is embedded with the typed PrecomputePlan,
+TransmissionPlan, and QueryPlan in `POST /api/v1/physical-plan`. The backend validates all shared
 identities, fingerprints, schemas, parameters, producers, and lifecycle fields
 before returning `staged`; `POST /api/v1/physical-plan/activate` performs the
 single immutable-snapshot swap.

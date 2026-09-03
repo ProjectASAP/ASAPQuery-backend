@@ -130,6 +130,7 @@ pub struct PhysicalPlan {
     pub envelope: PlanEnvelope,
     pub collector_plans: Vec<CollectorPlan>, // complete per-target projections
     pub precompute_plan: PrecomputePlan,      // backend streaming materializations
+    pub transmission_plan: TransmissionPlan,  // producer/frame wire contract
     pub backend_plan: BackendPlan,
     pub query_plan: QueryPlan,                // node-ID physical serving DAG
 }
@@ -143,6 +144,7 @@ Supporting public types:
 | `PlanEnvelope` | Shared deterministic `plan_id`, generation time, capability snapshot, and Planner revision. |
 | `CollectorPlan` | Serializable execution projection consumed by ASAPCollector. |
 | `PrecomputePlan` | Authoritative materialization, ingest, state-schema, and producer contract consumed directly by the backend runtime. |
+| `TransmissionPlan` | Exact per-producer mode, encoding, cadence, destination, checkpoint policy, and frame identity contract. |
 | `BackendPlan` | Versioned public data-plane materialization/routing contract defined in this repository. |
 | `QueryPlan` | Canonical-query keyed executable DAG with exact materialization bindings and fallback policy. |
 
@@ -158,6 +160,7 @@ Output definitions:
 | `envelope` | Shared plan/version/activation/compatibility identity. |
 | `collector_plans` | One plan per targeted collector, following ASAPCollector's public CollectorPlan schema. |
 | `precompute_plan` | Materializations plus `/v1/metrics` ingest semantics, typed state schemas/encodings, and allowed producers; it is installed directly and contains no query-string jobs. |
+| `transmission_plan` | One rule per producer/materialization/schema binding plus the mandatory frame identity and sequencing scope. |
 | `backend_plan` | Matching data-plane materialization and routing contract. |
 | `query_plan` | Canonical query identity, explicit fallback policy, node-ID DAG, and exact per-node materialization bindings. |
 
@@ -271,6 +274,16 @@ one compatible backend ingest/storage declaration and that every planned query
 route references a declared materialization. A Backend-only precompute has a
 BackendPlan producer but no Collector materialization; a raw pass-through has
 matching raw transmission and ingest/archive declarations.
+
+### Summary frame identity
+
+Until modified OTLP has dedicated identity fields, Collector attaches reserved
+data-point attributes under `asap.frame.*`: identity version, plan ID/version,
+backend compatibility, materialization and schema IDs, producer ID/epoch,
+sequence, full/delta kind, encoding, and checkpoint/base IDs. Window start/end
+remain the typed data-point timestamps. The backend removes reserved attributes
+before building the series label key and rejects any frame that does not match
+the active TransmissionPlan.
 
 The compiler error must identify an unsupported capability, invalid placement,
 window incompatibility, identity conflict, or invalid selected guarantee. It

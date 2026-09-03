@@ -1035,6 +1035,16 @@ mod tests {
                     output_representation: "summary_state".into(),
                 },
             }],
+            transmission_rules: vec![crate::physical::compiler::TransmissionRule {
+                materialization: asap_types::PolicyFingerprint(1),
+                producer_id: collector_id.into(),
+                schema_id: "asap-query-backend.v1:summary-state:v1:1".into(),
+                mode: crate::physical::compiler::TransmissionMode::Full,
+                encoding: crate::physical::compiler::StateEncoding::SketchlibProtobufV1,
+                emit_every_ms: 60_000,
+                full_checkpoint_every_ms: None,
+                destination_ref: "asapquery-backend".into(),
+            }],
         }
     }
 
