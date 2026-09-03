@@ -11,16 +11,23 @@ The command runs tests serially because several transport tests temporarily
 change process environment or still use fixed loopback ports. It covers:
 
 1. shared type and protobuf wire contracts;
-2. the real control-plane binary plus HTTP, OpAMP, plan publication, and
-   runtime feedback;
+2. the real control-plane binary: HTTP workload planning, configuration
+   delivery to a simulated collector over the production OpAMP WebSocket, and
+   runtime feedback ingestion over the production gRPC listener;
 3. data-plane ingest adapters, query routing, storage, lifecycle, persistence,
    exact-backend forwarding with controlled peers, and a real data-plane
-   process bootstrapped from a file;
-4. the monitor coordinator over a real bidirectional gRPC connection;
-5. Gorilla fragment ingest, WAL recovery, TSDB block construction, Thanos
-   StoreAPI, compaction, and object-store shipping; and
-6. the final controller planning -> backend configuration -> modified OTLP
-   ingest -> precompute -> SketchStore -> PromQL query path.
+   process that accepts modified OTLP, stores a DDSketch, and returns its
+   quantile through the public PromQL endpoint;
+4. the monitor coordinator hosted by a real data-plane process, with two edge
+   clients exchanging reports and differentiated grants over bidirectional
+   gRPC;
+5. a real Gorilla merger process that accepts an XOR fragment over HTTP,
+   durably writes its TSDB block, and returns the exact chunk over Thanos
+   StoreAPI, plus its compaction, recovery, and shipping suites; and
+6. the final production-process path: typed physical-plan compilation,
+   BackendPlan/precompute installation, collector capability and applied ACK
+   over OpAMP, modified-OTLP ingest, SketchStore policy routing, and PromQL
+   query readout of that same plan.
 
 The component suites can also be run separately:
 
@@ -71,6 +78,6 @@ known ignored tests and their reasons with:
 ./scripts/e2e.sh list
 ```
 
-In particular, the older `e2e_modified_otlp_sketch_path` cases remain ignored
-after the protobuf refactor. The maintained whole-path suite is
-`e2e_controller_plans_and_backend_serves`.
+In particular, ignored legacy cases remain visible but do not substitute for
+the maintained production-process tests. The final local whole-backend test is
+`data_plane/tests/backend_process_e2e.rs`.

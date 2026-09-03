@@ -12,7 +12,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // with `sketch-bench/sketch-runtime/proto/feedback.proto`.
     tonic_build::configure()
         .build_server(true)
-        .build_client(false)
+        // Keep the generated client available for black-box process E2E tests
+        // and for downstream agents that share this crate's wire contract.
+        .build_client(true)
         .compile_protos(&["proto/feedback.proto"], &["proto/"])?;
     Ok(())
 }

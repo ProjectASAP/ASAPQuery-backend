@@ -96,7 +96,7 @@ data_plane() {
     rust_test data_plane --test edge_runtime_consumes_precompute_rs
 
     CURRENT_STAGE="data-plane/production-process"
-    say "data-plane: production binary bootstrap and public HTTP diagnostics"
+    say "data-plane: production binary -> modified OTLP -> SketchStore -> PromQL"
     rust_test data_plane --test component_process_e2e
 }
 
@@ -104,27 +104,33 @@ monitor() {
     CURRENT_STAGE="monitor-grpc"
     say "monitor: real bidirectional gRPC server/client"
     rust_test data_plane --test monitor_grpc
+
+    CURRENT_STAGE="monitor-production-process"
+    say "monitor: production coordinator process -> two edge streams -> sampling grants"
+    rust_test data_plane --test monitor_process_e2e
 }
 
 gorilla_merger() {
     CURRENT_STAGE="gorilla-merger"
     say "gorilla-merger: HTTP ingest, WAL, blocks, StoreAPI, compaction, shipping"
     need go
+    mkdir -p "${CARGO_TARGET_DIR}"
     (
         cd "${REPO_DIR}/gorilla-merger"
         GOPRIVATE="${GOPRIVATE:-github.com/ProjectASAP/*}" \
+            go build -o "${CARGO_TARGET_DIR}/gorilla-merger-e2e" ./cmd/gorilla-merger
+        GORILLA_MERGER_E2E_BIN="${CARGO_TARGET_DIR}/gorilla-merger-e2e" \
+            GOPRIVATE="${GOPRIVATE:-github.com/ProjectASAP/*}" \
             go test -count=1 ./...
     )
 }
 
 whole() {
     CURRENT_STAGE="whole/controller-to-query"
-    say "whole repository: controller plan -> backend -> OTLP -> sketch store -> PromQL"
-    # This is the maintained representative happy path. The broader matrix is
-    # intentionally a separate target: it includes known feature regressions
-    # and must not make the routine repository acceptance test nondeterministic.
-    rust_test data_plane --test e2e_controller_plans_and_backend_serves \
-        controller_plan_to_query_full_roundtrip_ddsketch
+    say "whole repository: production controller -> production backend -> OTLP -> PromQL"
+    cargo build --locked -p control_plane --bin control_plane -p data_plane --bin data_plane
+    ASAP_E2E_CONTROL_PLANE_BIN="${CARGO_TARGET_DIR}/debug/control_plane" \
+        rust_test data_plane --test backend_process_e2e
 }
 
 whole_matrix() {

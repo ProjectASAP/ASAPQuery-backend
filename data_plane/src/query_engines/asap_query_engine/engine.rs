@@ -556,6 +556,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     idx, query, now_ms, backend_plan.as_deref(),
                 )
                 .map_err(|reason| {
+                    tracing::debug!(query, ?reason, "post-ASAP warm serving capability miss");
                     if let Some(req) = Self::requirements_from_query_str(query) {
                         crate::drivers::control_plane_client::spawn_capability_miss_notify(
                             &self.control_plane_client,
