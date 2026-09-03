@@ -189,6 +189,13 @@ window. The data plane resolves only that fingerprint through the
 `policy_fp -> SID` reverse index and verifies SID metadata exactly. It never
 scans the catalog for a serving-time candidate.
 
+The compiler walks the entire executable post-ASAP DAG recursively. Every
+`SummaryAgg` leaf reached through `SummaryEstimate` and `SummaryMerge` is bound
+to an exact physical materialization before the query is published. If any
+family or operator on that path is unsupported, the query entry is emitted as
+`ExactFallback`; the compiler does not provision otherwise-unused warm state
+for a query that cannot be executed end to end.
+
 Graph traversal is separate from node definitions and store semantics.
 Activation validates roots, edges, bindings, reachability, and cycles.
 Execution uses the validated topological order and memoizes every node result,
