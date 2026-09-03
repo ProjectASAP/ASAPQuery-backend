@@ -14,22 +14,24 @@ for every target collector. Legacy
 `StageAllocator`/`ThreeStageEmitter` paths remain for older publication flows;
 they are not a second semantic planner.
 
-ASAPPlanner owns logical semantics and summary selection. In particular, a
-deployment override may choose only a family compatible with the selected
-statistic; the physical compiler must reject or ignore an incompatible
-override, never change the statistic to make the override fit. Upgrading the
-Planner pin is a whole-interface migration because newer Planner revisions
-change the post-ASAP family, reduction, grouping, and maintenance types.
+ASAPPlanner owns abstract semantics and selection: summary family and
+parameters, summary-maintenance lifecycle, and summary-window framework. The
+backend enumerates executor-feasible concrete implementations and supplies
+complete workload-scoped cost evidence to Planner. It then retains the
+concrete identity corresponding to Planner's selected abstract framework.
+Missing or stale implementation evidence makes the candidate unavailable; the
+compiler never invents a framework or assigns it an optimistic zero cost.
 
 ## 1. Code architecture
 
 The control plane has three public layers:
 
 ```text
-PlanningRequest
-      |
-      v
-ASAPPlanner candidate selection
+PlanningRequest + DataWorkload + concrete implementation evidence
+      |                                      ^
+      | abstract candidates                  | complete physical costs
+      v                                      |
+ASAPPlanner selection <---------- PhysicalCompiler
       |
       v
 PhysicalCompiler -------> PhysicalPlan
@@ -42,8 +44,9 @@ PhysicalCompiler -------> PhysicalPlan
 - **Planner selection boundary** is
   `planner_selection::select_summary_with_evidence`. It enumerates Planner's
   candidates and commits only a legal candidate.
-- **Physical compiler** adds backend-owned placement, windows, transport, and
-  runtime capabilities without changing logical semantics.
+- **Physical compiler** enumerates concrete window/pane/state-layout,
+  placement, transport, and runtime implementations without changing the
+  Planner-owned abstract framework.
 - **PhysicalPlan** is the only output passed to publication. Its CollectorPlan,
   PrecomputePlan, and BackendPlan projections are created together and share identities.
 
@@ -70,7 +73,7 @@ Input definitions:
 
 | Field | Definition |
 | --- | --- |
-| `queries` | Canonical `QueryExpr`, source, window, grouping labels, accuracy, and stable query ID. |
+| `queries` | Canonical `QueryExpr`, source, grouping labels, accuracy, stable query ID, `DataWorkload`, and executor-feasible `window_implementations`. |
 | `evidence` | Optional typed TopK membership certificates keyed by query ID. |
 | `planner_revision` | Immutable Planner build/revision used for reproducibility. |
 
@@ -90,6 +93,14 @@ pub struct TopKMembershipEvidence {
 
 Why this interface exists: it prevents adapters, protocols, and physical
 planning from each implementing their own query-to-summary mapping.
+
+Each `WindowImplementationCandidate` carries a backend-owned implementation
+identity, its Planner `SummaryWindowFramework`, concrete window/pane/state
+layout, and versioned workload-specific CPU, peak-memory, network, storage,
+scan, and calibrated weighted-cost evidence. The compiler collapses several
+physical realizations of one framework to the cheapest complete one before
+calling Planner, then resolves Planner's result back to that retained concrete
+identity. Physical identities never enter post-ASAP IR.
 
 ### Physical compiler
 
@@ -269,13 +280,17 @@ cross-consistent; it does not mean they have been activated.
 
 For delta, verify duplicate, missing, reordered, and recovery-checkpoint cases.
 
-### Add a physical window policy
+### Add a window implementation
 
-1. Add the public policy variant with anchor, size, slide, and lateness.
-2. Prove it covers the selected logical range without changing semantics.
-3. Include it in materialization identity.
-4. Verify generated collector/backend windows are identical and incompatible
-   query ranges fail compilation.
+1. Use an existing Planner-owned `SummaryWindowFramework`; new abstract
+   frameworks must first be added to Planner.
+2. Advertise an executor-feasible concrete implementation with complete,
+   fresh `DataWorkload` evidence.
+3. Prove its panes and state layout implement the framework and cover the
+   selected query-time range.
+4. Retain the concrete implementation identity in the physical plan and
+   materialization identity, never in Planner IR.
+5. Verify missing evidence and incompatible executor semantics fail closed.
 
 ### Required output checks
 

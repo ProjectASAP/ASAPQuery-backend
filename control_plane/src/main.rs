@@ -582,6 +582,7 @@ struct PhysicalPlanQueryRequest {
     group_by: Vec<String>,
     accuracy: types_v2::AccuracyTarget,
     lifecycle: physical::compiler::LifecyclePlanningInput,
+    window_implementations: Vec<physical::compiler::WindowImplementationCandidate>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -732,6 +733,7 @@ fn compile_physical_plan_request(
             group_by: query.group_by,
             accuracy: query.accuracy,
             lifecycle: query.lifecycle,
+            window_implementations: query.window_implementations,
         });
     }
 
