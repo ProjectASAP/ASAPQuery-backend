@@ -54,7 +54,9 @@ known query/planner regressions are fixed.
 
 Use `ASAP_E2E_NOCAPTURE=1` to display Rust test output. Build artifacts and
 the Go compilation cache are kept below `target/` by default so a full system
-disk does not make Go use the home-directory cache.
+disk does not make Go use the home-directory cache. Rust incremental builds
+are disabled by default to limit disk usage; set `ASAP_E2E_CARGO_INCREMENTAL=1`
+to retain that cache when space is available.
 
 ## Full external system
 

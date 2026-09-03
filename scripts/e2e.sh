@@ -15,6 +15,7 @@ STARTED_AT="$(date +%s)"
 
 export CARGO_TARGET_DIR="${ASAP_E2E_CARGO_TARGET_DIR:-${REPO_DIR}/target/e2e}"
 export GOCACHE="${ASAP_E2E_GO_CACHE:-${REPO_DIR}/target/e2e-go-cache}"
+export CARGO_INCREMENTAL="${ASAP_E2E_CARGO_INCREMENTAL:-0}"
 
 usage() {
     cat <<'EOF'
@@ -36,6 +37,7 @@ Useful environment variables:
   ASAP_COLLECTOR_DIR          Sibling ASAPCollector checkout (system target)
   ASAP_E2E_CARGO_TARGET_DIR   Rust build directory
   ASAP_E2E_GO_CACHE           Go build cache directory
+  ASAP_E2E_CARGO_INCREMENTAL  Set to 1 to retain Rust incremental artifacts
   ASAP_E2E_NOCAPTURE=1        Pass --nocapture to Rust test binaries
 EOF
 }
