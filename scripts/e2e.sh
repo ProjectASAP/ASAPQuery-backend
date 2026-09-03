@@ -94,6 +94,10 @@ data_plane() {
     CURRENT_STAGE="data-plane/edge-runtime-wire"
     say "data-plane: edge runtime sketch envelope -> backend accumulator"
     rust_test data_plane --test edge_runtime_consumes_precompute_rs
+
+    CURRENT_STAGE="data-plane/production-process"
+    say "data-plane: production binary bootstrap and public HTTP diagnostics"
+    rust_test data_plane --test component_process_e2e
 }
 
 monitor() {

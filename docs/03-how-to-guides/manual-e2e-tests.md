@@ -11,14 +11,16 @@ The command runs tests serially because several transport tests temporarily
 change process environment or still use fixed loopback ports. It covers:
 
 1. shared type and protobuf wire contracts;
-2. control-plane HTTP, OpAMP, plan publication, and runtime feedback;
+2. the real control-plane binary plus HTTP, OpAMP, plan publication, and
+   runtime feedback;
 3. data-plane ingest adapters, query routing, storage, lifecycle, persistence,
-   and exact-backend forwarding with controlled peers;
+   exact-backend forwarding with controlled peers, and a real data-plane
+   process bootstrapped from a file;
 4. the monitor coordinator over a real bidirectional gRPC connection;
 5. Gorilla fragment ingest, WAL recovery, TSDB block construction, Thanos
    StoreAPI, compaction, and object-store shipping; and
-6. the final controller-plan -> backend-plan install -> modified OTLP ingest ->
-   precompute -> SketchStore -> PromQL query path.
+6. the final controller planning -> backend configuration -> modified OTLP
+   ingest -> precompute -> SketchStore -> PromQL query path.
 
 The component suites can also be run separately:
 
