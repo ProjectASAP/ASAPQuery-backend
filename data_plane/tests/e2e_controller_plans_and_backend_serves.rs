@@ -360,8 +360,7 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
             // `sketch_index` via OTLP ingest (the engine's
             // `precompute_engine` shares the Arc), but the query
             // path can't see them without this binding.
-            .with_sketch_index(sketch_index.clone())
-            .with_hot_reload_backend_plan(hot_reload_backend_plan.clone()),
+            .with_sketch_index(sketch_index.clone()),
     );
     let server = HttpServer::new(http_config, query_engine, sketch_index)
         .with_hot_reload_config(hot_reload.clone())
