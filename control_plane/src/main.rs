@@ -644,6 +644,7 @@ async fn handle_compile_and_publish_physical_plan(
         .post_physical_plan_typed(
             &bundle.precompute_plan,
             bundle.backend_plan.encode_to_vec(),
+            &bundle.query_plan,
             None,
         )
         .await
@@ -722,6 +723,7 @@ fn compile_physical_plan_request(
         };
         queries.push(physical::compiler::PlanningQuery {
             query_id: query.query_id,
+            query_string: query.query_string,
             post_asap,
             source: planner_types::pre_asap::Source::TimeSeries {
                 metric: query.metric,

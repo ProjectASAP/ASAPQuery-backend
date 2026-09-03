@@ -85,6 +85,57 @@ pub fn execute_post_asap_readout(
     )
 }
 
+/// Execute an already-bound QueryPlan entry.  This is the production serving
+/// path: no PromQL lowering, planner cost model, observed-family lookup, or
+/// BackendPlan materialization search occurs here.
+pub fn execute_query_plan_readout(
+    index: &SketchStore,
+    entry: &control_plane::query_plan::QueryPlanEntry,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    let node = entry
+        .root
+        .to_summary_node()
+        .map_err(|error| LoweringSkip::InvalidQueryPlan(error.to_string()))?;
+    execute_bound_post_asap(
+        index,
+        &node,
+        t0_ms,
+        t1_ms,
+        is_cumulative,
+        entry.materializations.clone(),
+    )
+}
+
+pub fn execute_query_plan_instant(
+    index: &SketchStore,
+    entry: &control_plane::query_plan::QueryPlanEntry,
+    now_ms: u64,
+) -> Result<(PostAsapReadoutOutcome, u64), LoweringSkip> {
+    const DEFAULT_LOOKBACK_MS: u64 = 5 * 60 * 1000;
+    let node = entry
+        .root
+        .to_summary_node()
+        .map_err(|error| LoweringSkip::InvalidQueryPlan(error.to_string()))?;
+    let hints = execution_hints(&node);
+    let t0_ms = if hints.full_history {
+        0
+    } else {
+        now_ms.saturating_sub(hints.lookback_ms.unwrap_or(DEFAULT_LOOKBACK_MS))
+    };
+    let outcome = execute_bound_post_asap(
+        index,
+        &node,
+        t0_ms,
+        now_ms,
+        hints.cumulative_readout,
+        entry.materializations.clone(),
+    )?;
+    Ok((outcome, t0_ms))
+}
+
 /// Plan and execute an instant query without consulting the legacy candidate
 /// analyzer. Lookback and cumulative-vs-per-window behavior come from the
 /// post-ASAP DAG itself.
@@ -166,6 +217,59 @@ fn execute_planned_post_asap(
     }
 }
 
+fn execute_bound_post_asap(
+    index: &SketchStore,
+    node: &planner_types::post_asap::SummaryNode,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+    allowed_materializations: std::collections::BTreeSet<asap_types::PolicyFingerprint>,
+) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    let ctx = QueryExecutionContext {
+        index,
+        t0_ms,
+        t1_ms,
+        is_cumulative,
+        allowed_materializations: Some(allowed_materializations),
+    };
+    convert_execution_result(execute(node, &ctx), t1_ms)
+}
+
+fn convert_execution_result(
+    result: Result<
+        ExecOutcome<QueryExecutionContext<'_>>,
+        crate::query_engines::asap_query_engine::summary_exec::ExecError<
+            crate::query_engines::asap_query_engine::summary_executor::SummaryExecutorError,
+        >,
+    >,
+    t1_ms: u64,
+) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    match result {
+        Ok(ExecOutcome::Value(values)) => {
+            let mut coverage: Option<(u64, u64)> = None;
+            let mut series = Vec::new();
+            for (group_key, value) in &values {
+                fold_coverage(&mut coverage, value.coverage());
+                series.extend(summary_value_to_series(group_key, value));
+            }
+            Ok(PostAsapReadoutOutcome { series, coverage })
+        }
+        Ok(ExecOutcome::State(groups)) => {
+            let mut coverage: Option<(u64, u64)> = None;
+            let mut series = Vec::new();
+            for (group_key, state, _family) in &groups {
+                fold_coverage(&mut coverage, state.exact_coverage());
+                let Some(value) = state.exact_value(&None) else {
+                    continue;
+                };
+                series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
+            }
+            Ok(PostAsapReadoutOutcome { series, coverage })
+        }
+        Err(error) => Err(LoweringSkip::ExecuteFailed(format!("{error:?}"))),
+    }
+}
+
 /// `SummaryValue::Points`/`TopK` -> `ASAPTierResult.series`'s row shape.
 /// `TopK`'s ranked-list-per-timestamp shape is pivoted into one row per
 /// item (each row = the group's label map plus an `item` label, one point
@@ -243,7 +347,7 @@ mod tests {
             first_seen_unix_ms: 0,
             retired_at_ms: None,
             expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET,
+            policy_fp: asap_types::PolicyFingerprint(123),
         });
         use asap_sketchlib::{HllSketch, HllVariant, MessagePackCodec};
         let mut sk = HllSketch::new(HllVariant::Regular, 14);
@@ -302,6 +406,26 @@ mod tests {
             },
         );
         idx
+    }
+
+    #[test]
+    fn formal_query_plan_executes_only_its_bound_policy() {
+        let idx = SketchStore::new();
+        register_hll(&idx, 1, "api", &["a", "b"]);
+        register_hll(&idx, 2, "worker", &["b", "c"]);
+        let node = plan_promql_to_post_asap(&idx, "count(unique_users)", accuracy(), None)
+            .expect("compile-stage fixture");
+        let entry = control_plane::query_plan::QueryPlanEntry {
+            query_id: "q-cardinality".into(),
+            canonical_promql: control_plane::query_plan::canonical_promql("count(unique_users)")
+                .unwrap(),
+            root: control_plane::query_plan::QueryPlanNode::compile(&node).unwrap(),
+            materializations: [asap_types::PolicyFingerprint(123)].into_iter().collect(),
+            fallback: control_plane::query_plan::FallbackPolicy::ExactBackend,
+        };
+        let result = execute_query_plan_readout(&idx, &entry, 1_000, 2_000, true)
+            .expect("execute formal QueryPlan");
+        assert!(!result.series.is_empty());
     }
 
     #[test]

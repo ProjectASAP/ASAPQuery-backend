@@ -5271,6 +5271,7 @@ async fn handle_post_backend_plan(
 struct PhysicalPlanInstallRequest {
     precompute_plan: control_plane::physical::compiler::PrecomputePlan,
     backend_plan: Vec<u8>,
+    query_plan: control_plane::query_plan::QueryPlan,
     storage_routing: Option<serde_json::Value>,
 }
 
@@ -5325,6 +5326,15 @@ async fn handle_post_physical_plan(
         )
             .into_response();
     }
+    if request.query_plan.plan_id != new_plan.plan_id {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": "QueryPlan and BackendPlan plan_id differ"
+            })),
+        )
+            .into_response();
+    }
     let config_fps: BTreeSet<u64> = new_config.aggregation_configs.keys().copied().collect();
     let plan_fps: BTreeSet<u64> = new_plan.materializations.keys().map(|fp| fp.0).collect();
     if config_fps != plan_fps {
@@ -5333,6 +5343,16 @@ async fn handle_post_physical_plan(
             axum::Json(serde_json::json!({
                 "status": "error",
                 "error": "streaming-config and BackendPlan materialization fingerprints differ"
+            })),
+        )
+            .into_response();
+    }
+    let typed_plan_fps: BTreeSet<_> = new_plan.materializations.keys().copied().collect();
+    if let Err(error) = request.query_plan.validate(&typed_plan_fps) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": format!("QueryPlan validation error: {error}")
             })),
         )
             .into_response();
@@ -5356,6 +5376,7 @@ async fn handle_post_physical_plan(
         precompute_plan: request.precompute_plan,
         runtime_config: Arc::new(new_config),
         backend_plan: Arc::new(new_plan),
+        query_plan: Arc::new(request.query_plan),
         storage_routing: new_routing,
     };
     let generated = active.backend_plan.generated_at_unix_ms;

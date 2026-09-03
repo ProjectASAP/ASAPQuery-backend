@@ -4,7 +4,7 @@
 //! deployment decision: evidence freshness, target capabilities, windows, the
 //! Collector execution projection, and the matching BackendPlan.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use asap_aware_mapping::cost_model::Cost;
@@ -34,6 +34,9 @@ use crate::physical::colored_dag::emitter::{
     AggregationInput, BackendAggregation, BackendReadout, BackendStageConfig,
 };
 use crate::physical::post_asap::cost_model::ControlPlaneCostModel;
+use crate::query_plan::{
+    canonical_promql, FallbackPolicy, QueryPlan, QueryPlanEntry, QueryPlanNode,
+};
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
@@ -42,6 +45,9 @@ pub const PLANNER_REVISION: &str = "5d0b6f6edcac65edc89a72051f37977ab0c83031";
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
     pub query_id: String,
+    /// Catalog expression used only to build the stable QueryPlan identity.
+    /// The selected implementation comes from `post_asap`, never this text.
+    pub query_string: String,
     /// Planner-selected post-ASAP DAG. The physical compiler must not
     /// re-select a summary family from pre-ASAP input.
     pub post_asap: Rc<SummaryNode>,
@@ -154,6 +160,7 @@ pub struct PhysicalPlan {
     pub collector_plans: Vec<CollectorPlan>,
     pub precompute_plan: PrecomputePlan,
     pub backend_plan: BackendPlan,
+    pub query_plan: QueryPlan,
 }
 
 #[derive(Debug, Error)]
@@ -171,6 +178,8 @@ pub enum CompileError {
     Lifecycle { query_id: String, reason: String },
     #[error("failed to construct BackendPlan: {0}")]
     BackendPlan(#[from] anyhow::Error),
+    #[error("failed to construct QueryPlan: {0}")]
+    QueryPlan(#[from] crate::query_plan::QueryPlanError),
 }
 
 struct QueryEvidence<'a>(Option<&'a TopKMembershipEvidence>);
@@ -324,11 +333,68 @@ impl PhysicalCompiler {
                 .map(backend_plan::aggregation_config_for_materialization)
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        let materialization_fingerprints: BTreeSet<_> =
+            backend_plan.materializations.keys().copied().collect();
+        let mut query_entries = BTreeMap::new();
+        for query in &request.queries {
+            let canonical = canonical_promql(&query.query_string)?;
+            let selected =
+                extract_selected(&query.post_asap).ok_or_else(|| CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason: "selected plan has no executable sketch materialization/readout".into(),
+                })?;
+            let kind = asap_types::SummaryKind::from(selected.kind);
+            let params = asap_types::SummaryParams::from(selected.params);
+            let metric = match &query.source {
+                Source::TimeSeries { metric } => metric,
+                Source::Table { .. } => unreachable!("table source rejected above"),
+            };
+            let bound: BTreeSet<_> = backend_plan
+                .routing
+                .iter()
+                .filter_map(|route| {
+                    let materialization = backend_plan.materializations.get(&route.materialization)?;
+                    (route.storage_backend == backend_plan::StorageBackend::SketchStore
+                        && matches!(&materialization.source, Source::TimeSeries { metric: m } if m == metric)
+                        && materialization.kind == kind
+                        && materialization.params == params
+                        && materialization.window.size_ms == query.window_secs.saturating_mul(1_000)
+                        && materialization.group_by == query.group_by)
+                        .then_some(route.materialization)
+                })
+                .collect();
+            if bound.is_empty() {
+                return Err(CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason: "compiled BackendPlan has no exact materialization for QueryPlan"
+                        .into(),
+                });
+            }
+            let entry = QueryPlanEntry {
+                query_id: query.query_id.clone(),
+                canonical_promql: canonical.clone(),
+                root: QueryPlanNode::compile(&query.post_asap)?,
+                materializations: bound,
+                fallback: FallbackPolicy::ExactBackend,
+            };
+            if query_entries.insert(canonical.clone(), entry).is_some() {
+                return Err(CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason: format!("duplicate canonical query identity `{canonical}`"),
+                });
+            }
+        }
+        let query_plan = QueryPlan {
+            plan_id,
+            entries: query_entries,
+        };
+        query_plan.validate(&materialization_fingerprints)?;
         Ok(PhysicalPlan {
             envelope,
             collector_plans,
             precompute_plan,
             backend_plan,
+            query_plan,
         })
     }
 }
@@ -611,6 +677,7 @@ mod tests {
         Ok(PlanningRequest {
             queries: vec![PlanningQuery {
                 query_id: query_id.into(),
+                query_string: promql.into(),
                 post_asap,
                 source: Source::TimeSeries { metric: "m".into() },
                 window_secs: 60,
@@ -653,6 +720,17 @@ mod tests {
             SummaryMaintenanceLifecycle::ContinuouslyMaintained
         );
         assert_eq!(bundle.backend_plan.routing.len(), 1);
+        assert_eq!(bundle.query_plan.plan_id, bundle.envelope.plan_id);
+        let entry = bundle
+            .query_plan
+            .lookup("quantile_over_time( 0.99, m[1m] )")
+            .expect("canonical QueryPlan lookup");
+        assert_eq!(entry.query_id, "q-quantile");
+        assert_eq!(entry.materializations.len(), 1);
+        entry.root.to_summary_node().expect("executable DAG recipe");
+        let wire = serde_json::to_vec(&bundle.query_plan).expect("serialize QueryPlan");
+        let decoded: QueryPlan = serde_json::from_slice(&wire).expect("deserialize QueryPlan");
+        assert_eq!(decoded, bundle.query_plan);
         for plan in &bundle.collector_plans {
             assert_eq!(plan.envelope, bundle.envelope);
             assert_eq!(plan.materializations[0].metric, "m");

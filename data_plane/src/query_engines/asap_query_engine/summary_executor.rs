@@ -366,7 +366,21 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
             ExactAgg(AggregationType),
         }
 
-        let candidate_sids = self.index.instances_matching(&metric, &required_keys);
+        // A compiled QueryPlan resolves materializations before activation.
+        // Serving follows the direct fingerprint -> SID reverse index; it
+        // never scans metric registrations to discover a compatible family.
+        let candidate_sids = if let Some(allowed) = &self.allowed_materializations {
+            let mut sids: Vec<_> = allowed
+                .iter()
+                .flat_map(|fingerprint| self.index.sids_for_policy(*fingerprint))
+                .collect();
+            sids.sort_unstable();
+            sids.dedup();
+            sids
+        } else {
+            // Compatibility-only callers without a formal QueryPlan.
+            self.index.instances_matching(&metric, &required_keys)
+        };
         let mut out = Vec::new();
         for sid in candidate_sids {
             let candidate = self

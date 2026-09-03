@@ -88,6 +88,7 @@ pub struct ActivePhysicalPlan {
     pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
     pub runtime_config: Arc<StreamingConfig>,
     pub backend_plan: Arc<control_plane::backend_plan::BackendPlan>,
+    pub query_plan: Arc<control_plane::query_plan::QueryPlan>,
     pub storage_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
 }
 
@@ -117,6 +118,7 @@ impl std::fmt::Debug for HotReloadActivePhysicalPlan {
         let snapshot = self.snapshot();
         f.debug_struct("HotReloadActivePhysicalPlan")
             .field("plan_id", &snapshot.backend_plan.plan_id)
+            .field("query_count", &snapshot.query_plan.entries.len())
             .field(
                 "materializations",
                 &snapshot.precompute_plan.materializations.len(),

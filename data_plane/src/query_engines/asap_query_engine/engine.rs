@@ -56,14 +56,9 @@ pub struct ASAPQueryEngine {
     /// the rest of the routing matrix.
     archive_engine:
         Option<Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>>,
-    /// BackendPlan wire format (design-backend-plan-wire-format.md). When
-    /// `Some`, `post_asap_planner.rs`'s serving-time family/params lookup
-    /// prefers reading the installed plan's materializations directly
-    /// over reconstructing from `SketchStore` metadata
-    /// (`ObservedFamilyCostModel`). `None` when not wired up (unit
-    /// tests, legacy callers), which falls back to `SketchStore`
-    /// reconstruction only.
-    hot_reload_backend_plan: Option<crate::storage_engines::types::HotReloadBackendPlan>,
+    /// Generation-consistent physical snapshot used by the production query
+    /// path. QueryPlan and BackendPlan must never be sampled separately.
+    active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
 }
 
 impl ASAPQueryEngine {
@@ -94,31 +89,25 @@ impl ASAPQueryEngine {
             control_plane_client: None,
             sketch_index: None,
             archive_engine: None,
-            hot_reload_backend_plan: None,
+            active_physical_plan: None,
         }
     }
 
-    /// Attach a `HotReloadBackendPlan` handle so serving-time family/params
-    /// lookups prefer the control plane's installed `BackendPlan` over
-    /// `SketchStore` reconstruction (see this struct's field doc).
-    /// Without this call, lookups fall back to `SketchStore`
-    /// reconstruction unconditionally.
-    pub fn with_hot_reload_backend_plan(
+    pub fn with_active_physical_plan(
         mut self,
-        handle: crate::storage_engines::types::HotReloadBackendPlan,
+        handle: crate::storage_engines::types::HotReloadActivePhysicalPlan,
     ) -> Self {
-        self.hot_reload_backend_plan = Some(handle);
+        self.active_physical_plan = Some(handle);
         self
     }
 
-    /// Snapshot of the currently installed `BackendPlan`, if a hot-reload
-    /// handle is wired up. `None` otherwise — callers fall back to the
-    /// `SketchStore`-reconstruction path.
-    fn backend_plan_snapshot(&self) -> Option<Arc<control_plane::backend_plan::BackendPlan>> {
-        self.hot_reload_backend_plan
+    fn physical_plan_snapshot(
+        &self,
+    ) -> Option<Arc<crate::storage_engines::types::ActivePhysicalPlan>> {
+        self.active_physical_plan
             .as_ref()
-            .map(|h| h.snapshot())
-            .filter(|plan| plan.plan_id != 0)
+            .map(|handle| handle.snapshot())
+            .filter(|plan| plan.backend_plan.plan_id != 0)
     }
 
     /// Phase-5 hybrid-stitch builder — attach an archive engine the
@@ -320,32 +309,49 @@ impl ASAPQueryEngine {
             ));
         };
 
-        let backend_plan_snap = self.backend_plan_snapshot();
-        let result =
-            crate::query_engines::asap_query_engine::live_serve::serve_from_summary_executor(
+        let planned = match self.physical_plan_snapshot() {
+            Some(physical_plan) => match physical_plan.query_plan.lookup(query) {
+                Ok(query_entry) => {
+                    crate::query_engines::asap_query_engine::live_serve::serve_from_query_plan(
+                        idx,
+                        query_entry,
+                        start_ms,
+                        end_ms,
+                        false,
+                    )
+                }
+                Err(reason) => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(reason.to_string())),
+            },
+            #[cfg(test)]
+            None => crate::query_engines::asap_query_engine::live_serve::serve_from_summary_executor(
                 idx,
                 query,
                 start_ms,
                 end_ms,
                 false,
                 control_plane::types_v2::AccuracyTarget::Epsilon(0.01),
-                backend_plan_snap.as_deref(),
-            )
-            .map_err(|reason| {
-                if let Some(req) = Self::requirements_from_query_str(query) {
-                    crate::drivers::control_plane_client::spawn_capability_miss_notify(
-                        &self.control_plane_client,
-                        &req,
-                    );
-                }
-                crate::query_engines::EngineError::capability_miss(
-                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                    format!(
-                        "post-ASAP/BackendPlan resolver could not serve `{query}` over \
+                None,
+            ),
+            #[cfg(not(test))]
+            None => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(
+                "no active physical QueryPlan".into(),
+            )),
+        };
+        let result = planned.map_err(|reason| {
+            if let Some(req) = Self::requirements_from_query_str(query) {
+                crate::drivers::control_plane_client::spawn_capability_miss_notify(
+                    &self.control_plane_client,
+                    &req,
+                );
+            }
+            crate::query_engines::EngineError::capability_miss(
+                crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
+                format!(
+                    "post-ASAP/BackendPlan resolver could not serve `{query}` over \
                      [{start_ms}, {end_ms}]: {reason:?} — failing over to archive"
-                    ),
-                )
-            })?;
+                ),
+            )
+        })?;
 
         // Matrix shape — the range_query wire format requires it.
         let warm_qr = asap_tier_result_to_query_result(result.clone(), end_ms, true);
@@ -550,13 +556,23 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let backend_plan = self.backend_plan_snapshot();
-            let (result, t0_ms) =
-                crate::query_engines::asap_query_engine::live_serve::serve_instant_from_summary_executor(
-                    idx, query, now_ms, backend_plan.as_deref(),
-                )
-                .map_err(|reason| {
-                    tracing::debug!(query, ?reason, "post-ASAP warm serving capability miss");
+            let planned = match self.physical_plan_snapshot() {
+                Some(physical_plan) => match physical_plan.query_plan.lookup(query) {
+                    Ok(query_entry) => crate::query_engines::asap_query_engine::live_serve::serve_instant_from_query_plan(
+                        idx, query_entry, now_ms,
+                    ),
+                    Err(reason) => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(reason.to_string())),
+                },
+                #[cfg(test)]
+                None => crate::query_engines::asap_query_engine::live_serve::serve_instant_from_summary_executor(
+                    idx, query, now_ms, None,
+                ),
+                #[cfg(not(test))]
+                None => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(
+                    "no active physical QueryPlan".into(),
+                )),
+            };
+            let (result, t0_ms) = planned.map_err(|reason| {
                     if let Some(req) = Self::requirements_from_query_str(query) {
                         crate::drivers::control_plane_client::spawn_capability_miss_notify(
                             &self.control_plane_client,
