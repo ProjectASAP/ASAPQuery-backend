@@ -265,7 +265,7 @@ pub enum SummaryExecutorError {
     UnsupportedFamily,
     /// Decode/merge failure surfaced from `delta_apply`/`asap_sketchlib`.
     Decode(String),
-    /// A `SummaryExpr::Logical` node — nothing committed at L4. Same
+    /// A `SummaryExpr::KeepPreAsap` node — no maintained summary was selected. Same
     /// meaning as today's "no candidate bound"; the caller fails over.
     Logical,
     /// A query shape not covered by this executor — see the module doc.
@@ -836,7 +836,7 @@ fn project_group_key(
 }
 
 /// Group-key construction for `find_candidates`, shared by both the
-/// `Sketch` and `ExactAgg` branches -- driven directly by L3/L4's own
+/// `Sketch` and `ExactAgg` branches -- driven directly by the post-ASAP IR's
 /// `Reduction` (ASAPController#163/#164/#165), not inferred from whether
 /// `by` happens to be empty.
 ///
@@ -845,7 +845,7 @@ fn project_group_key(
 /// `SummaryAgg`, an empty `by: Vec<ColumnId>` was genuinely ambiguous --
 /// it could mean either "no explicit grouping was even resolvable" (a
 /// bare per-series range function like `quantile_over_time(0.99,
-/// http_latency_ms[10s])`, where L3/L4 planning has no reference to any
+/// http_latency_ms[10s])`, where the post-ASAP plan has no reference to any
 /// label column at all) or "a real cross-series reduction with zero
 /// grouping columns" (`count(hll_metric)`, `sum(...)`-shaped). Those two
 /// cases need OPPOSITE group-key behavior and the old `by: &[ColumnId]`
@@ -953,7 +953,7 @@ fn find_metric(node: &SummaryNode) -> Option<String> {
 
 /// Walk a canonical `QueryExpr` down to its first `Scan {
 /// source: Source::TimeSeries { metric }, .. }` to recover the target
-/// metric name. Shared with `l4_lowering.rs`'s observed-family lookup
+/// metric name. Shared with `post_asap_planner.rs`'s observed-family lookup
 /// (serving time must know which metric to check the `SketchStore`
 /// against BEFORE binding — see that module's docs).
 pub(crate) fn find_metric_in_query_expr(qe: &QueryExpr) -> Option<String> {

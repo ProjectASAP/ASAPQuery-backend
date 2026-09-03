@@ -1115,7 +1115,7 @@ async fn controller_really_pushes_backend_plan_and_query_really_serves() {
 
     // ── 2. Confirm the backend really installed it (not just accepted the
     //        POST) — read it back via GET, the same handle
-    //        `l4_lowering.rs`'s serving-time lookup reads from. ──
+    //        `post_asap_planner.rs`'s serving-time lookup reads from. ──
     let installed = get_backend_plan(&client, stack.backend_port).await;
     assert_eq!(installed["status"], "success");
     assert_eq!(installed["plan_id"], 1);

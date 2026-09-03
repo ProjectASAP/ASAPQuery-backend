@@ -1,14 +1,15 @@
 //! `SummaryNode` lowering + execution + conversion into `ASAPTierResult`'s
 //! `(series, coverage)` shape — the core `live_serve.rs` (the serving
-//! cutover) calls into. See
-//! `data_plane/docs/l4node-plan-executor-design.md` for the design.
+//! cutover) calls into.
 
 use std::collections::BTreeMap;
 
 use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome};
 use control_plane::types_v2::AccuracyTarget;
 
-use crate::query_engines::asap_query_engine::l4_lowering::{lower_promql_to_l4node, LoweringSkip};
+use crate::query_engines::asap_query_engine::post_asap_planner::{
+    plan_promql_to_post_asap, LoweringSkip,
+};
 use crate::query_engines::asap_query_engine::summary_executor::{
     QueryExecutionContext, SummaryValue,
 };
@@ -51,17 +52,18 @@ pub type SeriesRows = Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)>;
 /// The flag would therefore be unconditionally `false` today; keeping it
 /// would mean keeping a heuristic that can only ever misfire (declining
 /// correct `PerEntity` answers) now that the real signal is available.
-pub struct L4ReadoutOutcome {
+pub struct PostAsapReadoutOutcome {
     pub series: SeriesRows,
     pub coverage: Option<(u64, u64)>,
 }
 
-/// Lower `query`, execute it against `index` over `[t0_ms, t1_ms]`, and
-/// convert the result into `L4ReadoutOutcome`. `Err` covers every reason
+/// Ask ASAPPlanner for the post-ASAP representation of `query`, execute it
+/// against `index` over `[t0_ms, t1_ms]`, and
+/// convert the result into `PostAsapReadoutOutcome`. `Err` covers every reason
 /// this couldn't produce a trustworthy answer — see `LoweringSkip`'s
 /// variants; every one of them means "fall back to the legacy path,"
 /// never "the legacy path is wrong."
-pub fn execute_l4_readout(
+pub fn execute_post_asap_readout(
     index: &SketchStore,
     query: &str,
     t0_ms: u64,
@@ -69,8 +71,8 @@ pub fn execute_l4_readout(
     is_cumulative: bool,
     accuracy: AccuracyTarget,
     backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
-) -> Result<L4ReadoutOutcome, LoweringSkip> {
-    let node = lower_promql_to_l4node(index, query, accuracy, backend_plan)?;
+) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    let node = plan_promql_to_post_asap(index, query, accuracy, backend_plan)?;
 
     let ctx = QueryExecutionContext {
         index,
@@ -87,7 +89,7 @@ pub fn execute_l4_readout(
                 fold_coverage(&mut coverage, value.coverage());
                 series.extend(summary_value_to_series(group_key, value));
             }
-            Ok(L4ReadoutOutcome { series, coverage })
+            Ok(PostAsapReadoutOutcome { series, coverage })
         }
         Ok(ExecOutcome::State(groups)) => {
             let mut coverage: Option<(u64, u64)> = None;
@@ -99,7 +101,7 @@ pub fn execute_l4_readout(
                 };
                 series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
             }
-            Ok(L4ReadoutOutcome { series, coverage })
+            Ok(PostAsapReadoutOutcome { series, coverage })
         }
         Err(e) => Err(LoweringSkip::ExecuteFailed(format!("{e:?}"))),
     }
@@ -246,7 +248,7 @@ mod tests {
     #[test]
     fn bare_range_function_keeps_one_series_per_entity() {
         let idx = ddsketch_fixture();
-        let outcome = execute_l4_readout(
+        let outcome = execute_post_asap_readout(
             &idx,
             "quantile_over_time(0.99, latency_ms[1m])",
             1_000,
@@ -277,7 +279,7 @@ mod tests {
         let idx = SketchStore::new();
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
-        let outcome = execute_l4_readout(
+        let outcome = execute_post_asap_readout(
             &idx,
             "count(unique_users)",
             1_000,
@@ -330,7 +332,7 @@ mod tests {
             (1_000, 2_000),
             Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(42.0)),
         );
-        let outcome = execute_l4_readout(
+        let outcome = execute_post_asap_readout(
             &idx,
             "sum(bytes_total)",
             1_000,

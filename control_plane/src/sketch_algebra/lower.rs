@@ -68,7 +68,7 @@ pub fn bind_query_expr(
 /// instead of the default planning-time [`ControlPlaneCostModel`].
 ///
 /// This is the seam serving-time re-binding needs: `data_plane`'s
-/// live-serving path (`l4_lowering.rs`) must NOT re-derive a family/params
+/// live-serving path (`post_asap_planner.rs`) must NOT re-derive family/params
 /// choice independently of what was actually planned — it looks up what's
 /// really registered in the `SketchStore` and hands in a cost model that
 /// echoes that back, so the resulting `SummaryNode` matches reality by

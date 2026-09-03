@@ -29,7 +29,7 @@
 //! * [`ASAPTierResult`] — per-series timestamped scalar samples
 //!   matching the shape of [`crate::query_engines::query_result::QueryResult::Matrix`],
 //!   filled in by `SummaryExecutor` (via
-//!   `asap_query_engine::live_serve`/`l4_readout`) — the sole
+//!   `asap_query_engine::live_serve`/`post_asap_readout`) — the sole
 //!   sketch-serving path; the legacy `SketchReducer` this module used
 //!   to also hold is retired (see `asap_tier_result.rs`'s doc).
 //!

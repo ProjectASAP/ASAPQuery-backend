@@ -1,5 +1,5 @@
 //! `ASAPTierResult` — the per-series, per-window scalar-result shape
-//! `SummaryExecutor` (via `live_serve.rs`/`l4_readout.rs`) fills in for
+//! `SummaryExecutor` (via `live_serve.rs`/`post_asap_readout.rs`) fills in for
 //! the engine to adapt into `QueryResult`.
 //!
 //! This module used to also hold `SketchReducer`, the legacy per-Capability
