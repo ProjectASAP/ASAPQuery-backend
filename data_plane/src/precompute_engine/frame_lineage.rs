@@ -46,6 +46,7 @@ struct FrameLineageKey {
     plan_id: u64,
     plan_version: u64,
     materialization: asap_types::PolicyFingerprint,
+    series_identity: String,
     producer_id: String,
     producer_epoch: String,
     window_start_unix_nano: u64,
@@ -58,6 +59,7 @@ impl From<&SummaryFrameIdentity> for FrameLineageKey {
             plan_id: frame.plan_id,
             plan_version: frame.plan_version,
             materialization: frame.materialization,
+            series_identity: frame.series_identity.clone(),
             producer_id: frame.producer_id.clone(),
             producer_epoch: frame.producer_epoch.clone(),
             window_start_unix_nano: frame.window_start_unix_nano,
@@ -176,6 +178,7 @@ mod tests {
             plan_version: 3,
             backend_compat: "asap-query-backend.v1".into(),
             materialization: asap_types::PolicyFingerprint(41),
+            series_identity: "service=checkout,zone=a".into(),
             schema_id: "schema-41".into(),
             producer_id: "edge-a".into(),
             producer_epoch: "boot-9".into(),
@@ -277,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_epoch_and_window_have_independent_lineages() {
+    fn plan_series_epoch_and_window_have_independent_lineages() {
         let tracker = FrameLineageTracker::default();
         let first = frame(1, SummaryFrameKind::Full);
         tracker.observe(&first).unwrap();
@@ -285,6 +288,13 @@ mod tests {
         let mut next_plan = first.clone();
         next_plan.plan_version += 1;
         assert_eq!(tracker.observe(&next_plan), Ok(FrameLineageDecision::Apply));
+
+        let mut next_series = first.clone();
+        next_series.series_identity = "service=checkout,zone=b".into();
+        assert_eq!(
+            tracker.observe(&next_series),
+            Ok(FrameLineageDecision::Apply)
+        );
 
         let mut next_epoch = first.clone();
         next_epoch.producer_epoch = "boot-10".into();

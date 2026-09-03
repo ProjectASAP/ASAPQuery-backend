@@ -2468,6 +2468,7 @@ mod tests {
             plan_version: 2,
             backend_compat: "asap-query-backend.v1".into(),
             materialization: PolicyFingerprint(41),
+            series_identity: "service=checkout,zone=a".into(),
             schema_id: "schema-41".into(),
             producer_id: "edge-a".into(),
             producer_epoch: "boot-1".into(),

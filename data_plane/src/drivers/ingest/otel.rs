@@ -2322,6 +2322,7 @@ fn take_summary_frame_identity(
     let backend_compat = required(attrs, "asap.frame.backend_compat")?;
     let materialization =
         asap_types::PolicyFingerprint(number(attrs, "asap.frame.materialization")?);
+    let series_identity = required(attrs, "asap.frame.series_identity")?;
     let schema_id = required(attrs, "asap.frame.schema_id")?;
     let producer_id = required(attrs, "asap.frame.producer_id")?;
     let producer_epoch = required(attrs, "asap.frame.producer_epoch")?;
@@ -2351,6 +2352,7 @@ fn take_summary_frame_identity(
         plan_version,
         backend_compat,
         materialization,
+        series_identity,
         schema_id,
         producer_id,
         producer_epoch,
@@ -4644,6 +4646,10 @@ mod sid_bucketing_tests {
                 "asap-query-backend.v1".into(),
             ),
             ("asap.frame.materialization".into(), "99".into()),
+            (
+                "asap.frame.series_identity".into(),
+                "service=checkout,zone=a".into(),
+            ),
             ("asap.frame.schema_id".into(), "schema-99".into()),
             ("asap.frame.producer_id".into(), "edge-a".into()),
             ("asap.frame.producer_epoch".into(), "boot-7".into()),

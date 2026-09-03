@@ -797,6 +797,8 @@ pub struct SummaryFrameIdentity {
     pub plan_version: u64,
     pub backend_compat: String,
     pub materialization: asap_types::PolicyFingerprint,
+    /// Canonical producer-side identity for one concrete retained-label group.
+    pub series_identity: String,
     pub schema_id: String,
     pub producer_id: String,
     pub producer_epoch: String,
@@ -1075,6 +1077,7 @@ impl TransmissionPlan {
             || frame.plan_id != self.envelope.plan_id
             || frame.plan_version != self.envelope.plan_version
             || frame.backend_compat != self.envelope.backend_compat
+            || frame.series_identity.is_empty()
             || frame.producer_epoch.is_empty()
             || frame.series_fingerprint.is_empty()
             || frame.sequence == 0
@@ -2181,6 +2184,7 @@ mod tests {
             plan_version: bundle.envelope.plan_version,
             backend_compat: bundle.envelope.backend_compat.clone(),
             materialization: rule.materialization,
+            series_identity: "service=checkout,zone=a".into(),
             schema_id: rule.schema_id.clone(),
             producer_id: rule.producer_id.clone(),
             producer_epoch: "boot-1".into(),
@@ -2510,6 +2514,7 @@ mod tests {
                 plan_version: bundle.envelope.plan_version,
                 backend_compat: bundle.envelope.backend_compat.clone(),
                 materialization: rule.materialization,
+                series_identity: "service=checkout,zone=a".into(),
                 schema_id: rule.schema_id.clone(),
                 producer_id: rule.producer_id.clone(),
                 producer_epoch: "boot-1".into(),
