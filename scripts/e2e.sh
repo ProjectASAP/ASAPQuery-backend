@@ -26,10 +26,12 @@ Targets:
   contracts       Shared Rust type/protobuf wire contracts
   control-plane   Planner HTTP, OpAMP, publication, and runtime feedback
   data-plane      Query, routing, storage, ingest adapter, and lifecycle tests
+  differential    Production backend PromQL vs deterministic raw-value oracle
   monitor         Real monitor gRPC transport tests
   gorilla-merger  Gorilla HTTP/WAL/block/StoreAPI/compaction/shipper tests
   whole           Controller plan -> backend install -> OTLP -> store -> PromQL
-  whole-matrix    Run every whole-path sketch/query scenario (diagnostic)
+  whole-matrix    All sketch families and query shapes (diagnostic)
+  differential-all Raw oracle test plus the all-sketch/query matrix
   system          Delegate to ASAPCollector's real multi-node system harness
   list            Print the suites and audit Rust E2E ignore markers
 
@@ -100,6 +102,14 @@ data_plane() {
     CURRENT_STAGE="data-plane/production-process"
     say "data-plane: production binary -> modified OTLP -> SketchStore -> PromQL"
     rust_test data_plane --test component_process_e2e
+
+    differential
+}
+
+differential() {
+    CURRENT_STAGE="data-plane/promql-differential"
+    say "data-plane: production backend PromQL -> raw-value oracle + instant/range parity"
+    rust_test data_plane --test promql_differential_process_e2e
 }
 
 monitor() {
@@ -141,6 +151,11 @@ whole_matrix() {
     rust_test data_plane --test e2e_controller_plans_and_backend_serves
 }
 
+differential_all() {
+    differential
+    whole_matrix
+}
+
 list_suites() {
     usage
     printf '\nRust E2E tests marked #[ignore] (expected: none):\n'
@@ -178,10 +193,12 @@ main() {
         contracts) need cargo; contracts ;;
         control-plane) need cargo; control_plane ;;
         data-plane) need cargo; data_plane ;;
+        differential) need cargo; differential ;;
         monitor) need cargo; monitor ;;
         gorilla-merger) gorilla_merger ;;
         whole) need cargo; whole ;;
         whole-matrix) need cargo; whole_matrix ;;
+        differential-all) need cargo; differential_all ;;
         system) system_e2e ;;
         list) list_suites; exit 0 ;;
         -h|--help|help) usage; exit 0 ;;

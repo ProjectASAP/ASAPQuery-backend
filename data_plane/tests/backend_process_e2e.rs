@@ -67,7 +67,11 @@ async fn wait_http(client: &reqwest::Client, url: &str, child: &mut Child, name:
     panic!("{name} did not become ready at {url}");
 }
 
-fn ddsketch_export(metric: &str, timestamp_ns: u64, counts: Vec<u64>, alpha: f64) -> Vec<u8> {
+fn ddsketch_export(metric: &str, timestamp_ns: u64, values: &[f64], alpha: f64) -> Vec<u8> {
+    let mut sketch = asap_sketchlib::DdSketch::new(alpha);
+    for value in values {
+        sketch.update(*value);
+    }
     let point = DdSketchDataPoint {
         attributes: vec![KeyValue {
             key: "service".into(),
@@ -78,9 +82,9 @@ fn ddsketch_export(metric: &str, timestamp_ns: u64, counts: Vec<u64>, alpha: f64
         start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
         time_unix_nano: timestamp_ns,
         sketch: DdSketchState {
-            alpha,
-            store_counts: counts,
-            store_offset: -1,
+            alpha: sketch.wire_alpha(),
+            store_counts: sketch.store_counts,
+            store_offset: sketch.store_offset,
         }
         .encode_to_vec(),
         encoding: DdSketchEncoding::DdsketchEncodingProto as i32,
@@ -110,6 +114,16 @@ fn ddsketch_export(metric: &str, timestamp_ns: u64, counts: Vec<u64>, alpha: f64
         }],
     }
     .encode_to_vec()
+}
+
+fn exact_quantile(values: &[f64], quantile: f64) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = quantile * (sorted.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    let fraction = rank - lower as f64;
+    sorted[lower] + (sorted[upper] - sorted[lower]) * fraction
 }
 
 fn first_scalar(response: &serde_json::Value) -> Option<f64> {
@@ -390,13 +404,15 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock");
     let sample_ns = now.as_nanos() as u64;
+    let raw_values = (1..=100).map(|value| value as f64).collect::<Vec<_>>();
+    let reference_p99 = exact_quantile(&raw_values, 0.99);
     client
         .post(format!("http://{otlp_http}/v1/metrics"))
         .header("content-type", "application/x-protobuf")
         .body(ddsketch_export(
             "whole_process_e2e_latency_ms",
             sample_ns,
-            vec![5, 10, 15, 20],
+            &raw_values,
             planned_alpha,
         ))
         .send()
@@ -421,7 +437,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
         .body(ddsketch_export(
             "whole_process_e2e_latency_ms",
             watermark_ns,
-            Vec::new(),
+            &[],
             planned_alpha,
         ))
         .send()
@@ -443,9 +459,16 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
             .await
             .expect("decode PromQL response");
         if let Some(value) = first_scalar(&response) {
+            let relative_error = (value - reference_p99).abs() / reference_p99;
             assert!(
-                value.is_finite() && value > 0.0,
-                "invalid quantile: {value}"
+                value.is_finite() && relative_error <= planned_alpha * 1.05,
+                "backend p99 {value} differs from raw-value oracle {reference_p99}; \
+                 relative_error={relative_error}, allowed={}",
+                planned_alpha * 1.05
+            );
+            assert_eq!(
+                response["data"]["result"][0]["metric"]["service"],
+                "whole-e2e"
             );
             return;
         }

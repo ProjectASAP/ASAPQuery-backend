@@ -35,10 +35,42 @@ The component suites can also be run separately:
 ./scripts/e2e.sh contracts
 ./scripts/e2e.sh control-plane
 ./scripts/e2e.sh data-plane
+./scripts/e2e.sh differential
 ./scripts/e2e.sh monitor
 ./scripts/e2e.sh gorilla-merger
 ./scripts/e2e.sh whole
 ```
+
+`differential` starts the production data-plane process, derives a modified
+OTLP DDSketch from a deterministic raw-value fixture, and compares public
+instant and range PromQL results with an independent exact quantile oracle.
+It also verifies labels, ASAP-local execution, instant/range parity, and range
+parameter validation. It does not require Docker or a Prometheus process.
+
+The complete sketch/query differential inventory is exercised with:
+
+```bash
+./scripts/e2e.sh differential-all
+```
+
+It first runs the stable production-process raw-oracle comparison and then the
+whole-path scenario matrix. The matrix covers DDSketch and KLL quantiles, HLL
+cardinality, CountSketch and Count-Min count queries, heap-backed top-k, an
+instant/range query pair, grouping, delta/sub-window ingest, and shadow/live
+serving. It exits non-zero for every real product regression; no scenario is
+ignored or converted into an expected pass.
+
+| Sketch / path | Public query shape | Oracle / invariant |
+| --- | --- | --- |
+| DDSketch | `quantile_over_time(0.5, ...[10s])`, instant + range | exact raw-value median and instant/range parity |
+| DDSketch | `quantile_over_time(0.99, ...[30s])` | exact raw-value p99 within planned alpha |
+| DDSketch delta | `quantile_over_time(0.99, ...[3m])` | reconstructed multi-window distribution |
+| KLL | `quantile_over_time(0.5, ...[10s])` | non-empty approximate quantile |
+| HLL | `count(metric)` | cardinality result, including multi-SID merge |
+| CountSketch | `count_over_time(...[10s])` | frequency result |
+| Count-Min Sketch | instant and range `count_over_time` | frequency result and matrix wire shape |
+| Heap-backed CountSketch / CMS | `topk(3, metric)` | bounded result count, item labels, and deterministic leader |
+| PromQL range validation | equal start/end and zero step | Prometheus-compatible explicit errors |
 
 `whole` is the stable representative DDSketch path. To exercise every
 currently checked-in sketch/query combination, including scenarios tracking
