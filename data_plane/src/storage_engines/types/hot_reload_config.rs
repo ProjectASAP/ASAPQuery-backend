@@ -118,6 +118,19 @@ impl HotReloadBackendPlan {
     ) -> Arc<control_plane::backend_plan::BackendPlan> {
         self.inner.swap(Arc::new(new))
     }
+
+    /// Validate then atomically install a plan. A rejected plan never becomes
+    /// observable and the previous snapshot remains active.
+    pub fn install(
+        &self,
+        new: control_plane::backend_plan::BackendPlan,
+    ) -> Result<
+        Arc<control_plane::backend_plan::BackendPlan>,
+        control_plane::backend_plan::ValidationError,
+    > {
+        new.validate()?;
+        Ok(self.swap(new))
+    }
 }
 
 impl Default for HotReloadBackendPlan {
@@ -169,6 +182,23 @@ mod hot_reload_backend_plan_tests {
         let hr_clone = hr.clone();
         hr.swap(plan(2));
         assert_eq!(hr_clone.snapshot().plan_id, 2);
+    }
+
+    #[test]
+    fn invalid_plan_is_rejected_without_replacing_snapshot() {
+        let hr = HotReloadBackendPlan::new(plan(1));
+        let mut invalid = plan(2);
+        invalid
+            .routing
+            .push(control_plane::backend_plan::RoutingEntry {
+                satisfies: control_plane::physical::runtime_capability::Capability::ExactAgg(
+                    asap_types::AggregationType::Sum,
+                ),
+                materialization: asap_types::PolicyFingerprint(99),
+                storage_backend: control_plane::backend_plan::StorageBackend::SketchStore,
+            });
+        assert!(hr.install(invalid).is_err());
+        assert_eq!(hr.snapshot().plan_id, 1);
     }
 }
 
