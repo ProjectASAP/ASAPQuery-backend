@@ -1219,21 +1219,13 @@ mod tests {
         let hits = StdArc::new(AtomicU32::new(0));
         let app = Router::new()
             .route(
-                "/api/v1/streaming-config",
+                "/api/v1/physical-plan",
                 post(
                     |State(h): State<StdArc<AtomicU32>>, _b: axum::body::Bytes| async move {
                         h.fetch_add(1, Ordering::SeqCst);
                         axum::http::StatusCode::OK
                     },
                 ),
-            )
-            .route(
-                "/api/v1/storage_routing",
-                post(|_b: axum::body::Bytes| async move { axum::http::StatusCode::OK }),
-            )
-            .route(
-                "/api/v1/backend-plan",
-                post(|_b: axum::body::Bytes| async move { axum::http::StatusCode::OK }),
             )
             .with_state(StdArc::clone(&hits));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

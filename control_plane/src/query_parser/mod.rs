@@ -103,27 +103,12 @@ pub fn parse_query_expr_canonical(
 
 /// Parse a PromQL query string into a [`ParsedQuery`].
 ///
-/// This is the backward-compatible entry point for the existing
-/// [`crate::analyzer::Analyzer`].  Internally it parses via
+/// Flat compatibility entry point for workload metadata extraction. Internally it parses via
 /// [`parse_query_expr_canonical`] and extracts the flat summary by walking
 /// the canonical [`QueryExpr`] tree.
 pub fn parse_query(query: &str, accuracy: AccuracyTarget) -> anyhow::Result<ParsedQuery> {
     let qe = parse_query_expr_canonical(query, accuracy)?;
     Ok(qe_to_parsed_query(&qe))
-}
-
-/// Extract a flat [`ParsedQuery`] from an ALREADY-parsed canonical
-/// [`QueryExpr`].
-///
-/// This is the parse-once seam (P2-1): callers that already hold a
-/// canonical tree (e.g. `asap_tier_analysis::analyze_promql_for_asap_tier`,
-/// which needs both the tree AND the flat summary) derive the
-/// [`ParsedQuery`] from it directly instead of re-running the full
-/// PromQL → legacy → canonical pipeline a second time. The output is
-/// byte-for-byte identical to `parse_query(src)` for the `src` that
-/// produced `qe`.
-pub(crate) fn parsed_query_from_canonical(qe: &QueryExpr) -> ParsedQuery {
-    qe_to_parsed_query(qe)
 }
 
 /// Extract a flat [`ParsedQuery`] by walking a canonical [`QueryExpr`] tree.

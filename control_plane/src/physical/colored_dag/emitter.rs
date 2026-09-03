@@ -672,7 +672,7 @@ pub struct BackendStageConfig {
 /// payload is built by `emit::stage_config::build_backend_aggregation_json`
 /// (a hand-written JSON builder reading these fields), never a whole-struct
 /// serialize.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackendAggregation {
     /// Internal-only id (see struct doc). Not on the wire.
     pub aggregation_id: String,

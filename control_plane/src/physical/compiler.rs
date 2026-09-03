@@ -41,7 +41,9 @@ pub const PLANNER_REVISION: &str = "5d0b6f6edcac65edc89a72051f37977ab0c83031";
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
     pub query_id: String,
-    pub expr: QueryExpr,
+    /// Planner-selected post-ASAP DAG. The physical compiler must not
+    /// re-select a summary family from pre-ASAP input.
+    pub post_asap: Rc<SummaryNode>,
     pub source: Source,
     pub window_secs: u64,
     /// Label names are deployment metadata because Planner's canonical IR
@@ -137,10 +139,10 @@ pub struct CollectorPlan {
 /// PromQL string or ad-hoc scheduler job. The aggregation definitions are
 /// emitted to `/api/v1/streaming-config`, where the runtime matches incoming
 /// series, maintains windows, and writes content-addressed materializations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputePlan {
     pub envelope: PlanEnvelope,
-    pub materializations: Vec<BackendAggregation>,
+    pub materializations: Vec<asap_types::AggregationConfig>,
 }
 
 /// Complete physical projection of one post-ASAP planning decision.
@@ -235,17 +237,7 @@ impl PhysicalCompiler {
                         delete: false,
                     },
                 );
-            let node = crate::planner_selection::select_summary_with_evidence(
-                &query.expr,
-                &model,
-                &DefaultAccuracyModel,
-                &EqualSplitAllocator,
-                &QueryEvidence(evidence),
-            )
-            .map_err(|error| CompileError::Query {
-                query_id: query.query_id.clone(),
-                reason: error.to_string(),
-            })?;
+            let node = query.post_asap.clone();
             let selected = extract_selected(&node).ok_or_else(|| CompileError::Query {
                 query_id: query.query_id.clone(),
                 reason: "selected plan has no executable sketch materialization/readout".into(),
@@ -327,7 +319,10 @@ impl PhysicalCompiler {
             .collect();
         let precompute_plan = PrecomputePlan {
             envelope: envelope.clone(),
-            materializations: aggregations,
+            materializations: aggregations
+                .iter()
+                .map(backend_plan::aggregation_config_for_materialization)
+                .collect::<Result<Vec<_>, _>>()?,
         };
         Ok(PhysicalPlan {
             envelope,
@@ -336,6 +331,38 @@ impl PhysicalCompiler {
             backend_plan,
         })
     }
+}
+
+/// Planner-adapter selection step used before physical compilation. Keeping
+/// this separate makes the ownership boundary explicit: callers supply the
+/// selected post-ASAP DAG to [`PhysicalCompiler::compile`].
+pub fn select_post_asap(
+    expr: &QueryExpr,
+    accuracy: AccuracyTarget,
+    lifecycle: &LifecyclePlanningInput,
+    evidence: Option<&TopKMembershipEvidence>,
+) -> Result<Rc<SummaryNode>, crate::planner_selection::SelectionError> {
+    let model = ControlPlaneCostModel::new(accuracy).with_summary_maintenance(
+        SummaryMaintenanceLifecycleCostInputs {
+            build_cost: Some(Cost(lifecycle.costs.build)),
+            maintenance_cost_per_update: Some(Cost(lifecycle.costs.maintenance_per_update)),
+            summary_read_cost: Some(Cost(lifecycle.costs.read)),
+            retention_cost_rate: Some(CostRate(lifecycle.costs.retention_per_second)),
+            retirement_cost: Some(Cost(lifecycle.costs.retirement)),
+        },
+        SummaryMaintenanceCapabilities {
+            incremental_update: true,
+            merge: true,
+            delete: false,
+        },
+    );
+    crate::planner_selection::select_summary_with_evidence(
+        expr,
+        &model,
+        &DefaultAccuracyModel,
+        &EqualSplitAllocator,
+        &QueryEvidence(evidence),
+    )
 }
 
 fn validate_evidence(
@@ -551,40 +578,53 @@ mod tests {
         }
     }
 
-    fn request(query_id: &str, promql: &str) -> PlanningRequest {
+    fn request_with_evidence(
+        query_id: &str,
+        promql: &str,
+        evidence: Option<TopKMembershipEvidence>,
+    ) -> Result<PlanningRequest, crate::planner_selection::SelectionError> {
         let accuracy = AccuracyTarget::EpsilonDelta {
             epsilon: 0.01,
             delta: 0.01,
         };
         let parsed = crate::query_parser::parse_query_expr_canonical(promql, accuracy.clone())
             .expect("canonical query");
-        let expr = parsed;
-        PlanningRequest {
+        let lifecycle = LifecyclePlanningInput {
+            evaluation_interval_ms: 10_000,
+            ingestion_rate_per_second: 100.0,
+            evidence_observed_at_unix_ms: 9_500,
+            evidence_valid_for_ms: 60_000,
+            horizon_seconds: 300.0,
+            costs: LifecycleCostEvidence {
+                build: 10.0,
+                maintenance_per_update: 0.001,
+                read: 0.1,
+                retention_per_second: 0.001,
+                retirement: 1.0,
+            },
+        };
+        let post_asap = select_post_asap(&parsed, accuracy.clone(), &lifecycle, evidence.as_ref())?;
+        let mut evidence_by_query = HashMap::new();
+        if let Some(evidence) = evidence {
+            evidence_by_query.insert(query_id.to_string(), evidence);
+        }
+        Ok(PlanningRequest {
             queries: vec![PlanningQuery {
                 query_id: query_id.into(),
-                expr,
+                post_asap,
                 source: Source::TimeSeries { metric: "m".into() },
                 window_secs: 60,
                 group_by: vec![],
                 accuracy,
-                lifecycle: LifecyclePlanningInput {
-                    evaluation_interval_ms: 10_000,
-                    ingestion_rate_per_second: 100.0,
-                    evidence_observed_at_unix_ms: 9_500,
-                    evidence_valid_for_ms: 60_000,
-                    horizon_seconds: 300.0,
-                    costs: LifecycleCostEvidence {
-                        build: 10.0,
-                        maintenance_per_update: 0.001,
-                        read: 0.1,
-                        retention_per_second: 0.001,
-                        retirement: 1.0,
-                    },
-                },
+                lifecycle,
             }],
-            evidence: HashMap::new(),
+            evidence: evidence_by_query,
             planner_revision: PLANNER_REVISION.into(),
-        }
+        })
+    }
+
+    fn request(query_id: &str, promql: &str) -> PlanningRequest {
+        request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
     }
 
     #[test]
@@ -635,25 +675,23 @@ mod tests {
 
     #[test]
     fn topk_fails_closed_without_membership_evidence() {
-        let error = PhysicalCompiler
-            .compile(request("q-topk", "topk(5, m)"), environment(10_000))
-            .expect_err("missing certificate must fail");
-        assert!(matches!(error, CompileError::Query { .. }));
+        assert!(request_with_evidence("q-topk", "topk(5, m)", None).is_err());
     }
 
     #[test]
     fn stale_topk_evidence_is_rejected_before_planner_selection() {
-        let mut request = request("q-topk", "topk(5, count_over_time(m[1m]))");
-        request.evidence.insert(
-            "q-topk".into(),
-            TopKMembershipEvidence {
+        let request = request_with_evidence(
+            "q-topk",
+            "topk(5, count_over_time(m[1m]))",
+            Some(TopKMembershipEvidence {
                 selected_lower_bound: 101.0,
                 excluded_upper_bound: 100.0,
                 interval_failure_probability: 0.005,
                 observed_at_unix_ms: 1,
                 source: "runtime-margin-monitor".into(),
-            },
-        );
+            }),
+        )
+        .expect("selection accepts evidence before freshness validation");
         let error = PhysicalCompiler
             .compile(request, environment(100_000))
             .expect_err("stale certificate must fail");
@@ -662,17 +700,18 @@ mod tests {
 
     #[test]
     fn fresh_topk_evidence_enables_physical_compilation() {
-        let mut request = request("q-topk", "topk(5, count_over_time(m[1m]))");
-        request.evidence.insert(
-            "q-topk".into(),
-            TopKMembershipEvidence {
+        let request = request_with_evidence(
+            "q-topk",
+            "topk(5, count_over_time(m[1m]))",
+            Some(TopKMembershipEvidence {
                 selected_lower_bound: 101.0,
                 excluded_upper_bound: 100.0,
                 interval_failure_probability: 0.005,
                 observed_at_unix_ms: 9_500,
                 source: "runtime-margin-monitor".into(),
-            },
-        );
+            }),
+        )
+        .expect("selection accepts valid evidence");
         let bundle = PhysicalCompiler
             .compile(request, environment(10_000))
             .expect("certified TopK compiles");

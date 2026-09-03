@@ -223,10 +223,10 @@ fn observed_family_for_metric(
 /// `observed_family_for_metric`'s "first sketch-typed one found"
 /// semantics); `None` when the plan has no materialization for this
 /// metric.
-fn observed_family_for_metric_from_plan(
+fn observed_families_for_metric_from_plan(
     plan: &control_plane::backend_plan::BackendPlan,
     metric: &str,
-) -> Option<(SketchAlgorithm, SketchParams)> {
+) -> Vec<(SketchAlgorithm, SketchParams)> {
     let mut warm_fingerprints: Vec<_> = plan
         .routing
         .iter()
@@ -237,7 +237,7 @@ fn observed_family_for_metric_from_plan(
         .collect();
     warm_fingerprints.sort_by_key(|fp| fp.0);
     warm_fingerprints.dedup();
-    warm_fingerprints.into_iter().find_map(|fingerprint| {
+    warm_fingerprints.into_iter().filter_map(|fingerprint| {
         let m = plan.materializations.get(&fingerprint)?;
         if !matches!(&m.source, planner_types::pre_asap::Source::TimeSeries { metric: mm } if mm == metric)
         {
@@ -249,16 +249,39 @@ fn observed_family_for_metric_from_plan(
         // materializations (mirrors `observed_family_for_metric`'s
         // "first sketch-typed one found" semantics).
         Some((m.kind.as_sketch_kind()?, m.params.as_sketch_params()?))
-    })
+    }).collect()
 }
 
-fn backend_plan_covers_post_asap(
+pub fn resolve_materializations_for_post_asap(
     plan: &control_plane::backend_plan::BackendPlan,
     node: &SummaryNode,
-) -> Result<(), LoweringSkip> {
+    query: &str,
+    accuracy: AccuracyTarget,
+) -> Result<std::collections::BTreeSet<asap_types::PolicyFingerprint>, LoweringSkip> {
+    let parsed = control_plane::query_parser::parse_query(query, accuracy)
+        .map_err(|e| LoweringSkip::ParseFailed(e.to_string()))?;
+    let spatial_filter = if parsed.label_filters.is_empty() {
+        String::new()
+    } else {
+        let rendered = parsed
+            .label_filters
+            .iter()
+            .map(|(key, value)| format!("{key}=\"{value}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        asap_types::utils::normalize_spatial_filter(&rendered)
+    };
+    let required_groups: std::collections::BTreeSet<_> =
+        parsed.group_by_labels.into_iter().collect();
+    let query_window_ms = parsed.time_window.as_millis() as u64;
+
     fn visit(
         plan: &control_plane::backend_plan::BackendPlan,
         node: &SummaryNode,
+        spatial_filter: &str,
+        required_groups: &std::collections::BTreeSet<String>,
+        query_window_ms: u64,
+        resolved: &mut std::collections::BTreeSet<asap_types::PolicyFingerprint>,
     ) -> Result<(), LoweringSkip> {
         match &node.expr {
             SummaryExpr::SummaryAgg { child, family, .. } => {
@@ -281,25 +304,51 @@ fn backend_plan_covers_post_asap(
                             )))
                         }
                     };
-                let covered = plan.routing.iter().any(|route| {
-                    route.storage_backend == control_plane::backend_plan::StorageBackend::SketchStore
+                let matches: Vec<_> = plan.routing.iter().filter_map(|route| {
+                    (route.storage_backend == control_plane::backend_plan::StorageBackend::SketchStore
                         && plan.materializations.get(&route.materialization).is_some_and(|m| {
                             matches!(&m.source, planner_types::pre_asap::Source::TimeSeries { metric: mm } if mm == &metric)
                                 && m.kind == kind
                                 && m.params == params
-                        })
-                });
-                if !covered {
+                                && m.spatial_filter == spatial_filter
+                                && required_groups.iter().all(|key| m.group_by.contains(key))
+                                && m.window.size_ms <= query_window_ms
+                        }))
+                    .then_some(route.materialization)
+                }).collect();
+                if matches.is_empty() {
                     return Err(LoweringSkip::NoWarmRoute(format!(
                         "no warm BackendPlan route for metric `{metric}` and family `{kind:?}`"
                     )));
                 }
-                visit(plan, child)
+                resolved.extend(matches);
+                visit(
+                    plan,
+                    child,
+                    spatial_filter,
+                    required_groups,
+                    query_window_ms,
+                    resolved,
+                )
             }
-            SummaryExpr::SummaryEstimate { summary_input, .. } => visit(plan, summary_input),
+            SummaryExpr::SummaryEstimate { summary_input, .. } => visit(
+                plan,
+                summary_input,
+                spatial_filter,
+                required_groups,
+                query_window_ms,
+                resolved,
+            ),
             SummaryExpr::SummaryMerge { children } => {
                 for child in children {
-                    visit(plan, child)?;
+                    visit(
+                        plan,
+                        child,
+                        spatial_filter,
+                        required_groups,
+                        query_window_ms,
+                        resolved,
+                    )?;
                 }
                 Ok(())
             }
@@ -309,7 +358,16 @@ fn backend_plan_covers_post_asap(
             )),
         }
     }
-    visit(plan, node)
+    let mut resolved = std::collections::BTreeSet::new();
+    visit(
+        plan,
+        node,
+        &spatial_filter,
+        &required_groups,
+        query_window_ms,
+        &mut resolved,
+    )?;
+    Ok(resolved)
 }
 
 fn query_expr_contains_time_range(qe: &planner_types::pre_asap::QueryExpr) -> bool {
@@ -580,35 +638,78 @@ pub fn plan_promql_to_post_asap(
     // has nothing registered (or only an `ExactAgg` sid, which bypasses
     // `CostModel` entirely) -- `ObservedFamilyCostModel` then falls back
     // further to the accuracy-driven default.
-    let observed = find_metric_in_query_expr(&qe).and_then(|metric| {
-        backend_plan
-            .and_then(|plan| observed_family_for_metric_from_plan(plan, &metric))
-            .or_else(|| observed_family_for_metric(index, &metric))
-    });
-    let cost_model = ObservedFamilyCostModel::new(accuracy, observed);
-
-    let physical =
-        bind_query_expr_with_cost_model(&qe, &cost_model).map_err(|e: BindingError| match e {
-            BindingError::Implement(
-                control_plane::planner_selection::SelectionError::NoLegalCandidate,
-            ) => LoweringSkip::NotRealized,
-            other => LoweringSkip::Implement(other.to_string()),
-        })?;
-
-    match physical {
-        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => {
-            if matches!(node.expr, SummaryExpr::KeepPreAsap(_)) {
-                Err(LoweringSkip::NotRealized)
-            } else {
-                ensure_warm_runtime_support(&node, source_has_filter)?;
-                if let Some(plan) = backend_plan {
-                    backend_plan_covers_post_asap(plan, &node)?;
-                }
-                Ok(node)
-            }
+    let metric = find_metric_in_query_expr(&qe);
+    let mut observed = metric
+        .as_deref()
+        .and_then(|metric| {
+            backend_plan.map(|plan| observed_families_for_metric_from_plan(plan, metric))
+        })
+        .unwrap_or_default();
+    if observed.is_empty() {
+        if let Some(family) = metric
+            .as_deref()
+            .and_then(|metric| observed_family_for_metric(index, metric))
+        {
+            observed.push(family);
         }
-        _ => Err(LoweringSkip::UnsupportedPhysicalShape),
     }
+    // No installed family means the planner may use its accuracy-driven
+    // default. With a BackendPlan, try every family materialized for the
+    // metric: a fingerprint does not uniquely identify query semantics,
+    // and choosing the first family could incorrectly fall back while a
+    // later materialization is an exact match.
+    let candidates: Vec<_> = if observed.is_empty() {
+        vec![None]
+    } else {
+        observed.into_iter().map(Some).collect()
+    };
+    let mut last_skip = LoweringSkip::NotRealized;
+    for observed in candidates {
+        let cost_model = ObservedFamilyCostModel::new(accuracy.clone(), observed);
+        let physical = match bind_query_expr_with_cost_model(&qe, &cost_model) {
+            Ok(physical) => physical,
+            Err(BindingError::Implement(
+                control_plane::planner_selection::SelectionError::NoLegalCandidate,
+            )) => {
+                last_skip = LoweringSkip::NotRealized;
+                continue;
+            }
+            Err(other) => {
+                last_skip = LoweringSkip::Implement(other.to_string());
+                continue;
+            }
+        };
+
+        match physical {
+            PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => {
+                if matches!(node.expr, SummaryExpr::KeepPreAsap(_)) {
+                    last_skip = LoweringSkip::NotRealized;
+                } else {
+                    if let Err(skip) = ensure_warm_runtime_support(&node, source_has_filter) {
+                        last_skip = skip;
+                        continue;
+                    }
+                    if let Some(plan) = backend_plan {
+                        match resolve_materializations_for_post_asap(
+                            plan,
+                            &node,
+                            query,
+                            accuracy.clone(),
+                        ) {
+                            Ok(_) => return Ok(node),
+                            Err(skip) => {
+                                last_skip = skip;
+                                continue;
+                            }
+                        }
+                    }
+                    return Ok(node);
+                }
+            }
+            _ => last_skip = LoweringSkip::UnsupportedPhysicalShape,
+        }
+    }
+    Err(last_skip)
 }
 
 #[cfg(test)]
@@ -810,6 +911,7 @@ mod tests {
                     },
                     group_by: Vec::new(),
                     rollup: Vec::new(),
+                    spatial_filter: String::new(),
                     // `Materialization.kind`/`.params` span both exact
                     // accumulators and sketches -- the flat
                     // `asap_types::SummaryKind`, not this file's own

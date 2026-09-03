@@ -28,6 +28,7 @@ pub mod proto {
 }
 
 mod from_stage_config;
+pub use from_stage_config::aggregation_config_for_materialization;
 pub use from_stage_config::from_stage_config;
 
 use std::collections::HashMap;
@@ -70,6 +71,12 @@ pub enum ValidationError {
     ZeroSlide { fingerprint: u64 },
     #[error("route references unknown materialization {fingerprint}")]
     UnknownMaterialization { fingerprint: u64 },
+    #[error("materialization {fingerprint} has mismatched kind/parameters")]
+    KindParamsMismatch { fingerprint: u64 },
+    #[error("route capability is incompatible with materialization {fingerprint}")]
+    IncompatibleRoute { fingerprint: u64 },
+    #[error("stale plan generation: incoming={incoming}, active={active}")]
+    StaleGeneration { incoming: u64, active: u64 },
 }
 
 // ── WindowSpec ───────────────────────────────────────────────────────────────
@@ -586,6 +593,7 @@ pub struct Materialization {
     pub window: WindowSpec,
     pub group_by: Vec<String>,
     pub rollup: Vec<String>,
+    pub spatial_filter: String,
     pub kind: SummaryKind,
     pub params: SummaryParams,
     pub col: ColumnRef,
@@ -631,6 +639,7 @@ impl From<&Materialization> for proto::Materialization {
             window: Some((&m.window).into()),
             group_by: m.group_by.clone(),
             rollup: m.rollup.clone(),
+            spatial_filter: m.spatial_filter.clone(),
             params: Some((&m.params).into()),
             col: Some((&m.col).into()),
             retention: m.retention.as_ref().map(Into::into),
@@ -674,6 +683,7 @@ impl TryFrom<proto::Materialization> for Materialization {
                 .try_into()?,
             group_by: m.group_by,
             rollup: m.rollup,
+            spatial_filter: m.spatial_filter,
             kind,
             params,
             col: m
@@ -811,16 +821,68 @@ impl BackendPlan {
             if materialization.window.slide_ms == Some(0) {
                 return Err(ValidationError::ZeroSlide { fingerprint: key.0 });
             }
+            if !kind_params_match(&materialization.kind, &materialization.params) {
+                return Err(ValidationError::KindParamsMismatch { fingerprint: key.0 });
+            }
         }
         for route in &self.routing {
-            if !self.materializations.contains_key(&route.materialization) {
+            let Some(materialization) = self.materializations.get(&route.materialization) else {
                 return Err(ValidationError::UnknownMaterialization {
+                    fingerprint: route.materialization.0,
+                });
+            };
+            if !materialization_satisfies(&route.satisfies, materialization) {
+                return Err(ValidationError::IncompatibleRoute {
                     fingerprint: route.materialization.0,
                 });
             }
         }
         Ok(())
     }
+}
+
+fn kind_params_match(kind: &SummaryKind, params: &SummaryParams) -> bool {
+    matches!(
+        (kind, params),
+        (SummaryKind::Sum, SummaryParams::Sum)
+            | (SummaryKind::Count, SummaryParams::Count)
+            | (SummaryKind::MinMax, SummaryParams::MinMax)
+            | (SummaryKind::Increase, SummaryParams::Increase)
+            | (SummaryKind::Rate, SummaryParams::Rate)
+            | (SummaryKind::Kll, SummaryParams::Kll { .. })
+            | (SummaryKind::Cms, SummaryParams::Cms { .. })
+            | (SummaryKind::Hll, SummaryParams::Hll { .. })
+            | (SummaryKind::DDSketch, SummaryParams::DDSketch { .. })
+            | (SummaryKind::CmsWithHeap, SummaryParams::CmsWithHeap { .. })
+            | (SummaryKind::Kmv, SummaryParams::Kmv { .. })
+            | (SummaryKind::Theta, SummaryParams::Theta { .. })
+            | (SummaryKind::CountSketch, SummaryParams::CountSketch { .. })
+            | (
+                SummaryKind::CountSketchWithHeap,
+                SummaryParams::CountSketchWithHeap { .. }
+            )
+    )
+}
+
+fn materialization_satisfies(required: &Capability, m: &Materialization) -> bool {
+    let available = match m.kind {
+        SummaryKind::DDSketch => Capability::QuantileApprox(SketchKindHandle::DDSketch),
+        SummaryKind::Kll => Capability::QuantileApprox(SketchKindHandle::Kll),
+        SummaryKind::Hll => Capability::CardinalityApprox,
+        SummaryKind::Cms => Capability::FrequencyEstimate(SketchKindHandle::CountMin),
+        SummaryKind::CountSketch => Capability::FrequencyEstimate(SketchKindHandle::CountSketch),
+        SummaryKind::CmsWithHeap => Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap),
+        SummaryKind::CountSketchWithHeap => {
+            Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap)
+        }
+        SummaryKind::Sum => Capability::ExactAgg(AggregationType::Sum),
+        SummaryKind::MinMax => Capability::ExactAgg(AggregationType::MinMax),
+        SummaryKind::Increase => Capability::ExactAgg(AggregationType::Increase),
+        SummaryKind::Count | SummaryKind::Rate | SummaryKind::Kmv | SummaryKind::Theta => {
+            return false
+        }
+    };
+    required.is_satisfied_by(&available)
 }
 
 #[cfg(test)]
@@ -845,6 +907,7 @@ mod tests {
             },
             group_by: vec!["zone".to_string()],
             rollup: vec![],
+            spatial_filter: String::new(),
             kind,
             params,
             col: ColumnRef::SampleValue,

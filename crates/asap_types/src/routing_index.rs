@@ -33,7 +33,7 @@
 //! cached derived value through `HotReloadStreamingConfig`'s swap path)
 //! and is not done by this type on its own.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use crate::aggregation_config::AggregationConfig;
 use crate::policy_fingerprint::PolicyFingerprint;
@@ -91,6 +91,36 @@ impl RoutingIndex {
     /// registry — see [`PolicyRegistry::fingerprints`].
     pub fn fingerprints(&self) -> impl Iterator<Item = PolicyFingerprint> + '_ {
         self.registry.fingerprints()
+    }
+
+    /// Resolve an ingest-side sketch shape to exactly one configured policy.
+    /// Ambiguous or absent matches fail closed.
+    pub fn find_policy_by_content(
+        &self,
+        metric: &str,
+        group_by_keys: &BTreeSet<String>,
+        agg_type: crate::AggregationType,
+        expected_params: &HashMap<String, serde_json::Value>,
+    ) -> Option<PolicyFingerprint> {
+        let mut hit = None;
+        for fp in self.candidates_for_metric(metric) {
+            let cfg = self.get(*fp)?;
+            let policy_keys: BTreeSet<_> = cfg.grouping_labels.labels.iter().cloned().collect();
+            if cfg.aggregation_type != agg_type
+                || &policy_keys != group_by_keys
+                || !cfg.spatial_filter_normalized.is_empty()
+                || !expected_params
+                    .iter()
+                    .all(|(key, value)| cfg.parameters.get(key) == Some(value))
+            {
+                continue;
+            }
+            if hit.is_some() {
+                return None;
+            }
+            hit = Some(*fp);
+        }
+        hit
     }
 }
 

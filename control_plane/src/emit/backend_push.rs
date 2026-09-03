@@ -49,11 +49,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::backend_client::{BackendClient, BackendPostError};
-use crate::emit::{emit_backend_storage_routing, emit_backend_streaming_config_json};
+use crate::emit::emit_backend_storage_routing;
 use crate::physical::colored_dag::emitter::BackendStageConfig;
+use crate::physical::compiler::{PlanEnvelope, PrecomputePlan};
 use crate::workload::AggRole;
 
 /// Retry policy for transient POST failures. Tuned to bridge the
@@ -227,58 +228,32 @@ pub enum PushOutcome {
 /// Returns the per-side success flags and the total attempts spent.
 async fn push_documents_coupled(
     client: &Arc<BackendClient>,
-    streaming_body: String,
+    precompute_plan: &PrecomputePlan,
     routing_body: String,
+    plan_bytes: Vec<u8>,
 ) -> (bool, bool, u32) {
     let start = Instant::now();
-    let mut streaming_ok = false;
-    let mut routing_ok = false;
-    // A permanent failure on a side disables further attempts on that side
-    // (retrying a 400 just floods the logs).
-    let mut streaming_permanent = false;
-    let mut routing_permanent = false;
+    let routing: serde_json::Value = match serde_json::from_str(&routing_body) {
+        Ok(value) => value,
+        Err(error) => {
+            warn!(%error, "invalid generated storage routing");
+            return (false, false, 0);
+        }
+    };
 
     for attempt in 1..=RETRY_MAX_ATTEMPTS {
-        // POST whichever side is still outstanding (not yet ok, not
-        // permanently failed). Re-POSTing an already-applied side is safe
-        // (idempotent swap) but wasteful, so we skip it.
-        if !streaming_ok && !streaming_permanent {
-            match client
-                .post_streaming_config_json_typed(streaming_body.clone())
-                .await
-            {
-                Ok(()) => streaming_ok = true,
-                Err(BackendPostError::Permanent(e)) => {
-                    streaming_permanent = true;
-                    warn!(op = "streaming-config", error = %e, "permanent backend POST failure; will not retry this side");
-                }
-                Err(BackendPostError::Transient(e)) => {
-                    warn!(op = "streaming-config", attempt, error = %e, "transient backend POST failure (coupled)");
-                }
+        match client
+            .post_physical_plan_typed(precompute_plan, plan_bytes.clone(), Some(routing.clone()))
+            .await
+        {
+            Ok(()) => return (true, true, attempt),
+            Err(BackendPostError::Permanent(error)) => {
+                warn!(%error, "permanent physical-plan publication failure");
+                return (false, false, attempt);
             }
-        }
-        if !routing_ok && !routing_permanent {
-            match client
-                .post_storage_routing_json_typed(routing_body.clone())
-                .await
-            {
-                Ok(()) => routing_ok = true,
-                Err(BackendPostError::Permanent(e)) => {
-                    routing_permanent = true;
-                    warn!(op = "storage-routing", error = %e, "permanent backend POST failure; will not retry this side");
-                }
-                Err(BackendPostError::Transient(e)) => {
-                    warn!(op = "storage-routing", attempt, error = %e, "transient backend POST failure (coupled)");
-                }
+            Err(BackendPostError::Transient(error)) => {
+                warn!(attempt, %error, "transient physical-plan publication failure")
             }
-        }
-
-        // Both confirmed → done. Both terminal (ok or permanent) → no point
-        // sleeping. Otherwise back off and retry the outstanding side(s).
-        let streaming_done = streaming_ok || streaming_permanent;
-        let routing_done = routing_ok || routing_permanent;
-        if streaming_done && routing_done {
-            return (streaming_ok, routing_ok, attempt);
         }
         if attempt < RETRY_MAX_ATTEMPTS {
             let delay = backoff_delay(attempt, start);
@@ -286,7 +261,7 @@ async fn push_documents_coupled(
         }
     }
 
-    (streaming_ok, routing_ok, RETRY_MAX_ATTEMPTS)
+    (false, false, RETRY_MAX_ATTEMPTS)
 }
 
 /// Required push of the encoded `BackendPlan` — no
@@ -296,24 +271,6 @@ async fn push_documents_coupled(
 /// so the next cycle is itself the retry backstop — same contract
 /// [`push_or_log`] already establishes for the legacy YAML path. Logs at
 /// WARN on failure and return it to the coupled publication outcome.
-async fn push_backend_plan_required(client: &Arc<BackendClient>, bytes: Vec<u8>) -> bool {
-    match client.post_backend_plan_typed(bytes).await {
-        Ok(()) => {
-            debug!(stage = "backend", endpoint = %client.endpoint(), "BackendPlan push succeeded");
-            true
-        }
-        Err(e) => {
-            warn!(
-                stage = "backend",
-                endpoint = %client.endpoint(),
-                error = %e,
-                "BackendPlan push failed; publication generation is incomplete"
-            );
-            false
-        }
-    }
-}
-
 /// Update the cumulative cache with `be` for `(metric, role)` and
 /// POST the cumulative streaming-config + storage-routing JSON
 /// documents to the backend.
@@ -461,30 +418,44 @@ async fn push_cumulative_entries(
             .flat_map(|(_, c)| c.readouts.iter().cloned())
             .collect(),
     };
-    let streaming_body = match emit_backend_streaming_config_json(&cumulative_be, monitors) {
-        Ok(doc) => doc.to_string(),
-        Err(e) => {
-            warn!(error = %e, "emit_backend_streaming_config_json failed; skipping coupled push");
-            return PushOutcome::EmitFailed;
-        }
-    };
-
     // BackendPlan (design-backend-plan-wire-format.md): built from the
     // SAME `cumulative_be` snapshot as the legacy documents above, so all
     // three describe one consistent generation of planning state. Until
     // BackendPlan fully replaces the compatibility documents, publication
     // succeeds only when all three are accepted.
+    let plan_id = PLAN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let generated_at_unix_ms = now_unix_ms();
     let plan_bytes = match crate::backend_plan::from_stage_config(
         &cumulative_be,
         monitors,
-        PLAN_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-        now_unix_ms(),
+        plan_id,
+        generated_at_unix_ms,
     ) {
         Ok(plan) => plan.encode_to_vec(),
         Err(e) => {
             warn!(error = %e, "backend_plan::from_stage_config failed; refusing partial publication");
             return PushOutcome::EmitFailed;
         }
+    };
+    let precompute_plan = PrecomputePlan {
+        envelope: PlanEnvelope {
+            plan_id,
+            generated_at_unix_ms,
+            planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
+            capability_snapshot_id: "replanner".into(),
+        },
+        materializations: match cumulative_be
+            .aggregations
+            .iter()
+            .map(crate::backend_plan::aggregation_config_for_materialization)
+            .collect::<anyhow::Result<Vec<_>>>()
+        {
+            Ok(materializations) => materializations,
+            Err(error) => {
+                warn!(%error, "failed to build typed PrecomputePlan");
+                return PushOutcome::EmitFailed;
+            }
+        },
     };
 
     // Storage-routing: the routing classifier (`build_routing_entry` in
@@ -545,9 +516,8 @@ async fn push_cumulative_entries(
     };
 
     let (streaming_ok, routing_ok, attempts) =
-        push_documents_coupled(client, streaming_body, routing_body).await;
-
-    let plan_ok = push_backend_plan_required(client, plan_bytes).await;
+        push_documents_coupled(client, &precompute_plan, routing_body, plan_bytes).await;
+    let plan_ok = streaming_ok;
 
     if streaming_ok && routing_ok && plan_ok {
         info!(
@@ -844,29 +814,17 @@ mod tests {
         };
         let app = Router::new()
             .route(
-                "/api/v1/streaming-config",
+                "/api/v1/physical-plan",
                 post(
                     |State(m): State<DualMock>, _body: axum::body::Bytes| async move {
                         m.streaming_hits.fetch_add(1, StdOrdering::SeqCst);
-                        m.streaming_status
-                    },
-                ),
-            )
-            .route(
-                "/api/v1/storage_routing",
-                post(
-                    |State(m): State<DualMock>, _body: axum::body::Bytes| async move {
                         m.routing_hits.fetch_add(1, StdOrdering::SeqCst);
-                        m.routing_status
-                    },
-                ),
-            )
-            .route(
-                "/api/v1/backend-plan",
-                post(
-                    |State(m): State<DualMock>, _body: axum::body::Bytes| async move {
                         m.plan_hits.fetch_add(1, StdOrdering::SeqCst);
-                        axum::http::StatusCode::OK
+                        if !m.streaming_status.is_success() {
+                            m.streaming_status
+                        } else {
+                            m.routing_status
+                        }
                     },
                 ),
             )
@@ -928,17 +886,8 @@ mod tests {
     /// explicitly incomplete even if both compatibility documents landed.
     #[tokio::test]
     async fn backend_plan_push_failure_is_reported_as_desync() {
-        // A mock that only serves the legacy endpoints (no
-        // `/api/v1/backend-plan` route) — the plan push 404s.
-        let app = Router::new()
-            .route(
-                "/api/v1/streaming-config",
-                post(|_body: axum::body::Bytes| async { axum::http::StatusCode::OK }),
-            )
-            .route(
-                "/api/v1/storage_routing",
-                post(|_body: axum::body::Bytes| async { axum::http::StatusCode::OK }),
-            );
+        // A mock without the atomic endpoint: the whole generation fails.
+        let app = Router::new();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -962,8 +911,8 @@ mod tests {
         assert_eq!(
             outcome,
             PushOutcome::Desynced {
-                streaming_ok: true,
-                routing_ok: true,
+                streaming_ok: false,
+                routing_ok: false,
                 plan_ok: false,
             },
             "publication must not report success when the authoritative plan is missing"
@@ -997,9 +946,9 @@ mod tests {
         assert_eq!(
             outcome,
             PushOutcome::Desynced {
-                streaming_ok: true,
+                streaming_ok: false,
                 routing_ok: false,
-                plan_ok: true,
+                plan_ok: false,
             },
             "one-sided failure must surface as Desynced, not silent success"
         );

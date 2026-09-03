@@ -640,33 +640,12 @@ async fn handle_compile_and_publish_physical_plan(
         )
             .into_response();
     }
-    let precompute_stage_config = BackendStageConfig {
-        aggregations: bundle.precompute_plan.materializations.clone(),
-        readouts: Vec::new(),
-    };
-    let precompute_config =
-        match emit::emit_backend_streaming_config_json(&precompute_stage_config, &[]) {
-            Ok(config) => config.to_string(),
-            Err(error) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("failed to emit precompute physical plan: {error}"),
-                )
-                    .into_response()
-            }
-        };
     if let Err(error) = backend
-        .post_streaming_config_json_typed(precompute_config)
-        .await
-    {
-        return (
-            StatusCode::BAD_GATEWAY,
-            format!("backend rejected precompute physical plan: {error}"),
+        .post_physical_plan_typed(
+            &bundle.precompute_plan,
+            bundle.backend_plan.encode_to_vec(),
+            None,
         )
-            .into_response();
-    }
-    if let Err(error) = backend
-        .post_backend_plan_typed(bundle.backend_plan.encode_to_vec())
         .await
     {
         return (
@@ -732,9 +711,18 @@ fn compile_physical_plan_request(
             Ok(expr) => expr,
             Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
         };
+        let post_asap = match physical::compiler::select_post_asap(
+            &expr,
+            query.accuracy.clone(),
+            &query.lifecycle,
+            request.evidence.get(&query.query_id),
+        ) {
+            Ok(plan) => plan,
+            Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
+        };
         queries.push(physical::compiler::PlanningQuery {
             query_id: query.query_id,
-            expr,
+            post_asap,
             source: planner_types::pre_asap::Source::TimeSeries {
                 metric: query.metric,
             },
@@ -3336,7 +3324,7 @@ mod api_tests {
         let sink: Arc<SinkInner> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink_capture = Arc::clone(&sink);
         let mock_app = axum::Router::new().route(
-            "/api/v1/storage_routing",
+            "/api/v1/physical-plan",
             axum::routing::post(move |body: axum::body::Bytes| {
                 let sink = Arc::clone(&sink_capture);
                 async move {
@@ -3412,7 +3400,7 @@ mod api_tests {
         // MinIO and Thanos has them indexed.
         let last: serde_json::Value =
             serde_json::from_str(bodies.last().unwrap()).expect("last body is valid JSON");
-        let metric_names: std::collections::BTreeSet<String> = last["metrics"]
+        let metric_names: std::collections::BTreeSet<String> = last["storage_routing"]["metrics"]
             .as_array()
             .expect("metrics array")
             .iter()
@@ -3432,7 +3420,7 @@ mod api_tests {
         // queries to Thanos. Without this target the metric falls back
         // to `default_engine: sketch_store` and the archive miss
         // reproduces.
-        for m in last["metrics"].as_array().unwrap() {
+        for m in last["storage_routing"]["metrics"].as_array().unwrap() {
             let targets = m["targets"].as_array().expect("targets array");
             let engines: Vec<&str> = targets
                 .iter()
@@ -3491,26 +3479,17 @@ mod api_tests {
         type SinkInner = std::sync::Mutex<Vec<String>>;
         let sink: Arc<SinkInner> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink_capture = Arc::clone(&sink);
-        let mock_app = axum::Router::new()
-            .route(
-                "/api/v1/streaming-config",
-                axum::routing::post(move |body: axum::body::Bytes| {
-                    let sink = Arc::clone(&sink_capture);
-                    async move {
-                        let s = String::from_utf8_lossy(&body).to_string();
-                        sink.lock().unwrap().push(s);
-                        axum::http::StatusCode::OK
-                    }
-                }),
-            )
-            // Sibling storage-routing endpoint stubbed so the
-            // `handle_plan` cycle's second POST doesn't 404 and
-            // pollute the test log (the assertion only inspects the
-            // streaming-config sink).
-            .route(
-                "/api/v1/storage_routing",
-                axum::routing::post(|| async { axum::http::StatusCode::OK }),
-            );
+        let mock_app = axum::Router::new().route(
+            "/api/v1/physical-plan",
+            axum::routing::post(move |body: axum::body::Bytes| {
+                let sink = Arc::clone(&sink_capture);
+                async move {
+                    let s = String::from_utf8_lossy(&body).to_string();
+                    sink.lock().unwrap().push(s);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -3576,7 +3555,7 @@ mod api_tests {
         // `archive_miss` failure documented on the sibling test.
         let last: serde_json::Value =
             serde_json::from_str(bodies.last().unwrap()).expect("last body is valid JSON");
-        let aggs = last["aggregations"]
+        let aggs = last["precompute_plan"]["materializations"]
             .as_array()
             .expect("aggregations array on cumulative streaming-config body");
         // Wire-format note: `build_backend_aggregation_json` writes
