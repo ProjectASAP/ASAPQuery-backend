@@ -40,9 +40,10 @@ pub struct PrecomputeEngineConfig {
     pub wall_clock_idle_grace_period_ms: i64,
     /// Additional grace for the absolute wall-clock deadline. A pane closes
     /// after `window_size + max_open_grace` from its first input even if it is
-    /// still active. Non-positive disables the deadline. It stays disabled by
-    /// default until late corrections are guaranteed not to be dropped.
-    #[serde(default)]
+    /// still active. Non-positive disables the deadline. The worker applies an
+    /// absolute deadline only with `ForwardToStore`, ensuring later inputs are
+    /// emitted as mergeable corrections. Default: 5000 ms.
+    #[serde(default = "default_wall_clock_max_open_grace_period_ms")]
     pub wall_clock_max_open_grace_period_ms: i64,
     /// Optional path where the `SchemaRegistry` persists per-`agg_id`
     /// lifecycle state across restarts (sketch DB Phase 2c). When
@@ -65,15 +66,19 @@ impl Default for PrecomputeEngineConfig {
             channel_buffer_size: 10_000,
             pass_raw_samples: false,
             raw_mode_aggregation_id: 0,
-            late_data_policy: LateDataPolicy::Drop,
+            late_data_policy: LateDataPolicy::ForwardToStore,
             wall_clock_idle_grace_period_ms: default_wall_clock_idle_grace_period_ms(),
-            wall_clock_max_open_grace_period_ms: 0,
+            wall_clock_max_open_grace_period_ms: default_wall_clock_max_open_grace_period_ms(),
             schema_persist_path: None,
         }
     }
 }
 
 fn default_wall_clock_idle_grace_period_ms() -> i64 {
+    5_000
+}
+
+fn default_wall_clock_max_open_grace_period_ms() -> i64 {
     5_000
 }
 
@@ -91,9 +96,9 @@ mod tests {
         assert_eq!(config.channel_buffer_size, 10_000);
         assert!(!config.pass_raw_samples);
         assert_eq!(config.raw_mode_aggregation_id, 0);
-        assert_eq!(config.late_data_policy, LateDataPolicy::Drop);
+        assert_eq!(config.late_data_policy, LateDataPolicy::ForwardToStore);
         assert_eq!(config.wall_clock_idle_grace_period_ms, 5_000);
-        assert_eq!(config.wall_clock_max_open_grace_period_ms, 0);
+        assert_eq!(config.wall_clock_max_open_grace_period_ms, 5_000);
     }
 
     #[test]
@@ -113,6 +118,6 @@ wall_clock_grace_period_ms: 7000
         )
         .expect("legacy config should deserialize");
         assert_eq!(config.wall_clock_idle_grace_period_ms, 7_000);
-        assert_eq!(config.wall_clock_max_open_grace_period_ms, 0);
+        assert_eq!(config.wall_clock_max_open_grace_period_ms, 5_000);
     }
 }
