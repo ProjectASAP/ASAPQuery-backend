@@ -556,6 +556,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     idx, query, now_ms, backend_plan.as_deref(),
                 )
                 .map_err(|reason| {
+                    tracing::debug!(query, ?reason, "post-ASAP warm serving capability miss");
                     if let Some(req) = Self::requirements_from_query_str(query) {
                         crate::drivers::control_plane_client::spawn_capability_miss_notify(
                             &self.control_plane_client,
@@ -1367,7 +1368,7 @@ mod asap_tier_classify_tests {
     /// Schema-retirement #5 regression: a sketch sid registered with
     /// a wider-than-requested `group_by_keys` and `policy_fp=UNSET`
     /// must still be findable by the query path. Mirrors the MVP
-    /// smoke-test failure (issue #271 / tracking #272): the agent
+    /// end-to-end failure (issue #271 / tracking #272): the agent
     /// emits DDSketch DPs carrying every wire attribute, so the sid
     /// catalog ends up with `group_by_keys=[zone,rack,node,pod,...]`
     /// and `derive_sketch_policy_fp` returns `UNSET` because no
@@ -1426,7 +1427,7 @@ mod asap_tier_classify_tests {
     }
 
     /// `sum by (zone) (http_requests_total)` end-to-end via the
-    /// `execute(&str)` adapter. Mirrors the MVP smoke test's Axis-C
+    /// `execute(&str)` adapter. Mirrors the MVP acceptance test's Axis-C
     /// failure: ExactAgg(Sum) sids existed for `http_requests_total`
     /// (one per zone), but the old reducer
     /// returned `UnsupportedFunction("sum")` because
@@ -1441,7 +1442,7 @@ mod asap_tier_classify_tests {
         use crate::storage_engines::sketch_db::data::AggregationType;
 
         let idx = Arc::new(SketchStore::new());
-        // Mirror the smoke-test setup: four ExactAgg(Sum) sids, one
+        // Mirror the acceptance-test setup: four ExactAgg(Sum) sids, one
         // per zone (z0..z3), registered with `group_by_keys=["zone"]`
         // and carrying a `SumAccumulator` per window.
         let zones = ["z0", "z1", "z2", "z3"];

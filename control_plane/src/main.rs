@@ -439,7 +439,7 @@ async fn main() {
     // Loop through every `(metric, role)` pair the workload-registry
     // pre-pop loop populated and POST the typed cumulative
     // streaming-config + storage-routing to the backend. Without this,
-    // queries that never trigger `POST /api/v1/plan` (the smoke
+    // queries that never trigger `POST /api/v1/plan` (the acceptance
     // harness, bootstrap deployments) hit the data plane's static
     // startup config (DDSketch only) and `sum by (zone) (…)` returns
     // `ExactAgg(Sum) capability not satisfied`.
@@ -3460,7 +3460,7 @@ mod api_tests {
     //
     // The (metric, role) cache key is exercised in tandem by the live
     // mvp-workload.yaml pre-pop loop (the workload registry lists 3
-    // entries for `http_requests_total`) → see the MVP smoke-test
+    // entries for `http_requests_total`) → see the MVP acceptance-test
     // pipeline. This in-process test exercises the cumulative-merge
     // plumbing in isolation against the same emit path used by both
     // the pre-pop loop and per-request replans.

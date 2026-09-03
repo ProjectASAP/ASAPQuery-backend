@@ -77,7 +77,7 @@ pub struct OtlpReceiver {
 
 impl OtlpReceiver {
     /// Construct a receiver without a backend. Metrics are parsed and
-    /// logged but not stored — useful for smoke-testing the OTLP pipe.
+    /// logged but not stored — useful for diagnosing the OTLP pipe.
     pub fn new(config: OtlpReceiverConfig) -> Self {
         Self {
             config,

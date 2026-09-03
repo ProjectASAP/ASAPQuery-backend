@@ -646,7 +646,7 @@ mod tests {
     }
 
     /// Happy path on the first attempt: zero retries, Ok outcome,
-    /// attempts == 1. This protects the smoke-test invariant that the
+    /// attempts == 1. This protects the retry unit-test invariant that the
     /// fire-and-forget happy path is unchanged when the backend is up
     /// before the controller's first POST.
     #[tokio::test(start_paused = true)]

@@ -1,0 +1,477 @@
+//! Production-process E2E oracle matrix for every supported sketch family.
+//!
+//! Each test starts the real `data_plane` binary, installs a streaming policy,
+//! posts modified OTLP over HTTP, and queries the public Prometheus endpoint.
+//! Sketch implementations are used only to encode raw fixtures. Expected
+//! answers are independently computed from those raw fixtures.
+
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::net::TcpListener;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use asap_otel_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use asap_otel_proto::tonic::common::v1::{any_value, AnyValue, KeyValue};
+use asap_otel_proto::tonic::metrics::v1::{
+    metric::Data, CountMinSketch as OtelCountMinSketch, CountMinSketchDataPoint,
+    CountMinSketchEncoding, CountSketch as OtelCountSketch, CountSketchDataPoint,
+    CountSketchEncoding, HllSketch as OtelHllSketch, HllSketchDataPoint, HllSketchEncoding,
+    KllSketch as OtelKllSketch, KllSketchDataPoint, KllSketchEncoding, Metric, ResourceMetrics,
+    ScopeMetrics,
+};
+use asap_sketchlib::proto::sketchlib::{HllVariant as ProtoHllVariant, HyperLogLogState, KllState};
+use asap_sketchlib::{
+    CountMinSketchWithHeap, CountSketchWithHeap, HllSketch, HllVariant, MessagePackCodec,
+};
+use prost::Message;
+use serde_json::Value;
+
+const SERVICE: &str = "oracle-e2e";
+const K: u32 = 200;
+const HLL_PRECISION: u32 = 10;
+const ROWS: usize = 5;
+const COLS: usize = 2048;
+const HEAP_SIZE: usize = 16;
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+struct Backend {
+    _child: ChildGuard,
+    client: reqwest::Client,
+    query_base: String,
+    otlp_url: String,
+    _config: tempfile::NamedTempFile,
+    _output_dir: tempfile::TempDir,
+}
+
+fn unused_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .expect("reserve loopback port")
+        .local_addr()
+        .expect("read loopback address")
+        .port()
+}
+
+fn now_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before UNIX epoch")
+        .as_nanos() as u64
+}
+
+fn labels() -> Vec<KeyValue> {
+    vec![KeyValue {
+        key: "service".into(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(SERVICE.into())),
+        }),
+    }]
+}
+
+fn envelope(metric: &str, data: Data) -> ExportMetricsServiceRequest {
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                metrics: vec![Metric {
+                    name: metric.into(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: Vec::new(),
+                    data: Some(data),
+                }],
+                schema_url: String::new(),
+            }],
+            schema_url: String::new(),
+        }],
+    }
+}
+
+async fn start_backend(config_yaml: &str) -> Backend {
+    let query_port = unused_port();
+    let otlp_http_port = unused_port();
+    let otlp_grpc_port = unused_port();
+    let output_dir = tempfile::tempdir().expect("create data-plane output directory");
+    let mut config = tempfile::NamedTempFile::new().expect("create streaming config");
+    config
+        .write_all(config_yaml.as_bytes())
+        .expect("write streaming config");
+    config.flush().expect("flush streaming config");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
+        .arg("--streaming-config")
+        .arg(config.path())
+        .arg("--http-port")
+        .arg(query_port.to_string())
+        .arg("--output-dir")
+        .arg(output_dir.path())
+        .arg("--enable-otel-ingest")
+        .arg("--otel-http-port")
+        .arg(otlp_http_port.to_string())
+        .arg("--otel-grpc-port")
+        .arg(otlp_grpc_port.to_string())
+        .arg("--precompute-allowed-lateness-ms")
+        .arg("0")
+        .arg("--precompute-flush-interval-ms")
+        .arg("100")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start production data-plane binary");
+    let mut child = ChildGuard(child);
+    let client = reqwest::Client::new();
+    let query_base = format!("http://127.0.0.1:{query_port}");
+    let health = format!("{query_base}/api/v1/health");
+    for _ in 0..100 {
+        if let Some(status) = child.0.try_wait().expect("inspect data-plane process") {
+            panic!("data-plane exited before readiness: {status}");
+        }
+        if client
+            .get(&health)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            return Backend {
+                _child: child,
+                client,
+                query_base,
+                otlp_url: format!("http://127.0.0.1:{otlp_http_port}/v1/metrics"),
+                _config: config,
+                _output_dir: output_dir,
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("data-plane did not become ready at {health}");
+}
+
+async fn post(backend: &Backend, request: ExportMetricsServiceRequest) {
+    backend
+        .client
+        .post(&backend.otlp_url)
+        .header("content-type", "application/x-protobuf")
+        .body(request.encode_to_vec())
+        .send()
+        .await
+        .expect("post modified OTLP")
+        .error_for_status()
+        .expect("production backend accepted modified OTLP");
+}
+
+async fn query(backend: &Backend, promql: &str) -> Value {
+    let mut response = Value::Null;
+    for _ in 0..50 {
+        response = backend
+            .client
+            .get(format!("{}/api/v1/query", backend.query_base))
+            .query(&[("query", promql)])
+            .send()
+            .await
+            .expect("query production backend")
+            .json()
+            .await
+            .expect("decode Prometheus JSON");
+        if response["data"]["result"]
+            .as_array()
+            .is_some_and(|result| !result.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        response["infos"]
+            .as_array()
+            .is_some_and(|infos| infos.iter().any(|info| info
+                .as_str()
+                .is_some_and(|text| text.contains("data_source: asap_query")))),
+        "query was not proven to execute in ASAPQuery: {response}"
+    );
+    assert_eq!(response["status"], "success", "PromQL response: {response}");
+    response
+}
+
+fn scalar_values(response: &Value) -> Vec<(HashMap<String, String>, f64)> {
+    response["data"]["result"]
+        .as_array()
+        .expect("Prometheus result array")
+        .iter()
+        .map(|series| {
+            let labels = series["metric"]
+                .as_object()
+                .expect("metric labels")
+                .iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        value.as_str().expect("string label").to_string(),
+                    )
+                })
+                .collect();
+            let value = series["value"][1]
+                .as_str()
+                .expect("string sample value")
+                .parse()
+                .expect("numeric sample value");
+            (labels, value)
+        })
+        .collect()
+}
+
+fn config(metric: &str, kind: &str, parameters: &str) -> String {
+    format!(
+        "aggregations:\n  - aggregationType: {kind}\n    aggregationSubType: ''\n    labels:\n      grouping: [service]\n      rollup: []\n      aggregated: []\n    metric: {metric}\n    parameters:\n{parameters}\n    windowSize: 1\n    windowType: tumbling\n    spatialFilter: ''\n"
+    )
+}
+
+fn kll_export(metric: &str, timestamp_ns: u64, raw: &[f64]) -> ExportMetricsServiceRequest {
+    let state = KllState {
+        k: K,
+        m: 8,
+        num_levels: 0,
+        levels: Vec::new(),
+        items: raw.to_vec(),
+        coin: None,
+        offset: 0.0,
+        value_scale: 0,
+        residuals: Vec::new(),
+    };
+    envelope(
+        metric,
+        Data::Kllsketch(OtelKllSketch {
+            data_points: vec![KllSketchDataPoint {
+                attributes: labels(),
+                start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
+                time_unix_nano: timestamp_ns,
+                sketch: state.encode_to_vec(),
+                encoding: KllSketchEncoding::Proto as i32,
+                flags: 0,
+                series_id: 0,
+            }],
+            aggregation_temporality: 0,
+            k: K,
+        }),
+    )
+}
+
+fn hll_export(metric: &str, timestamp_ns: u64, raw: &[&str]) -> ExportMetricsServiceRequest {
+    let mut sketch = HllSketch::new(HllVariant::Regular, HLL_PRECISION);
+    for value in raw {
+        sketch.update(value.as_bytes());
+    }
+    let state = HyperLogLogState {
+        variant: ProtoHllVariant::Regular as i32,
+        precision: HLL_PRECISION,
+        registers: sketch.registers,
+        hip_kxq0: 0.0,
+        hip_kxq1: 0.0,
+        hip_est: 0.0,
+        registers_sparse: None,
+    };
+    envelope(
+        metric,
+        Data::Hllsketch(OtelHllSketch {
+            data_points: vec![HllSketchDataPoint {
+                attributes: labels(),
+                start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
+                time_unix_nano: timestamp_ns,
+                sketch: state.encode_to_vec(),
+                encoding: HllSketchEncoding::Proto as i32,
+                flags: 0,
+                series_id: 0,
+            }],
+            aggregation_temporality: 0,
+            precision: HLL_PRECISION,
+        }),
+    )
+}
+
+fn cms_export(metric: &str, timestamp_ns: u64, raw: &[&str]) -> ExportMetricsServiceRequest {
+    let mut sketch = CountMinSketchWithHeap::new(ROWS, COLS, HEAP_SIZE);
+    for key in raw {
+        sketch.update(key, 1.0);
+    }
+    envelope(
+        metric,
+        Data::Countminsketch(OtelCountMinSketch {
+            data_points: vec![CountMinSketchDataPoint {
+                attributes: labels(),
+                start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
+                time_unix_nano: timestamp_ns,
+                sketch: sketch.to_msgpack().expect("encode CMS-with-heap"),
+                encoding: CountMinSketchEncoding::Msgpack as i32,
+                flags: 0,
+                series_id: 0,
+            }],
+            aggregation_temporality: 0,
+            rows: ROWS as i32,
+            cols: COLS as i32,
+        }),
+    )
+}
+
+fn count_sketch_export(
+    metric: &str,
+    timestamp_ns: u64,
+    raw: &[&str],
+) -> ExportMetricsServiceRequest {
+    let mut sketch = CountSketchWithHeap::new(ROWS, COLS, HEAP_SIZE);
+    for key in raw {
+        sketch.update(key, 1.0);
+    }
+    envelope(
+        metric,
+        Data::Countsketch(OtelCountSketch {
+            data_points: vec![CountSketchDataPoint {
+                attributes: labels(),
+                start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
+                time_unix_nano: timestamp_ns,
+                sketch: sketch.to_msgpack().expect("encode CountSketch-with-heap"),
+                encoding: CountSketchEncoding::Msgpack as i32,
+                flags: 0,
+                series_id: 0,
+            }],
+            aggregation_temporality: 0,
+            rows: ROWS as i32,
+            cols: COLS as i32,
+        }),
+    )
+}
+
+fn exact_quantile(raw: &[f64], q: f64) -> f64 {
+    let mut sorted = raw.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let rank = q * (sorted.len() - 1) as f64;
+    let low = rank.floor() as usize;
+    let high = rank.ceil() as usize;
+    sorted[low] + (sorted[high] - sorted[low]) * (rank - low as f64)
+}
+
+fn raw_frequencies(raw: &[&str]) -> HashMap<String, u64> {
+    let mut counts = HashMap::new();
+    for key in raw {
+        *counts.entry((*key).to_string()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn assert_topk_oracle(response: &Value, raw: &[&str], k: usize) {
+    let mut expected: Vec<_> = raw_frequencies(raw).into_iter().collect();
+    expected.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    expected.truncate(k);
+    let expected: HashMap<_, _> = expected.into_iter().collect();
+
+    let actual: HashMap<String, u64> = scalar_values(response)
+        .into_iter()
+        .map(|(labels, value)| {
+            assert_eq!(labels.get("service").map(String::as_str), Some(SERVICE));
+            (
+                labels.get("item").expect("topk item label").clone(),
+                value.round() as u64,
+            )
+        })
+        .collect();
+    assert_eq!(actual, expected, "top-k differs from raw frequency oracle");
+}
+
+#[tokio::test]
+async fn production_kll_matches_raw_quantile_oracle() {
+    let metric = "oracle_kll_latency";
+    let backend = start_backend(&config(metric, "DatasketchesKLL", "      K: 200")).await;
+    let raw: Vec<f64> = (1..=101).map(f64::from).collect();
+    let timestamp = now_ns().saturating_sub(2_000_000_000);
+    post(&backend, kll_export(metric, timestamp, &raw)).await;
+    post(
+        &backend,
+        kll_export(metric, timestamp + 1_000_000_000, &raw),
+    )
+    .await;
+    let response = query(&backend, &format!("quantile_over_time(0.5, {metric}[10s])")).await;
+    let samples = scalar_values(&response);
+    assert_eq!(
+        samples[0].0.get("service").map(String::as_str),
+        Some(SERVICE)
+    );
+    let actual = samples[0].1;
+    assert_eq!(actual, exact_quantile(&raw, 0.5));
+}
+
+#[tokio::test]
+async fn production_hll_matches_raw_distinct_oracle() {
+    let metric = "oracle_hll_users";
+    let backend = start_backend(&config(metric, "HLL", "      precision: 10")).await;
+    let owned: Vec<String> = (0..2_000).map(|i| format!("user-{i}")).collect();
+    let mut raw: Vec<&str> = owned.iter().map(String::as_str).collect();
+    raw.extend(owned.iter().take(500).map(String::as_str));
+    let exact = raw.iter().copied().collect::<HashSet<_>>().len() as f64;
+    let timestamp = now_ns().saturating_sub(2_000_000_000);
+    post(&backend, hll_export(metric, timestamp, &raw)).await;
+    post(
+        &backend,
+        hll_export(metric, timestamp + 1_000_000_000, &raw),
+    )
+    .await;
+    let response = query(&backend, &format!("count({metric})")).await;
+    let actual = scalar_values(&response)[0].1;
+    let relative_error = (actual - exact).abs() / exact;
+    assert!(
+        relative_error <= 0.10,
+        "HLL differs from exact distinct oracle: exact={exact}, actual={actual}, error={relative_error}"
+    );
+}
+
+fn frequency_fixture() -> Vec<&'static str> {
+    let mut raw = Vec::new();
+    for (key, count) in [("alpha", 100), ("beta", 50), ("gamma", 200), ("delta", 75)] {
+        raw.extend(std::iter::repeat_n(key, count));
+    }
+    raw
+}
+
+#[tokio::test]
+async fn production_cms_matches_raw_topk_oracle() {
+    let metric = "oracle_cms_frequency";
+    let params = format!(
+        "      w: {COLS}\n      d: {ROWS}\n      heap_size: {HEAP_SIZE}\n      with_heap: true"
+    );
+    let backend = start_backend(&config(metric, "CountMinSketchWithHeap", &params)).await;
+    let raw = frequency_fixture();
+    let timestamp = now_ns().saturating_sub(2_000_000_000);
+    post(&backend, cms_export(metric, timestamp, &raw)).await;
+    post(
+        &backend,
+        cms_export(metric, timestamp + 1_000_000_000, &raw),
+    )
+    .await;
+    let response = query(&backend, &format!("topk(3, {metric})")).await;
+    assert_topk_oracle(&response, &raw, 3);
+}
+
+#[tokio::test]
+async fn production_count_sketch_matches_raw_topk_oracle() {
+    let metric = "oracle_count_sketch_frequency";
+    let params = format!(
+        "      w: {COLS}\n      d: {ROWS}\n      heap_size: {HEAP_SIZE}\n      with_heap: true"
+    );
+    let backend = start_backend(&config(metric, "CountSketchWithHeap", &params)).await;
+    let raw = frequency_fixture();
+    let timestamp = now_ns().saturating_sub(2_000_000_000);
+    post(&backend, count_sketch_export(metric, timestamp, &raw)).await;
+    post(
+        &backend,
+        count_sketch_export(metric, timestamp + 1_000_000_000, &raw),
+    )
+    .await;
+    let response = query(&backend, &format!("topk(3, {metric})")).await;
+    assert_topk_oracle(&response, &raw, 3);
+}

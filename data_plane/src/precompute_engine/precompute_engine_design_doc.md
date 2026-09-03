@@ -1134,8 +1134,8 @@ store with the Kafka consumer path.
 - **Unit tests -- other modules**: `window_manager.rs` (tumbling/sliding arithmetic, pane enumeration, closure detection), `series_buffer.rs` (ordering, watermark), `accumulator_factory.rs` (updater creation and reset), `series_router.rs` (consistent hash routing), `config.rs` (defaults).
 
 - **E2E coverage**: end-to-end paths now run through the OTLP receiver
-  driving the same `IngestState` (`tests/e2e_modified_otlp_sketch_path.rs`,
-  `tests/edge_runtime_consumes_precompute_rs.rs`; the runnable demo
+  driving the same `IngestState` (`tests/component_process_e2e.rs`,
+  `tests/backend_process_e2e.rs`; the runnable multi-node demo
   lives in ASAPCollector). The legacy in-process remote-write E2E binaries
   (`bin/test_e2e_precompute.rs`, `bin/e2e_quickstart_resource_test.rs`,
   `bin/bench_precompute_sketch.rs`) and the equivalent test

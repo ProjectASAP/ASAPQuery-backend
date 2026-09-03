@@ -109,9 +109,16 @@ impl RoutingIndex {
             if cfg.aggregation_type != agg_type
                 || &policy_keys != group_by_keys
                 || !cfg.spatial_filter_normalized.is_empty()
-                || !expected_params
-                    .iter()
-                    .all(|(key, value)| cfg.parameters.get(key) == Some(value))
+                || !expected_params.iter().all(|(key, value)| {
+                    cfg.parameters.get(key).or_else(|| match key.as_str() {
+                        // The typed physical-plan compiler names this field
+                        // after SummaryParams, while legacy collector YAML
+                        // uses the equivalent runtime-facing name.
+                        "relative_accuracy" => cfg.parameters.get("alpha"),
+                        "alpha" => cfg.parameters.get("relative_accuracy"),
+                        _ => None,
+                    }) == Some(value)
+                })
             {
                 continue;
             }
@@ -224,5 +231,42 @@ mod tests {
         let idx = RoutingIndex::build(PolicyRegistry::from_configs(vec![cfg("m")]));
         assert!(!idx.is_empty());
         assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn ddsketch_alpha_and_relative_accuracy_are_wire_compatible() {
+        let mut parameters = StdHashMap::new();
+        parameters.insert("alpha".to_string(), serde_json::json!(0.01));
+        let config = AggregationConfig::new(
+            AggregationType::DDSketch,
+            String::new(),
+            parameters,
+            KeyByLabelNames::new(vec!["service".to_string()]),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            5,
+            5,
+            WindowKind::Tumbling,
+            String::new(),
+            "latency".to_string(),
+            None,
+            None,
+            None,
+        );
+        let fingerprint = PolicyFingerprint::from_config(&config);
+        let index = RoutingIndex::build(PolicyRegistry::from_configs(vec![config]));
+        let expected =
+            StdHashMap::from([("relative_accuracy".to_string(), serde_json::json!(0.01))]);
+
+        assert_eq!(
+            index.find_policy_by_content(
+                "latency",
+                &BTreeSet::from(["service".to_string()]),
+                AggregationType::DDSketch,
+                &expected,
+            ),
+            Some(fingerprint)
+        );
     }
 }

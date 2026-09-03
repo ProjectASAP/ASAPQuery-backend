@@ -1,5 +1,9 @@
 # ASAPQuery-backend documentation
 
+## Testing
+
+- [Manual component and whole-system E2E tests](03-how-to-guides/manual-e2e-tests.md)
+
 ## Canonical system design
 
 The end-to-end architecture and shared contracts are maintained centrally in
