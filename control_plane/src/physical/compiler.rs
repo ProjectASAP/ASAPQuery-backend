@@ -545,7 +545,7 @@ pub enum TransmissionMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceScope {
-    MaterializationWindowProducerEpoch,
+    MaterializationSeriesWindowProducerEpoch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -894,7 +894,7 @@ impl TransmissionPlan {
             envelope,
             frame_identity: FrameIdentityContract {
                 identity_version: 1,
-                sequence_scope: SequenceScope::MaterializationWindowProducerEpoch,
+                sequence_scope: SequenceScope::MaterializationSeriesWindowProducerEpoch,
                 require_checkpoint_for_full: true,
                 require_base_checkpoint_for_delta: true,
             },

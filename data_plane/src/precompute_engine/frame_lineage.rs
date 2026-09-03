@@ -39,7 +39,7 @@ pub enum FrameLineageError {
     Incomplete,
 }
 
-/// Exact scope mandated by `SequenceScope::MaterializationWindowProducerEpoch`.
+/// Exact scope mandated by `SequenceScope::MaterializationSeriesWindowProducerEpoch`.
 /// `producer_id` is included because epochs are only unique within a producer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FrameLineageKey {
