@@ -190,6 +190,38 @@ impl SeriesRouter {
         Ok(())
     }
 
+    /// Atomically reserve queue capacity for an entire request and then
+    /// publish it. If any target worker is full or closed, every reservation
+    /// is dropped and no message is enqueued. Remote Write uses this to turn
+    /// bounded-queue pressure into a retryable HTTP response without leaving
+    /// an untracked partial request behind.
+    pub fn try_route_group_batch_atomic(
+        &self,
+        messages: Vec<WorkerMessage>,
+    ) -> Result<(), TryRouteError> {
+        let mut pending = Vec::with_capacity(messages.len());
+        for message in messages {
+            let worker_idx = match &message {
+                WorkerMessage::GroupSamples { sid, .. }
+                | WorkerMessage::AccumulatorInput { sid, .. } => self.worker_for_sid(*sid),
+                WorkerMessage::RawSamples { series_key, .. } => self.worker_for(series_key),
+                WorkerMessage::Flush | WorkerMessage::Shutdown => 0,
+            };
+            let permit = self.senders[worker_idx]
+                .clone()
+                .try_reserve_owned()
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => TryRouteError::Full,
+                    mpsc::error::TrySendError::Closed(_) => TryRouteError::Closed,
+                })?;
+            pending.push((permit, message));
+        }
+        for (permit, message) in pending {
+            permit.send(message);
+        }
+        Ok(())
+    }
+
     /// Broadcast a flush signal to all workers.
     pub async fn broadcast_flush(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         for (i, sender) in self.senders.iter().enumerate() {
@@ -229,6 +261,14 @@ impl SeriesRouter {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TryRouteError {
+    #[error("precompute queue is full")]
+    Full,
+    #[error("precompute worker is unavailable")]
+    Closed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +303,31 @@ mod tests {
         let w2 = router.worker_for("cpu{host=\"a\"}");
         assert_eq!(w1, w2);
         assert!(router.worker_for("mem{host=\"a\"}") < 4);
+    }
+
+    #[tokio::test]
+    async fn atomic_route_publishes_nothing_when_batch_exceeds_capacity() {
+        let (sender, mut receiver) = mpsc::channel::<WorkerMessage>(1);
+        let router = SeriesRouter::new(vec![sender]);
+        let messages = vec![
+            WorkerMessage::RawSamples {
+                series_key: "m{job=\"a\"}".into(),
+                samples: vec![(1, 1.0)],
+                ingest_received_at: Instant::now(),
+            },
+            WorkerMessage::RawSamples {
+                series_key: "m{job=\"b\"}".into(),
+                samples: vec![(1, 2.0)],
+                ingest_received_at: Instant::now(),
+            },
+        ];
+        assert_eq!(
+            router.try_route_group_batch_atomic(messages),
+            Err(TryRouteError::Full)
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 }

@@ -71,6 +71,7 @@ hex = "0.4"
 arrow = "53.4.1"
 futures = "0.3"
 prost = "0.13"
+snap = "1.1"
 # Vendored modified opentelemetry-proto with first-class sketch metric
 # variants from DataCollector (DDSketch / KLLSketch / CountSketch /
 # CountMinSketch / HLLSketch). See docs/pipeline-query-catalog.md §5.4 in the

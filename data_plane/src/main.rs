@@ -10,7 +10,7 @@
 // RuntimeSamples gRPC endpoint (port 4321) will be served from inside
 // this same backend process — there is no longer a separate
 // `asap-controller` container in `mvp-multinode/run_demo.sh`.
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::fs;
 use std::sync::Arc;
 use tokio::signal;
@@ -23,12 +23,25 @@ use data_plane::storage_engines::types::enums::{CleanupPolicy, LockStrategy};
 use data_plane::utils::file_io::read_streaming_config;
 use data_plane::{
     ASAPQueryEngine, HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig,
-    PrecomputeEngine, PrecomputeEngineConfig, Result, SketchStoreSink,
+    PrecomputeEngine, PrecomputeEngineConfig, PrometheusRemoteWriteConfig,
+    PrometheusRemoteWriteReceiver, Result, SketchStoreSink,
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum RuntimeProfile {
+    #[default]
+    Distributed,
+    Asapquery,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Runtime component profile. `asapquery` enables backend-local raw
+    /// Remote Write precompute and rejects Collector/OTLP-only components.
+    #[arg(long, value_enum, default_value = "distributed")]
+    profile: RuntimeProfile,
+
     /// File path for streaming_config
     #[arg(long)]
     streaming_config: String,
@@ -117,6 +130,39 @@ struct Args {
     /// Enable OTLP metrics ingest (gRPC + HTTP)
     #[arg(long)]
     enable_otel_ingest: bool,
+
+    /// Enable Prometheus Remote Write v1 at POST /api/v1/write. Automatically
+    /// enabled by `--profile asapquery`.
+    #[arg(long)]
+    enable_remote_write: bool,
+
+    /// Maximum compressed Remote Write request size.
+    #[arg(long, default_value = "33554432")]
+    remote_write_max_compressed_bytes: usize,
+
+    /// Maximum Snappy-decompressed Remote Write request size.
+    #[arg(long, default_value = "134217728")]
+    remote_write_max_decompressed_bytes: usize,
+
+    /// Maximum series in one Remote Write request.
+    #[arg(long, default_value = "100000")]
+    remote_write_max_timeseries: usize,
+
+    /// Maximum samples in one Remote Write request.
+    #[arg(long, default_value = "1000000")]
+    remote_write_max_samples: usize,
+
+    /// Bounded Remote Write idempotency horizon.
+    #[arg(long, default_value = "600000")]
+    remote_write_dedup_horizon_ms: u64,
+
+    /// Expected maximum interval over which Prometheus can retry a request.
+    #[arg(long, default_value = "60000")]
+    remote_write_expected_retry_interval_ms: u64,
+
+    /// Maximum retained (series,timestamp) idempotency keys.
+    #[arg(long, default_value = "2000000")]
+    remote_write_max_dedup_entries: usize,
 
     /// OTLP gRPC listen port
     #[arg(long, default_value = "4317")]
@@ -282,9 +328,91 @@ struct Args {
     backend_storage_routing: Option<std::path::PathBuf>,
 }
 
+fn validate_profile(args: &Args) -> Result<()> {
+    if args.profile != RuntimeProfile::Asapquery {
+        return Ok(());
+    }
+    let mut excluded = Vec::new();
+    if args.enable_otel_ingest {
+        excluded.push("--enable-otel-ingest");
+    }
+    if args.enable_monitor_coordinator {
+        excluded.push("--enable-monitor-coordinator");
+    }
+    if args.enable_backfill_worker {
+        excluded.push("--enable-backfill-worker");
+    }
+    if args.enable_schema_eviction {
+        excluded.push("--enable-schema-eviction");
+    }
+    if args.persistence_enabled {
+        excluded.push("--persistence-enabled");
+    }
+    if args.backend_storage_routing.is_some() {
+        excluded.push("--backend-storage-routing");
+    }
+    if args.control_plane_endpoint.is_some() {
+        excluded.push("--control-plane-endpoint");
+    }
+    if !excluded.is_empty() {
+        return Err(format!(
+            "--profile asapquery excludes distributed/durable components: {}",
+            excluded.join(", ")
+        )
+        .into());
+    }
+    if !args.forward_unsupported_queries {
+        return Err(
+            "--profile asapquery requires --forward-unsupported-queries for exact fallback".into(),
+        );
+    }
+    let required_horizon = (args.precompute_allowed_lateness_ms.max(0) as u64)
+        .saturating_add(args.remote_write_expected_retry_interval_ms);
+    if args.remote_write_dedup_horizon_ms < required_horizon {
+        return Err(format!(
+            "--remote-write-dedup-horizon-ms must cover allowed lateness plus the expected retry interval (at least {required_horizon}ms)"
+        )
+        .into());
+    }
+    if args.remote_write_max_compressed_bytes == 0
+        || args.remote_write_max_decompressed_bytes == 0
+        || args.remote_write_max_timeseries == 0
+        || args.remote_write_max_samples == 0
+        || args.remote_write_max_dedup_entries == 0
+    {
+        return Err("Remote Write resource limits must all be greater than zero".into());
+    }
+    if args.remote_write_max_decompressed_bytes < args.remote_write_max_compressed_bytes {
+        return Err(
+            "--remote-write-max-decompressed-bytes must be at least the compressed limit".into(),
+        );
+    }
+    Ok(())
+}
+
+async fn verify_prometheus_fallback(base_url: &str) -> Result<()> {
+    let url = format!("{}/-/healthy", base_url.trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|error| format!("Prometheus fallback health check {url} failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Prometheus fallback health check {url} returned {}",
+            response.status()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    validate_profile(&args)?;
 
     // Create output directory
     fs::create_dir_all(&args.output_dir)?;
@@ -296,11 +424,15 @@ async fn main() -> Result<()> {
     info!("Starting Query Engine Rust");
     info!("Output directory: {}", args.output_dir);
 
+    if args.profile == RuntimeProfile::Asapquery {
+        verify_prometheus_fallback(&args.prometheus_server).await?;
+        info!("ASAPQuery compatibility profile: Prometheus fallback is healthy");
+    }
+
     if let Some(ingest_port) = args.ingest_port {
         warn!(
-            "--ingest-port={ingest_port} is deprecated and ignored: the backend's only HTTP \
-             listener is the PromQL query surface (PRW ingest was removed in PR #100). \
-             Drop the flag from your compose `command:` block."
+            "--ingest-port={ingest_port} is deprecated and ignored: Remote Write and PromQL \
+             share --http-port. Drop the flag from your compose `command:` block."
         );
     }
 
@@ -564,7 +696,7 @@ async fn main() -> Result<()> {
         );
         let worker_diagnostics = engine.diagnostics();
         let ingest_state = engine.ingest_state();
-        info!("Starting precompute engine (OTLP-fed; no HTTP ingest port)");
+        info!("Starting precompute engine (ingest adapters share its bounded worker queues)");
 
         // Spawn periodic memory diagnostics logger — M2.3.6g routes
         // through SketchStore now that SketchStore no longer holds
@@ -786,6 +918,24 @@ async fn main() -> Result<()> {
         .with_hot_reload_backend_plan(hot_reload_backend_plan.clone())
         .with_active_physical_plan(active_physical_plan.clone())
         .with_probe_cache(probe_cache.clone());
+
+    if args.enable_remote_write || args.profile == RuntimeProfile::Asapquery {
+        let receiver = PrometheusRemoteWriteReceiver::new(
+            PrometheusRemoteWriteConfig {
+                max_compressed_bytes: args.remote_write_max_compressed_bytes,
+                max_decompressed_bytes: args.remote_write_max_decompressed_bytes,
+                max_timeseries: args.remote_write_max_timeseries,
+                max_samples: args.remote_write_max_samples,
+                dedup_horizon: std::time::Duration::from_millis(args.remote_write_dedup_horizon_ms),
+                max_dedup_entries: args.remote_write_max_dedup_entries,
+            },
+            precompute_ingest_state
+                .clone()
+                .expect("precompute ingest state is always constructed"),
+        );
+        info!("Prometheus Remote Write v1 enabled at POST /api/v1/write");
+        server = server.with_remote_write(receiver);
+    }
 
     // Per-metric storage-backend routing table (issue #46
     // criterion ⑤). Mirror the `precompute_engine` binary: load it

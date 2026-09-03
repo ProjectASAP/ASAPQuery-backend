@@ -1,0 +1,35 @@
+aggregations:
+  - aggregationType: Sum
+    aggregationSubType: ''
+    metric: compat_value
+    labels:
+      grouping: [job]
+      rollup: []
+      aggregated: []
+    parameters: {}
+    windowSize: 30
+    windowType: tumbling
+    spatialFilter: ''
+  - aggregationType: Increase
+    aggregationSubType: ''
+    metric: compat_counter_total
+    labels:
+      grouping: [job]
+      rollup: []
+      aggregated: []
+    parameters: {}
+    windowSize: 30
+    windowType: tumbling
+    spatialFilter: ''
+  - aggregationType: DDSketch
+    aggregationSubType: ''
+    metric: compat_latency_seconds
+    labels:
+      grouping: [job]
+      rollup: []
+      aggregated: []
+    parameters:
+      relative_accuracy: 0.01
+    windowSize: 30
+    windowType: tumbling
+    spatialFilter: ''

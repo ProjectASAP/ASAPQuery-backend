@@ -23,6 +23,7 @@ backend operation material.
 ## Backend implementation
 
 - [ASAPQuery compatibility profile](design_docs/asapquery-compatibility-profile.md)
+  - [Run the compatibility profile](user_guide/asapquery-profile.md)
 - [Developer guide](developer_docs/README.md)
 - [Summary store engine](developer_docs/summary-store-engine/implementation.md)
 - [Query engine](developer_docs/query-engine/query-engine.md)

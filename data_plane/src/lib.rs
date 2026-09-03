@@ -24,6 +24,9 @@ pub use storage_engines::StoreResult;
 
 pub use query_engines::{ASAPQueryEngine, InstantVector, QueryResult};
 
+pub use drivers::ingest::{
+    PrometheusRemoteWriteConfig, PrometheusRemoteWriteReceiver, RemoteWriteStats,
+};
 pub use drivers::{HttpServer, HttpServerConfig, OtlpReceiver, OtlpReceiverConfig};
 
 pub use precompute_engine::config::{LateDataPolicy, PrecomputeEngineConfig};
