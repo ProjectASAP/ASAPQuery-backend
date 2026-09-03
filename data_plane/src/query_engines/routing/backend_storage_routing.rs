@@ -944,6 +944,7 @@ pub struct HotReloadBackendStorageRouting {
     /// once and pick the tenant's `Arc<BackendStorageRouting>`.
     inner:
         std::sync::Arc<arc_swap::ArcSwap<HashMap<String, std::sync::Arc<BackendStorageRouting>>>>,
+    active: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
 }
 
 impl HotReloadBackendStorageRouting {
@@ -957,6 +958,7 @@ impl HotReloadBackendStorageRouting {
         map.insert(initial.tenant.clone(), std::sync::Arc::new(initial));
         Self {
             inner: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(map))),
+            active: None,
         }
     }
 
@@ -979,6 +981,17 @@ impl HotReloadBackendStorageRouting {
         map.insert(initial.tenant.clone(), initial);
         Self {
             inner: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(map))),
+            active: None,
+        }
+    }
+
+    pub fn from_active(active: crate::storage_engines::types::HotReloadActivePhysicalPlan) -> Self {
+        let initial = active.snapshot().storage_routing.clone();
+        let mut map = HashMap::new();
+        map.insert(initial.tenant().to_string(), initial);
+        Self {
+            inner: std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(map))),
+            active: Some(active),
         }
     }
 
@@ -998,6 +1011,12 @@ impl HotReloadBackendStorageRouting {
     /// table when even the default tenant is missing. Stable for the
     /// caller's lifetime; concurrent swaps don't invalidate it.
     pub fn snapshot_for_tenant(&self, tenant: &str) -> std::sync::Arc<BackendStorageRouting> {
+        if let Some(active) = &self.active {
+            let routing = active.snapshot().storage_routing.clone();
+            if routing.tenant() == tenant || tenant == DEFAULT_TENANT {
+                return routing;
+            }
+        }
         let map = self.inner.load_full();
         if let Some(t) = map.get(tenant) {
             return t.clone();

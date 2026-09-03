@@ -142,7 +142,7 @@ pub struct CollectorPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputePlan {
     pub envelope: PlanEnvelope,
-    pub materializations: Vec<asap_types::AggregationConfig>,
+    pub materializations: Vec<asap_types::PrecomputeMaterialization>,
 }
 
 /// Complete physical projection of one post-ASAP planning decision.

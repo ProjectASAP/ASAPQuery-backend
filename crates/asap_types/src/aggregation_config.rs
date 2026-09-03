@@ -22,7 +22,7 @@ use crate::KeyByLabelNames;
 /// stop reading it). Existing fixtures that still spell out
 /// `aggregationId: N` parse cleanly — the field is silently dropped.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AggregationConfig {
+pub struct PrecomputeMaterialization {
     pub aggregation_type: AggregationType,
     pub aggregation_sub_type: String,
     pub parameters: HashMap<String, Value>,
@@ -74,7 +74,11 @@ impl AggregationIdInfo {
     }
 }
 
-impl AggregationConfig {
+/// Compatibility name for legacy streaming-config and precompute call sites.
+/// New PhysicalPlan code should use [`PrecomputeMaterialization`].
+pub type AggregationConfig = PrecomputeMaterialization;
+
+impl PrecomputeMaterialization {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         aggregation_type: AggregationType,
@@ -340,7 +344,7 @@ impl AggregationConfig {
     }
 }
 
-impl SerializableToSink for AggregationConfig {
+impl SerializableToSink for PrecomputeMaterialization {
     fn serialize_to_json(&self) -> Value {
         // PR 5: `aggregationId` is no longer emitted — readers derive it
         // from content via `PolicyFingerprint::from_config(...).as_u64()`.

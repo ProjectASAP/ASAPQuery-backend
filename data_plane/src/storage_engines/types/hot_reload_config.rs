@@ -81,6 +81,50 @@ use arc_swap::ArcSwap;
 
 use crate::storage_engines::types::StreamingConfig;
 
+/// One immutable, generation-consistent runtime snapshot. Every execution
+/// subsystem must project its view from the same `Arc<ActivePhysicalPlan>`.
+#[derive(Debug, Clone)]
+pub struct ActivePhysicalPlan {
+    pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
+    pub runtime_config: Arc<StreamingConfig>,
+    pub backend_plan: Arc<control_plane::backend_plan::BackendPlan>,
+    pub storage_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
+}
+
+#[derive(Clone)]
+pub struct HotReloadActivePhysicalPlan {
+    inner: Arc<ArcSwap<ActivePhysicalPlan>>,
+}
+
+impl HotReloadActivePhysicalPlan {
+    pub fn new(initial: ActivePhysicalPlan) -> Self {
+        Self {
+            inner: Arc::new(ArcSwap::new(Arc::new(initial))),
+        }
+    }
+
+    pub fn snapshot(&self) -> Arc<ActivePhysicalPlan> {
+        self.inner.load_full()
+    }
+
+    pub fn swap(&self, next: ActivePhysicalPlan) -> Arc<ActivePhysicalPlan> {
+        self.inner.swap(Arc::new(next))
+    }
+}
+
+impl std::fmt::Debug for HotReloadActivePhysicalPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let snapshot = self.snapshot();
+        f.debug_struct("HotReloadActivePhysicalPlan")
+            .field("plan_id", &snapshot.backend_plan.plan_id)
+            .field(
+                "materializations",
+                &snapshot.precompute_plan.materializations.len(),
+            )
+            .finish()
+    }
+}
+
 /// Hot-reloadable `BackendPlan` state — same `ArcSwap` shape as
 /// [`HotReloadStreamingConfig`], applied to
 /// `control_plane::backend_plan::BackendPlan` (see
@@ -94,6 +138,7 @@ use crate::storage_engines::types::StreamingConfig;
 pub struct HotReloadBackendPlan {
     inner: Arc<ArcSwap<control_plane::backend_plan::BackendPlan>>,
     install_lock: Arc<std::sync::Mutex<()>>,
+    active: Option<HotReloadActivePhysicalPlan>,
 }
 
 impl HotReloadBackendPlan {
@@ -101,6 +146,7 @@ impl HotReloadBackendPlan {
         Self {
             inner: Arc::new(ArcSwap::new(Arc::new(initial))),
             install_lock: Arc::new(std::sync::Mutex::new(())),
+            active: None,
         }
     }
 
@@ -108,11 +154,24 @@ impl HotReloadBackendPlan {
         Self {
             inner: Arc::new(ArcSwap::new(initial)),
             install_lock: Arc::new(std::sync::Mutex::new(())),
+            active: None,
+        }
+    }
+
+    pub fn from_active(active: HotReloadActivePhysicalPlan) -> Self {
+        let initial = active.snapshot().backend_plan.clone();
+        Self {
+            inner: Arc::new(ArcSwap::new(initial)),
+            install_lock: Arc::new(std::sync::Mutex::new(())),
+            active: Some(active),
         }
     }
 
     pub fn snapshot(&self) -> Arc<control_plane::backend_plan::BackendPlan> {
-        self.inner.load_full()
+        self.active
+            .as_ref()
+            .map(|a| a.snapshot().backend_plan.clone())
+            .unwrap_or_else(|| self.inner.load_full())
     }
 
     pub fn swap(
@@ -238,6 +297,7 @@ mod hot_reload_backend_plan_tests {
 #[derive(Clone)]
 pub struct HotReloadStreamingConfig {
     inner: Arc<ArcSwap<StreamingConfig>>,
+    active: Option<HotReloadActivePhysicalPlan>,
 }
 
 impl HotReloadStreamingConfig {
@@ -247,6 +307,7 @@ impl HotReloadStreamingConfig {
     pub fn new(initial: StreamingConfig) -> Self {
         Self {
             inner: Arc::new(ArcSwap::new(Arc::new(initial))),
+            active: None,
         }
     }
 
@@ -256,6 +317,15 @@ impl HotReloadStreamingConfig {
     pub fn from_arc(initial: Arc<StreamingConfig>) -> Self {
         Self {
             inner: Arc::new(ArcSwap::new(initial)),
+            active: None,
+        }
+    }
+
+    pub fn from_active(active: HotReloadActivePhysicalPlan) -> Self {
+        let initial = active.snapshot().runtime_config.clone();
+        Self {
+            inner: Arc::new(ArcSwap::new(initial)),
+            active: Some(active),
         }
     }
 
@@ -263,7 +333,10 @@ impl HotReloadStreamingConfig {
     /// returned `Arc` is stable for the caller's lifetime — a
     /// concurrent swap produces a new `Arc` and leaves this one alone.
     pub fn snapshot(&self) -> Arc<StreamingConfig> {
-        self.inner.load_full()
+        self.active
+            .as_ref()
+            .map(|a| a.snapshot().runtime_config.clone())
+            .unwrap_or_else(|| self.inner.load_full())
     }
 
     /// Atomically replace the current config. The previous `Arc` is

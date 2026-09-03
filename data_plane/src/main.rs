@@ -318,9 +318,6 @@ async fn main() -> Result<()> {
     // startup snapshot; hot-reload currently only affects the
     // control-plane GET/POST endpoint. Phase 2 will extend the swap
     // to query execution and ingest routing.
-    let hot_reload_config = data_plane::storage_engines::types::HotReloadStreamingConfig::from_arc(
-        streaming_config.clone(),
-    );
 
     // M2.3.6g — the legacy `SketchStore` construction is gone.
     // Production data lives in `SketchStore` (allocated below); the
@@ -426,9 +423,38 @@ async fn main() -> Result<()> {
     // engine (serving-time cutover, Phase 4) and the HTTP server (the
     // push target) so a POST is observable by the next query, same
     // sharing contract as `hot_reload_config`.
-    let hot_reload_backend_plan = data_plane::storage_engines::types::HotReloadBackendPlan::new(
-        control_plane::backend_plan::BackendPlan::default(),
+    let initial_backend_plan = control_plane::backend_plan::BackendPlan::default();
+    let initial_precompute_plan = control_plane::physical::compiler::PrecomputePlan {
+        envelope: control_plane::physical::compiler::PlanEnvelope {
+            plan_id: 0,
+            generated_at_unix_ms: 0,
+            planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
+            capability_snapshot_id: "bootstrap".into(),
+        },
+        materializations: streaming_config
+            .aggregation_configs
+            .values()
+            .cloned()
+            .collect(),
+    };
+    let active_physical_plan = data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(
+        data_plane::storage_engines::types::ActivePhysicalPlan {
+            precompute_plan: initial_precompute_plan,
+            runtime_config: streaming_config.clone(),
+            backend_plan: Arc::new(initial_backend_plan),
+            storage_routing: Arc::new(
+                data_plane::storage_engines::types::BackendStorageRouting::empty(),
+            ),
+        },
     );
+    let hot_reload_config =
+        data_plane::storage_engines::types::HotReloadStreamingConfig::from_active(
+            active_physical_plan.clone(),
+        );
+    let hot_reload_backend_plan =
+        data_plane::storage_engines::types::HotReloadBackendPlan::from_active(
+            active_physical_plan.clone(),
+        );
 
     // Setup query engine. ASAPQueryEngine shares the same
     // HotReloadStreamingConfig handle as the HTTP server, so a POST
@@ -730,6 +756,7 @@ async fn main() -> Result<()> {
     let mut server = HttpServer::new(http_config, engine, sketch_index.clone())
         .with_hot_reload_config(hot_reload_config.clone())
         .with_hot_reload_backend_plan(hot_reload_backend_plan.clone())
+        .with_active_physical_plan(active_physical_plan.clone())
         .with_probe_cache(probe_cache.clone());
 
     // Per-metric storage-backend routing table (issue #46
@@ -772,7 +799,20 @@ async fn main() -> Result<()> {
         );
         data_plane::storage_engines::types::BackendStorageRouting::empty()
     };
-    server = server.with_backend_storage_routing(Arc::new(bootstrap_routing));
+    if active_physical_plan.snapshot().backend_plan.plan_id == 0 {
+        let current = active_physical_plan.snapshot();
+        active_physical_plan.swap(data_plane::storage_engines::types::ActivePhysicalPlan {
+            precompute_plan: current.precompute_plan.clone(),
+            runtime_config: current.runtime_config.clone(),
+            backend_plan: current.backend_plan.clone(),
+            storage_routing: Arc::new(bootstrap_routing),
+        });
+    }
+    server = server.with_hot_reload_backend_storage_routing(
+        data_plane::query_engines::routing::HotReloadBackendStorageRouting::from_active(
+            active_physical_plan.clone(),
+        ),
+    );
 
     // Phase-5/6 + Step-2.3: register the Thanos query engine on the
     // capability router. Path A2 is the only archive path now: when
