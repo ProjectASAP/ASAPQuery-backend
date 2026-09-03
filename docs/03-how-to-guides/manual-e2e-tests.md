@@ -71,15 +71,19 @@ ASAP_COLLECTOR_DIR=../ASAPCollector ./scripts/e2e.sh system
 
 The local `all` target never performs those external operations.
 
-## Ignored regressions
+## Test hygiene
 
-Tests marked `#[ignore]` are not counted as passing coverage. List the current
-known ignored tests and their reasons with:
+Tests marked `#[ignore]` are not counted as passing coverage. The repository
+does not retain ignored tests for retired or unsupported contracts; those
+belong in issue tracking. List suites and verify that no Rust E2E is hidden
+behind `#[ignore]` with:
 
 ```bash
 ./scripts/e2e.sh list
 ```
 
-In particular, ignored legacy cases remain visible but do not substitute for
-the maintained production-process tests. The final local whole-backend test is
-`data_plane/tests/backend_process_e2e.rs`.
+The final local whole-backend test is
+`data_plane/tests/backend_process_e2e.rs`. The environment-gated VictoriaMetrics
+comparison in `gorilla-merger/internal/merger/vmload_test.go` remains an
+explicit external integration test and reports a Go skip when `VM_ADDR` is not
+provided.

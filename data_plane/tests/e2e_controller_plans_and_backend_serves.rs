@@ -761,13 +761,13 @@ async fn post_otlp_http(client: &reqwest::Client, port: u16, req: ExportMetricsS
 
 // ── Test 1 — single DDSketch-quantile workload, no grouping ─────────────────
 //
-// Smoke test: the controller emits a streaming-config JSON for a
+// HTTP integration contract: the controller emits a streaming-config JSON for a
 // workload that resolves to DDSketch. The backend's parser accepts it
 // (POST returns 2xx) and the registered aggregation surfaces on the
 // GET endpoint with the expected metric / sketch family.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn controller_plans_ddsketch_quantile_and_backend_parses_streaming_config() {
+async fn controller_streaming_config_round_trips_through_backend_http() {
     let (port, _hot_reload) = start_backend_http_server().await;
     let client = reqwest::Client::new();
 
@@ -952,8 +952,8 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     // count math (DDSketch index = ceil(log_gamma(value))) doesn't
     // matter for this test — we want to verify the wire round-trip,
     // not the quantile readout accuracy. Pick a simple count vector
-    // the existing `e2e_modified_otlp_sketch_path::e2e_dd_sketch_*`
-    // test uses so we know it's representable.
+    // used by the production modified-OTLP process E2E, so it is known
+    // to be representable.
     let alpha = 0.01;
     let store_counts = vec![5u64, 10, 15, 20];
     let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
@@ -1412,13 +1412,6 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
 // sketch on its own).
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known gap, exposed (not caused) by sketch_reducer.rs's retirement: this shape \
-    now hard capability-misses on SummaryExecutor ('No result for query') instead of \
-    silently falling through to the retired legacy reducer, which used to mask it. Not \
-    fully root-caused yet -- possibly the same effective_is_cumulative gap as \
-    ASAPQuery-backend#431 (this query is also `count_over_time(...)`, a function name \
-    effective_is_cumulative's match doesn't cover), but that's unconfirmed for this \
-    specific CountSketchWithHeap/heap_size shape. Needs its own investigation."]
 async fn controller_plan_to_query_full_roundtrip_count_sketch() {
     let stack = start_full_stack(19_567, 19_568).await;
     let client = reqwest::Client::new();

@@ -31,7 +31,7 @@ Targets:
   whole           Controller plan -> backend install -> OTLP -> store -> PromQL
   whole-matrix    Run every whole-path sketch/query scenario (diagnostic)
   system          Delegate to ASAPCollector's real multi-node system harness
-  list            Print the suites and known ignored E2E tests
+  list            Print the suites and audit Rust E2E ignore markers
 
 Useful environment variables:
   ASAP_COLLECTOR_DIR          Sibling ASAPCollector checkout (system target)
@@ -143,7 +143,7 @@ whole_matrix() {
 
 list_suites() {
     usage
-    printf '\nKnown intentionally ignored E2E tests (not counted as passes):\n'
+    printf '\nRust E2E tests marked #[ignore] (expected: none):\n'
     rg -n '^[[:space:]]*#\[ignore' \
         "${REPO_DIR}/data_plane/tests" \
         "${REPO_DIR}/data_plane/src/tests" \

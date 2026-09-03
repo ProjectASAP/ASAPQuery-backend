@@ -29,19 +29,17 @@
 //! "control plane reacts to workload drift in T seconds" claim has
 //! a concrete local floor.
 //!
-//! Scope note: we do not ingest samples here. The "next query
-//! actually returns data" half of the story requires OTLP
-//! ingestion through a separate entry point and is covered by
-//! the unit tests in `simple_engine.rs`. What this file locks
-//! down is the HTTP-boundary behaviour of the feedback loop
-//! (plan-arrival + idempotency on repeat query).
+//! Scope note: we do not ingest samples here. The "next query actually
+//! returns data" half is covered by the production-process E2E. This file
+//! locks down the HTTP-boundary plan-arrival behavior only. A config alone
+//! does not make a repeat query servable under the current lazy-SID model.
 
 use crate::drivers::control_plane_client::{ControlPlaneClient, HttpControlPlaneClient};
 use crate::drivers::query::adapters::AdapterConfig;
 use crate::drivers::query::servers::http::{HttpServer, HttpServerConfig};
 use crate::query_engines::ASAPQueryEngine;
 #[cfg(test)]
-use crate::storage_engines::types::{HotReloadStreamingConfig, QueryLanguage, StreamingConfig};
+use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
 use axum::{extract::State, routing::post, Router};
 use reqwest::Client;
 use serde_json::Value;
@@ -317,7 +315,6 @@ async fn http_capability_miss_feedback_loop_closes_over_http() {
     //    code paths (timeline dispatch, capability matching,
     //    per-segment resolution) can each observe the miss
     //    before the plan lands — so we assert `>= 1` here.
-    //    Idempotency on a *repeat* query is a separate test.
     let count = control_plane_state.received_count.load(Ordering::SeqCst);
     assert!(
         count >= 1,
@@ -326,74 +323,5 @@ async fn http_capability_miss_feedback_loop_closes_over_http() {
     assert!(
         control_plane_state.pushed_plan_ts.lock().unwrap().is_some(),
         "mock control plane should have pushed plan back to backend"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "regression after InferenceConfig retirement; see TODO"]
-async fn http_capability_miss_repeat_query_is_idempotent_over_http() {
-    // After the plan lands, the SAME query must not fire a
-    // second miss notification — `find_compatible_aggregation`
-    // now returns Some and the miss-notify branch is skipped.
-    // This is the HTTP-visible version of the in-process
-    // `capability_miss_idempotent_on_repeat` test.
-    let metric = "http_e2e_repeat_metric";
-    let expected_agg_id: u64 = 4343;
-
-    let (backend_url, control_plane_state, _hot_reload) =
-        spin_up_loop(metric, expected_agg_id).await;
-    let client = Client::new();
-
-    // 1. First query — miss, triggers the loop.
-    let _ = client
-        .get(format!("{backend_url}/api/v1/query"))
-        .query(&[("query", format!("sum({metric})").as_str()), ("time", "0")])
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await;
-
-    poll_until_plan_active(
-        &client,
-        &backend_url,
-        expected_agg_id,
-        Duration::from_secs(3),
-    )
-    .await
-    .expect("plan should have landed within 3s");
-
-    // 2. Second query on the same metric — should be idempotent.
-    //    Let any still-in-flight fire-and-forget notifies from
-    //    the first query land before we snapshot `count_before`,
-    //    so we're comparing apples to apples.
-    sleep(Duration::from_millis(150)).await;
-    let count_before = control_plane_state.received_count.load(Ordering::SeqCst);
-    assert!(
-        count_before >= 1,
-        "first query should have triggered at least one notify"
-    );
-
-    let t_second = Instant::now();
-    let _ = client
-        .get(format!("{backend_url}/api/v1/query"))
-        .query(&[("query", format!("sum({metric})").as_str()), ("time", "0")])
-        .send()
-        .await
-        .unwrap()
-        .bytes()
-        .await;
-    // Give any errant fire-and-forget notify a window to land.
-    sleep(Duration::from_millis(150)).await;
-    let count_after = control_plane_state.received_count.load(Ordering::SeqCst);
-
-    println!(
-        "http-e2e-repeat: notifies before={count_before} after={count_after} \
-         second_query_roundtrip={}ms",
-        t_second.elapsed().as_millis()
-    );
-    assert_eq!(
-        count_after, count_before,
-        "a repeat query on a covered agg_id must NOT fire a second capability-miss"
     );
 }

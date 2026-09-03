@@ -593,8 +593,8 @@ mod tests {
         assert_eq!(written[2], (fp, (20, 30)));
         assert_eq!(written[3], (fp, (30, 40)));
 
-        // Smoke test: the worker didn't fail mid-run. Window
-        // assertions above are sufficient.
+        // The exact window assertions above prove the worker completed
+        // every expected write.
     }
 
     /// ## The parity test (§10.5 determinism invariant)

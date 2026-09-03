@@ -150,7 +150,7 @@ pub trait RawSampleReader: Send + Sync {
 }
 
 /// In-memory reader used by unit tests and the Phase 5c worker
-/// smoke test. Seeded with a flat `Vec<RawSample>` at construction;
+/// deterministic test adapter. Seeded with a flat `Vec<RawSample>` at construction;
 /// `read_samples` applies `(range, filter)` on every call.
 ///
 /// Not for production use — it doesn't scale past a few thousand

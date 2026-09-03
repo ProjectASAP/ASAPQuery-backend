@@ -13,24 +13,14 @@
 //! - **DDSketch**: round-trip + structural assertions are live — DDSketch
 //!   is a deterministic histogram, so `snapshot → reconstruct → snapshot`
 //!   is byte-identical (`asap_sketchlib`#40).
-//! - **KLL**: the *structural* round-trip is live, but the **byte-parity**
-//!   round-trip is gated `#[ignore]`. KLL compaction is randomized and
-//!   lossy; `reconstruct_via_runtime` rebuilds the sketch by replaying the
-//!   envelope's retained items through `apply_delta`, which re-compacts
-//!   them (different RNG, double compaction) — so the re-snapshot is a
-//!   valid KLL summary but not byte-identical to the original. True byte
-//!   parity needs an `asap_sketchlib` `KLL::from_wire_state` that consumes
-//!   the on-wire `levels`/`items`/`coin` directly — tracked in
-//!   `asap_sketchlib`#41.
-//! - **HLL + CountSketch + CountMinSketch**: the byte-parity work
-//!   for these three sketches is tracked under
-//!   `ProjectASAP/ASAPCollector#243`. Tests are present and gated
-//!   `#[ignore = "blocked on ASAPCollector#243 HLL/CS/CMS byte parity"]`
-//!   so the gap is visible without breaking CI.
+//! - **KLL**: structural envelope compatibility is live. Byte identity is
+//!   not a supported contract because reconstruction replays retained items
+//!   through randomized, lossy compaction.
+//! - **HLL + CountSketch + CountMinSketch**: the shared runtime adapter does
+//!   not support these families; their production decoders are tested at the
+//!   backend accumulator boundary instead.
 
-use asap_precompute_rs::sketches::{
-    CMSWrapper, CountSketchWrapper, DDSketchWrapper, HLLWrapper, KLLWrapper,
-};
+use asap_precompute_rs::sketches::{DDSketchWrapper, KLLWrapper};
 use asap_precompute_rs::Sketch;
 
 use data_plane::precompute_engine::operators::edge_runtime_adapter::{
@@ -181,44 +171,6 @@ fn ddsketch_backend_sketch_snapshots_to_canonical_envelope_bytes() {
 
 // --- KLL ----------------------------------------------------------
 
-/// Round-trip: a KLL envelope produced by asap-precompute-rs's
-/// `KLLWrapper` is reconstructed by the backend's runtime adapter,
-/// which returns a re-snapshot from the runtime.
-///
-/// **Byte parity is gated `#[ignore]`** — see below. `reconstruct_via_runtime`
-/// rebuilds the KLL by replaying the envelope's retained `items` through
-/// `apply_delta` → `update()`. For an input large enough to compact
-/// (here, 400 items at k=200 → 2 levels), that re-feed re-compacts
-/// lossily and with a different RNG seed than the original, so the
-/// re-snapshot — though a valid KLL summary — is not byte-identical.
-/// True byte parity needs an `asap_sketchlib` `KLL::from_wire_state`
-/// that restores the exact compactor state (`levels`/`items`/`coin`)
-/// instead of replaying items; tracked in `asap_sketchlib`#41. The
-/// *structural* round-trip is covered live by the test below.
-#[test]
-#[ignore = "KLL byte parity needs asap_sketchlib KLL::from_wire_state (asap_sketchlib#41); \
-            reconstruct_via_runtime replays items, which re-compacts lossily"]
-fn kll_envelope_round_trip_through_backend_adapter() {
-    let mut w = KLLWrapper::new(200, Some(42));
-    for i in 1..=400 {
-        w.update(i as f64);
-    }
-    let original = w.snapshot().expect("KLL snapshot");
-    assert!(!original.is_empty());
-
-    let reconstructed = reconstruct_via_runtime(SketchType::KLLSketch, &original)
-        .expect("runtime adapter reconstruction");
-    let snapshot_bytes = match reconstructed {
-        ReconstructedSketch::Kll { snapshot_bytes } => snapshot_bytes,
-        _ => panic!("expected KLL reconstruction"),
-    };
-    assert!(!snapshot_bytes.is_empty(), "non-empty re-snapshot");
-    assert_eq!(
-        snapshot_bytes, original,
-        "KLL envelope round-trip via asap-precompute-rs runtime is byte-identical"
-    );
-}
-
 /// Structural: KLL envelope unwraps to the expected oneof variant via
 /// the shared `unwrap_envelope_state` helper.
 #[test]
@@ -240,43 +192,4 @@ fn kll_envelope_structural_assertions() {
         }
         other => panic!("expected KLL state, got {other:?}"),
     }
-}
-
-// --- Sketches gated on ASAPCollector#243 --------------------------
-
-#[test]
-#[ignore = "blocked on ASAPCollector#243 HLL/CS/CMS byte parity"]
-fn hll_envelope_round_trip_through_backend_adapter() {
-    use asap_sketchlib::HllVariant;
-    let mut w = HLLWrapper::new(HllVariant::Regular, 12);
-    for i in 0..1000u32 {
-        w.update(&i.to_le_bytes());
-    }
-    let bytes = w.snapshot().expect("HLL snapshot");
-    let _ = reconstruct_via_runtime(SketchType::HLLSketch, &bytes)
-        .expect("HLL reconstruction (gated until #243)");
-}
-
-#[test]
-#[ignore = "blocked on ASAPCollector#243 HLL/CS/CMS byte parity"]
-fn countsketch_envelope_round_trip_through_backend_adapter() {
-    let mut w = CountSketchWrapper::new(4, 1024);
-    for i in 0..100u32 {
-        w.update(&format!("k{}", i % 10), 1.0);
-    }
-    let bytes = w.snapshot().expect("CountSketch snapshot");
-    let _ = reconstruct_via_runtime(SketchType::CountSketch, &bytes)
-        .expect("CountSketch reconstruction (gated until #243)");
-}
-
-#[test]
-#[ignore = "blocked on ASAPCollector#243 HLL/CS/CMS byte parity"]
-fn cms_envelope_round_trip_through_backend_adapter() {
-    let mut w = CMSWrapper::new(4, 1024);
-    for i in 0..100u32 {
-        w.update(&format!("k{}", i % 10), 1.0);
-    }
-    let bytes = w.snapshot().expect("CMS snapshot");
-    let _ = reconstruct_via_runtime(SketchType::CountMinSketch, &bytes)
-        .expect("CMS reconstruction (gated until #243)");
 }

@@ -451,7 +451,7 @@ mod tests {
 
     const ACC: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
 
-    // Smoke tests for the parse entry point.
+    // Focused unit contracts for the PromQL parse entry point.
 
     #[test]
     fn promql_dispatched_correctly() {

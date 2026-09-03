@@ -5301,7 +5301,7 @@ mod tests {
     // wire-attr tuple, minting one sid per unique tuple — defeating
     // the streaming-config contract and ballooning the schema endpoint
     // per-metric sid count (51 for `http_requests_total_latency_ms`
-    // in the smoke test).
+    // in the end-to-end acceptance test).
     //
     // We chose OTTL `transform` over `attributes/keep` because the
     // attributes processor has NO native allowlist action (only

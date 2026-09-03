@@ -1256,7 +1256,7 @@ mod runtime_tests {
     // is threaded through the pre-pop QuerySpec → analyzer →
     // QueryWorkload.group_by_labels → collect_metric_to_grouping_labels
     // → the emitter's keep_keys list. Without this round-trip the
-    // smoke test's sid catalog stays empty-per-zone.
+    // end-to-end test's sid catalog stays empty-per-zone.
     #[test]
     fn workload_entry_grouping_labels_round_trip_through_emit_to_keep_keys() {
         let yaml = r#"
