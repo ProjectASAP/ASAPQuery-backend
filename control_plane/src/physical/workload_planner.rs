@@ -36,7 +36,7 @@ fn mvp_deployment_policy(
     })
 }
 
-/// Bind a `QueryWorkload` into the typed L4 [`crate::sketch_algebra::PhysicalExpr`]
+/// Bind a `QueryWorkload` into the typed L4 [`crate::physical::post_asap::PhysicalExpr`]
 /// IR, when callers want to inspect the typed binding alongside the
 /// legacy `CollectionPlan` output.
 ///
@@ -69,7 +69,7 @@ fn mvp_deployment_policy(
 /// the parallel `USE_TYPED_STAGE_SPLIT` gate is enabled — the bound
 /// `PhysicalExpr` is then fed into `planner::stage_split::split_typed_three_stage`
 /// + the per-stage emitters in `config::stage_config`.
-pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::PhysicalExpr> {
+pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::physical::post_asap::PhysicalExpr> {
     bind_workload_typed_with_item_filter(w, None)
 }
 
@@ -87,8 +87,8 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::sketch_algebra::P
 pub fn bind_workload_typed_with_item_filter(
     w: &QueryWorkload,
     item_filter: Option<(&str, &str)>,
-) -> Option<crate::sketch_algebra::PhysicalExpr> {
-    use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
+) -> Option<crate::physical::post_asap::PhysicalExpr> {
+    use crate::physical::post_asap::cost_model::ForcedFamilyCostModel;
     use crate::types_v2::AccuracyTarget;
     use planner_types::post_asap::SketchAlgorithm;
     use planner_types::pre_asap::{AggIntent as L3AggIntent, QueryExpr, Schema, Source};
@@ -286,7 +286,7 @@ pub fn bind_workload_typed_with_item_filter(
     ) {
         return None;
     }
-    Some(crate::sketch_algebra::physical_expr::PhysicalExpr::committed(node))
+    Some(crate::physical::post_asap::deployment_expr::PhysicalExpr::committed(node))
 }
 
 pub struct DeploymentPlanCompiler {
@@ -611,7 +611,7 @@ mod tests {
     // | `top_endpoint_qps`      | CountSketch  |
     // | `endpoint_request_freq` | CMS          |
 
-    use crate::sketch_algebra::physical_expr::PhysicalExpr;
+    use crate::physical::post_asap::deployment_expr::PhysicalExpr;
     use planner_types::post_asap::SketchAlgorithm;
     use planner_types::pre_asap::expr_ir::ColumnRef;
 
@@ -628,8 +628,9 @@ mod tests {
     /// readout itself (to check `PointCount`'s `key`/`value`), not just
     /// the sketch family underneath it.
     fn extract_query(expr: &PhysicalExpr) -> Option<planner_types::post_asap::SketchQuery> {
-        let PhysicalExpr::Committed(crate::sketch_algebra::physical_expr::L4Plan::Summary(node)) =
-            expr
+        let PhysicalExpr::Committed(
+            crate::physical::post_asap::deployment_expr::PostAsapPlan::Summary(node),
+        ) = expr
         else {
             return None;
         };

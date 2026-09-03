@@ -5,7 +5,7 @@
 //! typed L5 colouring + emitter for the DC three-stage topology
 //! (edge → gateway → backend).
 //!
-//! Pipeline position. L4 [`crate::sketch_algebra::PhysicalExpr`] is the
+//! Pipeline position. L4 [`crate::physical::post_asap::PhysicalExpr`] is the
 //! input — sketch-bound, language-orthogonal, deployment-independent.
 //! L5 paints each `PhysicalExpr` node with a [`StageId`] and emits one
 //! [`emitter::StageConfig`] per occupied stage. The configs become the

@@ -194,9 +194,9 @@ impl std::fmt::Display for SketchType {
     }
 }
 
-// Moved from the retired `sketch_algebra::sketch_params` (Stage 3 of the
+// Moved from the retired `physical::post_asap::sketch_params` (Stage 3 of the
 // sketch-identity unification — see
-// scratchpad/artifacts/enum-unification-plan.md) when `sketch_algebra::SketchAlgorithm`
+// scratchpad/artifacts/enum-unification-plan.md) when `physical::post_asap::SketchAlgorithm`
 // was replaced by `planner_types::post_asap::SummaryKind` (later `planner_types::post_asap::
 // SketchAlgorithm` once ASAPPlanner split the old flat `SummaryKind` per-family —
 // see control_plane/docs/design-asapplanner-pin-migration.md). `SketchType::

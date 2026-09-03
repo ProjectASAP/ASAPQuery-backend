@@ -43,7 +43,7 @@ message SummaryParams {
   }
 }
 
-// ── Capability (control_plane::sketch_algebra::capability) ──────────────────
+// ── Capability (control_plane::physical::post_asap::capability) ──────────────────
 
 enum SketchKindHandle {
   SKETCH_KIND_HANDLE_UNSPECIFIED = 0;

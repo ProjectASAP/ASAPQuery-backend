@@ -43,8 +43,8 @@ use planner_types::post_asap::{SummaryExpr, SummaryNode};
 
 use crate::physical::colored_dag::dag::{ColoredDag, ColoredNode, NodeId};
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
-use crate::sketch_algebra::physical_expr::L4Plan;
-use crate::sketch_algebra::PhysicalExpr;
+use crate::physical::post_asap::deployment_expr::PostAsapPlan;
+use crate::physical::post_asap::PhysicalExpr;
 use crate::types_v2::BindingName;
 
 /// Errors surfaced by [`StageAllocator::allocate`].
@@ -124,18 +124,18 @@ impl ThreeStageWalker {
         }
     }
 
-    /// Recursively visit an [`L4Plan`] — the "what to compute" layer.
-    /// [`L4Plan::Summary`] delegates the actual per-node granularity to
+    /// Recursively visit an [`PostAsapPlan`] — the "what to compute" layer.
+    /// [`PostAsapPlan::Summary`] delegates the actual per-node granularity to
     /// [`Self::visit_l4node`] (walking `planner_types::post_asap::SummaryNode`'s own DAG
-    /// shape); [`L4Plan::LetBinding`] / [`L4Plan::Ref`] are this crate's
+    /// shape); [`PostAsapPlan::LetBinding`] / [`PostAsapPlan::Ref`] are this crate's
     /// own named-binding sharing mechanism, unchanged from before Step B.
-    fn visit_plan(&mut self, plan: &L4Plan) -> Result<(NodeId, StageId), AllocateError> {
+    fn visit_plan(&mut self, plan: &PostAsapPlan) -> Result<(NodeId, StageId), AllocateError> {
         match plan {
-            L4Plan::Summary(node) => self.visit_l4node(node),
+            PostAsapPlan::Summary(node) => self.visit_l4node(node),
 
             // ── LetBinding: colour by the bound expression's stage,
             // and bring the binding into scope before walking the body.
-            L4Plan::LetBinding { name, expr, child } => {
+            PostAsapPlan::LetBinding { name, expr, child } => {
                 let id = self.reserve_node(PhysicalExpr::Committed(plan.clone()));
                 let (eid, expr_stage) = self.visit_plan(expr)?;
                 self.dag.edges.push((id, eid));
@@ -147,7 +147,7 @@ impl ThreeStageWalker {
 
             // ── Ref: colour matches the binding's stage. Unresolved
             // refs bubble up as `AllocateError::UnresolvedRef`.
-            L4Plan::Ref { name } => {
+            PostAsapPlan::Ref { name } => {
                 let id = self.reserve_node(PhysicalExpr::Committed(plan.clone()));
                 let stage = self
                     .scope
@@ -163,7 +163,7 @@ impl ThreeStageWalker {
     /// itself, owned upstream. Every semantic node gets its own
     /// [`ColoredNode`] (matching the granularity the old, locally-defined
     /// `PhysicalExpr::{SketchAgg,SketchEstimate,SketchMerge}` had),
-    /// stored back as `PhysicalExpr::Committed(L4Plan::Summary(..))`
+    /// stored back as `PhysicalExpr::Committed(PostAsapPlan::Summary(..))`
     /// wrapping just that sub-node, so downstream consumers
     /// (`colored_dag::emitter`, `emit::mod`) keep pattern-matching
     /// against the same `PhysicalExpr` shape.
@@ -214,7 +214,7 @@ impl ThreeStageWalker {
 
             // ── SummaryJoin / SummarySubtract / SummaryDelete: not
             // surfaced by any `Bind*` path yet (gated on rules that
-            // haven't landed — see `physical_expr.rs`'s module docs'
+            // haven't landed — see `deployment_expr.rs`'s module docs'
             // predecessor note). Conservative default matching
             // SummaryMerge's multi-input-combination shape until a real
             // consumer picks a placement.
@@ -320,7 +320,9 @@ impl ThreeStageWalker {
 // stage lookup keyed by binding name.
 pub(crate) fn binding_stage(dag: &ColoredDag, name: &BindingName) -> Option<StageId> {
     dag.nodes.iter().find_map(|n| match &n.expr {
-        PhysicalExpr::Committed(L4Plan::LetBinding { name: n2, .. }) if n2 == name => Some(n.stage),
+        PhysicalExpr::Committed(PostAsapPlan::LetBinding { name: n2, .. }) if n2 == name => {
+            Some(n.stage)
+        }
         _ => None,
     })
 }

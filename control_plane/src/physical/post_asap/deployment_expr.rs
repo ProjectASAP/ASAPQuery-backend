@@ -1,13 +1,9 @@
-//! Layer 4/5 IR — `L4Plan` / `PhysicalExpr`.
-//!
-//! Per `control_plane/docs/design.md` §6 "`core::sketch_algebra` — Layer 4 IR"
-//! and the L4/L5 layer-spine invariant: "sketch binding is already
-//! committed by L4; L5 is about stage allocation + emission."
+//! Backend deployment wrappers around the canonical post-ASAP plan.
 //!
 //! Step B of the plan-shaped-serving migration retires this crate's own
 //! `PhysicalExpr`-as-L4-algebra (the old `Logical` / `SketchAgg` /
 //! `SketchEstimate` / `SketchMerge` / `ExactAgg` variants) in favor of
-//! ASAPController's canonical L4 IR, `planner_types::post_asap::{SummaryExpr, SummaryNode}`
+//! ASAPPlanner's canonical post-ASAP IR, `planner_types::post_asap::{SummaryExpr, SummaryNode}`
 //! — the same move Step 3 of the enum-unification made for
 //! `SketchAlgorithm → SketchAlgorithm`, one layer up. `implement_promql_for_asap_tier`
 //! (`asap_tier_implement.rs`, Step A) already builds `Rc<SummaryNode>` trees via
@@ -23,8 +19,7 @@
 //!   this crate discovers sharing incrementally, per-node, so it still needs
 //!   a name to thread a bound value across sibling calls. This is a
 //!   deployment-specific mechanism, not a fact about the sketch algebra
-//!   itself — L4 concern (it's still "what to compute", just with sharing),
-//!   hence `L4Plan` rather than `PhysicalExpr`.
+//!   itself, hence the backend-local [`PostAsapPlan`] wrapper.
 //! - **`RawAtEdgeSketchAtBackend` / `RawAtEdgePrometheusArchive`** — Phase
 //!   ε.1's placement decisions (where the sketch gets built, not what it
 //!   is). Genuinely L5. `physical::deployment_cost::wire` once named the same three
@@ -39,7 +34,7 @@
 //! don't get their own variants anymore — `planner_types::post_asap::SummaryExpr`
 //! already unifies all of them (including "exact accumulator" and "sketch"
 //! as the same `SummaryAgg` node, with or without a wrapping
-//! `SummaryEstimate`) inside a single `L4Plan::Summary(Rc<SummaryNode>)`.
+//! `SummaryEstimate`) inside a single `PostAsapPlan::Summary(Rc<SummaryNode>)`.
 
 #![allow(dead_code)]
 
@@ -50,12 +45,12 @@ use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryNode};
 
 use crate::types_v2::BindingName;
 
-/// L4 IR — "what to compute". Wraps `planner_types::post_asap::SummaryNode` (the sketch
-/// algebra itself, owned upstream) and adds only the named-binding sharing
-/// mechanism `asap_sketch` doesn't have. See module docs.
+/// Backend-local wrapper around the Planner-owned post-ASAP tree.
+///
+/// It adds only named sharing required during physical placement and emission.
 #[derive(Debug, Clone)]
-pub enum L4Plan {
-    /// A committed L4 sub-tree — `SummaryAgg` / `SummaryEstimate` /
+pub enum PostAsapPlan {
+    /// A committed post-ASAP sub-tree — `SummaryAgg` / `SummaryEstimate` /
     /// `SummaryMerge` / `Logical`, whatever `implement_tree_in_with` (or a
     /// deployment-specific pre-pass) produced.
     Summary(Rc<SummaryNode>),
@@ -69,9 +64,9 @@ pub enum L4Plan {
         /// Binding name; must be unique within the surrounding scope.
         name: BindingName,
         /// Bound sub-expression.
-        expr: Rc<L4Plan>,
+        expr: Rc<PostAsapPlan>,
         /// In-scope sub-tree — references the binding via `Ref`.
-        child: Rc<L4Plan>,
+        child: Rc<PostAsapPlan>,
     },
 
     /// Reference a `LetBinding` by name. Resolution is lexical (scope
@@ -82,16 +77,17 @@ pub enum L4Plan {
     },
 }
 
-/// L5 IR — "where/how". Wraps an already-committed [`L4Plan`] (sketch
-/// binding is final by the time anything reaches here) with placement
+/// Physical placement — "where/how". Wraps an already-committed
+/// [`PostAsapPlan`] (summary selection is final by the time it reaches here)
+/// with placement
 /// info: build at the edge (the common case — `Committed` needs no extra
-/// annotation since the `L4Plan` itself is the whole story), or one of
+/// annotation since the `PostAsapPlan` itself is the whole story), or one of
 /// Phase ε.1's two backend/archive placements.
 #[derive(Debug, Clone)]
 pub enum PhysicalExpr {
     /// Sketch built at the edge — the default placement. The committed
-    /// `L4Plan` alone determines the output.
-    Committed(L4Plan),
+    /// `PostAsapPlan` alone determines the output.
+    Committed(PostAsapPlan),
 
     /// Phase ε.1 Mode 2: no sketch processor at the edge — raw OTLP
     /// forwards to the backend, which builds the sketch at ingest. The
@@ -105,7 +101,7 @@ pub enum PhysicalExpr {
         params: SketchParams,
         /// Input sub-tree — typically `Summary(Logical(Window{...}))` or
         /// `Summary(Logical(Scan{...}))`.
-        child: Box<L4Plan>,
+        child: Box<PostAsapPlan>,
     },
 
     /// Phase ε.1 Mode 3: no sketch processor at the edge — raw OTLP ships
@@ -140,7 +136,7 @@ impl PhysicalExpr {
     /// Convenience constructor for the common case: a committed
     /// `SummaryNode` sketch-built at the edge, no placement wrapper.
     pub fn committed(node: Rc<SummaryNode>) -> Self {
-        PhysicalExpr::Committed(L4Plan::Summary(node))
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node))
     }
 }
 
@@ -212,7 +208,7 @@ mod tests {
         let node = crate::planner_selection::select_summary_default(&q).expect("implements");
         let e = PhysicalExpr::committed(node);
         match e {
-            PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+            PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
                 planner_types::post_asap::SummaryExpr::SummaryEstimate {
                     query,
                     summary_input,

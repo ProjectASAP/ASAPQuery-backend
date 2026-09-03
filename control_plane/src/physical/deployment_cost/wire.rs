@@ -7,7 +7,7 @@
 //! sketch runs at the edge, ships raw for backend-side sketching, or
 //! falls back to a Prometheus archive, based on per-workload wire-cost
 //! break-even math. It was fully designed and unit-tested but never
-//! wired into `sketch_algebra::lower::bind_query_expr` (which always
+//! wired into `physical::post_asap::lower::bind_query_expr` (which always
 //! produces `PhysicalExpr::Committed` — see that function's doc) or
 //! anywhere else; `PhysicalExpr::RawAtEdgeSketchAtBackend` /
 //! `RawAtEdgePrometheusArchive` remain structurally unreachable in
@@ -18,7 +18,7 @@
 //!
 //! What's left is the cost table alone — genuinely load-bearing today
 //! via [`WireCostTable::for_kind`], consumed by
-//! `sketch_algebra::cost_model::ControlPlaneCostModel` to rank
+//! `physical::post_asap::cost_model::ControlPlaneCostModel` to rank
 //! candidate sketch families by wire cost.
 //!
 //! ## Cost table source
@@ -105,7 +105,7 @@ impl WireCostTable {
 
     /// Lookup the per-flush cost for a sketch family.
     ///
-    /// `SketchAlgorithm` (unlike the retired `sketch_algebra::SketchAlgorithm`)
+    /// `SketchAlgorithm` (unlike the retired `physical::post_asap::SketchAlgorithm`)
     /// distinguishes heap-bearing from bare frequency sketches at the
     /// kind level rather than via a `with_heap` param flag. This table
     /// never modeled the heap's extra bytes separately (the old

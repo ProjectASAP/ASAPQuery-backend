@@ -2,14 +2,14 @@
 //! surface.
 //!
 //! Moved out of `physical::runtime_capability` (Stage 4 of the
-//! `promql_utilities` retirement / `sketch_algebra` re-layering): this is a
+//! `promql_utilities` retirement / `physical::post_asap` re-layering): this is a
 //! cost-model concern (insert/query throughput, memory, CPU, transmission
 //! size, which intents each sketch family serves), read by the optimizer
 //! for cost-based plan rewriting and by the physical planner to check
 //! whether a sketch fits within a stage's budget — it was never L4 IR, just
 //! filed alongside it because both modules touched `SketchAlgorithm`.
 //!
-//! Distinct from [`crate::sketch_algebra::schema::SketchStateMetadata`] —
+//! Distinct from [`crate::physical::post_asap::schema::SketchStateMetadata`] —
 //! that struct carries the **L4 type-system flags** (`mergeable` /
 //! `subtractable` / `deletable`) that gate `SketchMerge` / `SketchSubtract`
 //! / `SketchDelete` at plan-time. `SketchCapability` here is the

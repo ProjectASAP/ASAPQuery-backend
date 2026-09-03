@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::physical::colored_dag::dag::ColoredDag;
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
-use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
+use crate::physical::post_asap::deployment_expr::{PhysicalExpr, PostAsapPlan};
 use crate::types_v2::BindingName;
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SketchQuery, SummaryExpr};
 // `BackendAggregation.sketch_kind`/`.sketch_params` (below) span BOTH
@@ -53,7 +53,7 @@ use asap_types::{SummaryKind as BackendSketchKind, SummaryParams as BackendSketc
 /// `PhysicalExpr`, for the tuple-style `(&node.expr, node.stage)` matching
 /// this file uses throughout. Mirrors the shape the old, locally-defined
 /// flat `PhysicalExpr` had before Step B folded most of its variants into
-/// `planner_types::post_asap::SummaryExpr` — see `sketch_algebra::physical_expr`'s
+/// `planner_types::post_asap::SummaryExpr` — see `physical::post_asap::deployment_expr`'s
 /// module docs.
 enum NodeKind<'a> {
     Logical(&'a planner_types::pre_asap::QueryExpr),
@@ -95,7 +95,7 @@ enum NodeKind<'a> {
 
 fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
     match expr {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
             SummaryExpr::KeepPreAsap(qe) => NodeKind::Logical(qe),
             // `SummaryAgg`'s `kind`/`params` fields collapsed into one
             // `family: SummaryFamilyType` field (ASAPPlanner#218 --
@@ -126,8 +126,10 @@ fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
             | SummaryExpr::SummarySubtract { .. }
             | SummaryExpr::SummaryDelete { .. } => NodeKind::Other,
         },
-        PhysicalExpr::Committed(L4Plan::LetBinding { name, .. }) => NodeKind::LetBinding { name },
-        PhysicalExpr::Committed(L4Plan::Ref { name }) => NodeKind::Ref { name },
+        PhysicalExpr::Committed(PostAsapPlan::LetBinding { name, .. }) => {
+            NodeKind::LetBinding { name }
+        }
+        PhysicalExpr::Committed(PostAsapPlan::Ref { name }) => NodeKind::Ref { name },
         PhysicalExpr::RawAtEdgeSketchAtBackend { family, params, .. } => {
             NodeKind::RawAtEdgeSketchAtBackend { family, params }
         }
@@ -1068,7 +1070,7 @@ impl Emitter for ThreeStageEmitter {
 /// crates in `opentelemetry-collector-contrib`) already use.
 ///
 /// Heap-bearing kinds (`CmsWithHeap`/`CountSketchWithHeap`) reuse their
-/// bare counterpart's processor name — the retired `sketch_algebra::SketchAlgorithm`
+/// bare counterpart's processor name — the retired `physical::post_asap::SketchAlgorithm`
 /// this replaces had no heap-bearing variant at all (`with_heap` was a
 /// `SketchParams` field this function never received), so heap-bearing
 /// and bare CMS/CountSketch already mapped to the identical processor

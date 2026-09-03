@@ -11,9 +11,9 @@ use planner_types::post_asap::{
 };
 use planner_types::pre_asap::expr_ir::ColumnRef;
 
-use crate::sketch_algebra::cost_model::ForcedFamilyCostModel;
-use crate::sketch_algebra::lower::bind_query_expr;
-use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
+use crate::physical::post_asap::cost_model::ForcedFamilyCostModel;
+use crate::physical::post_asap::deployment_expr::{PhysicalExpr, PostAsapPlan};
+use crate::physical::post_asap::lower::bind_query_expr;
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::{AggIntent, QueryExpr, Reduction, Schema, Source};
 use planner_types::pre_asap::{Column, DataType};
@@ -91,11 +91,13 @@ fn binding_is_archive(expr: &PhysicalExpr) -> bool {
     }
 }
 
-fn plan_is_archive(plan: &L4Plan) -> bool {
+fn plan_is_archive(plan: &PostAsapPlan) -> bool {
     match plan {
-        L4Plan::Summary(node) => node_is_archive(node),
-        L4Plan::LetBinding { expr, child, .. } => plan_is_archive(expr) || plan_is_archive(child),
-        L4Plan::Ref { .. } => false,
+        PostAsapPlan::Summary(node) => node_is_archive(node),
+        PostAsapPlan::LetBinding { expr, child, .. } => {
+            plan_is_archive(expr) || plan_is_archive(child)
+        }
+        PostAsapPlan::Ref { .. } => false,
     }
 }
 
@@ -200,7 +202,7 @@ fn bind_picks_ddsketch_over_kll_when_eps_explicit() {
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01))
         .expect("bind_query_expr should not error");
     match bound {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryEstimate { summary_input, .. } => match &summary_input.expr {
                 SummaryExpr::SummaryAgg { family, .. } => {
                     assert!(
@@ -236,7 +238,7 @@ fn agg_topk(k: usize, accuracy: AccuracyTarget) -> QueryExpr {
 /// return anymore.
 fn topk_binding_family(bound: &PhysicalExpr) -> (SketchAlgorithm, u32, u32) {
     match bound {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryEstimate {
                 query,
                 summary_input,
@@ -351,7 +353,7 @@ fn bind_hll_cardinality_basic() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).expect("no error");
     match bound {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryEstimate {
                 query,
                 summary_input,
@@ -390,7 +392,7 @@ fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     // variant (and `asap_types::AggregationType`) no longer exist at
     // the L4 IR level: `planner_types::post_asap::SummaryExpr` unifies exact
     // accumulators and approximate sketches into the same `SummaryAgg`
-    // node shape, keyed by `SummaryKind` (see `physical_expr.rs`'s
+    // node shape, keyed by `SummaryKind` (see `deployment_expr.rs`'s
     // module docs).
     let expr = QueryExpr::Aggregate {
         reduction: Reduction::PerEntity,
@@ -401,7 +403,7 @@ fn sum_now_binds_to_exact_agg_after_pr_6_followup() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Exact).expect("no error");
     match bound {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryAgg { family, .. } => {
                 assert_eq!(
                     family,
@@ -423,7 +425,7 @@ fn bind_exact_accuracy_disables_quantile_binding() {
     let expr = agg_quantile(0.99, AccuracyTarget::Exact);
     let bound = bind_query_expr(&expr, AccuracyTarget::Exact).expect("no error");
     match bound {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => {
             assert!(
                 matches!(&node.expr, SummaryExpr::KeepPreAsap(qe) if matches!(**qe, QueryExpr::Aggregate { .. })),
                 "Exact accuracy should disable summary binding and pass through as Logical, got {:?}",
@@ -460,7 +462,7 @@ fn phase_b_pattern_only_temporal_quantile_binds_to_sketch() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryEstimate {
                 query,
                 summary_input,
@@ -501,7 +503,7 @@ fn phase_b_pattern_only_temporal_sum_binds_to_exact_agg() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryAgg { family, .. } => {
                 assert_eq!(
                     family,
@@ -533,7 +535,7 @@ fn phase_b_pattern_only_spatial_aggregate_binds_to_multiple_sum() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryAgg {
                 family, reduction, ..
             } => {
@@ -571,7 +573,7 @@ fn phase_b_pattern_temporal_and_spatial_combined_binds_to_multiple_increase() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).unwrap();
     match bound {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
             SummaryExpr::SummaryAgg {
                 family, reduction, ..
             } => {
@@ -616,7 +618,7 @@ fn phase_b_pattern_archive_only_routes_to_archive() {
     // The archive-only rule's output is a Logical pass-through carrying
     // the original Aggregate. Downstream emitters check archive_only().
     match bound {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
             SummaryExpr::KeepPreAsap(qe) => match qe.as_ref() {
                 QueryExpr::Aggregate { measures: aggs, .. } => {
                     assert_eq!(aggs, &vec![intent]);
@@ -841,7 +843,7 @@ fn phase_b_archive_only_intents_round_trip_through_binder() {
         let bound =
             bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).expect("bind should succeed");
         match bound {
-            PhysicalExpr::Committed(L4Plan::Summary(node)) => match &node.expr {
+            PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => match &node.expr {
                 SummaryExpr::KeepPreAsap(qe) => match qe.as_ref() {
                     QueryExpr::Aggregate { measures: aggs, .. } => {
                         assert_eq!(aggs.len(), 1);
@@ -888,7 +890,7 @@ fn frequency_extension_binds_cms() {
     };
     let bound = bind_query_expr(&expr, AccuracyTarget::Epsilon(0.01)).expect("no error");
     match bound {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => {
             let SummaryExpr::SummaryEstimate {
                 summary_input,
                 query,
@@ -928,7 +930,7 @@ fn topk_exact_accuracy_declines_to_bind() {
     let expr = agg_topk(10, AccuracyTarget::Exact);
     let bound = bind_query_expr(&expr, AccuracyTarget::Exact).expect("no error");
     match bound {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => {
             assert!(
                 matches!(&node.expr, SummaryExpr::KeepPreAsap(_)),
                 "TopK{{accuracy: Exact}} should decline pending ASAPController#151, got {:?}",

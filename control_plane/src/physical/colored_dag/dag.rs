@@ -23,7 +23,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
-use crate::sketch_algebra::PhysicalExpr;
+use crate::physical::post_asap::PhysicalExpr;
 
 /// Stable position-based identifier for a node within a `ColoredDag`.
 /// `NodeId(0)` is the root; depth-first walk order otherwise.
@@ -146,7 +146,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::sketch_algebra::PhysicalExpr;
+    use crate::physical::post_asap::PhysicalExpr;
     use planner_types::pre_asap::{Column, DataType};
     use planner_types::pre_asap::{QueryExpr, Schema, Source};
 
