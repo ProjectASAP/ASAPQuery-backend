@@ -203,29 +203,6 @@ impl ASAPQueryEngine {
         )
     }
 
-    /// Build a `QueryRequirements` from an ASAP-tier candidate (the
-    /// shape modern `execute()` works with). Used by the modern miss
-    /// branches to fire the capability-miss notify the legacy
-    /// `find_compatible_aggregation_with_miss_notify` path provided
-    /// before the B7.5 retirement.
-    fn requirements_from_candidate(
-        candidate: &control_plane::asap_tier_analysis::ASAPTierCandidate,
-    ) -> QueryRequirements {
-        QueryRequirements {
-            metric: candidate.metric_name.clone(),
-            statistics: Vec::new(),
-            data_range_ms: if candidate.range_seconds > 0 {
-                Some(candidate.range_seconds.saturating_mul(1000))
-            } else {
-                None
-            },
-            grouping_labels: KeyByLabelNames::new(
-                candidate.group_by_keys.iter().cloned().collect(),
-            ),
-            spatial_filter_normalized: candidate.spatial_filter_canonical.clone(),
-        }
-    }
-
     /// Build a minimal `QueryRequirements` from a bare PromQL string —
     /// used by the no-sketch-index miss branch in modern `execute()`,
     /// where we don't have a parsed candidate (analysis was skipped)
@@ -343,150 +320,32 @@ impl ASAPQueryEngine {
             ));
         };
 
-        let analysis = control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
-
-        if let Some(reason) = &analysis.unsupported {
-            return Err(crate::query_engines::EngineError::capability_miss(
-                crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                format!(
-                    "SketchStore analyzer rejected `{query}` for range query: \
-                     {reason:?} — failing over to archive"
-                ),
-            ));
-        }
-        if analysis.candidates.is_empty() {
-            return Err(crate::query_engines::EngineError::capability_miss(
-                crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                format!(
-                    "SketchStore analyzer produced no ASAP-tier candidates for \
-                     `{query}` — failing over to archive"
-                ),
-            ));
-        }
-
-        let streaming_snap = self.streaming_config_snapshot();
-        let routing_index = asap_types::RoutingIndex::build(streaming_snap.policy_registry());
-        let mut combined_result: Option<crate::storage_engines::sketch_db::query::ASAPTierResult> =
-            None;
-        // Resilience fix -- see the instant-query `execute(&str)` path's
-        // identical comment above `for candidate in &analysis.candidates`
-        // for the full rationale (design-target-architecture.md Part B).
-        let mut last_miss_detail: Option<String> = None;
-
-        for candidate in &analysis.candidates {
-            if combined_result.is_some() {
-                continue;
-            }
-            // Resolve candidate → {sids} via the sid catalog. Schema-
-            // retirement #5: prefer `instances_matching` over the
-            // policy-fp reverse index — it's the more general
-            // primitive and works whether or not the ingest path was
-            // able to bind the sid back to a streaming-config policy.
-            //
-            // History: an earlier PR removed an `instances_matching`
-            // fallback under the assumption every production sid
-            // registration would populate `policy_fp`. The MVP smoke
-            // test (issue #271 / tracking #272) showed that
-            // assumption is wrong — sketches arriving from the agent
-            // carry the full wire-attr set rather than the streaming-
-            // config's `grouping_labels` subset, so
-            // `derive_sketch_policy_fp` returns `UNSET` and
-            // `sids_for_policy(fp)` returns empty. The agg_id-aware
-            // path is preserved for ExactAgg sids minted via
-            // `ingest_precompute_for_agg_config` (those carry a
-            // populated `policy_fp`) but its result is unioned with
-            // the catalog-walk result so we don't miss the sketches.
-            let policy_fps = control_plane::asap_tier_analysis::find_matching_policies(
-                &routing_index,
-                candidate,
-            );
-            let mut sids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-            for fp in &policy_fps {
-                sids.extend(idx.sids_for_policy(*fp));
-            }
-            sids.extend(idx.instances_matching(&candidate.metric_name, &candidate.group_by_keys));
-            if sids.is_empty() {
-                last_miss_detail = Some(format!(
-                    "SketchStore has no policy for metric `{}` satisfying \
-                     capability {:?} — failing over to archive",
-                    candidate.metric_name, candidate.required_capability,
-                ));
-                continue;
-            }
-
-            let required: crate::storage_engines::sketch_db::index::Capability =
-                candidate.required_capability.clone();
-            let mut hit_sids: Vec<u64> = Vec::with_capacity(sids.len());
-            for sid in &sids {
-                // P2-2: borrow the metadata under the read lock to test
-                // capability satisfaction — no per-candidate deep clone
-                // of `SketchInstanceMetadata` (String + BTreeSet<String>
-                // + AggKind) just to inspect one field.
-                let satisfied = idx
-                    .with_instance(*sid, |m| {
-                        m.capability
-                            .as_ref()
-                            .map(|cap| required.is_satisfied_by(cap))
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if satisfied {
-                    hit_sids.push(*sid);
-                }
-            }
-            if hit_sids.is_empty() {
-                last_miss_detail = Some(format!(
-                    "SketchStore has no sid satisfying capability {:?} for \
-                     metric `{}` — failing over to archive",
-                    candidate.required_capability, candidate.metric_name
-                ));
-                continue;
-            }
-
-            // Serve this candidate from `SummaryExecutor` (see
-            // `live_serve.rs`) — the sole sketch-serving path now that
-            // the legacy `SketchReducer` fallback is retired (it's "also
-            // not the ground truth" per the decision to remove it
-            // alongside `shadow_compare.rs`; see
-            // `control_plane/docs/design-target-architecture.md`). `None`
-            // covers a rate-shaped candidate (self-excludes via
-            // `LoweringSkip::RateShape`), `topk(K, sum by(...)(rate(...)))`
-            // (`LoweringSkip::NotRealized`), keyed-CMS point-estimates,
-            // and every other "can't safely serve this way" outcome —
-            // none of these are answerable via the sketch tier anymore;
-            // the caller fails over to archive.
-            let backend_plan_snap = self.backend_plan_snapshot();
-            let live_served_result =
-                crate::query_engines::asap_query_engine::live_serve::try_serve_from_summary_executor(
-                    idx, query, start_ms, end_ms, false, backend_plan_snap.as_deref(),
-                );
-            let result = match live_served_result {
-                Some(result) => result,
-                None => {
-                    last_miss_detail = Some(format!(
-                        "SketchStore's SummaryExecutor could not serve `{query}` over \
-                         [{start_ms}, {end_ms}] — failing over to archive"
-                    ));
-                    continue;
-                }
-            };
-            // No outer-aggregation fold here (issue #296's range-query
-            // fix): every `result` now comes from `SummaryExecutor`
-            // (`live_served_result` above), and `bind_query_expr`'s
-            // lowering already realizes the full aggregation (including
-            // any `by (...)`) into the `SummaryNode` it executed — re-folding
-            // here would double-apply it.
-            combined_result = Some(result);
-        }
-
-        let result = combined_result.ok_or_else(|| {
-            crate::query_engines::EngineError::capability_miss(
-                crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                last_miss_detail.unwrap_or_else(|| {
-                    format!("SketchStore reducer produced no result for `{query}`")
-                }),
+        let backend_plan_snap = self.backend_plan_snapshot();
+        let result =
+            crate::query_engines::asap_query_engine::live_serve::serve_from_summary_executor(
+                idx,
+                query,
+                start_ms,
+                end_ms,
+                false,
+                control_plane::types_v2::AccuracyTarget::Epsilon(0.01),
+                backend_plan_snap.as_deref(),
             )
-        })?;
+            .map_err(|reason| {
+                if let Some(req) = Self::requirements_from_query_str(query) {
+                    crate::drivers::control_plane_client::spawn_capability_miss_notify(
+                        &self.control_plane_client,
+                        &req,
+                    );
+                }
+                crate::query_engines::EngineError::capability_miss(
+                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
+                    format!(
+                        "post-ASAP/BackendPlan resolver could not serve `{query}` over \
+                     [{start_ms}, {end_ms}]: {reason:?} — failing over to archive"
+                    ),
+                )
+            })?;
 
         // Matrix shape — the range_query wire format requires it.
         let warm_qr = asap_tier_result_to_query_result(result.clone(), end_ms, true);
@@ -530,95 +389,6 @@ impl ASAPQueryEngine {
 // translated to `EngineError::CapabilityMiss` so the router can fall through
 // to the next compatible backend.
 // ---------------------------------------------------------------------------
-
-/// Fold the inner reducer's per-row [`ASAPTierResult`] into one row per
-/// `by`-group, using the analyzer-typed
-/// [`control_plane::asap_tier_analysis::OuterAgg`] operator
-/// (`max`/`min`/`avg`/`count`/`group`/`stddev`/`stdvar`). Closes
-/// [#296](https://github.com/ProjectASAP/ASAPQuery-backend/issues/296)
-/// — the asap engine now composes outer aggregation operators on top
-/// of inner function results (sketch + accumulator alike).
-///
-/// Semantics — one pass over the inner result's rows:
-/// 1. Project each row's label map onto the `OuterAgg.by_labels()` set.
-///    Labels not in the by-set are dropped; missing keys are dropped
-///    silently (the by-projection treats absent keys as empty strings
-///    only when the by-set is empty, in which case all rows collapse
-///    into one no-label group — matching PromQL `<op>()` without `by`).
-/// 2. Group rows by their projected label map.
-/// 3. For each group, walk the rows' (timestamp, value) samples,
-///    bucketed by timestamp, and apply the operator's
-///    [`OuterAgg::fold`] across the values present at that timestamp.
-///    Timestamps unique to one row contribute that row's value alone
-///    (identity case: fold([v]) == v for max/min/avg, fold([v]) == 1
-///    for count/group).
-///
-/// Identity / no-op case for asap's per-zone sketches:
-/// `max by (zone) (quantile_over_time(...))` — the inner reducer
-/// emits one row per zone already; each `by`-group has exactly one
-/// row, the fold returns that row's value unchanged, and the result
-/// shape mirrors the inner-only query. The general fold handles this
-/// without a special case.
-///
-/// Coverage is preserved from the inner result — the fold doesn't
-/// change which time-range the underlying sids covered.
-/// Effective sketch function-name for a candidate.
-///
-/// Only [`effective_is_cumulative`] below still consumes this — it needs
-/// a canonical function name to tell `*_over_time` rollups apart from
-/// per-window shapes. The analyzer's `trace.function` is usually that
-/// name (`quantile_over_time`, `cardinality_estimate`, …), BUT for an
-/// outer-aggregation idiom whose inner is a BARE selector — e.g.
-/// `count(metric)` (the HLL distinct-count idiom) — `trace_from_promql`
-/// unwraps the outer `count` into `outer_agg` and then walks the inner
-/// bare selector, which carries no function name. The trace's `function`
-/// is then EMPTY.
-///
-/// When `function` is empty we fall back to a canonical name derived
-/// from the analyzer's typed `required_capability` (the load-bearing
-/// signal), so `count(hll_metric)` dispatches to the Cardinality family
-/// and `quantile(...)` to the Quantile family even when the AST walk
-/// couldn't recover a string. Non-empty function names pass through
-/// unchanged so existing aliases keep their exact semantics.
-fn effective_sketch_function(
-    candidate: &control_plane::asap_tier_analysis::ASAPTierCandidate,
-) -> &str {
-    if !candidate.function.is_empty() {
-        return &candidate.function;
-    }
-    use crate::storage_engines::sketch_db::index::Capability;
-    match &candidate.required_capability {
-        Capability::QuantileApprox(_) => "quantile",
-        Capability::CardinalityApprox => "cardinality_estimate",
-        Capability::FrequencyTopk(_) => "topk",
-        Capability::FrequencyEstimate(_) => "frequency",
-        // ExactAgg never reaches the sketch `evaluate` path (handled by
-        // the ExactAgg dispatch branch), but return a benign default so
-        // a stray ExactAgg still surfaces as UnsupportedFunction rather
-        // than silently mis-dispatching.
-        Capability::ExactAgg(_) => "",
-    }
-}
-
-/// Whether `SummaryExecutor` should evaluate the candidate in CUMULATIVE
-/// (`*_over_time` rollup → one scalar over `[t0,t1]`) vs per-window mode
-/// — passed straight through to `try_serve_from_summary_executor`'s
-/// `is_cumulative` argument. Computed from the candidate's original
-/// PromQL function name via [`effective_sketch_function`] above.
-fn effective_is_cumulative(
-    candidate: &control_plane::asap_tier_analysis::ASAPTierCandidate,
-) -> bool {
-    use crate::storage_engines::sketch_db::index::Capability;
-    use control_plane::asap_tier_analysis::OuterAgg;
-
-    matches!(
-        effective_sketch_function(candidate),
-        "quantile_over_time" | "count_distinct_over_time" | "topk_over_time"
-    ) || matches!(
-        (&candidate.required_capability, &candidate.outer_agg),
-        (Capability::CardinalityApprox, OuterAgg::Count(_))
-    )
-}
 
 /// Adapt a [`crate::storage_engines::sketch_db::query::ASAPTierResult`] to the engine's
 /// existing `QueryResult` shape. The reducer hands back per-series
@@ -705,7 +475,7 @@ fn asap_tier_result_to_query_result(
 
     // Instant-query result-shape: the Prometheus adapter's
     // `format_success_response` rejects `Matrix` for queries the
-    // analyzer marked as instant (`range_seconds == 0`) — produces a
+    // request identifies as instant — produces a
     // 500 ”shape mismatch”. Project the per-series last sample into
     // an `InstantVectorElement` and wrap as `Vector` so the wire
     // response carries `resultType: vector` matching the request.
@@ -771,489 +541,49 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         query: &str,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
-        // Phase 9 controller-unification (2026-05) — the ASAP-tier
-        // hook is now a thin driver around the control plane's
-        // `analyze_promql_for_asap_tier`. The analyzer is the single
-        // owner of "is this PromQL ASAP-tier-answerable" knowledge.
-        // We drop into one of three branches:
-        //
-        // 1. `ASAPTierAnalysis::unsupported` is `Some(_)` — the
-        //    PromQL shape isn't ASAP-tier-servable. Surface as
-        //    `EngineError::CapabilityMiss(SketchStore, …)` with the
-        //    structured `UnsupportedReason` in the detail string. The
-        //    EngineRouter fails over to the archive engine. This
-        //    covers all of:
-        //      * `MissReason::UnsupportedFunction(_)` (rate, irate,
-        //        increase, etc.) → cold tier (archive)
-        //      * `MissReason::UnsupportedComposition(_)` (sum-by,
-        //        topk-over-rate, etc.) → cold tier
-        //      * `MissReason::NoCallNodeFound` (bare selector) →
-        //        cold tier (archive answers raw selectors)
-        //      * `MissReason::UnparseablePromql(_)` → cold tier
-        //        (archive's parser may be more permissive, or it'll
-        //        also reject and the user sees the error)
-        //
-        // 2. `ASAPTierAnalysis::candidates` is populated, but ANY
-        //    candidate's `instances_matching` returns empty OR a
-        //    sid that classifies as `Ghost`/`Unknown` — surface
-        //    as CapabilityMiss. The EngineRouter falls over.
-        //
-        // 3. All candidates resolve to all-`Hit` sids — dispatch
-        //    each to the per-`Capability` sketch reducer. Today's
-        //    semantic: ANY candidate-level reducer error → fall
-        //    over to archive (no per-candidate hybrid stitch yet —
-        //    that's the documented follow-up).
+        // One authoritative warm path: ASAPPlanner post-ASAP DAG →
+        // BackendPlan/materialization resolver → SID lookup → DAG executor.
+        // A typed resolver/executor error becomes CapabilityMiss, which lets
+        // EngineRouter continue to the archive backend.
         if let Some(idx) = self.sketch_index.as_ref() {
-            let analysis = control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
-
-            // `topk(K, sum by (gbk) (rate(metric[r])))` no longer has an
-            // engine-side fallback: it was only reachable via the
-            // retired `SketchReducer` (`try_topk_over_rate_fallback`,
-            // removed alongside `sketch_reducer.rs`). `SummaryExecutor`
-            // self-excludes this shape (`LoweringSkip::NotRealized`), so
-            // it now falls straight through to archive via the
-            // capability-miss path below, same as any other unsupported
-            // shape.
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-
-            // Branch 1 — the control plane analyzer rejects the shape.
-            if let Some(reason) = &analysis.unsupported {
-                return Err(crate::query_engines::EngineError::capability_miss(
-                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                    format!(
-                        "SketchStore analyzer rejected `{query}`: {reason:?} — \
-                         failing over to archive"
-                    ),
-                ));
-            }
-            if analysis.candidates.is_empty() {
-                // Defensive — `is_asap_tier_answerable` would have
-                // caught this; analyzer guarantees `unsupported.is_some()`
-                // when `candidates.is_empty()` but we keep the
-                // belt-and-braces miss-path for safety.
-                return Err(crate::query_engines::EngineError::capability_miss(
-                    crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                    format!(
-                        "SketchStore analyzer produced no ASAP-tier candidates for \
-                         `{query}` — failing over to archive"
-                    ),
-                ));
-            }
-
-            // Branch 2 + 3 — resolve each candidate's sids and
-            // dispatch the reducer. Today this is single-candidate
-            // for every supported PromQL shape; the loop is here
-            // for the per-candidate hybrid-stitch follow-up.
-            // `now_ms` is captured above (also used by the
-            // topk-over-rate fallback).
-            // Time bounds: the trait's `execute(&str)` adapter
-            // doesn't carry an explicit range today (it's an
-            // instant-query surface). For each candidate, prefer the
-            // candidate's `range_seconds` (extracted from `[5m]` /
-            // `[30s]` selectors); fall back to a 5-minute default
-            // for instant-vector candidates (range_seconds == 0).
-            const DEFAULT_LOOKBACK_MS: u64 = 5 * 60 * 1000;
-
-            // Multi-candidate aggregation is deferred (single-result
-            // shapes today). On the first reducer error we surface
-            // CapabilityMiss; on Ok we keep the result for the
-            // hybrid-stitch path below. (When more than one
-            // candidate is supported, a follow-up will fold
-            // per-candidate ASAPTierResults.)
-            let mut combined_result: Option<
-                crate::storage_engines::sketch_db::query::ASAPTierResult,
-            > = None;
-            let mut combined_t0: u64 = u64::MAX;
-            // Track whether ANY candidate is range-vector-shaped
-            // (`range_seconds > 0`). Drives the Vector-vs-Matrix
-            // result-shape choice in `asap_tier_result_to_query_result`
-            // below — instant queries (`count(metric)`,
-            // `quantile(...)` without `_over_time` etc.) need
-            // `QueryResult::Vector` so the Prometheus adapter's
-            // `format_success_response` wraps them as `resultType:
-            // vector`. Returning `Matrix` for an instant query
-            // produces a 500 (adapter rejects the shape mismatch).
-            let mut any_range_candidate = false;
-
-            // Snapshot the streaming config once for this query's
-            // policy lookups. Hot-reload swaps the underlying Arc; the
-            // snapshot pins one revision for the duration.
-            let streaming_snap = self.streaming_config_snapshot();
-            let routing_index = asap_types::RoutingIndex::build(streaming_snap.policy_registry());
-
-            // Resilience fix (design-target-architecture.md Part B,
-            // completing the analyzer-side fix in
-            // `asap_tier_analysis::analyze_promql_for_asap_tier`):
-            // `lower_promql` genuinely produces multiple independent
-            // candidates for composed queries (e.g. `max by (zone)
-            // (quantile_over_time(...))` -> an outer `ExactAgg(MinMax)` +
-            // an inner `QuantileApprox`), where the retired local parser
-            // fused these into one shape. This loop used to hard-fail the
-            // whole query the moment ANY candidate had no matching sid --
-            // fine when there was always exactly one candidate, wrong now
-            // that a later candidate may still answer the query. Capacity-
-            // miss points below `continue` to the next candidate instead
-            // of returning immediately; genuine reducer/decode errors
-            // (not capability misses) still fail hard, unchanged. Once
-            // one candidate succeeds, skip the rest (first-success-wins,
-            // not "last write wins" -- multi-candidate result *folding*
-            // remains explicitly deferred future work per this loop's own
-            // pre-existing comment above).
-            let mut last_miss_detail: Option<String> = None;
-            for candidate in &analysis.candidates {
-                if combined_result.is_some() {
-                    continue;
-                }
-                if candidate.range_seconds > 0 {
-                    any_range_candidate = true;
-                }
-                // Schema-retirement #5: resolve candidate → {sids} by
-                // unioning the policy-fp reverse index (fast path for
-                // ExactAgg sids minted via `ingest_precompute_for_agg_config`
-                // where `policy_fp` is set) with `instances_matching`
-                // (catalog walk that subset-matches on
-                // `group_by_keys`, covering raw sketches whose
-                // `derive_sketch_policy_fp` returned `UNSET` because
-                // the wire-attr set didn't match any streaming-config
-                // policy). The earlier policy-fp-only path returned
-                // empty for the MVP demo workload — see issue #271 /
-                // tracking #272.
-                let policy_fps = control_plane::asap_tier_analysis::find_matching_policies(
-                    &routing_index,
-                    candidate,
-                );
-                let mut sids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
-                for fp in &policy_fps {
-                    sids.extend(idx.sids_for_policy(*fp));
-                }
-                sids.extend(
-                    idx.instances_matching(&candidate.metric_name, &candidate.group_by_keys),
-                );
-                if sids.is_empty() {
-                    // Fire the capability-miss notify so the
-                    // control-plane feedback loop closes — replaces
-                    // the side-effect the now-deleted
-                    // `find_compatible_aggregation_with_miss_notify`
-                    // provided on the legacy path.
-                    let req = Self::requirements_from_candidate(candidate);
-                    crate::drivers::control_plane_client::spawn_capability_miss_notify(
-                        &self.control_plane_client,
-                        &req,
-                    );
-                    last_miss_detail = Some(format!(
-                        "SketchStore has no policy for metric `{}` \
-                         with group_by_keys ⊇ {:?} satisfying capability \
-                         {:?} — failing over to archive",
-                        candidate.metric_name,
-                        candidate.group_by_keys,
-                        candidate.required_capability,
-                    ));
-                    continue;
-                }
-
-                // Verify each sid carries the analyzer's required
-                // capability. After Step 2a there's exactly one
-                // `Capability` enum (defined in the control plane and
-                // re-exported by `sketch_index`), so no `From`
-                // conversion is needed — just clone.
-                let required: crate::storage_engines::sketch_db::index::Capability =
-                    candidate.required_capability.clone();
-                let mut hit_sids: Vec<u64> = Vec::with_capacity(sids.len());
-                // Track whether the candidate's sid set contained ONLY
-                // Ghost/Unknown sids with no usable Hit. A single
-                // metric/group-by selector legitimately resolves to a MIX
-                // of sids: freshly-minted Active sids carrying live sketch
-                // state (`Hit`) alongside retired-then-evicted or
-                // merged-away identities that no longer hold data
-                // (`Ghost`), plus stale sender-cache sids (`Unknown`). The
-                // earlier behavior aborted the whole query to CapabilityMiss
-                // on the FIRST Ghost/Unknown encountered — which, with the
-                // sid set iterated in ascending-u64 order, meant an older
-                // dataless sid masked the newer Active sketch sids that
-                // could answer. Skip non-Hit sids instead; only fail over
-                // to the archive when no Hit sid satisfies the capability
-                // (handled by the `hit_sids.is_empty()` check below, which
-                // preserves the all-ghost → CapabilityMiss contract).
-                for sid in &sids {
-                    match idx.classify(*sid) {
-                        crate::storage_engines::sketch_db::index::SidLookup::Hit => {}
-                        crate::storage_engines::sketch_db::index::SidLookup::Ghost
-                        | crate::storage_engines::sketch_db::index::SidLookup::Unknown => {
-                            continue;
-                        }
-                    }
-                    // P2-2: borrow under the read lock to test capability
-                    // satisfaction instead of deep-cloning the metadata.
-                    // Precompute-backed sids (M2.3) have `capability: None`
-                    // — the analyzer doesn't route them through this path,
-                    // but skip defensively if one slips in.
-                    let satisfied = idx
-                        .with_instance(*sid, |m| {
-                            m.capability
-                                .as_ref()
-                                .map(|cap| required.is_satisfied_by(cap))
-                                .unwrap_or(false)
-                        })
-                        .unwrap_or(false);
-                    if satisfied {
-                        hit_sids.push(*sid);
-                    }
-                }
-                // P1-1 fallback (rate over a FrequencyEstimate sid) is
-                // retired along with `sketch_reducer.rs` /
-                // `try_rate_over_frequency_fallback`: `rate(cms_metric[r])`
-                // is one of the shapes `SummaryExecutor` self-excludes, and
-                // there's no legacy reducer left to answer it from. An
-                // empty `hit_sids` here always fails over to archive.
-                if hit_sids.is_empty() {
-                    let req = Self::requirements_from_candidate(candidate);
-                    crate::drivers::control_plane_client::spawn_capability_miss_notify(
-                        &self.control_plane_client,
-                        &req,
-                    );
-                    last_miss_detail = Some(format!(
-                        "SketchStore has no sid satisfying capability \
-                         {:?} for metric `{}` — failing over to archive",
-                        candidate.required_capability, candidate.metric_name
-                    ));
-                    continue;
-                }
-
-                // P2-6 (safe-miss for keyed CMS frequency). A
-                // `FrequencyEstimate` sid (CMS / CountSketch) answers only
-                // the per-window TOTAL across all items — it has no
-                // string-keyed point estimate yet. So a KEYED query like
-                // `cms_metric{item="X"}` would silently get the bucket
-                // TOTAL (every item's inserts), not item X's frequency —
-                // a wrong answer that never fails over. Detect the case
-                // and capability-miss to archive instead (which CAN answer
-                // the per-item query). The trigger is a NON-EMPTY
-                // candidate spatial filter that is NOT already baked into
-                // any matched sid's registered filter: a filter-distinct
-                // CMS policy registers its sid WITH that filter (the sketch
-                // is pre-filtered, so the total IS correct for it) and is
-                // left alone; the bare `count_over_time(cms[r])` demo has
-                // an empty filter and is unaffected.
-                //
-                // The Phase 2b per-item `estimate(key)` path that used to
-                // avoid this safe-miss for a resolved item-label key is
-                // retired along with `sketch_reducer.rs` (that resolution
-                // only fed `reducer.evaluate_for_capability`'s
-                // `item_key` argument) — every keyed FrequencyEstimate
-                // selector now safe-misses unconditionally and fails over
-                // to archive, which can answer the per-item query exactly.
-                if matches!(
-                    &candidate.required_capability,
-                    crate::storage_engines::sketch_db::index::Capability::FrequencyEstimate(_)
-                ) && !candidate.spatial_filter_canonical.is_empty()
-                {
-                    let filter_baked_into_a_hit = hit_sids.iter().any(|sid| {
-                        idx.with_instance(*sid, |m| match &m.agg_kind {
-                            crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                                spatial_filter_canonical,
-                                ..
-                            } => *spatial_filter_canonical == candidate.spatial_filter_canonical,
-                            _ => false,
-                        })
-                        .unwrap_or(false)
-                    });
-                    if !filter_baked_into_a_hit {
-                        let req = Self::requirements_from_candidate(candidate);
+            let backend_plan = self.backend_plan_snapshot();
+            let (result, t0_ms) =
+                crate::query_engines::asap_query_engine::live_serve::serve_instant_from_summary_executor(
+                    idx, query, now_ms, backend_plan.as_deref(),
+                )
+                .map_err(|reason| {
+                    if let Some(req) = Self::requirements_from_query_str(query) {
                         crate::drivers::control_plane_client::spawn_capability_miss_notify(
                             &self.control_plane_client,
                             &req,
                         );
-                        last_miss_detail = Some(format!(
-                            "SketchStore FrequencyEstimate sid for metric `{}` cannot \
-                             answer the per-item selector `{}` (CMS/CountSketch return \
-                             the per-window bucket TOTAL, not a string-keyed estimate) — \
-                             failing over to archive rather than returning a misleading \
-                             total",
-                            candidate.metric_name, candidate.spatial_filter_canonical
-                        ));
-                        continue;
                     }
-                }
-
-                // Counter-function dispatch (issue #301). The four
-                // PromQL counter idioms all lower to
-                // `Capability::ExactAgg(Sum)`; the analyzer's typed
-                // `candidate.outer_fn` carries the function distinction
-                // that the engine MUST honor (otherwise sum /
-                // sum_over_time / increase / rate collapse to the same
-                // wrong number — the bug this fix closes).
-                //
-                //   Rate        → evaluate_exact_agg_rate over `[t-r, t]`
-                //                 (Σ deltas ÷ min(r, coverage)).
-                //   Increase    → evaluate_exact_agg(accumulate) over
-                //                 `[t-r, t]` → Σ deltas, one number.
-                //   Plain (sum) → evaluate_exact_agg(accumulate) over the
-                //                 FULL storage horizon (`t0 = 0`) →
-                //                 cumulative-since-storage-start, the
-                //                 PromQL semantic for an instant counter
-                //                 sum. (Not the most-recent window's
-                //                 delta — Layer 3 of #301.)
-                //   SumOverTime → capability-miss → archive (asap stores
-                //                 deltas and cannot reconstruct the
-                //                 Σ-of-cumulative-samples that
-                //                 sum_over_time wants — issue #301
-                //                 decision (a)).
-                //
-                // `range_seconds` is lifted by the analyzer from the
-                // matrix selector (`[5m]` → 300); 0 for instant shapes.
-                use control_plane::asap_tier_analysis::OuterFn;
-                let is_exact_sum_family = matches!(
-                    &candidate.required_capability,
-                    crate::storage_engines::sketch_db::index::Capability::ExactAgg(
-                        crate::storage_engines::sketch_db::data::AggregationType::Sum
-                            | crate::storage_engines::sketch_db::data::AggregationType::MultipleSum
-                            | crate::storage_engines::sketch_db::data::AggregationType::Increase
-                            | crate::storage_engines::sketch_db::data::AggregationType::MultipleIncrease
+                    crate::query_engines::EngineError::capability_miss(
+                        crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
+                        format!(
+                            "post-ASAP/BackendPlan resolver could not serve `{query}`: \n                             {reason:?} — failing over to archive"
+                        ),
                     )
-                );
+                })?;
 
-                // sum_over_time over a counter sid → refuse (route to
-                // archive) rather than fabricate a wrong delta-sum.
-                if is_exact_sum_family && candidate.outer_fn == OuterFn::SumOverTime {
-                    let req = Self::requirements_from_candidate(candidate);
-                    crate::drivers::control_plane_client::spawn_capability_miss_notify(
-                        &self.control_plane_client,
-                        &req,
-                    );
-                    last_miss_detail = Some(format!(
-                        "SketchStore cannot answer `sum_over_time` over counter \
-                         deltas for metric `{}` (issue #301: Σ-of-cumulative-samples \
-                         not reconstructable from per-window deltas) — failing over \
-                         to archive",
-                        candidate.metric_name
-                    ));
-                    continue;
-                }
-
-                // Instant `Plain` sum reads the FULL storage horizon so it
-                // returns cumulative-since-start; `Increase`/`Rate` clip to
-                // the requested `[t-r, t]` (lookback_ms below).
-                let plain_instant_sum = is_exact_sum_family
-                    && candidate.outer_fn == OuterFn::Plain
-                    && candidate.range_seconds == 0;
-
-                let lookback_ms = if candidate.range_seconds > 0 {
-                    candidate.range_seconds.saturating_mul(1000)
-                } else {
-                    DEFAULT_LOOKBACK_MS
-                };
-                let t0_ms = if plain_instant_sum {
-                    0
-                } else {
-                    now_ms.saturating_sub(lookback_ms)
-                };
-                if t0_ms < combined_t0 {
-                    combined_t0 = t0_ms;
-                }
-
-                // Serve this candidate from `SummaryExecutor` (see
-                // `live_serve.rs`) — the sole sketch-serving path now
-                // that the legacy `SketchReducer` fallback is retired.
-                // `None` covers a rate-shaped candidate (self-excludes
-                // via `LoweringSkip::RateShape`), the global-HLL-rollup
-                // and keyed-CMS shapes the legacy reducer used to special-
-                // case (both now resolved/excluded upstream — see
-                // `live_serve_hll_global_count_merges_across_sids` for the
-                // former), and every other "can't safely serve this way"
-                // outcome — the caller fails over to archive.
-                let backend_plan_snap = self.backend_plan_snapshot();
-                let live_served_result =
-                    crate::query_engines::asap_query_engine::live_serve::try_serve_from_summary_executor(
-                        idx,
-                        query,
-                        t0_ms,
-                        now_ms,
-                        effective_is_cumulative(candidate),
-                        backend_plan_snap.as_deref(),
-                    );
-                let result = match live_served_result {
-                    Some(r) => r,
-                    None => {
-                        let req = Self::requirements_from_candidate(candidate);
-                        crate::drivers::control_plane_client::spawn_capability_miss_notify(
-                            &self.control_plane_client,
-                            &req,
-                        );
-                        last_miss_detail = Some(format!(
-                            "SketchStore's SummaryExecutor could not serve `{query}` \
-                             for metric `{}` — failing over to archive",
-                            candidate.metric_name
-                        ));
-                        continue;
-                    }
-                };
-                // No outer-aggregation fold here (issue #296): every
-                // `result` now comes from `SummaryExecutor` above, and
-                // `bind_query_expr`'s lowering already realizes the full
-                // aggregation (including any `by (...)`) into the
-                // `SummaryNode` it executed — re-folding here would
-                // double-apply it.
-                combined_result = Some(result);
-            }
-
-            // All candidates resolved successfully — adapt to
-            // QueryResult and run the hybrid-stitch path if archive
-            // is wired and warm coverage is narrower than request.
-            if let Some(result) = combined_result {
-                // `execute(&str)` is the instant-query trait surface —
-                // it's only called from `/api/v1/query` (never from
-                // `/api/v1/query_range`, which has its own
-                // `handle_range_query_promql` path). For PromQL,
-                // instant queries always return a vector: even when
-                // the inner expression carries a range selector like
-                // `count_over_time(metric[10s])`, the outer evaluation
-                // at time `t` yields one value per series (computed
-                // over `[t-range, t]`). So this site always wants
-                // Vector — `any_range_candidate` was the wrong signal
-                // (it captures the inner range, not the outer eval
-                // shape) and produced Matrix for instant queries
-                // with range-bound inners, which the Prometheus
-                // adapter's `format_success_response` rejects with
-                // a 500 ”shape mismatch” / empty-body response.
-                let _ = any_range_candidate;
-                let stitch_t0 = if combined_t0 == u64::MAX {
-                    now_ms.saturating_sub(DEFAULT_LOOKBACK_MS)
-                } else {
-                    combined_t0
-                };
-                let warm_qr = asap_tier_result_to_query_result(result.clone(), now_ms, false);
-                if let (Some((cov_lo, cov_hi)), Some(archive)) =
-                    (result.coverage, self.archive_engine.as_ref())
-                {
-                    if cov_lo > stitch_t0 || cov_hi < now_ms {
-                        let archive_qr = archive.execute(query).await;
-                        if let Ok(archive_qr) = archive_qr {
-                            return Ok(stitch_warm_and_archive(
-                                warm_qr, archive_qr, cov_lo, cov_hi,
-                            ));
-                        }
-                        // On archive error, fall back to warm-only.
+            let warm_qr = asap_tier_result_to_query_result(result.clone(), now_ms, false);
+            if let (Some((cov_lo, cov_hi)), Some(archive)) =
+                (result.coverage, self.archive_engine.as_ref())
+            {
+                if cov_lo > t0_ms || cov_hi < now_ms {
+                    if let Ok(archive_qr) = archive.execute(query).await {
+                        return Ok(stitch_warm_and_archive(warm_qr, archive_qr, cov_lo, cov_hi));
                     }
                 }
-                return Ok(warm_qr);
             }
-            // Every candidate the analyzer produced was skipped above
-            // (resilience fix, design-target-architecture.md Part B) --
-            // none of them had a servable sid/reducer path. Surface the
-            // last-recorded miss reason rather than falling through to
-            // the unrelated no-sketch-index branch below.
-            return Err(crate::query_engines::EngineError::capability_miss(
-                crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
-                last_miss_detail.unwrap_or_else(|| {
-                    format!("SketchStore found no servable candidate for `{query}`")
-                }),
-            ));
+            return Ok(warm_qr);
         }
 
-        // CRITICAL #4: no-sketch-index fallback. The legacy
+        // No-sketch-index fallback. The legacy
         // `handle_query` path used to live here and provide the
         // capability-miss notify side-effect through
         // `find_compatible_aggregation_with_miss_notify`. With legacy
@@ -2026,7 +1356,7 @@ mod asap_tier_classify_tests {
                 assert!(
                     detail.contains("ExactAgg(Sum)")
                         || detail.contains("no policy")
-                        || detail.contains("NoCallNodeFound"),
+                        || detail.contains("NotRealized"),
                     "expected a capability-miss fall-over to archive: {detail}"
                 );
             }
@@ -2097,9 +1427,8 @@ mod asap_tier_classify_tests {
 
     /// `sum by (zone) (http_requests_total)` end-to-end via the
     /// `execute(&str)` adapter. Mirrors the MVP smoke test's Axis-C
-    /// failure: the control plane's analyzer minted ExactAgg(Sum)
-    /// sids for `http_requests_total` (one per zone), the engine
-    /// resolved them via `instances_matching`, but the reducer
+    /// failure: ExactAgg(Sum) sids existed for `http_requests_total`
+    /// (one per zone), but the old reducer
     /// returned `UnsupportedFunction("sum")` because
     /// `SketchReducer::evaluate` only knows sketch-backed query
     /// families. This test pins the ExactAgg dispatch branch added
@@ -2283,14 +1612,9 @@ mod asap_tier_classify_tests {
     /// REGRESSION of the HLL `count(metric)` "No result" e2e failure
     /// (`controller_plan_to_query_full_roundtrip_hll`) isolated to the
     /// engine layer. `count(unique_users_per_min)` is the distinct-count
-    /// idiom: the analyzer lifts the outer `count` into `outer_agg=Count`
-    /// AND `required_capability=CardinalityApprox`, and the bare-selector
-    /// inner leaves the trace `function` EMPTY. Before the fix the engine
-    /// passed the empty function to the reducer (→ `UnsupportedFunction`)
-    /// AND re-applied the `Count` fold (→ row-count 1.0). The fix derives
-    /// the reducer family from the capability and suppresses the
-    /// already-consumed `Count` fold, so the HLL distinct-count is
-    /// returned directly. A single FULL HLL frame (~500 users) is used so
+    /// idiom. The Planner DAG represents this as a cardinality readout,
+    /// so the executor returns the HLL distinct-count directly. A single
+    /// FULL HLL frame (~500 users) is used so
     /// the instant projection reads the real estimate.
     #[tokio::test]
     async fn execute_count_hll_returns_cardinality_not_rowcount() {
@@ -2628,8 +1952,8 @@ mod asap_tier_classify_tests {
     }
 
     /// `rate(http_requests_total[5m])` end-to-end via `execute(&str)`.
-    /// The analyzer hands the engine `Capability::ExactAgg(Sum)` with
-    /// `sketch_reducer.rs` retirement: bare `rate(...)` is one of the
+    /// The Planner input marks the inner aggregate as `AggIntent::Rate`;
+    /// bare `rate(...)` is one of the
     /// shapes `SummaryExecutor` self-excludes before ever binding
     /// (`LoweringSkip::RateShape` -- it has no rate-division logic), and
     /// there's no legacy reducer left to fall through to. This test used
@@ -2703,7 +2027,7 @@ mod asap_tier_classify_tests {
     /// but its PromQL semantic (Σ of CUMULATIVE sample values in `[r]`,
     /// a quadratic) CANNOT be reconstructed from the per-window deltas
     /// asap stores. Rather than fabricate a wrong number, the engine
-    /// reads the analyzer's typed `OuterFn::SumOverTime` and returns a
+    /// recognizes exact Sum over a Planner `TimeRange` and returns a
     /// capability-miss so the query routes to the archive tier. Before
     /// #301 this returned the delta-sum (1500 here) — a wrong answer the
     /// caller couldn't distinguish from a correct one.
@@ -2916,90 +2240,10 @@ mod asap_tier_classify_tests {
         );
     }
 
-    /// Regression: the engine's rate-vs-plain dispatch decision MUST
-    /// be made off the analyzer's typed `ASAPTierCandidate.outer_fn`
-    /// field, NOT by re-parsing the raw PromQL query string. This test
-    /// fabricates an analyzer-shaped candidate by name (no raw PromQL
-    /// in scope) and asserts the `OuterFn` enum values the engine
-    /// reads off it. If the engine ever re-introduces a
-    /// `query_contains_rate_call`-style raw-string re-parse this test
-    /// continues to pass — but the deletion of the string helper +
-    /// this typed contract is what guards against the regression in
-    /// the first place.
-    #[test]
-    fn analyzer_candidate_outer_fn_distinguishes_rate_from_sum_over_time() {
-        use crate::storage_engines::sketch_db::data::AggregationType;
-        use crate::storage_engines::sketch_db::index::Capability;
-        use control_plane::asap_tier_analysis::{analyze_promql_for_asap_tier, OuterFn};
-        let rate = analyze_promql_for_asap_tier("rate(http_requests_total[5m])");
-        let sot = analyze_promql_for_asap_tier("sum_over_time(http_requests_total[5m])");
-        let sum_by_rate =
-            analyze_promql_for_asap_tier("sum by (zone) (rate(http_requests_total[5m]))");
-        // L1 adoption (design-target-architecture.md Part B), accepted
-        // behavior change: a bare selector no longer lowers to an
-        // implicit `Aggregate { Sum }` (see control_plane's
-        // `asap_tier_analysis::bare_selector_is_no_longer_asap_tier_answerable`),
-        // so it's no longer part of this test's comparison set.
-        let bare = analyze_promql_for_asap_tier("http_requests_total");
-
-        assert!(rate.unsupported.is_none() && !rate.candidates.is_empty());
-        assert!(sot.unsupported.is_none() && !sot.candidates.is_empty());
-        assert!(sum_by_rate.unsupported.is_none() && !sum_by_rate.candidates.is_empty());
-        assert!(bare.candidates.is_empty(), "{bare:?}");
-
-        // Whichever query has a `rate(...)` call ANYWHERE in its tree
-        // (bare `rate(...)` or composed `sum by (...) (rate(...))`) binds
-        // to `AggIntent::Rate` and now maps to `ExactAgg(Increase)` --
-        // matching `asap_aware_mapping::boundary::implementation_for`'s
-        // `SummaryKind::Rate` (ASAPController models Rate as its own
-        // summary family; see `capability_for`'s module doc and
-        // `Capability::is_satisfied_by`'s `sum_satisfies_increase` for
-        // why a Sum-registered sid still answers it). This is a real,
-        // intentional behavior change from the Phase 2 semantic retarget
-        // (Rate/Increase used to collapse onto AggIntent::Sum) -- not a
-        // stale assertion left over from before it. `sot` has no
-        // `rate(...)` anywhere and stays `ExactAgg(Sum)`.
-        //
-        // L1 adoption: `sum_by_rate` is now TWO candidates (the outer
-        // `sum by (zone)` reduction + the inner `rate(...)`), not one
-        // fused shape -- find the `Increase` one rather than assuming
-        // index 0.
-        assert_eq!(
-            rate.candidates[0].required_capability,
-            Capability::ExactAgg(AggregationType::Increase),
-        );
-        assert!(
-            sum_by_rate
-                .candidates
-                .iter()
-                .any(|c| c.required_capability == Capability::ExactAgg(AggregationType::Increase)),
-            "composed `sum by (...) (rate(...))` must include the same Rate \
-             AggIntent as bare `rate(...)`: {sum_by_rate:?}",
-        );
-
-        // `outer_fn` carries the counter-function distinction (#301) --
-        // shared trace context across every candidate from one analysis
-        // call, so index 0 is fine here regardless of candidate count.
-        assert_eq!(rate.candidates[0].outer_fn, OuterFn::Rate);
-        assert_eq!(sot.candidates[0].outer_fn, OuterFn::SumOverTime);
-        assert_eq!(
-            sum_by_rate.candidates[0].outer_fn,
-            OuterFn::Rate,
-            "composed `sum by (...) (rate(...))` MUST flag OuterFn::Rate \
-             even though the outer function name is `sum`"
-        );
-    }
-
     /// `sum by (zone) (rate(http_requests_total[5m]))` end-to-end.
-    /// The analyzer gives `Capability::ExactAgg(Increase)` (the inner
-    /// `rate(...)` binds the `AggIntent::Rate` `capability_for` reads;
-    /// see `analyzer_candidate_outer_fn_distinguishes_rate_from_sum_over_time`)
-    /// with `function="sum"` (outer), `range_seconds=300` (lifted from
-    /// `sketch_reducer.rs` retirement: `sum by (zone) (rate(...))`
-    /// contains an inner `rate(...)` call, so every candidate the
-    /// analyzer produces carries `outer_fn=OuterFn::Rate` -- `RateShape`
-    /// self-excludes the whole query from `SummaryExecutor` before ever
-    /// binding, with no legacy reducer left to fall through to. This
+    /// The canonical Planner input contains an inner `AggIntent::Rate`, so
+    /// the post-ASAP resolver returns `RateShape` before execution, with no
+    /// legacy reducer left to fall through to. This
     /// test used to pin the `evaluate_exact_agg_rate` composed-candidate
     /// dispatch; now it pins the accepted replacement outcome:
     /// capability-miss.
@@ -3284,8 +2528,8 @@ mod asap_tier_classify_tests {
         match result {
             Err(EngineError::CapabilityMiss { detail, .. }) => {
                 assert!(
-                    detail.contains("per-item") || detail.contains("string-keyed"),
-                    "expected the P2-6 per-item safe-miss detail, got: {detail}"
+                    detail.contains("KeyedFrequency"),
+                    "expected the Planner-DAG keyed-frequency safe-miss, got: {detail}"
                 );
             }
             other => panic!("keyed CMS frequency must fail over to archive (P2-6), got {other:?}"),

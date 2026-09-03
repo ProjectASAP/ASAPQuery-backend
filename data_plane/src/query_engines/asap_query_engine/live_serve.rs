@@ -20,7 +20,10 @@
 
 use control_plane::types_v2::AccuracyTarget;
 
-use crate::query_engines::asap_query_engine::post_asap_readout::execute_post_asap_readout;
+use crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip;
+use crate::query_engines::asap_query_engine::post_asap_readout::{
+    execute_post_asap_instant, execute_post_asap_readout,
+};
 use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::sketch_db::query::ASAPTierResult;
 
@@ -79,7 +82,7 @@ pub fn try_serve_from_summary_executor(
         return None;
     }
 
-    let outcome = match execute_post_asap_readout(
+    serve_from_summary_executor(
         index,
         query,
         t0_ms,
@@ -87,23 +90,64 @@ pub fn try_serve_from_summary_executor(
         is_cumulative,
         LIVE_ACCURACY,
         backend_plan,
-    ) {
-        Ok(outcome) => outcome,
-        Err(skip) => {
-            tracing::debug!(
-                query,
-                ?skip,
-                "live: query not servable from SummaryExecutor, falling back"
-            );
-            return None;
-        }
-    };
+    )
+    .map_err(|skip| {
+        tracing::debug!(
+            query,
+            ?skip,
+            "live: query not servable from SummaryExecutor, falling back"
+        );
+    })
+    .ok()
+}
+
+pub fn serve_from_summary_executor(
+    index: &SketchStore,
+    query: &str,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+    accuracy: AccuracyTarget,
+    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
+) -> Result<ASAPTierResult, LoweringSkip> {
+    if !summary_executor_live_enabled() {
+        return Err(LoweringSkip::Disabled);
+    }
+    let outcome = execute_post_asap_readout(
+        index,
+        query,
+        t0_ms,
+        t1_ms,
+        is_cumulative,
+        accuracy,
+        backend_plan,
+    )?;
 
     tracing::debug!(query, "live: served from SummaryExecutor");
-    Some(ASAPTierResult {
+    Ok(ASAPTierResult {
         series: outcome.series,
         coverage: outcome.coverage,
     })
+}
+
+pub fn serve_instant_from_summary_executor(
+    index: &SketchStore,
+    query: &str,
+    now_ms: u64,
+    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
+) -> Result<(ASAPTierResult, u64), LoweringSkip> {
+    if !summary_executor_live_enabled() {
+        return Err(LoweringSkip::Disabled);
+    }
+    let (outcome, t0_ms) =
+        execute_post_asap_instant(index, query, now_ms, LIVE_ACCURACY, backend_plan)?;
+    Ok((
+        ASAPTierResult {
+            series: outcome.series,
+            coverage: outcome.coverage,
+        },
+        t0_ms,
+    ))
 }
 
 #[cfg(test)]

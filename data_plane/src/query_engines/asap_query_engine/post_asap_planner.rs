@@ -44,7 +44,7 @@ use control_plane::physical::post_asap::cost_model::ObservedFamilyCostModel;
 use control_plane::physical::post_asap::{
     bind_query_expr_with_cost_model, BindingError, PhysicalExpr, PostAsapPlan,
 };
-use control_plane::physical::runtime_capability::{OuterFn, SketchKindHandle};
+use control_plane::physical::runtime_capability::SketchKindHandle;
 use control_plane::types_v2::AccuracyTarget;
 
 use crate::query_engines::asap_query_engine::summary_executor::find_metric_in_query_expr;
@@ -61,8 +61,10 @@ use crate::storage_engines::sketch_db::index::SketchStore;
 /// "log this as a problem."
 #[derive(Debug)]
 pub enum LoweringSkip {
+    /// Operational kill switch disabled warm DAG execution.
+    Disabled,
     /// `parse_query_expr_canonical` failed — same failure mode the legacy
-    /// `analyze_promql_for_asap_tier` path already tolerates.
+    /// parsing path tolerates and reports as an archive fallback reason.
     ParseFailed(String),
     /// The query contains `rate(...)`/`irate(...)` (`OuterFn::Rate`, per
     /// `control_plane::asap_tier_analysis`'s own candidate analysis).
@@ -74,6 +76,12 @@ pub enum LoweringSkip {
     /// spurious mismatch, not a real one. Must be excluded before ever
     /// calling into `control_plane`'s binder, not just deprioritized.
     RateShape,
+    /// An exact Sum materialization stores counter deltas and cannot answer
+    /// PromQL's sum-over-cumulative-samples semantics.
+    CounterSumOverTime,
+    /// The current CMS/CountSketch serving adapter cannot safely resolve a
+    /// string-keyed point lookup from the maintained state.
+    KeyedFrequency,
     /// `bind_query_expr` itself failed (a genuine `BindingError`, e.g.
     /// post-ASAP implementation/schema-derivation failure).
     Implement(String),
@@ -304,6 +312,243 @@ fn backend_plan_covers_post_asap(
     visit(plan, node)
 }
 
+fn query_expr_contains_time_range(qe: &planner_types::pre_asap::QueryExpr) -> bool {
+    use planner_types::pre_asap::QueryExpr;
+    match qe {
+        QueryExpr::TimeRange { .. } => true,
+        QueryExpr::Filter { child, .. }
+        | QueryExpr::Project { child, .. }
+        | QueryExpr::Aggregate { child, .. }
+        | QueryExpr::Dedup { child, .. }
+        | QueryExpr::Sort { child, .. }
+        | QueryExpr::Limit { child, .. }
+        | QueryExpr::PromqlSubquery { child, .. }
+        | QueryExpr::TimeShift { child, .. }
+        | QueryExpr::SQLWindowFunc { child, .. } => query_expr_contains_time_range(child),
+        QueryExpr::Concat { children } => children.iter().any(query_expr_contains_time_range),
+        QueryExpr::Join { left, right, .. }
+        | QueryExpr::SetOp { left, right, .. }
+        | QueryExpr::BinaryOp {
+            lhs: left,
+            rhs: right,
+            ..
+        } => query_expr_contains_time_range(left) || query_expr_contains_time_range(right),
+        _ => false,
+    }
+}
+
+fn query_expr_contains_rate(qe: &planner_types::pre_asap::QueryExpr) -> bool {
+    use planner_types::pre_asap::{AggIntent, QueryExpr};
+    match qe {
+        QueryExpr::Aggregate {
+            measures, child, ..
+        } => {
+            measures.iter().any(|m| matches!(m, AggIntent::Rate)) || query_expr_contains_rate(child)
+        }
+        QueryExpr::Filter { child, .. }
+        | QueryExpr::Project { child, .. }
+        | QueryExpr::Dedup { child, .. }
+        | QueryExpr::Sort { child, .. }
+        | QueryExpr::Limit { child, .. }
+        | QueryExpr::PromqlSubquery { child, .. }
+        | QueryExpr::TimeRange { child, .. }
+        | QueryExpr::TimeShift { child, .. }
+        | QueryExpr::SQLWindowFunc { child, .. } => query_expr_contains_rate(child),
+        QueryExpr::Concat { children } => children.iter().any(query_expr_contains_rate),
+        QueryExpr::Join { left, right, .. }
+        | QueryExpr::SetOp { left, right, .. }
+        | QueryExpr::BinaryOp {
+            lhs: left,
+            rhs: right,
+            ..
+        } => query_expr_contains_rate(left) || query_expr_contains_rate(right),
+        _ => false,
+    }
+}
+
+fn query_expr_has_filter(qe: &planner_types::pre_asap::QueryExpr) -> bool {
+    use planner_types::pre_asap::QueryExpr;
+    match qe {
+        QueryExpr::Scan { predicates, .. } => !predicates.is_empty(),
+        QueryExpr::Filter { .. } => true,
+        QueryExpr::Project { child, .. }
+        | QueryExpr::Aggregate { child, .. }
+        | QueryExpr::Dedup { child, .. }
+        | QueryExpr::Sort { child, .. }
+        | QueryExpr::Limit { child, .. }
+        | QueryExpr::PromqlSubquery { child, .. }
+        | QueryExpr::TimeRange { child, .. }
+        | QueryExpr::TimeShift { child, .. }
+        | QueryExpr::SQLWindowFunc { child, .. } => query_expr_has_filter(child),
+        QueryExpr::Concat { children } => children.iter().any(query_expr_has_filter),
+        QueryExpr::Join { left, right, .. }
+        | QueryExpr::SetOp { left, right, .. }
+        | QueryExpr::BinaryOp {
+            lhs: left,
+            rhs: right,
+            ..
+        } => query_expr_has_filter(left) || query_expr_has_filter(right),
+        _ => false,
+    }
+}
+
+fn query_expr_max_time_range_ms(qe: &planner_types::pre_asap::QueryExpr) -> Option<u64> {
+    use planner_types::pre_asap::QueryExpr;
+    let child_max =
+        |child: &planner_types::pre_asap::QueryExpr| query_expr_max_time_range_ms(child);
+    match qe {
+        QueryExpr::TimeRange { range, child } => {
+            Some((range.as_millis() as u64).max(child_max(child).unwrap_or_default()))
+        }
+        QueryExpr::PromqlSubquery { range, child, .. } => {
+            Some((range.as_millis() as u64).max(child_max(child).unwrap_or_default()))
+        }
+        QueryExpr::Filter { child, .. }
+        | QueryExpr::Project { child, .. }
+        | QueryExpr::Aggregate { child, .. }
+        | QueryExpr::Dedup { child, .. }
+        | QueryExpr::Sort { child, .. }
+        | QueryExpr::Limit { child, .. }
+        | QueryExpr::TimeShift { child, .. }
+        | QueryExpr::SQLWindowFunc { child, .. } => child_max(child),
+        QueryExpr::Concat { children } => children
+            .iter()
+            .filter_map(query_expr_max_time_range_ms)
+            .max(),
+        QueryExpr::Join { left, right, .. }
+        | QueryExpr::SetOp { left, right, .. }
+        | QueryExpr::BinaryOp {
+            lhs: left,
+            rhs: right,
+            ..
+        } => child_max(left).into_iter().chain(child_max(right)).max(),
+        _ => None,
+    }
+}
+
+fn summary_contains_time_range(node: &SummaryNode) -> bool {
+    match &node.expr {
+        SummaryExpr::KeepPreAsap(qe) => query_expr_contains_time_range(qe),
+        SummaryExpr::SummaryAgg { child, .. } => summary_contains_time_range(child),
+        SummaryExpr::SummaryEstimate { summary_input, .. } => {
+            summary_contains_time_range(summary_input)
+        }
+        SummaryExpr::SummaryMerge { children } => {
+            children.iter().any(|n| summary_contains_time_range(n))
+        }
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PostAsapExecutionHints {
+    pub lookback_ms: Option<u64>,
+    pub cumulative_readout: bool,
+    pub full_history: bool,
+}
+
+/// Derive execution-time window semantics from the Planner DAG rather than
+/// from a second PromQL capability analyzer.
+pub fn execution_hints(node: &SummaryNode) -> PostAsapExecutionHints {
+    use planner_types::post_asap::{ExactKind, SketchQuery, SummaryFamilyType};
+
+    fn visit(
+        node: &SummaryNode,
+        lookback_ms: &mut Option<u64>,
+        has_cardinality: &mut bool,
+        has_plain_sum: &mut bool,
+    ) {
+        match &node.expr {
+            SummaryExpr::KeepPreAsap(qe) => {
+                if let Some(range) = query_expr_max_time_range_ms(qe) {
+                    *lookback_ms = Some(lookback_ms.unwrap_or_default().max(range));
+                }
+            }
+            SummaryExpr::SummaryAgg { child, family, .. } => {
+                if matches!(family, SummaryFamilyType::ExactAggregate(ExactKind::Sum, _)) {
+                    *has_plain_sum = true;
+                }
+                visit(child, lookback_ms, has_cardinality, has_plain_sum);
+            }
+            SummaryExpr::SummaryEstimate {
+                summary_input,
+                query,
+            } => {
+                *has_cardinality |= matches!(query, SketchQuery::Cardinality);
+                visit(summary_input, lookback_ms, has_cardinality, has_plain_sum);
+            }
+            SummaryExpr::SummaryMerge { children } => {
+                for child in children {
+                    visit(child, lookback_ms, has_cardinality, has_plain_sum);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut lookback_ms = None;
+    let mut has_cardinality = false;
+    let mut has_plain_sum = false;
+    visit(
+        node,
+        &mut lookback_ms,
+        &mut has_cardinality,
+        &mut has_plain_sum,
+    );
+    PostAsapExecutionHints {
+        lookback_ms,
+        cumulative_readout: lookback_ms.is_some() || has_cardinality,
+        full_history: lookback_ms.is_none() && has_plain_sum,
+    }
+}
+
+/// Runtime support is derived from the Planner DAG itself. This replaces the
+/// former PromQL candidate analyzer gate, so unsupported semantics cannot
+/// diverge from the plan the executor will actually run.
+fn ensure_warm_runtime_support(
+    node: &SummaryNode,
+    source_has_filter: bool,
+) -> Result<(), LoweringSkip> {
+    use planner_types::post_asap::{ExactKind, SketchQuery, SummaryFamilyType};
+    match &node.expr {
+        SummaryExpr::SummaryAgg { child, family, .. } => {
+            match family {
+                SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => {
+                    return Err(LoweringSkip::RateShape)
+                }
+                SummaryFamilyType::ExactAggregate(ExactKind::Sum, _)
+                    if summary_contains_time_range(child) =>
+                {
+                    return Err(LoweringSkip::CounterSumOverTime)
+                }
+                _ => {}
+            }
+            ensure_warm_runtime_support(child, source_has_filter)
+        }
+        SummaryExpr::SummaryEstimate {
+            summary_input: _,
+            query: SketchQuery::PointCount { value: Some(_), .. },
+        } => Err(LoweringSkip::KeyedFrequency),
+        SummaryExpr::SummaryEstimate {
+            summary_input,
+            query: SketchQuery::PointCount { .. },
+        } if source_has_filter => Err(LoweringSkip::KeyedFrequency),
+        SummaryExpr::SummaryEstimate { summary_input, .. } => {
+            ensure_warm_runtime_support(summary_input, source_has_filter)
+        }
+        SummaryExpr::SummaryMerge { children } => {
+            for child in children {
+                ensure_warm_runtime_support(child, source_has_filter)?;
+            }
+            Ok(())
+        }
+        SummaryExpr::KeepPreAsap(_) => Ok(()),
+        _ => Err(LoweringSkip::NoWarmRoute(
+            "post-ASAP operator is not executable by the warm runtime".into(),
+        )),
+    }
+}
+
 /// Lower a raw PromQL query string to the `SummaryNode` tree
 /// `crate::query_engines::asap_query_engine::summary_exec::execute`/`SummaryExecutor` needs — the actual
 /// serving cutover (`live_serve.rs`). Returns `Err` for any shape serving
@@ -316,25 +561,12 @@ pub fn plan_promql_to_post_asap(
     accuracy: AccuracyTarget,
     backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<Rc<SummaryNode>, LoweringSkip> {
-    // Reuse the SAME candidate analysis `engine.rs` already runs for the
-    // legacy dispatch, rather than re-deriving rate detection via a
-    // second raw-AST walk. `OuterFn::Rate` is the one shape that binds
-    // SUCCESSFULLY today (via the Rate->Increase rewrite) but would
-    // produce a semantically wrong comparison -- see `LoweringSkip::RateShape`.
-    let analysis = control_plane::asap_tier_analysis::analyze_promql_for_asap_tier(query);
-    if analysis
-        .candidates
-        .iter()
-        .any(|c| c.outer_fn == OuterFn::Rate)
-    {
-        return Err(LoweringSkip::RateShape);
-    }
-
     let qe = control_plane::query_parser::parse_query_expr_canonical(query, accuracy.clone())
         .map_err(|e| LoweringSkip::ParseFailed(e.to_string()))?;
-    if analysis.candidates.is_empty() {
-        return Err(LoweringSkip::NotRealized);
+    if query_expr_contains_rate(&qe) {
+        return Err(LoweringSkip::RateShape);
     }
+    let source_has_filter = query_expr_has_filter(&qe);
 
     // Serving time must reproduce the REAL planning decision, not
     // independently re-derive one -- see this module's docs. Prefer
@@ -355,14 +587,20 @@ pub fn plan_promql_to_post_asap(
     });
     let cost_model = ObservedFamilyCostModel::new(accuracy, observed);
 
-    let physical = bind_query_expr_with_cost_model(&qe, &cost_model)
-        .map_err(|e: BindingError| LoweringSkip::Implement(e.to_string()))?;
+    let physical =
+        bind_query_expr_with_cost_model(&qe, &cost_model).map_err(|e: BindingError| match e {
+            BindingError::Implement(
+                control_plane::planner_selection::SelectionError::NoLegalCandidate,
+            ) => LoweringSkip::NotRealized,
+            other => LoweringSkip::Implement(other.to_string()),
+        })?;
 
     match physical {
         PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => {
             if matches!(node.expr, SummaryExpr::KeepPreAsap(_)) {
                 Err(LoweringSkip::NotRealized)
             } else {
+                ensure_warm_runtime_support(&node, source_has_filter)?;
                 if let Some(plan) = backend_plan {
                     backend_plan_covers_post_asap(plan, &node)?;
                 }
@@ -468,6 +706,37 @@ mod tests {
             "expected a real SummaryAgg/SummaryEstimate binding, got Logical (the gap \
              this module exists to avoid): {:?}",
             node.expr
+        );
+    }
+
+    #[test]
+    fn execution_hints_come_from_post_asap_dag() {
+        let idx = empty_index();
+        let ranged = plan_promql_to_post_asap(
+            &idx,
+            "quantile_over_time(0.99, latency[5m])",
+            accuracy(),
+            None,
+        )
+        .expect("quantile plan");
+        assert_eq!(
+            execution_hints(&ranged),
+            PostAsapExecutionHints {
+                lookback_ms: Some(300_000),
+                cumulative_readout: true,
+                full_history: false,
+            }
+        );
+
+        let plain_sum =
+            plan_promql_to_post_asap(&idx, "sum(requests)", accuracy(), None).expect("sum plan");
+        assert_eq!(
+            execution_hints(&plain_sum),
+            PostAsapExecutionHints {
+                lookback_ms: None,
+                cumulative_readout: false,
+                full_history: true,
+            }
         );
     }
 
