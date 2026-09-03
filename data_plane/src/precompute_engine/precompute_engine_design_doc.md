@@ -98,69 +98,21 @@ Late data handling:
                3 < 6 → YES, late → DROP (or ForwardToStore)
 ```
 
-### Cross-group watermark propagation
+### Per-group event-time watermarks
 
-Without cross-group propagation, each group tracks its own watermark
-independently. If a group stops receiving data, its watermark freezes and its
-windows never close. Cross-group propagation solves this with two layers:
+Each group tracks its own maximum observed event timestamp. Its event-time
+watermark is `max_event_time_ms - allowed_lateness_ms`. Periodic flushes never
+modify observed event time.
 
-**Layer 1 — Intra-worker (max):** Each worker computes its worker watermark as
-`max(all group watermarks)`. This represents "time has progressed to at least
-here on this worker." During each flush, idle groups are advanced to the worker
-watermark.
+A timestamp observed for one group does not advance another group. Independent
+sources can progress at different rates, so cross-group propagation can close a
+live window prematurely and turn valid input into late data. The worker-level
+watermark atomic reports the maximum group watermark for diagnostics only; it
+is not fed back into group closure.
 
-**Layer 2 — Cross-worker (min):** Each worker publishes its worker watermark to
-a shared `Arc<AtomicI64>`. The global watermark is `min(all worker watermarks)`,
-ignoring workers that have not yet started. This becomes the floor for all group
-watermarks across all workers.
-
-```
-                    ┌──────────────────────────────────────────┐
-                    │              Shared Atomics               │
-                    │  AtomicI64[0]  AtomicI64[1]  AtomicI64[2]│
-                    │     100s          80s           90s       │
-                    └──┬──────────────┬──────────────┬─────────┘
-                       │ store        │ store        │ store
-                       │ (Release)    │ (Release)    │ (Release)
-              ┌────────┴───┐  ┌───────┴────┐  ┌─────┴──────┐
-              │  Worker 0  │  │  Worker 1  │  │  Worker 2  │
-              │            │  │            │  │            │
-              │ Groups:    │  │ Groups:    │  │ Groups:    │
-              │  A: wm=100s│  │  C: wm=80s│  │  E: wm=90s│
-              │  B: wm=50s │  │  D: wm=80s│  │  F: wm=30s│
-              │            │  │            │  │            │
-              │ worker_wm  │  │ worker_wm  │  │ worker_wm  │
-              │ = max(A,B) │  │ = max(C,D) │  │ = max(E,F) │
-              │ = 100s     │  │ = 80s      │  │ = 90s      │
-              └────────────┘  └────────────┘  └────────────┘
-                       │ load all      │ load all      │ load all
-                       │ (Acquire)     │ (Acquire)     │ (Acquire)
-                       ▼               ▼               ▼
-              global_wm = min(100s, 80s, 90s) = 80s
-
-              On flush, each group's effective watermark becomes:
-                max(group_wm, global_wm) + 1ms
-
-              Worker 0: Group B (50s) → advanced to 80s → closes [50s, 80s] windows
-              Worker 2: Group F (30s) → advanced to 80s → closes [30s, 80s] windows
-```
-
-**Why max within a worker?** We want to propagate forward progress from active
-groups to idle groups on the same worker.
-
-**Why min across workers?** Conservative: only advance as far as ALL workers
-agree time has progressed. If worker 1 is behind at 80s, we should not close
-windows at 90s on worker 2 because worker 1 might still send data for those
-windows.
-
-**Staleness:** Because workers read each other's atomics during flush, the
-global watermark may be up to one `flush_interval_ms` (default 1s) stale.
-This is acceptable — it only means idle groups close windows one flush cycle
-later than they theoretically could.
-
-**Unstarted workers:** Workers that have not yet received any data remain at
-`i64::MIN` and are excluded from the global watermark min calculation. This
-prevents a cold worker from blocking the entire system.
+Idle and bounded-time closure use a separate wall-clock policy. Distributed
+completion requires an explicit source/window barrier; an unrelated group's
+timestamp is not such a barrier.
 
 ## 3. Components
 
@@ -384,15 +336,16 @@ from `active_panes`. Remaining panes are read non-destructively via
 
 ```
 1. Match series to AggregationConfigs (by metric name / spatial_filter)
-2. Insert samples into SeriesBuffer, update watermark
-3. Drop samples beyond allowed_lateness_ms behind watermark
+2. Insert samples and update maximum observed event time
+3. Compute event watermark as `max_event_time_ms - allowed_lateness_ms`
 4. For each sample × each aggregation:
    a. Compute pane_start = pane_start_for(ts)
    b. If pane was evicted (late data for closed window):
       → late_data_policy == Drop:           skip
       → late_data_policy == ForwardToStore:  create mini-accumulator, emit
    c. Else: get-or-create pane in active_panes, feed value (1 update per sample)
-5. Detect newly closed windows via closed_windows(prev_wm, current_wm)
+5. Detect newly closed windows via
+   `closed_windows(previous_closure_watermark, event_watermark)`
 6. For each closed window:
    a. Get pane starts via panes_for_window(window_start)
    b. Oldest pane: take_accumulator() + remove from active_panes (destructive)
@@ -400,7 +353,7 @@ from `active_panes`. Remaining panes are read non-destructively via
    d. Merge all pane accumulators via AggregateCore::merge_with()
    e. Emit merged result as PrecomputedOutput + AggregateCore
 7. Emit batch to OutputSink
-8. Update previous_watermark_ms
+8. Update observed event time and the separate closure watermark
 ```
 
 #### Raw mode
