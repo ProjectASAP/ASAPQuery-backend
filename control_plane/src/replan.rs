@@ -824,7 +824,7 @@ impl Replanner {
             ticker.tick().await;
             let outcome = self.repost_cumulative_backend_config().await;
             match outcome {
-                PushOutcome::BothApplied => info!(
+                PushOutcome::AllApplied => info!(
                     "periodic backend re-POST applied cumulative streaming-config + storage-routing"
                 ),
                 PushOutcome::Skipped => { /* no backend / empty cache — nothing logged each tick */
@@ -835,9 +835,11 @@ impl Replanner {
                 PushOutcome::Desynced {
                     streaming_ok,
                     routing_ok,
+                    plan_ok,
                 } => warn!(
                     streaming_ok,
                     routing_ok,
+                    plan_ok,
                     "periodic backend re-POST desynced after retries; will retry next tick"
                 ),
             }
@@ -1209,9 +1211,9 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc as StdArc;
 
-    /// Start a mock backend serving both the streaming-config and
-    /// storage-routing endpoints, returning the streaming-config URL and a
-    /// shared hit-counter for the streaming endpoint.
+    /// Start a mock backend serving the complete publication contract,
+    /// returning the streaming-config URL and a shared hit-counter for that
+    /// endpoint.
     async fn start_repost_mock() -> (String, StdArc<AtomicU32>) {
         use axum::extract::State;
         use axum::routing::post;
@@ -1229,6 +1231,10 @@ mod tests {
             )
             .route(
                 "/api/v1/storage_routing",
+                post(|_b: axum::body::Bytes| async move { axum::http::StatusCode::OK }),
+            )
+            .route(
+                "/api/v1/backend-plan",
                 post(|_b: axum::body::Bytes| async move { axum::http::StatusCode::OK }),
             )
             .with_state(StdArc::clone(&hits));
@@ -1321,7 +1327,7 @@ mod tests {
         // the full cumulative config WITHOUT any replan. The (now-restarted)
         // backend receives the streaming-config again.
         let outcome = r.repost_cumulative_backend_config().await;
-        assert_eq!(outcome, PushOutcome::BothApplied);
+        assert_eq!(outcome, PushOutcome::AllApplied);
         assert_eq!(
             hits.load(Ordering::SeqCst),
             1,
@@ -1331,7 +1337,7 @@ mod tests {
         // Idempotent: a second tick re-POSTs again (the data plane no-ops on
         // a matching config; the controller still re-sends each cycle).
         let outcome2 = r.repost_cumulative_backend_config().await;
-        assert_eq!(outcome2, PushOutcome::BothApplied);
+        assert_eq!(outcome2, PushOutcome::AllApplied);
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
