@@ -16,9 +16,9 @@ multiple storage tiers, and compile distributed physical plans. This profile
 does not remove those capabilities. It defines the target configuration required
 for ASAPQuery-compatible behavior and gives that configuration an independent
 end-to-end acceptance target. It is not yet a strict subset of the implemented
-runtime: Remote Write ingestion and in-backend workload observation must first
-be restored as optional backend components. After that work lands, selecting
-this profile is a strict configuration subset of the broader product.
+runtime because Remote Write ingestion must first be restored as an optional
+backend component. After that work lands, selecting this profile is a strict
+configuration subset of the broader product.
 
 The user-visible goal is the same drop-in shape as ASAPQuery:
 
@@ -55,20 +55,22 @@ internal types.
 - in-process streaming precompute with windowing and lateness handling;
 - an in-process summary store sufficient for the accelerated query path;
 - Prometheus-compatible instant and range query endpoints;
-- query-workload observation and canonical ASAPPlanner invocation;
+- startup-supplied `QueryWorkload` and `DataWorkload` snapshots and canonical
+  ASAPPlanner invocation;
 - backend-only physical compilation and atomic plan activation;
 - summary-backed execution with explicit Prometheus fallback; and
 - one self-contained compatibility demo and end-to-end test.
 
-### Excluded from this profile
+### Excluded from the MVP profile
 
 - ASAPCollector discovery, configuration, or plan publication;
 - `CollectorPlan`, `SDKPlan`, OpAMP, or collector activation evidence;
 - OTLP or modified-OTLP ingestion;
 - prebuilt summary ingestion from external producers;
 - source sampling, GOS, sparse delta transmission, and frame ACK protocols;
-- VictoriaMetrics Remote Write, Kafka, CSV, JSON, or other ingest connectors;
-- SQL, ClickHouse, and Elasticsearch query protocols;
+- VictoriaMetrics Remote Write, Kafka, CSV, JSON, or other ingest connectors in
+  the MVP;
+- SQL, ClickHouse, and Elasticsearch query protocols in the MVP;
 - S3, Thanos, Gorilla, or other durable/cold tiers; and
 - distributed placement or multi-producer summary merging.
 
@@ -88,10 +90,7 @@ PromQL client ──► Prometheus API ──► query router
 
 Planning path
 
-query observations + Remote Write evidence
-                    │
-                    ▼
-         QueryWorkload + DataWorkload
+configured QueryWorkload + DataWorkload
                     │
                     ▼
                ASAPPlanner
@@ -132,22 +131,27 @@ rules into ASAPQuery-backend.
 
 ### ASAPQuery-backend control plane
 
-The data-plane query endpoint emits bounded, canonical query observations
-without performing planning. The control plane:
+For the first MVP, operators provide immutable `QueryWorkload` and
+`DataWorkload` snapshots at startup. The control plane:
 
-1. aggregates those observations as one workload rather than planning each
-   request;
-2. derives data-workload evidence from Remote Write and runtime measurements;
-3. invokes ASAPPlanner with `QueryWorkload` and its `DataWorkload`;
-4. enumerates only backend-local implementations for Planner candidates;
-5. returns implementation-cost evidence needed for selection;
-6. compiles the selected candidate into matching PrecomputePlan and BackendPlan
+1. validates and loads both configured workload snapshots;
+2. invokes ASAPPlanner with the complete `QueryWorkload` and associated
+   `DataWorkload`;
+3. enumerates only backend-local implementations for Planner candidates;
+4. returns implementation-cost evidence needed for selection;
+5. compiles the selected candidate into matching PrecomputePlan and BackendPlan
    views; and
-7. stages and atomically activates those views.
+6. stages and atomically activates those views.
 
 It does not enumerate SDK or Collector placements in this profile. A Planner
 candidate that has no backend-local raw-sample implementation is unavailable;
 the control plane must not assign it an optimistic zero cost.
+
+Online query observation, data-workload estimation from Remote Write, and
+replanning may be added later. If enabled, the data-plane query endpoint emits
+bounded canonical observations and the control plane aggregates them; the
+request path never owns planning. These capabilities are not startup or MVP
+dependencies.
 
 ### Raw ingest and precompute
 
@@ -249,12 +253,11 @@ Startup is fallback-safe:
 ```text
 start backend
   -> verify Prometheus fallback health
-  -> accept Remote Write and observe queries
-  -> forward every query to Prometheus
-  -> build QueryWorkload and DataWorkload snapshot
+  -> load configured QueryWorkload and DataWorkload snapshots
   -> run Planner candidate search and selection
   -> compile PrecomputePlan + BackendPlan
   -> atomically install precompute + catalog + inactive routes under one version
+  -> accept Remote Write and forward every query to Prometheus
   -> enter Materializing state
   -> wait for complete summary coverage
   -> mark each ready materialization Serving
@@ -267,9 +270,9 @@ Precompute, store metadata, and query routing must never observe a mixture of
 old and new aggregation parameters. Until the new plan is installed and warm,
 the previous compatible route or Prometheus remains authoritative.
 
-The first MVP may plan once after a fixed observation window. Repeated
-replanning is optional, but any later implementation must preserve the same
-atomic cutover and warmup rules.
+The first MVP plans once from the startup snapshots. Runtime observation and
+repeated replanning are optional, but any later implementation must preserve the
+same atomic cutover and warmup rules.
 
 ## Relationship to the broader backend
 
@@ -306,7 +309,7 @@ Against ASAPQuery-backend
 | Streaming precompute workers and accumulators | Present | Admit raw Remote Write samples through a dedicated adapter. |
 | Hot-reload plan/store/query snapshots | Partial | Install PrecomputePlan and BackendPlan as one atomic version. |
 | Prometheus Remote Write decoder/listener | Removed from the current backend path | Restore the narrow v1 adapter from the reference behavior without restoring other legacy connectors. Preserve stale-marker semantics and retry-safe batch application. |
-| Query-workload observation | Removed from the data-plane request path | Add a bounded data-plane observer; aggregate its canonical Planner workload input in the control plane without moving planning logic into the request path. |
+| Workload input | Canonical Planner integration is present | Load deterministic `QueryWorkload` and `DataWorkload` snapshots at startup; online observation is optional after the MVP. |
 | Collector/OTLP path | Present in the broader product | Disable it in this profile; do not make it a test or startup dependency. |
 | Compatibility E2E | Missing | Add a Prometheus + backend + synthetic writer/query test and demo. |
 
@@ -316,8 +319,9 @@ Against ASAPQuery-backend
 
 Add an explicit `asapquery` profile with startup validation. It permits only
 Prometheus fallback, Remote Write ingestion, PromQL HTTP serving, backend-local
-precompute, and the warm summary store. An excluded connector or required
-Collector endpoint is a configuration error.
+precompute, the warm summary store, and configured `QueryWorkload` and
+`DataWorkload` inputs. An excluded connector or required Collector endpoint is
+a configuration error.
 
 Acceptance: the backend starts with no ASAPCollector or OTLP endpoint and all
 queries initially reach Prometheus.
@@ -335,9 +339,9 @@ overloaded requests cannot leave untracked mutations while returning success.
 
 ### Phase C: backend-only planning
 
-Collect query and data workload evidence, call the pinned ASAPPlanner, enumerate
-backend-local implementations, and compile one PrecomputePlan plus BackendPlan.
-Do not create or wait for CollectorPlan.
+Load the configured query and data workload snapshots, call the pinned
+ASAPPlanner, enumerate backend-local implementations, and compile one
+PrecomputePlan plus BackendPlan. Do not create or wait for CollectorPlan.
 
 Acceptance: captured Planner input, selected Post-ASAP candidate,
 PrecomputePlan, and BackendPlan are deterministic golden artifacts with matching
@@ -367,29 +371,44 @@ Prometheus, and fallback responses are equivalent to direct Prometheus calls.
 
 ### Phase F: compatibility demo
 
-Run Prometheus with `remote_write` configured to the backend, send a repeating
-query workload through the backend, wait for planning and warmup, and capture
-route decisions and resource measurements.
+Run Prometheus with `remote_write` configured to the backend, start the backend
+with fixed workload snapshots, send their corresponding repeating queries
+through the backend, wait for planning and warmup, and capture route decisions
+and resource measurements.
 
 Acceptance evidence includes:
 
 - Remote Write requests, samples, rejected requests, duplicates, and bytes;
-- observed queries and the exact Planner input/output artifacts;
+- configured workload snapshots and the exact Planner input/output artifacts;
 - active plan/materialization identities and activation time;
 - summary versus fallback query counts;
 - window coverage and end-to-end freshness;
 - result error against direct Prometheus; and
 - query latency, backend CPU, and backend memory before and after activation.
 
+## Post-MVP compatibility extensions
+
+The first query extension should be a SQL endpoint because ASAPQuery exposed SQL
+as an additional query surface. It must translate SQL into canonical Planner
+query semantics and reuse the same BackendPlan readiness, summary store, and
+exact-fallback rules; it must not introduce a second planner or separately
+configured materializations. Its supported SQL subset and fallback target need
+their own versioned compatibility contract and conformance cases.
+
+CSV and JSON ingestion can follow as convenience adapters. Each adapter is
+limited to parsing and validation before emitting the same canonical raw-sample
+records as Remote Write. It must not choose aggregation families or bypass the
+active PrecomputePlan. These adapters remain optional and cannot become startup
+dependencies of the Remote Write profile.
+
 ## MVP completion criterion
 
 The profile is complete when a clean checkout can run one documented command
 that starts Prometheus and ASAPQuery-backend without ASAPCollector, ingests only
-through Prometheus Remote Write, plans from the observed workload, activates a
+through Prometheus Remote Write, plans from the configured workloads, activates a
 backend-local summary, serves both the declared sum and sketch-backed quantile
 compatibility cases from complete summary windows, and transparently falls back
-for an unsupported query. The run
-must fail if ingestion, planning, activation, coverage, accuracy, or fallback
-evidence is missing.
+for an unsupported query. The run must fail if ingestion, planning, activation,
+coverage, accuracy, or fallback evidence is missing.
 
 Starting the components or exposing `/api/v1/write` alone is not completion.

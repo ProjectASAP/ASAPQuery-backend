@@ -13,4 +13,4 @@ Backend-specific operating profiles:
 - [ASAPQuery compatibility profile](asapquery-compatibility-profile.md) defines
   the smaller target configuration for Prometheus Remote Write, backend-local
   precompute, and PromQL serving without ASAPCollector. It becomes a strict
-  configuration subset after its currently missing optional adapters land.
+  configuration subset after its currently missing Remote Write adapter lands.
