@@ -11,5 +11,6 @@ internals and are subordinate to the shared system contracts.
 Backend-specific operating profiles:
 
 - [ASAPQuery compatibility profile](asapquery-compatibility-profile.md) defines
-  the smaller Prometheus Remote Write, backend-local precompute, and PromQL
-  serving subset that runs without ASAPCollector.
+  the smaller target configuration for Prometheus Remote Write, backend-local
+  precompute, and PromQL serving without ASAPCollector. It becomes a strict
+  configuration subset after its currently missing optional adapters land.
