@@ -334,26 +334,27 @@ where
             },
             SummaryExpr::SummaryMerge { children } => {
                 if children.is_empty() {
-                    return Err(QueryPlanError::UnsupportedNode(
-                        "empty summary_merge".into(),
-                    ));
+                    QueryPlanNode::ExactFallback {
+                        reason: "empty summary_merge".into(),
+                    }
+                } else {
+                    QueryPlanNode::SummaryMerge {
+                        inputs: children
+                            .iter()
+                            .map(|child| self.lower(child))
+                            .collect::<Result<_, _>>()?,
+                    }
                 }
-                QueryPlanNode::SummaryMerge {
-                    inputs: children
-                        .iter()
-                        .map(|child| self.lower(child))
-                        .collect::<Result<_, _>>()?,
-                }
             }
-            SummaryExpr::SummaryJoin { .. } => {
-                return Err(QueryPlanError::UnsupportedNode("summary_join".into()))
-            }
-            SummaryExpr::SummarySubtract { .. } => {
-                return Err(QueryPlanError::UnsupportedNode("summary_subtract".into()))
-            }
-            SummaryExpr::SummaryDelete { .. } => {
-                return Err(QueryPlanError::UnsupportedNode("summary_delete".into()))
-            }
+            SummaryExpr::SummaryJoin { .. } => QueryPlanNode::ExactFallback {
+                reason: "summary_join is not executable by the warm tier".into(),
+            },
+            SummaryExpr::SummarySubtract { .. } => QueryPlanNode::ExactFallback {
+                reason: "summary_subtract is not executable by the warm tier".into(),
+            },
+            SummaryExpr::SummaryDelete { .. } => QueryPlanNode::ExactFallback {
+                reason: "summary_delete is not executable by the warm tier".into(),
+            },
         };
         self.nodes.insert(id, physical);
         Ok(id)
