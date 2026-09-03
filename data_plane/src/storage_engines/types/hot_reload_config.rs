@@ -139,8 +139,12 @@ pub enum PhysicalPlanLifecycleError {
 #[derive(Clone)]
 pub struct PhysicalPlanLifecycle {
     active: HotReloadActivePhysicalPlan,
-    staged: Arc<std::sync::Mutex<BTreeMap<(u64, u64), ActivePhysicalPlan>>>,
-    statuses: Arc<std::sync::Mutex<BTreeMap<(u64, u64), PhysicalPlanStatus>>>,
+    state: Arc<std::sync::Mutex<PhysicalPlanLifecycleState>>,
+}
+
+struct PhysicalPlanLifecycleState {
+    staged: BTreeMap<(u64, u64), ActivePhysicalPlan>,
+    statuses: BTreeMap<(u64, u64), PhysicalPlanStatus>,
 }
 
 impl PhysicalPlanLifecycle {
@@ -158,8 +162,10 @@ impl PhysicalPlanLifecycle {
         }
         Self {
             active,
-            staged: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-            statuses: Arc::new(std::sync::Mutex::new(statuses)),
+            state: Arc::new(std::sync::Mutex::new(PhysicalPlanLifecycleState {
+                staged: BTreeMap::new(),
+                statuses,
+            })),
         }
     }
 
@@ -175,28 +181,31 @@ impl PhysicalPlanLifecycle {
             }
         }
         let active = self.active.snapshot();
-        if active.backend_plan.plan_id == key.0 && key.1 <= active.backend_plan.plan_version {
+        if active.backend_plan.plan_id != 0 && key.1 <= active.backend_plan.plan_version {
             return Err(PhysicalPlanLifecycleError::StaleVersion {
                 plan_id: key.0,
                 incoming: key.1,
                 active: active.backend_plan.plan_version,
             });
         }
-        let mut staged = self
-            .staged
+        let mut state = self
+            .state
             .lock()
-            .expect("staged physical-plan lock poisoned");
-        if staged.contains_key(&key) {
+            .expect("physical-plan lifecycle lock poisoned");
+        if state.staged.contains_key(&key)
+            || state.statuses.values().any(|status| {
+                status.plan_version == key.1 && !matches!(status.phase, PhysicalPlanPhase::Retired)
+            })
+        {
             return Err(PhysicalPlanLifecycleError::Duplicate {
                 plan_id: key.0,
                 plan_version: key.1,
             });
         }
-        self.statuses
-            .lock()
-            .expect("physical-plan status lock poisoned")
+        state
+            .statuses
             .insert(key, status_for(&plan, PhysicalPlanPhase::Staged));
-        staged.insert(key, plan);
+        state.staged.insert(key, plan);
         Ok(())
     }
 
@@ -207,11 +216,12 @@ impl PhysicalPlanLifecycle {
         now: u64,
     ) -> Result<Arc<ActivePhysicalPlan>, PhysicalPlanLifecycleError> {
         let key = (plan_id, plan_version);
-        let mut staged = self
-            .staged
+        let mut state = self
+            .state
             .lock()
-            .expect("staged physical-plan lock poisoned");
-        let plan = staged
+            .expect("physical-plan lifecycle lock poisoned");
+        let plan = state
+            .staged
             .get(&key)
             .ok_or(PhysicalPlanLifecycleError::NotStaged {
                 plan_id,
@@ -228,28 +238,37 @@ impl PhysicalPlanLifecycle {
                 return Err(PhysicalPlanLifecycleError::Expired { expiry, now });
             }
         }
-        let plan = staged.remove(&key).expect("staged plan disappeared");
-        drop(staged);
+        let current = self.active.snapshot();
+        if current.backend_plan.plan_id != 0
+            && plan.backend_plan.plan_version <= current.backend_plan.plan_version
+        {
+            return Err(PhysicalPlanLifecycleError::StaleVersion {
+                plan_id,
+                incoming: plan_version,
+                active: current.backend_plan.plan_version,
+            });
+        }
+        let plan = state.staged.remove(&key).expect("staged plan disappeared");
         let old = self.active.swap(plan.clone());
-        let mut statuses = self
-            .statuses
-            .lock()
-            .expect("physical-plan status lock poisoned");
         if old.backend_plan.plan_id != 0 {
-            if let Some(status) =
-                statuses.get_mut(&(old.backend_plan.plan_id, old.backend_plan.plan_version))
+            if let Some(status) = state
+                .statuses
+                .get_mut(&(old.backend_plan.plan_id, old.backend_plan.plan_version))
             {
                 status.phase = PhysicalPlanPhase::Draining;
             }
         }
-        statuses.insert(key, status_for(&plan, PhysicalPlanPhase::Active));
+        state
+            .statuses
+            .insert(key, status_for(&plan, PhysicalPlanPhase::Active));
         Ok(old)
     }
 
     pub fn statuses(&self) -> Vec<PhysicalPlanStatus> {
-        self.statuses
+        self.state
             .lock()
-            .expect("physical-plan status lock poisoned")
+            .expect("physical-plan lifecycle lock poisoned")
+            .statuses
             .values()
             .cloned()
             .collect()
@@ -259,9 +278,10 @@ impl PhysicalPlanLifecycle {
     /// immutable snapshot have drained.
     pub fn retire_drained(&self, plan_id: u64, plan_version: u64) {
         if let Some(status) = self
-            .statuses
+            .state
             .lock()
-            .expect("physical-plan status lock poisoned")
+            .expect("physical-plan lifecycle lock poisoned")
+            .statuses
             .get_mut(&(plan_id, plan_version))
         {
             if status.phase == PhysicalPlanPhase::Draining {
@@ -758,5 +778,28 @@ mod tests {
             lifecycle.stage(physical_plan(8, 1, 100, Some(150)), 150),
             Err(PhysicalPlanLifecycleError::Expired { .. })
         ));
+    }
+
+    #[test]
+    fn activation_rechecks_version_and_cannot_downgrade_across_plan_ids() {
+        let active = HotReloadActivePhysicalPlan::new(physical_plan(7, 1, 100, None));
+        let lifecycle = PhysicalPlanLifecycle::new(active.clone());
+        lifecycle
+            .stage(physical_plan(8, 3, 100, None), 100)
+            .unwrap();
+        lifecycle
+            .stage(physical_plan(9, 2, 100, None), 100)
+            .unwrap();
+        lifecycle.activate(8, 3, 100).unwrap();
+
+        assert!(matches!(
+            lifecycle.activate(9, 2, 100),
+            Err(PhysicalPlanLifecycleError::StaleVersion {
+                incoming: 2,
+                active: 3,
+                ..
+            })
+        ));
+        assert_eq!(active.snapshot().backend_plan.plan_version, 3);
     }
 }
