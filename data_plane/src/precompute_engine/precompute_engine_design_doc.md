@@ -146,9 +146,9 @@ pub struct PrecomputeEngineConfig {
     pub channel_buffer_size: usize,      // default: 10,000
     pub pass_raw_samples: bool,          // default: false
     pub raw_mode_aggregation_id: u64,    // default: 0
-    pub late_data_policy: LateDataPolicy, // default: Drop
+    pub late_data_policy: LateDataPolicy, // default: ForwardToStore
     pub wall_clock_idle_grace_period_ms: i64, // default: 5,000
-    pub wall_clock_max_open_grace_period_ms: i64, // default: 0 (disabled)
+    pub wall_clock_max_open_grace_period_ms: i64, // default: 5,000
 }
 
 pub enum LateDataPolicy {
@@ -162,6 +162,12 @@ without a touch. When enabled, the absolute deadline fires after
 `W + max_open_grace` from the first touch even if input remains active. These
 wall-clock decisions advance only the closure watermark; they never modify the
 maximum observed event timestamp.
+
+The absolute deadline is applied only with `ForwardToStore`: input arriving
+after a deadline close is appended as a mergeable correction for the same
+logical window. With explicit `Drop`, the absolute deadline is disabled so a
+timer cannot introduce silent loss. Both actions increment
+`asap_precompute_late_inputs_total{action,input_kind}`.
 
 ### 3.3 SeriesRouter (`series_router.rs`)
 
@@ -1032,19 +1038,12 @@ automatically combined with original window data at query time.
 
 ## 7. Late Data Handling
 
-Two checks determine whether a sample is "late":
+Two checks classify an input as late: its timestamp is behind the event-time
+watermark, or its target window has already closed. `LateDataPolicy` applies to
+both cases and to both raw samples and prebuilt sketches:
 
-1. **Watermark check** (sample-level): `ts < watermark - allowed_lateness_ms` →
-   sample is dropped entirely before reaching any aggregation logic.
-
-2. **Window closure check** (window-level): the sample passes the watermark check
-   but targets a window that is already closed
-   (`window not in active_windows && watermark >= window_end`).
-
-For case 2, the `LateDataPolicy` controls behavior:
-
-- **Drop**: log at debug level and skip. No ghost accumulator is created
-  (fixing the original bug where `or_insert_with` would create orphaned entries).
+- **Drop**: increment `asap_precompute_late_inputs_total{action="drop",...}`,
+  log at debug level, and skip. No ghost accumulator is created.
 
 - **ForwardToStore**: create a fresh `AccumulatorUpdater`, feed the single
   late sample, wrap as `PrecomputedOutput`, and push into the same `emit_batch`
@@ -1129,7 +1128,7 @@ store with the Kafka consumer path.
   | `test_tumbling_window_correctness` | Samples at t=1s/5s/9s; window [0,10s) closes on t=10s; `sum=6` |
   | `test_sliding_window_pane_sharing` | Sample at t=15s in 30s/10s window -> 2 emits for [0,30s) and [10s,40s), both `sum=42` via shared pane snapshot/take |
   | `test_groupby_separate_emits_per_series` | Two series (`host=A`, `host=B`) on same worker -> 2 independent `MultipleSumAccumulator` emits (no ingest-time cross-series merge) |
-  | `test_late_data_drop` | Sample behind `watermark - allowed_lateness_ms` with `Drop` policy -> 0 emits |
+  | `test_late_data_drop` | Sample behind the event watermark with `Drop` policy -> 0 emits and records the action |
   | `test_late_data_forward_to_store` | Late sample for evicted pane with `ForwardToStore` -> 1 emit as mini-accumulator with correct window bounds and sum |
 
 - **Unit tests -- other modules**: `window_manager.rs` (tumbling/sliding arithmetic, pane enumeration, closure detection), `series_buffer.rs` (ordering, watermark), `accumulator_factory.rs` (updater creation and reset), `series_router.rs` (consistent hash routing), `config.rs` (defaults).
@@ -1149,18 +1148,12 @@ The engine is currently in-memory and single-process with no persistence of in-f
 
 | # | Case | When it occurs | Mitigation status |
 |---|---|---|---|
-| 1 | **Explicit late drop** | `LateDataPolicy::Drop` + `ts < watermark - allowed_lateness_ms` | Intended; use `ForwardToStore` to avoid |
-| 2 | **Intra-batch lateness** | Within a single `process_samples` call, `current_wm` is set to the batch's max timestamp before pane routing; with `allowed_lateness_ms=0` every sample below the batch max is dropped | Set `allowed_lateness_ms` >= max timestamp spread within a producer batch |
-| 3 | **Evicted pane + Drop** | Sample passes watermark check but its pane was already evicted (window closed); `Drop` policy discards it | Use `ForwardToStore` |
-| 4 | **No matching config** | `matching_agg_configs` returns empty -- metric name in the series key does not match any config's `metric` or `spatial_filter`; worker silently returns `Ok(())` | No warning is logged. TODO: emit a metric or log at warn level for unmatched series |
-| 5 | **Open panes on shutdown** | `flush_all` only emits windows already closed by the watermark; panes that are still open at shutdown are discarded | TODO (see below) |
-| 6 | **Worker panic** | Tokio task dies; all series owned by that worker lose their pane state; subsequent sends log a warning and drop | TODO (see below) |
+| 1 | **Explicit late drop** | `LateDataPolicy::Drop` handles a late or already-closed-window input | Intended and counted; use `ForwardToStore` to retain corrections |
+| 2 | **No matching config** | Metric name does not match a configured policy | Warn and expose the existing policy-miss diagnostics |
+| 3 | **Worker panic** | Tokio task dies with in-memory panes | TODO: worker supervision and durable pane recovery |
 
-### TODO: open-pane flush on shutdown
-
-`flush_all` currently only closes windows whose `end <= watermark`. On graceful shutdown it should optionally force-close all open panes by advancing each series watermark to `i64::MAX` (or to `current_wm + window_size_ms`) before the final flush. This would emit partial windows with whatever samples have accumulated, allowing downstream consumers to decide whether to use them.
-
-This behaviour should be opt-in (a `force_flush_on_shutdown: bool` config flag) because partial windows can be misleading for consumers that expect complete windows.
+On graceful shutdown, `force_close_all` emits all remaining raw and sketch
+panes. These are partial windows when the event-time boundary was not reached.
 
 ### TODO: warn on unmatched series
 

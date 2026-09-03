@@ -2,6 +2,7 @@ use crate::precompute_engine::accumulator_factory::{
     create_accumulator_updater, AccumulatorUpdater,
 };
 use crate::precompute_engine::config::LateDataPolicy;
+use crate::precompute_engine::metrics::record_late_input;
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
 use crate::precompute_engine::output_sink::OutputSink;
 use crate::precompute_engine::series_router::WorkerMessage;
@@ -425,6 +426,7 @@ impl Worker {
                 let window_end = pane_start + state.window_manager.window_size_ms();
                 match late_data_policy {
                     LateDataPolicy::Drop => {
+                        record_late_input("drop", "raw_sample");
                         debug!(
                             "Worker {} dropping late sample for sid={} (group={}): \
                              ts={} observed_event_time={} pane=[{}, {})",
@@ -439,6 +441,7 @@ impl Worker {
                         continue;
                     }
                     LateDataPolicy::ForwardToStore => {
+                        record_late_input("append_correction", "raw_sample");
                         let mut updater = create_accumulator_updater(&state.config);
                         apply_sample(&mut *updater, series_key, *val, *ts, &state.config);
                         let key = build_group_key_label_values(group_key);
@@ -575,12 +578,14 @@ impl Worker {
         if too_late || pane_closed {
             match late_data_policy {
                 LateDataPolicy::Drop => {
+                    record_late_input("drop", "prebuilt_sketch");
                     debug!(
                         "Worker {} dropping late accumulator input for sid={} (group={}): ts={} watermark={}",
                         worker_id, sid, group_key, timestamp_ms, previous_event_time
                     );
                 }
                 LateDataPolicy::ForwardToStore => {
+                    record_late_input("append_correction", "prebuilt_sketch");
                     let window_start = pane_start;
                     let window_end = pane_start + state.window_manager.window_size_ms();
                     let key = build_group_key_label_values(group_key);
@@ -808,7 +813,11 @@ impl Worker {
                     let idle_due = idle_grace_ms > 0
                         && now_ms.saturating_sub(clock.last_touch_ms)
                             >= window_size_ms.saturating_add(idle_grace_ms);
-                    let deadline_due = max_open_grace_ms > 0
+                    // An absolute close can be followed by more input for the
+                    // same event-time window. Enable it only when those inputs
+                    // are emitted as mergeable corrections.
+                    let deadline_due = self.late_data_policy == LateDataPolicy::ForwardToStore
+                        && max_open_grace_ms > 0
                         && now_ms.saturating_sub(clock.first_touch_ms)
                             >= window_size_ms.saturating_add(max_open_grace_ms);
                     if idle_due || deadline_due {
@@ -2693,6 +2702,7 @@ aggregations:
     fn make_worker_with_wall_clock_policy(
         agg_configs: HashMap<u64, AggregationConfig>,
         sink: Arc<CapturingOutputSink>,
+        late_data_policy: LateDataPolicy,
         idle_grace_period_ms: i64,
         max_open_grace_period_ms: i64,
     ) -> Worker {
@@ -2708,7 +2718,7 @@ aggregations:
                 allowed_lateness_ms: 0,
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
-                late_data_policy: LateDataPolicy::Drop,
+                late_data_policy,
                 wall_clock_idle_grace_period_ms: idle_grace_period_ms,
                 wall_clock_max_open_grace_period_ms: max_open_grace_period_ms,
             },
@@ -2737,7 +2747,13 @@ aggregations:
         let agg_configs = HashMap::from([(1, cfg)]);
         let sink = Arc::new(CapturingOutputSink::new());
         // 5s grace period — production default.
-        let mut worker = make_worker_with_wall_clock_policy(agg_configs, sink.clone(), 5_000, 0);
+        let mut worker = make_worker_with_wall_clock_policy(
+            agg_configs,
+            sink.clone(),
+            LateDataPolicy::Drop,
+            5_000,
+            0,
+        );
 
         // Pin clock at t_wall = 1_000_000 ms during ingest. Every
         // sketch arrives stamped with the SAME event-time
@@ -2841,8 +2857,13 @@ aggregations:
             vec![],
         );
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker =
-            make_worker_with_wall_clock_policy(HashMap::from([(7, cfg)]), sink.clone(), 5_000, 0);
+        let mut worker = make_worker_with_wall_clock_policy(
+            HashMap::from([(7, cfg)]),
+            sink.clone(),
+            LateDataPolicy::Drop,
+            5_000,
+            0,
+        );
         let wall_clock = Arc::new(AtomicI64::new(1_000_000));
         let wc_clone = wall_clock.clone();
         worker.set_now_ms_fn(Box::new(move || wc_clone.load(Ordering::Relaxed)));
@@ -2897,6 +2918,7 @@ aggregations:
         let mut worker = make_worker_with_wall_clock_policy(
             HashMap::from([(9, cfg)]),
             sink.clone(),
+            LateDataPolicy::ForwardToStore,
             5_000,
             5_000,
         );
@@ -2921,14 +2943,72 @@ aggregations:
         // 6.5s: longer than window_size + max_open_grace = 6s.
         wall_clock.store(3_006_500, Ordering::Relaxed);
         worker.flush_all().unwrap();
-        let captured = sink.drain();
+        let mut captured = sink.drain();
         assert_eq!(captured.len(), 1, "absolute deadline must bound freshness");
-        let sum = captured[0]
-            .1
+        let initial = captured.pop().expect("deadline output").1;
+        let sum = initial
             .as_any()
             .downcast_ref::<SumAccumulator>()
             .expect("must emit SumAccumulator");
         assert_eq!(sum.sum, 28.0);
+
+        // Continuing input for the already-closed event-time window becomes a
+        // mergeable correction instead of being silently dropped.
+        wall_clock.store(3_007_000, Ordering::Relaxed);
+        worker
+            .process_group_samples(9, pf, "", group_samples("netflow_bytes", vec![(0, 8.0)]))
+            .unwrap();
+        let mut corrections = sink.drain();
+        assert_eq!(corrections.len(), 1, "late input must emit a correction");
+        let correction = corrections.pop().expect("correction output").1;
+        let merged = initial
+            .merge_with(correction.as_ref())
+            .expect("deadline output and correction must merge");
+        let merged_sum = merged
+            .as_any()
+            .downcast_ref::<SumAccumulator>()
+            .expect("merged output must remain SumAccumulator");
+        assert_eq!(merged_sum.sum, 36.0);
+    }
+
+    #[test]
+    fn absolute_deadline_is_disabled_for_drop_policy() {
+        let cfg = make_agg_config(
+            11,
+            "netflow_bytes",
+            AggregationType::SingleSubpopulation,
+            "Sum",
+            1,
+            0,
+            vec![],
+        );
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker_with_wall_clock_policy(
+            HashMap::from([(11, cfg)]),
+            sink.clone(),
+            LateDataPolicy::Drop,
+            0,
+            5_000,
+        );
+        let wall_clock = Arc::new(AtomicI64::new(5_000_000));
+        let wc_clone = wall_clock.clone();
+        worker.set_now_ms_fn(Box::new(move || wc_clone.load(Ordering::Relaxed)));
+
+        worker
+            .process_group_samples(
+                11,
+                PolicyFingerprint(11),
+                "",
+                group_samples("netflow_bytes", vec![(0, 1.0)]),
+            )
+            .unwrap();
+        wall_clock.store(5_006_500, Ordering::Relaxed);
+        worker.flush_all().unwrap();
+        assert_eq!(
+            sink.len(),
+            0,
+            "a deadline must not close a pane when later input would be dropped"
+        );
     }
 
     #[test]
@@ -2943,8 +3023,13 @@ aggregations:
             vec!["zone"],
         );
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker =
-            make_worker_with_wall_clock_policy(HashMap::from([(8, cfg)]), sink.clone(), 5_000, 0);
+        let mut worker = make_worker_with_wall_clock_policy(
+            HashMap::from([(8, cfg)]),
+            sink.clone(),
+            LateDataPolicy::Drop,
+            5_000,
+            0,
+        );
         let wall_clock = Arc::new(AtomicI64::new(2_000_000));
         let wc_clone = wall_clock.clone();
         worker.set_now_ms_fn(Box::new(move || wc_clone.load(Ordering::Relaxed)));
@@ -2984,6 +3069,66 @@ aggregations:
         assert_eq!(dd.inner.total_count(), 8);
     }
 
+    #[test]
+    fn absolute_deadline_forwards_late_sketch_correction() {
+        let cfg = make_agg_config(
+            10,
+            "latency",
+            AggregationType::DDSketch,
+            "",
+            1,
+            0,
+            vec!["zone"],
+        );
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker_with_wall_clock_policy(
+            HashMap::from([(10, cfg)]),
+            sink.clone(),
+            LateDataPolicy::ForwardToStore,
+            5_000,
+            5_000,
+        );
+        let wall_clock = Arc::new(AtomicI64::new(4_000_000));
+        let wc_clone = wall_clock.clone();
+        worker.set_now_ms_fn(Box::new(move || wc_clone.load(Ordering::Relaxed)));
+
+        let pf = PolicyFingerprint(10);
+        for i in 0..7 {
+            wall_clock.store(4_000_000 + i * 1_000, Ordering::Relaxed);
+            worker
+                .process_accumulator_input(
+                    100,
+                    pf,
+                    "us-east",
+                    0,
+                    Box::new(make_ddsketch(0.01, &[1.0 + i as f64])),
+                )
+                .unwrap();
+        }
+
+        wall_clock.store(4_006_500, Ordering::Relaxed);
+        worker.flush_all().unwrap();
+        let mut deadline_outputs = sink.drain();
+        assert_eq!(deadline_outputs.len(), 1);
+        let initial = deadline_outputs.pop().expect("deadline output").1;
+
+        wall_clock.store(4_007_000, Ordering::Relaxed);
+        worker
+            .process_accumulator_input(100, pf, "us-east", 0, Box::new(make_ddsketch(0.01, &[8.0])))
+            .unwrap();
+        let mut corrections = sink.drain();
+        assert_eq!(corrections.len(), 1, "late sketch must emit a correction");
+        let correction = corrections.pop().expect("correction output").1;
+        let merged = initial
+            .merge_with(correction.as_ref())
+            .expect("deadline output and sketch correction must merge");
+        let dd = merged
+            .as_any()
+            .downcast_ref::<DDSketchAccumulator>()
+            .expect("merged output must remain DDSketchAccumulator");
+        assert_eq!(dd.inner.total_count(), 8);
+    }
+
     /// Pin the wall-clock-fallback opt-out: setting
     /// Disabling both wall-clock grace values preserves event-time-only
     /// semantics, matching pre-fix behaviour. This keeps
@@ -3003,7 +3148,13 @@ aggregations:
         let agg_configs = HashMap::from([(1, cfg)]);
         let sink = Arc::new(CapturingOutputSink::new());
         // grace=0 disables the fallback entirely.
-        let mut worker = make_worker_with_wall_clock_policy(agg_configs, sink.clone(), 0, 0);
+        let mut worker = make_worker_with_wall_clock_policy(
+            agg_configs,
+            sink.clone(),
+            LateDataPolicy::Drop,
+            0,
+            0,
+        );
 
         let wall_clock = Arc::new(AtomicI64::new(1_000_000));
         let wc_clone = wall_clock.clone();
@@ -3119,7 +3270,13 @@ aggregations:
         );
         let agg_configs = HashMap::from([(1, cfg)]);
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker_with_wall_clock_policy(agg_configs, sink.clone(), 0, 0);
+        let mut worker = make_worker_with_wall_clock_policy(
+            agg_configs,
+            sink.clone(),
+            LateDataPolicy::Drop,
+            0,
+            0,
+        );
 
         // 10 sketches, all stamped at frozen event-time 0 → window [0, 30_000).
         let pf = PolicyFingerprint(1);
