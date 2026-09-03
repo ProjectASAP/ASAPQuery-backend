@@ -38,8 +38,6 @@
 //! | `controller/src/config/{stage_config*,agent,backend,asapquery_backend,precompute}.rs` | `controller/src/emit/{...}.rs` |
 //!
 //! Public modules to consume from `asap-query-engine`:
-//! - `sketch_algebra` — `Capability` enum + `capability_for(agg_intent: &AggIntent)`
-//!   lookup table (Phase 4 / 5 use this to route raw-name PromQL).
 //! - `intent_algebra` — `AggIntent` + `QueryExpr` DAG (canonical L3 IR;
 //!   `relational` carries the L2 relational IR the parsers emit and
 //!   `lower` lowers it to the canonical L3 types).
@@ -73,7 +71,6 @@ pub mod query_parser;
 pub mod query_planning;
 pub mod replan;
 pub mod runtime_samples;
-pub mod sketch_algebra;
 pub mod sketch_selection;
 pub mod store;
 pub mod threshold_alloc;
@@ -95,9 +92,8 @@ pub mod workload;
 /// the module docs for the full PromQL shape coverage matrix.
 pub mod asap_tier_analysis;
 
-/// PromQL → compositional L4 plan via `asap_aware_mapping::bind::implement_tree`.
-/// Step A of the plan-shaped-serving scoping (see module doc) -- not yet
-/// wired into the live serving path.
+/// PromQL → ASAPPlanner's canonical post-ASAP plan via
+/// `asap_aware_mapping::bind::implement_tree`.
 pub mod asap_tier_implement;
 
 /// Crate-wide test-only utilities for serialising access to process-global

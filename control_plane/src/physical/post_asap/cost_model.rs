@@ -109,7 +109,7 @@ impl ControlPlaneCostModel {
     /// [`Self::combined_eps_delta`], an `Exact` side does not bail: it
     /// picks the *other* side's budget (falling back to the catalog
     /// default `(0.01, 0.01)` only when both sides are `Exact`). Public
-    /// (within the crate) because [`crate::sketch_algebra::lower`]'s
+    /// (within the crate) because [`crate::physical::post_asap::lower`]'s
     /// `TopK { accuracy: Exact }` pre-pass needs the same combination.
     pub(crate) fn topk_eps_delta(&self, intent_accuracy: &AccuracyTarget) -> (f64, f64) {
         match (&self.workload_accuracy, intent_accuracy) {

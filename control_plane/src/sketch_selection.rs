@@ -19,7 +19,7 @@
 //! When a capability binds a *concrete* `SketchKindHandle` (not `Any`), the
 //! result is exactly that one family; `Any` expands to the full candidate set.
 //!
-//! Moved out of `sketch_algebra` (Stage 4 of the `sketch_algebra`
+//! Moved out of `physical::post_asap` (Stage 4 of the `physical::post_asap`
 //! re-layering) — this is a query-planning concern (its one caller is
 //! [`crate::query_planning`]), not L4 IR.
 

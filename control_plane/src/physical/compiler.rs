@@ -32,7 +32,7 @@ use crate::emit::monitor::MonitorIntent;
 use crate::physical::colored_dag::emitter::{
     AggregationInput, BackendAggregation, BackendReadout, BackendStageConfig,
 };
-use crate::sketch_algebra::cost_model::ControlPlaneCostModel;
+use crate::physical::post_asap::cost_model::ControlPlaneCostModel;
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 

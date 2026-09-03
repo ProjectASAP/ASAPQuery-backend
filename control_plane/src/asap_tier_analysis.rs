@@ -42,7 +42,7 @@
 //!   exist in real PromQL/MetricsQL; the lowerer handles the real
 //!   names like `quantile_over_time` and `count_over_time`).
 //! - The local `Capability` / `SketchKindHandle` enums — they're now
-//!   re-exported from `sketch_algebra` (the single source of truth).
+//!   re-exported from `physical::post_asap` (the single source of truth).
 
 use std::collections::BTreeSet;
 use std::time::Duration;

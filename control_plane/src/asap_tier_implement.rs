@@ -10,7 +10,7 @@
 //! four already-distinct senses of "bind" in this stack (L2 name
 //! resolution `ColumnRef → ColumnId`; the L3→L4 per-node physical
 //! choice; a deployment's own L4→L5 *placement* decision, e.g.
-//! `control_plane::sketch_algebra::rules::bind_*`; and this module's own
+//! `control_plane::physical::post_asap::rules::bind_*`; and this module's own
 //! prior usage) and deliberately names its L3→L4 step **"implementation"**
 //! instead (Cascades/Volcano terminology: an *implementation rule* is
 //! logical → physical, distinct from a *transformation rule*, logical →

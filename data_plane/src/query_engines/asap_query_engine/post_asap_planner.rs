@@ -40,11 +40,11 @@ use std::rc::Rc;
 
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryExpr, SummaryNode};
 
-use control_plane::physical::runtime_capability::{OuterFn, SketchKindHandle};
-use control_plane::sketch_algebra::cost_model::ObservedFamilyCostModel;
-use control_plane::sketch_algebra::{
-    bind_query_expr_with_cost_model, BindingError, L4Plan, PhysicalExpr,
+use control_plane::physical::post_asap::cost_model::ObservedFamilyCostModel;
+use control_plane::physical::post_asap::{
+    bind_query_expr_with_cost_model, BindingError, PhysicalExpr, PostAsapPlan,
 };
+use control_plane::physical::runtime_capability::{OuterFn, SketchKindHandle};
 use control_plane::types_v2::AccuracyTarget;
 
 use crate::query_engines::asap_query_engine::summary_executor::find_metric_in_query_expr;
@@ -107,7 +107,7 @@ pub enum LoweringSkip {
     ExecuteFailed(String),
 }
 
-// `L4Plan` and `PhysicalExpr` are backend compatibility/placement wrappers.
+// `PostAsapPlan` and `PhysicalExpr` are backend compatibility/placement wrappers.
 // The semantic tree returned by ASAPPlanner is `post_asap::SummaryNode`; this
 // module does not claim or recreate an ASAPPlanner "L4" IR.
 
@@ -359,7 +359,7 @@ pub fn plan_promql_to_post_asap(
         .map_err(|e: BindingError| LoweringSkip::Implement(e.to_string()))?;
 
     match physical {
-        PhysicalExpr::Committed(L4Plan::Summary(node)) => {
+        PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => {
             if matches!(node.expr, SummaryExpr::KeepPreAsap(_)) {
                 Err(LoweringSkip::NotRealized)
             } else {

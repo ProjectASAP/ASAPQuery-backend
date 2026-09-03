@@ -899,7 +899,7 @@ fn build_routing_entry(metric_name: &str, cfg: &BackendStageConfig) -> JsonValue
         warm_shapes.push("count");
     }
     // Heap-bearing kinds count too — `SummaryKind` (unlike the retired
-    // `sketch_algebra::SummaryKind`) promotes `with_heap` to a distinct
+    // `physical::post_asap::SummaryKind`) promotes `with_heap` to a distinct
     // identity variant, but a topk-bound Count-Sketch/CMS aggregation
     // still needs to register here exactly as it did before the split.
     let has_count_sketch = kinds.iter().any(|k| {
@@ -3037,7 +3037,7 @@ fn build_backend_readout_json(r: &BackendReadout) -> JsonValue {
 /// The wire-string key for a `SketchQuery::PointCount` readout.
 ///
 /// `SampleValue` and `Wildcard` both wire to the legacy `"*"` sentinel
-/// (`sketch_algebra::rules::bind_cms_count`, retired by Step B, used the
+/// (`physical::post_asap::rules::bind_cms_count`, retired by Step B, used the
 /// literal string `"*"` to mean "all rows / no specific key"; the L5
 /// emitter's per-group resolution already special-cases that string) —
 /// there's no real queryable column for a plain `Count`/`Frequency`
@@ -3056,7 +3056,7 @@ fn column_ref_to_wire_key(col: &ColumnRef) -> String {
 /// The 5-sketch routing-connector edge YAML path (`emit_edge_yaml`'s
 /// `USE_5SKETCH_ROUTING` branch and its `metric_to_family` sibling)
 /// keys its fixed `FAMILY_ORDER` list and lookup maps on the 5 bare
-/// families only — matching the retired `sketch_algebra::SketchAlgorithm`,
+/// families only — matching the retired `physical::post_asap::SketchAlgorithm`,
 /// which had no heap-bearing variant at all (`with_heap` was a
 /// `SketchParams` field, invisible to anything keying on kind alone).
 /// A committed heap-bearing kind (`CmsWithHeap`/`CountSketchWithHeap`,
@@ -3079,7 +3079,7 @@ fn base_family(kind: &SketchAlgorithm) -> SketchAlgorithm {
 ///
 /// Heap-bearing is now identity, not a params flag (`SketchAlgorithm::CmsWithHeap`
 /// / `CountSketchWithHeap`, set by `BindCountSketchOnTopK` — see
-/// `sketch_algebra::rules::bind_cms_topk`), so this maps on `kind` alone;
+/// `physical::post_asap::rules::bind_cms_topk`), so this maps on `kind` alone;
 /// `params` is unused but kept for call-site stability. This is what
 /// lets the backend's `policy_capability` lookup return
 /// `FrequencyTopk(*WithHeap)` for heap-bearing aggregations — required

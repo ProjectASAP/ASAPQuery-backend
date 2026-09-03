@@ -1,7 +1,7 @@
 //! L3 → L4/L5 lowering — `QueryExpr` walk that adopts
 //! `asap_aware_mapping::bind::implement_tree_in_with` for the sketch algebra
 //! itself (Step B of the plan-shaped-serving migration), with
-//! `crate::sketch_algebra::cost_model::ControlPlaneCostModel` plugged in
+//! `crate::physical::post_asap::cost_model::ControlPlaneCostModel` plugged in
 //! for family selection + parameter sizing.
 //!
 //! Per `control_plane/docs/design.md` §6: "the optimizer's job is to
@@ -36,8 +36,8 @@ use std::rc::Rc;
 use asap_aware_mapping::cost_model::CostModel;
 use thiserror::Error;
 
-use crate::sketch_algebra::cost_model::ControlPlaneCostModel;
-use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
+use crate::physical::post_asap::cost_model::ControlPlaneCostModel;
+use crate::physical::post_asap::deployment_expr::{PhysicalExpr, PostAsapPlan};
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::{AggIntent, QueryExpr};
 
@@ -82,13 +82,16 @@ pub fn bind_query_expr_with_cost_model(
     Ok(PhysicalExpr::Committed(bind_recursive(expr, cost_model)?))
 }
 
-fn bind_recursive(expr: &QueryExpr, cost_model: &dyn CostModel) -> Result<L4Plan, BindingError> {
+fn bind_recursive(
+    expr: &QueryExpr,
+    cost_model: &dyn CostModel,
+) -> Result<PostAsapPlan, BindingError> {
     match expr {
         // `QueryExpr::LetBinding`/`::Ref` don't exist in the canonical IR
         // anymore (ASAPPlanner#181/#192 -- see
         // control_plane/docs/design-asapplanner-pin-migration.md), so
         // this walk can never actually receive that shape; the arms that
-        // used to produce `L4Plan::LetBinding`/`L4Plan::Ref` here are
+        // used to produce `PostAsapPlan::LetBinding`/`PostAsapPlan::Ref` here are
         // gone with it.
 
         // The canonical L3 IR places `TimeRange` *above* a single-statistic
@@ -148,15 +151,15 @@ fn bind_recursive(expr: &QueryExpr, cost_model: &dyn CostModel) -> Result<L4Plan
             }]
         ) =>
         {
-            Ok(L4Plan::Summary(crate::planner_selection::select_summary(
-                expr, cost_model,
-            )?))
+            Ok(PostAsapPlan::Summary(
+                crate::planner_selection::select_summary(expr, cost_model)?,
+            ))
         }
 
         _ => {
             let rewritten = rewrite_rate_to_increase(expr);
             let node = crate::planner_selection::select_summary(&rewritten, cost_model)?;
-            Ok(L4Plan::Summary(node))
+            Ok(PostAsapPlan::Summary(node))
         }
     }
 }

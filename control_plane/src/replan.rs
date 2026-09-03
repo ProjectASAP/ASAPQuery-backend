@@ -203,7 +203,7 @@ impl Replanner {
     ///
     /// Steps:
     ///   1. `bind_workload_typed(&workload)` → PhysicalExpr
-    ///   2. `split_typed_three_stage(&physical_expr)` → per-stage configs
+    ///   2. `split_typed_three_stage(&deployment_expr)` → per-stage configs
     ///   3. Pick the `Edge` stage config
     ///   4. Apply `extend_edge_with_demo_plumbing` (freshness probes +
     ///      workload-registry archive metrics) so the OpAMP-pushed YAML
@@ -242,8 +242,8 @@ impl Replanner {
         workload: &QueryWorkload,
         agent_id: &str,
     ) -> Option<String> {
-        let physical_expr = rules::bind_workload_typed(workload)?;
-        let configs = stage_split::split_typed_three_stage(&physical_expr)?;
+        let deployment_expr = rules::bind_workload_typed(workload)?;
+        let configs = stage_split::split_typed_three_stage(&deployment_expr)?;
         let mut edge_cfg = configs.into_iter().find_map(|(_, cfg)| match cfg {
             crate::physical::colored_dag::StageConfig::Edge(edge) => Some(edge),
             _ => None,
@@ -600,8 +600,8 @@ impl Replanner {
         role: AggRole,
     ) -> Option<BackendStageConfig> {
         // ── Typed sketch path (Quantile / Cardinality / TopK / Frequency) ──
-        if let Some(physical_expr) = rules::bind_workload_typed(workload) {
-            if let Some(configs) = stage_split::split_typed_three_stage(&physical_expr) {
+        if let Some(deployment_expr) = rules::bind_workload_typed(workload) {
+            if let Some(configs) = stage_split::split_typed_three_stage(&deployment_expr) {
                 if let Some(mut be) = configs.into_iter().find_map(|(_, cfg)| match cfg {
                     crate::physical::colored_dag::StageConfig::Backend(be) => Some(be),
                     _ => None,

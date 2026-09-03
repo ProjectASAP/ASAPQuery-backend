@@ -5,11 +5,11 @@ use control_plane::metrics_exposer;
 use control_plane::monitor;
 use control_plane::opamp;
 use control_plane::physical;
+use control_plane::physical::post_asap;
 use control_plane::pipeline;
 use control_plane::query_parser;
 use control_plane::replan;
 use control_plane::runtime_samples;
-use control_plane::sketch_algebra;
 use control_plane::store;
 use control_plane::types;
 use control_plane::types_v2;
@@ -779,7 +779,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
     // is no `query_string`.
     let raw_bps = plan.transmission_cost_summary.raw_bytes_per_sec;
     let budgets = StageResourceBudgets::from_workload_chars(&wc);
-    // Everything that touches `sketch_algebra::PhysicalExpr` (which
+    // Everything that touches `physical::post_asap::PhysicalExpr` (which
     // carries `Rc<planner_types::post_asap::SummaryNode>` since Step B of the
     // plan-shaped-serving migration adopted ASAPController's own
     // `Rc`-based DAG sharing) is scoped to this block and resolved down
@@ -789,7 +789,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
     // yield point would make its `Future` `!Send`, breaking
     // `axum::Handler`.
     let (plan_summary, stage_configs) = {
-        let mut bound_physical: Option<control_plane::sketch_algebra::PhysicalExpr> = None;
+        let mut bound_physical: Option<control_plane::physical::post_asap::PhysicalExpr> = None;
         let mut plan_summary = None;
         if let Some(ref qs) = query_string {
             match parse_query_expr_canonical(qs, accuracy) {
@@ -807,7 +807,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                         )
                     };
                     bound_physical =
-                        control_plane::sketch_algebra::bind_query_expr(&qe, accuracy).ok();
+                        control_plane::physical::post_asap::bind_query_expr(&qe, accuracy).ok();
                     // Cost summary for the JSON response.
                     let plan_node = SketchAllocator::new(budgets.clone(), raw_bps).allocate(qe);
                     plan_summary = Some(plan_node.summarise(raw_bps));
@@ -821,9 +821,9 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
                 crate::physical::colored_dag::StageConfig,
             >,
         > = if physical::stage_split::typed_stage_split_enabled() {
-            let physical_expr = bound_physical
+            let deployment_expr = bound_physical
                 .or_else(|| physical::workload_planner::bind_workload_typed(&workload));
-            physical_expr.and_then(|pe| physical::stage_split::split_typed_three_stage(&pe))
+            deployment_expr.and_then(|pe| physical::stage_split::split_typed_three_stage(&pe))
         } else {
             None
         };
@@ -883,7 +883,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
     //
     // The typed L5 stage-split is now fed by the real **L4 output**: when
     // the spec carries a `query_string`, `bound_physical` holds the
-    // optimised L3 tree run through `sketch_algebra::bind_query_expr`.
+    // optimised L3 tree run through `physical::post_asap::bind_query_expr`.
     // For specs that supply only explicit fields (no `query_string` to
     // parse), there is no L3 tree to bind, so we fall back to
     // `bind_workload_typed`, which lowers the flat `QueryWorkload`
@@ -1616,7 +1616,7 @@ async fn emit_bootstrap_typed(
     //      typed bind, so for `http_requests_total` the
     //      Quantile-shaped role on `http_requests_total_latency_ms`
     //      stays the source of the edge config.
-    let mut chosen: Option<(String, crate::sketch_algebra::PhysicalExpr)> = None;
+    let mut chosen: Option<(String, crate::physical::post_asap::PhysicalExpr)> = None;
     'outer: for cand in &candidates {
         for (_, wl, _) in st.workload_store.get_all_for_metric(cand) {
             if let Some(expr) = physical::workload_planner::bind_workload_typed(&wl) {
@@ -1625,13 +1625,13 @@ async fn emit_bootstrap_typed(
             }
         }
     }
-    let (metric, physical_expr) = chosen.ok_or_else(|| {
+    let (metric, deployment_expr) = chosen.ok_or_else(|| {
         anyhow!(
             "no registry metric binds via the typed path (all {} candidates declined)",
             candidates.len()
         )
     })?;
-    let configs = physical::stage_split::split_typed_three_stage(&physical_expr)
+    let configs = physical::stage_split::split_typed_three_stage(&deployment_expr)
         .ok_or_else(|| anyhow!("split_typed_three_stage returned None for `{metric}`"))?;
 
     // 4. Pick the Edge stage config and emit per-runtime. The

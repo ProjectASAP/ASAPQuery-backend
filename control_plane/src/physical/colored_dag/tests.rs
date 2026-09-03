@@ -18,7 +18,7 @@ use planner_types::post_asap::{
 use crate::physical::colored_dag::allocator::StageAllocator;
 use crate::physical::colored_dag::emitter::{EmitError, Emitter, StageConfig, ThreeStageEmitter};
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
-use crate::sketch_algebra::physical_expr::{L4Plan, PhysicalExpr};
+use crate::physical::post_asap::deployment_expr::{PhysicalExpr, PostAsapPlan};
 use crate::types_v2::{AccuracyTarget, BindingName};
 use planner_types::pre_asap::{Column, DataType};
 use planner_types::pre_asap::{ColumnRef, QueryExpr, Reduction, Schema, Source};
@@ -135,7 +135,7 @@ fn estimate_l4(query: SketchQuery, summary_input: Rc<SummaryNode>) -> Rc<Summary
 /// `PhysicalExpr::SketchMerge { algebra, children }`. `SummaryMerge` (the
 /// upstream replacement) carries no `algebra` field — `MergeAlgebra` was
 /// this crate's own addition and doesn't exist upstream (see
-/// `physical_expr.rs`'s module docs).
+/// `deployment_expr.rs`'s module docs).
 fn merge_l4(children: Vec<Rc<SummaryNode>>) -> Rc<SummaryNode> {
     Rc::new(SummaryNode {
         expr: SummaryExpr::SummaryMerge { children },
@@ -145,22 +145,25 @@ fn merge_l4(children: Vec<Rc<SummaryNode>>) -> Rc<SummaryNode> {
 }
 
 fn is_sketch_agg(expr: &PhysicalExpr) -> bool {
-    matches!(expr, PhysicalExpr::Committed(L4Plan::Summary(n)) if matches!(n.expr, SummaryExpr::SummaryAgg { .. }))
+    matches!(expr, PhysicalExpr::Committed(PostAsapPlan::Summary(n)) if matches!(n.expr, SummaryExpr::SummaryAgg { .. }))
 }
 fn is_logical(expr: &PhysicalExpr) -> bool {
-    matches!(expr, PhysicalExpr::Committed(L4Plan::Summary(n)) if matches!(n.expr, SummaryExpr::KeepPreAsap(_)))
+    matches!(expr, PhysicalExpr::Committed(PostAsapPlan::Summary(n)) if matches!(n.expr, SummaryExpr::KeepPreAsap(_)))
 }
 fn is_sketch_estimate(expr: &PhysicalExpr) -> bool {
-    matches!(expr, PhysicalExpr::Committed(L4Plan::Summary(n)) if matches!(n.expr, SummaryExpr::SummaryEstimate { .. }))
+    matches!(expr, PhysicalExpr::Committed(PostAsapPlan::Summary(n)) if matches!(n.expr, SummaryExpr::SummaryEstimate { .. }))
 }
 fn is_sketch_merge(expr: &PhysicalExpr) -> bool {
-    matches!(expr, PhysicalExpr::Committed(L4Plan::Summary(n)) if matches!(n.expr, SummaryExpr::SummaryMerge { .. }))
+    matches!(expr, PhysicalExpr::Committed(PostAsapPlan::Summary(n)) if matches!(n.expr, SummaryExpr::SummaryMerge { .. }))
 }
 fn is_let_binding(expr: &PhysicalExpr) -> bool {
-    matches!(expr, PhysicalExpr::Committed(L4Plan::LetBinding { .. }))
+    matches!(
+        expr,
+        PhysicalExpr::Committed(PostAsapPlan::LetBinding { .. })
+    )
 }
 fn is_ref(expr: &PhysicalExpr) -> bool {
-    matches!(expr, PhysicalExpr::Committed(L4Plan::Ref { .. }))
+    matches!(expr, PhysicalExpr::Committed(PostAsapPlan::Ref { .. }))
 }
 
 /// `SummaryEstimate{Quantile{0.99}}{SummaryAgg{Kll}{Logical(Window{Scan})}}`
@@ -257,9 +260,9 @@ fn allocator_let_binding_color_propagates() {
     // The new `SummaryEstimate::sketch_input` field is `Rc<SummaryNode>` —
     // upstream `asap_sketch`'s own type, which has no `Ref`/`LetBinding`
     // concept at all — so a `Ref`/`LetBinding` can only appear where an
-    // `L4Plan` is expected (this crate's own named-binding sharing
+    // `PostAsapPlan` is expected (this crate's own named-binding sharing
     // mechanism layered *above* `SummaryNode`, not inside it; see
-    // `physical_expr.rs`'s module docs). The property under test —
+    // `deployment_expr.rs`'s module docs). The property under test —
     // LetBinding colors by its bound expression's stage — is preserved
     // with the `child` position held by a bare `Ref` instead of a
     // `SketchEstimate{child: Ref}`.
@@ -268,10 +271,10 @@ fn allocator_let_binding_color_propagates() {
         SketchParams::Kll { k: 200 },
         logical_l4(windowed_scan()),
     );
-    let bind = PhysicalExpr::Committed(L4Plan::LetBinding {
+    let bind = PhysicalExpr::Committed(PostAsapPlan::LetBinding {
         name: BindingName::new("kll_state"),
-        expr: Rc::new(L4Plan::Summary(inner_agg)),
-        child: Rc::new(L4Plan::Ref {
+        expr: Rc::new(PostAsapPlan::Summary(inner_agg)),
+        child: Rc::new(PostAsapPlan::Ref {
             name: BindingName::new("kll_state"),
         }),
     });
@@ -298,10 +301,10 @@ fn allocator_ref_resolves_to_binding_stage() {
         SketchParams::Kll { k: 200 },
         logical_l4(windowed_scan()),
     );
-    let bind = PhysicalExpr::Committed(L4Plan::LetBinding {
+    let bind = PhysicalExpr::Committed(PostAsapPlan::LetBinding {
         name: BindingName::new("shared"),
-        expr: Rc::new(L4Plan::Summary(inner_agg)),
-        child: Rc::new(L4Plan::Ref {
+        expr: Rc::new(PostAsapPlan::Summary(inner_agg)),
+        child: Rc::new(PostAsapPlan::Ref {
             name: BindingName::new("shared"),
         }),
     });

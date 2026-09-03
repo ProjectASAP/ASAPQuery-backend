@@ -1,7 +1,7 @@
 //! L5 stage split — assign the L4 `PhysicalExpr` DAG across pipeline stages.
 //!
 //! The control plane's L5: take the sketch-bound `PhysicalExpr` produced
-//! by `sketch_algebra::bind_query_expr`, colour its DAG by `StageId`
+//! by `physical::post_asap::bind_query_expr`, colour its DAG by `StageId`
 //! across the DC three-stage topology (`crate::physical::colored_dag::
 //! StageAllocator` + `ThreeStageEmitter`), and return one
 //! `StageConfig` per stage for the per-stage emitters in
@@ -12,7 +12,7 @@
 //! retired; `split_typed_three_stage` below is the sole L5.
 
 /// Env-var that opts *out* of the typed L5 stage_split path. The typed
-/// path — `sketch_algebra::PhysicalExpr` (L4) → `split_typed_three_stage`
+/// path — `physical::post_asap::PhysicalExpr` (L4) → `split_typed_three_stage`
 /// → per-stage `StageConfig` emit — is the primary (and only) L5; this
 /// var exists only as a kill switch.
 #[allow(dead_code)]
@@ -42,7 +42,7 @@ pub fn typed_stage_split_enabled() -> bool {
 /// `emit_gateway_yaml` for `Gateway`, `emit_backend_streaming_config_json`
 /// for `Backend`.
 pub fn split_typed_three_stage(
-    expr: &crate::sketch_algebra::PhysicalExpr,
+    expr: &crate::physical::post_asap::PhysicalExpr,
 ) -> Option<
     std::collections::HashMap<
         crate::physical::colored_dag::StageId,
@@ -102,9 +102,9 @@ mod l5_walk_propagation_tests {
     #[test]
     fn l5_walk_surfaces_metric_name_for_bind_workload_typed_output() {
         let w = workload("http_latency_ms", Vec::new(), Duration::from_secs(60));
-        let physical_expr =
+        let deployment_expr =
             crate::physical::workload_planner::bind_workload_typed(&w).expect("bind produced expr");
-        let configs = super::split_typed_three_stage(&physical_expr).expect("split ok");
+        let configs = super::split_typed_three_stage(&deployment_expr).expect("split ok");
         let backend_cfg = configs
             .into_values()
             .find_map(|cfg| match cfg {
@@ -126,9 +126,9 @@ mod l5_walk_propagation_tests {
     #[test]
     fn l5_walk_surfaces_window_secs_for_bind_workload_typed_output() {
         let w = workload("http_latency_ms", Vec::new(), Duration::from_secs(120));
-        let physical_expr =
+        let deployment_expr =
             crate::physical::workload_planner::bind_workload_typed(&w).expect("bind produced expr");
-        let configs = super::split_typed_three_stage(&physical_expr).expect("split ok");
+        let configs = super::split_typed_three_stage(&deployment_expr).expect("split ok");
         let backend_cfg = configs
             .into_values()
             .find_map(|cfg| match cfg {
@@ -161,9 +161,9 @@ mod l5_walk_propagation_tests {
             vec!["zone".to_string()],
             Duration::from_secs(60),
         );
-        let physical_expr =
+        let deployment_expr =
             crate::physical::workload_planner::bind_workload_typed(&w).expect("bind produced expr");
-        let configs = super::split_typed_three_stage(&physical_expr).expect("split ok");
+        let configs = super::split_typed_three_stage(&deployment_expr).expect("split ok");
         let backend_cfg = configs
             .into_values()
             .find_map(|cfg| match cfg {

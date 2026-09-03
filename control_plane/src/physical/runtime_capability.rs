@@ -5,7 +5,7 @@
 //! cost-model half of that consolidation — [`SketchCapability`] /
 //! `SupportedIntent` / `default_capability_table` / `load_capability_overrides`
 //! — moved to `crate::physical::deployment_cost::sketch_capability` (Stage 4 of the
-//! `sketch_algebra` re-layering): it's a cost-model concern read by the
+//! `physical::post_asap` re-layering): it's a cost-model concern read by the
 //! optimizer and physical planner, not L4 IR. What's left here:
 //!
 //! - [`Capability`] / [`SketchKindHandle`] — query-side capability tag,
@@ -19,7 +19,7 @@
 
 #![allow(dead_code)]
 
-use crate::sketch_algebra::matcher::sketch_family_satisfied;
+use crate::physical::post_asap::matcher::sketch_family_satisfied;
 use crate::types_v2::AccuracyTarget;
 use asap_types::AggregationType;
 use planner_types::post_asap::SketchAlgorithm;
@@ -1067,7 +1067,7 @@ mod tests {
         assert!(required_concrete.is_satisfied_by(&cap));
         // Intentional broadening vs. this module's pre-`sketch_family_satisfied`
         // behavior: CMS and CountSketch are the SAME frequency family in
-        // `sketch_algebra::matcher`'s reference rule table (both bare and
+        // `physical::post_asap::matcher`'s reference rule table (both bare and
         // heap-bearing — see its
         // `cms_and_count_sketch_are_the_same_frequency_family` test), so a
         // `CmsWithHeap` requirement IS now satisfied by a

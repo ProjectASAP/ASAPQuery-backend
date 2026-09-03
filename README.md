@@ -93,7 +93,7 @@ ASAPQuery-backend/                 # Cargo workspace
 │   └── src/
 │       ├── query_parser/            # PromQL/SQL parsing → intent algebra
 │       ├── intent_algebra/          # shared intent representation
-│       ├── sketch_algebra/          # sketch planning (+ rules/)
+│       ├── physical/post_asap/      # physical adapters for Planner post-ASAP IR
 │       ├── optimizer/               # plan optimization (cost/ + rules/)
 │       ├── physical/                # physical plan (colored_dag/)
 │       ├── emit/                    # per-runtime config emission
@@ -233,7 +233,7 @@ that produced the current architecture:
 
 - **Sketch placement planner** — moved into [`ASAPCollector/controller/`](https://github.com/ProjectASAP/ASAPCollector/tree/main/controller)
 - **PromQL pattern matchers for the planner** — migrated into the
-  controller's L3 `intent_algebra` + L4 `sketch_algebra`
+  ASAPPlanner's post-ASAP IR plus backend physical placement
 - **JSONL cold-fallback path** — deleted; the configured exact backend is the
   explicit fallback described by
   [query-engine implementation design](docs/developer_docs/query-engine/design.md).

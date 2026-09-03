@@ -46,8 +46,8 @@ pub use telegraf::emit_telegraf_toml;
 pub use crate::workload::WorkloadRegistry;
 
 use crate::physical::colored_dag::emitter::EdgeStageConfig;
-use crate::sketch_algebra::physical_expr::L4Plan;
-use crate::sketch_algebra::PhysicalExpr;
+use crate::physical::post_asap::deployment_expr::PostAsapPlan;
+use crate::physical::post_asap::PhysicalExpr;
 use crate::store::WorkloadStore;
 use anyhow::Result;
 use planner_types::post_asap::{SketchAlgorithm, SummaryExpr, SummaryNode};
@@ -295,13 +295,13 @@ pub fn extract_root_sketch_kind(expr: &PhysicalExpr) -> Option<SketchAlgorithm> 
     }
 }
 
-fn extract_from_plan(plan: &L4Plan) -> Option<SketchAlgorithm> {
+fn extract_from_plan(plan: &PostAsapPlan) -> Option<SketchAlgorithm> {
     match plan {
-        L4Plan::Summary(node) => extract_from_node(node),
-        L4Plan::LetBinding { expr, child, .. } => {
+        PostAsapPlan::Summary(node) => extract_from_node(node),
+        PostAsapPlan::LetBinding { expr, child, .. } => {
             extract_from_plan(expr).or_else(|| extract_from_plan(child))
         }
-        L4Plan::Ref { .. } => None,
+        PostAsapPlan::Ref { .. } => None,
     }
 }
 
@@ -323,7 +323,7 @@ fn extract_from_node(node: &Rc<SummaryNode>) -> Option<SketchAlgorithm> {
         SummaryExpr::SummaryEstimate { summary_input, .. } => extract_from_node(summary_input),
         SummaryExpr::SummaryMerge { children } => children.iter().find_map(extract_from_node),
         // Not surfaced by any `Bind*` path yet (gated on rules that
-        // haven't landed — see `physical_expr.rs`'s module docs).
+        // haven't landed — see `deployment_expr.rs`'s module docs).
         SummaryExpr::SummaryJoin { .. }
         | SummaryExpr::SummarySubtract { .. }
         | SummaryExpr::SummaryDelete { .. }
@@ -389,7 +389,7 @@ pub fn collect_metric_to_family(
                     .get(label)
                     .map(|v| (label, v.as_str()))
             });
-            let Some(physical_expr) =
+            let Some(deployment_expr) =
                 crate::physical::workload_planner::bind_workload_typed_with_item_filter(
                     &workload,
                     item_filter,
@@ -397,7 +397,7 @@ pub fn collect_metric_to_family(
             else {
                 continue;
             };
-            if let Some(kind) = extract_root_sketch_kind(&physical_expr) {
+            if let Some(kind) = extract_root_sketch_kind(&deployment_expr) {
                 out.entry(entry.metric_name.clone())
                     .or_default()
                     .insert(kind);

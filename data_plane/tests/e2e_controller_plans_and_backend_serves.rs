@@ -117,9 +117,9 @@ fn build_workload(
 fn plan_backend_stage_config(
     workload: &QueryWorkload,
 ) -> control_plane::physical::colored_dag::BackendStageConfig {
-    let physical_expr = control_plane::physical::workload_planner::bind_workload_typed(workload)
+    let deployment_expr = control_plane::physical::workload_planner::bind_workload_typed(workload)
         .expect("bind_workload_typed produced a PhysicalExpr");
-    let configs = control_plane::physical::stage_split::split_typed_three_stage(&physical_expr)
+    let configs = control_plane::physical::stage_split::split_typed_three_stage(&deployment_expr)
         .expect("split_typed_three_stage produced per-stage configs");
     let mut backend_cfg = configs
         .into_iter()
