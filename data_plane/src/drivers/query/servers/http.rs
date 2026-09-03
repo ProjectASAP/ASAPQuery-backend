@@ -149,6 +149,7 @@ pub struct HttpServer {
     /// Serializes multi-document physical-plan publication so two control
     /// plane generations cannot interleave their config and BackendPlan.
     physical_plan_lock: Arc<tokio::sync::Mutex<()>>,
+    active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
 }
 
 #[derive(Clone)]
@@ -175,6 +176,7 @@ struct AppState {
     /// See [`HttpServer::probe_cache`].
     probe_cache: Option<Arc<FreshnessProbeCache>>,
     physical_plan_lock: Arc<tokio::sync::Mutex<()>>,
+    active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
 }
 
 impl HttpServer {
@@ -200,6 +202,7 @@ impl HttpServer {
             data_retention_ms: None,
             probe_cache: None,
             physical_plan_lock: Arc::new(tokio::sync::Mutex::new(())),
+            active_physical_plan: None,
         }
     }
 
@@ -254,6 +257,14 @@ impl HttpServer {
         handle: crate::storage_engines::types::HotReloadBackendPlan,
     ) -> Self {
         self.hot_reload_backend_plan = Some(handle);
+        self
+    }
+
+    pub fn with_active_physical_plan(
+        mut self,
+        handle: crate::storage_engines::types::HotReloadActivePhysicalPlan,
+    ) -> Self {
+        self.active_physical_plan = Some(handle);
         self
     }
 
@@ -364,6 +375,7 @@ impl HttpServer {
             data_retention_ms: self.data_retention_ms,
             probe_cache: self.probe_cache.clone(),
             physical_plan_lock: self.physical_plan_lock.clone(),
+            active_physical_plan: self.active_physical_plan.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -451,6 +463,7 @@ impl HttpServer {
             data_retention_ms: self.data_retention_ms,
             probe_cache: self.probe_cache.clone(),
             physical_plan_lock: self.physical_plan_lock.clone(),
+            active_physical_plan: self.active_physical_plan.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -5363,10 +5376,7 @@ async fn handle_post_physical_plan(
     use axum::response::IntoResponse;
     use std::collections::BTreeSet;
 
-    let (Some(config_handle), Some(plan_handle)) = (
-        state.hot_reload_config.as_ref(),
-        state.hot_reload_backend_plan.as_ref(),
-    ) else {
+    let Some(active_handle) = state.active_physical_plan.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
@@ -5426,33 +5436,31 @@ async fn handle_post_physical_plan(
         },
         None => None,
     };
-    if new_routing.is_some() && state.backend_storage_routing.is_none() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({
-                "status": "error", "error": "storage-routing hot-reload handle is not attached"
-            })),
-        )
-            .into_response();
-    }
+    let new_routing = new_routing
+        .map(Arc::new)
+        .unwrap_or_else(|| active_handle.snapshot().storage_routing.clone());
 
     let _guard = state.physical_plan_lock.lock().await;
     let plan_id = new_plan.plan_id;
-    if let Err(error) = plan_handle.install(new_plan) {
+    let active = crate::storage_engines::types::ActivePhysicalPlan {
+        precompute_plan: request.precompute_plan,
+        runtime_config: Arc::new(new_config),
+        backend_plan: Arc::new(new_plan),
+        storage_routing: new_routing,
+    };
+    let generated = active.backend_plan.generated_at_unix_ms;
+    let current = active_handle.snapshot();
+    if generated < current.backend_plan.generated_at_unix_ms {
         return (
             StatusCode::CONFLICT,
             axum::Json(serde_json::json!({
-                "status": "error", "error": format!("BackendPlan install error: {error}")
+                "status": "error", "error": "stale physical-plan generation"
             })),
         )
             .into_response();
     }
-    config_handle.swap(new_config);
-    if let (Some(handle), Some(routing)) = (state.backend_storage_routing.as_ref(), new_routing) {
-        let tenant = routing.tenant().to_string();
-        handle.swap_tenant(&tenant, routing);
-    }
-    let snap = config_handle.snapshot();
+    active_handle.swap(active);
+    let snap = active_handle.snapshot().runtime_config.clone();
     let sid_summary = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
         state.sketch_index.as_ref(),
         snap.as_ref(),

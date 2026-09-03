@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use asap_types::SummaryKind;
-use asap_types::{AggregationConfig, MonitorSpec, PolicyFingerprint, QueryLanguage};
+use asap_types::{MonitorSpec, PolicyFingerprint, PrecomputeMaterialization, QueryLanguage};
 
 use crate::emit::monitor::{agg_id_for_metric, MonitorIntent};
 use crate::emit::stage_config::build_backend_aggregation_json;
@@ -138,12 +138,12 @@ pub fn from_stage_config(
 /// JSON is valid YAML) — rather than re-deriving the field mapping here.
 pub fn aggregation_config_for_materialization(
     agg: &BackendAggregation,
-) -> Result<AggregationConfig> {
+) -> Result<PrecomputeMaterialization> {
     let json = build_backend_aggregation_json(agg);
     let text = serde_json::to_string(&json).context("serialize synthesized aggregation JSON")?;
     let yaml_value: serde_yaml::Value =
         serde_yaml::from_str(&text).context("parse synthesized aggregation JSON as YAML")?;
-    AggregationConfig::from_yaml_data(&yaml_value, None, QueryLanguage::promql)
+    PrecomputeMaterialization::from_yaml_data(&yaml_value, None, QueryLanguage::promql)
         .context("build AggregationConfig from synthesized aggregation JSON")
 }
 
@@ -247,7 +247,7 @@ mod tests {
     /// Independently construct the `AggregationConfig` a hand-written
     /// (non-JSON-round-trip) reader would build for this fixture, so the
     /// parity test doesn't just check the implementation against itself.
-    fn hand_built_config(agg: &BackendAggregation) -> AggregationConfig {
+    fn hand_built_config(agg: &BackendAggregation) -> PrecomputeMaterialization {
         let parameters: StdHashMap<String, serde_json::Value> = match &agg.sketch_params {
             SummaryParams::DDSketch { alpha } => {
                 StdHashMap::from([("alpha".to_string(), serde_json::json!(alpha))])
@@ -266,7 +266,7 @@ mod tests {
             ]),
             other => unreachable!("fixture doesn't exercise {other:?}"),
         };
-        AggregationConfig::new(
+        PrecomputeMaterialization::new(
             match agg.sketch_kind {
                 SummaryKind::DDSketch => AggregationType::DDSketch,
                 SummaryKind::Kll => AggregationType::DatasketchesKLL,
