@@ -1,18 +1,15 @@
-//! Authoritative serving plan compiled from one selected post-ASAP DAG.
+//! Authoritative backend-executable query DAG.
 //!
-//! A query request may be parsed only to obtain its stable identity.  Family
-//! selection, materialization matching and execution-shape construction all
-//! happen here, before publication.  The data plane therefore never invokes
-//! ASAPPlanner or searches the materialization catalog while serving.
+//! ASAPPlanner owns semantic post-ASAP IR. Physical compilation binds every
+//! maintained-summary leaf to one materialization and lowers edges to stable
+//! node IDs. Serving executes this graph without reconstructing Planner IR or
+//! searching for compatible materializations.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use planner_types::post_asap::{
-    ExactKind, ExactParams, GroupingStrategy, SketchKind, SketchQuery, SummaryExpr,
-    SummaryFamilyType, SummaryField, SummaryNode, SummarySchema,
-};
-use planner_types::pre_asap::{ColumnRef, DataType, QueryExpr, Reduction};
+use planner_types::post_asap::{SketchQuery, SummaryExpr, SummaryFamilyType, SummaryNode};
+use planner_types::pre_asap::Reduction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -40,10 +37,7 @@ impl QueryPlan {
             .ok_or(QueryPlanError::QueryNotPlanned(identity))
     }
 
-    pub fn validate(
-        &self,
-        materializations: &BTreeSet<PolicyFingerprint>,
-    ) -> Result<(), QueryPlanError> {
+    pub fn validate(&self, available: &BTreeSet<PolicyFingerprint>) -> Result<(), QueryPlanError> {
         for (identity, entry) in &self.entries {
             if identity != &entry.canonical_promql {
                 return Err(QueryPlanError::Invalid(format!(
@@ -51,34 +45,145 @@ impl QueryPlan {
                     entry.canonical_promql
                 )));
             }
-            if entry.materializations.is_empty() {
-                return Err(QueryPlanError::Invalid(format!(
-                    "query `{identity}` has no bound materialization"
-                )));
-            }
-            if let Some(missing) = entry
-                .materializations
-                .iter()
-                .find(|fingerprint| !materializations.contains(fingerprint))
-            {
-                return Err(QueryPlanError::Invalid(format!(
-                    "query `{identity}` references absent materialization {}",
-                    missing.0
-                )));
-            }
+            entry.validate(available)?;
         }
         Ok(())
     }
 }
+
+/// Stable identity inside one query entry. Edges are IDs so common
+/// subexpressions remain shared after serialization.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(transparent)]
+pub struct QueryNodeId(pub u64);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct QueryPlanEntry {
     pub query_id: String,
     pub canonical_promql: String,
-    pub root: QueryPlanNode,
-    pub materializations: BTreeSet<PolicyFingerprint>,
+    pub root: QueryNodeId,
+    pub nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
+    pub instant: InstantExecution,
     pub fallback: FallbackPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct InstantExecution {
+    pub lookback_ms: u64,
+    pub full_history: bool,
+    pub cumulative_readout: bool,
+}
+
+impl QueryPlanEntry {
+    pub fn compile_bound<F>(
+        query_id: String,
+        canonical_promql: String,
+        root: &Rc<SummaryNode>,
+        instant: InstantExecution,
+        fallback: FallbackPolicy,
+        mut bind: F,
+    ) -> Result<Self, QueryPlanError>
+    where
+        F: FnMut(
+            &SummaryNode,
+            SummaryKind,
+            SummaryParams,
+        ) -> Result<MaterializationBinding, QueryPlanError>,
+    {
+        let mut compiler = DagCompiler {
+            next_id: 0,
+            nodes: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            bind: &mut bind,
+        };
+        let root = compiler.lower(root)?;
+        Ok(Self {
+            query_id,
+            canonical_promql,
+            root,
+            nodes: compiler.nodes,
+            instant,
+            fallback,
+        })
+    }
+
+    /// Validate references, bindings, reachability, and cycles before activation.
+    pub fn validate(&self, available: &BTreeSet<PolicyFingerprint>) -> Result<(), QueryPlanError> {
+        if !self.nodes.contains_key(&self.root) {
+            return Err(QueryPlanError::Invalid(format!(
+                "query `{}` has missing root {}",
+                self.query_id, self.root.0
+            )));
+        }
+        for (id, node) in &self.nodes {
+            for input in node.inputs() {
+                if !self.nodes.contains_key(input) {
+                    return Err(QueryPlanError::Invalid(format!(
+                        "query `{}` node {} references missing input {}",
+                        self.query_id, id.0, input.0
+                    )));
+                }
+            }
+            if let QueryPlanNode::ReadMaterialization { binding } = node {
+                if !available.contains(&binding.materialization) {
+                    return Err(QueryPlanError::Invalid(format!(
+                        "query `{}` node {} references absent materialization {}",
+                        self.query_id, id.0, binding.materialization.0
+                    )));
+                }
+            }
+        }
+        let order = self.topological_order()?;
+        if order.len() != self.nodes.len() {
+            return Err(QueryPlanError::Invalid(format!(
+                "query `{}` contains unreachable nodes",
+                self.query_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Return reachable nodes with every input before its consumer.
+    pub fn topological_order(&self) -> Result<Vec<QueryNodeId>, QueryPlanError> {
+        fn visit(
+            id: QueryNodeId,
+            nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
+            visiting: &mut BTreeSet<QueryNodeId>,
+            visited: &mut BTreeSet<QueryNodeId>,
+            out: &mut Vec<QueryNodeId>,
+        ) -> Result<(), QueryPlanError> {
+            if visited.contains(&id) {
+                return Ok(());
+            }
+            if !visiting.insert(id) {
+                return Err(QueryPlanError::Invalid(format!(
+                    "cycle detected at query node {}",
+                    id.0
+                )));
+            }
+            let node = nodes
+                .get(&id)
+                .ok_or_else(|| QueryPlanError::Invalid(format!("missing query node {}", id.0)))?;
+            for input in node.inputs() {
+                visit(*input, nodes, visiting, visited, out)?;
+            }
+            visiting.remove(&id);
+            visited.insert(id);
+            out.push(id);
+            Ok(())
+        }
+        let mut out = Vec::with_capacity(self.nodes.len());
+        visit(
+            self.root,
+            &self.nodes,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut out,
+        )?;
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -89,29 +194,52 @@ pub enum FallbackPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializationBinding {
+    pub materialization: PolicyFingerprint,
+    pub metric: String,
+    pub kind: SummaryKind,
+    pub params: SummaryParams,
+    /// Exact label-key layout of the stored materialization.
+    pub sid_grouping: Vec<String>,
+    /// Query operator grouping applied while folding those SIDs.
+    pub output_grouping: PhysicalGrouping,
+    pub window_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", content = "keys", rename_all = "snake_case")]
+pub enum PhysicalGrouping {
+    PerEntity,
+    Reduce(Vec<String>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
-    KeepPreAsap {
-        logical: serde_json::Value,
-        schema_names: Vec<String>,
-    },
-    SummaryAgg {
-        child: Box<QueryPlanNode>,
-        kind: SummaryKind,
-        params: SummaryParams,
-        col: ColumnRef,
-        reduction: Reduction,
-        schema_names: Vec<String>,
+    ReadMaterialization {
+        binding: MaterializationBinding,
     },
     SummaryEstimate {
-        summary_input: Box<QueryPlanNode>,
+        input: QueryNodeId,
         query: QueryReadout,
-        schema_names: Vec<String>,
     },
     SummaryMerge {
-        children: Vec<QueryPlanNode>,
-        schema_names: Vec<String>,
+        inputs: Vec<QueryNodeId>,
     },
+    ExactFallback {
+        reason: String,
+    },
+}
+
+impl QueryPlanNode {
+    pub fn inputs(&self) -> &[QueryNodeId] {
+        match self {
+            Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => &[],
+            Self::SummaryEstimate { input, .. } => std::slice::from_ref(input),
+            Self::SummaryMerge { inputs } => inputs,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -121,221 +249,13 @@ pub enum QueryReadout {
         q: f64,
     },
     PointCount {
-        key: ColumnRef,
+        key: planner_types::pre_asap::ColumnRef,
         value: Option<String>,
     },
     Cardinality,
     TopK {
         k: usize,
     },
-}
-
-#[derive(Debug, Error)]
-pub enum QueryPlanError {
-    #[error("invalid PromQL query identity: {0}")]
-    InvalidPromql(String),
-    #[error("query is absent from the active QueryPlan: {0}")]
-    QueryNotPlanned(String),
-    #[error("post-ASAP DAG cannot be represented by the MVP query executor: {0}")]
-    UnsupportedNode(String),
-    #[error("invalid QueryPlan: {0}")]
-    Invalid(String),
-    #[error("invalid serialized pre-ASAP leaf: {0}")]
-    InvalidLogicalLeaf(String),
-}
-
-/// Canonical textual identity used by both compilation and request lookup.
-/// PromQL's parser/formatter normalizes whitespace and matcher formatting;
-/// semantically different expressions retain different keys.
-pub fn canonical_promql(query: &str) -> Result<String, QueryPlanError> {
-    promql_parser::parser::parse(query.trim())
-        .map(|expr| expr.to_string())
-        .map_err(|error| QueryPlanError::InvalidPromql(error.to_string()))
-}
-
-impl QueryPlanNode {
-    pub fn compile(node: &SummaryNode) -> Result<Self, QueryPlanError> {
-        let schema_names = node
-            .schema
-            .fields
-            .iter()
-            .map(|field| field.name.clone())
-            .collect();
-        match &node.expr {
-            SummaryExpr::KeepPreAsap(logical) => Ok(Self::KeepPreAsap {
-                logical: serde_json::to_value(logical.as_ref())
-                    .map_err(|error| QueryPlanError::InvalidLogicalLeaf(error.to_string()))?,
-                schema_names,
-            }),
-            SummaryExpr::SummaryAgg {
-                child,
-                family,
-                col,
-                reduction,
-                ..
-            } => {
-                let (kind, params) = flatten_family(family)?;
-                Ok(Self::SummaryAgg {
-                    child: Box::new(Self::compile(child)?),
-                    kind,
-                    params,
-                    col: col.clone(),
-                    reduction: reduction.clone(),
-                    schema_names,
-                })
-            }
-            SummaryExpr::SummaryEstimate {
-                summary_input,
-                query,
-            } => Ok(Self::SummaryEstimate {
-                summary_input: Box::new(Self::compile(summary_input)?),
-                query: query.clone().into(),
-                schema_names,
-            }),
-            SummaryExpr::SummaryMerge { children } => Ok(Self::SummaryMerge {
-                children: children
-                    .iter()
-                    .map(|child| Self::compile(child))
-                    .collect::<Result<Vec<_>, _>>()?,
-                schema_names,
-            }),
-            SummaryExpr::SummaryJoin { .. } => {
-                Err(QueryPlanError::UnsupportedNode("summary_join".into()))
-            }
-            SummaryExpr::SummarySubtract { .. } => {
-                Err(QueryPlanError::UnsupportedNode("summary_subtract".into()))
-            }
-            SummaryExpr::SummaryDelete { .. } => {
-                Err(QueryPlanError::UnsupportedNode("summary_delete".into()))
-            }
-        }
-    }
-
-    /// Rebuild the planner-owned semantic node without making a planning
-    /// decision.  Schema names are retained because group IDs are positional;
-    /// other schema/guarantee details are irrelevant to execution.
-    pub fn to_summary_node(&self) -> Result<Rc<SummaryNode>, QueryPlanError> {
-        let (expr, names) = match self {
-            Self::KeepPreAsap {
-                logical,
-                schema_names,
-            } => {
-                let logical: QueryExpr = serde_json::from_value(logical.clone())
-                    .map_err(|error| QueryPlanError::InvalidLogicalLeaf(error.to_string()))?;
-                (SummaryExpr::KeepPreAsap(Rc::new(logical)), schema_names)
-            }
-            Self::SummaryAgg {
-                child,
-                kind,
-                params,
-                col,
-                reduction,
-                schema_names,
-            } => (
-                SummaryExpr::SummaryAgg {
-                    child: child.to_summary_node()?,
-                    family: expand_family(*kind, params.clone())?,
-                    col: col.clone(),
-                    reduction: reduction.clone(),
-                    grouping: GroupingStrategy::default(),
-                },
-                schema_names,
-            ),
-            Self::SummaryEstimate {
-                summary_input,
-                query,
-                schema_names,
-            } => (
-                SummaryExpr::SummaryEstimate {
-                    summary_input: summary_input.to_summary_node()?,
-                    query: query.clone().into(),
-                },
-                schema_names,
-            ),
-            Self::SummaryMerge {
-                children,
-                schema_names,
-            } => (
-                SummaryExpr::SummaryMerge {
-                    children: children
-                        .iter()
-                        .map(Self::to_summary_node)
-                        .collect::<Result<Vec<_>, _>>()?,
-                },
-                schema_names,
-            ),
-        };
-        Ok(Rc::new(SummaryNode {
-            expr,
-            schema: execution_schema(names),
-            guarantee: None,
-        }))
-    }
-}
-
-fn execution_schema(names: &[String]) -> SummarySchema {
-    SummarySchema {
-        fields: names
-            .iter()
-            .map(|name| SummaryField {
-                name: name.clone(),
-                dtype: SummaryFamilyType::Plain(DataType::Utf8),
-                nullable: true,
-            })
-            .collect(),
-        time_index: None,
-    }
-}
-
-fn flatten_family(
-    family: &SummaryFamilyType,
-) -> Result<(SummaryKind, SummaryParams), QueryPlanError> {
-    match family {
-        SummaryFamilyType::ExactAggregate(kind, params) => {
-            Ok((kind.clone().into(), params.clone().into()))
-        }
-        SummaryFamilyType::Sketch(kind, _) => {
-            Ok((kind.clone().into(), kind.params().clone().into()))
-        }
-        other => Err(QueryPlanError::UnsupportedNode(format!(
-            "summary family {other:?}"
-        ))),
-    }
-}
-
-fn expand_family(
-    kind: SummaryKind,
-    params: SummaryParams,
-) -> Result<SummaryFamilyType, QueryPlanError> {
-    if kind.is_exact() {
-        let exact = match (kind, params) {
-            (SummaryKind::Sum, SummaryParams::Sum) => (ExactKind::Sum, ExactParams::Sum),
-            (SummaryKind::Count, SummaryParams::Count) => (ExactKind::Count, ExactParams::Count),
-            (SummaryKind::MinMax, SummaryParams::MinMax) => {
-                (ExactKind::MinMax, ExactParams::MinMax)
-            }
-            (SummaryKind::Increase, SummaryParams::Increase) => {
-                (ExactKind::Increase, ExactParams::Increase)
-            }
-            (SummaryKind::Rate, SummaryParams::Rate) => (ExactKind::Rate, ExactParams::Rate),
-            (kind, params) => {
-                return Err(QueryPlanError::Invalid(format!(
-                    "mismatched exact family {kind:?}/{params:?}"
-                )))
-            }
-        };
-        return Ok(SummaryFamilyType::ExactAggregate(exact.0, exact.1));
-    }
-    let algorithm = kind
-        .as_sketch_kind()
-        .ok_or_else(|| QueryPlanError::Invalid(format!("not a sketch kind: {kind:?}")))?;
-    let sketch_params = params
-        .as_sketch_params()
-        .ok_or_else(|| QueryPlanError::Invalid(format!("not sketch params: {params:?}")))?;
-    Ok(SummaryFamilyType::Sketch(
-        SketchKind::new(algorithm, sketch_params),
-        GroupingStrategy::default(),
-    ))
 }
 
 impl From<SketchQuery> for QueryReadout {
@@ -360,6 +280,135 @@ impl From<QueryReadout> for SketchQuery {
     }
 }
 
+struct DagCompiler<'a, F> {
+    next_id: u64,
+    nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
+    seen: BTreeMap<usize, QueryNodeId>,
+    bind: &'a mut F,
+}
+
+impl<F> DagCompiler<'_, F>
+where
+    F: FnMut(
+        &SummaryNode,
+        SummaryKind,
+        SummaryParams,
+    ) -> Result<MaterializationBinding, QueryPlanError>,
+{
+    fn lower(&mut self, node: &Rc<SummaryNode>) -> Result<QueryNodeId, QueryPlanError> {
+        let identity = Rc::as_ptr(node) as usize;
+        if let Some(id) = self.seen.get(&identity) {
+            return Ok(*id);
+        }
+        let id = QueryNodeId(self.next_id);
+        self.next_id += 1;
+        self.seen.insert(identity, id);
+        let physical = match &node.expr {
+            SummaryExpr::KeepPreAsap(_) => QueryPlanNode::ExactFallback {
+                reason: "post-ASAP node requires exact execution".into(),
+            },
+            SummaryExpr::SummaryAgg {
+                family,
+                reduction,
+                child,
+                ..
+            } => {
+                let (kind, params) = flatten_family(family)?;
+                let mut binding = (self.bind)(node, kind, params)?;
+                binding.output_grouping = physical_grouping(reduction, child)?;
+                QueryPlanNode::ReadMaterialization { binding }
+            }
+            SummaryExpr::SummaryEstimate {
+                summary_input,
+                query,
+            } => QueryPlanNode::SummaryEstimate {
+                input: self.lower(summary_input)?,
+                query: query.clone().into(),
+            },
+            SummaryExpr::SummaryMerge { children } => {
+                if children.is_empty() {
+                    return Err(QueryPlanError::UnsupportedNode(
+                        "empty summary_merge".into(),
+                    ));
+                }
+                QueryPlanNode::SummaryMerge {
+                    inputs: children
+                        .iter()
+                        .map(|child| self.lower(child))
+                        .collect::<Result<_, _>>()?,
+                }
+            }
+            SummaryExpr::SummaryJoin { .. } => {
+                return Err(QueryPlanError::UnsupportedNode("summary_join".into()))
+            }
+            SummaryExpr::SummarySubtract { .. } => {
+                return Err(QueryPlanError::UnsupportedNode("summary_subtract".into()))
+            }
+            SummaryExpr::SummaryDelete { .. } => {
+                return Err(QueryPlanError::UnsupportedNode("summary_delete".into()))
+            }
+        };
+        self.nodes.insert(id, physical);
+        Ok(id)
+    }
+}
+
+fn physical_grouping(
+    reduction: &Reduction,
+    child: &SummaryNode,
+) -> Result<PhysicalGrouping, QueryPlanError> {
+    let Some(keys) = reduction.group_keys() else {
+        return Ok(PhysicalGrouping::PerEntity);
+    };
+    let names = keys
+        .keys()
+        .iter()
+        .map(|&id| {
+            child
+                .schema
+                .fields
+                .get(id)
+                .map(|f| f.name.clone())
+                .ok_or_else(|| QueryPlanError::Invalid(format!("unresolved grouping column {id}")))
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(PhysicalGrouping::Reduce(names))
+}
+
+fn flatten_family(
+    family: &SummaryFamilyType,
+) -> Result<(SummaryKind, SummaryParams), QueryPlanError> {
+    match family {
+        SummaryFamilyType::ExactAggregate(kind, params) => {
+            Ok((kind.clone().into(), params.clone().into()))
+        }
+        SummaryFamilyType::Sketch(kind, _) => {
+            Ok((kind.clone().into(), kind.params().clone().into()))
+        }
+        other => Err(QueryPlanError::UnsupportedNode(format!(
+            "summary family {other:?}"
+        ))),
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum QueryPlanError {
+    #[error("invalid PromQL query identity: {0}")]
+    InvalidPromql(String),
+    #[error("query is absent from the active QueryPlan: {0}")]
+    QueryNotPlanned(String),
+    #[error("post-ASAP DAG cannot be represented by the query executor: {0}")]
+    UnsupportedNode(String),
+    #[error("invalid QueryPlan: {0}")]
+    Invalid(String),
+}
+
+pub fn canonical_promql(query: &str) -> Result<String, QueryPlanError> {
+    promql_parser::parser::parse(query.trim())
+        .map(|expr| expr.to_string())
+        .map_err(|error| QueryPlanError::InvalidPromql(error.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,5 +419,33 @@ mod tests {
             canonical_promql("sum by (service) ( rate(http_requests_total[5m]) )").unwrap(),
             canonical_promql("sum by(service)(rate(http_requests_total[5m]))").unwrap()
         );
+    }
+
+    #[test]
+    fn graph_validation_rejects_cycles() {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(
+            QueryNodeId(0),
+            QueryPlanNode::SummaryMerge {
+                inputs: vec![QueryNodeId(0)],
+            },
+        );
+        let entry = QueryPlanEntry {
+            query_id: "q".into(),
+            canonical_promql: "up".into(),
+            root: QueryNodeId(0),
+            nodes,
+            instant: InstantExecution {
+                lookback_ms: 0,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::Reject,
+        };
+        assert!(entry
+            .validate(&BTreeSet::new())
+            .unwrap_err()
+            .to_string()
+            .contains("cycle"));
     }
 }

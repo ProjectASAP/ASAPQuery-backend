@@ -35,12 +35,13 @@ use crate::physical::colored_dag::emitter::{
 };
 use crate::physical::post_asap::cost_model::ControlPlaneCostModel;
 use crate::query_plan::{
-    canonical_promql, FallbackPolicy, QueryPlan, QueryPlanEntry, QueryPlanNode,
+    canonical_promql, FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping,
+    QueryPlan, QueryPlanEntry,
 };
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "264937ec4a06e260920c7e583bffed34cc07dd64";
+pub const PLANNER_REVISION: &str = "739753e33e096c01faccca8e7a1e3da5ad3aab9c";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
@@ -423,13 +424,52 @@ impl PhysicalCompiler {
                         .into(),
                 });
             }
-            let entry = QueryPlanEntry {
-                query_id: query.query_id.clone(),
-                canonical_promql: canonical.clone(),
-                root: QueryPlanNode::compile(&query.post_asap)?,
-                materializations: bound,
-                fallback: FallbackPolicy::ExactBackend,
-            };
+            let entry = QueryPlanEntry::compile_bound(
+                query.query_id.clone(),
+                canonical.clone(),
+                &query.post_asap,
+                InstantExecution {
+                    lookback_ms: query.window_secs.saturating_mul(1_000),
+                    full_history: false,
+                    cumulative_readout: true,
+                },
+                FallbackPolicy::ExactBackend,
+                |node, node_kind, node_params| {
+                    let planned_metric = summary_agg_metric(node).ok_or_else(|| {
+                        crate::query_plan::QueryPlanError::Invalid(
+                            "materialized node has no unique time-series source".into(),
+                        )
+                    })?;
+                    if planned_metric != *metric {
+                        return Err(crate::query_plan::QueryPlanError::Invalid(format!(
+                            "catalog metric `{metric}` disagrees with post-ASAP source `{planned_metric}`"
+                        )));
+                    }
+                    let fingerprint = bound
+                        .iter()
+                        .find(|fingerprint| {
+                            backend_plan
+                                .materializations
+                                .get(fingerprint)
+                                .is_some_and(|m| m.kind == node_kind && m.params == node_params)
+                        })
+                        .copied()
+                        .ok_or_else(|| {
+                            crate::query_plan::QueryPlanError::Invalid(format!(
+                                "no exact physical binding for {node_kind:?}/{node_params:?}"
+                            ))
+                        })?;
+                    Ok(MaterializationBinding {
+                        materialization: fingerprint,
+                        metric: metric.clone(),
+                        kind: node_kind,
+                        params: node_params,
+                        sid_grouping: query.group_by.clone(),
+                        output_grouping: PhysicalGrouping::Reduce(query.group_by.clone()),
+                        window_ms: query.window_secs.saturating_mul(1_000),
+                    })
+                },
+            )?;
             if query_entries.insert(canonical.clone(), entry).is_some() {
                 return Err(CompileError::Query {
                     query_id: query.query_id.clone(),
@@ -450,6 +490,41 @@ impl PhysicalCompiler {
             query_plan,
         })
     }
+}
+
+fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
+    fn walk(node: &SummaryNode, metrics: &mut BTreeSet<String>) {
+        match &node.expr {
+            SummaryExpr::KeepPreAsap(expr) => {
+                let parsed = crate::query_parser::qe_to_parsed_query(expr);
+                if !parsed.metric_name.is_empty() {
+                    metrics.insert(parsed.metric_name);
+                }
+            }
+            SummaryExpr::SummaryAgg { child, .. } => walk(child, metrics),
+            SummaryExpr::SummaryEstimate { summary_input, .. } => walk(summary_input, metrics),
+            SummaryExpr::SummaryMerge { children } => {
+                for child in children {
+                    walk(child, metrics);
+                }
+            }
+            SummaryExpr::SummaryJoin {
+                outer: left,
+                inner: right,
+                ..
+            }
+            | SummaryExpr::SummarySubtract { left, right } => {
+                walk(left, metrics);
+                walk(right, metrics);
+            }
+            SummaryExpr::SummaryDelete { summary_input, .. } => walk(summary_input, metrics),
+        }
+    }
+    let mut metrics = BTreeSet::new();
+    walk(node, &mut metrics);
+    (metrics.len() == 1)
+        .then(|| metrics.into_iter().next())
+        .flatten()
 }
 
 /// Planner-adapter selection step used before physical compilation. Keeping
@@ -874,8 +949,27 @@ mod tests {
             .lookup("quantile_over_time( 0.99, m[1m] )")
             .expect("canonical QueryPlan lookup");
         assert_eq!(entry.query_id, "q-quantile");
-        assert_eq!(entry.materializations.len(), 1);
-        entry.root.to_summary_node().expect("executable DAG recipe");
+        assert_eq!(
+            entry
+                .nodes
+                .values()
+                .filter(|node| matches!(
+                    node,
+                    crate::query_plan::QueryPlanNode::ReadMaterialization { .. }
+                ))
+                .count(),
+            1
+        );
+        entry
+            .validate(
+                &bundle
+                    .backend_plan
+                    .materializations
+                    .keys()
+                    .copied()
+                    .collect(),
+            )
+            .expect("executable physical DAG");
         let wire = serde_json::to_vec(&bundle.query_plan).expect("serialize QueryPlan");
         let decoded: QueryPlan = serde_json::from_slice(&wire).expect("deserialize QueryPlan");
         assert_eq!(decoded, bundle.query_plan);

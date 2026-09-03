@@ -118,7 +118,7 @@ pub fn parse_query(query: &str, accuracy: AccuracyTarget) -> anyhow::Result<Pars
 /// `collect_agg_func*` helpers are replaced by per-intent [`collect_op`]
 /// calls. Canonical `Scan` also carries `label_filters` inline, so they
 /// are picked up at the scan leaf as well as from any `Filter` predicate.
-fn qe_to_parsed_query(qe: &QueryExpr) -> ParsedQuery {
+pub(crate) fn qe_to_parsed_query(qe: &QueryExpr) -> ParsedQuery {
     // The Binder-built `Scan.schema` is the complete, self-contained
     // column universe every `ColumnId` in the tree indexes into. We grab
     // it up-front so the `Aggregate` walk can recover group-by *names*

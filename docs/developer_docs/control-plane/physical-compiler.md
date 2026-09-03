@@ -9,7 +9,7 @@ The compiler consumes ASAPPlanner types pinned to the revision exposed as
 `physical::compiler::PLANNER_REVISION`, selects
 from Planner's legal candidate space with backend-owned cost and evidence
 inputs, and emits one `PhysicalPlan`. The plan contains CollectorPlan,
-PrecomputePlan, and BackendPlan projections compiled from the same decision
+PrecomputePlan, BackendPlan, and QueryPlan projections compiled from the same decision
 for every target collector. Legacy
 `StageAllocator`/`ThreeStageEmitter` paths remain for older publication flows;
 they are not a second semantic planner.
@@ -35,10 +35,10 @@ ASAPPlanner selection <---------- PhysicalCompiler
       |
       v
 PhysicalCompiler -------> PhysicalPlan
-                            |       |       |
-                            v       v       v
-                      Collector  Precompute Backend
-                         Plan       Plan     Plan
+                            |       |       |      |
+                            v       v       v      v
+                      Collector  Precompute Backend Query
+                         Plan       Plan     Plan   DAG
 ```
 
 - **Planner selection boundary** is
@@ -48,7 +48,7 @@ PhysicalCompiler -------> PhysicalPlan
   placement, transport, and runtime implementations without changing the
   Planner-owned abstract framework.
 - **PhysicalPlan** is the only output passed to publication. Its CollectorPlan,
-  PrecomputePlan, and BackendPlan projections are created together and share identities.
+  PrecomputePlan, BackendPlan, and QueryPlan projections are created together and share identities.
 
 Logical query parsing, summary alternatives, guarantees, and candidate search
 remain public ASAPPlanner interfaces. Runtime publication is documented in
@@ -127,6 +127,7 @@ pub struct PhysicalPlan {
     pub collector_plans: Vec<CollectorPlan>, // complete per-target projections
     pub precompute_plan: PrecomputePlan,      // backend streaming materializations
     pub backend_plan: BackendPlan,
+    pub query_plan: QueryPlan,                // node-ID physical serving DAG
 }
 ```
 
@@ -153,6 +154,22 @@ Output definitions:
 | `collector_plans` | One plan per targeted collector, following ASAPCollector's public CollectorPlan schema. |
 | `precompute_plan` | Aggregation definitions emitted to `/api/v1/streaming-config`; contains no query-string jobs. |
 | `backend_plan` | Matching data-plane materialization and routing contract. |
+| `query_plan` | Canonical query identity, explicit fallback policy, node-ID DAG, and exact per-node materialization bindings. |
+
+### QueryPlan execution boundary
+
+`QueryPlan` is physical and executable; it is not a serialized copy of
+post-ASAP IR. Each `ReadMaterialization` node binds one policy fingerprint,
+metric, family/parameters, stored SID grouping layout, output reduction, and
+window. The data plane resolves only that fingerprint through the
+`policy_fp -> SID` reverse index and verifies SID metadata exactly. It never
+scans the catalog for a serving-time candidate.
+
+Graph traversal is separate from node definitions and store semantics.
+Activation validates roots, edges, bindings, reachability, and cycles.
+Execution uses the validated topological order and memoizes every node result,
+so a shared node in a diamond DAG performs one store/operator execution. A
+typed node failure follows the entry's explicit fallback route.
 
 ### What the compiler puts in CollectorPlan
 

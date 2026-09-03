@@ -226,6 +226,7 @@ impl CostModel for ControlPlaneCostModel {
         deployments: &[CostedSummaryDeployment<'_>],
         _horizon: Option<Horizon>,
         _expected_reads: Option<f64>,
+        _required_accuracy: &[AccuracyTarget],
     ) -> Option<CompleteSummaryCandidateEstimate> {
         // One compiler candidate describes the complete concrete realization
         // of this query DAG. The current executor exposes one anchored window
@@ -241,12 +242,23 @@ impl CostModel for ControlPlaneCostModel {
             .sum();
         self.window_framework_costs
             .iter()
+            // GOS/error propagation is introduced by the later adaptation
+            // slice. Until then, do not claim an approximate exponential
+            // histogram window is exact.
+            .filter(|(framework, _)| {
+                !matches!(framework, SummaryWindowFramework::ExponentialHistogram)
+            })
             .filter(|(_, cost)| cost.0.is_finite() && cost.0 >= 0.0)
             .min_by(|left, right| left.1 .0.total_cmp(&right.1 .0))
             .map(
                 |(framework, physical_cost)| CompleteSummaryCandidateEstimate {
                     cost: Cost(lifecycle_cost + physical_cost.0),
                     window_frameworks: vec![Some(framework.clone()); deployments.len()],
+                    window_accuracy_guarantee: Some(
+                        planner_types::post_asap::ResultGuarantee::exact(
+                            "backend exact window implementation",
+                        ),
+                    ),
                 },
             )
     }

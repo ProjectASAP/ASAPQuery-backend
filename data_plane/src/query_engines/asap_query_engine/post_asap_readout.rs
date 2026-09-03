@@ -5,13 +5,15 @@
 use std::collections::BTreeMap;
 
 use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome};
+use control_plane::query_plan::{QueryNodeId, QueryPlanNode};
 use control_plane::types_v2::AccuracyTarget;
 
+use crate::query_engines::asap_query_engine::physical_dag::{self, QueryNodeRuntime};
 use crate::query_engines::asap_query_engine::post_asap_planner::{
     execution_hints, plan_promql_to_post_asap, resolve_materializations_for_post_asap, LoweringSkip,
 };
 use crate::query_engines::asap_query_engine::summary_executor::{
-    QueryExecutionContext, SummaryValue,
+    GroupState, QueryExecutionContext, SummaryExecutorError, SummaryValue,
 };
 use crate::storage_engines::sketch_db::index::SketchStore;
 
@@ -95,18 +97,7 @@ pub fn execute_query_plan_readout(
     t1_ms: u64,
     is_cumulative: bool,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    let node = entry
-        .root
-        .to_summary_node()
-        .map_err(|error| LoweringSkip::InvalidQueryPlan(error.to_string()))?;
-    execute_bound_post_asap(
-        index,
-        &node,
-        t0_ms,
-        t1_ms,
-        is_cumulative,
-        entry.materializations.clone(),
-    )
+    execute_physical_query_plan(index, entry, t0_ms, t1_ms, is_cumulative)
 }
 
 pub fn execute_query_plan_instant(
@@ -114,26 +105,168 @@ pub fn execute_query_plan_instant(
     entry: &control_plane::query_plan::QueryPlanEntry,
     now_ms: u64,
 ) -> Result<(PostAsapReadoutOutcome, u64), LoweringSkip> {
-    const DEFAULT_LOOKBACK_MS: u64 = 5 * 60 * 1000;
-    let node = entry
-        .root
-        .to_summary_node()
-        .map_err(|error| LoweringSkip::InvalidQueryPlan(error.to_string()))?;
-    let hints = execution_hints(&node);
-    let t0_ms = if hints.full_history {
+    let t0_ms = if entry.instant.full_history {
         0
     } else {
-        now_ms.saturating_sub(hints.lookback_ms.unwrap_or(DEFAULT_LOOKBACK_MS))
+        now_ms.saturating_sub(entry.instant.lookback_ms)
     };
-    let outcome = execute_bound_post_asap(
+    let outcome = execute_physical_query_plan(
         index,
-        &node,
+        entry,
         t0_ms,
         now_ms,
-        hints.cumulative_readout,
-        entry.materializations.clone(),
+        entry.instant.cumulative_readout,
     )?;
     Ok((outcome, t0_ms))
+}
+
+#[derive(Clone)]
+enum PhysicalQueryOutput {
+    State(
+        Vec<(
+            BTreeMap<String, String>,
+            GroupState,
+            asap_types::SummaryKind,
+            asap_types::SummaryParams,
+        )>,
+    ),
+    Value(Vec<(BTreeMap<String, String>, SummaryValue)>),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum PhysicalNodeError {
+    #[error("materialization/store operation failed: {0:?}")]
+    Store(SummaryExecutorError),
+    #[error("node expected summary state input")]
+    ExpectedState,
+    #[error("summary merge inputs have different families")]
+    FamilyMismatch,
+    #[error("physical fallback requested: {0}")]
+    Fallback(String),
+}
+
+struct PhysicalQueryRuntime<'a> {
+    context: QueryExecutionContext<'a>,
+}
+
+impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
+    type Output = PhysicalQueryOutput;
+    type Error = PhysicalNodeError;
+
+    fn execute_node(
+        &self,
+        _id: QueryNodeId,
+        node: &QueryPlanNode,
+        inputs: &[Self::Output],
+    ) -> Result<Self::Output, Self::Error> {
+        match node {
+            QueryPlanNode::ReadMaterialization { binding } => {
+                let groups = self
+                    .context
+                    .read_bound_materialization(binding)
+                    .map_err(PhysicalNodeError::Store)?;
+                Ok(PhysicalQueryOutput::State(
+                    groups
+                        .into_iter()
+                        .map(|(key, state)| {
+                            (key, state, binding.kind.clone(), binding.params.clone())
+                        })
+                        .collect(),
+                ))
+            }
+            QueryPlanNode::SummaryEstimate { query, .. } => {
+                let [PhysicalQueryOutput::State(groups)] = inputs else {
+                    return Err(PhysicalNodeError::ExpectedState);
+                };
+                let query: planner_types::post_asap::SketchQuery = query.clone().into();
+                groups
+                    .iter()
+                    .map(|(key, state, _, _)| {
+                        self.context
+                            .readout_bound(state, &query)
+                            .map(|value| (key.clone(), value))
+                            .map_err(PhysicalNodeError::Store)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(PhysicalQueryOutput::Value)
+            }
+            QueryPlanNode::SummaryMerge { .. } => {
+                let mut family: Option<(asap_types::SummaryKind, asap_types::SummaryParams)> = None;
+                let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<GroupState>> =
+                    BTreeMap::new();
+                for input in inputs {
+                    let PhysicalQueryOutput::State(groups) = input else {
+                        return Err(PhysicalNodeError::ExpectedState);
+                    };
+                    for (key, state, kind, params) in groups {
+                        match &family {
+                            None => family = Some((kind.clone(), params.clone())),
+                            Some((expected_kind, expected_params))
+                                if expected_kind == kind && expected_params == params => {}
+                            Some(_) => return Err(PhysicalNodeError::FamilyMismatch),
+                        }
+                        by_group.entry(key.clone()).or_default().push(state.clone());
+                    }
+                }
+                let (kind, params) = family.ok_or(PhysicalNodeError::ExpectedState)?;
+                by_group
+                    .into_iter()
+                    .map(|(key, states)| {
+                        self.context
+                            .merge_bound_states(states)
+                            .map(|state| (key, state, kind.clone(), params.clone()))
+                            .map_err(PhysicalNodeError::Store)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(PhysicalQueryOutput::State)
+            }
+            QueryPlanNode::ExactFallback { reason } => {
+                Err(PhysicalNodeError::Fallback(reason.clone()))
+            }
+        }
+    }
+}
+
+fn execute_physical_query_plan(
+    index: &SketchStore,
+    entry: &control_plane::query_plan::QueryPlanEntry,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    let runtime = PhysicalQueryRuntime {
+        context: QueryExecutionContext {
+            index,
+            t0_ms,
+            t1_ms,
+            is_cumulative,
+            allowed_materializations: None,
+        },
+    };
+    let output = physical_dag::execute(entry, &runtime)
+        .map_err(|error| LoweringSkip::ExecuteFailed(error.to_string()))?;
+    match output {
+        PhysicalQueryOutput::Value(values) => {
+            let mut coverage = None;
+            let mut series = Vec::new();
+            for (group_key, value) in &values {
+                fold_coverage(&mut coverage, value.coverage());
+                series.extend(summary_value_to_series(group_key, value));
+            }
+            Ok(PostAsapReadoutOutcome { series, coverage })
+        }
+        PhysicalQueryOutput::State(groups) => {
+            let mut coverage = None;
+            let mut series = Vec::new();
+            for (group_key, state, _, _) in &groups {
+                fold_coverage(&mut coverage, state.exact_coverage());
+                if let Some(value) = state.exact_value(&None) {
+                    series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
+                }
+            }
+            Ok(PostAsapReadoutOutcome { series, coverage })
+        }
+    }
 }
 
 /// Plan and execute an instant query without consulting the legacy candidate
@@ -214,59 +347,6 @@ fn execute_planned_post_asap(
             Ok(PostAsapReadoutOutcome { series, coverage })
         }
         Err(e) => Err(LoweringSkip::ExecuteFailed(format!("{e:?}"))),
-    }
-}
-
-fn execute_bound_post_asap(
-    index: &SketchStore,
-    node: &planner_types::post_asap::SummaryNode,
-    t0_ms: u64,
-    t1_ms: u64,
-    is_cumulative: bool,
-    allowed_materializations: std::collections::BTreeSet<asap_types::PolicyFingerprint>,
-) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    let ctx = QueryExecutionContext {
-        index,
-        t0_ms,
-        t1_ms,
-        is_cumulative,
-        allowed_materializations: Some(allowed_materializations),
-    };
-    convert_execution_result(execute(node, &ctx), t1_ms)
-}
-
-fn convert_execution_result(
-    result: Result<
-        ExecOutcome<QueryExecutionContext<'_>>,
-        crate::query_engines::asap_query_engine::summary_exec::ExecError<
-            crate::query_engines::asap_query_engine::summary_executor::SummaryExecutorError,
-        >,
-    >,
-    t1_ms: u64,
-) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    match result {
-        Ok(ExecOutcome::Value(values)) => {
-            let mut coverage: Option<(u64, u64)> = None;
-            let mut series = Vec::new();
-            for (group_key, value) in &values {
-                fold_coverage(&mut coverage, value.coverage());
-                series.extend(summary_value_to_series(group_key, value));
-            }
-            Ok(PostAsapReadoutOutcome { series, coverage })
-        }
-        Ok(ExecOutcome::State(groups)) => {
-            let mut coverage: Option<(u64, u64)> = None;
-            let mut series = Vec::new();
-            for (group_key, state, _family) in &groups {
-                fold_coverage(&mut coverage, state.exact_coverage());
-                let Some(value) = state.exact_value(&None) else {
-                    continue;
-                };
-                series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
-            }
-            Ok(PostAsapReadoutOutcome { series, coverage })
-        }
-        Err(error) => Err(LoweringSkip::ExecuteFailed(format!("{error:?}"))),
     }
 }
 
@@ -415,14 +495,30 @@ mod tests {
         register_hll(&idx, 2, "worker", &["b", "c"]);
         let node = plan_promql_to_post_asap(&idx, "count(unique_users)", accuracy(), None)
             .expect("compile-stage fixture");
-        let entry = control_plane::query_plan::QueryPlanEntry {
-            query_id: "q-cardinality".into(),
-            canonical_promql: control_plane::query_plan::canonical_promql("count(unique_users)")
-                .unwrap(),
-            root: control_plane::query_plan::QueryPlanNode::compile(&node).unwrap(),
-            materializations: [asap_types::PolicyFingerprint(123)].into_iter().collect(),
-            fallback: control_plane::query_plan::FallbackPolicy::ExactBackend,
-        };
+        let canonical = control_plane::query_plan::canonical_promql("count(unique_users)").unwrap();
+        let entry = control_plane::query_plan::QueryPlanEntry::compile_bound(
+            "q-cardinality".into(),
+            canonical,
+            &node,
+            control_plane::query_plan::InstantExecution {
+                lookback_ms: 60_000,
+                full_history: false,
+                cumulative_readout: true,
+            },
+            control_plane::query_plan::FallbackPolicy::ExactBackend,
+            |_node, kind, params| {
+                Ok(control_plane::query_plan::MaterializationBinding {
+                    materialization: asap_types::PolicyFingerprint(123),
+                    metric: "unique_users".into(),
+                    kind,
+                    params,
+                    sid_grouping: vec!["service".into()],
+                    output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
+                    window_ms: 60_000,
+                })
+            },
+        )
+        .unwrap();
         let result = execute_query_plan_readout(&idx, &entry, 1_000, 2_000, true)
             .expect("execute formal QueryPlan");
         assert!(!result.series.is_empty());
