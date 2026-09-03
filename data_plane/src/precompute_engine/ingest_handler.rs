@@ -45,6 +45,10 @@ pub struct IngestObservability {
     /// series, used as the eviction sweep's reference point. Advanced
     /// monotonically on each cached base insert.
     pub snapshot_newest_window_start: AtomicU64,
+    /// Stateful checkpoint and sequence validation for physical-plan summary
+    /// frames. Kept with the ingest-wide shared state so concurrent OTLP
+    /// requests observe one linearizable lineage per producer/window.
+    pub frame_lineage: super::frame_lineage::FrameLineageTracker,
 }
 
 impl IngestObservability {
@@ -69,6 +73,7 @@ impl IngestObservability {
             dropped_policy_miss: AtomicU64::new(0),
             snapshot_max_window_lag_nanos: AtomicU64::new(lag),
             snapshot_newest_window_start: AtomicU64::new(0),
+            frame_lineage: super::frame_lineage::FrameLineageTracker::default(),
         }
     }
 }

@@ -1272,6 +1272,51 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 "materialization changed after successful request preflight"
                             );
                         }
+
+                        match ingest_state.observability.frame_lineage.observe(frame) {
+                            Ok(
+                                crate::precompute_engine::frame_lineage::FrameLineageDecision::Apply,
+                            ) => {
+                                if frame.kind
+                                    == control_plane::physical::compiler::SummaryFrameKind::Full
+                                {
+                                    ingest_state
+                                        .sketch_index
+                                        .clear_summary_lineage_incomplete(sid, frame);
+                                }
+                            }
+                            Ok(
+                                crate::precompute_engine::frame_lineage::FrameLineageDecision::Duplicate,
+                            ) => {
+                                debug!(
+                                    plan_id = frame.plan_id,
+                                    plan_version = frame.plan_version,
+                                    materialization = frame.materialization.0,
+                                    producer = %frame.producer_id,
+                                    producer_epoch = %frame.producer_epoch,
+                                    sequence = frame.sequence,
+                                    "ignored duplicate summary frame"
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                ingest_state
+                                    .sketch_index
+                                    .mark_summary_lineage_incomplete(sid, frame);
+                                rejected_frames = rejected_frames.saturating_add(1);
+                                warn!(
+                                    plan_id = frame.plan_id,
+                                    plan_version = frame.plan_version,
+                                    materialization = frame.materialization.0,
+                                    producer = %frame.producer_id,
+                                    producer_epoch = %frame.producer_epoch,
+                                    sequence = frame.sequence,
+                                    %error,
+                                    "rejected summary frame lineage"
+                                );
+                                continue;
+                            }
+                        }
                     }
 
                     // Phase 5 — register a `SketchInstanceMetadata` on

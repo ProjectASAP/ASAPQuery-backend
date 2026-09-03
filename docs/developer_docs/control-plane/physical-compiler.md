@@ -153,6 +153,22 @@ materializations are accepted; table sources and unexecutable selected families
 return `CompileError`. Versioned stage/activate/drain/retire lifecycle is part
 of publication; richer topology placement remains follow-up work.
 
+`TransmissionRule.runtime_policy` is the single physical contract for sampling,
+delta gating, and GOS. Sampling is typed by its implemented estimator; GOS is a
+CountSketch delta policy, not a summary family. Unsupported family/policy
+combinations fail compilation. Delta rules declare a periodic full-checkpoint
+cadence and accept both deltas and their recovery full frames.
+
+Runtime feedback cannot mutate an active rule. `authorize_successor` accepts
+only the next `plan_version`, requires fresh evidence for the exact
+plan/materialization/schema/producer tuple, and bounds each permitted knob by
+the active rule's guardrails. Family, parameters, grouping, window, schema,
+encoding, destination, mode, and checkpoint semantics stay fixed; changing
+them requires ordinary recompilation and staged activation.
+The atomic physical-plan publication carries the evidence records alongside
+the successor; the backend performs this authorization before staging it, so a
+caller cannot bypass guardrails by posting a changed rule directly.
+
 Output definitions:
 
 | Output | Definition |
@@ -288,7 +304,11 @@ writing any frame when one identity, schema, encoding, materialization, or full
 payload does not match the active TransmissionPlan. HTTP 2xx / gRPC OK is the
 delivery acknowledgement. Retrying the same full frame is idempotent because
 the identity selects the same SID, label set, and window replacement; no second
-application-level ACK or transport WAL is part of this contract.
+application-level ACK or transport WAL is part of this contract. Receiver
+lineage is scoped by plan/version,
+materialization, producer and producer epoch, and logical window. Exact retries
+are ignored idempotently; a missing base or sequence gap leaves the lineage
+incomplete until a newer full checkpoint arrives.
 
 The compiler error must identify an unsupported capability, invalid placement,
 window incompatibility, identity conflict, or invalid selected guarantee. It

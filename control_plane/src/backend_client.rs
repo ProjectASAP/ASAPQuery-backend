@@ -370,6 +370,7 @@ impl BackendClient {
         backend_plan: Vec<u8>,
         query_plan: &crate::query_plan::QueryPlan,
         storage_routing: Option<serde_json::Value>,
+        adaptation_evidence: &[crate::physical::compiler::RuntimeAdaptationEvidence],
     ) -> std::result::Result<(), BackendPostError> {
         let url = derive_physical_plan_url(&self.endpoint);
         let response = self
@@ -381,6 +382,7 @@ impl BackendClient {
             "backend_plan": backend_plan,
             "query_plan": query_plan,
             "storage_routing": storage_routing,
+            "adaptation_evidence": adaptation_evidence,
             }))
             .send()
             .await

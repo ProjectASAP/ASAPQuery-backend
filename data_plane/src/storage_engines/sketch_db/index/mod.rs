@@ -19,7 +19,7 @@
 //! See design doc §4.6 ("OTLP metadata model + backend store layout") at
 //! `docs/design_docs/series-identity.md`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -275,6 +275,29 @@ impl SketchInstanceMetadata {
 /// `SketchStore` can host both sketches and precomputes.
 type SidStore = Arc<RwLock<SidStoreData<BTreeMap<String, String>, AggPayload>>>;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IncompleteSummaryLineage {
+    plan_id: u64,
+    plan_version: u64,
+    producer_id: String,
+    producer_epoch: String,
+    window_start_unix_ms: u64,
+    window_end_unix_ms: u64,
+}
+
+impl From<&control_plane::physical::compiler::SummaryFrameIdentity> for IncompleteSummaryLineage {
+    fn from(frame: &control_plane::physical::compiler::SummaryFrameIdentity) -> Self {
+        Self {
+            plan_id: frame.plan_id,
+            plan_version: frame.plan_version,
+            producer_id: frame.producer_id.clone(),
+            producer_epoch: frame.producer_epoch.clone(),
+            window_start_unix_ms: frame.window_start_unix_nano / 1_000_000,
+            window_end_unix_ms: frame.window_end_unix_nano / 1_000_000,
+        }
+    }
+}
+
 /// Two-level sketch index. Replaces the legacy `aggregation_id`-keyed
 /// SimpleStore lookup once Phase 5 wiring lands at the streaming engine
 /// ingest path and the query path.
@@ -302,6 +325,10 @@ pub struct SketchStore {
     /// key) for ghost sids — query path detects this and falls through
     /// to Thanos archive.
     series: DashMap<u64, SidStore>,
+    /// Receiver-observed delta gaps. Query reads overlapping an incomplete
+    /// lineage fail closed to the exact tier until a recovery full checkpoint
+    /// for that exact producer/window lineage is accepted.
+    incomplete_summary_lineages: DashMap<u64, HashSet<IncompleteSummaryLineage>>,
     /// Reverse index: `policy_fp → {sids}`. Lets the query path resolve
     /// "which sids belong to this policy?" in O(1) without walking
     /// `instances`. Maintained by [`Self::register`] /
@@ -594,6 +621,18 @@ impl SketchStore {
         start_unix_ms: u64,
         end_unix_ms: u64,
     ) -> Vec<SketchTimeSeries> {
+        if self
+            .incomplete_summary_lineages
+            .get(&sid)
+            .is_some_and(|lineages| {
+                lineages.iter().any(|lineage| {
+                    lineage.window_start_unix_ms < end_unix_ms
+                        && lineage.window_end_unix_ms > start_unix_ms
+                })
+            })
+        {
+            return Vec::new();
+        }
         // Result is keyed by the resolved label MAP so the in-memory tier
         // (its own intern space) and the durable disk tier (independent
         // intern space) union by label identity, not `LabelValuesId`.
@@ -1740,8 +1779,33 @@ impl SketchStore {
         };
         if removed.is_some() {
             self.series.remove(&sid);
+            self.incomplete_summary_lineages.remove(&sid);
         }
         removed
+    }
+
+    /// Mark a producer/window delta lineage unsafe for warm reads.
+    pub fn mark_summary_lineage_incomplete(
+        &self,
+        sid: u64,
+        frame: &control_plane::physical::compiler::SummaryFrameIdentity,
+    ) {
+        self.incomplete_summary_lineages
+            .entry(sid)
+            .or_default()
+            .insert(frame.into());
+    }
+
+    /// A full checkpoint repairs only its exact producer/window lineage.
+    pub fn clear_summary_lineage_incomplete(
+        &self,
+        sid: u64,
+        frame: &control_plane::physical::compiler::SummaryFrameIdentity,
+    ) {
+        let key = IncompleteSummaryLineage::from(frame);
+        if let Some(mut lineages) = self.incomplete_summary_lineages.get_mut(&sid) {
+            lineages.remove(&key);
+        }
     }
 }
 
@@ -2386,6 +2450,48 @@ mod tests {
         let s_b = &series[1];
         assert_eq!(s_b.series_label_values, lv_b);
         assert_eq!(s_b.samples.len(), 2);
+    }
+
+    #[test]
+    fn incomplete_delta_window_fails_closed_until_matching_full_checkpoint() {
+        use control_plane::physical::compiler::{
+            StateEncoding, SummaryFrameIdentity, SummaryFrameKind,
+        };
+
+        let idx = SketchStore::new();
+        idx.register(meta(12));
+        idx.append_sample(12, BTreeMap::new(), (0, 10), sample(0));
+        idx.append_sample(12, BTreeMap::new(), (1000, 1010), sample(1));
+        let frame = SummaryFrameIdentity {
+            identity_version: 1,
+            plan_id: 7,
+            plan_version: 2,
+            backend_compat: "asap-query-backend.v1".into(),
+            materialization: PolicyFingerprint(41),
+            schema_id: "schema-41".into(),
+            producer_id: "edge-a".into(),
+            producer_epoch: "boot-1".into(),
+            window_start_unix_nano: 1_000_000_000,
+            window_end_unix_nano: 1_010_000_000,
+            sequence: 3,
+            kind: SummaryFrameKind::Delta,
+            encoding: StateEncoding::SketchlibProtobufV1,
+            checkpoint_id: None,
+            base_checkpoint_id: Some("cp-1".into()),
+        };
+        idx.mark_summary_lineage_incomplete(12, &frame);
+        assert!(idx.query_range(12, 1000, 1010).is_empty());
+        assert_eq!(idx.query_range(12, 0, 999).len(), 1);
+
+        let recovery = SummaryFrameIdentity {
+            kind: SummaryFrameKind::Full,
+            checkpoint_id: Some("cp-4".into()),
+            base_checkpoint_id: None,
+            sequence: 4,
+            ..frame
+        };
+        idx.clear_summary_lineage_incomplete(12, &recovery);
+        assert_eq!(idx.query_range(12, 1000, 1010).len(), 1);
     }
 
     #[test]

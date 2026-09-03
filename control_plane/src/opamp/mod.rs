@@ -1044,6 +1044,7 @@ mod tests {
                 emit_every_ms: 60_000,
                 full_checkpoint_every_ms: None,
                 destination_ref: "asapquery-backend".into(),
+                runtime_policy: crate::physical::compiler::RuntimeRulePolicy::default(),
             }],
         }
     }
