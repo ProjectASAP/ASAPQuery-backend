@@ -72,8 +72,9 @@ The complete sketch/query differential inventory is exercised with:
 ./scripts/e2e.sh differential-all
 ```
 
-It first runs all production-process raw-oracle comparisons and then the
-whole-path in-process scenario matrix. The matrix covers DDSketch and KLL quantiles, HLL
+It runs all production-process raw-oracle comparisons and the whole-path
+in-process scenario matrix even when the oracle suite finds a regression, then
+returns non-zero if either suite failed. The matrix covers DDSketch and KLL quantiles, HLL
 cardinality, CountSketch and Count-Min count queries, heap-backed top-k, an
 instant/range query pair, grouping, delta/sub-window ingest, and shadow/live
 serving. It exits non-zero for every real product regression; no scenario is

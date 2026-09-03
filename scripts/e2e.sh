@@ -160,8 +160,10 @@ whole_matrix() {
 }
 
 differential_all() {
-    sketch_oracles
-    whole_matrix
+    local status=0
+    sketch_oracles || status=$?
+    whole_matrix || status=$?
+    return "${status}"
 }
 
 list_suites() {
