@@ -517,7 +517,6 @@ mod tests {
                 data_sink: AgentDataSink::default(),
             },
             gateway_config: GatewayCollectorConfig { passthrough: true },
-            precompute: vec![],
             valid_until: Utc::now(),
             delta_decision: DeltaDecision::default(),
             transmission_cost_summary: TransmissionCostSummary::default(),

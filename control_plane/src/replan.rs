@@ -22,9 +22,9 @@ use tracing::{info, warn};
 
 use crate::backend_client::BackendClient;
 use crate::emit::{
-    build_precompute_engine_jobs, collect_metric_to_family, emit_for_runtime,
-    extend_edge_with_demo_plumbing, generate_agent_collector_config, post_typed_backend_for_role,
-    repost_cumulative_backend_config, AgentRuntime, PushOutcome, WorkloadRegistry,
+    collect_metric_to_family, emit_for_runtime, extend_edge_with_demo_plumbing,
+    generate_agent_collector_config, post_typed_backend_for_role, repost_cumulative_backend_config,
+    AgentRuntime, PushOutcome, WorkloadRegistry,
 };
 use crate::monitor::Scraper;
 use crate::opamp::{OpampServer, RemoteConfig};
@@ -447,8 +447,7 @@ impl Replanner {
         // previously established baseline — the whole point of a re-plan is to
         // re-optimise with current EMA data.
         self.planner.reset(metric);
-        let mut plan = self.planner.plan(&workload, Some(&wc));
-        plan.precompute = build_precompute_engine_jobs(&workload, "data-plane:4317");
+        let plan = self.planner.plan(&workload, Some(&wc));
         self.plan_store.set(metric, role, plan.clone());
 
         // Push agent config only to agents registered for this specific
@@ -925,7 +924,6 @@ mod tests {
                 data_sink: AgentDataSink::default(),
             },
             gateway_config: GatewayCollectorConfig { passthrough: true },
-            precompute: vec![],
             valid_until: Utc::now() + chrono::Duration::seconds(3600),
             delta_decision: DeltaDecision::default(),
             transmission_cost_summary: TransmissionCostSummary::default(),

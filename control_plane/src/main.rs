@@ -5,7 +5,6 @@ use control_plane::metrics_exposer;
 use control_plane::monitor;
 use control_plane::opamp;
 use control_plane::physical;
-use control_plane::physical::post_asap;
 use control_plane::pipeline;
 use control_plane::query_parser;
 use control_plane::replan;
@@ -30,10 +29,8 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use emit::{
-    build_precompute_engine_jobs, generate_agent_collector_config, post_typed_backend_for_role,
-};
 use emit::{emit_for_runtime, AgentRuntime};
+use emit::{generate_agent_collector_config, post_typed_backend_for_role};
 use monitor::{Endpoint, ScrapedData, Scraper, Thresholds, Violation};
 use opamp::{AgentRole, OpampServer, RemoteConfig};
 use physical::allocator::SketchAllocator;
@@ -612,7 +609,7 @@ struct CompileAndPublishPhysicalPlanResponse {
     collector_ids: Vec<String>,
 }
 
-/// Compile one Planner IR decision into the matching backend/Collector views
+/// Compile one Planner IR decision into matching Collector, Precompute, and Backend views
 /// and install them in dependency order. Unlike the legacy planning endpoint,
 /// this MVP boundary is fail-closed: the Collector plan is never published
 /// unless the backend accepted the exact matching BackendPlan first.
@@ -640,6 +637,31 @@ async fn handle_compile_and_publish_physical_plan(
         return (
             StatusCode::BAD_GATEWAY,
             format!("collector physical-plan preflight failed: {error}"),
+        )
+            .into_response();
+    }
+    let precompute_stage_config = BackendStageConfig {
+        aggregations: bundle.precompute_plan.materializations.clone(),
+        readouts: Vec::new(),
+    };
+    let precompute_config =
+        match emit::emit_backend_streaming_config_json(&precompute_stage_config, &[]) {
+            Ok(config) => config.to_string(),
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to emit precompute physical plan: {error}"),
+                )
+                    .into_response()
+            }
+        };
+    if let Err(error) = backend
+        .post_streaming_config_json_typed(precompute_config)
+        .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("backend rejected precompute physical plan: {error}"),
         )
             .into_response();
     }
@@ -677,14 +699,7 @@ async fn handle_compile_and_publish_physical_plan(
 // Only the Send-safe compiled bundle crosses an await point.
 fn compile_physical_plan_request(
     request: CompileAndPublishPhysicalPlanRequest,
-) -> Result<
-    (
-        physical::compiler::CompiledPlanBundle,
-        Vec<String>,
-        Duration,
-    ),
-    (StatusCode, String),
-> {
+) -> Result<(physical::compiler::PhysicalPlan, Vec<String>, Duration), (StatusCode, String)> {
     if request.queries.is_empty() || request.collector_ids.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -767,7 +782,7 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
         Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
     };
 
-    let mut plan = st.planner.plan(&workload, Some(&wc));
+    let plan = st.planner.plan(&workload, Some(&wc));
 
     // ── L1→L5: parse → optimise → bind → stage. One algebra pipeline. ───────
     // When the spec carries a `query_string`, this is the single place the
@@ -831,7 +846,6 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
         (plan_summary, stage_configs)
     };
 
-    plan.precompute = build_precompute_engine_jobs(&workload, "data-plane:4317");
     // B2 (metric, role): derive the role from the request's
     // query_string + optional `sketch_type` override so the
     // store keys at (metric, role) granularity. Without the role
@@ -1055,7 +1069,6 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
             "aggregate_by":        plan.agent_config.aggregate_by,
             "valid_until":         plan.valid_until,
             "agents_notified":     agents.len(),
-            "precompute_jobs":     plan.precompute.len(),
             "delta_decision":      plan.delta_decision,
             "transmission_costs": {
                 "raw_bytes_per_sec":                   cost.raw_bytes_per_sec,

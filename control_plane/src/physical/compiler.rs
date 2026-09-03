@@ -132,10 +132,24 @@ pub struct CollectorPlan {
     pub materializations: Vec<CollectorMaterialization>,
 }
 
+/// Backend-side materialization projection consumed by the streaming
+/// precompute engine. This is deliberately config-driven: it contains no
+/// PromQL string or ad-hoc scheduler job. The aggregation definitions are
+/// emitted to `/api/v1/streaming-config`, where the runtime matches incoming
+/// series, maintains windows, and writes content-addressed materializations.
 #[derive(Debug, Clone)]
-pub struct CompiledPlanBundle {
+pub struct PrecomputePlan {
+    pub envelope: PlanEnvelope,
+    pub materializations: Vec<BackendAggregation>,
+}
+
+/// Complete physical projection of one post-ASAP planning decision.
+/// All three child plans share the same envelope and are compiled together.
+#[derive(Debug, Clone)]
+pub struct PhysicalPlan {
     pub envelope: PlanEnvelope,
     pub collector_plans: Vec<CollectorPlan>,
+    pub precompute_plan: PrecomputePlan,
     pub backend_plan: BackendPlan,
 }
 
@@ -185,7 +199,7 @@ impl PhysicalCompiler {
         &self,
         request: PlanningRequest,
         environment: DeploymentEnvironment,
-    ) -> Result<CompiledPlanBundle, CompileError> {
+    ) -> Result<PhysicalPlan, CompileError> {
         if request.planner_revision != PLANNER_REVISION {
             return Err(CompileError::PlannerRevision {
                 request: request.planner_revision,
@@ -284,11 +298,12 @@ impl PhysicalCompiler {
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: environment.capability_snapshot_id,
         };
+        let backend_stage_config = BackendStageConfig {
+            aggregations: aggregations.clone(),
+            readouts,
+        };
         let mut backend_plan = backend_plan::from_stage_config(
-            &BackendStageConfig {
-                aggregations,
-                readouts,
-            },
+            &backend_stage_config,
             &Vec::<MonitorIntent>::new(),
             plan_id,
             environment.observed_at_unix_ms,
@@ -310,9 +325,14 @@ impl PhysicalCompiler {
                 materializations: collector_materializations.clone(),
             })
             .collect();
-        Ok(CompiledPlanBundle {
+        let precompute_plan = PrecomputePlan {
+            envelope: envelope.clone(),
+            materializations: aggregations,
+        };
+        Ok(PhysicalPlan {
             envelope,
             collector_plans,
+            precompute_plan,
             backend_plan,
         })
     }
@@ -576,6 +596,8 @@ mod tests {
             )
             .expect("compile");
         assert_eq!(bundle.collector_plans.len(), 2);
+        assert_eq!(bundle.precompute_plan.envelope, bundle.envelope);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 1);
         assert_eq!(bundle.backend_plan.materializations.len(), 1);
         assert_eq!(
             bundle
