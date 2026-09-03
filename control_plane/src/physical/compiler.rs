@@ -244,7 +244,19 @@ pub struct StateSchemaContract {
     pub schema_version: u32,
     pub materialization: asap_types::PolicyFingerprint,
     pub family: SummaryFamilyType,
+    pub source: Source,
+    pub value_column: planner_types::pre_asap::ColumnRef,
+    pub group_by: Vec<String>,
+    pub window: StateWindowContract,
     pub encodings: Vec<StateEncoding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct StateWindowContract {
+    pub kind: asap_types::WindowKind,
+    pub size_ms: u64,
+    pub slide_ms: Option<u64>,
 }
 
 /// A collector authorized to produce state for one materialization. Runtime
@@ -302,6 +314,14 @@ impl PrecomputePlan {
                 schema_version: 1,
                 materialization: *fingerprint,
                 family: materialization.family.clone(),
+                source: materialization.source.clone(),
+                value_column: materialization.col.clone(),
+                group_by: materialization.group_by.clone(),
+                window: StateWindowContract {
+                    kind: materialization.window.kind,
+                    size_ms: materialization.window.size_ms,
+                    slide_ms: materialization.window.slide_ms,
+                },
                 encodings: state_encodings(&materialization.family),
             })
             .collect::<Vec<_>>();
@@ -330,7 +350,7 @@ impl PrecomputePlan {
             producers,
             materializations,
         };
-        plan.validate()?;
+        plan.validate_against_backend(backend_plan)?;
         Ok(plan)
     }
 
@@ -409,6 +429,33 @@ impl PrecomputePlan {
         }
         if let Some(missing) = materializations.difference(&produced).next() {
             return Err(PrecomputePlanError::MissingProducer(missing.0));
+        }
+        Ok(())
+    }
+
+    pub fn validate_against_backend(
+        &self,
+        backend_plan: &BackendPlan,
+    ) -> Result<(), PrecomputePlanError> {
+        self.validate()?;
+        for schema in &self.schemas {
+            let Some(materialization) = backend_plan.materializations.get(&schema.materialization)
+            else {
+                return Err(PrecomputePlanError::SchemaSetMismatch);
+            };
+            if schema.family != materialization.family
+                || schema.schema_id != state_schema_id(schema.materialization)
+                || schema.source != materialization.source
+                || schema.value_column != materialization.col
+                || schema.group_by != materialization.group_by
+                || schema.window.kind != materialization.window.kind
+                || schema.window.size_ms != materialization.window.size_ms
+                || schema.window.slide_ms != materialization.window.slide_ms
+            {
+                return Err(PrecomputePlanError::InvalidSchema {
+                    schema_id: schema.schema_id.clone(),
+                });
+            }
         }
         Ok(())
     }
@@ -622,10 +669,17 @@ impl PhysicalCompiler {
                 materializations: collector_materializations.clone(),
             })
             .collect::<Vec<_>>();
-        let materializations = aggregations
-            .iter()
-            .map(backend_plan::aggregation_config_for_materialization)
-            .collect::<Result<Vec<_>, _>>()?;
+        // Several queries/readouts may intentionally share one maintained
+        // summary. PrecomputePlan is keyed by physical identity, not query ID.
+        let mut materializations_by_fingerprint = BTreeMap::new();
+        for aggregation in &aggregations {
+            let materialization =
+                backend_plan::aggregation_config_for_materialization(aggregation)?;
+            materializations_by_fingerprint
+                .entry(materialization.policy_fingerprint())
+                .or_insert(materialization);
+        }
+        let materializations = materializations_by_fingerprint.into_values().collect();
         let producer_ids = collector_plans
             .iter()
             .map(|plan| plan.collector_id.clone())
@@ -1280,6 +1334,42 @@ mod tests {
                 "ddsketch" | "kll"
             ));
         }
+    }
+
+    #[test]
+    fn multiple_readouts_share_one_precompute_materialization() {
+        let mut planning_request = request("q-p90", "quantile_over_time(0.90, m[1m])");
+        let second = request("q-p99", "quantile_over_time(0.99, m[1m])")
+            .queries
+            .into_iter()
+            .next()
+            .unwrap();
+        planning_request.queries.push(second);
+        let bundle = PhysicalCompiler
+            .compile(planning_request, environment(10_000))
+            .unwrap();
+
+        assert_eq!(bundle.query_plan.entries.len(), 2);
+        assert_eq!(bundle.backend_plan.materializations.len(), 1);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+        assert_eq!(bundle.precompute_plan.schemas.len(), 1);
+        assert_eq!(bundle.precompute_plan.producers.len(), 2);
+    }
+
+    #[test]
+    fn precompute_schema_must_match_backend_semantics() {
+        let bundle = PhysicalCompiler
+            .compile(
+                request("q-quantile", "quantile_over_time(0.99, m[1m])"),
+                environment(10_000),
+            )
+            .unwrap();
+        let mut plan = bundle.precompute_plan.clone();
+        plan.schemas[0].group_by.push("invented".into());
+        assert!(matches!(
+            plan.validate_against_backend(&bundle.backend_plan),
+            Err(PrecomputePlanError::InvalidSchema { .. })
+        ));
     }
 
     #[test]

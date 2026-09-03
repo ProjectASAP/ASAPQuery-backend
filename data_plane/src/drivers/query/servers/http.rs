@@ -5363,6 +5363,15 @@ async fn handle_post_physical_plan(
         )
             .into_response();
     }
+    if let Err(error) = request.precompute_plan.validate_against_backend(&new_plan) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": format!("PrecomputePlan validation error: {error}")
+            })),
+        )
+            .into_response();
+    }
     if request.query_plan.plan_id != new_plan.plan_id
         || request.query_plan.plan_version != new_plan.plan_version
         || request.precompute_plan.envelope.plan_id != new_plan.plan_id
