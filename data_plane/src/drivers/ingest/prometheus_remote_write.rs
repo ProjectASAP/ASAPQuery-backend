@@ -100,8 +100,8 @@ struct ReceiverInner {
 
 #[derive(Default)]
 struct DedupState {
-    values: HashMap<(String, i64), DedupValue>,
-    expiry: VecDeque<(Instant, String, i64)>,
+    values: HashMap<(u64, u64, String, i64), DedupValue>,
+    expiry: VecDeque<(Instant, u64, u64, String, i64)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -136,6 +136,8 @@ pub enum RemoteWriteError {
     Conflict { series: String, timestamp: i64 },
     #[error("deduplication capacity ({0}) is exhausted")]
     DedupCapacity(usize),
+    #[error("Remote Write requires an active PrometheusRemoteWriteV1 PhysicalPlan")]
+    InactivePhysicalPlan,
     #[error(transparent)]
     Backpressure(#[from] TryRouteError),
 }
@@ -208,6 +210,24 @@ impl PrometheusRemoteWriteReceiver {
         let request = WriteRequest::decode(decoded.as_slice())
             .map_err(|error| RemoteWriteError::Protobuf(error.to_string()))?;
         let samples = canonicalize_request(&request, config)?;
+        let physical_plan = self
+            .inner
+            .ingest
+            .physical_plan_snapshot()
+            .ok_or(RemoteWriteError::InactivePhysicalPlan)?;
+        if physical_plan.precompute_plan.envelope.plan_id == 0
+            || !matches!(
+                physical_plan.precompute_plan.ingest.protocol,
+                control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
+            )
+            || physical_plan.precompute_plan.ingest.endpoint_path != "/api/v1/write"
+        {
+            return Err(RemoteWriteError::InactivePhysicalPlan);
+        }
+        let plan_identity = (
+            physical_plan.precompute_plan.envelope.plan_id,
+            physical_plan.precompute_plan.envelope.plan_version,
+        );
 
         let now = Instant::now();
         let mut dedup = self
@@ -219,11 +239,16 @@ impl PrometheusRemoteWriteReceiver {
 
         // Validate conflicts both against committed history and inside this
         // request before reserving any worker capacity.
-        let mut batch_values: HashMap<(String, i64), DedupValue> = HashMap::new();
+        let mut batch_values: HashMap<(u64, u64, String, i64), DedupValue> = HashMap::new();
         let mut new_samples = Vec::with_capacity(samples.len());
         let mut duplicates = 0u64;
         for sample in samples {
-            let key = (sample.series_key.clone(), sample.timestamp_ms);
+            let key = (
+                plan_identity.0,
+                plan_identity.1,
+                sample.series_key.clone(),
+                sample.timestamp_ms,
+            );
             let value = sample
                 .value
                 .map(|v| DedupValue::Number(v.to_bits()))
@@ -249,15 +274,19 @@ impl PrometheusRemoteWriteReceiver {
             return Err(RemoteWriteError::DedupCapacity(config.max_dedup_entries));
         }
 
-        let messages = route_messages(&new_samples, &self.inner.ingest);
+        let messages = route_messages(&new_samples, &self.inner.ingest, &physical_plan);
         self.inner
             .ingest
             .router
             .try_route_group_batch_atomic(messages)?;
 
-        for ((series, timestamp), value) in batch_values {
-            dedup.values.insert((series.clone(), timestamp), value);
-            dedup.expiry.push_back((now, series, timestamp));
+        for ((plan_id, plan_version, series, timestamp), value) in batch_values {
+            dedup
+                .values
+                .insert((plan_id, plan_version, series.clone(), timestamp), value);
+            dedup
+                .expiry
+                .push_back((now, plan_id, plan_version, series, timestamp));
         }
         let stale_count = new_samples
             .iter()
@@ -288,10 +317,11 @@ impl DedupState {
         while self
             .expiry
             .front()
-            .is_some_and(|(accepted_at, _, _)| *accepted_at < cutoff)
+            .is_some_and(|(accepted_at, _, _, _, _)| *accepted_at < cutoff)
         {
-            if let Some((_, series, timestamp)) = self.expiry.pop_front() {
-                self.values.remove(&(series, timestamp));
+            if let Some((_, plan_id, plan_version, series, timestamp)) = self.expiry.pop_front() {
+                self.values
+                    .remove(&(plan_id, plan_version, series, timestamp));
             }
         }
     }
@@ -392,10 +422,14 @@ fn canonicalize_labels(
     Ok((metric, attrs, series_key))
 }
 
-fn route_messages(samples: &[CanonicalSample], ingest: &Arc<IngestState>) -> Vec<WorkerMessage> {
+fn route_messages(
+    samples: &[CanonicalSample],
+    ingest: &Arc<IngestState>,
+    physical_plan: &crate::storage_engines::types::ActivePhysicalPlan,
+) -> Vec<WorkerMessage> {
     type Bucket = (u64, asap_types::PolicyFingerprint, String);
     type RoutedSample = (String, i64, f64);
-    let snapshot = ingest.config_snapshot();
+    let snapshot = physical_plan.runtime_config.clone();
     let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed(
         ingest.sketch_index.as_ref(),
         &snapshot,
@@ -492,7 +526,10 @@ mod tests {
     use super::*;
     use crate::precompute_engine::ingest_handler::IngestObservability;
     use crate::precompute_engine::series_router::SeriesRouter;
-    use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
+    use crate::storage_engines::types::{
+        ActivePhysicalPlan, BackendStorageRouting, HotReloadActivePhysicalPlan,
+        HotReloadStreamingConfig, StreamingConfig,
+    };
     use tokio::sync::mpsc;
 
     fn compressed(request: WriteRequest) -> Vec<u8> {
@@ -501,13 +538,61 @@ mod tests {
             .unwrap()
     }
 
+    fn physical_config(streaming: StreamingConfig) -> HotReloadStreamingConfig {
+        use control_plane::physical::compiler::{
+            FrameIdentityContract, IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan,
+            SequenceScope, TimestampUnit, TransmissionPlan, PLANNER_REVISION,
+        };
+        let envelope = PlanEnvelope {
+            plan_id: 7,
+            plan_version: 3,
+            generated_at_unix_ms: 1,
+            activation_unix_ms: 1,
+            expiry_unix_ms: None,
+            backend_compat: control_plane::backend_plan::BACKEND_COMPAT.into(),
+            planner_revision: PLANNER_REVISION.into(),
+            capability_snapshot_id: "test".into(),
+        };
+        let active = ActivePhysicalPlan {
+            precompute_plan: PrecomputePlan {
+                envelope: envelope.clone(),
+                ingest: IngestContract {
+                    protocol: IngestProtocol::PrometheusRemoteWriteV1,
+                    endpoint_path: "/api/v1/write".into(),
+                    timestamp_unit: TimestampUnit::UnixMilliseconds,
+                    require_plan_identity: false,
+                    require_materialization_identity: false,
+                    require_registered_producer: false,
+                },
+                schemas: Vec::new(),
+                producers: Vec::new(),
+                materializations: streaming.aggregation_configs.values().cloned().collect(),
+            },
+            transmission_plan: TransmissionPlan {
+                envelope,
+                frame_identity: FrameIdentityContract {
+                    identity_version: 1,
+                    sequence_scope: SequenceScope::MaterializationSeriesProducerEpoch,
+                    require_checkpoint_for_full: true,
+                    require_base_checkpoint_for_delta: true,
+                },
+                rules: Vec::new(),
+            },
+            runtime_config: Arc::new(streaming),
+            backend_plan: Arc::new(control_plane::backend_plan::BackendPlan::default()),
+            query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
+            storage_routing: Arc::new(BackendStorageRouting::empty()),
+        };
+        HotReloadStreamingConfig::from_active(HotReloadActivePhysicalPlan::new(active))
+    }
+
     fn receiver(config: PrometheusRemoteWriteConfig) -> PrometheusRemoteWriteReceiver {
         let (sender, _receiver) = mpsc::channel(8);
         let ingest = Arc::new(IngestState {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: HotReloadStreamingConfig::new(StreamingConfig::default()),
+            hot_reload_config: physical_config(StreamingConfig::default()),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
@@ -545,7 +630,7 @@ mod tests {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: HotReloadStreamingConfig::new(streaming),
+            hot_reload_config: physical_config(streaming),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
@@ -579,6 +664,27 @@ mod tests {
                 histograms: Vec::new(),
             }],
         })
+    }
+
+    #[test]
+    fn rejects_writes_without_an_active_physical_plan() {
+        let (sender, _worker) = mpsc::channel(1);
+        let ingest = Arc::new(IngestState {
+            router: SeriesRouter::new(vec![sender]),
+            samples_ingested: AtomicU64::new(0),
+            samples_blocked_by_schema_barrier: AtomicU64::new(0),
+            hot_reload_config: HotReloadStreamingConfig::new(StreamingConfig::default()),
+            pass_raw_samples: false,
+            sketch_snapshots: dashmap::DashMap::new(),
+            series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
+            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            observability: IngestObservability::default(),
+        });
+        let receiver = PrometheusRemoteWriteReceiver::new(Default::default(), ingest);
+        assert!(matches!(
+            receiver.accept(&one_sample(1.0)),
+            Err(RemoteWriteError::InactivePhysicalPlan)
+        ));
     }
 
     #[test]
