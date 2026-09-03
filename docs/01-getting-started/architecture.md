@@ -2,6 +2,11 @@
 
 > Status: active
 
+This page describes the distributed Collector profile. The proposed
+[ASAPQuery compatibility profile](../design_docs/asapquery-compatibility-profile.md)
+is a smaller, collector-free mode that ingests raw samples only through
+Prometheus Remote Write.
+
 ## TL;DR
 
 ASAP separates logical planning, physical control, edge summary maintenance,
@@ -47,10 +52,11 @@ metrics, and transmits raw observations, full state, or deltas as directed. The
 data plane accepts a payload only when it matches the active BackendPlan and
 stores it under the declared materialization and logical window.
 
-ASAPQuery-backend does not treat legacy Telegraf, OTAP, Kafka, Prometheus
-remote-write, or in-backend raw precomputation paths as the MVP architecture.
-Future adapters may exist behind explicit interfaces without changing the
-primary OTel path.
+The distributed Collector profile does not treat legacy Telegraf, OTAP, Kafka,
+Prometheus Remote Write, or in-backend raw precomputation paths as its MVP
+architecture. The separate ASAPQuery compatibility profile intentionally uses
+Prometheus Remote Write and backend-local precompute without changing this
+profile's primary OTel path.
 
 ## Query path
 
