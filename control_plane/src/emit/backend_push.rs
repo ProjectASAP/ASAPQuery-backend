@@ -442,41 +442,52 @@ async fn push_cumulative_entries(
     // succeeds only when all three are accepted.
     let plan_id = PLAN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let generated_at_unix_ms = now_unix_ms();
-    let plan_bytes = match crate::backend_plan::from_stage_config(
+    let backend_plan = match crate::backend_plan::from_stage_config(
         &cumulative_be,
         monitors,
         plan_id,
         generated_at_unix_ms,
     ) {
-        Ok(plan) => plan.encode_to_vec(),
+        Ok(plan) => plan,
         Err(e) => {
             warn!(error = %e, "backend_plan::from_stage_config failed; refusing partial publication");
             return PushOutcome::EmitFailed;
         }
     };
-    let precompute_plan = PrecomputePlan {
-        envelope: PlanEnvelope {
-            plan_id,
-            plan_version: 1,
-            generated_at_unix_ms,
-            activation_unix_ms: generated_at_unix_ms,
-            expiry_unix_ms: None,
-            backend_compat: "asap-query-backend.v1".into(),
-            planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
-            capability_snapshot_id: "replanner".into(),
-        },
-        materializations: match cumulative_be
-            .aggregations
-            .iter()
-            .map(crate::backend_plan::aggregation_config_for_materialization)
-            .collect::<anyhow::Result<Vec<_>>>()
-        {
-            Ok(materializations) => materializations,
-            Err(error) => {
-                warn!(%error, "failed to build typed PrecomputePlan");
-                return PushOutcome::EmitFailed;
-            }
-        },
+    let plan_bytes = backend_plan.encode_to_vec();
+    let precompute_envelope = PlanEnvelope {
+        plan_id,
+        plan_version: 1,
+        generated_at_unix_ms,
+        activation_unix_ms: generated_at_unix_ms,
+        expiry_unix_ms: None,
+        backend_compat: "asap-query-backend.v1".into(),
+        planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
+        capability_snapshot_id: "replanner".into(),
+    };
+    let materializations = match cumulative_be
+        .aggregations
+        .iter()
+        .map(crate::backend_plan::aggregation_config_for_materialization)
+        .collect::<anyhow::Result<Vec<_>>>()
+    {
+        Ok(materializations) => materializations,
+        Err(error) => {
+            warn!(%error, "failed to build typed PrecomputePlan");
+            return PushOutcome::EmitFailed;
+        }
+    };
+    let precompute_plan = match PrecomputePlan::build(
+        precompute_envelope,
+        materializations,
+        &backend_plan,
+        &["legacy-replanner".into()],
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            warn!(%error, "failed to validate typed PrecomputePlan");
+            return PushOutcome::EmitFailed;
+        }
     };
 
     // Storage-routing: the routing classifier (`build_routing_entry` in

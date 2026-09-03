@@ -618,6 +618,18 @@ mod tests {
         ActivePhysicalPlan {
             precompute_plan: control_plane::physical::compiler::PrecomputePlan {
                 envelope,
+                ingest: control_plane::physical::compiler::IngestContract {
+                    protocol:
+                        control_plane::physical::compiler::IngestProtocol::ModifiedOtlpMetricsV1,
+                    endpoint_path: "/v1/metrics".into(),
+                    timestamp_unit:
+                        control_plane::physical::compiler::TimestampUnit::UnixNanoseconds,
+                    require_plan_identity: true,
+                    require_materialization_identity: true,
+                    require_registered_producer: true,
+                },
+                schemas: Vec::new(),
+                producers: Vec::new(),
                 materializations: Vec::new(),
             },
             runtime_config: Arc::new(StreamingConfig::new(HashMap::new())),
