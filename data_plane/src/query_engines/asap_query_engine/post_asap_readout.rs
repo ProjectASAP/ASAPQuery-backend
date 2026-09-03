@@ -8,7 +8,7 @@ use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome
 use control_plane::types_v2::AccuracyTarget;
 
 use crate::query_engines::asap_query_engine::post_asap_planner::{
-    execution_hints, plan_promql_to_post_asap, LoweringSkip,
+    execution_hints, plan_promql_to_post_asap, resolve_materializations_for_post_asap, LoweringSkip,
 };
 use crate::query_engines::asap_query_engine::summary_executor::{
     QueryExecutionContext, SummaryValue,
@@ -72,8 +72,17 @@ pub fn execute_post_asap_readout(
     accuracy: AccuracyTarget,
     backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    let node = plan_promql_to_post_asap(index, query, accuracy, backend_plan)?;
-    execute_planned_post_asap(index, &node, t0_ms, t1_ms, is_cumulative, backend_plan)
+    let node = plan_promql_to_post_asap(index, query, accuracy.clone(), backend_plan)?;
+    execute_planned_post_asap(
+        index,
+        &node,
+        query,
+        accuracy,
+        t0_ms,
+        t1_ms,
+        is_cumulative,
+        backend_plan,
+    )
 }
 
 /// Plan and execute an instant query without consulting the legacy candidate
@@ -87,7 +96,7 @@ pub fn execute_post_asap_instant(
     backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<(PostAsapReadoutOutcome, u64), LoweringSkip> {
     const DEFAULT_LOOKBACK_MS: u64 = 5 * 60 * 1000;
-    let node = plan_promql_to_post_asap(index, query, accuracy, backend_plan)?;
+    let node = plan_promql_to_post_asap(index, query, accuracy.clone(), backend_plan)?;
     let hints = execution_hints(&node);
     let t0_ms = if hints.full_history {
         0
@@ -97,6 +106,8 @@ pub fn execute_post_asap_instant(
     let outcome = execute_planned_post_asap(
         index,
         &node,
+        query,
+        accuracy,
         t0_ms,
         now_ms,
         hints.cumulative_readout,
@@ -108,26 +119,25 @@ pub fn execute_post_asap_instant(
 fn execute_planned_post_asap(
     index: &SketchStore,
     node: &planner_types::post_asap::SummaryNode,
+    query: &str,
+    accuracy: AccuracyTarget,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
     backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    let allowed_materializations = match backend_plan {
+        Some(plan) => Some(resolve_materializations_for_post_asap(
+            plan, node, query, accuracy,
+        )?),
+        None => None,
+    };
     let ctx = QueryExecutionContext {
         index,
         t0_ms,
         t1_ms,
         is_cumulative,
-        allowed_materializations: backend_plan.map(|plan| {
-            plan.routing
-                .iter()
-                .filter(|route| {
-                    route.storage_backend
-                        == control_plane::backend_plan::StorageBackend::SketchStore
-                })
-                .map(|route| route.materialization)
-                .collect()
-        }),
+        allowed_materializations,
     };
 
     match execute(node, &ctx) {

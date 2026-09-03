@@ -48,8 +48,9 @@ pub fn from_stage_config(
         HashMap::with_capacity(cfg.aggregations.len());
 
     for agg in &cfg.aggregations {
-        let fingerprint = policy_fingerprint_for_aggregation(agg)
+        let fingerprint = aggregation_config_for_materialization(agg)
             .with_context(|| format!("aggregation_id {:?}", agg.aggregation_id))?;
+        let fingerprint = fingerprint.policy_fingerprint();
         fingerprint_by_agg_id.insert(agg.aggregation_id.as_str(), fingerprint);
 
         let (kind, params) = match &agg.agg_type_override {
@@ -71,6 +72,7 @@ pub fn from_stage_config(
                 },
                 group_by: agg.grouping.clone(),
                 rollup: Vec::new(),
+                spatial_filter: asap_types::utils::normalize_spatial_filter(&agg.spatial_filter),
                 kind,
                 params,
                 col: ColumnRef::SampleValue,
@@ -134,14 +136,15 @@ pub fn from_stage_config(
 /// parser the real `POST /api/v1/streaming-config` handler uses (which
 /// parses its body as YAML regardless of declared content-type, since
 /// JSON is valid YAML) — rather than re-deriving the field mapping here.
-fn policy_fingerprint_for_aggregation(agg: &BackendAggregation) -> Result<PolicyFingerprint> {
+pub fn aggregation_config_for_materialization(
+    agg: &BackendAggregation,
+) -> Result<AggregationConfig> {
     let json = build_backend_aggregation_json(agg);
     let text = serde_json::to_string(&json).context("serialize synthesized aggregation JSON")?;
     let yaml_value: serde_yaml::Value =
         serde_yaml::from_str(&text).context("parse synthesized aggregation JSON as YAML")?;
-    let cfg = AggregationConfig::from_yaml_data(&yaml_value, None, QueryLanguage::promql)
-        .context("build AggregationConfig from synthesized aggregation JSON")?;
-    Ok(cfg.policy_fingerprint())
+    AggregationConfig::from_yaml_data(&yaml_value, None, QueryLanguage::promql)
+        .context("build AggregationConfig from synthesized aggregation JSON")
 }
 
 /// Option B (post-#287) exact-agg override: `s` is already the wire

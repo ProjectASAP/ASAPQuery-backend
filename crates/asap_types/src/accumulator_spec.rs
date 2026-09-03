@@ -95,7 +95,8 @@ use crate::AggregationType;
 /// variant, e.g. `CmsWithHeap` vs `Cms`). Vendored (see module doc): same
 /// 14-variant shape ASAPController's pre-split `asap_sketch::SummaryKind`
 /// had.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SummaryKind {
     Sum,
     Count,
@@ -132,7 +133,8 @@ impl SummaryKind {
 /// Typed tuning parameters matching a [`SummaryKind`]. Vendored
 /// alongside it (see module doc) — same shape as ASAPController's
 /// pre-split `asap_sketch::SummaryParams`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SummaryParams {
     Sum,
     Count,

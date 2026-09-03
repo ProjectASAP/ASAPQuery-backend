@@ -396,11 +396,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
                     if self
                         .allowed_materializations
                         .as_ref()
-                        .is_some_and(|allowed| {
-                            !allowed.contains(&m.policy_fp)
-                                && !(m.policy_fp == asap_types::PolicyFingerprint::UNSET
-                                    && allowed.len() == 1)
-                        })
+                        .is_some_and(|allowed| !allowed.contains(&m.policy_fp))
                     {
                         return None;
                     }

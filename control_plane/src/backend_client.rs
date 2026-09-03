@@ -359,6 +359,47 @@ impl BackendClient {
             Err(classify_http_status(status, body, "BackendPlan POST"))
         }
     }
+
+    /// Publish the backend-facing portions of one PhysicalPlan in a single
+    /// request, preventing independently retried documents from mixing
+    /// generations at the backend.
+    pub async fn post_physical_plan_typed(
+        &self,
+        precompute_plan: &crate::physical::compiler::PrecomputePlan,
+        backend_plan: Vec<u8>,
+        storage_routing: Option<serde_json::Value>,
+    ) -> std::result::Result<(), BackendPostError> {
+        let url = derive_physical_plan_url(&self.endpoint);
+        let response = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+            "precompute_plan": precompute_plan,
+            "backend_plan": backend_plan,
+            "storage_routing": storage_routing,
+            }))
+            .send()
+            .await
+            .map_err(classify_reqwest_error)?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(classify_http_status(status, body, "PhysicalPlan POST"))
+        }
+    }
+}
+
+fn derive_physical_plan_url(endpoint: &str) -> String {
+    const DASH: &str = "/api/v1/streaming-config";
+    const UNDERSCORE: &str = "/api/v1/streaming_config";
+    const PHYSICAL: &str = "/api/v1/physical-plan";
+    endpoint
+        .strip_suffix(DASH)
+        .or_else(|| endpoint.strip_suffix(UNDERSCORE))
+        .map(|base| format!("{base}{PHYSICAL}"))
+        .unwrap_or_else(|| endpoint.to_string())
 }
 
 /// Map a streaming-config endpoint URL to the sibling storage-routing

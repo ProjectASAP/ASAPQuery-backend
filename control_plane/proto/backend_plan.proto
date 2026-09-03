@@ -168,6 +168,8 @@ message Materialization {
   ColumnRef col = 7;
   optional RetentionPolicy retention = 8;
   optional SummaryMaintenanceLifecycle lifecycle = 9;
+  // Canonical label matcher set (sorted `key="value"` entries).
+  string spatial_filter = 10;
 }
 
 message SummaryMaintenanceLifecycle {

@@ -93,18 +93,21 @@ use crate::storage_engines::types::StreamingConfig;
 #[derive(Clone)]
 pub struct HotReloadBackendPlan {
     inner: Arc<ArcSwap<control_plane::backend_plan::BackendPlan>>,
+    install_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl HotReloadBackendPlan {
     pub fn new(initial: control_plane::backend_plan::BackendPlan) -> Self {
         Self {
             inner: Arc::new(ArcSwap::new(Arc::new(initial))),
+            install_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
     pub fn from_arc(initial: Arc<control_plane::backend_plan::BackendPlan>) -> Self {
         Self {
             inner: Arc::new(ArcSwap::new(initial)),
+            install_lock: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -128,7 +131,20 @@ impl HotReloadBackendPlan {
         Arc<control_plane::backend_plan::BackendPlan>,
         control_plane::backend_plan::ValidationError,
     > {
+        let _guard = self
+            .install_lock
+            .lock()
+            .expect("backend-plan install lock poisoned");
         new.validate()?;
+        let active = self.snapshot();
+        if new.generated_at_unix_ms < active.generated_at_unix_ms {
+            return Err(
+                control_plane::backend_plan::ValidationError::StaleGeneration {
+                    incoming: new.generated_at_unix_ms,
+                    active: active.generated_at_unix_ms,
+                },
+            );
+        }
         Ok(self.swap(new))
     }
 }
@@ -199,6 +215,20 @@ mod hot_reload_backend_plan_tests {
             });
         assert!(hr.install(invalid).is_err());
         assert_eq!(hr.snapshot().plan_id, 1);
+    }
+
+    #[test]
+    fn older_generation_is_rejected_without_replacing_snapshot() {
+        let mut current = plan(2);
+        current.generated_at_unix_ms = 200;
+        let hr = HotReloadBackendPlan::new(current);
+        let mut stale = plan(3);
+        stale.generated_at_unix_ms = 199;
+        assert!(matches!(
+            hr.install(stale),
+            Err(control_plane::backend_plan::ValidationError::StaleGeneration { .. })
+        ));
+        assert_eq!(hr.snapshot().plan_id, 2);
     }
 }
 

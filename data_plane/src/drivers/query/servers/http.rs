@@ -146,6 +146,9 @@ pub struct HttpServer {
     /// normal routing-table path (which goes to Thanos for the cold
     /// archive and observes the 60–90 s flush gap).
     probe_cache: Option<Arc<FreshnessProbeCache>>,
+    /// Serializes multi-document physical-plan publication so two control
+    /// plane generations cannot interleave their config and BackendPlan.
+    physical_plan_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -171,6 +174,7 @@ struct AppState {
     data_retention_ms: Option<u64>,
     /// See [`HttpServer::probe_cache`].
     probe_cache: Option<Arc<FreshnessProbeCache>>,
+    physical_plan_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl HttpServer {
@@ -195,6 +199,7 @@ impl HttpServer {
             backfill: None,
             data_retention_ms: None,
             probe_cache: None,
+            physical_plan_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -358,6 +363,7 @@ impl HttpServer {
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
             probe_cache: self.probe_cache.clone(),
+            physical_plan_lock: self.physical_plan_lock.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -383,6 +389,7 @@ impl HttpServer {
                 "/api/v1/backend-plan",
                 get(handle_get_backend_plan).post(handle_post_backend_plan),
             )
+            .route("/api/v1/physical-plan", post(handle_post_physical_plan))
             // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
             // returns a JSON snapshot for operator diagnostics.
@@ -443,6 +450,7 @@ impl HttpServer {
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
             probe_cache: self.probe_cache.clone(),
+            physical_plan_lock: self.physical_plan_lock.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -464,6 +472,7 @@ impl HttpServer {
                 "/api/v1/backend-plan",
                 get(handle_get_backend_plan).post(handle_post_backend_plan),
             )
+            .route("/api/v1/physical-plan", post(handle_post_physical_plan))
             // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
             // returns a JSON snapshot for operator diagnostics.
@@ -5333,6 +5342,130 @@ async fn handle_post_backend_plan(
         "materialization_count": materialization_count,
         "routing_count": routing_count});
     (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct PhysicalPlanInstallRequest {
+    precompute_plan: control_plane::physical::compiler::PrecomputePlan,
+    backend_plan: Vec<u8>,
+    storage_routing: Option<serde_json::Value>,
+}
+
+/// Install the two backend views of one PhysicalPlan as one validated
+/// publication. The BackendPlan is installed first, so readers racing the
+/// short swap interval fail closed on missing fingerprints rather than using
+/// a new streaming configuration with stale routing authority.
+async fn handle_post_physical_plan(
+    State(state): State<AppState>,
+    axum::Json(request): axum::Json<PhysicalPlanInstallRequest>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use std::collections::BTreeSet;
+
+    let (Some(config_handle), Some(plan_handle)) = (
+        state.hot_reload_config.as_ref(),
+        state.hot_reload_backend_plan.as_ref(),
+    ) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": "physical-plan hot-reload handles are not attached"
+            })),
+        )
+            .into_response();
+    };
+    let new_config = crate::storage_engines::types::StreamingConfig::new(
+        request
+            .precompute_plan
+            .materializations
+            .iter()
+            .cloned()
+            .map(|config| (config.policy_fp_u64(), config))
+            .collect(),
+    );
+    let new_plan = match control_plane::backend_plan::BackendPlan::decode(&request.backend_plan) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(serde_json::json!({
+                    "status": "error", "error": format!("BackendPlan decode error: {error}")
+                })),
+            )
+                .into_response()
+        }
+    };
+    if let Err(error) = new_plan.validate() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": format!("BackendPlan validation error: {error}")
+            })),
+        )
+            .into_response();
+    }
+    let config_fps: BTreeSet<u64> = new_config.aggregation_configs.keys().copied().collect();
+    let plan_fps: BTreeSet<u64> = new_plan.materializations.keys().map(|fp| fp.0).collect();
+    if config_fps != plan_fps {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(serde_json::json!({
+                "status": "error",
+                "error": "streaming-config and BackendPlan materialization fingerprints differ"
+            })),
+        )
+            .into_response();
+    }
+    let new_routing = match request.storage_routing.as_ref() {
+        Some(value) => match crate::storage_engines::types::BackendStorageRouting::from_json_payload(value) {
+            Ok(routing) => Some(routing),
+            Err(error) => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
+                "status": "error", "error": format!("BackendStorageRouting build error: {error:#}")
+            }))).into_response(),
+        },
+        None => None,
+    };
+    if new_routing.is_some() && state.backend_storage_routing.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": "storage-routing hot-reload handle is not attached"
+            })),
+        )
+            .into_response();
+    }
+
+    let _guard = state.physical_plan_lock.lock().await;
+    let plan_id = new_plan.plan_id;
+    if let Err(error) = plan_handle.install(new_plan) {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": format!("BackendPlan install error: {error}")
+            })),
+        )
+            .into_response();
+    }
+    config_handle.swap(new_config);
+    if let (Some(handle), Some(routing)) = (state.backend_storage_routing.as_ref(), new_routing) {
+        let tenant = routing.tenant().to_string();
+        handle.swap_tenant(&tenant, routing);
+    }
+    let snap = config_handle.snapshot();
+    let sid_summary = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
+        state.sketch_index.as_ref(),
+        snap.as_ref(),
+        crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
+    );
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "status": "success", "plan_id": plan_id,
+            "materialization_count": plan_fps.len(), "sids_retired": sid_summary.retired
+        })),
+    )
+        .into_response()
 }
 
 // ── Phase α: BackendStorageRouting hot-reload endpoints ────────────

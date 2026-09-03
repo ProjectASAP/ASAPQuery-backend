@@ -1814,15 +1814,10 @@ fn derive_sketch_policy_fp(
     };
     let params = sketch_config_to_params(cfg);
     let snap = ingest_state.config_snapshot();
-    let registry = snap.policy_registry();
-    control_plane::asap_tier_analysis::find_policy_by_content(
-        &registry,
-        metric,
-        group_by_keys,
-        agg_type,
-        &params,
-    )
-    .unwrap_or(asap_types::PolicyFingerprint::UNSET)
+    let index = asap_types::RoutingIndex::build(snap.policy_registry());
+    index
+        .find_policy_by_content(metric, group_by_keys, agg_type, &params)
+        .unwrap_or(asap_types::PolicyFingerprint::UNSET)
 }
 
 /// Phase 5 helper — map a `ModifiedOtlpSketchDp` to the matching

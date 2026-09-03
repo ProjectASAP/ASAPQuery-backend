@@ -2,10 +2,7 @@
 //! plan**.
 //!
 //! This composes two existing pieces with slice 1's inverse map:
-//!   1. [`analyze_promql_for_asap_tier`] lowers each query to
-//!      `ASAPTierCandidate`s, each already carrying a `metric_name` and the
-//!      `required_capability` the query needs (and an `unsupported` reason for
-//!      the parts that only the cold tier can answer).
+//!   1. ASAPPlanner lowers each query to its canonical post-ASAP summary DAG.
 //!   2. [`required_sketches_for_capabilities`](crate::sketch_selection::required_sketches_for_capabilities)
 //!      (slice 1) maps a capability set to the `SketchType` families that satisfy it.
 //!
@@ -16,7 +13,6 @@
 
 use std::collections::BTreeMap;
 
-use crate::asap_tier_analysis::{analyze_promql_for_asap_tier, UnsupportedReason};
 use crate::physical::runtime_capability::Capability;
 use crate::sketch_selection::required_sketches_for_capabilities;
 use crate::types::SketchType;
@@ -40,7 +36,7 @@ pub struct ColdQuery {
     pub query: String,
     /// Why it isn't ASAP-tier-answerable (`None` only in the degenerate case
     /// where the analyzer returned no candidates and no explicit reason).
-    pub reason: Option<UnsupportedReason>,
+    pub reason: Option<String>,
 }
 
 /// The full allocation plan for a query set: what to allocate warm, and what
@@ -91,21 +87,23 @@ where
 
     for q in queries {
         let q = q.as_ref();
-        let analysis = analyze_promql_for_asap_tier(q);
-
-        for cand in &analysis.candidates {
-            let caps = by_metric.entry(cand.metric_name.clone()).or_default();
-            if !caps.contains(&cand.required_capability) {
-                caps.push(cand.required_capability.clone());
+        let planned = crate::asap_tier_implement::implement_promql_for_asap_tier(q);
+        let mut found = false;
+        if let Ok(nodes) = &planned {
+            for node in nodes {
+                if let Some((metric, capability)) = planned_capability(node) {
+                    found = true;
+                    let caps = by_metric.entry(metric).or_default();
+                    if !caps.contains(&capability) {
+                        caps.push(capability);
+                    }
+                }
             }
         }
-
-        // No answerable candidate at all, OR a partially-supported query with a
-        // residual unsupported reason → the (residual) query goes cold.
-        if analysis.candidates.is_empty() || analysis.unsupported.is_some() {
+        if !found {
             cold_only.push(ColdQuery {
                 query: q.to_string(),
-                reason: analysis.unsupported,
+                reason: planned.err().map(|error| format!("{error:?}")),
             });
         }
     }
@@ -126,6 +124,93 @@ where
         per_metric,
         cold_only,
     }
+}
+
+fn planned_capability(
+    node: &planner_types::post_asap::SummaryNode,
+) -> Option<(String, Capability)> {
+    use crate::physical::runtime_capability::SketchKindHandle;
+    use planner_types::post_asap::{SketchQuery, SummaryExpr, SummaryFamilyType};
+
+    fn metric(node: &planner_types::post_asap::SummaryNode) -> Option<String> {
+        fn from_query(expr: &planner_types::pre_asap::QueryExpr) -> Option<String> {
+            use planner_types::pre_asap::{QueryExpr, Source};
+            match expr {
+                QueryExpr::Scan {
+                    source: Source::TimeSeries { metric },
+                    ..
+                } => Some(metric.clone()),
+                QueryExpr::Filter { child, .. }
+                | QueryExpr::Project { child, .. }
+                | QueryExpr::Aggregate { child, .. }
+                | QueryExpr::Dedup { child, .. }
+                | QueryExpr::Sort { child, .. }
+                | QueryExpr::Limit { child, .. }
+                | QueryExpr::PromqlSubquery { child, .. }
+                | QueryExpr::TimeRange { child, .. }
+                | QueryExpr::TimeShift { child, .. }
+                | QueryExpr::SQLWindowFunc { child, .. } => from_query(child),
+                _ => None,
+            }
+        }
+        match &node.expr {
+            SummaryExpr::KeepPreAsap(expr) => from_query(expr),
+            SummaryExpr::SummaryAgg { child, .. } => metric(child),
+            SummaryExpr::SummaryEstimate { summary_input, .. } => metric(summary_input),
+            SummaryExpr::SummaryMerge { children } => {
+                children.iter().find_map(|child| metric(child))
+            }
+            _ => None,
+        }
+    }
+
+    fn handle(family: &SummaryFamilyType) -> Option<SketchKindHandle> {
+        let SummaryFamilyType::Sketch(kind, _) = family else {
+            return None;
+        };
+        Some(match asap_types::SummaryKind::from(kind.clone()) {
+            asap_types::SummaryKind::DDSketch => SketchKindHandle::DDSketch,
+            asap_types::SummaryKind::Kll => SketchKindHandle::Kll,
+            asap_types::SummaryKind::Hll => SketchKindHandle::Hll,
+            asap_types::SummaryKind::Cms => SketchKindHandle::CountMin,
+            asap_types::SummaryKind::CmsWithHeap => SketchKindHandle::CmsWithHeap,
+            asap_types::SummaryKind::CountSketch => SketchKindHandle::CountSketch,
+            asap_types::SummaryKind::CountSketchWithHeap => SketchKindHandle::CountSketchWithHeap,
+            _ => return None,
+        })
+    }
+
+    let metric = metric(node)?;
+    let capability = match &node.expr {
+        SummaryExpr::SummaryEstimate {
+            summary_input,
+            query,
+        } => {
+            let SummaryExpr::SummaryAgg { family, .. } = &summary_input.expr else {
+                return None;
+            };
+            match query {
+                SketchQuery::Quantile { .. } => Capability::QuantileApprox(handle(family)?),
+                SketchQuery::Cardinality => Capability::CardinalityApprox,
+                SketchQuery::PointCount { .. } => Capability::FrequencyEstimate(handle(family)?),
+                SketchQuery::TopK { .. } => Capability::FrequencyTopk(handle(family)?),
+            }
+        }
+        SummaryExpr::SummaryAgg {
+            family: SummaryFamilyType::ExactAggregate(kind, _),
+            ..
+        } => {
+            let agg = match asap_types::SummaryKind::from(kind.clone()) {
+                asap_types::SummaryKind::Sum => asap_types::AggregationType::Sum,
+                asap_types::SummaryKind::Increase => asap_types::AggregationType::Increase,
+                asap_types::SummaryKind::MinMax => asap_types::AggregationType::MinMax,
+                _ => return None,
+            };
+            Capability::ExactAgg(agg)
+        }
+        _ => return None,
+    };
+    Some((metric, capability))
 }
 
 #[cfg(test)]

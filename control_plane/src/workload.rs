@@ -152,7 +152,7 @@ pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
         return AggRole::Other;
     };
     let mut intents: Vec<AggIntent> = Vec::new();
-    crate::asap_tier_analysis::collect_agg_intents(&expr, &mut intents);
+    collect_agg_intents(&expr, &mut intents);
     let Some(outer) = intents.first() else {
         // No Aggregate node at all — a bare metric selector (or a
         // window-only shape with no AggType to map onto). Bare
@@ -173,6 +173,43 @@ pub fn derive_agg_role(entry: &WorkloadEntry) -> AggRole {
         AggIntent::Cardinality { .. } | AggIntent::Count { .. } => AggRole::Count,
         AggIntent::Sum { .. } | AggIntent::Rate | AggIntent::Increase => AggRole::Sum,
         _ => AggRole::Other,
+    }
+}
+
+fn collect_agg_intents(expr: &planner_types::pre_asap::QueryExpr, out: &mut Vec<AggIntent>) {
+    use planner_types::pre_asap::QueryExpr;
+    match expr {
+        QueryExpr::Aggregate {
+            measures, child, ..
+        } => {
+            out.extend(measures.iter().cloned());
+            collect_agg_intents(child, out);
+        }
+        QueryExpr::Filter { child, .. }
+        | QueryExpr::Project { child, .. }
+        | QueryExpr::Dedup { child, .. }
+        | QueryExpr::Sort { child, .. }
+        | QueryExpr::Limit { child, .. }
+        | QueryExpr::PromqlSubquery { child, .. }
+        | QueryExpr::TimeRange { child, .. }
+        | QueryExpr::TimeShift { child, .. }
+        | QueryExpr::SQLWindowFunc { child, .. } => collect_agg_intents(child, out),
+        QueryExpr::Concat { children } => {
+            for child in children {
+                collect_agg_intents(child, out);
+            }
+        }
+        QueryExpr::Join { left, right, .. }
+        | QueryExpr::SetOp { left, right, .. }
+        | QueryExpr::BinaryOp {
+            lhs: left,
+            rhs: right,
+            ..
+        } => {
+            collect_agg_intents(left, out);
+            collect_agg_intents(right, out);
+        }
+        _ => {}
     }
 }
 

@@ -450,7 +450,7 @@ mod tests {
             0.05,
             &["quantile_over_time(0.99, latency_ms[5m])".to_string()],
             1.0,
-            |_m, sks| metric_rate_from_telemetry(&store, sks),
+            |_m, _sks| metric_rate_from_telemetry(&store, &[SketchType::DDSketch]),
             &monitors,
         );
         let m = resp
