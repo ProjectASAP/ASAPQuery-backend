@@ -532,6 +532,12 @@ impl AccumulatorUpdater for MultipleIncreaseAccumulatorUpdater {
 // CmsAccumulatorUpdater (CountMinSketch)
 // ---------------------------------------------------------------------------
 
+/// Keyed weighted-frequency updater.
+///
+/// A raw Prometheus sample represents the observed metric value, so a bare CMS
+/// adds `value` for its key. Counting each received sample as one is a distinct
+/// event-count operation and requires an explicit typed plan contract; it must
+/// not be inferred from the sketch algorithm alone.
 pub struct CmsAccumulatorUpdater {
     acc: CountMinSketchAccumulator,
     row_num: usize,
@@ -684,6 +690,10 @@ impl AccumulatorUpdater for CmsHeapAccumulatorUpdater {
 /// `CmsAccumulatorUpdater`'s CMS (min-of-rows). Closes, on the raw-metric
 /// ingest path, the conflation bug where `SummaryKind::CountSketch` silently
 /// shared `CmsAccumulatorUpdater` with bare CMS.
+///
+/// As with bare CMS, each raw Prometheus sample contributes its `value`.
+/// Unit event counting must be selected explicitly by a future typed plan
+/// contract rather than being implied by `SummaryKind::CountSketch`.
 pub struct CountSketchAccumulatorUpdater {
     acc: CountSketchAccumulator,
     row_num: usize,
@@ -1166,6 +1176,40 @@ mod tests {
 
         let acc = updater.take_accumulator();
         assert_eq!(acc.type_name(), "MultipleSumAccumulator");
+    }
+
+    #[test]
+    fn bare_cms_adds_sample_values() {
+        let mut updater = CmsAccumulatorUpdater::new(4, 256);
+        let key = KeyByLabelValues::new_with_labels(vec!["api".to_string()]);
+
+        updater.update_keyed(&key, 2.0, 1000);
+        updater.update_keyed(&key, 3.0, 2000);
+        updater.update_keyed(&key, 5.0, 3000);
+
+        let acc = updater.snapshot_accumulator();
+        let cms = acc
+            .as_any()
+            .downcast_ref::<CountMinSketchAccumulator>()
+            .expect("should be a CountMinSketchAccumulator");
+        assert_eq!(cms.query_key(&key), 10.0);
+    }
+
+    #[test]
+    fn bare_count_sketch_adds_sample_values() {
+        let mut updater = CountSketchAccumulatorUpdater::new(5, 256);
+        let key = KeyByLabelValues::new_with_labels(vec!["api".to_string()]);
+
+        updater.update_keyed(&key, 2.0, 1000);
+        updater.update_keyed(&key, 3.0, 2000);
+        updater.update_keyed(&key, 5.0, 3000);
+
+        let acc = updater.snapshot_accumulator();
+        let count_sketch = acc
+            .as_any()
+            .downcast_ref::<CountSketchAccumulator>()
+            .expect("should be a CountSketchAccumulator");
+        assert_eq!(count_sketch.query_key(&key), 10.0);
     }
 
     #[test]
