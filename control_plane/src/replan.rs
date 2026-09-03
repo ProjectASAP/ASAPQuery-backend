@@ -1211,9 +1211,9 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc as StdArc;
 
-    /// Start a mock backend serving both the streaming-config and
-    /// storage-routing endpoints, returning the streaming-config URL and a
-    /// shared hit-counter for the streaming endpoint.
+    /// Start a mock backend serving the complete publication contract,
+    /// returning the streaming-config URL and a shared hit-counter for that
+    /// endpoint.
     async fn start_repost_mock() -> (String, StdArc<AtomicU32>) {
         use axum::extract::State;
         use axum::routing::post;
@@ -1231,6 +1231,10 @@ mod tests {
             )
             .route(
                 "/api/v1/storage_routing",
+                post(|_b: axum::body::Bytes| async move { axum::http::StatusCode::OK }),
+            )
+            .route(
+                "/api/v1/backend-plan",
                 post(|_b: axum::body::Bytes| async move { axum::http::StatusCode::OK }),
             )
             .with_state(StdArc::clone(&hits));
