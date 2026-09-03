@@ -80,18 +80,12 @@ message BackendCollectorConfig {
   repeated string group_by     = 2;
 }
 
-message PrecomputeJob {
-  string   query_expr   = 1;
-  google.protobuf.Duration granularity = 2;
-  string   sketch_source = 3;
-  string   store_path    = 4;
-}
-
 message CollectionPlan {
   AgentCollectorConfig   agent_config   = 1;
   GatewayCollectorConfig gateway_config = 2;
   BackendCollectorConfig backend_config = 3;
-  repeated PrecomputeJob precompute     = 4;
+  reserved 4;
+  reserved "precompute";
   google.protobuf.Timestamp valid_until = 5;
 }
 

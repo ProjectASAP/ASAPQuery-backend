@@ -51,8 +51,6 @@ pub struct ControlPlanePlan {
     #[serde(default)]
     pub aggregate_by: Vec<String>,
     #[serde(default)]
-    pub precompute_jobs: usize,
-    #[serde(default)]
     pub delta_decision: serde_json::Value,
     #[serde(default)]
     pub staged_plan: Option<serde_json::Value>,

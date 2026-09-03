@@ -5,10 +5,12 @@
 
 ## Current implementation boundary
 
-The compiler consumes ASAPPlanner types pinned to revision `3afcba6`, selects
+The compiler consumes ASAPPlanner types pinned to the revision exposed as
+`physical::compiler::PLANNER_REVISION`, selects
 from Planner's legal candidate space with backend-owned cost and evidence
-inputs, and emits one `CompiledPlanBundle`. The bundle contains a CollectorPlan
-for every target collector and the matching BackendPlan. Legacy
+inputs, and emits one `PhysicalPlan`. The plan contains CollectorPlan,
+PrecomputePlan, and BackendPlan projections compiled from the same decision
+for every target collector. Legacy
 `StageAllocator`/`ThreeStageEmitter` paths remain for older publication flows;
 they are not a second semantic planner.
 
@@ -30,10 +32,11 @@ PlanningRequest
 ASAPPlanner candidate selection
       |
       v
-PhysicalCompiler -------> CompiledPlanBundle
-                            |             |
-                            v             v
-                       CollectorPlan   BackendPlan
+PhysicalCompiler -------> PhysicalPlan
+                            |       |       |
+                            v       v       v
+                      Collector  Precompute Backend
+                         Plan       Plan     Plan
 ```
 
 - **Planner selection boundary** is
@@ -41,8 +44,8 @@ PhysicalCompiler -------> CompiledPlanBundle
   candidates and commits only a legal candidate.
 - **Physical compiler** adds backend-owned placement, windows, transport, and
   runtime capabilities without changing logical semantics.
-- **Plan bundle** is the only output passed to publication. CollectorPlan and
-  BackendPlan are created together and share identities.
+- **PhysicalPlan** is the only output passed to publication. Its CollectorPlan,
+  PrecomputePlan, and BackendPlan projections are created together and share identities.
 
 Logical query parsing, summary alternatives, guarantees, and candidate search
 remain public ASAPPlanner interfaces. Runtime publication is documented in
@@ -96,7 +99,7 @@ impl PhysicalCompiler {
         &self,
         request: PlanningRequest,
         environment: DeploymentEnvironment,
-    ) -> Result<CompiledPlanBundle, CompileError>;
+    ) -> Result<PhysicalPlan, CompileError>;
 }
 ```
 
@@ -108,9 +111,10 @@ pub struct DeploymentEnvironment {
     pub max_evidence_age_ms: u64,
 }
 
-pub struct CompiledPlanBundle {
+pub struct PhysicalPlan {
     pub envelope: PlanEnvelope,
     pub collector_plans: Vec<CollectorPlan>, // complete per-target projections
+    pub precompute_plan: PrecomputePlan,      // backend streaming materializations
     pub backend_plan: BackendPlan,
 }
 ```
@@ -122,6 +126,7 @@ Supporting public types:
 | `DeploymentEnvironment` | Target collector IDs, capability snapshot identity, planning time, and evidence freshness policy. |
 | `PlanEnvelope` | Shared deterministic `plan_id`, generation time, capability snapshot, and Planner revision. |
 | `CollectorPlan` | Serializable execution projection consumed by ASAPCollector. |
+| `PrecomputePlan` | Config-driven aggregation/window projection consumed by the backend streaming precompute engine. |
 | `BackendPlan` | Versioned public data-plane materialization/routing contract defined in this repository. |
 
 Current MVP limits are explicit: time-series sources and sketch
@@ -135,6 +140,7 @@ Output definitions:
 | --- | --- |
 | `envelope` | Shared plan/version/activation/compatibility identity. |
 | `collector_plans` | One plan per targeted collector, following ASAPCollector's public CollectorPlan schema. |
+| `precompute_plan` | Aggregation definitions emitted to `/api/v1/streaming-config`; contains no query-string jobs. |
 | `backend_plan` | Matching data-plane materialization and routing contract. |
 
 ### What the compiler puts in CollectorPlan

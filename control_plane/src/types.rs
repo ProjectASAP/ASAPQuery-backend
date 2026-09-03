@@ -598,14 +598,6 @@ pub struct GatewayCollectorConfig {
     pub passthrough: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct PrecomputeJob {
-    pub query_expr: String,
-    pub granularity: Duration,
-    pub sketch_source: String,
-    pub store_path: String,
-}
-
 // ── Per-stage resource budgets ────────────────────────────────────────────────
 
 /// Per-stage resource caps. The agent cap feeds the physical planner's
@@ -644,7 +636,6 @@ impl StageResourceBudgets {
 pub struct CollectionPlan {
     pub agent_config: AgentCollectorConfig,
     pub gateway_config: GatewayCollectorConfig,
-    pub precompute: Vec<PrecomputeJob>,
     pub valid_until: DateTime<Utc>,
     /// Resolved delta transmission decision and rationale.
     pub delta_decision: DeltaDecision,

@@ -10,7 +10,6 @@
 //! | `config/backend.rs` | *retired — emitted YAML for a "backend-role" OTel merge collector tier that was never deployed; superseded by the typed L5's [`stage_config::emit_backend_streaming_config_json`] which posts to asapquery-backend's precompute engine over HTTP* |
 //! | `config/asapquery_backend.rs` | *retired — `generate_streaming_config_yaml` was the legacy single-aggregation `CollectionPlan`-shaped emitter for `POST /api/v1/streaming-config`; under the data plane's atomic `handle.swap(new_config)` it would WIPE sibling `(metric, role)` aggregations on every fire. Replaced by [`backend_push::post_typed_backend_for_role`], which posts a cumulative typed `BackendStageConfig` derived from the shared per-`(metric, role)` cache* |
 //! | *(new)* | [`backend_push`] |
-//! | `config/precompute.rs` | [`precompute`] |
 //! | `config/stage_config.rs` | [`stage_config`] (TODO: split into `opamp` + `streaming_config` + `inference_config` per design.md §5; deferred from refactor 2026-05 because the 3,020-line monolith mixes OTel-collector YAML emit, ASAPQuery-backend JSON emit, and shared internals — clean split needs ownership reorganisation, not file renames) |
 //! | `config/stage_config_otap.rs` | [`otap`] |
 //! | `config/stage_config_telegraf.rs` | [`telegraf`] |
@@ -20,7 +19,6 @@ pub mod agent;
 pub mod backend_push;
 pub mod monitor;
 pub mod otap;
-pub mod precompute;
 pub mod stage_config;
 pub mod telegraf;
 
@@ -29,7 +27,6 @@ pub use backend_push::{
     post_typed_backend_for_role, repost_cumulative_backend_config, BackendRoutingCache, PushOutcome,
 };
 pub use otap::emit_otap_dag_yaml;
-pub use precompute::{build_precompute_engine_jobs, should_precompute, PrecomputeClient};
 pub use stage_config::{
     emit_backend_storage_routing, emit_backend_storage_routing_for_tenant,
     emit_backend_storage_routing_with_prometheus,
