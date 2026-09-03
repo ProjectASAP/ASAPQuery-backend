@@ -30,18 +30,21 @@ pub struct PrecomputeEngineConfig {
     pub raw_mode_aggregation_id: u64,
     /// Policy for handling late samples that arrive after their window has closed.
     pub late_data_policy: LateDataPolicy,
-    /// Wall-clock grace period (milliseconds) for the watermark fallback in
-    /// `flush_all`. When event-time stagnates (e.g. agents stamp every
-    /// sketch with the same `time_unix_nano`), `flush_all`'s `+1ms`
-    /// watermark advance is a no-op and idle windows never close. The
-    /// wall-clock fallback closes a pane whose creation has been older
-    /// than `window_size_ms + wall_clock_grace_period_ms` of *wall-clock*
-    /// time, regardless of where event-time is. The grace period
-    /// tolerates late-arriving events that would otherwise be evicted as
-    /// "the window already closed". Default: 5000 ms (matches
-    /// `allowed_lateness_ms` default).
-    #[serde(default = "default_wall_clock_grace_period_ms")]
-    pub wall_clock_grace_period_ms: i64,
+    /// Additional idle grace after one window duration. A pane closes when it
+    /// has received no input for `window_size + idle_grace`. The legacy YAML
+    /// name is accepted as a serde alias. Non-positive disables idle closure.
+    #[serde(
+        default = "default_wall_clock_idle_grace_period_ms",
+        alias = "wall_clock_grace_period_ms"
+    )]
+    pub wall_clock_idle_grace_period_ms: i64,
+    /// Additional grace for the absolute wall-clock deadline. A pane closes
+    /// after `window_size + max_open_grace` from its first input even if it is
+    /// still active. Non-positive disables the deadline. The worker applies an
+    /// absolute deadline only with `ForwardToStore`, ensuring later inputs are
+    /// emitted as mergeable corrections. Default: 5000 ms.
+    #[serde(default = "default_wall_clock_max_open_grace_period_ms")]
+    pub wall_clock_max_open_grace_period_ms: i64,
     /// Optional path where the `SchemaRegistry` persists per-`agg_id`
     /// lifecycle state across restarts (sketch DB Phase 2c). When
     /// set, the registry loads prior `created_at_ms` / `retired_at_ms`
@@ -63,14 +66,19 @@ impl Default for PrecomputeEngineConfig {
             channel_buffer_size: 10_000,
             pass_raw_samples: false,
             raw_mode_aggregation_id: 0,
-            late_data_policy: LateDataPolicy::Drop,
-            wall_clock_grace_period_ms: default_wall_clock_grace_period_ms(),
+            late_data_policy: LateDataPolicy::ForwardToStore,
+            wall_clock_idle_grace_period_ms: default_wall_clock_idle_grace_period_ms(),
+            wall_clock_max_open_grace_period_ms: default_wall_clock_max_open_grace_period_ms(),
             schema_persist_path: None,
         }
     }
 }
 
-fn default_wall_clock_grace_period_ms() -> i64 {
+fn default_wall_clock_idle_grace_period_ms() -> i64 {
+    5_000
+}
+
+fn default_wall_clock_max_open_grace_period_ms() -> i64 {
     5_000
 }
 
@@ -88,7 +96,28 @@ mod tests {
         assert_eq!(config.channel_buffer_size, 10_000);
         assert!(!config.pass_raw_samples);
         assert_eq!(config.raw_mode_aggregation_id, 0);
-        assert_eq!(config.late_data_policy, LateDataPolicy::Drop);
-        assert_eq!(config.wall_clock_grace_period_ms, 5_000);
+        assert_eq!(config.late_data_policy, LateDataPolicy::ForwardToStore);
+        assert_eq!(config.wall_clock_idle_grace_period_ms, 5_000);
+        assert_eq!(config.wall_clock_max_open_grace_period_ms, 5_000);
+    }
+
+    #[test]
+    fn legacy_wall_clock_grace_deserializes_as_idle_grace() {
+        let config: PrecomputeEngineConfig = serde_yaml::from_str(
+            r#"
+num_workers: 1
+allowed_lateness_ms: 100
+max_buffer_per_series: 10
+flush_interval_ms: 1000
+channel_buffer_size: 10
+pass_raw_samples: false
+raw_mode_aggregation_id: 0
+late_data_policy: Drop
+wall_clock_grace_period_ms: 7000
+"#,
+        )
+        .expect("legacy config should deserialize");
+        assert_eq!(config.wall_clock_idle_grace_period_ms, 7_000);
+        assert_eq!(config.wall_clock_max_open_grace_period_ms, 5_000);
     }
 }

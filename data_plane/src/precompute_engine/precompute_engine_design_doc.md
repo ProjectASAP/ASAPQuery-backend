@@ -98,69 +98,21 @@ Late data handling:
                3 < 6 → YES, late → DROP (or ForwardToStore)
 ```
 
-### Cross-group watermark propagation
+### Per-group event-time watermarks
 
-Without cross-group propagation, each group tracks its own watermark
-independently. If a group stops receiving data, its watermark freezes and its
-windows never close. Cross-group propagation solves this with two layers:
+Each group tracks its own maximum observed event timestamp. Its event-time
+watermark is `max_event_time_ms - allowed_lateness_ms`. Periodic flushes never
+modify observed event time.
 
-**Layer 1 — Intra-worker (max):** Each worker computes its worker watermark as
-`max(all group watermarks)`. This represents "time has progressed to at least
-here on this worker." During each flush, idle groups are advanced to the worker
-watermark.
+A timestamp observed for one group does not advance another group. Independent
+sources can progress at different rates, so cross-group propagation can close a
+live window prematurely and turn valid input into late data. The worker-level
+watermark atomic reports the maximum group watermark for diagnostics only; it
+is not fed back into group closure.
 
-**Layer 2 — Cross-worker (min):** Each worker publishes its worker watermark to
-a shared `Arc<AtomicI64>`. The global watermark is `min(all worker watermarks)`,
-ignoring workers that have not yet started. This becomes the floor for all group
-watermarks across all workers.
-
-```
-                    ┌──────────────────────────────────────────┐
-                    │              Shared Atomics               │
-                    │  AtomicI64[0]  AtomicI64[1]  AtomicI64[2]│
-                    │     100s          80s           90s       │
-                    └──┬──────────────┬──────────────┬─────────┘
-                       │ store        │ store        │ store
-                       │ (Release)    │ (Release)    │ (Release)
-              ┌────────┴───┐  ┌───────┴────┐  ┌─────┴──────┐
-              │  Worker 0  │  │  Worker 1  │  │  Worker 2  │
-              │            │  │            │  │            │
-              │ Groups:    │  │ Groups:    │  │ Groups:    │
-              │  A: wm=100s│  │  C: wm=80s│  │  E: wm=90s│
-              │  B: wm=50s │  │  D: wm=80s│  │  F: wm=30s│
-              │            │  │            │  │            │
-              │ worker_wm  │  │ worker_wm  │  │ worker_wm  │
-              │ = max(A,B) │  │ = max(C,D) │  │ = max(E,F) │
-              │ = 100s     │  │ = 80s      │  │ = 90s      │
-              └────────────┘  └────────────┘  └────────────┘
-                       │ load all      │ load all      │ load all
-                       │ (Acquire)     │ (Acquire)     │ (Acquire)
-                       ▼               ▼               ▼
-              global_wm = min(100s, 80s, 90s) = 80s
-
-              On flush, each group's effective watermark becomes:
-                max(group_wm, global_wm) + 1ms
-
-              Worker 0: Group B (50s) → advanced to 80s → closes [50s, 80s] windows
-              Worker 2: Group F (30s) → advanced to 80s → closes [30s, 80s] windows
-```
-
-**Why max within a worker?** We want to propagate forward progress from active
-groups to idle groups on the same worker.
-
-**Why min across workers?** Conservative: only advance as far as ALL workers
-agree time has progressed. If worker 1 is behind at 80s, we should not close
-windows at 90s on worker 2 because worker 1 might still send data for those
-windows.
-
-**Staleness:** Because workers read each other's atomics during flush, the
-global watermark may be up to one `flush_interval_ms` (default 1s) stale.
-This is acceptable — it only means idle groups close windows one flush cycle
-later than they theoretically could.
-
-**Unstarted workers:** Workers that have not yet received any data remain at
-`i64::MIN` and are excluded from the global watermark min calculation. This
-prevents a cold worker from blocking the entire system.
+Idle and bounded-time closure use a separate wall-clock policy. Distributed
+completion requires an explicit source/window barrier; an unrelated group's
+timestamp is not such a barrier.
 
 ## 3. Components
 
@@ -194,7 +146,9 @@ pub struct PrecomputeEngineConfig {
     pub channel_buffer_size: usize,      // default: 10,000
     pub pass_raw_samples: bool,          // default: false
     pub raw_mode_aggregation_id: u64,    // default: 0
-    pub late_data_policy: LateDataPolicy, // default: Drop
+    pub late_data_policy: LateDataPolicy, // default: ForwardToStore
+    pub wall_clock_idle_grace_period_ms: i64, // default: 5,000
+    pub wall_clock_max_open_grace_period_ms: i64, // default: 5,000
 }
 
 pub enum LateDataPolicy {
@@ -202,6 +156,18 @@ pub enum LateDataPolicy {
     ForwardToStore,  // Emit a mini-accumulator for query-time merge
 }
 ```
+
+For a window of duration `W`, idle closure fires after `W + idle_grace`
+without a touch. When enabled, the absolute deadline fires after
+`W + max_open_grace` from the first touch even if input remains active. These
+wall-clock decisions advance only the closure watermark; they never modify the
+maximum observed event timestamp.
+
+The absolute deadline is applied only with `ForwardToStore`: input arriving
+after a deadline close is appended as a mergeable correction for the same
+logical window. With explicit `Drop`, the absolute deadline is disabled so a
+timer cannot introduce silent loss. Both actions increment
+`asap_precompute_late_inputs_total{action,input_kind}`.
 
 ### 3.3 SeriesRouter (`series_router.rs`)
 
@@ -384,15 +350,16 @@ from `active_panes`. Remaining panes are read non-destructively via
 
 ```
 1. Match series to AggregationConfigs (by metric name / spatial_filter)
-2. Insert samples into SeriesBuffer, update watermark
-3. Drop samples beyond allowed_lateness_ms behind watermark
+2. Insert samples and update maximum observed event time
+3. Compute event watermark as `max_event_time_ms - allowed_lateness_ms`
 4. For each sample × each aggregation:
    a. Compute pane_start = pane_start_for(ts)
    b. If pane was evicted (late data for closed window):
       → late_data_policy == Drop:           skip
       → late_data_policy == ForwardToStore:  create mini-accumulator, emit
    c. Else: get-or-create pane in active_panes, feed value (1 update per sample)
-5. Detect newly closed windows via closed_windows(prev_wm, current_wm)
+5. Detect newly closed windows via
+   `closed_windows(previous_closure_watermark, event_watermark)`
 6. For each closed window:
    a. Get pane starts via panes_for_window(window_start)
    b. Oldest pane: take_accumulator() + remove from active_panes (destructive)
@@ -400,7 +367,7 @@ from `active_panes`. Remaining panes are read non-destructively via
    d. Merge all pane accumulators via AggregateCore::merge_with()
    e. Emit merged result as PrecomputedOutput + AggregateCore
 7. Emit batch to OutputSink
-8. Update previous_watermark_ms
+8. Update observed event time and the separate closure watermark
 ```
 
 #### Raw mode
@@ -1071,19 +1038,12 @@ automatically combined with original window data at query time.
 
 ## 7. Late Data Handling
 
-Two checks determine whether a sample is "late":
+Two checks classify an input as late: its timestamp is behind the event-time
+watermark, or its target window has already closed. `LateDataPolicy` applies to
+both cases and to both raw samples and prebuilt sketches:
 
-1. **Watermark check** (sample-level): `ts < watermark - allowed_lateness_ms` →
-   sample is dropped entirely before reaching any aggregation logic.
-
-2. **Window closure check** (window-level): the sample passes the watermark check
-   but targets a window that is already closed
-   (`window not in active_windows && watermark >= window_end`).
-
-For case 2, the `LateDataPolicy` controls behavior:
-
-- **Drop**: log at debug level and skip. No ghost accumulator is created
-  (fixing the original bug where `or_insert_with` would create orphaned entries).
+- **Drop**: increment `asap_precompute_late_inputs_total{action="drop",...}`,
+  log at debug level, and skip. No ghost accumulator is created.
 
 - **ForwardToStore**: create a fresh `AccumulatorUpdater`, feed the single
   late sample, wrap as `PrecomputedOutput`, and push into the same `emit_batch`
@@ -1168,7 +1128,7 @@ store with the Kafka consumer path.
   | `test_tumbling_window_correctness` | Samples at t=1s/5s/9s; window [0,10s) closes on t=10s; `sum=6` |
   | `test_sliding_window_pane_sharing` | Sample at t=15s in 30s/10s window -> 2 emits for [0,30s) and [10s,40s), both `sum=42` via shared pane snapshot/take |
   | `test_groupby_separate_emits_per_series` | Two series (`host=A`, `host=B`) on same worker -> 2 independent `MultipleSumAccumulator` emits (no ingest-time cross-series merge) |
-  | `test_late_data_drop` | Sample behind `watermark - allowed_lateness_ms` with `Drop` policy -> 0 emits |
+  | `test_late_data_drop` | Sample behind the event watermark with `Drop` policy -> 0 emits and records the action |
   | `test_late_data_forward_to_store` | Late sample for evicted pane with `ForwardToStore` -> 1 emit as mini-accumulator with correct window bounds and sum |
 
 - **Unit tests -- other modules**: `window_manager.rs` (tumbling/sliding arithmetic, pane enumeration, closure detection), `series_buffer.rs` (ordering, watermark), `accumulator_factory.rs` (updater creation and reset), `series_router.rs` (consistent hash routing), `config.rs` (defaults).
@@ -1188,18 +1148,12 @@ The engine is currently in-memory and single-process with no persistence of in-f
 
 | # | Case | When it occurs | Mitigation status |
 |---|---|---|---|
-| 1 | **Explicit late drop** | `LateDataPolicy::Drop` + `ts < watermark - allowed_lateness_ms` | Intended; use `ForwardToStore` to avoid |
-| 2 | **Intra-batch lateness** | Within a single `process_samples` call, `current_wm` is set to the batch's max timestamp before pane routing; with `allowed_lateness_ms=0` every sample below the batch max is dropped | Set `allowed_lateness_ms` >= max timestamp spread within a producer batch |
-| 3 | **Evicted pane + Drop** | Sample passes watermark check but its pane was already evicted (window closed); `Drop` policy discards it | Use `ForwardToStore` |
-| 4 | **No matching config** | `matching_agg_configs` returns empty -- metric name in the series key does not match any config's `metric` or `spatial_filter`; worker silently returns `Ok(())` | No warning is logged. TODO: emit a metric or log at warn level for unmatched series |
-| 5 | **Open panes on shutdown** | `flush_all` only emits windows already closed by the watermark; panes that are still open at shutdown are discarded | TODO (see below) |
-| 6 | **Worker panic** | Tokio task dies; all series owned by that worker lose their pane state; subsequent sends log a warning and drop | TODO (see below) |
+| 1 | **Explicit late drop** | `LateDataPolicy::Drop` handles a late or already-closed-window input | Intended and counted; use `ForwardToStore` to retain corrections |
+| 2 | **No matching config** | Metric name does not match a configured policy | Warn and expose the existing policy-miss diagnostics |
+| 3 | **Worker panic** | Tokio task dies with in-memory panes | TODO: worker supervision and durable pane recovery |
 
-### TODO: open-pane flush on shutdown
-
-`flush_all` currently only closes windows whose `end <= watermark`. On graceful shutdown it should optionally force-close all open panes by advancing each series watermark to `i64::MAX` (or to `current_wm + window_size_ms`) before the final flush. This would emit partial windows with whatever samples have accumulated, allowing downstream consumers to decide whether to use them.
-
-This behaviour should be opt-in (a `force_flush_on_shutdown: bool` config flag) because partial windows can be misleading for consumers that expect complete windows.
+On graceful shutdown, `force_close_all` emits all remaining raw and sketch
+panes. These are partial windows when the event-time boundary was not reached.
 
 ### TODO: warn on unmatched series
 

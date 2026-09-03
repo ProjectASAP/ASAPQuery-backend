@@ -1,5 +1,9 @@
 # ASAP overview
 
+This page describes the distributed Collector profile. For the smaller mode
+that runs without ASAPCollector and ingests raw samples from Prometheus, see the
+[ASAPQuery compatibility profile](../design_docs/asapquery-compatibility-profile.md).
+
 ## TL;DR
 
 ASAP is a summary-based metrics pipeline. ASAPCollector maintains selected

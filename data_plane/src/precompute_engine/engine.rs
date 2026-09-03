@@ -134,11 +134,13 @@ impl PrecomputeEngine {
                     pass_raw_samples: self.config.pass_raw_samples,
                     raw_mode_aggregation_id: self.config.raw_mode_aggregation_id,
                     late_data_policy: self.config.late_data_policy,
-                    wall_clock_grace_period_ms: self.config.wall_clock_grace_period_ms,
+                    wall_clock_idle_grace_period_ms: self.config.wall_clock_idle_grace_period_ms,
+                    wall_clock_max_open_grace_period_ms: self
+                        .config
+                        .wall_clock_max_open_grace_period_ms,
                 },
                 self.diagnostics.worker_group_counts[id].clone(),
                 self.diagnostics.worker_watermarks[id].clone(),
-                self.diagnostics.worker_watermarks.to_vec(),
             );
             let handle = tokio::spawn(async move {
                 worker.run().await;
