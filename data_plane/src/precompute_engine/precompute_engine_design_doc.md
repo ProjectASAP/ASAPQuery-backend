@@ -147,6 +147,8 @@ pub struct PrecomputeEngineConfig {
     pub pass_raw_samples: bool,          // default: false
     pub raw_mode_aggregation_id: u64,    // default: 0
     pub late_data_policy: LateDataPolicy, // default: Drop
+    pub wall_clock_idle_grace_period_ms: i64, // default: 5,000
+    pub wall_clock_max_open_grace_period_ms: i64, // default: 0 (disabled)
 }
 
 pub enum LateDataPolicy {
@@ -154,6 +156,12 @@ pub enum LateDataPolicy {
     ForwardToStore,  // Emit a mini-accumulator for query-time merge
 }
 ```
+
+For a window of duration `W`, idle closure fires after `W + idle_grace`
+without a touch. When enabled, the absolute deadline fires after
+`W + max_open_grace` from the first touch even if input remains active. These
+wall-clock decisions advance only the closure watermark; they never modify the
+maximum observed event timestamp.
 
 ### 3.3 SeriesRouter (`series_router.rs`)
 

@@ -64,27 +64,32 @@ struct GroupState {
     /// This is separate from observed event time because wall-clock policies
     /// may close a window without manufacturing a later input timestamp.
     closure_watermark_ms: i64,
-    /// Wall-clock time (ms since epoch) at which each currently-open pane
-    /// was last touched by an input. Used by `flush_all`'s wall-clock fallback
-    /// to close panes that have been idle too long when event-time has
-    /// stagnated. Refreshing on every touch prevents an active bulk ingest
-    /// with a fixed event timestamp from being force-closed mid-stream.
-    /// Keyed by `pane_start_ms` and covers entries in BOTH
-    /// `active_panes` and `sketch_panes` (a single pane_start may have
-    /// either or both populated). Entries are GC'd by
-    /// `prune_pane_wall_clock_last_touches` after each window-close cycle.
-    pane_wall_clock_last_touches_ms: BTreeMap<i64, i64>,
+    /// First and latest wall-clock input times for each open pane. The former
+    /// enforces an absolute lifetime; the latter supports idle closure.
+    pane_wall_clock: BTreeMap<i64, PaneWallClock>,
+}
+
+#[derive(Clone, Copy)]
+struct PaneWallClock {
+    first_touch_ms: i64,
+    last_touch_ms: i64,
 }
 
 impl GroupState {
-    /// Drop wall-clock-last-touch entries whose pane no longer exists in
-    /// either pane map. Called after window-close cycles in
-    /// `process_group_samples`, `process_accumulator_input`, and
-    /// `flush_all` so the bookkeeping doesn't leak as panes turn over.
-    fn prune_pane_wall_clock_last_touches(&mut self) {
+    fn touch_pane(&mut self, pane_start_ms: i64, now_ms: i64) {
+        self.pane_wall_clock
+            .entry(pane_start_ms)
+            .and_modify(|clock| clock.last_touch_ms = now_ms)
+            .or_insert(PaneWallClock {
+                first_touch_ms: now_ms,
+                last_touch_ms: now_ms,
+            });
+    }
+
+    fn prune_pane_wall_clock(&mut self) {
         let active = &self.active_panes;
         let sketch = &self.sketch_panes;
-        self.pane_wall_clock_last_touches_ms
+        self.pane_wall_clock
             .retain(|ps, _| active.contains_key(ps) || sketch.contains_key(ps));
     }
 }
@@ -96,10 +101,8 @@ pub struct WorkerRuntimeConfig {
     pub pass_raw_samples: bool,
     pub raw_mode_aggregation_id: u64,
     pub late_data_policy: LateDataPolicy,
-    /// See `PrecomputeEngineConfig::wall_clock_grace_period_ms`. Set to a
-    /// non-positive value to disable the wall-clock fallback entirely
-    /// (event-time-only behaviour, matching pre-fix semantics).
-    pub wall_clock_grace_period_ms: i64,
+    pub wall_clock_idle_grace_period_ms: i64,
+    pub wall_clock_max_open_grace_period_ms: i64,
 }
 
 /// Worker that processes samples for a shard of the sid space.
@@ -135,9 +138,8 @@ pub struct Worker {
     worker_watermark: Arc<AtomicI64>,
     /// Externally-readable group count for diagnostics.
     group_count: Arc<AtomicUsize>,
-    /// Grace period (ms) for the wall-clock fallback in `flush_all`.
-    /// `<= 0` disables the fallback (event-time-only).
-    wall_clock_grace_period_ms: i64,
+    wall_clock_idle_grace_period_ms: i64,
+    wall_clock_max_open_grace_period_ms: i64,
     /// Injectable clock returning current wall-clock time in milliseconds
     /// since the unix epoch. Production uses `SystemTime::now`; tests
     /// override with a deterministic fake. The closure runs under
@@ -164,7 +166,8 @@ impl Worker {
             pass_raw_samples,
             raw_mode_aggregation_id,
             late_data_policy,
-            wall_clock_grace_period_ms,
+            wall_clock_idle_grace_period_ms,
+            wall_clock_max_open_grace_period_ms,
         } = runtime_config;
         Self {
             id,
@@ -178,7 +181,8 @@ impl Worker {
             late_data_policy,
             worker_watermark,
             group_count,
-            wall_clock_grace_period_ms,
+            wall_clock_idle_grace_period_ms,
+            wall_clock_max_open_grace_period_ms,
             now_ms_fn: Box::new(default_now_ms),
         }
     }
@@ -349,7 +353,7 @@ impl Worker {
                 sketch_panes: BTreeMap::new(),
                 max_event_time_ms: i64::MIN,
                 closure_watermark_ms: i64::MIN,
-                pane_wall_clock_last_touches_ms: BTreeMap::new(),
+                pane_wall_clock: BTreeMap::new(),
             };
             self.group_states.insert(sid, gs);
             self.group_count
@@ -458,9 +462,7 @@ impl Worker {
             // Refresh the pane's wall-clock last-touch time so the fallback
             // only closes an idle pane, not a long-running bulk ingest whose
             // records share one event timestamp.
-            state
-                .pane_wall_clock_last_touches_ms
-                .insert(pane_start, now_ms);
+            state.touch_pane(pane_start, now_ms);
             let updater = state
                 .active_panes
                 .entry(pane_start)
@@ -495,7 +497,7 @@ impl Worker {
         if event_watermark > state.closure_watermark_ms {
             state.closure_watermark_ms = event_watermark;
         }
-        state.prune_pane_wall_clock_last_touches();
+        state.prune_pane_wall_clock();
 
         // Emit to output sink
         if !emit_batch.is_empty() {
@@ -602,9 +604,7 @@ impl Worker {
 
         // Refresh the pane's wall-clock last-touch time so an active sketch
         // stream with a fixed event timestamp is not force-closed mid-ingest.
-        state
-            .pane_wall_clock_last_touches_ms
-            .insert(pane_start, now_ms);
+        state.touch_pane(pane_start, now_ms);
 
         // Merge into the sketch pane covering this timestamp.
         match state.sketch_panes.remove(&pane_start) {
@@ -660,7 +660,7 @@ impl Worker {
         if event_watermark > state.closure_watermark_ms {
             state.closure_watermark_ms = event_watermark;
         }
-        state.prune_pane_wall_clock_last_touches();
+        state.prune_pane_wall_clock();
 
         if !emit_batch.is_empty() {
             debug!(
@@ -766,7 +766,8 @@ impl Worker {
         }
 
         let now_ms = (self.now_ms_fn)();
-        let grace_ms = self.wall_clock_grace_period_ms;
+        let idle_grace_ms = self.wall_clock_idle_grace_period_ms;
+        let max_open_grace_ms = self.wall_clock_max_open_grace_period_ms;
 
         // Publish the largest observed event-time watermark for diagnostics.
         // It must not be fed back into another group's closure decision: group
@@ -798,20 +799,19 @@ impl Worker {
             // alone must not advance event time.
             let mut effective_wm = state.closure_watermark_ms;
 
-            // Wall-clock fallback for stuck event-time. If the agent
-            // stamps every sketch with the same `time_unix_nano`
-            // (e.g. window-start), its event watermark freezes
-            // forever — the 30s window never closes and ASAP-tier
-            // queries come back empty even though sketches keep
-            // arriving (sweep blocker #2). Force `effective_wm` past
-            // `pane_start + window_size_ms` for any pane untouched for
-            // `window_size + grace` of WALL-CLOCK time. Set
-            // `wall_clock_grace_period_ms <= 0` to opt out and keep
-            // strict event-time semantics.
-            if grace_ms > 0 {
+            // Wall-clock policy is independent of observed event time. Idle
+            // closure handles completed finite input; the optional first-touch
+            // deadline bounds freshness even for a continuously touched pane.
+            if idle_grace_ms > 0 || max_open_grace_ms > 0 {
                 let window_size_ms = state.window_manager.window_size_ms();
-                for (&pane_start, &pane_last_touch_ms) in &state.pane_wall_clock_last_touches_ms {
-                    if now_ms.saturating_sub(pane_last_touch_ms) >= window_size_ms + grace_ms {
+                for (&pane_start, &clock) in &state.pane_wall_clock {
+                    let idle_due = idle_grace_ms > 0
+                        && now_ms.saturating_sub(clock.last_touch_ms)
+                            >= window_size_ms.saturating_add(idle_grace_ms);
+                    let deadline_due = max_open_grace_ms > 0
+                        && now_ms.saturating_sub(clock.first_touch_ms)
+                            >= window_size_ms.saturating_add(max_open_grace_ms);
+                    if idle_due || deadline_due {
                         let force_to = pane_start.saturating_add(window_size_ms);
                         if force_to > effective_wm {
                             effective_wm = force_to;
@@ -859,7 +859,7 @@ impl Worker {
                 state.closure_watermark_ms = effective_wm;
             }
 
-            state.prune_pane_wall_clock_last_touches();
+            state.prune_pane_wall_clock();
         }
 
         if !emit_batch.is_empty() {
@@ -958,7 +958,7 @@ impl Worker {
             if force_wm > state.closure_watermark_ms {
                 state.closure_watermark_ms = force_wm;
             }
-            state.prune_pane_wall_clock_last_touches();
+            state.prune_pane_wall_clock();
         }
 
         if !emit_batch.is_empty() {
@@ -1455,7 +1455,8 @@ mod tests {
                 pass_raw_samples: pass_raw,
                 raw_mode_aggregation_id: raw_agg_id,
                 late_data_policy: late_policy,
-                wall_clock_grace_period_ms: 0,
+                wall_clock_idle_grace_period_ms: 0,
+                wall_clock_max_open_grace_period_ms: 0,
             },
             Arc::new(AtomicUsize::new(0)),
             wm,
@@ -1982,7 +1983,8 @@ mod tests {
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0,
+                wall_clock_idle_grace_period_ms: 0,
+                wall_clock_max_open_grace_period_ms: 0,
             },
             Arc::new(AtomicUsize::new(0)),
             wm,
@@ -2035,7 +2037,8 @@ mod tests {
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::ForwardToStore,
-                wall_clock_grace_period_ms: 0,
+                wall_clock_idle_grace_period_ms: 0,
+                wall_clock_max_open_grace_period_ms: 0,
             },
             Arc::new(AtomicUsize::new(0)),
             wm,
@@ -2427,7 +2430,8 @@ aggregations:
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms: 0,
+                wall_clock_idle_grace_period_ms: 0,
+                wall_clock_max_open_grace_period_ms: 0,
             },
             Arc::new(AtomicUsize::new(0)),
             wm.clone(),
@@ -2685,14 +2689,12 @@ aggregations:
     // `std::thread::sleep(35s)`.
     // -----------------------------------------------------------------------
 
-    /// Build a Worker for the wall-clock fallback test that is otherwise
-    /// identical to `make_worker`, but takes an explicit
-    /// `wall_clock_grace_period_ms`. Test-local helper so existing
-    /// callsites stay untouched.
-    fn make_worker_with_grace(
+    /// Build a worker with explicit wall-clock closure grace values.
+    fn make_worker_with_wall_clock_policy(
         agg_configs: HashMap<u64, AggregationConfig>,
         sink: Arc<CapturingOutputSink>,
-        wall_clock_grace_period_ms: i64,
+        idle_grace_period_ms: i64,
+        max_open_grace_period_ms: i64,
     ) -> Worker {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
         let wm = Arc::new(AtomicI64::new(i64::MIN));
@@ -2703,15 +2705,12 @@ aggregations:
             make_hot_reload(agg_configs),
             WorkerRuntimeConfig {
                 max_buffer_per_series: 10_000,
-                // `flush_all` advances a stagnant event-time watermark by
-                // 1ms. Permit that one boundary nudge so a subsequent
-                // same-timestamp touch exercises wall-clock idleness rather
-                // than the unrelated late-data path.
-                allowed_lateness_ms: 1,
+                allowed_lateness_ms: 0,
                 pass_raw_samples: false,
                 raw_mode_aggregation_id: 0,
                 late_data_policy: LateDataPolicy::Drop,
-                wall_clock_grace_period_ms,
+                wall_clock_idle_grace_period_ms: idle_grace_period_ms,
+                wall_clock_max_open_grace_period_ms: max_open_grace_period_ms,
             },
             Arc::new(AtomicUsize::new(0)),
             wm,
@@ -2738,7 +2737,7 @@ aggregations:
         let agg_configs = HashMap::from([(1, cfg)]);
         let sink = Arc::new(CapturingOutputSink::new());
         // 5s grace period — production default.
-        let mut worker = make_worker_with_grace(agg_configs, sink.clone(), 5_000);
+        let mut worker = make_worker_with_wall_clock_policy(agg_configs, sink.clone(), 5_000, 0);
 
         // Pin clock at t_wall = 1_000_000 ms during ingest. Every
         // sketch arrives stamped with the SAME event-time
@@ -2818,7 +2817,7 @@ aggregations:
         // Calling flush_all again with no new data must NOT re-emit
         // the same window — once a window has been closed via the
         // fallback, its pane is drained from `sketch_panes` and from
-        // `pane_wall_clock_last_touches_ms`, so there's nothing left to
+        // `pane_wall_clock`, so there's nothing left to
         // close. This pins the monotonicity invariant: emitted
         // windows have monotonically non-decreasing close times and
         // each window is emitted at most once.
@@ -2842,7 +2841,8 @@ aggregations:
             vec![],
         );
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker_with_grace(HashMap::from([(7, cfg)]), sink.clone(), 5_000);
+        let mut worker =
+            make_worker_with_wall_clock_policy(HashMap::from([(7, cfg)]), sink.clone(), 5_000, 0);
         let wall_clock = Arc::new(AtomicI64::new(1_000_000));
         let wc_clone = wall_clock.clone();
         worker.set_now_ms_fn(Box::new(move || wc_clone.load(Ordering::Relaxed)));
@@ -2883,6 +2883,55 @@ aggregations:
     }
 
     #[test]
+    fn absolute_wall_clock_deadline_closes_active_raw_ingest() {
+        let cfg = make_agg_config(
+            9,
+            "netflow_bytes",
+            AggregationType::SingleSubpopulation,
+            "Sum",
+            1,
+            0,
+            vec![],
+        );
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker_with_wall_clock_policy(
+            HashMap::from([(9, cfg)]),
+            sink.clone(),
+            5_000,
+            5_000,
+        );
+        let wall_clock = Arc::new(AtomicI64::new(3_000_000));
+        let wc_clone = wall_clock.clone();
+        worker.set_now_ms_fn(Box::new(move || wc_clone.load(Ordering::Relaxed)));
+
+        let pf = PolicyFingerprint(9);
+        for i in 0..7 {
+            wall_clock.store(3_000_000 + i * 1_000, Ordering::Relaxed);
+            worker
+                .process_group_samples(
+                    9,
+                    pf,
+                    "",
+                    group_samples("netflow_bytes", vec![(0, 1.0 + i as f64)]),
+                )
+                .unwrap();
+        }
+
+        // The last touch was only 500ms ago, but the pane has been open for
+        // 6.5s: longer than window_size + max_open_grace = 6s.
+        wall_clock.store(3_006_500, Ordering::Relaxed);
+        worker.flush_all().unwrap();
+        let captured = sink.drain();
+        assert_eq!(captured.len(), 1, "absolute deadline must bound freshness");
+        let sum = captured[0]
+            .1
+            .as_any()
+            .downcast_ref::<SumAccumulator>()
+            .expect("must emit SumAccumulator");
+        assert_eq!(sum.sum, 28.0);
+    }
+
+    #[test]
     fn wall_clock_fallback_does_not_close_active_sketch_ingest() {
         let cfg = make_agg_config(
             8,
@@ -2894,7 +2943,8 @@ aggregations:
             vec!["zone"],
         );
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker_with_grace(HashMap::from([(8, cfg)]), sink.clone(), 5_000);
+        let mut worker =
+            make_worker_with_wall_clock_policy(HashMap::from([(8, cfg)]), sink.clone(), 5_000, 0);
         let wall_clock = Arc::new(AtomicI64::new(2_000_000));
         let wc_clone = wall_clock.clone();
         worker.set_now_ms_fn(Box::new(move || wc_clone.load(Ordering::Relaxed)));
@@ -2935,7 +2985,7 @@ aggregations:
     }
 
     /// Pin the wall-clock-fallback opt-out: setting
-    /// `wall_clock_grace_period_ms = 0` reverts to event-time-only
+    /// Disabling both wall-clock grace values preserves event-time-only
     /// semantics, matching pre-fix behaviour. This keeps
     /// `flush_all`'s contract backward-compatible for callers that
     /// want strict event-time (e.g. deterministic replays).
@@ -2953,7 +3003,7 @@ aggregations:
         let agg_configs = HashMap::from([(1, cfg)]);
         let sink = Arc::new(CapturingOutputSink::new());
         // grace=0 disables the fallback entirely.
-        let mut worker = make_worker_with_grace(agg_configs, sink.clone(), 0);
+        let mut worker = make_worker_with_wall_clock_policy(agg_configs, sink.clone(), 0, 0);
 
         let wall_clock = Arc::new(AtomicI64::new(1_000_000));
         let wc_clone = wall_clock.clone();
@@ -3069,7 +3119,7 @@ aggregations:
         );
         let agg_configs = HashMap::from([(1, cfg)]);
         let sink = Arc::new(CapturingOutputSink::new());
-        let mut worker = make_worker_with_grace(agg_configs, sink.clone(), 0);
+        let mut worker = make_worker_with_wall_clock_policy(agg_configs, sink.clone(), 0, 0);
 
         // 10 sketches, all stamped at frozen event-time 0 → window [0, 30_000).
         let pf = PolicyFingerprint(1);

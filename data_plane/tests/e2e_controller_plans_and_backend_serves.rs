@@ -313,7 +313,8 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
         pass_raw_samples: false,
         raw_mode_aggregation_id: 0,
         late_data_policy: LateDataPolicy::Drop,
-        wall_clock_grace_period_ms: 5_000,
+        wall_clock_idle_grace_period_ms: 5_000,
+        wall_clock_max_open_grace_period_ms: 0,
         schema_persist_path: None,
     };
     let engine = PrecomputeEngine::new(

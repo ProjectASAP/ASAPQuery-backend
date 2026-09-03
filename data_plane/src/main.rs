@@ -513,7 +513,10 @@ async fn main() -> Result<()> {
             pass_raw_samples: false,
             raw_mode_aggregation_id: 0,
             late_data_policy: LateDataPolicy::Drop,
-            wall_clock_grace_period_ms: 5_000,
+            wall_clock_idle_grace_period_ms: 5_000,
+            // Enabled only after deadline-triggered late corrections are
+            // guaranteed to append rather than drop.
+            wall_clock_max_open_grace_period_ms: 0,
             schema_persist_path: args.schema_persist_path.clone(),
         };
         // M2.3.6 — sketch-only sink. Precompute writes now go to
