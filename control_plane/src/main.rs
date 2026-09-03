@@ -595,6 +595,10 @@ struct CompileAndPublishPhysicalPlanRequest {
     evidence: HashMap<String, physical::compiler::TopKMembershipEvidence>,
     planner_revision: String,
     max_evidence_age_ms: u64,
+    plan_version: u64,
+    activation_unix_ms: u64,
+    expiry_unix_ms: Option<u64>,
+    backend_compat: String,
     #[serde(default = "default_physical_plan_timeout_ms")]
     apply_timeout_ms: u64,
 }
@@ -606,6 +610,8 @@ fn default_physical_plan_timeout_ms() -> u64 {
 #[derive(Debug, Serialize)]
 struct CompileAndPublishPhysicalPlanResponse {
     plan_id: u64,
+    plan_version: u64,
+    status: &'static str,
     generated_at_unix_ms: u64,
     collector_ids: Vec<String>,
 }
@@ -667,9 +673,36 @@ async fn handle_compile_and_publish_physical_plan(
         )
             .into_response();
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let activation_wait = bundle.envelope.activation_unix_ms.saturating_sub(now);
+    if activation_wait > apply_timeout.as_millis() as u64 {
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            "activation time exceeds apply_timeout_ms; backend remains staged".to_string(),
+        )
+            .into_response();
+    }
+    if activation_wait > 0 {
+        tokio::time::sleep(Duration::from_millis(activation_wait)).await;
+    }
+    if let Err(error) = backend
+        .activate_physical_plan(bundle.envelope.plan_id, bundle.envelope.plan_version)
+        .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!("backend physical-plan activation failed: {error}"),
+        )
+            .into_response();
+    }
 
     Json(CompileAndPublishPhysicalPlanResponse {
         plan_id: bundle.envelope.plan_id,
+        plan_version: bundle.envelope.plan_version,
+        status: "active",
         generated_at_unix_ms: bundle.envelope.generated_at_unix_ms,
         collector_ids,
     })
@@ -691,6 +724,18 @@ fn compile_physical_plan_request(
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
             "max_evidence_age_ms and apply_timeout_ms must be non-zero".to_string(),
+        ));
+    }
+    if request.plan_version == 0
+        || request.activation_unix_ms == 0
+        || request.backend_compat != control_plane::backend_plan::BACKEND_COMPAT
+        || request
+            .expiry_unix_ms
+            .is_some_and(|expiry| expiry <= request.activation_unix_ms)
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "plan_version, activation_unix_ms, backend_compat and expiry are invalid".to_string(),
         ));
     }
 
@@ -748,6 +793,10 @@ fn compile_physical_plan_request(
             capability_snapshot_id: request.capability_snapshot_id,
             observed_at_unix_ms: now,
             max_evidence_age_ms: request.max_evidence_age_ms,
+            plan_version: request.plan_version,
+            activation_unix_ms: request.activation_unix_ms,
+            expiry_unix_ms: request.expiry_unix_ms,
+            backend_compat: request.backend_compat,
         },
     ) {
         Ok(bundle) => bundle,

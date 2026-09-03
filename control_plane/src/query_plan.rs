@@ -19,6 +19,7 @@ use asap_types::PolicyFingerprint;
 #[serde(deny_unknown_fields)]
 pub struct QueryPlan {
     pub plan_id: u64,
+    pub plan_version: u64,
     pub entries: BTreeMap<String, QueryPlanEntry>,
 }
 
@@ -26,6 +27,7 @@ impl QueryPlan {
     pub fn empty() -> Self {
         Self {
             plan_id: 0,
+            plan_version: 0,
             entries: BTreeMap::new(),
         }
     }
@@ -38,6 +40,11 @@ impl QueryPlan {
     }
 
     pub fn validate(&self, available: &BTreeSet<PolicyFingerprint>) -> Result<(), QueryPlanError> {
+        if self.plan_id != 0 && self.plan_version == 0 {
+            return Err(QueryPlanError::Invalid(
+                "non-bootstrap QueryPlan has zero plan_version".into(),
+            ));
+        }
         for (identity, entry) in &self.entries {
             if identity != &entry.canonical_promql {
                 return Err(QueryPlanError::Invalid(format!(

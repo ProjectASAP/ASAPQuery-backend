@@ -191,4 +191,8 @@ message BackendPlan {
   map<uint64, Materialization> materializations = 3;
   repeated RoutingEntry routing = 4;
   repeated MonitorSpec monitors = 5;
+  uint64 plan_version = 6;
+  uint64 activation_unix_ms = 7;
+  optional uint64 expiry_unix_ms = 8;
+  string backend_compat = 9;
 }

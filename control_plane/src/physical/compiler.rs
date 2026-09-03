@@ -138,12 +138,20 @@ pub struct DeploymentEnvironment {
     pub capability_snapshot_id: String,
     pub observed_at_unix_ms: u64,
     pub max_evidence_age_ms: u64,
+    pub plan_version: u64,
+    pub activation_unix_ms: u64,
+    pub expiry_unix_ms: Option<u64>,
+    pub backend_compat: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PlanEnvelope {
     pub plan_id: u64,
+    pub plan_version: u64,
     pub generated_at_unix_ms: u64,
+    pub activation_unix_ms: u64,
+    pub expiry_unix_ms: Option<u64>,
+    pub backend_compat: String,
     pub planner_revision: String,
     pub capability_snapshot_id: String,
 }
@@ -349,7 +357,11 @@ impl PhysicalCompiler {
         let plan_id = stable_plan_id(&collector_materializations);
         let envelope = PlanEnvelope {
             plan_id,
+            plan_version: environment.plan_version,
             generated_at_unix_ms: environment.observed_at_unix_ms,
+            activation_unix_ms: environment.activation_unix_ms,
+            expiry_unix_ms: environment.expiry_unix_ms,
+            backend_compat: environment.backend_compat.clone(),
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: environment.capability_snapshot_id,
         };
@@ -363,6 +375,16 @@ impl PhysicalCompiler {
             plan_id,
             environment.observed_at_unix_ms,
         )?;
+        backend_plan.plan_version = envelope.plan_version;
+        backend_plan.activation_unix_ms = envelope.activation_unix_ms;
+        backend_plan.expiry_unix_ms = envelope.expiry_unix_ms;
+        backend_plan.backend_compat = envelope.backend_compat.clone();
+        backend_plan
+            .validate()
+            .map_err(|error| CompileError::Query {
+                query_id: "physical-plan-envelope".into(),
+                reason: error.to_string(),
+            })?;
         for materialization in backend_plan.materializations.values_mut() {
             materialization.lifecycle = Some(SummaryMaintenanceLifecycleGuarantee {
                 summary_maintenance_lifecycle: SummaryMaintenanceLifecycle::ContinuouslyMaintained,
@@ -478,6 +500,7 @@ impl PhysicalCompiler {
         }
         let query_plan = QueryPlan {
             plan_id,
+            plan_version: envelope.plan_version,
             entries: query_entries,
         };
         query_plan.validate(&materialization_fingerprints)?;
@@ -843,6 +866,10 @@ mod tests {
             capability_snapshot_id: "caps-7".into(),
             observed_at_unix_ms: now,
             max_evidence_age_ms: 60_000,
+            plan_version: 1,
+            activation_unix_ms: now,
+            expiry_unix_ms: None,
+            backend_compat: "asap-query-backend.v1".into(),
         }
     }
 

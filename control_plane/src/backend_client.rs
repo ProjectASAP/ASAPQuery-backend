@@ -391,6 +391,35 @@ impl BackendClient {
             Err(classify_http_status(status, body, "PhysicalPlan POST"))
         }
     }
+
+    pub async fn activate_physical_plan(
+        &self,
+        plan_id: u64,
+        plan_version: u64,
+    ) -> std::result::Result<(), BackendPostError> {
+        let url = format!("{}/activate", derive_physical_plan_url(&self.endpoint));
+        let response = self
+            .http
+            .post(&url)
+            .json(&serde_json::json!({
+                "plan_id": plan_id,
+                "plan_version": plan_version,
+            }))
+            .send()
+            .await
+            .map_err(classify_reqwest_error)?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(classify_http_status(
+                status,
+                body,
+                "PhysicalPlan activation POST",
+            ))
+        }
+    }
 }
 
 fn derive_physical_plan_url(endpoint: &str) -> String {

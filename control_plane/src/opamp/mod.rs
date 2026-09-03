@@ -62,6 +62,7 @@ pub enum CollectorPlanStatusKind {
 #[serde(deny_unknown_fields)]
 pub struct CollectorPlanStatus {
     pub plan_id: u64,
+    pub plan_version: u64,
     pub status: CollectorPlanStatusKind,
     #[serde(default)]
     pub error: Option<String>,
@@ -81,12 +82,19 @@ pub enum CollectorPlanPublishError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("collector {collector_id} did not report plan {plan_id} before timeout")]
-    StatusTimeout { collector_id: String, plan_id: u64 },
-    #[error("collector {collector_id} rejected plan {plan_id}: {error}")]
+    #[error(
+        "collector {collector_id} did not report plan {plan_id}/{plan_version} before timeout"
+    )]
+    StatusTimeout {
+        collector_id: String,
+        plan_id: u64,
+        plan_version: u64,
+    },
+    #[error("collector {collector_id} rejected plan {plan_id}/{plan_version}: {error}")]
     Rejected {
         collector_id: String,
         plan_id: u64,
+        plan_version: u64,
         error: String,
     },
 }
@@ -137,7 +145,7 @@ struct AgentConnection {
 }
 
 type AgentMap = HashMap<String, AgentConnection>;
-type PlanStatusMap = HashMap<(String, u64), CollectorPlanStatus>;
+type PlanStatusMap = HashMap<(String, u64, u64), CollectorPlanStatus>;
 
 pub type OnConnectFn = Arc<dyn Fn(String, AgentRole) + Send + Sync>;
 pub type OnDisconnectFn = Arc<dyn Fn(String) + Send + Sync>;
@@ -291,10 +299,11 @@ impl OpampServer {
                     source,
                 }
             })?;
-            self.plan_statuses
-                .write()
-                .await
-                .remove(&(plan.collector_id.clone(), plan.envelope.plan_id));
+            self.plan_statuses.write().await.remove(&(
+                plan.collector_id.clone(),
+                plan.envelope.plan_id,
+                plan.envelope.plan_version,
+            ));
             let sent = self.send_collector_plan(&plan.collector_id, body).await;
             if !sent {
                 return Err(CollectorPlanPublishError::Disconnected {
@@ -306,16 +315,23 @@ impl OpampServer {
         let mut reports = Vec::with_capacity(plans.len());
         for plan in plans {
             let report = self
-                .wait_for_plan_status(&plan.collector_id, plan.envelope.plan_id, timeout)
+                .wait_for_plan_status(
+                    &plan.collector_id,
+                    plan.envelope.plan_id,
+                    plan.envelope.plan_version,
+                    timeout,
+                )
                 .await
                 .ok_or_else(|| CollectorPlanPublishError::StatusTimeout {
                     collector_id: plan.collector_id.clone(),
                     plan_id: plan.envelope.plan_id,
+                    plan_version: plan.envelope.plan_version,
                 })?;
             if report.status != CollectorPlanStatusKind::Applied {
                 return Err(CollectorPlanPublishError::Rejected {
                     collector_id: plan.collector_id.clone(),
                     plan_id: report.plan_id,
+                    plan_version: report.plan_version,
                     error: report.error.clone().unwrap_or_else(|| "unspecified".into()),
                 });
             }
@@ -399,9 +415,10 @@ impl OpampServer {
         &self,
         agent_id: &str,
         plan_id: u64,
+        plan_version: u64,
         timeout: Duration,
     ) -> Option<CollectorPlanStatus> {
-        let key = (agent_id.to_string(), plan_id);
+        let key = (agent_id.to_string(), plan_id, plan_version);
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let changed = self.state_changed.notified();
@@ -526,10 +543,10 @@ async fn handle_socket(
                             {
                                 match serde_json::from_slice::<CollectorPlanStatus>(&message.data) {
                                     Ok(status) => {
-                                        srv.plan_statuses
-                                            .write()
-                                            .await
-                                            .insert((agent_id.clone(), status.plan_id), status);
+                                        srv.plan_statuses.write().await.insert(
+                                            (agent_id.clone(), status.plan_id, status.plan_version),
+                                            status,
+                                        );
                                         srv.state_changed.notify_waiters();
                                     }
                                     Err(error) => warn!(
@@ -989,7 +1006,11 @@ mod tests {
             collector_id: collector_id.into(),
             envelope: crate::physical::compiler::PlanEnvelope {
                 plan_id,
+                plan_version: 1,
                 generated_at_unix_ms: 1,
+                activation_unix_ms: 1,
+                expiry_unix_ms: None,
+                backend_compat: "asap-query-backend.v1".into(),
                 planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
                 capability_snapshot_id: "caps-1".into(),
             },
@@ -1072,6 +1093,7 @@ mod tests {
 
         let status = serde_json::to_vec(&CollectorPlanStatus {
             plan_id: 42,
+            plan_version: 1,
             status: CollectorPlanStatusKind::Applied,
             error: None,
         })
@@ -1092,6 +1114,7 @@ mod tests {
         let reports = publish.await.unwrap().unwrap();
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].plan_id, 42);
+        assert_eq!(reports[0].plan_version, 1);
         assert_eq!(reports[0].status, CollectorPlanStatusKind::Applied);
     }
 

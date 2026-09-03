@@ -247,6 +247,9 @@ async fn push_documents_coupled(
         plan_id: crate::backend_plan::BackendPlan::decode(&plan_bytes)
             .map(|plan| plan.plan_id)
             .unwrap_or_default(),
+        plan_version: crate::backend_plan::BackendPlan::decode(&plan_bytes)
+            .map(|plan| plan.plan_version)
+            .unwrap_or_default(),
         entries: Default::default(),
     };
 
@@ -454,7 +457,11 @@ async fn push_cumulative_entries(
     let precompute_plan = PrecomputePlan {
         envelope: PlanEnvelope {
             plan_id,
+            plan_version: 1,
             generated_at_unix_ms,
+            activation_unix_ms: generated_at_unix_ms,
+            expiry_unix_ms: None,
+            backend_compat: "asap-query-backend.v1".into(),
             planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
             capability_snapshot_id: "replanner".into(),
         },

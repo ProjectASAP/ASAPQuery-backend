@@ -10,7 +10,7 @@ use axum::{
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
 
@@ -150,6 +150,7 @@ pub struct HttpServer {
     /// plane generations cannot interleave their config and BackendPlan.
     physical_plan_lock: Arc<tokio::sync::Mutex<()>>,
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
+    physical_plan_lifecycle: Option<crate::storage_engines::types::PhysicalPlanLifecycle>,
 }
 
 #[derive(Clone)]
@@ -177,6 +178,7 @@ struct AppState {
     probe_cache: Option<Arc<FreshnessProbeCache>>,
     physical_plan_lock: Arc<tokio::sync::Mutex<()>>,
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
+    physical_plan_lifecycle: Option<crate::storage_engines::types::PhysicalPlanLifecycle>,
 }
 
 impl HttpServer {
@@ -203,6 +205,7 @@ impl HttpServer {
             probe_cache: None,
             physical_plan_lock: Arc::new(tokio::sync::Mutex::new(())),
             active_physical_plan: None,
+            physical_plan_lifecycle: None,
         }
     }
 
@@ -264,6 +267,9 @@ impl HttpServer {
         mut self,
         handle: crate::storage_engines::types::HotReloadActivePhysicalPlan,
     ) -> Self {
+        self.physical_plan_lifecycle = Some(
+            crate::storage_engines::types::PhysicalPlanLifecycle::new(handle.clone()),
+        );
         self.active_physical_plan = Some(handle);
         self
     }
@@ -376,6 +382,7 @@ impl HttpServer {
             probe_cache: self.probe_cache.clone(),
             physical_plan_lock: self.physical_plan_lock.clone(),
             active_physical_plan: self.active_physical_plan.clone(),
+            physical_plan_lifecycle: self.physical_plan_lifecycle.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -402,6 +409,14 @@ impl HttpServer {
                 get(handle_get_backend_plan).post(handle_post_backend_plan),
             )
             .route("/api/v1/physical-plan", post(handle_post_physical_plan))
+            .route(
+                "/api/v1/physical-plan/activate",
+                post(handle_activate_physical_plan),
+            )
+            .route(
+                "/api/v1/physical-plan/status",
+                get(handle_physical_plan_status),
+            )
             // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
             // returns a JSON snapshot for operator diagnostics.
@@ -464,6 +479,7 @@ impl HttpServer {
             probe_cache: self.probe_cache.clone(),
             physical_plan_lock: self.physical_plan_lock.clone(),
             active_physical_plan: self.active_physical_plan.clone(),
+            physical_plan_lifecycle: self.physical_plan_lifecycle.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -486,6 +502,14 @@ impl HttpServer {
                 get(handle_get_backend_plan).post(handle_post_backend_plan),
             )
             .route("/api/v1/physical-plan", post(handle_post_physical_plan))
+            .route(
+                "/api/v1/physical-plan/activate",
+                post(handle_activate_physical_plan),
+            )
+            .route(
+                "/api/v1/physical-plan/status",
+                get(handle_physical_plan_status),
+            )
             // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
             // returns a JSON snapshot for operator diagnostics.
@@ -2428,6 +2452,9 @@ aggregations:
         let new_plan = BackendPlan {
             plan_id: 7,
             generated_at_unix_ms: 123,
+            plan_version: 1,
+            activation_unix_ms: 123,
+            backend_compat: "asap-query-backend.v1".into(),
             ..Default::default()
         };
         let bytes = new_plan.encode_to_vec();
@@ -5275,10 +5302,8 @@ struct PhysicalPlanInstallRequest {
     storage_routing: Option<serde_json::Value>,
 }
 
-/// Install the two backend views of one PhysicalPlan as one validated
-/// publication. The BackendPlan is installed first, so readers racing the
-/// short swap interval fail closed on missing fingerprints rather than using
-/// a new streaming configuration with stale routing authority.
+/// Validate and stage all backend views. Staging never changes query routing;
+/// a separate activation request performs the single snapshot swap.
 async fn handle_post_physical_plan(
     State(state): State<AppState>,
     axum::Json(request): axum::Json<PhysicalPlanInstallRequest>,
@@ -5292,6 +5317,15 @@ async fn handle_post_physical_plan(
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
                 "status": "error", "error": "physical-plan hot-reload handles are not attached"
+            })),
+        )
+            .into_response();
+    };
+    let Some(lifecycle) = state.physical_plan_lifecycle.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": "physical-plan lifecycle is not attached"
             })),
         )
             .into_response();
@@ -5326,11 +5360,18 @@ async fn handle_post_physical_plan(
         )
             .into_response();
     }
-    if request.query_plan.plan_id != new_plan.plan_id {
+    if request.query_plan.plan_id != new_plan.plan_id
+        || request.query_plan.plan_version != new_plan.plan_version
+        || request.precompute_plan.envelope.plan_id != new_plan.plan_id
+        || request.precompute_plan.envelope.plan_version != new_plan.plan_version
+        || request.precompute_plan.envelope.activation_unix_ms != new_plan.activation_unix_ms
+        || request.precompute_plan.envelope.expiry_unix_ms != new_plan.expiry_unix_ms
+        || request.precompute_plan.envelope.backend_compat != new_plan.backend_compat
+    {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             axum::Json(serde_json::json!({
-                "status": "error", "error": "QueryPlan and BackendPlan plan_id differ"
+                "status": "error", "error": "physical subplans have different plan identity/version"
             })),
         )
             .into_response();
@@ -5379,20 +5420,78 @@ async fn handle_post_physical_plan(
         query_plan: Arc::new(request.query_plan),
         storage_routing: new_routing,
     };
-    let generated = active.backend_plan.generated_at_unix_ms;
-    let current = active_handle.snapshot();
-    if generated < current.backend_plan.generated_at_unix_ms {
+    let plan_version = active.backend_plan.plan_version;
+    let now = unix_time_ms();
+    if let Err(error) = lifecycle.stage(active, now) {
         return (
             StatusCode::CONFLICT,
-            axum::Json(serde_json::json!({
-                "status": "error", "error": "stale physical-plan generation"
-            })),
+            axum::Json(serde_json::json!({"status": "error", "error": error.to_string()})),
         )
             .into_response();
     }
-    active_handle.swap(active);
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(serde_json::json!({
+            "status": "staged", "plan_id": plan_id, "plan_version": plan_version,
+            "materialization_count": plan_fps.len()
+        })),
+    )
+        .into_response()
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivatePhysicalPlanRequest {
+    plan_id: u64,
+    plan_version: u64,
+}
+
+async fn handle_activate_physical_plan(
+    State(state): State<AppState>,
+    axum::Json(request): axum::Json<ActivatePhysicalPlanRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (Some(lifecycle), Some(active_handle)) = (
+        state.physical_plan_lifecycle.as_ref(),
+        state.active_physical_plan.as_ref(),
+    ) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": "physical-plan lifecycle is not attached"
+            })),
+        )
+            .into_response();
+    };
+    let _guard = state.physical_plan_lock.lock().await;
+    let old = match lifecycle.activate(request.plan_id, request.plan_version, unix_time_ms()) {
+        Ok(old) => old,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({
+                    "status": "error", "error": error.to_string()
+                })),
+            )
+                .into_response()
+        }
+    };
+    if old.backend_plan.plan_id != 0 {
+        let draining_id = old.backend_plan.plan_id;
+        let draining_version = old.backend_plan.plan_version;
+        let lifecycle = lifecycle.clone();
+        tokio::spawn(async move {
+            loop {
+                if Arc::strong_count(&old) == 1 {
+                    lifecycle.retire_drained(draining_id, draining_version);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+    }
     let snap = active_handle.snapshot().runtime_config.clone();
-    let sid_summary = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
+    let retired = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
         state.sketch_index.as_ref(),
         snap.as_ref(),
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
@@ -5400,11 +5499,38 @@ async fn handle_post_physical_plan(
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({
-            "status": "success", "plan_id": plan_id,
-            "materialization_count": plan_fps.len(), "sids_retired": sid_summary.retired
+            "status": "active", "plan_id": request.plan_id, "plan_version": request.plan_version,
+            "sids_retired": retired.retired
         })),
     )
         .into_response()
+}
+
+async fn handle_physical_plan_status(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(lifecycle) = state.physical_plan_lifecycle.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": "physical-plan lifecycle is not attached"
+            })),
+        )
+            .into_response();
+    };
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "status": "success", "plans": lifecycle.statuses()
+        })),
+    )
+        .into_response()
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 // ── Phase α: BackendStorageRouting hot-reload endpoints ────────────

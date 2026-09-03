@@ -75,6 +75,7 @@
 //! produce confusing store states where data under the same agg_id
 //! spans multiple parameter generations.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -95,6 +96,189 @@ pub struct ActivePhysicalPlan {
 #[derive(Clone)]
 pub struct HotReloadActivePhysicalPlan {
     inner: Arc<ArcSwap<ActivePhysicalPlan>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalPlanPhase {
+    Staged,
+    Active,
+    Draining,
+    Retired,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PhysicalPlanStatus {
+    pub plan_id: u64,
+    pub plan_version: u64,
+    pub phase: PhysicalPlanPhase,
+    pub activation_unix_ms: u64,
+    pub expiry_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum PhysicalPlanLifecycleError {
+    #[error("plan {plan_id}/{plan_version} is already staged or active")]
+    Duplicate { plan_id: u64, plan_version: u64 },
+    #[error("plan {plan_id}/{plan_version} is not staged")]
+    NotStaged { plan_id: u64, plan_version: u64 },
+    #[error("plan activation {activation} is later than now {now}")]
+    ActivationNotReached { activation: u64, now: u64 },
+    #[error("plan expired at {expiry}; now is {now}")]
+    Expired { expiry: u64, now: u64 },
+    #[error(
+        "plan version {incoming} is not newer than active version {active} for plan {plan_id}"
+    )]
+    StaleVersion {
+        plan_id: u64,
+        incoming: u64,
+        active: u64,
+    },
+}
+
+#[derive(Clone)]
+pub struct PhysicalPlanLifecycle {
+    active: HotReloadActivePhysicalPlan,
+    staged: Arc<std::sync::Mutex<BTreeMap<(u64, u64), ActivePhysicalPlan>>>,
+    statuses: Arc<std::sync::Mutex<BTreeMap<(u64, u64), PhysicalPlanStatus>>>,
+}
+
+impl PhysicalPlanLifecycle {
+    pub fn new(active: HotReloadActivePhysicalPlan) -> Self {
+        let snapshot = active.snapshot();
+        let mut statuses = BTreeMap::new();
+        if snapshot.backend_plan.plan_id != 0 {
+            statuses.insert(
+                (
+                    snapshot.backend_plan.plan_id,
+                    snapshot.backend_plan.plan_version,
+                ),
+                status_for(&snapshot, PhysicalPlanPhase::Active),
+            );
+        }
+        Self {
+            active,
+            staged: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            statuses: Arc::new(std::sync::Mutex::new(statuses)),
+        }
+    }
+
+    pub fn stage(
+        &self,
+        plan: ActivePhysicalPlan,
+        now: u64,
+    ) -> Result<(), PhysicalPlanLifecycleError> {
+        let key = (plan.backend_plan.plan_id, plan.backend_plan.plan_version);
+        if let Some(expiry) = plan.backend_plan.expiry_unix_ms {
+            if expiry <= now {
+                return Err(PhysicalPlanLifecycleError::Expired { expiry, now });
+            }
+        }
+        let active = self.active.snapshot();
+        if active.backend_plan.plan_id == key.0 && key.1 <= active.backend_plan.plan_version {
+            return Err(PhysicalPlanLifecycleError::StaleVersion {
+                plan_id: key.0,
+                incoming: key.1,
+                active: active.backend_plan.plan_version,
+            });
+        }
+        let mut staged = self
+            .staged
+            .lock()
+            .expect("staged physical-plan lock poisoned");
+        if staged.contains_key(&key) {
+            return Err(PhysicalPlanLifecycleError::Duplicate {
+                plan_id: key.0,
+                plan_version: key.1,
+            });
+        }
+        self.statuses
+            .lock()
+            .expect("physical-plan status lock poisoned")
+            .insert(key, status_for(&plan, PhysicalPlanPhase::Staged));
+        staged.insert(key, plan);
+        Ok(())
+    }
+
+    pub fn activate(
+        &self,
+        plan_id: u64,
+        plan_version: u64,
+        now: u64,
+    ) -> Result<Arc<ActivePhysicalPlan>, PhysicalPlanLifecycleError> {
+        let key = (plan_id, plan_version);
+        let mut staged = self
+            .staged
+            .lock()
+            .expect("staged physical-plan lock poisoned");
+        let plan = staged
+            .get(&key)
+            .ok_or(PhysicalPlanLifecycleError::NotStaged {
+                plan_id,
+                plan_version,
+            })?;
+        if now < plan.backend_plan.activation_unix_ms {
+            return Err(PhysicalPlanLifecycleError::ActivationNotReached {
+                activation: plan.backend_plan.activation_unix_ms,
+                now,
+            });
+        }
+        if let Some(expiry) = plan.backend_plan.expiry_unix_ms {
+            if now >= expiry {
+                return Err(PhysicalPlanLifecycleError::Expired { expiry, now });
+            }
+        }
+        let plan = staged.remove(&key).expect("staged plan disappeared");
+        drop(staged);
+        let old = self.active.swap(plan.clone());
+        let mut statuses = self
+            .statuses
+            .lock()
+            .expect("physical-plan status lock poisoned");
+        if old.backend_plan.plan_id != 0 {
+            if let Some(status) =
+                statuses.get_mut(&(old.backend_plan.plan_id, old.backend_plan.plan_version))
+            {
+                status.phase = PhysicalPlanPhase::Draining;
+            }
+        }
+        statuses.insert(key, status_for(&plan, PhysicalPlanPhase::Active));
+        Ok(old)
+    }
+
+    pub fn statuses(&self) -> Vec<PhysicalPlanStatus> {
+        self.statuses
+            .lock()
+            .expect("physical-plan status lock poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    /// Mark a superseded generation retired after all readers of the old
+    /// immutable snapshot have drained.
+    pub fn retire_drained(&self, plan_id: u64, plan_version: u64) {
+        if let Some(status) = self
+            .statuses
+            .lock()
+            .expect("physical-plan status lock poisoned")
+            .get_mut(&(plan_id, plan_version))
+        {
+            if status.phase == PhysicalPlanPhase::Draining {
+                status.phase = PhysicalPlanPhase::Retired;
+            }
+        }
+    }
+}
+
+fn status_for(plan: &ActivePhysicalPlan, phase: PhysicalPlanPhase) -> PhysicalPlanStatus {
+    PhysicalPlanStatus {
+        plan_id: plan.backend_plan.plan_id,
+        plan_version: plan.backend_plan.plan_version,
+        phase,
+        activation_unix_ms: plan.backend_plan.activation_unix_ms,
+        expiry_unix_ms: plan.backend_plan.expiry_unix_ms,
+    }
 }
 
 impl HotReloadActivePhysicalPlan {
@@ -198,6 +382,28 @@ impl HotReloadBackendPlan {
             .expect("backend-plan install lock poisoned");
         new.validate()?;
         let active = self.snapshot();
+        if new.plan_id == active.plan_id && new.plan_id != 0 {
+            if new.plan_version < active.plan_version {
+                return Err(
+                    control_plane::backend_plan::ValidationError::StalePlanVersion {
+                        plan_id: new.plan_id,
+                        incoming: new.plan_version,
+                        active: active.plan_version,
+                    },
+                );
+            }
+            if new.plan_version == active.plan_version {
+                if new == *active {
+                    return Ok(active);
+                }
+                return Err(
+                    control_plane::backend_plan::ValidationError::ReusedPlanVersion {
+                        plan_id: new.plan_id,
+                        plan_version: new.plan_version,
+                    },
+                );
+            }
+        }
         if new.generated_at_unix_ms < active.generated_at_unix_ms {
             return Err(
                 control_plane::backend_plan::ValidationError::StaleGeneration {
@@ -235,6 +441,9 @@ mod hot_reload_backend_plan_tests {
     fn plan(plan_id: u64) -> BackendPlan {
         BackendPlan {
             plan_id,
+            plan_version: 1,
+            activation_unix_ms: 1,
+            backend_compat: "asap-query-backend.v1".into(),
             ..Default::default()
         }
     }
@@ -370,6 +579,46 @@ mod tests {
     use std::collections::HashMap;
     use std::thread;
 
+    fn physical_plan(
+        plan_id: u64,
+        plan_version: u64,
+        activation_unix_ms: u64,
+        expiry_unix_ms: Option<u64>,
+    ) -> ActivePhysicalPlan {
+        let envelope = control_plane::physical::compiler::PlanEnvelope {
+            plan_id,
+            plan_version,
+            generated_at_unix_ms: activation_unix_ms,
+            activation_unix_ms,
+            expiry_unix_ms,
+            backend_compat: "asap-query-backend.v1".into(),
+            planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
+            capability_snapshot_id: "test".into(),
+        };
+        ActivePhysicalPlan {
+            precompute_plan: control_plane::physical::compiler::PrecomputePlan {
+                envelope,
+                materializations: Vec::new(),
+            },
+            runtime_config: Arc::new(StreamingConfig::new(HashMap::new())),
+            backend_plan: Arc::new(control_plane::backend_plan::BackendPlan {
+                plan_id,
+                plan_version,
+                generated_at_unix_ms: activation_unix_ms,
+                activation_unix_ms,
+                expiry_unix_ms,
+                backend_compat: "asap-query-backend.v1".into(),
+                ..Default::default()
+            }),
+            query_plan: Arc::new(control_plane::query_plan::QueryPlan {
+                plan_id,
+                plan_version,
+                entries: Default::default(),
+            }),
+            storage_routing: Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
+        }
+    }
+
     fn dummy_agg(id: u64) -> AggregationConfig {
         AggregationConfig::new(
             AggregationType::Sum,
@@ -470,5 +719,44 @@ mod tests {
         });
         writer.join().unwrap();
         reader.join().unwrap();
+    }
+
+    #[test]
+    fn physical_plan_stages_activates_drains_and_retires() {
+        let active = HotReloadActivePhysicalPlan::new(physical_plan(7, 1, 100, None));
+        let lifecycle = PhysicalPlanLifecycle::new(active.clone());
+        lifecycle
+            .stage(physical_plan(7, 2, 200, Some(500)), 150)
+            .unwrap();
+
+        assert_eq!(active.snapshot().backend_plan.plan_version, 1);
+        assert!(matches!(
+            lifecycle.activate(7, 2, 199),
+            Err(PhysicalPlanLifecycleError::ActivationNotReached { .. })
+        ));
+        let old = lifecycle.activate(7, 2, 200).unwrap();
+        assert_eq!(old.backend_plan.plan_version, 1);
+        assert_eq!(active.snapshot().backend_plan.plan_version, 2);
+
+        let statuses = lifecycle.statuses();
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(statuses[0].phase, PhysicalPlanPhase::Draining);
+        assert_eq!(statuses[1].phase, PhysicalPlanPhase::Active);
+        lifecycle.retire_drained(7, 1);
+        assert_eq!(lifecycle.statuses()[0].phase, PhysicalPlanPhase::Retired);
+    }
+
+    #[test]
+    fn physical_plan_rejects_stale_and_expired_generations() {
+        let active = HotReloadActivePhysicalPlan::new(physical_plan(7, 2, 100, None));
+        let lifecycle = PhysicalPlanLifecycle::new(active);
+        assert!(matches!(
+            lifecycle.stage(physical_plan(7, 1, 100, None), 150),
+            Err(PhysicalPlanLifecycleError::StaleVersion { .. })
+        ));
+        assert!(matches!(
+            lifecycle.stage(physical_plan(8, 1, 100, Some(150)), 150),
+            Err(PhysicalPlanLifecycleError::Expired { .. })
+        ));
     }
 }

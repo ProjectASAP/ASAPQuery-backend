@@ -119,6 +119,10 @@ pub fn from_stage_config(
     Ok(BackendPlan {
         plan_id,
         generated_at_unix_ms,
+        plan_version: 1,
+        activation_unix_ms: generated_at_unix_ms,
+        expiry_unix_ms: None,
+        backend_compat: super::BACKEND_COMPAT.into(),
         materializations,
         routing,
         monitors: plan_monitors,
