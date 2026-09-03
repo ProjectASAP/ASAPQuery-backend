@@ -26,12 +26,13 @@ Targets:
   contracts       Shared Rust type/protobuf wire contracts
   control-plane   Planner HTTP, OpAMP, publication, and runtime feedback
   data-plane      Query, routing, storage, ingest adapter, and lifecycle tests
-  differential    Production backend PromQL vs deterministic raw-value oracle
+  differential    Production DDSketch PromQL vs deterministic raw-value oracle
+  sketch-oracles  Every sketch via production binary + independent raw oracle
   monitor         Real monitor gRPC transport tests
   gorilla-merger  Gorilla HTTP/WAL/block/StoreAPI/compaction/shipper tests
   whole           Controller plan -> backend install -> OTLP -> store -> PromQL
   whole-matrix    All sketch families and query shapes (diagnostic)
-  differential-all Raw oracle test plus the all-sketch/query matrix
+  differential-all Production sketch oracles plus the in-process query matrix
   system          Delegate to ASAPCollector's real multi-node system harness
   list            Print the suites and audit Rust E2E ignore markers
 
@@ -108,8 +109,15 @@ data_plane() {
 
 differential() {
     CURRENT_STAGE="data-plane/promql-differential"
-    say "data-plane: production backend PromQL -> raw-value oracle + instant/range parity"
+    say "data-plane: production DDSketch PromQL -> raw oracle + range endpoint consistency"
     rust_test data_plane --test promql_differential_process_e2e
+}
+
+sketch_oracles() {
+    differential
+    CURRENT_STAGE="data-plane/all-sketch-production-oracles"
+    say "data-plane: production KLL/HLL/CountSketch/CMS -> independent raw-data oracles"
+    rust_test data_plane --test all_sketches_process_oracle_e2e
 }
 
 monitor() {
@@ -152,18 +160,19 @@ whole_matrix() {
 }
 
 differential_all() {
-    differential
+    sketch_oracles
     whole_matrix
 }
 
 list_suites() {
     usage
     printf '\nRust E2E tests marked #[ignore] (expected: none):\n'
-    rg -n '^[[:space:]]*#\[ignore' \
-        "${REPO_DIR}/data_plane/tests" \
-        "${REPO_DIR}/data_plane/src/tests" \
-        "${REPO_DIR}/crates" \
-        -g '*.rs' || true
+    local ignored
+    if ignored="$(git -C "${REPO_DIR}" grep -n -E '^[[:space:]]*#[[:space:]]*\[[[:space:]]*ignore' -- '*.rs')"; then
+        printf '%s\n' "${ignored}"
+        die "ignored Rust tests found; convert them to executable E2E/unit tests or remove stale coverage"
+    fi
+    printf 'none\n'
 }
 
 system_e2e() {
@@ -194,6 +203,7 @@ main() {
         control-plane) need cargo; control_plane ;;
         data-plane) need cargo; data_plane ;;
         differential) need cargo; differential ;;
+        sketch-oracles) need cargo; sketch_oracles ;;
         monitor) need cargo; monitor ;;
         gorilla-merger) gorilla_merger ;;
         whole) need cargo; whole ;;

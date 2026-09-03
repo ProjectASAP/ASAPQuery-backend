@@ -36,6 +36,7 @@ The component suites can also be run separately:
 ./scripts/e2e.sh control-plane
 ./scripts/e2e.sh data-plane
 ./scripts/e2e.sh differential
+./scripts/e2e.sh sketch-oracles
 ./scripts/e2e.sh monitor
 ./scripts/e2e.sh gorilla-merger
 ./scripts/e2e.sh whole
@@ -44,8 +45,26 @@ The component suites can also be run separately:
 `differential` starts the production data-plane process, derives a modified
 OTLP DDSketch from a deterministic raw-value fixture, and compares public
 instant and range PromQL results with an independent exact quantile oracle.
-It also verifies labels, ASAP-local execution, instant/range parity, and range
-parameter validation. It does not require Docker or a Prometheus process.
+It also verifies labels, ASAP-local execution, instant/range endpoint
+consistency, and range parameter validation. It does not claim Prometheus
+range-step resampling semantics, which are tracked by issue #487. It does not
+require Docker or a Prometheus process.
+
+To run every sketch family through a production data-plane child process and
+compare its public result with an oracle computed independently from the raw
+fixture, run:
+
+```bash
+./scripts/e2e.sh sketch-oracles
+```
+
+This covers DDSketch and KLL against exact raw quantiles, HLL against an exact
+raw distinct set, and CountSketch/CMS top-k against exact raw frequency maps.
+The sketch library is used only to encode modified-OTLP fixtures, never to
+compute expected answers. Each scenario is a real, non-ignored test. The
+command currently exits non-zero on the product gaps tracked by backend issues
+#489 and #491 and planner issue #340; that failure is intentional evidence,
+not an expected-pass or smoke assertion.
 
 The complete sketch/query differential inventory is exercised with:
 
@@ -53,8 +72,8 @@ The complete sketch/query differential inventory is exercised with:
 ./scripts/e2e.sh differential-all
 ```
 
-It first runs the stable production-process raw-oracle comparison and then the
-whole-path scenario matrix. The matrix covers DDSketch and KLL quantiles, HLL
+It first runs all production-process raw-oracle comparisons and then the
+whole-path in-process scenario matrix. The matrix covers DDSketch and KLL quantiles, HLL
 cardinality, CountSketch and Count-Min count queries, heap-backed top-k, an
 instant/range query pair, grouping, delta/sub-window ingest, and shadow/live
 serving. It exits non-zero for every real product regression; no scenario is
@@ -62,14 +81,13 @@ ignored or converted into an expected pass.
 
 | Sketch / path | Public query shape | Oracle / invariant |
 | --- | --- | --- |
-| DDSketch | `quantile_over_time(0.5, ...[10s])`, instant + range | exact raw-value median and instant/range parity |
-| DDSketch | `quantile_over_time(0.99, ...[30s])` | exact raw-value p99 within planned alpha |
+| DDSketch | `quantile_over_time(0.5, ...[10s])`, instant + range | exact raw-value median and endpoint consistency |
+| DDSketch | `quantile_over_time(0.99, ...[30s])` | strict small-sample p99 regression tracked by #492 |
 | DDSketch delta | `quantile_over_time(0.99, ...[3m])` | reconstructed multi-window distribution |
-| KLL | `quantile_over_time(0.5, ...[10s])` | non-empty approximate quantile |
-| HLL | `count(metric)` | cardinality result, including multi-SID merge |
-| CountSketch | `count_over_time(...[10s])` | frequency result |
-| Count-Min Sketch | instant and range `count_over_time` | frequency result and matrix wire shape |
-| Heap-backed CountSketch / CMS | `topk(3, metric)` | bounded result count, item labels, and deterministic leader |
+| KLL | `quantile_over_time(0.5, ...[10s])` | exact raw-value median (fixture retained below K) |
+| HLL | `count(metric)` | exact raw distinct set within a declared 10% bound |
+| CountSketch | `topk(3, metric)` | exact raw frequency map and item identities |
+| Count-Min Sketch | `topk(3, metric)` | exact raw frequency map and item identities |
 | PromQL range validation | equal start/end and zero step | Prometheus-compatible explicit errors |
 
 `whole` is the stable representative DDSketch path. To exercise every

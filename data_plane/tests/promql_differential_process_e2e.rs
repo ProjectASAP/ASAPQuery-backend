@@ -23,9 +23,9 @@ use serde_json::Value;
 const METRIC: &str = "differential_e2e_latency_ms";
 const SERVICE: &str = "checkout";
 const ALPHA: f64 = 0.01;
-// Median avoids conflating DDSketch's discrete rank selection with
-// Prometheus's interpolation between adjacent values. Small-sample p99
-// interpolation is covered by the broader diagnostic scenario matrix.
+// Median keeps this stable DDSketch oracle focused on the sketch's documented
+// relative-error contract. Small-sample p99 semantics are a separate product
+// gap tracked by issue #492; this test does not claim to cover them.
 const QUANTILE: f64 = 0.5;
 
 struct ChildGuard(Child);
@@ -174,7 +174,7 @@ async fn get_json(client: &reqwest::Client, url: &str, params: &[(&str, String)]
 }
 
 #[tokio::test]
-async fn production_backend_matches_raw_oracle_for_instant_and_range_promql() {
+async fn production_backend_matches_raw_oracle_and_range_endpoint() {
     let query_port = unused_port();
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
@@ -235,10 +235,14 @@ async fn production_backend_matches_raw_oracle_for_instant_and_range_promql() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock");
-    let sample_ns = now.as_nanos() as u64;
+    // Both observations are genuinely in the past. The second identical
+    // fixture advances the event-time watermark and closes the first window
+    // without fabricating a future timestamp or introducing a zero-valued
+    // range sample that has no counterpart in the raw oracle.
+    let sample_ns = (now - Duration::from_secs(2)).as_nanos() as u64;
     for body in [
         ddsketch_export(METRIC, sample_ns, &raw_values),
-        ddsketch_export(METRIC, sample_ns + 2_000_000_000, &[]),
+        ddsketch_export(METRIC, sample_ns + 1_000_000_000, &raw_values),
     ] {
         client
             .post(format!("http://127.0.0.1:{otlp_http_port}/v1/metrics"))
@@ -303,7 +307,7 @@ async fn production_backend_matches_raw_oracle_for_instant_and_range_promql() {
     assert_approx(
         instant_value,
         range_values.last().expect("last range value").1,
-        "instant/range parity",
+        "instant/range endpoint consistency",
     );
 
     for (start, end, step, expected_error) in [
