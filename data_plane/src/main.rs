@@ -427,7 +427,11 @@ async fn main() -> Result<()> {
     let initial_precompute_plan = control_plane::physical::compiler::PrecomputePlan {
         envelope: control_plane::physical::compiler::PlanEnvelope {
             plan_id: 0,
+            plan_version: 0,
             generated_at_unix_ms: 0,
+            activation_unix_ms: 0,
+            expiry_unix_ms: None,
+            backend_compat: "bootstrap".into(),
             planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
             capability_snapshot_id: "bootstrap".into(),
         },

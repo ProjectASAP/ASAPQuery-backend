@@ -39,6 +39,8 @@ use asap_types::{AggregationType, MonitorSpec, PolicyFingerprint};
 use prost::Message as _;
 use thiserror::Error;
 
+pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
+
 use crate::physical::runtime_capability::Capability;
 use asap_types::enums::WindowKind;
 use planner_types::post_asap::{
@@ -82,6 +84,27 @@ pub enum ValidationError {
     IncompatibleRoute { fingerprint: u64 },
     #[error("stale plan generation: incoming={incoming}, active={active}")]
     StaleGeneration { incoming: u64, active: u64 },
+    #[error("stale plan version for plan {plan_id}: incoming={incoming}, active={active}")]
+    StalePlanVersion {
+        plan_id: u64,
+        incoming: u64,
+        active: u64,
+    },
+    #[error("plan {plan_id} version {plan_version} was reused with different content")]
+    ReusedPlanVersion { plan_id: u64, plan_version: u64 },
+    #[error("non-bootstrap plan must have a non-zero plan version")]
+    ZeroPlanVersion,
+    #[error("non-bootstrap plan must have an activation time")]
+    MissingActivation,
+    #[error("plan expiry {expiry} is not after activation {activation}")]
+    InvalidExpiry { activation: u64, expiry: u64 },
+    #[error("non-bootstrap plan must declare backend compatibility")]
+    MissingBackendCompat,
+    #[error("unsupported backend compatibility `{actual}`; expected `{expected}`")]
+    UnsupportedBackendCompat {
+        actual: String,
+        expected: &'static str,
+    },
 }
 
 // ── WindowSpec ───────────────────────────────────────────────────────────────
@@ -772,6 +795,10 @@ pub struct BackendPlan {
     /// existing convention for the pre-`BackendPlan` wire format).
     pub plan_id: u64,
     pub generated_at_unix_ms: u64,
+    pub plan_version: u64,
+    pub activation_unix_ms: u64,
+    pub expiry_unix_ms: Option<u64>,
+    pub backend_compat: String,
     pub materializations: HashMap<PolicyFingerprint, Materialization>,
     pub routing: Vec<RoutingEntry>,
     pub monitors: Vec<MonitorSpec>,
@@ -782,6 +809,10 @@ impl From<&BackendPlan> for proto::BackendPlan {
         proto::BackendPlan {
             plan_id: p.plan_id,
             generated_at_unix_ms: p.generated_at_unix_ms,
+            plan_version: p.plan_version,
+            activation_unix_ms: p.activation_unix_ms,
+            expiry_unix_ms: p.expiry_unix_ms,
+            backend_compat: p.backend_compat.clone(),
             materializations: p
                 .materializations
                 .iter()
@@ -809,6 +840,10 @@ impl TryFrom<proto::BackendPlan> for BackendPlan {
         Ok(BackendPlan {
             plan_id: p.plan_id,
             generated_at_unix_ms: p.generated_at_unix_ms,
+            plan_version: p.plan_version,
+            activation_unix_ms: p.activation_unix_ms,
+            expiry_unix_ms: p.expiry_unix_ms,
+            backend_compat: p.backend_compat,
             materializations,
             routing,
             monitors: p.monitors.into_iter().map(Into::into).collect(),
@@ -832,6 +867,31 @@ impl BackendPlan {
     /// Validate cross-references and invariants required before a decoded
     /// plan may become visible to ingest or query readers.
     pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.plan_id != 0 {
+            if self.plan_version == 0 {
+                return Err(ValidationError::ZeroPlanVersion);
+            }
+            if self.activation_unix_ms == 0 {
+                return Err(ValidationError::MissingActivation);
+            }
+            if self.backend_compat.trim().is_empty() {
+                return Err(ValidationError::MissingBackendCompat);
+            }
+            if self.backend_compat != BACKEND_COMPAT {
+                return Err(ValidationError::UnsupportedBackendCompat {
+                    actual: self.backend_compat.clone(),
+                    expected: BACKEND_COMPAT,
+                });
+            }
+            if let Some(expiry) = self.expiry_unix_ms {
+                if expiry <= self.activation_unix_ms {
+                    return Err(ValidationError::InvalidExpiry {
+                        activation: self.activation_unix_ms,
+                        expiry,
+                    });
+                }
+            }
+        }
         for (key, materialization) in &self.materializations {
             if *key != materialization.fingerprint {
                 return Err(ValidationError::FingerprintMismatch {
@@ -976,6 +1036,10 @@ mod tests {
         BackendPlan {
             plan_id: 42,
             generated_at_unix_ms: 1_735_000_000_000,
+            plan_version: 1,
+            activation_unix_ms: 1_735_000_000_000,
+            expiry_unix_ms: None,
+            backend_compat: "asap-query-backend.v1".into(),
             materializations,
             routing: vec![
                 RoutingEntry {

@@ -210,9 +210,13 @@ async fn apply_next_collector_plan(address: String) -> serde_json::Value {
     let plan_id = plan["envelope"]["plan_id"]
         .as_u64()
         .expect("collector plan ID");
+    let plan_version = plan["envelope"]["plan_version"]
+        .as_u64()
+        .expect("collector plan version");
 
     let status = serde_json::to_vec(&CollectorPlanStatus {
         plan_id,
+        plan_version,
         status: CollectorPlanStatusKind::Applied,
         error: None,
     })

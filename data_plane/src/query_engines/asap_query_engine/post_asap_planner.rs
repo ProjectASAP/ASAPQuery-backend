@@ -964,6 +964,10 @@ mod tests {
             BackendPlan {
                 plan_id: 1,
                 generated_at_unix_ms: 0,
+                plan_version: 1,
+                activation_unix_ms: 1,
+                expiry_unix_ms: None,
+                backend_compat: "asap-query-backend.v1".into(),
                 materializations,
                 routing: vec![RoutingEntry {
                     satisfies: Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch)),
