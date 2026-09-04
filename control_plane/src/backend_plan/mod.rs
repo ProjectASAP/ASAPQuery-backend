@@ -41,7 +41,7 @@ use thiserror::Error;
 
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 
-use crate::physical::runtime_capability::{Capability, SketchKindHandle};
+use crate::physical::runtime_capability::Capability;
 use asap_types::enums::WindowKind;
 use planner_types::post_asap::{
     EvaluationSchedule, ExactKind, ExactParams, GroupingStrategy, OutputRepresentation,
