@@ -485,12 +485,10 @@ mod tests {
                 cumulative_readout: true,
             },
             control_plane::query_plan::FallbackPolicy::ExactBackend,
-            |_node, kind, params| {
+            |_node, _family| {
                 Ok(control_plane::query_plan::MaterializationBinding {
                     materialization: asap_types::PolicyFingerprint(123),
                     metric: "unique_users".into(),
-                    kind,
-                    params,
                     sid_grouping: vec!["service".into()],
                     output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                     window_ms: 60_000,
