@@ -53,6 +53,9 @@ pub struct PlanningQuery {
     /// Planner-selected post-ASAP DAG. The physical compiler must not
     /// re-select a summary family from pre-ASAP input.
     pub post_asap: Rc<SummaryNode>,
+    /// Legacy catalog source retained for request compatibility. Physical
+    /// materialization sources are derived from each post-ASAP SummaryAgg;
+    /// this field is only used to reject table execution in the MVP.
     pub source: Source,
     pub window_secs: u64,
     /// Label names are deployment metadata because Planner's canonical IR
@@ -1431,6 +1434,11 @@ impl PhysicalCompiler {
         let mut readouts = Vec::with_capacity(request.queries.len());
         let mut collector_materializations = Vec::with_capacity(request.queries.len());
         let mut runtime_policies = BTreeMap::new();
+        // Binding is established while compiling the physical
+        // materializations, then consumed by QueryPlan lowering. The key is
+        // the planner DAG node identity within a query; serving never scans
+        // BackendPlan candidates to rediscover this decision.
+        let mut node_bindings = HashMap::<(String, usize), asap_types::PolicyFingerprint>::new();
 
         for query in &request.queries {
             let evidence = request.evidence.get(&query.query_id);
@@ -1459,10 +1467,11 @@ impl PhysicalCompiler {
                 )
                 .with_window_framework_costs(window_costs);
             let node = query.post_asap.clone();
-            let selected = extract_selected(&node).ok_or_else(|| CompileError::Query {
-                query_id: query.query_id.clone(),
-                reason: "selected plan has no executable sketch materialization/readout".into(),
-            })?;
+            let selected =
+                collect_selected_materializations(&node).map_err(|reason| CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason,
+                })?;
             let planner_selection = select_lifecycle(query, &node, &model, &environment)?;
             let window_implementation = query
                 .window_implementations
@@ -1473,64 +1482,76 @@ impl PhysicalCompiler {
                     query_id: query.query_id.clone(),
                     reason: "Planner selected a window framework without a retained concrete implementation".into(),
                 })?;
-            let metric = match &query.source {
-                Source::TimeSeries { metric } => metric.clone(),
+            match &query.source {
+                Source::TimeSeries { .. } => {}
                 Source::Table { .. } => {
                     return Err(CompileError::Query {
                         query_id: query.query_id.clone(),
                         reason: "MVP physical compiler supports time-series sources only".into(),
                     })
                 }
-            };
-            let aggregation_id = format!("{}:{}", query.query_id, metric);
-            let aggregation = BackendAggregation {
-                aggregation_id: aggregation_id.clone(),
-                metric_name: metric.clone(),
-                family: SummaryFamilyType::Sketch(
-                    selected.kind.clone(),
-                    planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
-                ),
-                window_secs: query.window_secs,
-                spatial_filter: String::new(),
-                grouping: query.group_by.clone(),
-                item_label: None,
-                aggregation_input: AggregationInput::SketchEnvelope,
-            };
-            let precompute_materialization =
-                backend_plan::aggregation_config_for_materialization(&aggregation)?;
-            let materialization = precompute_materialization.policy_fingerprint();
-            if let Some(existing) =
-                runtime_policies.insert(materialization, query.runtime_policy.clone())
-            {
-                if existing != query.runtime_policy {
-                    return Err(CompileError::Query {
-                        query_id: query.query_id.clone(),
-                        reason:
-                            "queries sharing one materialization specify different runtime policies"
-                                .into(),
-                    });
-                }
             }
-            aggregations.push(aggregation);
-            readouts.push(BackendReadout {
-                aggregation_id,
-                op: selected.readout.clone(),
-            });
-            collector_materializations.push(CollectorMaterialization {
-                query_id: query.query_id.clone(),
-                materialization,
-                metric,
-                algorithm: format!("{:?}", selected.kind.algorithm()).to_ascii_lowercase(),
-                parameters: sketch_params_json(&selected.params),
-                group_by: query.group_by.clone(),
-                window_secs: query.window_secs,
-                abstract_window_framework: planner_selection.window_framework,
-                window_implementation_id: window_implementation.implementation_id.clone(),
-                pane_secs: window_implementation.pane_secs,
-                state_layout: window_implementation.state_layout.clone(),
-                evidence_source: evidence.map(|e| e.source.clone()),
-                lifecycle: planner_selection.lifecycle,
-            });
+            for (ordinal, selected) in selected.into_iter().enumerate() {
+                let metric = selected.metric.clone();
+                let aggregation_id = format!("{}:{ordinal}:{}", query.query_id, metric);
+                let aggregation = BackendAggregation {
+                    aggregation_id: aggregation_id.clone(),
+                    metric_name: metric.clone(),
+                    family: SummaryFamilyType::Sketch(
+                        selected.kind.clone(),
+                        planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
+                    ),
+                    window_secs: query.window_secs,
+                    spatial_filter: String::new(),
+                    grouping: query.group_by.clone(),
+                    item_label: None,
+                    aggregation_input: AggregationInput::SketchEnvelope,
+                };
+                let precompute_materialization =
+                    backend_plan::aggregation_config_for_materialization(&aggregation)?;
+                let materialization = precompute_materialization.policy_fingerprint();
+                let binding_key = (query.query_id.clone(), selected.node_identity);
+                if let Some(existing) = node_bindings.insert(binding_key, materialization) {
+                    if existing != materialization {
+                        return Err(CompileError::Query {
+                            query_id: query.query_id.clone(),
+                            reason: "one post-ASAP node resolved to conflicting materializations"
+                                .into(),
+                        });
+                    }
+                }
+                if let Some(existing) =
+                    runtime_policies.insert(materialization, query.runtime_policy.clone())
+                {
+                    if existing != query.runtime_policy {
+                        return Err(CompileError::Query {
+                            query_id: query.query_id.clone(),
+                            reason: "queries sharing one materialization specify different runtime policies"
+                                .into(),
+                        });
+                    }
+                }
+                aggregations.push(aggregation);
+                readouts.push(BackendReadout {
+                    aggregation_id,
+                    op: selected.readout.clone(),
+                });
+                collector_materializations.push(CollectorMaterialization {
+                    query_id: query.query_id.clone(),
+                    materialization,
+                    metric: metric.clone(),
+                    algorithm: format!("{:?}", selected.kind.algorithm()).to_ascii_lowercase(),
+                    parameters: sketch_params_json(&selected.params),
+                    group_by: query.group_by.clone(),
+                    window_secs: query.window_secs,
+                    abstract_window_framework: planner_selection.window_framework.clone(),
+                    window_implementation_id: window_implementation.implementation_id.clone(),
+                    pane_secs: window_implementation.pane_secs,
+                    state_layout: window_implementation.state_layout.clone(),
+                    evidence_source: evidence.map(|e| e.source.clone()),
+                    lifecycle: planner_selection.lifecycle.clone(),
+                });
+            }
         }
 
         let plan_id = stable_plan_id(&collector_materializations);
@@ -1619,39 +1640,6 @@ impl PhysicalCompiler {
         let mut query_entries = BTreeMap::new();
         for query in &request.queries {
             let canonical = canonical_promql(&query.query_string)?;
-            let selected =
-                extract_selected(&query.post_asap).ok_or_else(|| CompileError::Query {
-                    query_id: query.query_id.clone(),
-                    reason: "selected plan has no executable sketch materialization/readout".into(),
-                })?;
-            let family = SummaryFamilyType::Sketch(
-                selected.kind,
-                planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
-            );
-            let metric = match &query.source {
-                Source::TimeSeries { metric } => metric,
-                Source::Table { .. } => unreachable!("table source rejected above"),
-            };
-            let bound: BTreeSet<_> = backend_plan
-                .routing
-                .iter()
-                .filter_map(|route| {
-                    let materialization = backend_plan.materializations.get(&route.materialization)?;
-                    (route.storage_backend == backend_plan::StorageBackend::SketchStore
-                        && matches!(&materialization.source, Source::TimeSeries { metric: m } if m == metric)
-                        && materialization.family == family
-                        && materialization.window.size_ms == query.window_secs.saturating_mul(1_000)
-                        && materialization.group_by == query.group_by)
-                        .then_some(route.materialization)
-                })
-                .collect();
-            if bound.is_empty() {
-                return Err(CompileError::Query {
-                    query_id: query.query_id.clone(),
-                    reason: "compiled BackendPlan has no exact materialization for QueryPlan"
-                        .into(),
-                });
-            }
             let entry = QueryPlanEntry::compile_bound(
                 query.query_id.clone(),
                 canonical.clone(),
@@ -1668,28 +1656,35 @@ impl PhysicalCompiler {
                             "materialized node has no unique time-series source".into(),
                         )
                     })?;
-                    if planned_metric != *metric {
-                        return Err(crate::query_plan::QueryPlanError::Invalid(format!(
-                            "catalog metric `{metric}` disagrees with post-ASAP source `{planned_metric}`"
-                        )));
-                    }
-                    let fingerprint = bound
-                        .iter()
-                        .find(|fingerprint| {
-                            backend_plan
-                                .materializations
-                                .get(fingerprint)
-                                .is_some_and(|m| &m.family == node_family)
-                        })
+                    let fingerprint = node_bindings
+                        .get(&(query.query_id.clone(), node as *const SummaryNode as usize))
                         .copied()
                         .ok_or_else(|| {
                             crate::query_plan::QueryPlanError::Invalid(format!(
-                                "no exact physical binding for {node_family:?}"
+                                "post-ASAP node has no compiled physical binding for {node_family:?}"
                             ))
                         })?;
+                    let materialization = backend_plan
+                        .materializations
+                        .get(&fingerprint)
+                        .ok_or_else(|| {
+                            crate::query_plan::QueryPlanError::Invalid(format!(
+                                "compiled binding {} is absent from BackendPlan",
+                                fingerprint.0
+                            ))
+                        })?;
+                    if &materialization.family != node_family
+                        || materialization.window.size_ms != query.window_secs.saturating_mul(1_000)
+                        || materialization.group_by != query.group_by
+                    {
+                        return Err(crate::query_plan::QueryPlanError::Invalid(format!(
+                            "compiled binding {} disagrees with post-ASAP/deployment semantics",
+                            fingerprint.0
+                        )));
+                    }
                     Ok(MaterializationBinding {
                         materialization: fingerprint,
-                        metric: metric.clone(),
+                        metric: planned_metric,
                         sid_grouping: query.group_by.clone(),
                         output_grouping: PhysicalGrouping::Reduce(query.group_by.clone()),
                         window_ms: query.window_secs.saturating_mul(1_000),
@@ -2034,31 +2029,66 @@ fn select_lifecycle(
 }
 
 struct SelectedSketch {
+    node_identity: usize,
+    metric: String,
     kind: planner_types::post_asap::SketchKind,
     params: planner_types::post_asap::SketchParams,
     readout: SketchQuery,
 }
 
-fn extract_selected(node: &SummaryNode) -> Option<SelectedSketch> {
-    let SummaryExpr::SummaryEstimate {
-        summary_input,
-        query,
-    } = &node.expr
-    else {
-        return None;
-    };
-    let SummaryExpr::SummaryAgg {
-        family: SummaryFamilyType::Sketch(kind, _),
-        ..
-    } = &summary_input.expr
-    else {
-        return None;
-    };
-    Some(SelectedSketch {
-        kind: kind.clone(),
-        params: kind.params().clone(),
-        readout: query.clone(),
-    })
+/// Collect every executable materialization leaf in the selected post-ASAP
+/// graph. Readout context flows through merge nodes, so a graph such as
+/// `Estimate(Merge(Agg(a), Agg(b)))` creates two physical bindings while the
+/// serialized QueryPlan retains the merge edges. Unsupported operators are
+/// intentionally not traversed: QueryPlan lowers them to an explicit exact
+/// fallback node and no unused warm state is provisioned.
+fn collect_selected_materializations(
+    node: &Rc<SummaryNode>,
+) -> Result<Vec<SelectedSketch>, String> {
+    fn walk(
+        node: &Rc<SummaryNode>,
+        readout: Option<&SketchQuery>,
+        selected: &mut Vec<SelectedSketch>,
+    ) -> Result<(), String> {
+        match &node.expr {
+            SummaryExpr::SummaryEstimate {
+                summary_input,
+                query,
+            } => walk(summary_input, Some(query), selected)?,
+            SummaryExpr::SummaryMerge { children } => {
+                for child in children {
+                    walk(child, readout, selected)?;
+                }
+            }
+            SummaryExpr::SummaryAgg {
+                family: SummaryFamilyType::Sketch(kind, _),
+                ..
+            } => {
+                if let Some(readout) = readout {
+                    let metric = summary_agg_metric(node).ok_or_else(|| {
+                        "SummaryAgg has no unique time-series source in post-ASAP IR".to_string()
+                    })?;
+                    selected.push(SelectedSketch {
+                        node_identity: Rc::as_ptr(node) as usize,
+                        metric,
+                        kind: kind.clone(),
+                        params: kind.params().clone(),
+                        readout: readout.clone(),
+                    });
+                }
+            }
+            SummaryExpr::KeepPreAsap(_)
+            | SummaryExpr::SummaryAgg { .. }
+            | SummaryExpr::SummaryJoin { .. }
+            | SummaryExpr::SummarySubtract { .. }
+            | SummaryExpr::SummaryDelete { .. } => {}
+        }
+        Ok(())
+    }
+
+    let mut selected = Vec::new();
+    walk(node, None, &mut selected)?;
+    Ok(selected)
 }
 
 fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
@@ -2321,6 +2351,74 @@ mod tests {
         assert_eq!(bundle.precompute_plan.materializations.len(), 1);
         assert_eq!(bundle.precompute_plan.schemas.len(), 1);
         assert_eq!(bundle.precompute_plan.producers.len(), 2);
+    }
+
+    #[test]
+    fn compiles_every_materialization_leaf_in_a_merge_dag() {
+        let mut planning_request = request("q-merge", "quantile_over_time(0.90, m[1m])");
+        let right_request = request("q-right", "quantile_over_time(0.90, n[1m])");
+        let left_root = planning_request.queries[0].post_asap.clone();
+        let right_root = right_request.queries[0].post_asap.clone();
+        let (left, query) = match &left_root.expr {
+            SummaryExpr::SummaryEstimate {
+                summary_input,
+                query,
+            } => (summary_input.clone(), query.clone()),
+            other => panic!("expected selected estimate, got {other:?}"),
+        };
+        let right = match &right_root.expr {
+            SummaryExpr::SummaryEstimate { summary_input, .. } => summary_input.clone(),
+            other => panic!("expected selected estimate, got {other:?}"),
+        };
+        let merge = Rc::new(SummaryNode {
+            expr: SummaryExpr::SummaryMerge {
+                children: vec![left.clone(), right.clone()],
+            },
+            schema: left.schema.clone(),
+            guarantee: None,
+        });
+        planning_request.queries[0].post_asap = Rc::new(SummaryNode {
+            expr: SummaryExpr::SummaryEstimate {
+                summary_input: merge,
+                query,
+            },
+            schema: left_root.schema.clone(),
+            guarantee: left_root.guarantee.clone(),
+        });
+
+        let bundle = PhysicalCompiler
+            .compile(planning_request, environment(10_000))
+            .expect("compile merged post-ASAP DAG");
+        assert_eq!(bundle.backend_plan.materializations.len(), 2);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 2);
+        assert_eq!(bundle.backend_plan.routing.len(), 2);
+        let entry = bundle.query_plan.entries.values().next().unwrap();
+        assert_eq!(
+            entry
+                .nodes
+                .values()
+                .filter(|node| matches!(
+                    node,
+                    crate::query_plan::QueryPlanNode::ReadMaterialization { .. }
+                ))
+                .count(),
+            2
+        );
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            crate::query_plan::QueryPlanNode::SummaryMerge { inputs } if inputs.len() == 2
+        )));
+        let bound_metrics = entry
+            .nodes
+            .values()
+            .filter_map(|node| match node {
+                crate::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                    Some(binding.metric.as_str())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(bound_metrics, BTreeSet::from(["m", "n"]));
     }
 
     #[test]
