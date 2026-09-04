@@ -402,6 +402,10 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         "topk(5, sum_over_time(asap_demo_gauge[5s]))",
         "topk by (job) (5, count_over_time(asap_demo_gauge[5s]))",
     ] {
+        let first_instant =
+            wait_for_warm_instant(&client, &backend, query, first_eval, &backend_log).await;
+        let second_instant =
+            wait_for_warm_instant(&client, &backend, query, second_eval, &backend_log).await;
         let response: Value = client
             .get(format!("{backend}/api/v1/query_range"))
             .query(&[
@@ -427,6 +431,32 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         assert_eq!(values.len(), 2, "wrong step count for {query}: {response}");
         assert_eq!(values[0][0], first_eval);
         assert_eq!(values[1][0], second_eval);
+        assert_eq!(
+            response["data"]["result"][0]["metric"], first_instant["data"]["result"][0]["metric"],
+            "range/instant labels differ at first step for {query}"
+        );
+        assert_eq!(
+            response["data"]["result"][0]["metric"], second_instant["data"]["result"][0]["metric"],
+            "range/instant labels differ at second step for {query}"
+        );
+        let range_first = values[0][1]
+            .as_str()
+            .and_then(|value| value.parse::<f64>().ok())
+            .expect("first range value");
+        let range_second = values[1][1]
+            .as_str()
+            .and_then(|value| value.parse::<f64>().ok())
+            .expect("second range value");
+        assert_eq!(
+            range_first,
+            first_value(&first_instant, "value").expect("first instant value"),
+            "range value differs from an independent instant evaluation at first step for {query}"
+        );
+        assert_eq!(
+            range_second,
+            first_value(&second_instant, "value").expect("second instant value"),
+            "range value differs from an independent instant evaluation at second step for {query}"
+        );
     }
 
     let fallback_instant: Value = client
