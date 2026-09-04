@@ -68,6 +68,9 @@ pub enum LoweringSkip {
     /// The installed QueryPlan entry could not be reconstructed or failed
     /// its internal contract. The request must fail closed.
     InvalidQueryPlan(String),
+    /// The QueryPlan binding exists, but its warm materializations do not yet
+    /// cover the requested evaluation interval with complete, fresh windows.
+    MaterializationNotReady(String),
     /// `parse_query_expr_canonical` failed — same failure mode the legacy
     /// parsing path tolerates and reports as an archive fallback reason.
     ParseFailed(String),

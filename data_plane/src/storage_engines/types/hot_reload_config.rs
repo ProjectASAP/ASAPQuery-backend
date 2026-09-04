@@ -97,6 +97,105 @@ pub struct ActivePhysicalPlan {
 #[derive(Clone)]
 pub struct HotReloadActivePhysicalPlan {
     inner: Arc<ArcSwap<ActivePhysicalPlan>>,
+    readiness: Arc<std::sync::Mutex<MaterializationReadinessState>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaterializationPhase {
+    Materializing,
+    Ready,
+    Serving,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MaterializationStatus {
+    pub plan_id: u64,
+    pub plan_version: u64,
+    pub materialization: u64,
+    pub phase: MaterializationPhase,
+    pub coverage_start_unix_ms: Option<u64>,
+    pub coverage_end_unix_ms: Option<u64>,
+}
+
+struct MaterializationReadinessState {
+    plan_id: u64,
+    plan_version: u64,
+    statuses: BTreeMap<asap_types::PolicyFingerprint, MaterializationStatus>,
+}
+
+impl MaterializationReadinessState {
+    fn for_plan(plan: &ActivePhysicalPlan) -> Self {
+        let plan_id = plan.backend_plan.plan_id;
+        let plan_version = plan.backend_plan.plan_version;
+        let statuses = plan
+            .backend_plan
+            .materializations
+            .keys()
+            .copied()
+            .map(|materialization| {
+                (
+                    materialization,
+                    MaterializationStatus {
+                        plan_id,
+                        plan_version,
+                        materialization: materialization.0,
+                        phase: MaterializationPhase::Materializing,
+                        coverage_start_unix_ms: None,
+                        coverage_end_unix_ms: None,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            plan_id,
+            plan_version,
+            statuses,
+        }
+    }
+
+    fn update(
+        &mut self,
+        plan_id: u64,
+        plan_version: u64,
+        materializations: &[asap_types::PolicyFingerprint],
+        phase: MaterializationPhase,
+        coverage: Option<(u64, u64)>,
+    ) -> bool {
+        if self.plan_id != plan_id || self.plan_version != plan_version {
+            return false;
+        }
+        if materializations
+            .iter()
+            .any(|materialization| !self.statuses.contains_key(materialization))
+        {
+            return false;
+        }
+        for materialization in materializations {
+            let status = self
+                .statuses
+                .get_mut(materialization)
+                .expect("materializations were validated above");
+            if phase != MaterializationPhase::Materializing
+                || status.phase == MaterializationPhase::Materializing
+            {
+                status.phase = phase;
+            }
+            if let Some((start, end)) = coverage {
+                status.coverage_start_unix_ms = Some(
+                    status
+                        .coverage_start_unix_ms
+                        .map_or(start, |current| current.min(start)),
+                );
+                status.coverage_end_unix_ms = Some(
+                    status
+                        .coverage_end_unix_ms
+                        .map_or(end, |current| current.max(end)),
+                );
+            }
+        }
+        true
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -304,8 +403,10 @@ fn status_for(plan: &ActivePhysicalPlan, phase: PhysicalPlanPhase) -> PhysicalPl
 
 impl HotReloadActivePhysicalPlan {
     pub fn new(initial: ActivePhysicalPlan) -> Self {
+        let readiness = MaterializationReadinessState::for_plan(&initial);
         Self {
             inner: Arc::new(ArcSwap::new(Arc::new(initial))),
+            readiness: Arc::new(std::sync::Mutex::new(readiness)),
         }
     }
 
@@ -314,7 +415,85 @@ impl HotReloadActivePhysicalPlan {
     }
 
     pub fn swap(&self, next: ActivePhysicalPlan) -> Arc<ActivePhysicalPlan> {
-        self.inner.swap(Arc::new(next))
+        let next_readiness = MaterializationReadinessState::for_plan(&next);
+        let old = self.inner.swap(Arc::new(next));
+        *self
+            .readiness
+            .lock()
+            .expect("materialization readiness lock poisoned") = next_readiness;
+        old
+    }
+
+    pub fn materialization_statuses(&self) -> Vec<MaterializationStatus> {
+        self.readiness
+            .lock()
+            .expect("materialization readiness lock poisoned")
+            .statuses
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn mark_materializing(
+        &self,
+        plan_id: u64,
+        plan_version: u64,
+        materializations: &[asap_types::PolicyFingerprint],
+        coverage: Option<(u64, u64)>,
+    ) -> bool {
+        self.update_materializations(
+            plan_id,
+            plan_version,
+            materializations,
+            MaterializationPhase::Materializing,
+            coverage,
+        )
+    }
+
+    pub fn mark_ready(
+        &self,
+        plan_id: u64,
+        plan_version: u64,
+        materializations: &[asap_types::PolicyFingerprint],
+        coverage: (u64, u64),
+    ) -> bool {
+        self.update_materializations(
+            plan_id,
+            plan_version,
+            materializations,
+            MaterializationPhase::Ready,
+            Some(coverage),
+        )
+    }
+
+    pub fn mark_serving(
+        &self,
+        plan_id: u64,
+        plan_version: u64,
+        materializations: &[asap_types::PolicyFingerprint],
+        coverage: (u64, u64),
+    ) -> bool {
+        self.update_materializations(
+            plan_id,
+            plan_version,
+            materializations,
+            MaterializationPhase::Serving,
+            Some(coverage),
+        )
+    }
+
+    fn update_materializations(
+        &self,
+        plan_id: u64,
+        plan_version: u64,
+        materializations: &[asap_types::PolicyFingerprint],
+        phase: MaterializationPhase,
+        coverage: Option<(u64, u64)>,
+    ) -> bool {
+        self.readiness
+            .lock()
+            .expect("materialization readiness lock poisoned")
+            .update(plan_id, plan_version, materializations, phase, coverage)
     }
 }
 
@@ -800,6 +979,37 @@ mod tests {
         assert_eq!(statuses[1].phase, PhysicalPlanPhase::Active);
         lifecycle.retire_drained(7, 1);
         assert_eq!(lifecycle.statuses()[0].phase, PhysicalPlanPhase::Retired);
+    }
+
+    #[test]
+    fn materialization_readiness_is_generation_scoped_and_monotonic() {
+        let active = HotReloadActivePhysicalPlan::new(physical_plan(7, 1, 100, None));
+        let fingerprint = asap_types::PolicyFingerprint(41);
+        active.readiness.lock().unwrap().statuses.insert(
+            fingerprint,
+            MaterializationStatus {
+                plan_id: 7,
+                plan_version: 1,
+                materialization: fingerprint.0,
+                phase: MaterializationPhase::Materializing,
+                coverage_start_unix_ms: None,
+                coverage_end_unix_ms: None,
+            },
+        );
+
+        assert!(active.mark_ready(7, 1, &[fingerprint], (100, 200)));
+        assert!(active.mark_serving(7, 1, &[fingerprint], (100, 300)));
+        assert!(active.mark_materializing(7, 1, &[fingerprint], Some((200, 250))));
+        let status = active.materialization_statuses().pop().unwrap();
+        assert_eq!(status.phase, MaterializationPhase::Serving);
+        assert_eq!(status.coverage_start_unix_ms, Some(100));
+        assert_eq!(status.coverage_end_unix_ms, Some(300));
+
+        assert!(!active.mark_ready(7, 2, &[fingerprint], (100, 400)));
+        assert_eq!(
+            active.materialization_statuses()[0].coverage_end_unix_ms,
+            Some(300)
+        );
     }
 
     #[test]

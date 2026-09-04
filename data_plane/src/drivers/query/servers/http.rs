@@ -5869,10 +5869,17 @@ async fn handle_physical_plan_status(State(state): State<AppState>) -> axum::res
         )
             .into_response();
     };
+    let materializations = state
+        .active_physical_plan
+        .as_ref()
+        .map(|active| active.materialization_statuses())
+        .unwrap_or_default();
     (
         StatusCode::OK,
         axum::Json(serde_json::json!({
-            "status": "success", "plans": lifecycle.statuses()
+            "status": "success",
+            "plans": lifecycle.statuses(),
+            "materializations": materializations
         })),
     )
         .into_response()

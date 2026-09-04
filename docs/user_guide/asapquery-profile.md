@@ -84,6 +84,14 @@ Query serving uses only the installed `QueryPlan` DAG. A query absent from that
 DAG is a capability miss and goes to the exact Prometheus fallback; the backend
 does not search materialization candidates while serving.
 
+Activation and warm readiness are deliberately separate. A newly activated
+generation exposes each materialization as `materializing`; the QueryPlan path
+promotes it through `ready` to `serving` only after its closed-window coverage
+fully spans the requested interval. Missing, partial, stale, or generation-raced
+coverage is a capability miss, never a partial warm success. Inspect the
+per-materialization state and observed coverage through
+`GET /api/v1/physical-plan/status`.
+
 Snapshot schema version `1` currently accepts fixed-interval repeating PromQL
 queries with explicit whole-second lookbacks and fresh ingestion-rate
 evidence. Unsupported snapshot semantics fail startup rather than silently

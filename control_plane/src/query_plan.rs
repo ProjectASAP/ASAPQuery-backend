@@ -84,6 +84,19 @@ pub struct InstantExecution {
 }
 
 impl QueryPlanEntry {
+    /// Materializations this executable DAG reads, in stable node order.
+    /// Serving uses this set for readiness accounting; it never performs a
+    /// catalog candidate search to reconstruct dependencies.
+    pub fn materialization_bindings(&self) -> Vec<&MaterializationBinding> {
+        self.nodes
+            .values()
+            .filter_map(|node| match node {
+                QueryPlanNode::ReadMaterialization { binding } => Some(binding),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn compile_bound<F>(
         query_id: String,
         canonical_promql: String,

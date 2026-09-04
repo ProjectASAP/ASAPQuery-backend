@@ -4,6 +4,66 @@ use std::sync::Arc;
 use asap_types::query_requirements::QueryRequirements;
 use asap_types::KeyByLabelNames;
 
+#[derive(Clone)]
+struct QueryReadinessRequirement {
+    materializations: Vec<asap_types::PolicyFingerprint>,
+    max_window_ms: u64,
+}
+
+fn readiness_requirement(
+    entry: &control_plane::query_plan::QueryPlanEntry,
+) -> QueryReadinessRequirement {
+    let bindings = entry.materialization_bindings();
+    let mut materializations = bindings
+        .iter()
+        .map(|binding| binding.materialization)
+        .collect::<Vec<_>>();
+    materializations.sort_unstable();
+    materializations.dedup();
+    QueryReadinessRequirement {
+        materializations,
+        max_window_ms: bindings
+            .iter()
+            .map(|binding| binding.window_ms)
+            .max()
+            .unwrap_or(0),
+    }
+}
+
+fn complete_window_coverage(
+    coverage: Option<(u64, u64)>,
+    t0_ms: u64,
+    t1_ms: u64,
+    window_ms: u64,
+) -> bool {
+    let Some((coverage_start, coverage_end)) = coverage else {
+        return false;
+    };
+    if window_ms == 0 || coverage_start > coverage_end || t0_ms > t1_ms {
+        return false;
+    }
+    coverage_start.saturating_sub(window_ms) <= t0_ms
+        && coverage_end >= t1_ms
+        && coverage_end
+            .saturating_sub(coverage_start)
+            .saturating_add(window_ms)
+            >= t1_ms.saturating_sub(t0_ms)
+}
+
+#[cfg(test)]
+mod readiness_coverage_tests {
+    use super::complete_window_coverage;
+
+    #[test]
+    fn readiness_requires_complete_and_fresh_window_span() {
+        assert!(!complete_window_coverage(None, 100, 400, 100));
+        assert!(!complete_window_coverage(Some((200, 300)), 100, 500, 100));
+        assert!(!complete_window_coverage(Some((300, 500)), 100, 500, 100));
+        assert!(complete_window_coverage(Some((200, 500)), 100, 500, 100));
+        assert!(complete_window_coverage(Some((500, 500)), 400, 500, 100));
+    }
+}
+
 #[cfg(test)]
 use crate::storage_engines::types::KeyByLabelValues;
 #[cfg(test)]
@@ -309,9 +369,16 @@ impl ASAPQueryEngine {
             ));
         };
 
-        let planned = match self.physical_plan_snapshot() {
+        let physical_plan = self.physical_plan_snapshot();
+        let mut readiness = None;
+        let planned = match physical_plan.as_ref() {
             Some(physical_plan) => match physical_plan.query_plan.lookup(query) {
                 Ok(query_entry) => {
+                    readiness = Some((
+                        physical_plan.backend_plan.plan_id,
+                        physical_plan.backend_plan.plan_version,
+                        readiness_requirement(query_entry),
+                    ));
                     crate::query_engines::asap_query_engine::live_serve::serve_from_query_plan(
                         idx,
                         query_entry,
@@ -337,7 +404,50 @@ impl ASAPQueryEngine {
                 "no active physical QueryPlan".into(),
             )),
         };
-        let result = planned.map_err(|reason| {
+        let result = planned.and_then(|result| {
+            if let Some((plan_id, plan_version, requirement)) = readiness.as_ref() {
+                let complete = !requirement.materializations.is_empty()
+                    && complete_window_coverage(
+                        result.coverage,
+                        start_ms,
+                        end_ms,
+                        requirement.max_window_ms,
+                    );
+                let Some(active) = self.active_physical_plan.as_ref() else {
+                    return Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::MaterializationNotReady(
+                        "physical readiness registry is unavailable".into(),
+                    ));
+                };
+                if !complete {
+                    active.mark_materializing(
+                        *plan_id,
+                        *plan_version,
+                        &requirement.materializations,
+                        result.coverage,
+                    );
+                    return Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::MaterializationNotReady(
+                        format!("coverage {:?} does not completely and freshly cover [{start_ms}, {end_ms}]", result.coverage),
+                    ));
+                }
+                let coverage = result.coverage.expect("complete coverage checked above");
+                if !active.mark_ready(
+                    *plan_id,
+                    *plan_version,
+                    &requirement.materializations,
+                    coverage,
+                ) || !active.mark_serving(
+                    *plan_id,
+                    *plan_version,
+                    &requirement.materializations,
+                    coverage,
+                ) {
+                    return Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::MaterializationNotReady(
+                        "physical generation changed while checking readiness".into(),
+                    ));
+                }
+            }
+            Ok(result)
+        }).map_err(|reason| {
             if let Some(req) = Self::requirements_from_query_str(query) {
                 crate::drivers::control_plane_client::spawn_capability_miss_notify(
                     &self.control_plane_client,
@@ -356,8 +466,9 @@ impl ASAPQueryEngine {
         // Matrix shape — the range_query wire format requires it.
         let warm_qr = asap_tier_result_to_query_result(result.clone(), end_ms, true);
 
-        // FIX 3 — coverage-aware warm+archive HYBRID STITCH for RANGE
-        // queries. The instant path (`execute`) already stitches when warm
+        // Complete coverage is a prerequisite above. Hybrid stitching is
+        // retained for legacy/test callers without an active QueryPlan only.
+        // The instant path (`execute`) already stitches when warm
         // coverage is narrower than the request; the range path historically
         // returned warm-only, so a request `[start_ms, end_ms]` whose warm
         // sketches only cover a suffix `[cov_lo, cov_hi]` lost the
@@ -556,11 +667,20 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let planned = match self.physical_plan_snapshot() {
+            let physical_plan = self.physical_plan_snapshot();
+            let mut readiness = None;
+            let planned = match physical_plan.as_ref() {
                 Some(physical_plan) => match physical_plan.query_plan.lookup(query) {
-                    Ok(query_entry) => crate::query_engines::asap_query_engine::live_serve::serve_instant_from_query_plan(
-                        idx, query_entry, now_ms,
-                    ),
+                    Ok(query_entry) => {
+                        readiness = Some((
+                            physical_plan.backend_plan.plan_id,
+                            physical_plan.backend_plan.plan_version,
+                            readiness_requirement(query_entry),
+                        ));
+                        crate::query_engines::asap_query_engine::live_serve::serve_instant_from_query_plan(
+                            idx, query_entry, now_ms,
+                        )
+                    },
                     Err(reason) => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(reason.to_string())),
                 },
                 #[cfg(test)]
@@ -572,7 +692,50 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     "no active physical QueryPlan".into(),
                 )),
             };
-            let (result, t0_ms) = planned.map_err(|reason| {
+            let (result, t0_ms) = planned.and_then(|(result, t0_ms)| {
+                if let Some((plan_id, plan_version, requirement)) = readiness.as_ref() {
+                    let complete = !requirement.materializations.is_empty()
+                        && complete_window_coverage(
+                            result.coverage,
+                            t0_ms,
+                            now_ms,
+                            requirement.max_window_ms,
+                        );
+                    let Some(active) = self.active_physical_plan.as_ref() else {
+                        return Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::MaterializationNotReady(
+                            "physical readiness registry is unavailable".into(),
+                        ));
+                    };
+                    if !complete {
+                        active.mark_materializing(
+                            *plan_id,
+                            *plan_version,
+                            &requirement.materializations,
+                            result.coverage,
+                        );
+                        return Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::MaterializationNotReady(
+                            format!("coverage {:?} does not completely and freshly cover [{t0_ms}, {now_ms}]", result.coverage),
+                        ));
+                    }
+                    let coverage = result.coverage.expect("complete coverage checked above");
+                    if !active.mark_ready(
+                        *plan_id,
+                        *plan_version,
+                        &requirement.materializations,
+                        coverage,
+                    ) || !active.mark_serving(
+                        *plan_id,
+                        *plan_version,
+                        &requirement.materializations,
+                        coverage,
+                    ) {
+                        return Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::MaterializationNotReady(
+                            "physical generation changed while checking readiness".into(),
+                        ));
+                    }
+                }
+                Ok((result, t0_ms))
+            }).map_err(|reason| {
                     if let Some(req) = Self::requirements_from_query_str(query) {
                         crate::drivers::control_plane_client::spawn_capability_miss_notify(
                             &self.control_plane_client,
