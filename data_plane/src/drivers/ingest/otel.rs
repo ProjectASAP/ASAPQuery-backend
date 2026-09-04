@@ -1262,7 +1262,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 derive_sketch_policy_fp(
                                     ingest_state,
                                     &canonical_name,
-                                    sketch_kind_handle_for(&dp),
+                                    sketch_algorithm_for(&dp),
                                     &dp.container_config,
                                     &dp.attrs.keys().cloned().collect(),
                                 )
@@ -2099,7 +2099,7 @@ fn preflight_summary_frames(
         ingest_state: &IngestState,
         active: &crate::storage_engines::types::ActivePhysicalPlan,
     ) -> Result<(), String> {
-        let canonical_name = canonical_sketch_metric_name(metric_name, dp.kind);
+        let canonical_name = canonical_sketch_metric_name(metric_name, dp.algorithm.clone());
         let frame =
             take_summary_frame_identity(&mut dp.attrs, dp.start_time_unix_nano, dp.time_unix_nano)?;
         if state_encoding_for_wire(dp.encoding) != Some(frame.encoding.clone()) {
@@ -2129,7 +2129,7 @@ fn preflight_summary_frames(
         // A malformed full snapshot must not be discovered after an earlier
         // frame in the request has already reached SketchStore.
         if frame.kind == control_plane::physical::compiler::SummaryFrameKind::Full {
-            decode_modified_otlp_sketch_bytes(dp.kind, dp.encoding, &dp.sketch)
+            decode_modified_otlp_sketch_bytes(dp.algorithm.clone(), dp.encoding, &dp.sketch)
                 .map_err(|error| format!("invalid full frame for {metric_name}: {error}"))?;
         }
 
@@ -2151,7 +2151,7 @@ fn preflight_summary_frames(
             derive_sketch_policy_fp(
                 ingest_state,
                 canonical_name,
-                sketch_kind_handle_for(&dp),
+                sketch_algorithm_for(&dp),
                 &dp.container_config,
                 &dp.attrs.keys().cloned().collect(),
             )
@@ -2184,13 +2184,13 @@ fn preflight_summary_frames(
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect();
                 macro_rules! validate_points {
-                    ($points:expr, $kind:expr, $config:expr) => {{
+                    ($points:expr, $algorithm:expr, $config:expr) => {{
                         let config = $config;
                         for point in &$points {
                             validate_one(
                                 &metric.name,
                                 ModifiedOtlpSketchDp {
-                                    kind: $kind,
+                                    algorithm: $algorithm,
                                     attrs: merge_point_attributes(&base_labels, &point.attributes),
                                     time_unix_nano: point.time_unix_nano,
                                     sketch: point.sketch.clone(),
@@ -2208,19 +2208,19 @@ fn preflight_summary_frames(
                 match &metric.data {
                     Some(Data::Ddsketch(data)) => validate_points!(
                         data.data_points,
-                        SketchKind::DdSketch,
+                        SketchAlgorithm::DDSketch,
                         crate::storage_engines::sketch_db::index::SketchConfig::DDSketch {
                             relative_accuracy: data.relative_accuracy,
                         }
                     ),
                     Some(Data::Kllsketch(data)) => validate_points!(
                         data.data_points,
-                        SketchKind::Kll,
+                        SketchAlgorithm::Kll,
                         crate::storage_engines::sketch_db::index::SketchConfig::Kll { k: data.k }
                     ),
                     Some(Data::Countsketch(data)) => validate_points!(
                         data.data_points,
-                        SketchKind::CountSketch,
+                        SketchAlgorithm::CountSketch,
                         crate::storage_engines::sketch_db::index::SketchConfig::CountSketch {
                             rows: data.rows,
                             cols: data.cols,
@@ -2228,7 +2228,7 @@ fn preflight_summary_frames(
                     ),
                     Some(Data::Countminsketch(data)) => validate_points!(
                         data.data_points,
-                        SketchKind::CountMin,
+                        SketchAlgorithm::Cms,
                         crate::storage_engines::sketch_db::index::SketchConfig::CountMin {
                             rows: data.rows,
                             cols: data.cols,
@@ -2236,7 +2236,7 @@ fn preflight_summary_frames(
                     ),
                     Some(Data::Hllsketch(data)) => validate_points!(
                         data.data_points,
-                        SketchKind::Hll,
+                        SketchAlgorithm::Hll,
                         crate::storage_engines::sketch_db::index::SketchConfig::Hll {
                             precision: data.precision,
                         }
