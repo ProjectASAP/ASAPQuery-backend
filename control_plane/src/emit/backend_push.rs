@@ -746,6 +746,7 @@ mod tests {
                 ),
                 grouping: vec![],
                 item_label: None,
+                topk_weight: None,
                 spatial_filter: String::new(),
                 window_secs: 60,
                 aggregation_input: AggregationInput::SketchEnvelope,

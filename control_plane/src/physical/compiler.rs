@@ -42,7 +42,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "cb50219c582d43f53ab77d3a595bd1ea4a9aa119";
+pub const PLANNER_REVISION: &str = "5daccfede6fe75dbe638be8e5eed5382b5b91693";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
@@ -185,6 +185,10 @@ pub struct BackendLocalImplementation {
     pub window_implementation_id: String,
     pub state_layout: String,
     pub implementation_cost: ImplementationCostEvidence,
+    /// Optional per-query membership certificates for approximate TopK.
+    /// Keys are the exact PromQL strings in `query_workload`.
+    #[serde(default)]
+    pub topk_evidence: HashMap<String, TopKMembershipEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1544,6 +1548,7 @@ impl BackendLocalPlanningSnapshot {
             ));
         }
         let mut queries = Vec::with_capacity(entries.len());
+        let mut topk_evidence_by_id = HashMap::new();
         for (index, entry) in entries.into_iter().enumerate() {
             let evaluation_interval_ms = match entry.recurrence {
                 QueryRecurrence::Repeated(RepeatedDemand::FixedInterval(interval)) => interval.0,
@@ -1589,14 +1594,19 @@ impl BackendLocalPlanningSnapshot {
                 horizon_seconds: self.implementation.horizon_seconds,
                 costs: self.implementation.lifecycle_costs.clone(),
             };
-            let post_asap = select_post_asap(&parsed, accuracy.clone(), &lifecycle, None)
+            let topk_evidence = self.implementation.topk_evidence.get(&query_string);
+            let post_asap = select_post_asap(&parsed, accuracy.clone(), &lifecycle, topk_evidence)
                 .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
             let mut cost = self.implementation.implementation_cost.clone();
             cost.workload_fingerprint =
                 canonical_promql(&query_string).map_err(CompileError::QueryPlan)?;
             cost.horizon_seconds = self.implementation.horizon_seconds;
+            let query_id = format!("compat-query-{index}");
+            if let Some(evidence) = topk_evidence {
+                topk_evidence_by_id.insert(query_id.clone(), evidence.clone());
+            }
             queries.push(PlanningQuery {
-                query_id: format!("compat-query-{index}"),
+                query_id,
                 query_string,
                 post_asap,
                 source: Source::TimeSeries {
@@ -1620,7 +1630,7 @@ impl BackendLocalPlanningSnapshot {
         PhysicalCompiler.compile(
             PlanningRequest {
                 queries,
-                evidence: HashMap::new(),
+                evidence: topk_evidence_by_id,
                 planner_revision: PLANNER_REVISION.into(),
             },
             self.environment,
@@ -1725,6 +1735,10 @@ impl PhysicalCompiler {
                     spatial_filter: String::new(),
                     grouping: query.group_by.clone(),
                     item_label: None,
+                    topk_weight: selected.readout.as_ref().and_then(|readout| match readout {
+                        SketchQuery::TopK { weight, .. } => Some(*weight),
+                        _ => None,
+                    }),
                     aggregation_input: match environment.target {
                         PhysicalDeploymentTarget::DistributedCollectors => {
                             AggregationInput::SketchEnvelope
@@ -2688,6 +2702,7 @@ mod tests {
                 window_implementation_id: "backend-tumbling-v1".into(),
                 state_layout: "anchored-pane-v1".into(),
                 implementation_cost: template.window_implementations[0].cost.clone(),
+                topk_evidence: HashMap::new(),
             },
             environment,
         };
@@ -2800,13 +2815,15 @@ mod tests {
 
         assert!(plan.collector_plans.is_empty());
         assert!(plan.transmission_plan.rules.is_empty());
-        assert_eq!(plan.query_plan.entries.len(), 4);
-        assert_eq!(plan.precompute_plan.materializations.len(), 3);
+        assert_eq!(plan.query_plan.entries.len(), 6);
+        assert_eq!(plan.precompute_plan.materializations.len(), 5);
         for query in [
             "rate(asap_demo_counter_total[5s])",
             "increase(asap_demo_counter_total[5s])",
             "sum_over_time(asap_demo_gauge[5s])",
             "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
+            "topk(5, sum_over_time(asap_demo_gauge[5s]))",
+            "topk by (job) (5, count_over_time(asap_demo_gauge[5s]))",
         ] {
             assert!(plan.query_plan.lookup(query).is_ok(), "missing {query}");
         }
@@ -3052,6 +3069,40 @@ mod tests {
                 .as_deref(),
             Some("runtime-margin-monitor")
         );
+    }
+
+    #[test]
+    fn asapquery_706_topk_over_temporal_shapes_compile_with_explicit_weights() {
+        let evidence = || TopKMembershipEvidence {
+            selected_lower_bound: 101.0,
+            excluded_upper_bound: 100.0,
+            interval_failure_probability: 0.005,
+            observed_at_unix_ms: 9_500,
+            source: "runtime-margin-monitor".into(),
+        };
+        for (query, expected_weight) in [
+            ("topk(5, sum_over_time(m[1m]))", "value"),
+            ("topk by (job) (5, count_over_time(m[1m]))", "count"),
+        ] {
+            let request = request_with_evidence("q-topk-temporal", query, Some(evidence()))
+                .unwrap_or_else(|error| panic!("{query} must select: {error}"));
+            let bundle = PhysicalCompiler
+                .compile(request, environment(10_000))
+                .unwrap_or_else(|error| panic!("{query} must compile: {error}"));
+            let materialization = bundle
+                .precompute_plan
+                .materializations
+                .first()
+                .expect("TopK materialization");
+            assert_eq!(
+                materialization
+                    .parameters
+                    .get("weight_mode")
+                    .and_then(Value::as_str),
+                Some(expected_weight),
+                "{query} must configure the matching heap update mode"
+            );
+        }
     }
 
     #[test]

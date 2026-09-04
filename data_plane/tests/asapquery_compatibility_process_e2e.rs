@@ -51,11 +51,20 @@ async fn wait_until_ready(client: &reqwest::Client, url: &str, child: &mut Child
 }
 
 fn series(metric: &str, samples: &[(i64, f64)]) -> TimeSeries {
+    series_with_labels(metric, &[], samples)
+}
+
+fn series_with_labels(metric: &str, labels: &[(&str, &str)], samples: &[(i64, f64)]) -> TimeSeries {
+    let mut wire_labels = vec![Label {
+        name: "__name__".into(),
+        value: metric.into(),
+    }];
+    wire_labels.extend(labels.iter().map(|(name, value)| Label {
+        name: (*name).into(),
+        value: (*value).into(),
+    }));
     TimeSeries {
-        labels: vec![Label {
-            name: "__name__".into(),
-            value: metric.into(),
-        }],
+        labels: wire_labels,
         samples: samples
             .iter()
             .map(|(timestamp, value)| Sample {
@@ -265,8 +274,9 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
                     (base + 9_400, 12.0),
                 ],
             ),
-            series(
+            series_with_labels(
                 "asap_demo_gauge",
+                &[("job", "api")],
                 &[
                     (base + 500, 1.0),
                     (base + 1_700, 2.0),
@@ -297,7 +307,11 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let watermark_advance = WriteRequest {
         timeseries: vec![
             series("asap_demo_counter_total", &[(base + 10_500, 15.0)]),
-            series("asap_demo_gauge", &[(base + 10_500, 9.0)]),
+            series_with_labels(
+                "asap_demo_gauge",
+                &[("job", "api")],
+                &[(base + 10_500, 9.0)],
+            ),
             series("asap_demo_latency_ms", &[(base + 10_500, 55.0)]),
         ],
     };
@@ -352,6 +366,24 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         &backend_log,
     )
     .await;
+    let topk_sum = wait_for_warm_instant(
+        &client,
+        &backend,
+        "topk(5, sum_over_time(asap_demo_gauge[5s]))",
+        first_eval,
+        &backend_log,
+    )
+    .await;
+    let topk_count = wait_for_warm_instant(
+        &client,
+        &backend,
+        "topk by (job) (5, count_over_time(asap_demo_gauge[5s]))",
+        first_eval,
+        &backend_log,
+    )
+    .await;
+    assert!(first_value(&topk_sum, "value").is_some());
+    assert!(first_value(&topk_count, "value").is_some());
     let rate_value = first_value(&rate, "value").expect("rate value");
     let increase_value = first_value(&increase, "value").expect("increase value");
     assert!((rate_value * 5.0 - increase_value).abs() < 1e-9);
@@ -367,6 +399,8 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         "increase(asap_demo_counter_total[5s])",
         "sum_over_time(asap_demo_gauge[5s])",
         "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
+        "topk(5, sum_over_time(asap_demo_gauge[5s]))",
+        "topk by (job) (5, count_over_time(asap_demo_gauge[5s]))",
     ] {
         let response: Value = client
             .get(format!("{backend}/api/v1/query_range"))
@@ -467,7 +501,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let materializations = status["materializations"]
         .as_array()
         .expect("materialization statuses");
-    assert_eq!(materializations.len(), 3);
+    assert_eq!(materializations.len(), 5);
     assert!(materializations
         .iter()
         .all(|entry| entry["phase"] == "serving"));

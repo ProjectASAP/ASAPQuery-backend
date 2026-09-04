@@ -37,7 +37,7 @@ use crate::physical::post_asap::deployment_expr::{PhysicalExpr, PostAsapPlan};
 use crate::types_v2::BindingName;
 use planner_types::post_asap::{
     ExactKind, ExactParams, GroupingStrategy, SketchAlgorithm, SketchKind, SketchParams,
-    SketchQuery, SummaryExpr, SummaryFamilyType,
+    SketchQuery, SummaryExpr, SummaryFamilyType, TopKWeight,
 };
 
 /// Flattened view of one [`ColoredNode`](crate::physical::colored_dag::dag::ColoredNode)'s
@@ -701,6 +701,9 @@ pub struct BackendAggregation {
     /// `parameters["item_label"]` so the data-plane ingest records it on the
     /// CMS sid and can answer per-item `estimate(key)` (FrequencyEstimate).
     pub item_label: Option<String>,
+    /// Heap update mode selected by the TopK readout. `Count` uses unit
+    /// updates; `Value` ranks by the summed sample value.
+    pub topk_weight: Option<TopKWeight>,
     /// Phase ε.1 — what shape the backend ingests for this
     /// aggregation. Mode 1 (sketch at edge) / sketch_envelope is the
     /// default (the wire payload is a sketch state already). Mode 2
@@ -910,6 +913,7 @@ impl Emitter for ThreeStageEmitter {
                         // from workload.group_by_labels — see the
                         // struct doc-comment for the rationale.
                         grouping: Vec::new(),
+                        topk_weight: None,
                         // Mode 1 — sketch built at edge, ships envelope.
                         aggregation_input: AggregationInput::SketchEnvelope,
                     });
@@ -991,6 +995,7 @@ impl Emitter for ThreeStageEmitter {
                         window_secs: edge.window_secs.unwrap_or(0),
                         spatial_filter: spatial_filter_from_label_filters(&edge.label_filters),
                         grouping: Vec::new(),
+                        topk_weight: None,
                         // Mode 2 — backend builds sketch from raw OTLP.
                         aggregation_input: AggregationInput::Raw,
                     });

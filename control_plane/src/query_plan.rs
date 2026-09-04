@@ -286,7 +286,15 @@ pub enum QueryReadout {
     Cardinality,
     TopK {
         k: usize,
+        weight: QueryTopKWeight,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryTopKWeight {
+    Count,
+    Value,
 }
 
 impl From<SketchQuery> for QueryReadout {
@@ -295,7 +303,13 @@ impl From<SketchQuery> for QueryReadout {
             SketchQuery::Quantile { q } => Self::Quantile { q },
             SketchQuery::PointCount { key, value } => Self::PointCount { key, value },
             SketchQuery::Cardinality => Self::Cardinality,
-            SketchQuery::TopK { k } => Self::TopK { k },
+            SketchQuery::TopK { k, weight } => Self::TopK {
+                k,
+                weight: match weight {
+                    planner_types::post_asap::TopKWeight::Count => QueryTopKWeight::Count,
+                    planner_types::post_asap::TopKWeight::Value => QueryTopKWeight::Value,
+                },
+            },
         }
     }
 }
@@ -306,7 +320,13 @@ impl From<QueryReadout> for SketchQuery {
             QueryReadout::Quantile { q } => Self::Quantile { q },
             QueryReadout::PointCount { key, value } => Self::PointCount { key, value },
             QueryReadout::Cardinality => Self::Cardinality,
-            QueryReadout::TopK { k } => Self::TopK { k },
+            QueryReadout::TopK { k, weight } => Self::TopK {
+                k,
+                weight: match weight {
+                    QueryTopKWeight::Count => planner_types::post_asap::TopKWeight::Count,
+                    QueryTopKWeight::Value => planner_types::post_asap::TopKWeight::Value,
+                },
+            },
         }
     }
 }

@@ -739,7 +739,7 @@ fn readout_cumulative(
         return Err(SummaryExecutorError::NoCandidates);
     };
     let w_end = latest_window_end.unwrap_or(t1_ms);
-    if let SketchQuery::TopK { k } = query {
+    if let SketchQuery::TopK { k, .. } = query {
         Ok(SummaryValue::TopK(
             vec![(w_end, topk_ranked(&merged, *k)?)],
             coverage,
@@ -801,7 +801,7 @@ fn readout_per_window(
     if by_window.is_empty() {
         return Err(SummaryExecutorError::NoCandidates);
     }
-    if let SketchQuery::TopK { k } = query {
+    if let SketchQuery::TopK { k, .. } = query {
         let points = by_window
             .into_iter()
             .map(|(w_end, rs)| topk_ranked(&rs, *k).map(|items| (w_end, items)))
@@ -2133,7 +2133,13 @@ mod tests {
             },
         );
         let child = scan_node("requests_total", None);
-        let tree = estimate_node(cms_agg_node(child), SketchQuery::TopK { k: 5 });
+        let tree = estimate_node(
+            cms_agg_node(child),
+            SketchQuery::TopK {
+                k: 5,
+                weight: planner_types::post_asap::TopKWeight::Value,
+            },
+        );
         let exec = ctx(&idx);
         match execute(&tree, &exec) {
             Err(crate::query_engines::asap_query_engine::summary_exec::ExecError::Executor(
@@ -2170,7 +2176,13 @@ mod tests {
         );
 
         let child = scan_node("requests_by_route", None);
-        let tree = estimate_node(cms_with_heap_agg_node(child), SketchQuery::TopK { k: 3 });
+        let tree = estimate_node(
+            cms_with_heap_agg_node(child),
+            SketchQuery::TopK {
+                k: 3,
+                weight: planner_types::post_asap::TopKWeight::Value,
+            },
+        );
 
         let exec = ctx(&idx);
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
@@ -2220,7 +2232,13 @@ mod tests {
         );
 
         let child = scan_node("requests_by_route", None);
-        let tree = estimate_node(cms_with_heap_agg_node(child), SketchQuery::TopK { k: 5 });
+        let tree = estimate_node(
+            cms_with_heap_agg_node(child),
+            SketchQuery::TopK {
+                k: 5,
+                weight: planner_types::post_asap::TopKWeight::Value,
+            },
+        );
 
         let exec = ctx(&idx);
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
@@ -2266,7 +2284,13 @@ mod tests {
         );
 
         let child = scan_node("requests_by_route", None);
-        let tree = estimate_node(cms_with_heap_agg_node(child), SketchQuery::TopK { k: 2 });
+        let tree = estimate_node(
+            cms_with_heap_agg_node(child),
+            SketchQuery::TopK {
+                k: 2,
+                weight: planner_types::post_asap::TopKWeight::Value,
+            },
+        );
 
         let exec = matrix_ctx(&idx);
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
@@ -2586,7 +2610,13 @@ mod tests {
         );
 
         let child = scan_node("requests_by_route", None);
-        let tree = estimate_node(cms_with_heap_agg_node(child), SketchQuery::TopK { k: 5 });
+        let tree = estimate_node(
+            cms_with_heap_agg_node(child),
+            SketchQuery::TopK {
+                k: 5,
+                weight: planner_types::post_asap::TopKWeight::Value,
+            },
+        );
 
         let exec = matrix_ctx(&idx);
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {

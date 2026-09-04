@@ -243,7 +243,7 @@ fn topk_binding_family(bound: &PhysicalExpr) -> (SketchAlgorithm, u32, u32) {
                 query,
                 summary_input,
             } => {
-                assert!(matches!(query, SketchQuery::TopK { k } if *k == 10));
+                assert!(matches!(query, SketchQuery::TopK { k, .. } if *k == 10));
                 match &summary_input.expr {
                     SummaryExpr::SummaryAgg { family, .. } => match family {
                         SummaryFamilyType::Sketch(kind, _)

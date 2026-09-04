@@ -686,6 +686,7 @@ impl Replanner {
                 window_secs,
                 spatial_filter: String::new(),
                 grouping: workload.group_by_labels.clone(),
+                topk_weight: None,
                 // ExactAgg consumes raw values at the backend (the agent
                 // ships counter samples; the backend's
                 // SumAccumulator integrates them).
@@ -1319,6 +1320,7 @@ mod tests {
                         grouping: vec!["zone".to_string()],
                         spatial_filter: String::new(),
                         window_secs: 60,
+                        topk_weight: None,
                         aggregation_input: AggregationInput::Raw,
                     }],
                     readouts: Vec::new(),
