@@ -20,7 +20,7 @@
 //! sweep can later drop it.
 //!
 //! Sketch-typed agg-configs are not yet covered: the
-//! `AggregationConfig` shape doesn't carry a `SketchKindHandle` /
+//! `AggregationConfig` shape doesn't carry a `SketchAlgorithm` /
 //! `SketchConfig` natively (control plane pushes them through a parallel
 //! capability-routing channel). For now the reconciler treats every
 //! agg-config as a precompute signature; sketch sids never compare
@@ -210,23 +210,24 @@ fn build_live_signature_set(config: &StreamingConfig) -> HashSet<Vec<u8>> {
 }
 
 fn encode_agg_kind(agg_kind: &AggKind, buf: &mut Vec<u8>) {
-    use crate::storage_engines::sketch_db::data::{SketchConfig, SketchKindHandle};
+    use crate::storage_engines::sketch_db::data::{SketchAlgorithm, SketchConfig};
     match agg_kind {
         AggKind::Sketch {
-            kind,
+            algorithm: kind,
             config,
             spatial_filter_canonical,
         } => {
             buf.push(b'S');
             buf.push(match kind {
-                SketchKindHandle::DDSketch => 1,
-                SketchKindHandle::Kll => 2,
-                SketchKindHandle::Hll => 3,
-                SketchKindHandle::CountSketch => 4,
-                SketchKindHandle::CountMin => 5,
-                SketchKindHandle::CmsWithHeap => 6,
-                SketchKindHandle::CountSketchWithHeap => 7,
-                SketchKindHandle::Any => 0,
+                SketchAlgorithm::DDSketch => 1,
+                SketchAlgorithm::Kll => 2,
+                SketchAlgorithm::Hll => 3,
+                SketchAlgorithm::CountSketch => 4,
+                SketchAlgorithm::Cms => 5,
+                SketchAlgorithm::CmsWithHeap => 6,
+                SketchAlgorithm::CountSketchWithHeap => 7,
+                SketchAlgorithm::Kmv => 8,
+                SketchAlgorithm::Theta => 9,
             });
             match config {
                 SketchConfig::DDSketch { relative_accuracy } => {
@@ -415,7 +416,7 @@ mod tests {
     fn meta_sketch(
         sid: u64,
         metric: &str,
-        kind: crate::storage_engines::sketch_db::data::SketchKindHandle,
+        kind: crate::storage_engines::sketch_db::data::SketchAlgorithm,
         config: crate::storage_engines::sketch_db::data::SketchConfig,
         group_by: Vec<&str>,
     ) -> SketchInstanceMetadata {
@@ -426,7 +427,7 @@ mod tests {
             group_by_keys,
             capability: None,
             agg_kind: AggKind::Sketch {
-                kind,
+                algorithm: kind,
                 config,
                 spatial_filter_canonical: String::new(),
             },
@@ -450,19 +451,19 @@ mod tests {
     // plane's eviction RPC's job, not this path's.
     #[test]
     fn sketch_sids_are_never_retired_by_signature_reconcile() {
-        use crate::storage_engines::sketch_db::data::{SketchConfig, SketchKindHandle};
+        use crate::storage_engines::sketch_db::data::{SketchAlgorithm, SketchConfig};
         let store = SketchStore::new();
         store.register(meta_sketch(
             1,
             "http_requests_total_latency_ms",
-            SketchKindHandle::Kll,
+            SketchAlgorithm::Kll,
             SketchConfig::Kll { k: 200 },
             vec!["node", "pod", "zone"],
         ));
         store.register(meta_sketch(
             2,
             "unique_users_per_min",
-            SketchKindHandle::Hll,
+            SketchAlgorithm::Hll,
             SketchConfig::Hll { precision: 12 },
             vec!["zone"],
         ));

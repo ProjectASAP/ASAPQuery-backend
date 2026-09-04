@@ -42,7 +42,7 @@
 //!   `Some(_)`) — reported rather than silently guessed at.
 //!
 //! `find_candidates`/`fetch_state`/`merge_states` ALSO recognize
-//! `AggKind::ExactAgg` sids for `SummaryKind::{Sum, Increase}` (see
+//! `AggKind::ExactAgg` sids for `ExactKind::{Sum, Increase}` (see
 //! `exact_agg_kind_match`'s doc for why `MinMax`/`Count`/`Rate` aren't
 //! matched) — one sid is one aggregation, read out directly, with no
 //! special-casing of exact-vs-approximate at the `find_candidates`/merge
@@ -64,18 +64,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::query_engines::asap_query_engine::summary_exec::SummaryExecutor;
-use planner_types::post_asap::{SketchQuery, SummaryExpr, SummaryFamilyType, SummaryNode};
+use planner_types::post_asap::{
+    ExactKind, ExactParams, SketchAlgorithm, SketchParams, SketchQuery, SummaryExpr,
+    SummaryFamilyType, SummaryNode,
+};
 use planner_types::pre_asap::{ColumnId, ColumnRef, QueryExpr, Reduction, Source};
-// This file's own flat `(SummaryKind, SummaryParams)` -- spans both exact
-// accumulators and approximate sketches in one pair, matching every
-// internal matcher below (`summary_params_match`/`exact_agg_kind_match`)
-// -- vendored because ASAPPlanner split its old flat `SummaryKind` into
-// per-family `SketchKind`/`ExactKind` (ASAPPlanner#218). See
-// `crates/asap_types/src/accumulator_spec.rs`'s module doc and
-// control_plane/docs/design-asapplanner-pin-migration.md.
-use asap_types::{SummaryKind, SummaryParams};
-
-use control_plane::physical::runtime_capability::SketchKindHandle;
 
 use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig, SketchTimeSeries};
 use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
@@ -253,7 +246,7 @@ impl GroupState {
 #[derive(Debug)]
 pub enum SummaryExecutorError {
     /// No sid in the catalog matches the requested `(metric, by,
-    /// SummaryKind, SummaryParams)` — mirrors today's `CapabilityMiss`
+    /// SummaryFamilyType)` — mirrors today's `CapabilityMiss`
     /// contract; the caller fails over to archive.
     NoCandidates,
     /// Couldn't recover a metric name by walking the `SummaryAgg`'s
@@ -263,7 +256,7 @@ pub enum SummaryExecutorError {
     /// A requested `by` `ColumnId` doesn't resolve to a name against the
     /// child's schema.
     UnresolvedColumn(ColumnId),
-    /// A candidate sid claims a `SummaryKind` this executor doesn't
+    /// A candidate sid claims a `SummaryFamilyType` this executor doesn't
     /// implement cross-sid merge for, or the sid's on-disk
     /// `SketchConfig` didn't decode into a `DeltaSketchKind`.
     UnsupportedFamily,
@@ -340,29 +333,15 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         reduction: &Reduction,
         child: &SummaryNode,
     ) -> Result<Vec<(Self::GroupKey, Self::Handle)>, Self::Error> {
-        // `SummaryAgg`'s `kind`/`params` collapsed into this one `family`
-        // field (ASAPPlanner#218 -- see this file's `use asap_types::{...}`
-        // note above); recover the flat `(SummaryKind, SummaryParams)`
-        // pair every matcher below still expects. `Plain`/`Sample`/
-        // `Wavelet`/`StatModel` never occur on a real `SummaryAgg` (never
-        // `Plain` by construction; the others are unreachable via this
-        // deployment's own `CostModel` -- see
-        // the physical runtime-capability adapter
-        // doc for the same reasoning), so there's no candidate to find.
-        let (sketch, params): (SummaryKind, SummaryParams) = match family {
-            SummaryFamilyType::ExactAggregate(kind, params) => {
-                (kind.clone().into(), params.clone().into())
-            }
-            SummaryFamilyType::Sketch(kind, _) => {
-                (kind.clone().into(), kind.params().clone().into())
-            }
+        if matches!(
+            family,
             SummaryFamilyType::Plain(_)
-            | SummaryFamilyType::Sample(..)
-            | SummaryFamilyType::Wavelet(..)
-            | SummaryFamilyType::StatModel(..) => return Ok(Vec::new()),
-        };
-        let sketch = &sketch;
-        let params = &params;
+                | SummaryFamilyType::Sample(..)
+                | SummaryFamilyType::Wavelet(..)
+                | SummaryFamilyType::StatModel(..)
+        ) {
+            return Ok(Vec::new());
+        }
         let metric = find_metric(child).ok_or(SummaryExecutorError::NoMetricFound)?;
 
         let by: &[ColumnId] = reduction.group_keys().map(|k| k.keys()).unwrap_or(&[]);
@@ -401,14 +380,16 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
                         return None;
                     }
                     match &m.agg_kind {
-                        AggKind::Sketch { kind, config, .. } => {
-                            summary_params_match(sketch, params, *kind, config)
-                                .then(|| to_delta_kind(*kind, config))
-                                .flatten()
-                                .map(Candidate::Sketch)
-                        }
+                        AggKind::Sketch {
+                            algorithm: kind,
+                            config,
+                            ..
+                        } => summary_family_matches_sketch(family, kind.clone(), config)
+                            .then(|| to_delta_kind(kind.clone(), config))
+                            .flatten()
+                            .map(Candidate::Sketch),
                         AggKind::ExactAgg { agg_type, .. } => {
-                            exact_agg_kind_match(sketch, params, *agg_type)
+                            summary_family_matches_exact(family, *agg_type)
                                 .then_some(Candidate::ExactAgg(*agg_type))
                         }
                     }
@@ -506,7 +487,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
                     entries.extend(more);
                 }
                 // `find_candidates`'s exact-match contract never produces a
-                // mixed group (a `(SummaryKind, SummaryParams)` query
+                // mixed group (a `(SummaryFamilyType)` query
                 // matches either sketch-family sids or ExactAgg sids, never
                 // both) -- defensive, not a real path.
                 _ => return Err(SummaryExecutorError::UnsupportedFamily),
@@ -720,109 +701,104 @@ fn topk_ranked(rs: &SummaryState, k: usize) -> Result<Vec<(String, f64)>, Summar
     Ok(items)
 }
 
-/// Exact `(SummaryKind, SummaryParams)` match against a sid's own
-/// `(SketchKindHandle, SketchConfig)` -- the check `find_candidates`'s
+/// Exact canonical `SketchKind` match against a sid's own
+/// `(SketchAlgorithm, SketchConfig)` -- the check `find_candidates`'s
 /// trait contract requires (not the looser family-only
 /// `Capability::is_satisfied_by` check the legacy analyzer path uses),
 /// so a `SummaryMerge`'s precondition (every child agrees on kind AND
 /// params) is guaranteed by construction for anything routed through
 /// this executor.
-fn summary_params_match(
-    sketch: &SummaryKind,
-    params: &SummaryParams,
-    kind: SketchKindHandle,
+fn summary_family_matches_sketch(
+    family: &SummaryFamilyType,
+    kind: SketchAlgorithm,
     config: &SketchConfig,
 ) -> bool {
-    // `SummaryParams::{Cms,CmsWithHeap,CountSketch,CountSketchWithHeap}`
+    // `SketchParams::{Cms,CmsWithHeap,CountSketch,CountSketchWithHeap}`
     // use width=cols/depth=rows (matches the control-plane wire
     // convention -- see `sketch_config_to_json`'s comment). `SketchConfig`
     // has no `heap_size` field at all (heap-bearing kinds reuse their
     // heap-less base's config shape for identity -- see
-    // `base_sketch_kind_handle`'s doc in `drivers/ingest/otel.rs`), so
+    // `base_sketch_algorithm`'s doc in `drivers/ingest/otel.rs`), so
     // heap_size can't be part of this match; width/depth are.
-    match (sketch, params, kind, config) {
+    let SummaryFamilyType::Sketch(sketch, _) = family else {
+        return false;
+    };
+    match (sketch.algorithm(), sketch.params(), kind, config) {
         (
-            SummaryKind::DDSketch,
-            SummaryParams::DDSketch { alpha },
-            SketchKindHandle::DDSketch,
+            SketchAlgorithm::DDSketch,
+            SketchParams::DDSketch { alpha },
+            SketchAlgorithm::DDSketch,
             SketchConfig::DDSketch { relative_accuracy },
         ) => alpha == relative_accuracy,
         (
-            SummaryKind::Kll,
-            SummaryParams::Kll { k },
-            SketchKindHandle::Kll,
+            SketchAlgorithm::Kll,
+            SketchParams::Kll { k },
+            SketchAlgorithm::Kll,
             SketchConfig::Kll { k: sid_k },
         ) => k == sid_k,
         (
-            SummaryKind::Hll,
-            SummaryParams::Hll { precision },
-            SketchKindHandle::Hll,
+            SketchAlgorithm::Hll,
+            SketchParams::Hll { precision },
+            SketchAlgorithm::Hll,
             SketchConfig::Hll { precision: sid_p },
         ) => u32::from(*precision) == *sid_p,
         (
-            SummaryKind::Cms,
-            SummaryParams::Cms { width, depth },
-            SketchKindHandle::CountMin,
+            SketchAlgorithm::Cms,
+            SketchParams::Cms { width, depth },
+            SketchAlgorithm::Cms,
             SketchConfig::CountMin { rows, cols },
         ) => *depth as i32 == *rows && *width as i32 == *cols,
         (
-            SummaryKind::CountSketch,
-            SummaryParams::CountSketch { width, depth },
-            SketchKindHandle::CountSketch,
+            SketchAlgorithm::CountSketch,
+            SketchParams::CountSketch { width, depth },
+            SketchAlgorithm::CountSketch,
             SketchConfig::CountSketch { rows, cols },
         ) => *depth as i32 == *rows && *width as i32 == *cols,
         (
-            SummaryKind::CmsWithHeap,
-            SummaryParams::CmsWithHeap { width, depth, .. },
-            SketchKindHandle::CmsWithHeap,
+            SketchAlgorithm::CmsWithHeap,
+            SketchParams::CmsWithHeap { width, depth, .. },
+            SketchAlgorithm::CmsWithHeap,
             SketchConfig::CountMin { rows, cols },
         ) => *depth as i32 == *rows && *width as i32 == *cols,
         (
-            SummaryKind::CountSketchWithHeap,
-            SummaryParams::CountSketchWithHeap { width, depth, .. },
-            SketchKindHandle::CountSketchWithHeap,
+            SketchAlgorithm::CountSketchWithHeap,
+            SketchParams::CountSketchWithHeap { width, depth, .. },
+            SketchAlgorithm::CountSketchWithHeap,
             SketchConfig::CountSketch { rows, cols },
         ) => *depth as i32 == *rows && *width as i32 == *cols,
         _ => false,
     }
 }
 
-/// Exact-agg analog of `summary_params_match`, for `AggKind::ExactAgg`
-/// sids. `SummaryParams::{Sum, Count, MinMax, Increase, Rate}` are unit
-/// variants (no tuning parameters — see `asap-sketch`'s `SummaryParams`
-/// doc), so this is a pure kind-identity check against the sid's
+/// Exact-aggregate analog of `summary_family_matches_sketch`, for
+/// `AggKind::ExactAgg` sids. `ExactParams` variants carry no tuning
+/// parameters, so this is a pure `ExactKind` identity check against the sid's
 /// `AggregationType`, mirroring the canonical `AggregationType ->
-/// SummaryKind` mapping `asap_types::accumulator_spec` uses on the write
-/// side (`Sum|MultipleSum -> SummaryKind::Sum`, `Increase|MultipleIncrease
-/// -> SummaryKind::Increase` — confirmed against that module's own
+/// ExactKind` mapping `asap_types::accumulator_spec` uses on the write
+/// side (`Sum|MultipleSum -> ExactKind::Sum`, `Increase|MultipleIncrease
+/// -> ExactKind::Increase` — confirmed against that module's own
 /// dispatch table rather than invented here).
 ///
-/// `SummaryKind::MinMax` is deliberately NOT matched: `AggregationType`
+/// `ExactKind::MinMax` is deliberately NOT matched: `AggregationType`
 /// carries no min-vs-max DIRECTION (that lives in the write-side
 /// `AggregationConfig::aggregation_sub_type` string, which this sid's
 /// `AggKind::ExactAgg` metadata doesn't retain), so there's no honest way
 /// for `GroupState::exact_value` to know which statistic to compute --
 /// matching it here would force a later caller to silently guess a
-/// direction. `SummaryKind::Count`/`Rate` are ALSO not matched: no
+/// direction. `ExactKind::Count`/`Rate` are ALSO not matched: no
 /// `AggregationType` variant resolves to either today (mirrors
 /// `sketch_reducer.rs::evaluate_exact_agg`'s own `stat` mapping, which
 /// only handles `Sum`/`Increase` for the same reason); `Rate` in
 /// particular is "outer-agg-fold" territory the user has explicitly
 /// deferred pending a design conversation with ASAPController.
-fn exact_agg_kind_match(
-    sketch: &SummaryKind,
-    params: &SummaryParams,
-    agg_type: AggregationType,
-) -> bool {
+fn summary_family_matches_exact(family: &SummaryFamilyType, agg_type: AggregationType) -> bool {
     matches!(
-        (sketch, params, agg_type),
+        (family, agg_type),
         (
-            SummaryKind::Sum,
-            SummaryParams::Sum,
+            SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
             AggregationType::Sum | AggregationType::MultipleSum,
         ) | (
-            SummaryKind::Increase,
-            SummaryParams::Increase,
+            SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase),
             AggregationType::Increase | AggregationType::MultipleIncrease,
         )
     )
@@ -897,7 +873,7 @@ fn resolve_group_key(
 
 /// `SketchConfig` (data_plane's per-sid stored params) -> `DeltaSketchKind`
 /// (`delta_apply`'s decode/merge parameter carrier).
-fn to_delta_kind(kind: SketchKindHandle, config: &SketchConfig) -> Option<DeltaSketchKind> {
+fn to_delta_kind(kind: SketchAlgorithm, config: &SketchConfig) -> Option<DeltaSketchKind> {
     // Default heap_size when bootstrapping an empty Heap state for a
     // delta-from-empty leading window -- `SketchConfig` carries no
     // heap_size (see `summary_params_match`'s doc), so this only matters
@@ -907,35 +883,35 @@ fn to_delta_kind(kind: SketchKindHandle, config: &SketchConfig) -> Option<DeltaS
     // heap_size-absent default (`accuracy.rs`).
     const DEFAULT_HEAP_SIZE: usize = 100;
     match (kind, config) {
-        (SketchKindHandle::DDSketch, SketchConfig::DDSketch { relative_accuracy }) => {
+        (SketchAlgorithm::DDSketch, SketchConfig::DDSketch { relative_accuracy }) => {
             Some(DeltaSketchKind::DDSketch {
                 alpha: *relative_accuracy,
             })
         }
-        (SketchKindHandle::Kll, SketchConfig::Kll { k }) => Some(DeltaSketchKind::Kll { k: *k }),
-        (SketchKindHandle::Hll, SketchConfig::Hll { precision }) => Some(DeltaSketchKind::Hll {
+        (SketchAlgorithm::Kll, SketchConfig::Kll { k }) => Some(DeltaSketchKind::Kll { k: *k }),
+        (SketchAlgorithm::Hll, SketchConfig::Hll { precision }) => Some(DeltaSketchKind::Hll {
             precision: *precision,
         }),
-        (SketchKindHandle::CountMin, SketchConfig::CountMin { rows, cols }) => {
+        (SketchAlgorithm::Cms, SketchConfig::CountMin { rows, cols }) => {
             Some(DeltaSketchKind::Cms {
                 rows: *rows as usize,
                 cols: *cols as usize,
             })
         }
-        (SketchKindHandle::CountSketch, SketchConfig::CountSketch { rows, cols }) => {
+        (SketchAlgorithm::CountSketch, SketchConfig::CountSketch { rows, cols }) => {
             Some(DeltaSketchKind::CountSketch {
                 rows: *rows as usize,
                 cols: *cols as usize,
             })
         }
-        (SketchKindHandle::CmsWithHeap, SketchConfig::CountMin { rows, cols }) => {
+        (SketchAlgorithm::CmsWithHeap, SketchConfig::CountMin { rows, cols }) => {
             Some(DeltaSketchKind::CmsWithHeap {
                 rows: *rows as usize,
                 cols: *cols as usize,
                 heap_size: DEFAULT_HEAP_SIZE,
             })
         }
-        (SketchKindHandle::CountSketchWithHeap, SketchConfig::CountSketch { rows, cols }) => {
+        (SketchAlgorithm::CountSketchWithHeap, SketchConfig::CountSketch { rows, cols }) => {
             Some(DeltaSketchKind::CountSketchWithHeap {
                 rows: *rows as usize,
                 cols: *cols as usize,
@@ -1127,9 +1103,9 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<BTreeSet<_>>(),
-            capability: Some(Capability::QuantileApprox(SketchKindHandle::Kll)),
+            capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::Kll))),
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                kind: SketchKindHandle::Kll,
+                algorithm: SketchAlgorithm::Kll,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -1149,7 +1125,7 @@ mod tests {
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::CardinalityApprox),
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                kind: SketchKindHandle::Hll,
+                algorithm: SketchAlgorithm::Hll,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -1193,9 +1169,9 @@ mod tests {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
-            capability: Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
+            capability: Some(Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms))),
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                kind: SketchKindHandle::CountMin,
+                algorithm: SketchAlgorithm::Cms,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -1260,9 +1236,11 @@ mod tests {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
-            capability: Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap)),
+            capability: Some(Capability::FrequencyTopk(Some(
+                SketchAlgorithm::CmsWithHeap,
+            ))),
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                kind: SketchKindHandle::CmsWithHeap,
+                algorithm: SketchAlgorithm::CmsWithHeap,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -2604,7 +2582,7 @@ mod tests {
 
     #[test]
     fn minmax_exactagg_sid_is_not_matched() {
-        // `SummaryKind::MinMax` is deliberately NOT matched against
+        // `ExactKind::MinMax` is deliberately NOT matched against
         // ExactAgg sids (see `exact_agg_kind_match`'s doc: no direction
         // info survives to `AggKind::ExactAgg`) -- must fail over as
         // NoCandidates, not silently guess a direction.

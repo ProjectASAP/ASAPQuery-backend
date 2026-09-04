@@ -469,7 +469,7 @@ mod tests {
     /// statistic just to make an incompatible family appear valid.
     #[test]
     fn incompatible_override_does_not_rewrite_query_semantics() {
-        use crate::emit::extract_root_sketch_kind;
+        use crate::emit::extract_root_sketch_algorithm;
         use planner_types::post_asap::SketchAlgorithm;
         for (ov, expect) in [
             (SketchType::DDSketch, SketchAlgorithm::DDSketch),
@@ -483,7 +483,7 @@ mod tests {
             let pe = bind_workload_typed(&w)
                 .unwrap_or_else(|| panic!("bind declined for override {ov:?}"));
             assert_eq!(
-                extract_root_sketch_kind(&pe),
+                extract_root_sketch_algorithm(&pe),
                 Some(expect.clone()),
                 "override {ov:?} must not change Quantile semantics",
             );
@@ -616,9 +616,9 @@ mod tests {
     /// Walk the L4 binding output and pull out the approximate sketch
     /// family. Returns `None` if no sketch node is present (raw / pure
     /// logical pass-through, or an exact accumulator — see
-    /// `emit::extract_root_sketch_kind`, whose logic this mirrors).
+    /// `emit::extract_root_sketch_algorithm`, whose logic this mirrors).
     fn extract_family(expr: &PhysicalExpr) -> Option<SketchAlgorithm> {
-        crate::emit::extract_root_sketch_kind(expr)
+        crate::emit::extract_root_sketch_algorithm(expr)
     }
 
     /// Pull the `SketchQuery` out of a bound `PhysicalExpr`'s top-level

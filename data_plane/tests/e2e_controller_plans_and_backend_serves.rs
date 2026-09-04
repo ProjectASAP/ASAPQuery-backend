@@ -932,7 +932,7 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     // below carries `service` as an attribute (required to avoid the
     // receiver's "invalid wire shape" drop). The backend's
     // `derive_sketch_policy_fp` matches policies on
-    // `(metric, sketch_kind, config, group_by_keys)` — so the
+    // `(metric, sketch_algorithm, config, group_by_keys)` — so the
     // streaming-config's grouping MUST include "service" or the
     // fingerprint won't match and the registered sid stays orphaned
     // from any policy.
@@ -1620,7 +1620,7 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
 // dispatches both variants through `decode_cms_with_heap_from_msgpack`
 // (see `sketch_reducer.rs` at the FrequencyTopk dispatch site).
 //
-// On the ingest side, `sketch_kind_handle_for` peeks at incoming
+// On the ingest side, `sketch_algorithm_for` peeks at incoming
 // CountMin / CountSketch DPs with `encoding=MSGPACK`; if the bytes
 // round-trip through the heap envelope AND the heap is non-empty,
 // the sid is auto-promoted to the corresponding `*WithHeap` variant
@@ -1664,7 +1664,7 @@ fn extract_w_d_from_streaming_config(streaming_config_json: &JsonValue) -> (u32,
 
 /// OTLP `ExportMetricsServiceRequest` with a single `CountMinSketch` DP
 /// carrying msgpack-encoded heap-bearing bytes. `encoding=MSGPACK` (3)
-/// triggers `sketch_kind_handle_for`'s auto-promotion to `CmsWithHeap`.
+/// triggers `sketch_algorithm_for`'s auto-promotion to `CmsWithHeap`.
 /// `rows`/`cols` on the parent `CountMinSketch` MUST match the policy's
 /// `parameters.{d,w}` for the policy_fp content match to bind.
 fn build_cms_with_heap_msgpack_export(
@@ -1720,7 +1720,7 @@ fn build_cms_with_heap_msgpack_export(
 
 /// OTLP `ExportMetricsServiceRequest` with a single `CountSketch` DP
 /// carrying msgpack-encoded heap-bearing bytes. `encoding=MSGPACK` (3)
-/// triggers `sketch_kind_handle_for`'s auto-promotion to
+/// triggers `sketch_algorithm_for`'s auto-promotion to
 /// `CountSketchWithHeap` (the heap envelope is identical to the CMS
 /// variant). `rows`/`cols` MUST match the policy's `parameters.{d,w}`.
 fn build_count_sketch_with_heap_msgpack_export(
@@ -1783,7 +1783,7 @@ fn build_count_sketch_with_heap_msgpack_export(
 // Cormode & Muthukrishnan 2005).
 //
 // The OTLP DP carries a msgpack-encoded `CountMinSketchWithHeap`
-// payload (`encoding=MSGPACK`); the receiver's `sketch_kind_handle_for`
+// payload (`encoding=MSGPACK`); the receiver's `sketch_algorithm_for`
 // peeks at the bytes and auto-promotes the sid to `CmsWithHeap`,
 // registering it under `Capability::FrequencyTopk(CmsWithHeap)`.
 //
@@ -1949,7 +1949,7 @@ async fn controller_plan_to_query_full_roundtrip_cms_with_heap_topk() {
 // outer DP type changes (`CountSketchDataPoint` instead of
 // `CountMinSketchDataPoint`).
 //
-// `sketch_kind_handle_for` was extended in this PR to peek at
+// `sketch_algorithm_for` was extended in this PR to peek at
 // CountSketch DPs the same way it does for CountMin — a
 // non-empty heap in a msgpack-encoded payload promotes the sid to
 // `CountSketchWithHeap`, which the analyzer's `is_satisfied_by`

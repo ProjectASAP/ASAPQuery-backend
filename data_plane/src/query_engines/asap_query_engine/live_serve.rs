@@ -33,7 +33,30 @@ use crate::storage_engines::sketch_db::query::ASAPTierResult;
 /// query can't be served either way). `data_plane` doesn't carry a
 /// per-workload `AccuracyTarget` today (see the design doc's "Rollout"
 /// section).
-const LIVE_ACCURACY: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
+const DEFAULT_LIVE_EPSILON: f64 = 0.01;
+
+fn live_accuracy() -> AccuracyTarget {
+    live_accuracy_from_values(
+        std::env::var("ASAP_SUMMARY_EXECUTOR_EPSILON")
+            .ok()
+            .as_deref(),
+        std::env::var("ASAP_SUMMARY_EXECUTOR_DELTA").ok().as_deref(),
+    )
+}
+
+fn live_accuracy_from_values(epsilon: Option<&str>, delta: Option<&str>) -> AccuracyTarget {
+    let epsilon = epsilon
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0 && *value < 1.0)
+        .unwrap_or(DEFAULT_LIVE_EPSILON);
+    match delta
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0 && *value < 1.0)
+    {
+        Some(delta) => AccuracyTarget::EpsilonDelta { epsilon, delta },
+        None => AccuracyTarget::Epsilon(epsilon),
+    }
+}
 
 /// Whether the serving cutover is enabled for this process. The env var
 /// stays as a kill switch (`ASAP_SUMMARY_EXECUTOR_LIVE=0`/`false`/`off`) —
@@ -50,12 +73,14 @@ const LIVE_ACCURACY: AccuracyTarget = AccuracyTarget::Epsilon(0.01);
 /// (empty-`by` ambiguity) is resolved via the real `Reduction::{Reduce,
 /// PerEntity}` IR signal, not a heuristic.
 pub fn summary_executor_live_enabled() -> bool {
-    std::env::var("ASAP_SUMMARY_EXECUTOR_LIVE")
-        .map(|v| {
-            let v = v.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-        })
-        .unwrap_or(true)
+    let value = std::env::var("ASAP_SUMMARY_EXECUTOR_LIVE").ok();
+    summary_executor_live_value(value.as_deref())
+}
+
+fn summary_executor_live_value(value: Option<&str>) -> bool {
+    value.map(str::trim).is_none_or(|v| {
+        !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+    })
 }
 
 /// Try to serve `query` entirely from `SummaryExecutor`. Returns `None`
@@ -88,7 +113,7 @@ pub fn try_serve_from_summary_executor(
         t0_ms,
         t1_ms,
         is_cumulative,
-        LIVE_ACCURACY,
+        live_accuracy(),
         backend_plan,
     )
     .map_err(|skip| {
@@ -140,7 +165,7 @@ pub fn serve_instant_from_summary_executor(
         return Err(LoweringSkip::Disabled);
     }
     let (outcome, t0_ms) =
-        execute_post_asap_instant(index, query, now_ms, LIVE_ACCURACY, backend_plan)?;
+        execute_post_asap_instant(index, query, now_ms, live_accuracy(), backend_plan)?;
     Ok((
         ASAPTierResult {
             series: outcome.series,
@@ -157,39 +182,8 @@ mod tests {
 
     use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig};
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchInstanceMetadata, SketchKindHandle, SketchSampleState,
+        AccuracyBound, Capability, SketchAlgorithm, SketchInstanceMetadata, SketchSampleState,
     };
-
-    /// Mirrors `shadow_compare.rs`'s `ENV_VAR_LOCK`/`ShadowEnvGuard`
-    /// pattern exactly, own env var — `std::env::set_var`/`remove_var`
-    /// mutate process-global state and `cargo test` runs this module's
-    /// tests on multiple threads in the same process.
-    static ENV_VAR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[allow(dead_code)]
-    struct LiveEnvGuard(std::sync::MutexGuard<'static, ()>);
-
-    impl Drop for LiveEnvGuard {
-        fn drop(&mut self) {
-            std::env::remove_var("ASAP_SUMMARY_EXECUTOR_LIVE");
-        }
-    }
-
-    fn set_live_env(value: &str) -> LiveEnvGuard {
-        let guard = ENV_VAR_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::env::set_var("ASAP_SUMMARY_EXECUTOR_LIVE", value);
-        LiveEnvGuard(guard)
-    }
-
-    fn clear_live_env() -> LiveEnvGuard {
-        let guard = ENV_VAR_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::env::remove_var("ASAP_SUMMARY_EXECUTOR_LIVE");
-        LiveEnvGuard(guard)
-    }
 
     fn ddsketch_fixture() -> SketchStore {
         let idx = SketchStore::new();
@@ -200,9 +194,9 @@ mod tests {
             sid: 1,
             metric_name: "latency_ms".to_string(),
             group_by_keys: std::collections::BTreeSet::new(),
-            capability: Some(Capability::QuantileApprox(SketchKindHandle::DDSketch)),
+            capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),
             agg_kind: AggKind::Sketch {
-                kind: SketchKindHandle::DDSketch,
+                algorithm: SketchAlgorithm::DDSketch,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -239,7 +233,7 @@ mod tests {
             group_by_keys,
             capability: Some(Capability::CardinalityApprox),
             agg_kind: AggKind::Sketch {
-                kind: SketchKindHandle::Hll,
+                algorithm: SketchAlgorithm::Hll,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -268,20 +262,10 @@ mod tests {
     }
 
     #[test]
-    fn flag_explicitly_off_never_serves() {
-        // Kill switch: an explicit off-spelling still disables live-serve
-        // even though the default (unset) is now on.
-        let _guard = set_live_env("0");
-        let idx = ddsketch_fixture();
-        let result = try_serve_from_summary_executor(
-            &idx,
-            "quantile_over_time(0.99, latency_ms[1m])",
-            1_000,
-            2_000,
-            true,
-            None,
-        );
-        assert!(result.is_none(), "flag explicitly off must never serve");
+    fn flag_off_spellings_disable_live_serve() {
+        assert!(!summary_executor_live_value(Some("0")));
+        assert!(!summary_executor_live_value(Some(" false ")));
+        assert!(!summary_executor_live_value(Some("OFF")));
     }
 
     #[test]
@@ -289,7 +273,7 @@ mod tests {
         // Default flipped to on (design-target-architecture.md §4/Part A)
         // -- an unset env var must serve, not fall back to the legacy
         // path, for a shape this executor already proves safe.
-        let _guard = clear_live_env();
+        assert!(summary_executor_live_value(None));
         let idx = ddsketch_fixture();
         let result = try_serve_from_summary_executor(
             &idx,
@@ -303,8 +287,22 @@ mod tests {
     }
 
     #[test]
+    fn live_accuracy_accepts_explicit_valid_epsilon_delta() {
+        assert_eq!(
+            live_accuracy_from_values(Some("0.02"), Some("0.04")),
+            AccuracyTarget::EpsilonDelta {
+                epsilon: 0.02,
+                delta: 0.04,
+            }
+        );
+        assert_eq!(
+            live_accuracy_from_values(Some("invalid"), Some("1.0")),
+            AccuracyTarget::Epsilon(DEFAULT_LIVE_EPSILON)
+        );
+    }
+
+    #[test]
     fn flag_on_safe_shape_serves() {
-        let _guard = set_live_env("1");
         let idx = ddsketch_fixture();
         let result = try_serve_from_summary_executor(
             &idx,
@@ -328,7 +326,6 @@ mod tests {
         // executor resolves it -- `count(...)` lowers to `Reduce([])`, both
         // sids share one group key, and the new path serves the correctly
         // merged answer instead of falling back.
-        let _guard = set_live_env("1");
         let idx = SketchStore::new();
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
@@ -352,7 +349,6 @@ mod tests {
 
     #[test]
     fn flag_on_unservable_query_falls_back() {
-        let _guard = set_live_env("1");
         let idx = SketchStore::new();
         let result = try_serve_from_summary_executor(
             &idx,

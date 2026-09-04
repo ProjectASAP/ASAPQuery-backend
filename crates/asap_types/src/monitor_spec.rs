@@ -1,5 +1,36 @@
 use serde::{Deserialize, Serialize};
 
+/// Continuous-monitoring readout shared by the control and data planes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorFunctional {
+    #[default]
+    Sum,
+    CmsPoint,
+    LinearBuckets,
+    F2,
+}
+
+impl MonitorFunctional {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sum => "sum",
+            Self::CmsPoint => "cms_point",
+            Self::LinearBuckets => "linear_buckets",
+            Self::F2 => "f2",
+        }
+    }
+
+    pub fn from_name(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cms_point" | "cms" => Self::CmsPoint,
+            "linear_buckets" | "linear" => Self::LinearBuckets,
+            "f2" | "l2" => Self::F2,
+            _ => Self::Sum,
+        }
+    }
+}
+
 /// One continuous-monitoring (CDM) threshold spec. The data-plane monitor
 /// coordinator owns the AUTHORITATIVE `tau`/`epsilon`/`window_ms` (the edge
 /// copy is advisory), keyed by the same content-addressed `agg_id` the edge and

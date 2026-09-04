@@ -381,7 +381,10 @@ fn emitter_edge_config_has_correct_processor_kll() {
         StageConfig::Edge(e) => {
             assert_eq!(e.sketch_processors.len(), 1);
             assert_eq!(e.sketch_processors[0].processor_name, "KLL");
-            assert_eq!(e.sketch_processors[0].sketch_kind, SketchAlgorithm::Kll);
+            assert_eq!(
+                e.sketch_processors[0].sketch_algorithm,
+                SketchAlgorithm::Kll
+            );
             assert_eq!(
                 e.source_metric.as_deref(),
                 Some("http_request_duration_seconds")
@@ -428,7 +431,11 @@ fn emitter_backend_config_routes_aggregation_id() {
         StageConfig::Backend(b) => {
             assert_eq!(b.aggregations.len(), 1);
             assert_eq!(b.aggregations[0].aggregation_id, edge_aid);
-            assert_eq!(b.aggregations[0].sketch_kind, SketchAlgorithm::Kll.into());
+            assert!(matches!(
+                &b.aggregations[0].family,
+                SummaryFamilyType::Sketch(kind, _)
+                    if kind.algorithm() == &SketchAlgorithm::Kll
+            ));
             assert_eq!(b.readouts.len(), 1);
             assert_eq!(b.readouts[0].aggregation_id, edge_aid);
             // `SketchQuery` has no `PartialEq` upstream — destructure
@@ -511,7 +518,7 @@ fn end_to_end_quantile_workload() {
         StageConfig::Gateway(g) => {
             assert!(!g.merge_processors.is_empty());
             assert_eq!(g.merge_processors[0].processor_name, "sketchmergeprocessor");
-            assert_eq!(g.merge_processors[0].sketch_kind, SketchAlgorithm::Kll);
+            assert_eq!(g.merge_processors[0].sketch_algorithm, SketchAlgorithm::Kll);
         }
         _ => unreachable!(),
     }

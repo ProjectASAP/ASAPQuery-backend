@@ -368,10 +368,11 @@ mod tests {
     /// hand-merged sequence of full sketches.
     #[tokio::test]
     async fn delta_path_reconstitutes_cumulative_state() {
-        use crate::drivers::ingest::otel::{apply_modified_otlp_delta_bytes, SketchKind};
+        use crate::drivers::ingest::otel::apply_modified_otlp_delta_bytes;
         use crate::precompute_engine::operators::DDSketchAccumulator;
         use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
         use asap_sketchlib::DdSketch;
+        use planner_types::post_asap::SketchAlgorithm;
         use prost::Message;
 
         const ENCODING_PROTO_DELTA: i32 = 2;
@@ -416,8 +417,13 @@ mod tests {
             .unwrap()
             .core
             .clone_boxed_core();
-        apply_modified_otlp_delta_bytes(SketchKind::DdSketch, ENCODING_PROTO_DELTA, &mut acc1, &d1)
-            .expect("apply first delta");
+        apply_modified_otlp_delta_bytes(
+            SketchAlgorithm::DDSketch,
+            ENCODING_PROTO_DELTA,
+            &mut acc1,
+            &d1,
+        )
+        .expect("apply first delta");
         state.sketch_snapshots.insert(
             series_key.to_string(),
             SnapshotCacheEntry {
@@ -441,8 +447,13 @@ mod tests {
             .unwrap()
             .core
             .clone_boxed_core();
-        apply_modified_otlp_delta_bytes(SketchKind::DdSketch, ENCODING_PROTO_DELTA, &mut acc2, &d2)
-            .expect("apply second delta");
+        apply_modified_otlp_delta_bytes(
+            SketchAlgorithm::DDSketch,
+            ENCODING_PROTO_DELTA,
+            &mut acc2,
+            &d2,
+        )
+        .expect("apply second delta");
 
         let final_dd = acc2.as_any().downcast_ref::<DDSketchAccumulator>().unwrap();
         // Base [1,2,3] + d1 [+10 on 0, +20 on 2] = [11,2,23];

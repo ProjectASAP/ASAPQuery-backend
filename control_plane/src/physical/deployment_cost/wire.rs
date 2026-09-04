@@ -123,8 +123,8 @@ impl WireCostTable {
     // "exact accumulators have no sketch wire-state cost" panic, are
     // unreachable by construction now instead of at runtime; see
     // control_plane/docs/design-asapplanner-pin-migration.md).
-    pub const fn for_kind(&self, kind: &SketchAlgorithm) -> SketchWireCost {
-        match kind {
+    pub const fn for_algorithm(&self, algorithm: &SketchAlgorithm) -> SketchWireCost {
+        match algorithm {
             SketchAlgorithm::DDSketch => self.ddsketch_delta,
             SketchAlgorithm::Kll => self.kll_full,
             SketchAlgorithm::Hll => self.hll_delta,

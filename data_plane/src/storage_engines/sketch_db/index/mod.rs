@@ -35,7 +35,7 @@ use crate::storage_engines::sketch_db::lifecycle::AggStatus;
 // during the reorg.
 pub use crate::storage_engines::sketch_db::data::{
     canonical_parameters, AccuracyBound, AggKind, AggPayload, AggregationType, Capability,
-    SketchConfig, SketchEncoding, SketchKindHandle, SketchSampleState, SketchTimeSeries,
+    SketchAlgorithm, SketchConfig, SketchEncoding, SketchSampleState, SketchTimeSeries,
 };
 
 fn now_ms() -> u64 {
@@ -247,14 +247,16 @@ impl SketchInstanceMetadata {
     /// `Some(handle)` iff this sid is sketch-backed; `None` for
     /// exact-aggregation-backed sids. Consumers that only meaningfully
     /// run on sketches (e.g. the ASAP-tier reducer) `.expect` it.
-    pub fn sketch_kind(&self) -> Option<SketchKindHandle> {
+    pub fn sketch_algorithm(&self) -> Option<SketchAlgorithm> {
         match &self.agg_kind {
-            AggKind::Sketch { kind, .. } => Some(*kind),
+            AggKind::Sketch {
+                algorithm: kind, ..
+            } => Some(kind.clone()),
             AggKind::ExactAgg { .. } => None,
         }
     }
 
-    /// Sketch-config accessor mirroring [`Self::sketch_kind`].
+    /// Sketch-config accessor mirroring [`Self::sketch_algorithm`].
     pub fn sketch_config(&self) -> Option<&SketchConfig> {
         match &self.agg_kind {
             AggKind::Sketch { config, .. } => Some(config),
@@ -1291,7 +1293,7 @@ impl SketchStore {
         // ── KNOWN GAP — sketch-backed aggs return empty here ────────
         // The `matches!` predicate below ONLY matches
         // `AggKind::ExactAgg`. Sketch-backed sids
-        // (`AggKind::Sketch { kind, config, .. }`, registered by
+        // (`AggKind::Sketch { algorithm: kind, config, .. }`, registered by
         // `route_modified_otlp_sketches_to_precompute` for every
         // OTLP DDSketch/KLL/HLL/CountSketch/CountMinSketch DP) are
         // NEVER picked up — and the agg-keyed precompute query
@@ -2201,7 +2203,9 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
                 .ok()
                 .and_then(|g| g.get(&sid).cloned())
                 .and_then(|m| match &m.agg_kind {
-                    AggKind::Sketch { kind, .. } => Some(format!("{:?}", kind)),
+                    AggKind::Sketch {
+                        algorithm: kind, ..
+                    } => Some(format!("{:?}", kind)),
                     AggKind::ExactAgg { .. } => None,
                 })
         };
@@ -2321,9 +2325,9 @@ mod tests {
             sid,
             metric_name: "m".into(),
             group_by_keys: BTreeSet::new(),
-            capability: Some(Capability::QuantileApprox(SketchKindHandle::DDSketch)),
+            capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),
             agg_kind: AggKind::Sketch {
-                kind: SketchKindHandle::DDSketch,
+                algorithm: SketchAlgorithm::DDSketch,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -3446,9 +3450,9 @@ mod tests {
             sid,
             metric_name: "http_latency".into(),
             group_by_keys: ["host".to_string()].into_iter().collect(),
-            capability: Some(Capability::QuantileApprox(SketchKindHandle::Kll)),
+            capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::Kll))),
             agg_kind: AggKind::Sketch {
-                kind: SketchKindHandle::Kll,
+                algorithm: SketchAlgorithm::Kll,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -3512,7 +3516,7 @@ mod tests {
         assert_eq!(meta.metric_name, "http_latency");
         assert!(matches!(
             meta.capability,
-            Some(Capability::QuantileApprox(SketchKindHandle::Kll))
+            Some(Capability::QuantileApprox(Some(SketchAlgorithm::Kll)))
         ));
 
         // (b) a range query over the EVICTED window returns the data.

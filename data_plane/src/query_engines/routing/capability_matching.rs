@@ -12,27 +12,15 @@
 //! shared-struct-field reason to exist. Exercised only by this crate's
 //! own [`super::query_engine_routing`].
 
-use asap_types::Statistic;
-use serde::{Deserialize, Serialize};
-
 use crate::storage_engines::types::StorageBackend;
+use asap_types::Statistic;
+pub use planner_types::types::AccuracyTarget;
 
 /// Accuracy hint pushed by the controller at intent-binding time
 /// (`controller/docs/design.md` §6 `core::workload`). The Phase-5 capability
 /// router consults this to decide whether a metric configured for both warm-
 /// tier and Gorilla-S3 should answer from the archive (Exact) or the
 /// approximate ASAP-tier sketch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum AccuracyTarget {
-    /// Caller demands an exact answer; ASAP-tier sketches are not eligible
-    /// unless they happen to be exact accumulators (Sum, MinMax, Increase).
-    Exact,
-    /// Caller accepts ε/δ-bounded approximate answers. Default.
-    #[default]
-    Approximate,
-}
-
 /// Returns the storage backends that can serve a `(statistic, accuracy)`
 /// query when the metric is configured for `metric_storage_config`.
 ///
@@ -65,7 +53,7 @@ pub enum AccuracyTarget {
 ///   deploy.
 pub fn compatible_storage_backends(
     _stat: Statistic,
-    accuracy: AccuracyTarget,
+    accuracy: &AccuracyTarget,
     metric_storage_config: StorageBackend,
 ) -> Vec<StorageBackend> {
     match metric_storage_config {
@@ -81,7 +69,7 @@ pub fn compatible_storage_backends(
             // Exact: archive only — the warm sketches are ε/δ-bounded.
             AccuracyTarget::Exact => vec![StorageBackend::GorillaObjectStore],
             // Approximate: ASAP-tier first, archive (Thanos) fallback.
-            AccuracyTarget::Approximate => vec![
+            AccuracyTarget::Epsilon(_) | AccuracyTarget::EpsilonDelta { .. } => vec![
                 StorageBackend::SketchStore,
                 StorageBackend::GorillaObjectStore,
             ],
@@ -112,7 +100,7 @@ mod tests {
             StorageBackend::SketchStore,
             StorageBackend::DoubleWrite,
         ] {
-            let backends = compatible_storage_backends(Statistic::Sum, AccuracyTarget::Exact, cfg);
+            let backends = compatible_storage_backends(Statistic::Sum, &AccuracyTarget::Exact, cfg);
             assert_eq!(
                 backends,
                 vec![StorageBackend::GorillaObjectStore],
@@ -132,8 +120,11 @@ mod tests {
             StorageBackend::GorillaObjectStore,
             StorageBackend::DoubleWrite,
         ] {
-            let backends =
-                compatible_storage_backends(Statistic::Quantile, AccuracyTarget::Approximate, cfg);
+            let backends = compatible_storage_backends(
+                Statistic::Quantile,
+                &AccuracyTarget::Epsilon(0.01),
+                cfg,
+            );
             assert_eq!(
                 backends,
                 vec![
@@ -164,7 +155,7 @@ mod tests {
             Statistic::Quantile,
             Statistic::Topk,
         ];
-        let accuracies = [AccuracyTarget::Exact, AccuracyTarget::Approximate];
+        let accuracies = [AccuracyTarget::Exact, AccuracyTarget::Epsilon(0.01)];
         let configs = [
             StorageBackend::SketchStore,
             StorageBackend::GorillaObjectStore,
@@ -173,7 +164,7 @@ mod tests {
         ];
 
         for &stat in &stats {
-            for &acc in &accuracies {
+            for acc in &accuracies {
                 for &cfg in &configs {
                     let backends = compatible_storage_backends(stat, acc, cfg);
                     assert!(
@@ -198,7 +189,9 @@ mod tests {
                     let expected_head = match (cfg, acc) {
                         (StorageBackend::PrometheusRemote, _) => StorageBackend::PrometheusRemote,
                         (_, AccuracyTarget::Exact) => StorageBackend::GorillaObjectStore,
-                        (_, AccuracyTarget::Approximate) => StorageBackend::SketchStore,
+                        (_, AccuracyTarget::Epsilon(_) | AccuracyTarget::EpsilonDelta { .. }) => {
+                            StorageBackend::SketchStore
+                        }
                     };
                     assert_eq!(
                         backends[0], expected_head,

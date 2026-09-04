@@ -1,15 +1,8 @@
-//! `AccumulatorSpec` — data_plane's replacement for the
-//! `AggregationType` + `aggregation_sub_type: String` + untyped
-//! `parameters: HashMap<String, Value>` triple.
+//! Typed accumulator dispatch derived from legacy streaming config.
 //!
-//! **Step 5 of the sketch-identity unification** (see
-//! `scratchpad/artifacts/enum-unification-plan.md`, §7-8). Converges
-//! accumulator *identity* onto ASAPController's `planner_types::post_asap::SummaryKind`
-//! / `SummaryParams` — the same representation `control_plane` already
-//! uses as of Stage 3 (merged) — extended with the one axis that
-//! representation doesn't have: keyed-vs-unkeyed grouping, which
-//! `AggregationType` wrongly folded into identity (`Sum` vs
-//! `MultipleSum`, etc.) instead of modeling as a sibling field.
+//! The semantic identity is ASAPPlanner's [`SummaryFamilyType`]. This module
+//! only adds the backend execution concern of keyed versus unkeyed state and
+//! adapts the stable legacy wire fields into that canonical representation.
 //!
 //! ## This is an additive representation, not a replacement (yet)
 //!
@@ -46,37 +39,18 @@
 //! unaffected — nothing here changes how `AggregationConfig::from_yaml`
 //! / `from_json` parse or how `serialize_to_json` emits.
 //!
-//! ## What doesn't fit `SummaryKind`/`SummaryParams`
+//! Backend-specific execution details remain deliberately separate:
 //!
-//! `SummaryKind`/`SummaryParams` were ASAPController's (now ASAPPlanner's)
-//! types, not ours to extend from this repo, until ASAPPlanner split them
-//! into a per-family `(ExactKind, SketchKind, SamplingKind, ...)` union
-//! (ASAPPlanner#218) with no single flat type spanning both exact and
-//! approximate accumulator identity anymore — see
-//! `control_plane/docs/design-asapplanner-pin-migration.md`. This
-//! module's own `AccumulatorSpec::kind`/`params` dispatch (below, and its
-//! ~25 call sites in `data_plane::precompute_engine::accumulator_factory`)
-//! never needed that pre-ASAP/post-ASAP distinction in the first place —
-//! it's a flat "which concrete Rust accumulator struct to construct"
-//! question, entirely internal to this workspace. Rather than thread a
-//! two-level `Exact(ExactKind) | Sketch(SketchKind)` wrapper through every
-//! one of those call sites for a distinction they don't care about,
-//! `SummaryKind`/`SummaryParams` are now vendored here as local types,
-//! same 14-variant shape as before the split (mirrors the same call this
-//! workspace made for `WindowKind` — see `enums.rs`).
-//!
-//! Two data_plane-specific details don't fit them:
-//!
-//! - **Min/max direction.** `SummaryParams::MinMax` carries no fields —
+//! - **Min/max direction.** Planner's `ExactParams::MinMax` carries no fields —
 //!   upstream doesn't model a direction axis. `accumulator_factory.rs`
 //!   keeps reading `AggregationConfig::aggregation_sub_type` directly
 //!   for this one bit (`eq_ignore_ascii_case("max")`), exactly as it did
 //!   before this refactor.
-//! - **HydraKLL's `(row, col)` tiling.** `SummaryParams::Kll` carries
+//! - **HydraKLL's `(row, col)` tiling.** `SketchParams::Kll` carries
 //!   only `k` — upstream has no concept of the CMS-like grid-of-KLL-cells
 //!   layout `HydraKllSketchAccumulator` uses to parallelize a keyed KLL
 //!   across many populations. `accumulator_factory.rs` calls
-//!   [`cms_params`] directly for the `(SummaryKind::Kll, keyed=true)`
+//!   [`cms_params`] directly for keyed KLL execution
 //!   arm, same extraction the plain CMS arms use, because `w`/`d` are
 //!   genuinely the same wire keys for both.
 //! - **Top-k ranking mode (`weight_mode`).** Not a sketch structural
@@ -89,260 +63,10 @@ use serde_json::Value;
 use crate::aggregation_config::AggregationConfig;
 use crate::key_by_label_names::KeyByLabelNames;
 use crate::AggregationType;
-
-/// Which accumulator family to run — identity only (no keyed/unkeyed
-/// axis, no heap-vs-bare ambiguity: heap-bearing sketches are their own
-/// variant, e.g. `CmsWithHeap` vs `Cms`). Vendored (see module doc): same
-/// 14-variant shape ASAPController's pre-split `asap_sketch::SummaryKind`
-/// had.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SummaryKind {
-    Sum,
-    Count,
-    MinMax,
-    Increase,
-    Rate,
-    Kll,
-    Cms,
-    Hll,
-    DDSketch,
-    CmsWithHeap,
-    Kmv,
-    Theta,
-    CountSketch,
-    CountSketchWithHeap,
-}
-
-impl SummaryKind {
-    /// True for the exact, zero-error mergeable-accumulator kinds (no
-    /// tuning parameters, upstream's old `ExactKind` set); false for the
-    /// approximate sketch families (upstream's old `SketchKind` set).
-    pub fn is_exact(&self) -> bool {
-        matches!(
-            self,
-            SummaryKind::Sum
-                | SummaryKind::Count
-                | SummaryKind::MinMax
-                | SummaryKind::Increase
-                | SummaryKind::Rate
-        )
-    }
-}
-
-/// Typed tuning parameters matching a [`SummaryKind`]. Vendored
-/// alongside it (see module doc) — same shape as ASAPController's
-/// pre-split `asap_sketch::SummaryParams`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SummaryParams {
-    Sum,
-    Count,
-    MinMax,
-    Increase,
-    Rate,
-    Kll {
-        k: u32,
-    },
-    Cms {
-        width: u32,
-        depth: u32,
-    },
-    Hll {
-        precision: u8,
-    },
-    DDSketch {
-        alpha: f64,
-    },
-    CmsWithHeap {
-        width: u32,
-        depth: u32,
-        heap_size: u32,
-    },
-    Kmv {
-        k: u32,
-    },
-    Theta {
-        k: u32,
-    },
-    CountSketch {
-        width: u32,
-        depth: u32,
-    },
-    CountSketchWithHeap {
-        width: u32,
-        depth: u32,
-        heap_size: u32,
-    },
-}
-
-/// Widen an upstream (post-ASAPPlanner#218) `ExactKind` into this crate's
-/// flat [`SummaryKind`]. See the module doc for why the flat type exists.
-impl From<planner_types::post_asap::ExactKind> for SummaryKind {
-    fn from(k: planner_types::post_asap::ExactKind) -> Self {
-        use planner_types::post_asap::ExactKind as K;
-        match k {
-            K::Sum => SummaryKind::Sum,
-            K::Count => SummaryKind::Count,
-            K::MinMax => SummaryKind::MinMax,
-            K::Increase => SummaryKind::Increase,
-            K::Rate => SummaryKind::Rate,
-        }
-    }
-}
-
-impl From<planner_types::post_asap::ExactParams> for SummaryParams {
-    fn from(p: planner_types::post_asap::ExactParams) -> Self {
-        use planner_types::post_asap::ExactParams as P;
-        match p {
-            P::Sum => SummaryParams::Sum,
-            P::Count => SummaryParams::Count,
-            P::MinMax => SummaryParams::MinMax,
-            P::Increase => SummaryParams::Increase,
-            P::Rate => SummaryParams::Rate,
-        }
-    }
-}
-
-/// Widen an upstream (post-ASAPPlanner#218) `SketchKind` -- always a real
-/// approximate sketch, never exact -- into this crate's flat
-/// [`SummaryKind`]. Used at the boundary where a wire/config type needs
-/// to represent both exact and approximate accumulators in one field
-/// (e.g. `control_plane`'s `BackendAggregation`) but the value in hand is
-/// known-sketch. See the module doc for why the flat type exists.
-impl From<planner_types::post_asap::SketchKind> for SummaryKind {
-    fn from(k: planner_types::post_asap::SketchKind) -> Self {
-        use planner_types::post_asap::SketchAlgorithm as K;
-        match k.algorithm() {
-            K::Kll => SummaryKind::Kll,
-            K::Cms => SummaryKind::Cms,
-            K::Hll => SummaryKind::Hll,
-            K::DDSketch => SummaryKind::DDSketch,
-            K::CmsWithHeap => SummaryKind::CmsWithHeap,
-            K::Kmv => SummaryKind::Kmv,
-            K::Theta => SummaryKind::Theta,
-            K::CountSketch => SummaryKind::CountSketch,
-            K::CountSketchWithHeap => SummaryKind::CountSketchWithHeap,
-        }
-    }
-}
-
-impl From<planner_types::post_asap::SketchAlgorithm> for SummaryKind {
-    fn from(k: planner_types::post_asap::SketchAlgorithm) -> Self {
-        use planner_types::post_asap::SketchAlgorithm as K;
-        match k {
-            K::Kll => SummaryKind::Kll,
-            K::Cms => SummaryKind::Cms,
-            K::Hll => SummaryKind::Hll,
-            K::DDSketch => SummaryKind::DDSketch,
-            K::CmsWithHeap => SummaryKind::CmsWithHeap,
-            K::Kmv => SummaryKind::Kmv,
-            K::Theta => SummaryKind::Theta,
-            K::CountSketch => SummaryKind::CountSketch,
-            K::CountSketchWithHeap => SummaryKind::CountSketchWithHeap,
-        }
-    }
-}
-
-/// Narrow this crate's flat [`SummaryKind`] back down to an upstream
-/// `SketchKind`, when it identifies a real approximate sketch. `None` for
-/// the exact-accumulator variants (Sum/Count/MinMax/Increase/Rate),
-/// which have no `SketchKind` equivalent -- the inverse of the widening
-/// [`From`] impl above, fallible because that direction isn't total.
-impl SummaryKind {
-    pub fn as_sketch_kind(&self) -> Option<planner_types::post_asap::SketchAlgorithm> {
-        use planner_types::post_asap::SketchAlgorithm as K;
-        Some(match self {
-            SummaryKind::Kll => K::Kll,
-            SummaryKind::Cms => K::Cms,
-            SummaryKind::Hll => K::Hll,
-            SummaryKind::DDSketch => K::DDSketch,
-            SummaryKind::CmsWithHeap => K::CmsWithHeap,
-            SummaryKind::Kmv => K::Kmv,
-            SummaryKind::Theta => K::Theta,
-            SummaryKind::CountSketch => K::CountSketch,
-            SummaryKind::CountSketchWithHeap => K::CountSketchWithHeap,
-            SummaryKind::Sum
-            | SummaryKind::Count
-            | SummaryKind::MinMax
-            | SummaryKind::Increase
-            | SummaryKind::Rate => return None,
-        })
-    }
-}
-
-/// Same narrowing as [`SummaryKind::as_sketch_kind`], for the paired
-/// params. `None` whenever `self` isn't a sketch-family variant.
-impl SummaryParams {
-    pub fn as_sketch_params(&self) -> Option<planner_types::post_asap::SketchParams> {
-        use planner_types::post_asap::SketchParams as P;
-        Some(match self.clone() {
-            SummaryParams::Kll { k } => P::Kll { k },
-            SummaryParams::Cms { width, depth } => P::Cms { width, depth },
-            SummaryParams::Hll { precision } => P::Hll { precision },
-            SummaryParams::DDSketch { alpha } => P::DDSketch { alpha },
-            SummaryParams::CmsWithHeap {
-                width,
-                depth,
-                heap_size,
-            } => P::CmsWithHeap {
-                width,
-                depth,
-                heap_size,
-            },
-            SummaryParams::Kmv { k } => P::Kmv { k },
-            SummaryParams::Theta { k } => P::Theta { k },
-            SummaryParams::CountSketch { width, depth } => P::CountSketch { width, depth },
-            SummaryParams::CountSketchWithHeap {
-                width,
-                depth,
-                heap_size,
-            } => P::CountSketchWithHeap {
-                width,
-                depth,
-                heap_size,
-            },
-            SummaryParams::Sum
-            | SummaryParams::Count
-            | SummaryParams::MinMax
-            | SummaryParams::Increase
-            | SummaryParams::Rate => return None,
-        })
-    }
-}
-
-impl From<planner_types::post_asap::SketchParams> for SummaryParams {
-    fn from(p: planner_types::post_asap::SketchParams) -> Self {
-        use planner_types::post_asap::SketchParams as P;
-        match p {
-            P::Kll { k } => SummaryParams::Kll { k },
-            P::Cms { width, depth } => SummaryParams::Cms { width, depth },
-            P::Hll { precision } => SummaryParams::Hll { precision },
-            P::DDSketch { alpha } => SummaryParams::DDSketch { alpha },
-            P::CmsWithHeap {
-                width,
-                depth,
-                heap_size,
-            } => SummaryParams::CmsWithHeap {
-                width,
-                depth,
-                heap_size,
-            },
-            P::Kmv { k } => SummaryParams::Kmv { k },
-            P::Theta { k } => SummaryParams::Theta { k },
-            P::CountSketch { width, depth } => SummaryParams::CountSketch { width, depth },
-            P::CountSketchWithHeap {
-                width,
-                depth,
-                heap_size,
-            } => SummaryParams::CountSketchWithHeap {
-                width,
-                depth,
-                heap_size,
-            },
-        }
-    }
-}
+use planner_types::post_asap::{
+    ExactKind, ExactParams, GroupingStrategy, HydraKind, HydraParams, SketchAlgorithm, SketchKind,
+    SketchParams, SummaryFamilyType,
+};
 
 /// Data_plane's typed replacement for
 /// `(aggregation_type, aggregation_sub_type, parameters)`: which
@@ -355,15 +79,10 @@ impl From<planner_types::post_asap::SketchParams> for SummaryParams {
 /// feed [`crate::policy_fingerprint::PolicyFingerprint`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccumulatorSpec {
-    /// Which accumulator family — identity only (no keyed/unkeyed axis,
-    /// no heap-vs-bare ambiguity: heap-bearing sketches are their own
-    /// `SummaryKind` variant, e.g. `CmsWithHeap` vs `Cms`).
-    pub kind: SummaryKind,
-    /// Typed tuning parameters matching `kind` (no `HashMap` lookups —
-    /// see the module doc for the handful of details that still need
-    /// one, kept in `accumulator_factory.rs` since `SummaryParams` has
-    /// no field for them).
-    pub params: SummaryParams,
+    /// Planner-owned committed summary identity. For sketches this is a
+    /// validated `SketchKind` (category + algorithm + params), following the
+    /// ASAP-aware-mapping vocabulary.
+    pub family: SummaryFamilyType,
     /// `Some(labels)` for a keyed (multi-population) accumulator,
     /// `None` for a single-population one. This is the axis
     /// `AggregationType` wrongly folded into identity (`Sum` vs
@@ -390,8 +109,8 @@ pub enum AccumulatorSpecError {
     /// than the `SingleSubpopulation` case).
     UnknownMultipleSubpopulationSubType(String),
     /// `aggregation_type` itself has no accumulator-dispatch mapping.
-    /// Today this is only ever `AggregationType::HLL` — it's a real
-    /// `SummaryKind::Hll` identity and `control_plane` can emit
+    /// Today this is only ever `AggregationType::HLL` — it maps to the real
+    /// `SketchAlgorithm::Hll` identity and `control_plane` can emit
     /// `aggregationType: HLL` on the wire, but
     /// `accumulator_factory::create_accumulator_updater` never grew a
     /// real HLL arm (HLL accumulators are built via the SketchEnvelope
@@ -439,36 +158,72 @@ impl AggregationConfig {
 
         let sub_type = self.aggregation_sub_type.as_str();
 
-        let (kind, params, keyed): (SummaryKind, SummaryParams, bool) = match self.aggregation_type
-        {
-            Sum => (SummaryKind::Sum, SummaryParams::Sum, false),
-            Increase => (SummaryKind::Increase, SummaryParams::Increase, false),
-            MinMax => (SummaryKind::MinMax, SummaryParams::MinMax, false),
-            DatasketchesKLL => (
-                SummaryKind::Kll,
-                SummaryParams::Kll {
-                    k: kll_k_param(self) as u32,
-                },
+        let independent_sketch = |algorithm, params| {
+            SummaryFamilyType::Sketch(
+                SketchKind::new(algorithm, params),
+                GroupingStrategy::PerSubpopulationInstance,
+            )
+        };
+        let (family, keyed) = match self.aggregation_type {
+            Sum => (
+                SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
                 false,
             ),
-            MultipleSum => (SummaryKind::Sum, SummaryParams::Sum, true),
-            MultipleIncrease => (SummaryKind::Increase, SummaryParams::Increase, true),
-            MultipleMinMax => (SummaryKind::MinMax, SummaryParams::MinMax, true),
-            HydraKLL => (
-                SummaryKind::Kll,
-                SummaryParams::Kll {
-                    k: kll_k_param(self) as u32,
-                },
+            Increase => (
+                SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase),
+                false,
+            ),
+            MinMax => (
+                SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax),
+                false,
+            ),
+            DatasketchesKLL => (
+                independent_sketch(
+                    SketchAlgorithm::Kll,
+                    SketchParams::Kll {
+                        k: kll_k_param(self) as u32,
+                    },
+                ),
+                false,
+            ),
+            MultipleSum => (
+                SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
                 true,
             ),
+            MultipleIncrease => (
+                SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase),
+                true,
+            ),
+            MultipleMinMax => (
+                SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax),
+                true,
+            ),
+            HydraKLL => {
+                let k = kll_k_param(self) as u32;
+                (
+                    SummaryFamilyType::Sketch(
+                        SketchKind::new(SketchAlgorithm::Kll, SketchParams::Kll { k }),
+                        GroupingStrategy::SharedMultiSubpopulation {
+                            kind: HydraKind::HydraKll,
+                            params: HydraParams::HydraKll {
+                                k,
+                                shared_buckets: k,
+                            },
+                        },
+                    ),
+                    true,
+                )
+            }
             CountMinSketch => {
                 let (row_num, col_num) = cms_params(self);
                 (
-                    SummaryKind::Cms,
-                    SummaryParams::Cms {
-                        width: col_num as u32,
-                        depth: row_num as u32,
-                    },
+                    independent_sketch(
+                        SketchAlgorithm::Cms,
+                        SketchParams::Cms {
+                            width: col_num as u32,
+                            depth: row_num as u32,
+                        },
+                    ),
                     true,
                 )
             }
@@ -476,23 +231,27 @@ impl AggregationConfig {
                 let (row_num, col_num) = cms_params(self);
                 let heap_size = heap_size_param(self);
                 (
-                    SummaryKind::CmsWithHeap,
-                    SummaryParams::CmsWithHeap {
-                        width: col_num as u32,
-                        depth: row_num as u32,
-                        heap_size: heap_size as u32,
-                    },
+                    independent_sketch(
+                        SketchAlgorithm::CmsWithHeap,
+                        SketchParams::CmsWithHeap {
+                            width: col_num as u32,
+                            depth: row_num as u32,
+                            heap_size: heap_size as u32,
+                        },
+                    ),
                     true,
                 )
             }
             CountSketch => {
                 let (row_num, col_num) = cms_params(self);
                 (
-                    SummaryKind::CountSketch,
-                    SummaryParams::CountSketch {
-                        width: col_num as u32,
-                        depth: row_num as u32,
-                    },
+                    independent_sketch(
+                        SketchAlgorithm::CountSketch,
+                        SketchParams::CountSketch {
+                            width: col_num as u32,
+                            depth: row_num as u32,
+                        },
+                    ),
                     true,
                 )
             }
@@ -500,33 +259,47 @@ impl AggregationConfig {
                 let (row_num, col_num) = cms_params(self);
                 let heap_size = heap_size_param(self);
                 (
-                    SummaryKind::CountSketchWithHeap,
-                    SummaryParams::CountSketchWithHeap {
-                        width: col_num as u32,
-                        depth: row_num as u32,
-                        heap_size: heap_size as u32,
-                    },
+                    independent_sketch(
+                        SketchAlgorithm::CountSketchWithHeap,
+                        SketchParams::CountSketchWithHeap {
+                            width: col_num as u32,
+                            depth: row_num as u32,
+                            heap_size: heap_size as u32,
+                        },
+                    ),
                     true,
                 )
             }
             DDSketch => (
-                SummaryKind::DDSketch,
-                SummaryParams::DDSketch {
-                    alpha: ddsketch_alpha_param(self),
-                },
+                independent_sketch(
+                    SketchAlgorithm::DDSketch,
+                    SketchParams::DDSketch {
+                        alpha: ddsketch_alpha_param(self),
+                    },
+                ),
                 false,
             ),
             HLL => return Err(AccumulatorSpecError::UnmappedAggregationType(HLL)),
             SingleSubpopulation => match sub_type {
-                "Sum" | "sum" => (SummaryKind::Sum, SummaryParams::Sum, false),
-                "Min" | "min" => (SummaryKind::MinMax, SummaryParams::MinMax, false),
-                "Max" | "max" => (SummaryKind::MinMax, SummaryParams::MinMax, false),
-                "Increase" | "increase" => (SummaryKind::Increase, SummaryParams::Increase, false),
+                "Sum" | "sum" => (
+                    SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
+                    false,
+                ),
+                "Min" | "min" | "Max" | "max" => (
+                    SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax),
+                    false,
+                ),
+                "Increase" | "increase" => (
+                    SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase),
+                    false,
+                ),
                 "DatasketchesKLL" | "datasketches_kll" | "KLL" | "kll" => (
-                    SummaryKind::Kll,
-                    SummaryParams::Kll {
-                        k: kll_k_param(self) as u32,
-                    },
+                    independent_sketch(
+                        SketchAlgorithm::Kll,
+                        SketchParams::Kll {
+                            k: kll_k_param(self) as u32,
+                        },
+                    ),
                     false,
                 ),
                 other => {
@@ -536,26 +309,38 @@ impl AggregationConfig {
                 }
             },
             MultipleSubpopulation => match sub_type {
-                "Sum" | "sum" => (SummaryKind::Sum, SummaryParams::Sum, true),
-                "Min" | "min" => (SummaryKind::MinMax, SummaryParams::MinMax, true),
-                "Max" | "max" => (SummaryKind::MinMax, SummaryParams::MinMax, true),
-                "Increase" | "increase" => (SummaryKind::Increase, SummaryParams::Increase, true),
+                "Sum" | "sum" => (
+                    SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
+                    true,
+                ),
+                "Min" | "min" | "Max" | "max" => (
+                    SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax),
+                    true,
+                ),
+                "Increase" | "increase" => (
+                    SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase),
+                    true,
+                ),
                 "CountMinSketch" | "count_min_sketch" | "CMS" | "cms" => {
                     let (row_num, col_num) = cms_params(self);
                     (
-                        SummaryKind::Cms,
-                        SummaryParams::Cms {
-                            width: col_num as u32,
-                            depth: row_num as u32,
-                        },
+                        independent_sketch(
+                            SketchAlgorithm::Cms,
+                            SketchParams::Cms {
+                                width: col_num as u32,
+                                depth: row_num as u32,
+                            },
+                        ),
                         true,
                     )
                 }
                 "HydraKLL" | "hydra_kll" => (
-                    SummaryKind::Kll,
-                    SummaryParams::Kll {
-                        k: kll_k_param(self) as u32,
-                    },
+                    independent_sketch(
+                        SketchAlgorithm::Kll,
+                        SketchParams::Kll {
+                            k: kll_k_param(self) as u32,
+                        },
+                    ),
                     true,
                 ),
                 other => {
@@ -572,11 +357,7 @@ impl AggregationConfig {
             None
         };
 
-        Ok(AccumulatorSpec {
-            kind,
-            params,
-            grouping,
-        })
+        Ok(AccumulatorSpec { family, grouping })
     }
 }
 
@@ -668,6 +449,27 @@ mod tests {
     use crate::key_by_label_names::KeyByLabelNames;
     use std::collections::HashMap;
 
+    fn assert_exact(spec: &AccumulatorSpec, expected: ExactKind) {
+        assert!(matches!(
+            &spec.family,
+            SummaryFamilyType::ExactAggregate(kind, _) if kind == &expected
+        ));
+    }
+
+    fn assert_sketch(
+        spec: &AccumulatorSpec,
+        expected_algorithm: planner_types::post_asap::SketchAlgorithm,
+        expected_params: planner_types::post_asap::SketchParams,
+    ) {
+        match &spec.family {
+            SummaryFamilyType::Sketch(kind, _) => {
+                assert_eq!(kind.algorithm(), &expected_algorithm);
+                assert_eq!(kind.params(), &expected_params);
+            }
+            other => panic!("expected sketch family, got {other:?}"),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn make_config(
         agg_type: AggregationType,
@@ -700,8 +502,7 @@ mod tests {
     fn sum_is_unkeyed_sum() {
         let cfg = make_config(AggregationType::Sum, "", HashMap::new(), vec![]);
         let spec = cfg.accumulator_spec().expect("resolves");
-        assert_eq!(spec.kind, SummaryKind::Sum);
-        assert_eq!(spec.params, SummaryParams::Sum);
+        assert_exact(&spec, ExactKind::Sum);
         assert!(spec.grouping.is_none());
     }
 
@@ -714,7 +515,7 @@ mod tests {
             vec!["zone"],
         );
         let spec = cfg.accumulator_spec().expect("resolves");
-        assert_eq!(spec.kind, SummaryKind::Sum);
+        assert_exact(&spec, ExactKind::Sum);
         assert_eq!(
             spec.grouping,
             Some(KeyByLabelNames::new(vec!["zone".to_string()]))
@@ -727,8 +528,11 @@ mod tests {
         params.insert("k".to_string(), serde_json::json!(128));
         let cfg = make_config(AggregationType::DatasketchesKLL, "", params, vec![]);
         let spec = cfg.accumulator_spec().expect("resolves");
-        assert_eq!(spec.kind, SummaryKind::Kll);
-        assert_eq!(spec.params, SummaryParams::Kll { k: 128 });
+        assert_sketch(
+            &spec,
+            planner_types::post_asap::SketchAlgorithm::Kll,
+            planner_types::post_asap::SketchParams::Kll { k: 128 },
+        );
         assert!(spec.grouping.is_none());
     }
 
@@ -738,8 +542,11 @@ mod tests {
         params.insert("k".to_string(), serde_json::json!(64));
         let cfg = make_config(AggregationType::HydraKLL, "", params, vec!["host"]);
         let spec = cfg.accumulator_spec().expect("resolves");
-        assert_eq!(spec.kind, SummaryKind::Kll);
-        assert_eq!(spec.params, SummaryParams::Kll { k: 64 });
+        assert_sketch(
+            &spec,
+            planner_types::post_asap::SketchAlgorithm::Kll,
+            planner_types::post_asap::SketchParams::Kll { k: 64 },
+        );
         assert!(spec.grouping.is_some());
     }
 
@@ -750,13 +557,13 @@ mod tests {
         params.insert("w".to_string(), serde_json::json!(2048));
         let cfg = make_config(AggregationType::CountMinSketch, "", params, vec!["host"]);
         let spec = cfg.accumulator_spec().expect("resolves");
-        assert_eq!(spec.kind, SummaryKind::Cms);
-        assert_eq!(
-            spec.params,
-            SummaryParams::Cms {
+        assert_sketch(
+            &spec,
+            planner_types::post_asap::SketchAlgorithm::Cms,
+            planner_types::post_asap::SketchParams::Cms {
                 width: 2048,
-                depth: 7
-            }
+                depth: 7,
+            },
         );
         assert!(spec.grouping.is_some());
     }
@@ -774,19 +581,19 @@ mod tests {
             vec!["host"],
         );
         let spec = cfg.accumulator_spec().expect("resolves");
-        assert_eq!(spec.kind, SummaryKind::CmsWithHeap);
-        assert_eq!(
-            spec.params,
-            SummaryParams::CmsWithHeap {
+        assert_sketch(
+            &spec,
+            planner_types::post_asap::SketchAlgorithm::CmsWithHeap,
+            planner_types::post_asap::SketchParams::CmsWithHeap {
                 width: 256,
                 depth: 4,
-                heap_size: 8
-            }
+                heap_size: 8,
+            },
         );
     }
 
     /// Documented existing quirk (see `accumulator_factory.rs`): bare
-    /// `CountSketch` gets its own `SummaryKind` identity here, but
+    /// `CountSketch` gets its own `SketchAlgorithm` identity here, but
     /// `accumulator_factory` routes it through the same
     /// `CmsAccumulatorUpdater` as bare CMS — no dedicated heap-less
     /// Count-Sketch accumulator exists. This test locks in the *identity*
@@ -796,7 +603,11 @@ mod tests {
     fn count_sketch_gets_its_own_kind_identity() {
         let cfg = make_config(AggregationType::CountSketch, "", HashMap::new(), vec!["h"]);
         let spec = cfg.accumulator_spec().expect("resolves");
-        assert_eq!(spec.kind, SummaryKind::CountSketch);
+        assert!(matches!(
+            &spec.family,
+            SummaryFamilyType::Sketch(kind, _)
+                if kind.algorithm() == &planner_types::post_asap::SketchAlgorithm::CountSketch
+        ));
     }
 
     #[test]
@@ -805,8 +616,11 @@ mod tests {
         params.insert("relativeAccuracy".to_string(), serde_json::json!(0.02));
         let cfg = make_config(AggregationType::DDSketch, "", params, vec![]);
         let spec = cfg.accumulator_spec().expect("resolves");
-        assert_eq!(spec.kind, SummaryKind::DDSketch);
-        assert_eq!(spec.params, SummaryParams::DDSketch { alpha: 0.02 });
+        assert_sketch(
+            &spec,
+            planner_types::post_asap::SketchAlgorithm::DDSketch,
+            planner_types::post_asap::SketchParams::DDSketch { alpha: 0.02 },
+        );
         assert!(spec.grouping.is_none());
     }
 
@@ -832,7 +646,7 @@ mod tests {
                 vec![],
             );
             let spec = cfg.accumulator_spec().expect("resolves");
-            assert_eq!(spec.kind, SummaryKind::Sum);
+            assert_exact(&spec, ExactKind::Sum);
             assert!(spec.grouping.is_none());
         }
     }
@@ -847,7 +661,11 @@ mod tests {
                 vec!["host"],
             );
             let spec = cfg.accumulator_spec().expect("resolves");
-            assert_eq!(spec.kind, SummaryKind::Cms);
+            assert!(matches!(
+                &spec.family,
+                SummaryFamilyType::Sketch(kind, _)
+                    if kind.algorithm() == &planner_types::post_asap::SketchAlgorithm::Cms
+            ));
             assert!(spec.grouping.is_some());
         }
     }
@@ -862,7 +680,11 @@ mod tests {
                 vec!["host"],
             );
             let spec = cfg.accumulator_spec().expect("resolves");
-            assert_eq!(spec.kind, SummaryKind::Kll);
+            assert!(matches!(
+                &spec.family,
+                SummaryFamilyType::Sketch(kind, _)
+                    if kind.algorithm() == &planner_types::post_asap::SketchAlgorithm::Kll
+            ));
             assert!(spec.grouping.is_some());
         }
     }

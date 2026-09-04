@@ -51,7 +51,7 @@ impl SumAccumulator {
     /// self-contained fixed layout. It decodes into the SAME
     /// `AggregationType::Sum` accumulator as a plain-OTLP Sum, so the SumAgg
     /// envelope and a plain Sum land on one identity (`exact_agg:Sum`) with no
-    /// new SketchKindHandle. `count` is decoded but not retained
+    /// new SketchAlgorithm. `count` is decoded but not retained
     /// (SumAccumulator tracks the scalar sum only; Sum is never sample_p-thinned
     /// so no 1/p rescale is needed).
     pub fn from_sum_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {

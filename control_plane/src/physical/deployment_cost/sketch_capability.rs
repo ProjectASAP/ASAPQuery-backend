@@ -42,26 +42,12 @@ pub struct SketchCapability {
     pub cpu_micros_per_insert: f64,
     /// Transmission size per flush (bytes).
     pub transmission_bytes: u64,
-    /// Which logical aggregation intents this sketch supports.
-    pub supported_intents: Vec<SupportedIntent>,
     /// Whether the sketch supports merge (`sketch(A∪B) = merge(sketch(A), sketch(B))`).
     pub mergeable: bool,
     /// Whether the sketch supports delta encoding.
     pub supports_delta: bool,
     /// Whether the sketch supports sliding windows natively.
     pub supports_sliding_window: bool,
-}
-
-/// A logical aggregation intent that a sketch can serve. Used in
-/// [`SketchCapability::supported_intents`] to declare per-sketch
-/// coverage; the optimizer reads this when deciding which family to
-/// bind to an `AggIntent`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SupportedIntent {
-    Quantile,
-    Cardinality,
-    Frequency,
-    Extrema,
 }
 
 // ── YAML override loader ─────────────────────────────────────────────────────
@@ -74,7 +60,6 @@ struct SketchCapabilityYaml {
     memory_bytes_per_series: u64,
     cpu_micros_per_insert: f64,
     transmission_bytes: u64,
-    supported_intents: Vec<String>,
     mergeable: bool,
     supports_delta: bool,
     supports_sliding_window: bool,
@@ -82,24 +67,12 @@ struct SketchCapabilityYaml {
 
 impl SketchCapabilityYaml {
     fn to_capability(&self) -> SketchCapability {
-        let intents = self
-            .supported_intents
-            .iter()
-            .filter_map(|s| match s.as_str() {
-                "quantile" => Some(SupportedIntent::Quantile),
-                "cardinality" => Some(SupportedIntent::Cardinality),
-                "frequency" => Some(SupportedIntent::Frequency),
-                "extrema" => Some(SupportedIntent::Extrema),
-                _ => None,
-            })
-            .collect();
         SketchCapability {
             insert_throughput: self.insert_throughput,
             query_throughput: self.query_throughput,
             memory_bytes_per_series: self.memory_bytes_per_series,
             cpu_micros_per_insert: self.cpu_micros_per_insert,
             transmission_bytes: self.transmission_bytes,
-            supported_intents: intents,
             mergeable: self.mergeable,
             supports_delta: self.supports_delta,
             supports_sliding_window: self.supports_sliding_window,
@@ -133,7 +106,6 @@ pub fn default_capability_table() -> HashMap<SketchAlgorithm, SketchCapability> 
             memory_bytes_per_series: 4_096,
             cpu_micros_per_insert: 0.1,
             transmission_bytes: 4_096,
-            supported_intents: vec![SupportedIntent::Quantile, SupportedIntent::Extrema],
             mergeable: true,
             supports_delta: true,
             supports_sliding_window: false,
@@ -147,7 +119,6 @@ pub fn default_capability_table() -> HashMap<SketchAlgorithm, SketchCapability> 
             memory_bytes_per_series: 8_192,
             cpu_micros_per_insert: 0.2,
             transmission_bytes: 8_192,
-            supported_intents: vec![SupportedIntent::Quantile, SupportedIntent::Extrema],
             mergeable: true,
             supports_delta: false,
             supports_sliding_window: false,
@@ -161,7 +132,6 @@ pub fn default_capability_table() -> HashMap<SketchAlgorithm, SketchCapability> 
             memory_bytes_per_series: 16_384,
             cpu_micros_per_insert: 0.05,
             transmission_bytes: 16_384,
-            supported_intents: vec![SupportedIntent::Cardinality],
             mergeable: true,
             supports_delta: true,
             supports_sliding_window: false,
@@ -175,7 +145,6 @@ pub fn default_capability_table() -> HashMap<SketchAlgorithm, SketchCapability> 
             memory_bytes_per_series: 80_000,
             cpu_micros_per_insert: 0.5,
             transmission_bytes: 80_000,
-            supported_intents: vec![SupportedIntent::Frequency],
             mergeable: true,
             supports_delta: true,
             supports_sliding_window: false,
@@ -189,7 +158,6 @@ pub fn default_capability_table() -> HashMap<SketchAlgorithm, SketchCapability> 
             memory_bytes_per_series: 80_000,
             cpu_micros_per_insert: 0.5,
             transmission_bytes: 80_000,
-            supported_intents: vec![SupportedIntent::Frequency],
             mergeable: true,
             supports_delta: true,
             supports_sliding_window: false,
@@ -236,20 +204,17 @@ mod tests {
     }
 
     #[test]
-    fn default_table_ddsketch_serves_quantile_intent() {
+    fn default_table_ddsketch_has_runtime_cost_profile() {
         let t = default_capability_table();
         let cap = t.get(&SketchAlgorithm::DDSketch).unwrap();
-        assert!(cap.supported_intents.contains(&SupportedIntent::Quantile));
         assert!(cap.mergeable);
     }
 
     #[test]
-    fn default_table_hll_serves_cardinality_intent() {
+    fn default_table_hll_has_runtime_cost_profile() {
         let t = default_capability_table();
         let cap = t.get(&SketchAlgorithm::Hll).unwrap();
-        assert!(cap
-            .supported_intents
-            .contains(&SupportedIntent::Cardinality));
+        assert!(cap.query_throughput > 0.0);
     }
 
     #[test]
@@ -258,8 +223,7 @@ mod tests {
         let defaults = default_capability_table();
         // Same set of keys, same defaults — we don't assert byte
         // equality on the SketchCapability values because they don't
-        // impl PartialEq, but they share the same supported_intents
-        // set per kind.
+        // impl PartialEq.
         assert_eq!(loaded.len(), defaults.len());
         for k in defaults.keys() {
             assert!(loaded.contains_key(k));

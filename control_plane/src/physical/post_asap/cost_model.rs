@@ -157,7 +157,7 @@ impl ControlPlaneCostModel {
         };
         let table = WireCostTable::default();
         let mut ranked: Vec<SketchAlgorithm> = allowed.to_vec();
-        ranked.sort_by_key(|k| table.for_kind(k).per_flush());
+        ranked.sort_by_key(|algorithm| table.for_algorithm(algorithm).per_flush());
         ranked
     }
 

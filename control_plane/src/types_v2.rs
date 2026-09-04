@@ -17,8 +17,7 @@
 //! an L4 rule engine to pivot on `AccuracyTarget` and a stage allocator
 //! that respects `QueryShape::Streaming`.
 
-// Several types in this module (`BindingName`, `WorkloadPlan`,
-// `QueryExprPlaceholder`, the `new` / `as_str` helpers on `QueryId`
+// Several types in this module (`BindingName`, the `new` / `as_str` helpers on `QueryId`
 // and `BindingName`) are intentionally part of the public surface but
 // have no in-tree consumers yet — they're targets for the downstream
 // PR that wires the planner to consume the typed schema. Suppress the
@@ -201,47 +200,6 @@ impl std::fmt::Display for BindingName {
 
 // ── WorkloadPlan ──────────────────────────────────────────────────────────────
 
-/// Multi-root DAG container, one level above `QueryExpr` (`design.md` §6
-/// "Multi-root DAGs live one level above `QueryExpr`"). `QueryExpr`
-/// stays single-root; this struct holds N roots plus the hoisted
-/// bindings the CSE pass shares between them.
-///
-/// **Container only — no CSE pass yet.** This type is defined so the
-/// `analyzer::QuerySpec.id` field has a target to dock against and so
-/// the downstream planner can grow into a `WorkloadPlan` consumer
-/// without another schema rev. The `bindings` and `roots` payloads use
-/// `String` placeholders for the `QueryExpr` slot; the real `QueryExpr`
-/// from `algebra/expr.rs` lacks `Serialize` today, and the design's L3
-/// rewrites — `LetBinding` / `Ref` / sketch-binding split — haven't
-/// landed in `algebra/`. When they do, the placeholder becomes a
-/// `QueryExpr` and the surrounding plumbing stays put.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct WorkloadPlan {
-    /// Named shared producers, hoisted out of individual queries by
-    /// the CSE pass. Each binding is referenced by ≥2 roots via
-    /// `QueryExpr::Ref` once that lowering exists.
-    pub bindings: Vec<(BindingName, QueryExprPlaceholder)>,
-    /// One root per `QuerySpec` in the workload, in input order.
-    pub roots: Vec<(QueryId, QueryExprPlaceholder)>,
-}
-
-/// Placeholder for `QueryExpr` until `algebra::expr::QueryExpr` gets a
-/// `Serialize` impl + the L3 rewrites that `WorkloadPlan` consumers
-/// expect (CTE-style `LetBinding` / `Ref`, sketch-binding split). Today
-/// it's a string carrying the source-level query text or a debug
-/// `format!("{qe:?}")` of the algebra tree — enough for the control plane
-/// to round-trip a `WorkloadPlan` through JSON without losing identity,
-/// but not yet enough for L4 to consume.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(transparent)]
-pub struct QueryExprPlaceholder(pub String);
-
-impl QueryExprPlaceholder {
-    pub fn new(text: impl Into<String>) -> Self {
-        QueryExprPlaceholder(text.into())
-    }
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -336,17 +294,5 @@ mod tests {
         let back: QueryId = serde_json::from_str(&json).unwrap();
         assert_eq!(id, back);
         assert_eq!(id.as_str(), "metric-x@0.99");
-    }
-
-    #[test]
-    fn workload_plan_default_is_empty() {
-        let wp = WorkloadPlan::default();
-        assert!(wp.bindings.is_empty());
-        assert!(wp.roots.is_empty());
-        // Round-trip an empty WorkloadPlan as JSON.
-        let json = serde_json::to_string(&wp).unwrap();
-        let back: WorkloadPlan = serde_json::from_str(&json).unwrap();
-        assert!(back.bindings.is_empty());
-        assert!(back.roots.is_empty());
     }
 }

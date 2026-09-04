@@ -35,19 +35,10 @@ use crate::physical::colored_dag::dag::ColoredDag;
 use crate::physical::colored_dag::stage_id::{StageId, Topology};
 use crate::physical::post_asap::deployment_expr::{PhysicalExpr, PostAsapPlan};
 use crate::types_v2::BindingName;
-use planner_types::post_asap::{SketchAlgorithm, SketchParams, SketchQuery, SummaryExpr};
-// `BackendAggregation.sketch_kind`/`.sketch_params` (below) span BOTH
-// exact accumulators (Sum/Count/MinMax/Increase/Rate, via
-// `agg_type_override`) and approximate sketches -- unlike
-// `EdgeSketchProcessor`/`GatewayMergeProcessor`, which are always real
-// materialized sketches. They use the vendored flat
-// `asap_types::{SummaryKind, SummaryParams}` (same 14-variant shape as
-// ASAPController's pre-ASAPPlanner#218 flat `SummaryKind` -- see
-// `crates/asap_types/src/accumulator_spec.rs`'s module doc and
-// control_plane/docs/design-asapplanner-pin-migration.md), aliased here
-// so this file's existing `BackendAggregation`-adjacent code needs no
-// further changes.
-use asap_types::{SummaryKind as BackendSketchKind, SummaryParams as BackendSketchParams};
+use planner_types::post_asap::{
+    ExactKind, ExactParams, GroupingStrategy, SketchAlgorithm, SketchKind, SketchParams,
+    SketchQuery, SummaryExpr, SummaryFamilyType,
+};
 
 /// Flattened view of one [`ColoredNode`](crate::physical::colored_dag::dag::ColoredNode)'s
 /// `PhysicalExpr`, for the tuple-style `(&node.expr, node.stage)` matching
@@ -582,7 +573,7 @@ pub struct EdgeSketchProcessor {
     /// `countmin`, etc. Maps 1:1 from `SketchAlgorithm`.
     pub processor_name: String,
     /// Sketch family (mirror of the `SketchAgg::sketch_type` field).
-    pub sketch_kind: SketchAlgorithm,
+    pub sketch_algorithm: SketchAlgorithm,
     /// Sketch parameters (mirror of the `SketchAgg::params` field).
     pub sketch_params: SketchParams,
     /// Internal emitter plumbing — threads `EdgeSketchProcessor` →
@@ -625,7 +616,7 @@ pub struct GatewayMergeProcessor {
     pub processor_name: String,
     /// Sketch family being merged. All inputs to the merge agree on
     /// this (L4 type checker enforces it; design.md §6.4).
-    pub sketch_kind: SketchAlgorithm,
+    pub sketch_algorithm: SketchAlgorithm,
     /// Aggregation id — matches the upstream edge's
     /// `EdgeSketchProcessor::aggregation_id` so the gateway routes
     /// streams correctly.
@@ -672,7 +663,7 @@ pub struct BackendStageConfig {
 /// payload is built by `emit::stage_config::build_backend_aggregation_json`
 /// (a hand-written JSON builder reading these fields), never a whole-struct
 /// serialize.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackendAggregation {
     /// Internal-only id (see struct doc). Not on the wire.
     pub aggregation_id: String,
@@ -680,14 +671,10 @@ pub struct BackendAggregation {
     /// `http_requests_total_latency_ms`). Required by the backend's
     /// `AggregationConfig` parser.
     pub metric_name: String,
-    /// Accumulator family -- exact (Sum/Count/MinMax/Increase/Rate) or
-    /// approximate sketch (see this file's `use asap_types::{...}` note
-    /// above for why this is the flat type, not `SketchAlgorithm`).
-    pub sketch_kind: BackendSketchKind,
-    /// Accumulator parameters — the backend uses these to build its
-    /// per-aggregation instance (KLL with the right `k`, DDSketch with
-    /// the right `alpha`, etc.).
-    pub sketch_params: BackendSketchParams,
+    /// Planner-owned committed summary identity. Sketch entries carry a
+    /// validated `SketchKind` (category + algorithm + params); exact entries
+    /// carry the matching `ExactKind`/`ExactParams` pair.
+    pub family: SummaryFamilyType,
     /// Tumbling window size in seconds. Required by the backend; the
     /// parser rejects zero-window aggregations.
     pub window_secs: u64,
@@ -722,27 +709,6 @@ pub struct BackendAggregation {
     /// backend's `StreamingConfig` consumer interprets the field —
     /// Phase ε.2 implements the raw-input ingest path.
     pub aggregation_input: AggregationInput,
-
-    /// Option B (post-PR-#287) — when `Some(s)`, the wire-side
-    /// `aggregationType` is `s` (e.g. `"Sum"`, `"Increase"`,
-    /// `"MinMax"`) and the `parameters` object is emitted as `{}`,
-    /// bypassing the sketch-kind → backend-type mapping that runs
-    /// for the regular sketched aggregations.
-    ///
-    /// Why: the typed `bind_workload_typed` rule chain only knows
-    /// how to lower sketch-shaped statistics (Quantile / Cardinality
-    /// / Frequency / TopK). Sum/Rate/Count workloads — `sum by
-    /// (zone) (http_requests_total)`, `rate(metric[5m])`,
-    /// `count(metric)` — currently decline binding (return None) so
-    /// the typed L5 stage-split emits nothing for them. Under the
-    /// Option B unification, the Replanner falls back to this
-    /// override shape to emit an `ExactAgg(Sum)` (or Increase /
-    /// Count) row into the cumulative streaming-config so the data
-    /// plane recognises the metric and `sum by (zone) (…)` queries
-    /// resolve. `sketch_kind` / `sketch_params` carry sentinel
-    /// values when the override is in effect (their emitted form is
-    /// suppressed in `build_backend_aggregation_json`).
-    pub agg_type_override: Option<String>,
 }
 
 /// Phase ε.1 — what wire shape the backend ingests for an aggregation.
@@ -926,7 +892,7 @@ impl Emitter for ThreeStageEmitter {
                         .unwrap_or_else(|| format!("agg{}", node.id.0));
                     edge.sketch_processors.push(EdgeSketchProcessor {
                         processor_name,
-                        sketch_kind: sketch_type.clone(),
+                        sketch_algorithm: sketch_type.clone(),
                         sketch_params: params.clone(),
                         aggregation_id: aggregation_id.clone(),
                     });
@@ -934,8 +900,10 @@ impl Emitter for ThreeStageEmitter {
                         item_label: None,
                         aggregation_id,
                         metric_name: edge.source_metric.clone().unwrap_or_default(),
-                        sketch_kind: sketch_type.clone().into(),
-                        sketch_params: params.clone().into(),
+                        family: SummaryFamilyType::Sketch(
+                            SketchKind::new(sketch_type.clone(), params.clone()),
+                            GroupingStrategy::PerSubpopulationInstance,
+                        ),
                         window_secs: edge.window_secs.unwrap_or(0),
                         spatial_filter: spatial_filter_from_label_filters(&edge.label_filters),
                         // Populated post-emit by the caller (handle_plan)
@@ -944,8 +912,6 @@ impl Emitter for ThreeStageEmitter {
                         grouping: Vec::new(),
                         // Mode 1 — sketch built at edge, ships envelope.
                         aggregation_input: AggregationInput::SketchEnvelope,
-                        // Regular sketch path — no override.
-                        agg_type_override: None,
                     });
                 }
                 // Gateway: SketchMerge over edge sketches → one merge
@@ -960,7 +926,7 @@ impl Emitter for ThreeStageEmitter {
                     {
                         gateway_processors.push(GatewayMergeProcessor {
                             processor_name: "sketchmergeprocessor".into(),
-                            sketch_kind: kind,
+                            sketch_algorithm: kind,
                             aggregation_id: aid,
                         });
                     }
@@ -1018,15 +984,15 @@ impl Emitter for ThreeStageEmitter {
                         item_label: None,
                         aggregation_id: aid,
                         metric_name: edge.source_metric.clone().unwrap_or_default(),
-                        sketch_kind: family.clone().into(),
-                        sketch_params: params.clone().into(),
+                        family: SummaryFamilyType::Sketch(
+                            SketchKind::new(family.clone(), params.clone()),
+                            GroupingStrategy::PerSubpopulationInstance,
+                        ),
                         window_secs: edge.window_secs.unwrap_or(0),
                         spatial_filter: spatial_filter_from_label_filters(&edge.label_filters),
                         grouping: Vec::new(),
                         // Mode 2 — backend builds sketch from raw OTLP.
                         aggregation_input: AggregationInput::Raw,
-                        // Regular sketch path — no override.
-                        agg_type_override: None,
                     });
                 }
                 _ => {}

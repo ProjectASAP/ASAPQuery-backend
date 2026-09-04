@@ -16,42 +16,8 @@
 //! planner stage gains a monitor-intent slot. See
 //! `ASAPCollector/docs/continuous-monitoring-tumbling-cost-analysis.md`.
 
+pub use asap_types::MonitorFunctional as Functional;
 use serde_yaml::{Mapping, Value};
-
-/// Which additive readout to threshold. Mirrors the Go `monitor.Functional`
-/// and the edge `ThresholdConfig.functional` string values.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Functional {
-    Sum,
-    CmsPoint,
-    LinearBuckets,
-    /// Whole-sketch second frequency moment F2 = ‖f‖₂². Monitors the entire
-    /// sketch's L2 mass (no per-point key) so any future point query stays within
-    /// ε — see `data_plane::monitor` module docs for the whole-sketch-vs-point
-    /// decision rule. The edge reports its local F2 = Σ_x f_i(x)² as the value.
-    F2,
-}
-
-impl Functional {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Functional::Sum => "sum",
-            Functional::CmsPoint => "cms_point",
-            Functional::LinearBuckets => "linear_buckets",
-            Functional::F2 => "f2",
-        }
-    }
-
-    /// Parse a functional name (workload-spec value); unknown/empty → Sum.
-    pub fn from_name(s: &str) -> Functional {
-        match s {
-            "cms_point" => Functional::CmsPoint,
-            "linear_buckets" => Functional::LinearBuckets,
-            "f2" | "l2" => Functional::F2,
-            _ => Functional::Sum,
-        }
-    }
-}
 
 /// One monitored standing-query intent: "alert when the global Σ of `metric`'s
 /// `functional` crosses `tau`". τ/ε/window are authoritative at the coordinator;

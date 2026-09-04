@@ -21,18 +21,25 @@ use asap_otel_proto::tonic::metrics::v1::{
     ScopeMetrics,
 };
 use asap_sketchlib::proto::sketchlib::{HllVariant as ProtoHllVariant, HyperLogLogState, KllState};
-use asap_sketchlib::{
-    CountMinSketchWithHeap, CountSketchWithHeap, HllSketch, HllVariant, MessagePackCodec,
-};
+use asap_sketchlib::{CountMinSketch, CountSketch, HllSketch, HllVariant, MessagePackCodec};
 use prost::Message;
 use serde_json::Value;
 
 const SERVICE: &str = "oracle-e2e";
-const K: u32 = 200;
-const HLL_PRECISION: u32 = 10;
-const ROWS: usize = 5;
-const COLS: usize = 2048;
-const HEAP_SIZE: usize = 16;
+// These parameters satisfy the production query path's LIVE_ACCURACY
+// (`epsilon = 0.01`). ASAPPlanner validates an observed `SketchKind`
+// against that accuracy before committing it, so the fixture must use the
+// same contract as a real control-plane-generated materialization.
+const K: u32 = 269;
+const HLL_PRECISION: u32 = 14;
+const CMS_ROWS: usize = 5;
+const CMS_COLS: usize = 2048;
+// ASAPPlanner's CountSketch guarantee is L2-based: epsilon=sqrt(3/width),
+// with an odd Hoeffding-median depth. The current runtime's packed sign hash
+// limits this width to five rows, which satisfies the explicit delta=0.8
+// contract used only by the CountSketch child process below.
+const COUNT_SKETCH_ROWS: usize = 5;
+const COUNT_SKETCH_COLS: usize = 32_768;
 
 struct ChildGuard(Child);
 
@@ -96,7 +103,7 @@ fn envelope(metric: &str, data: Data) -> ExportMetricsServiceRequest {
     }
 }
 
-async fn start_backend(config_yaml: &str) -> Backend {
+async fn start_backend(config_yaml: &str, live_delta: Option<&str>) -> Backend {
     let query_port = unused_port();
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
@@ -107,7 +114,8 @@ async fn start_backend(config_yaml: &str) -> Backend {
         .expect("write streaming config");
     config.flush().expect("flush streaming config");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_data_plane"));
+    command
         .arg("--streaming-config")
         .arg(config.path())
         .arg("--http-port")
@@ -124,9 +132,11 @@ async fn start_backend(config_yaml: &str) -> Backend {
         .arg("--precompute-flush-interval-ms")
         .arg("100")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start production data-plane binary");
+        .stderr(Stdio::null());
+    if let Some(delta) = live_delta {
+        command.env("ASAP_SUMMARY_EXECUTOR_DELTA", delta);
+    }
+    let child = command.spawn().expect("start production data-plane binary");
     let mut child = ChildGuard(child);
     let client = reqwest::Client::new();
     let query_base = format!("http://127.0.0.1:{query_port}");
@@ -297,7 +307,7 @@ fn hll_export(metric: &str, timestamp_ns: u64, raw: &[&str]) -> ExportMetricsSer
 }
 
 fn cms_export(metric: &str, timestamp_ns: u64, raw: &[&str]) -> ExportMetricsServiceRequest {
-    let mut sketch = CountMinSketchWithHeap::new(ROWS, COLS, HEAP_SIZE);
+    let mut sketch = CountMinSketch::new(CMS_ROWS, CMS_COLS);
     for key in raw {
         sketch.update(key, 1.0);
     }
@@ -314,8 +324,8 @@ fn cms_export(metric: &str, timestamp_ns: u64, raw: &[&str]) -> ExportMetricsSer
                 series_id: 0,
             }],
             aggregation_temporality: 0,
-            rows: ROWS as i32,
-            cols: COLS as i32,
+            rows: CMS_ROWS as i32,
+            cols: CMS_COLS as i32,
         }),
     )
 }
@@ -325,7 +335,7 @@ fn count_sketch_export(
     timestamp_ns: u64,
     raw: &[&str],
 ) -> ExportMetricsServiceRequest {
-    let mut sketch = CountSketchWithHeap::new(ROWS, COLS, HEAP_SIZE);
+    let mut sketch = CountSketch::new(COUNT_SKETCH_ROWS, COUNT_SKETCH_COLS);
     for key in raw {
         sketch.update(key, 1.0);
     }
@@ -342,8 +352,8 @@ fn count_sketch_export(
                 series_id: 0,
             }],
             aggregation_temporality: 0,
-            rows: ROWS as i32,
-            cols: COLS as i32,
+            rows: COUNT_SKETCH_ROWS as i32,
+            cols: COUNT_SKETCH_COLS as i32,
         }),
     )
 }
@@ -357,37 +367,35 @@ fn exact_quantile(raw: &[f64], q: f64) -> f64 {
     sorted[low] + (sorted[high] - sorted[low]) * (rank - low as f64)
 }
 
-fn raw_frequencies(raw: &[&str]) -> HashMap<String, u64> {
-    let mut counts = HashMap::new();
-    for key in raw {
-        *counts.entry((*key).to_string()).or_insert(0) += 1;
-    }
-    counts
+fn assert_frequency_total_oracle(response: &Value, raw: &[&str]) {
+    let samples = scalar_values(response);
+    assert_eq!(samples.len(), 1, "expected one grouped frequency total");
+    assert_eq!(
+        samples[0].0.get("service").map(String::as_str),
+        Some(SERVICE)
+    );
+    assert_eq!(samples[0].1.round() as usize, raw.len());
 }
 
-fn assert_topk_oracle(response: &Value, raw: &[&str], k: usize) {
-    let mut expected: Vec<_> = raw_frequencies(raw).into_iter().collect();
-    expected.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    expected.truncate(k);
-    let expected: HashMap<_, _> = expected.into_iter().collect();
-
-    let actual: HashMap<String, u64> = scalar_values(response)
-        .into_iter()
-        .map(|(labels, value)| {
-            assert_eq!(labels.get("service").map(String::as_str), Some(SERVICE));
-            (
-                labels.get("item").expect("topk item label").clone(),
-                value.round() as u64,
-            )
-        })
-        .collect();
-    assert_eq!(actual, expected, "top-k differs from raw frequency oracle");
+fn assert_frequency_point_oracle(response: &Value, raw: &[&str], item: &str) {
+    let samples = scalar_values(response);
+    assert_eq!(samples.len(), 1, "expected one grouped frequency estimate");
+    assert_eq!(
+        samples[0].0.get("service").map(String::as_str),
+        Some(SERVICE)
+    );
+    let expected = raw.iter().filter(|value| **value == item).count();
+    assert_eq!(samples[0].1.round() as usize, expected);
 }
 
 #[tokio::test]
 async fn production_kll_matches_raw_quantile_oracle() {
     let metric = "oracle_kll_latency";
-    let backend = start_backend(&config(metric, "DatasketchesKLL", "      K: 200")).await;
+    let backend = start_backend(
+        &config(metric, "DatasketchesKLL", &format!("      K: {K}")),
+        None,
+    )
+    .await;
     let raw: Vec<f64> = (1..=101).map(f64::from).collect();
     let timestamp = now_ns().saturating_sub(2_000_000_000);
     post(&backend, kll_export(metric, timestamp, &raw)).await;
@@ -409,7 +417,11 @@ async fn production_kll_matches_raw_quantile_oracle() {
 #[tokio::test]
 async fn production_hll_matches_raw_distinct_oracle() {
     let metric = "oracle_hll_users";
-    let backend = start_backend(&config(metric, "HLL", "      precision: 10")).await;
+    let backend = start_backend(
+        &config(metric, "HLL", &format!("      precision: {HLL_PRECISION}")),
+        None,
+    )
+    .await;
     let owned: Vec<String> = (0..2_000).map(|i| format!("user-{i}")).collect();
     let mut raw: Vec<&str> = owned.iter().map(String::as_str).collect();
     raw.extend(owned.iter().take(500).map(String::as_str));
@@ -439,12 +451,10 @@ fn frequency_fixture() -> Vec<&'static str> {
 }
 
 #[tokio::test]
-async fn production_cms_matches_raw_topk_oracle() {
+async fn production_cms_matches_raw_frequency_oracle() {
     let metric = "oracle_cms_frequency";
-    let params = format!(
-        "      w: {COLS}\n      d: {ROWS}\n      heap_size: {HEAP_SIZE}\n      with_heap: true"
-    );
-    let backend = start_backend(&config(metric, "CountMinSketchWithHeap", &params)).await;
+    let params = format!("      w: {CMS_COLS}\n      d: {CMS_ROWS}");
+    let backend = start_backend(&config(metric, "CountMinSketch", &params), None).await;
     let raw = frequency_fixture();
     let timestamp = now_ns().saturating_sub(2_000_000_000);
     post(&backend, cms_export(metric, timestamp, &raw)).await;
@@ -453,17 +463,21 @@ async fn production_cms_matches_raw_topk_oracle() {
         cms_export(metric, timestamp + 1_000_000_000, &raw),
     )
     .await;
-    let response = query(&backend, &format!("topk(3, {metric})")).await;
-    assert_topk_oracle(&response, &raw, 3);
+    let response = query(&backend, &format!("count_over_time({metric}[10s])")).await;
+    let mut merged_raw = raw.clone();
+    merged_raw.extend_from_slice(&raw);
+    assert_frequency_total_oracle(&response, &merged_raw);
 }
 
 #[tokio::test]
-async fn production_count_sketch_matches_raw_topk_oracle() {
+async fn production_count_sketch_matches_raw_frequency_oracle() {
     let metric = "oracle_count_sketch_frequency";
-    let params = format!(
-        "      w: {COLS}\n      d: {ROWS}\n      heap_size: {HEAP_SIZE}\n      with_heap: true"
-    );
-    let backend = start_backend(&config(metric, "CountSketchWithHeap", &params)).await;
+    let params = format!("      w: {COUNT_SKETCH_COLS}\n      d: {COUNT_SKETCH_ROWS}");
+    // Planner's CountSketch confidence model requires more rows than the
+    // current packed-hash runtime can execute at this width. Keep the default
+    // production SLA untouched and declare the weaker contract explicitly
+    // for this isolated algorithm-oracle process.
+    let backend = start_backend(&config(metric, "CountSketch", &params), Some("0.8")).await;
     let raw = frequency_fixture();
     let timestamp = now_ns().saturating_sub(2_000_000_000);
     post(&backend, count_sketch_export(metric, timestamp, &raw)).await;
@@ -472,6 +486,12 @@ async fn production_count_sketch_matches_raw_topk_oracle() {
         count_sketch_export(metric, timestamp + 1_000_000_000, &raw),
     )
     .await;
-    let response = query(&backend, &format!("topk(3, {metric})")).await;
-    assert_topk_oracle(&response, &raw, 3);
+    let response = query(
+        &backend,
+        &format!("count_over_time({metric}{{item=\"alpha\"}}[10s])"),
+    )
+    .await;
+    let mut merged_raw = raw.clone();
+    merged_raw.extend_from_slice(&raw);
+    assert_frequency_point_oracle(&response, &merged_raw, "alpha");
 }

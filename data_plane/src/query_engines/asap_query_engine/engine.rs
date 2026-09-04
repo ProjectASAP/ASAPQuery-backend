@@ -1235,7 +1235,7 @@ mod asap_tier_classify_tests {
     use crate::query_engines::routing::query_engine_routing::QueryEngine as _;
     use crate::query_engines::EngineError;
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchConfig, SketchInstanceMetadata, SketchKindHandle,
+        AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchInstanceMetadata,
         SketchSampleState, SketchStore,
     };
     use crate::storage_engines::types::{CleanupPolicy, HotReloadStreamingConfig};
@@ -1258,9 +1258,9 @@ mod asap_tier_classify_tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<BTreeSet<_>>(),
-            capability: Some(Capability::QuantileApprox(SketchKindHandle::DDSketch)),
+            capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                kind: SketchKindHandle::DDSketch,
+                algorithm: SketchAlgorithm::DDSketch,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -1532,9 +1532,9 @@ mod asap_tier_classify_tests {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
-            capability: Some(Capability::QuantileApprox(SketchKindHandle::Kll)),
+            capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::Kll))),
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                kind: SketchKindHandle::Kll,
+                algorithm: SketchAlgorithm::Kll,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -1572,7 +1572,7 @@ mod asap_tier_classify_tests {
             group_by_keys: BTreeSet::new(),
             capability: Some(Capability::CardinalityApprox),
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                kind: SketchKindHandle::Hll,
+                algorithm: SketchAlgorithm::Hll,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -1720,7 +1720,7 @@ mod asap_tier_classify_tests {
         for (sid, items) in [(8200u64, &a_items), (8201u64, &b_items)] {
             let mut meta = hll_meta(sid, "unique_users_global");
             meta.agg_kind = crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                kind: SketchKindHandle::Hll,
+                algorithm: SketchAlgorithm::Hll,
                 config: SketchConfig::Hll { precision },
                 spatial_filter_canonical: String::new(),
             };
@@ -2413,9 +2413,9 @@ mod asap_tier_classify_tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<BTreeSet<_>>(),
-            capability: Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
+            capability: Some(Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms))),
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                kind: SketchKindHandle::CountMin,
+                algorithm: SketchAlgorithm::Cms,
                 config: cfg.clone(),
                 spatial_filter_canonical: spatial_filter.to_string(),
             },
@@ -2510,14 +2510,12 @@ mod asap_tier_classify_tests {
     }
 
     #[tokio::test]
-    async fn keyed_cms_frequency_fails_over_instead_of_misleading_total() {
-        // P2-6: a per-item selector `cms_metric{item="X"}` against a
-        // FrequencyEstimate sid would silently get the per-window bucket
-        // TOTAL (all items), not item X's count. The engine must
-        // capability-miss to archive rather than return that misleading
-        // total. The sid here is registered with an EMPTY spatial filter,
-        // so the `{item="X"}` matcher is an additional per-item selector
-        // not baked into the sketch.
+    async fn keyed_cms_frequency_reads_point_estimate_instead_of_total() {
+        use crate::query_engines::query_result::QueryResult;
+        // A per-item selector is bound to Planner's typed PointCount readout.
+        // This synthetic matrix stores 600 only in cell zero; item X hashes
+        // elsewhere, so its estimate is 0. Returning 600 would prove the old
+        // misleading whole-bucket-total behavior had regressed.
         let now = now_ms_for_test();
         let idx = Arc::new(SketchStore::new());
         register_cms_freq_sid(&idx, 7100, "cms_metric", &[], "", 600, now);
@@ -2525,16 +2523,29 @@ mod asap_tier_classify_tests {
         let engine = build_engine_with_index(idx);
         let result = engine
             .execute("count_over_time(cms_metric{item=\"X\"}[5m])")
+            .await
+            .expect("keyed CMS frequency should execute through PointCount");
+        let QueryResult::Vector(vector) = result else {
+            panic!("expected instant vector")
+        };
+        assert_eq!(vector.values.len(), 1);
+        assert_eq!(vector.values[0].value, 0.0);
+    }
+
+    #[tokio::test]
+    async fn ordinary_label_filter_is_not_bound_as_frequency_item_key() {
+        let now = now_ms_for_test();
+        let idx = Arc::new(SketchStore::new());
+        register_cms_freq_sid(&idx, 7150, "cms_metric", &[], "", 600, now);
+
+        let engine = build_engine_with_index(idx);
+        let result = engine
+            .execute("count_over_time(cms_metric{region=\"west\"}[5m])")
             .await;
-        match result {
-            Err(EngineError::CapabilityMiss { detail, .. }) => {
-                assert!(
-                    detail.contains("KeyedFrequency"),
-                    "expected the Planner-DAG keyed-frequency safe-miss, got: {detail}"
-                );
-            }
-            other => panic!("keyed CMS frequency must fail over to archive (P2-6), got {other:?}"),
-        }
+        assert!(
+            matches!(result, Err(EngineError::CapabilityMiss { .. })),
+            "a spatial label must not be reinterpreted as a sketch item key: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -2575,8 +2586,8 @@ mod outer_agg_integration_tests {
     use crate::query_engines::routing::query_engine_routing::QueryEngine as _;
     use crate::query_engines::EngineError;
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchConfig, SketchEncoding, SketchInstanceMetadata,
-        SketchKindHandle, SketchSampleState, SketchStore,
+        AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchEncoding,
+        SketchInstanceMetadata, SketchSampleState, SketchStore,
     };
     use crate::storage_engines::types::HotReloadStreamingConfig;
     use asap_sketchlib::DdSketch;
@@ -2611,9 +2622,9 @@ mod outer_agg_integration_tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect::<BTreeSet<_>>(),
-            capability: Some(Capability::QuantileApprox(SketchKindHandle::DDSketch)),
+            capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                kind: SketchKindHandle::DDSketch,
+                algorithm: SketchAlgorithm::DDSketch,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -2928,8 +2939,8 @@ mod range_stitch_tests {
     use crate::query_engines::routing::query_engine_routing::{EngineCapabilities, QueryEngine};
     use crate::query_engines::EngineError;
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchConfig, SketchEncoding, SketchInstanceMetadata,
-        SketchKindHandle, SketchSampleState, SketchStore,
+        AccuracyBound, Capability, SketchAlgorithm, SketchConfig, SketchEncoding,
+        SketchInstanceMetadata, SketchSampleState, SketchStore,
     };
     use crate::storage_engines::types::{HotReloadStreamingConfig, KeyByLabelValues};
     use async_trait::async_trait;
@@ -2998,9 +3009,9 @@ mod range_stitch_tests {
             sid,
             metric_name: metric.to_string(),
             group_by_keys: BTreeSet::new(),
-            capability: Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
+            capability: Some(Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms))),
             agg_kind: crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                kind: SketchKindHandle::CountMin,
+                algorithm: SketchAlgorithm::Cms,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
