@@ -187,7 +187,7 @@ pub struct BackendLocalImplementation {
     pub implementation_cost: ImplementationCostEvidence,
     /// Optional per-query membership certificates for approximate TopK.
     /// Keys are the exact PromQL strings in `query_workload`.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub topk_evidence: HashMap<String, TopKMembershipEvidence>,
 }
 

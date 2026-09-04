@@ -286,14 +286,16 @@ pub enum QueryReadout {
     Cardinality,
     TopK {
         k: usize,
+        #[serde(default)]
         weight: QueryTopKWeight,
     },
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum QueryTopKWeight {
     Count,
+    #[default]
     Value,
 }
 
@@ -472,6 +474,19 @@ mod tests {
         assert_eq!(
             canonical_promql("sum by (service) ( rate(http_requests_total[5m]) )").unwrap(),
             canonical_promql("sum by(service)(rate(http_requests_total[5m]))").unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_topk_readout_defaults_to_value_weighting() {
+        let readout: QueryReadout =
+            serde_json::from_str(r#"{"kind":"top_k","k":5}"#).expect("legacy TopK readout");
+        assert_eq!(
+            readout,
+            QueryReadout::TopK {
+                k: 5,
+                weight: QueryTopKWeight::Value,
+            }
         );
     }
 
