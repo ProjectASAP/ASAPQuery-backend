@@ -122,14 +122,7 @@ pub fn execute_query_plan_instant(
 
 #[derive(Clone)]
 enum PhysicalQueryOutput {
-    State(
-        Vec<(
-            BTreeMap<String, String>,
-            GroupState,
-            asap_types::SummaryKind,
-            asap_types::SummaryParams,
-        )>,
-    ),
+    State(Vec<(BTreeMap<String, String>, GroupState)>),
     Value(Vec<(BTreeMap<String, String>, SummaryValue)>),
 }
 
@@ -139,8 +132,6 @@ enum PhysicalNodeError {
     Store(SummaryExecutorError),
     #[error("node expected summary state input")]
     ExpectedState,
-    #[error("summary merge inputs have different families")]
-    FamilyMismatch,
     #[error("physical fallback requested: {0}")]
     Fallback(String),
 }
@@ -165,14 +156,7 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                     .context
                     .read_bound_materialization(binding)
                     .map_err(PhysicalNodeError::Store)?;
-                Ok(PhysicalQueryOutput::State(
-                    groups
-                        .into_iter()
-                        .map(|(key, state)| {
-                            (key, state, binding.kind.clone(), binding.params.clone())
-                        })
-                        .collect(),
-                ))
+                Ok(PhysicalQueryOutput::State(groups))
             }
             QueryPlanNode::SummaryEstimate { query, .. } => {
                 let [PhysicalQueryOutput::State(groups)] = inputs else {
@@ -181,7 +165,7 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                 let query: planner_types::post_asap::SketchQuery = query.clone().into();
                 groups
                     .iter()
-                    .map(|(key, state, _, _)| {
+                    .map(|(key, state)| {
                         self.context
                             .readout_bound(state, &query)
                             .map(|value| (key.clone(), value))
@@ -191,30 +175,25 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                     .map(PhysicalQueryOutput::Value)
             }
             QueryPlanNode::SummaryMerge { .. } => {
-                let mut family: Option<(asap_types::SummaryKind, asap_types::SummaryParams)> = None;
                 let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<GroupState>> =
                     BTreeMap::new();
                 for input in inputs {
                     let PhysicalQueryOutput::State(groups) = input else {
                         return Err(PhysicalNodeError::ExpectedState);
                     };
-                    for (key, state, kind, params) in groups {
-                        match &family {
-                            None => family = Some((kind.clone(), params.clone())),
-                            Some((expected_kind, expected_params))
-                                if expected_kind == kind && expected_params == params => {}
-                            Some(_) => return Err(PhysicalNodeError::FamilyMismatch),
-                        }
+                    for (key, state) in groups {
                         by_group.entry(key.clone()).or_default().push(state.clone());
                     }
                 }
-                let (kind, params) = family.ok_or(PhysicalNodeError::ExpectedState)?;
+                if by_group.is_empty() {
+                    return Err(PhysicalNodeError::ExpectedState);
+                }
                 by_group
                     .into_iter()
                     .map(|(key, states)| {
                         self.context
                             .merge_bound_states(states)
-                            .map(|state| (key, state, kind.clone(), params.clone()))
+                            .map(|state| (key, state))
                             .map_err(PhysicalNodeError::Store)
                     })
                     .collect::<Result<Vec<_>, _>>()
@@ -258,7 +237,7 @@ fn execute_physical_query_plan(
         PhysicalQueryOutput::State(groups) => {
             let mut coverage = None;
             let mut series = Vec::new();
-            for (group_key, state, _, _) in &groups {
+            for (group_key, state) in &groups {
                 fold_coverage(&mut coverage, state.exact_coverage());
                 if let Some(value) = state.exact_value(&None) {
                     series.push((group_key.clone(), vec![(t1_ms as i64, value)]));

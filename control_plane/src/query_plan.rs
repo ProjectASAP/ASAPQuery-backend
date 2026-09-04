@@ -13,7 +13,7 @@ use planner_types::pre_asap::Reduction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use asap_types::{PolicyFingerprint, SummaryKind, SummaryParams};
+use asap_types::PolicyFingerprint;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -88,8 +88,7 @@ impl QueryPlanEntry {
     where
         F: FnMut(
             &SummaryNode,
-            SummaryKind,
-            SummaryParams,
+            &SummaryFamilyType,
         ) -> Result<MaterializationBinding, QueryPlanError>,
     {
         let mut compiler = DagCompiler {
@@ -198,8 +197,6 @@ pub enum FallbackPolicy {
 pub struct MaterializationBinding {
     pub materialization: PolicyFingerprint,
     pub metric: String,
-    pub kind: SummaryKind,
-    pub params: SummaryParams,
     /// Exact label-key layout of the stored materialization.
     pub sid_grouping: Vec<String>,
     /// Query operator grouping applied while folding those SIDs.
@@ -289,11 +286,7 @@ struct DagCompiler<'a, F> {
 
 impl<F> DagCompiler<'_, F>
 where
-    F: FnMut(
-        &SummaryNode,
-        SummaryKind,
-        SummaryParams,
-    ) -> Result<MaterializationBinding, QueryPlanError>,
+    F: FnMut(&SummaryNode, &SummaryFamilyType) -> Result<MaterializationBinding, QueryPlanError>,
 {
     fn lower(&mut self, node: &Rc<SummaryNode>) -> Result<QueryNodeId, QueryPlanError> {
         let identity = Rc::as_ptr(node) as usize;
@@ -313,8 +306,15 @@ where
                 child,
                 ..
             } => {
-                let (kind, params) = flatten_family(family)?;
-                let mut binding = (self.bind)(node, kind, params)?;
+                if !matches!(
+                    family,
+                    SummaryFamilyType::ExactAggregate(..) | SummaryFamilyType::Sketch(..)
+                ) {
+                    return Err(QueryPlanError::UnsupportedNode(format!(
+                        "summary family {family:?}"
+                    )));
+                }
+                let mut binding = (self.bind)(node, family)?;
                 binding.output_grouping = physical_grouping(reduction, child)?;
                 QueryPlanNode::ReadMaterialization { binding }
             }
@@ -373,22 +373,6 @@ fn physical_grouping(
         })
         .collect::<Result<_, _>>()?;
     Ok(PhysicalGrouping::Reduce(names))
-}
-
-fn flatten_family(
-    family: &SummaryFamilyType,
-) -> Result<(SummaryKind, SummaryParams), QueryPlanError> {
-    match family {
-        SummaryFamilyType::ExactAggregate(kind, params) => {
-            Ok((kind.clone().into(), params.clone().into()))
-        }
-        SummaryFamilyType::Sketch(kind, _) => {
-            Ok((kind.clone().into(), kind.params().clone().into()))
-        }
-        other => Err(QueryPlanError::UnsupportedNode(format!(
-            "summary family {other:?}"
-        ))),
-    }
 }
 
 #[derive(Debug, Error)]

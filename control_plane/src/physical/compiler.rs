@@ -397,8 +397,10 @@ impl PhysicalCompiler {
                     query_id: query.query_id.clone(),
                     reason: "selected plan has no executable sketch materialization/readout".into(),
                 })?;
-            let kind = asap_types::SummaryKind::from(selected.kind);
-            let params = asap_types::SummaryParams::from(selected.params);
+            let family = SummaryFamilyType::Sketch(
+                selected.kind,
+                planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
+            );
             let metric = match &query.source {
                 Source::TimeSeries { metric } => metric,
                 Source::Table { .. } => unreachable!("table source rejected above"),
@@ -410,8 +412,7 @@ impl PhysicalCompiler {
                     let materialization = backend_plan.materializations.get(&route.materialization)?;
                     (route.storage_backend == backend_plan::StorageBackend::SketchStore
                         && matches!(&materialization.source, Source::TimeSeries { metric: m } if m == metric)
-                        && materialization.kind == kind
-                        && materialization.params == params
+                        && materialization.family == family
                         && materialization.window.size_ms == query.window_secs.saturating_mul(1_000)
                         && materialization.group_by == query.group_by)
                         .then_some(route.materialization)
@@ -434,7 +435,7 @@ impl PhysicalCompiler {
                     cumulative_readout: true,
                 },
                 FallbackPolicy::ExactBackend,
-                |node, node_kind, node_params| {
+                |node, node_family| {
                     let planned_metric = summary_agg_metric(node).ok_or_else(|| {
                         crate::query_plan::QueryPlanError::Invalid(
                             "materialized node has no unique time-series source".into(),
@@ -451,19 +452,17 @@ impl PhysicalCompiler {
                             backend_plan
                                 .materializations
                                 .get(fingerprint)
-                                .is_some_and(|m| m.kind == node_kind && m.params == node_params)
+                                .is_some_and(|m| &m.family == node_family)
                         })
                         .copied()
                         .ok_or_else(|| {
                             crate::query_plan::QueryPlanError::Invalid(format!(
-                                "no exact physical binding for {node_kind:?}/{node_params:?}"
+                                "no exact physical binding for {node_family:?}"
                             ))
                         })?;
                     Ok(MaterializationBinding {
                         materialization: fingerprint,
                         metric: metric.clone(),
-                        kind: node_kind,
-                        params: node_params,
                         sid_grouping: query.group_by.clone(),
                         output_grouping: PhysicalGrouping::Reduce(query.group_by.clone()),
                         window_ms: query.window_secs.saturating_mul(1_000),

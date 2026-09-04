@@ -338,16 +338,10 @@ impl QueryExecutionContext<'_> {
                         return None;
                     }
                     match &meta.agg_kind {
-                        AggKind::Sketch { kind, config, .. } => {
-                            summary_params_match(&binding.kind, &binding.params, *kind, config)
-                                .then(|| to_delta_kind(*kind, config))
-                                .flatten()
-                                .map(Candidate::Sketch)
-                        }
-                        AggKind::ExactAgg { agg_type, .. } => {
-                            exact_agg_kind_match(&binding.kind, &binding.params, *agg_type)
-                                .then_some(Candidate::ExactAgg(*agg_type))
-                        }
+                        AggKind::Sketch {
+                            algorithm, config, ..
+                        } => to_delta_kind(algorithm.clone(), config).map(Candidate::Sketch),
+                        AggKind::ExactAgg { agg_type, .. } => Some(Candidate::ExactAgg(*agg_type)),
                     }
                 })
                 .flatten();
