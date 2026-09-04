@@ -2353,13 +2353,12 @@ fn collect_selected_materializations(
 
 fn physical_materialization_family(family: &SummaryFamilyType) -> SummaryFamilyType {
     match family {
-        SummaryFamilyType::ExactAggregate(
-            planner_types::post_asap::ExactKind::Rate,
-            _,
-        ) => SummaryFamilyType::ExactAggregate(
-            planner_types::post_asap::ExactKind::Increase,
-            planner_types::post_asap::ExactParams::Increase,
-        ),
+        SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Rate, _) => {
+            SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Increase,
+                planner_types::post_asap::ExactParams::Increase,
+            )
+        }
         _ => family.clone(),
     }
 }
@@ -2761,8 +2760,13 @@ mod tests {
             ));
             if expected_readout == crate::query_plan::ExactReadout::Rate {
                 let materialization = plan.backend_plan.materializations.values().next().unwrap();
-                assert_eq!(materialization.kind, asap_types::SummaryKind::Increase);
-                assert_eq!(materialization.params, asap_types::SummaryParams::Increase);
+                assert_eq!(
+                    materialization.family,
+                    SummaryFamilyType::ExactAggregate(
+                        planner_types::post_asap::ExactKind::Increase,
+                        planner_types::post_asap::ExactParams::Increase,
+                    )
+                );
             }
         }
     }

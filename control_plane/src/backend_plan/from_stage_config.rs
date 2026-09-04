@@ -85,9 +85,20 @@ pub fn from_stage_config(
         .aggregations
         .iter()
         .filter_map(|agg| {
-            let exact_type = agg.agg_type_override.as_ref()?;
+            let planner_types::post_asap::SummaryFamilyType::ExactAggregate(kind, _) = &agg.family
+            else {
+                return None;
+            };
             let fingerprint = *fingerprint_by_agg_id.get(agg.aggregation_id.as_str())?;
-            let agg_type = exact_type.parse().ok()?;
+            let agg_type = match kind {
+                planner_types::post_asap::ExactKind::Sum
+                | planner_types::post_asap::ExactKind::Count => asap_types::AggregationType::Sum,
+                planner_types::post_asap::ExactKind::MinMax => asap_types::AggregationType::MinMax,
+                planner_types::post_asap::ExactKind::Increase
+                | planner_types::post_asap::ExactKind::Rate => {
+                    asap_types::AggregationType::Increase
+                }
+            };
             Some(RoutingEntry {
                 satisfies: Capability::ExactAgg(agg_type),
                 materialization: fingerprint,

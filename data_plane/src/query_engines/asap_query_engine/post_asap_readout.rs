@@ -180,7 +180,7 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                 };
                 groups
                     .iter()
-                    .map(|(key, state, _, _)| {
+                    .map(|(key, state)| {
                         state
                             .exact_value_for(
                                 *readout,
@@ -683,8 +683,6 @@ mod tests {
                         binding: control_plane::query_plan::MaterializationBinding {
                             materialization: policy,
                             metric: "requests_total".into(),
-                            kind: asap_types::SummaryKind::Increase,
-                            params: asap_types::SummaryParams::Increase,
                             sid_grouping: vec![],
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 60_000,

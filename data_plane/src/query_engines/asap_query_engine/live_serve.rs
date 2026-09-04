@@ -487,8 +487,6 @@ mod tests {
                         binding: control_plane::query_plan::MaterializationBinding {
                             materialization: policy,
                             metric: "bytes".into(),
-                            kind: asap_types::SummaryKind::Sum,
-                            params: asap_types::SummaryParams::Sum,
                             sid_grouping: vec![],
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 1_000,
