@@ -58,6 +58,12 @@ struct Args {
     #[arg(long)]
     physical_plan: Option<std::path::PathBuf>,
 
+    /// Versioned canonical QueryWorkload + DataWorkload and backend-local
+    /// implementation evidence. The ASAPQuery profile invokes the pinned
+    /// Planner and PhysicalCompiler at startup when this is supplied.
+    #[arg(long)]
+    planning_snapshot: Option<std::path::PathBuf>,
+
     /// Cleanup policy for SketchStore retention.
     /// `circular_buffer`: keep the N most recent windows per agg
     /// (N comes from each aggregation's `numAggregatesToRetain`).
@@ -345,13 +351,22 @@ fn validate_profile(args: &Args) -> Result<()> {
         if args.streaming_config.is_none() {
             return Err("the distributed profile requires --streaming-config".into());
         }
+        if args.planning_snapshot.is_some() {
+            return Err("--planning-snapshot is available only with --profile asapquery".into());
+        }
         return Ok(());
     }
     if args.streaming_config.is_some() {
-        return Err("--profile asapquery rejects --streaming-config; use --physical-plan".into());
+        return Err(
+            "--profile asapquery rejects --streaming-config; use --planning-snapshot or --physical-plan"
+                .into(),
+        );
     }
-    if args.physical_plan.is_none() {
-        return Err("--profile asapquery requires --physical-plan".into());
+    if args.physical_plan.is_some() == args.planning_snapshot.is_some() {
+        return Err(
+            "--profile asapquery requires exactly one of --planning-snapshot or --physical-plan"
+                .into(),
+        );
     }
     let mut excluded = Vec::new();
     if args.enable_otel_ingest {
@@ -457,20 +472,45 @@ async fn main() -> Result<()> {
         );
     }
 
-    let startup_physical_plan = if let Some(path) = args.physical_plan.as_ref() {
+    let startup_artifact = if let Some(path) = args.planning_snapshot.as_ref() {
         let bytes = fs::read(path)?;
-        let artifact: data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest =
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_slice(&bytes).map_err(|error| {
                 format!(
-                    "failed to decode physical plan artifact {}: {error}",
+                    "failed to decode planning snapshot {}: {error}",
                     path.display()
                 )
             })?;
+        let plan = snapshot
+            .compile()
+            .map_err(|error| format!("startup planning failed for {}: {error}", path.display()))?;
+        Some(
+            data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
+                precompute_plan: plan.precompute_plan,
+                transmission_plan: plan.transmission_plan,
+                backend_plan: plan.backend_plan.encode_to_vec(),
+                query_plan: plan.query_plan,
+                storage_routing: None,
+                adaptation_evidence: Vec::new(),
+            },
+        )
+    } else if let Some(path) = args.physical_plan.as_ref() {
+        let bytes = fs::read(path)?;
+        Some(serde_json::from_slice(&bytes).map_err(|error| {
+            format!(
+                "failed to decode physical plan artifact {}: {error}",
+                path.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    let startup_physical_plan = if let Some(artifact) = startup_artifact {
         let active = data_plane::drivers::query::servers::http::build_active_physical_plan(
             artifact,
             Arc::new(data_plane::storage_engines::types::BackendStorageRouting::empty()),
         )
-        .map_err(|error| format!("invalid physical plan artifact {}: {error}", path.display()))?;
+        .map_err(|error| format!("invalid startup PhysicalPlan: {error}"))?;
         if args.profile == RuntimeProfile::Asapquery
             && (active.backend_plan.plan_id == 0
                 || !matches!(
@@ -1449,6 +1489,33 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("rejects --streaming-config"));
+
+        let planned = Args::try_parse_from([
+            "data_plane",
+            "--profile",
+            "asapquery",
+            "--planning-snapshot",
+            "workload.json",
+            "--forward-unsupported-queries",
+        ])
+        .unwrap();
+        assert!(validate_profile(&planned).is_ok());
+
+        let ambiguous = Args::try_parse_from([
+            "data_plane",
+            "--profile",
+            "asapquery",
+            "--planning-snapshot",
+            "workload.json",
+            "--physical-plan",
+            "plan.json",
+            "--forward-unsupported-queries",
+        ])
+        .unwrap();
+        assert!(validate_profile(&ambiguous)
+            .unwrap_err()
+            .to_string()
+            .contains("exactly one"));
     }
 
     // Step-1 of the JSONL deprecation refactor deleted the

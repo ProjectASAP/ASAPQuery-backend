@@ -805,6 +805,7 @@ fn compile_physical_plan_request(
             planner_revision: request.planner_revision,
         },
         physical::compiler::DeploymentEnvironment {
+            target: physical::compiler::PhysicalDeploymentTarget::DistributedCollectors,
             collector_ids: request.collector_ids.clone(),
             capability_snapshot_id: request.capability_snapshot_id,
             observed_at_unix_ms: now,
