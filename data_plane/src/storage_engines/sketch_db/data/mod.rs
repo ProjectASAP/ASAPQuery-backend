@@ -132,64 +132,67 @@ pub enum AggKind {
 /// shared by SID minting and store registration so a sketch policy can never
 /// be minted as `ExactAgg` and later registered as `Sketch` (or vice versa).
 pub fn agg_kind_for_config(config: &asap_types::aggregation_config::AggregationConfig) -> AggKind {
-    use asap_types::{SummaryKind, SummaryParams};
+    use planner_types::post_asap::{SketchAlgorithm as Algorithm, SketchParams, SummaryFamilyType};
 
-    let sketch = config.accumulator_spec().ok().and_then(|spec| {
-        let (kind, physical) = match (spec.kind, spec.params) {
-            (SummaryKind::DDSketch, SummaryParams::DDSketch { alpha }) => (
-                SketchKindHandle::DDSketch,
-                SketchConfig::DDSketch {
-                    relative_accuracy: alpha,
-                },
-            ),
-            (SummaryKind::Kll, SummaryParams::Kll { k }) => {
-                (SketchKindHandle::Kll, SketchConfig::Kll { k })
+    // HLL is intentionally absent from raw-value accumulator dispatch because
+    // it arrives through SketchEnvelope ingest. It is still a sketch for SID
+    // identity and store registration, so classify it before consulting the
+    // accumulator factory contract.
+    let sketch = (config.aggregation_type == AggregationType::HLL)
+        .then(|| {
+            let precision = config
+                .parameters
+                .get("precision")
+                .or_else(|| config.parameters.get("p"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(14);
+            AggKind::Sketch {
+                algorithm: SketchAlgorithm::Hll,
+                config: SketchConfig::Hll { precision },
+                spatial_filter_canonical: config.spatial_filter_normalized.clone(),
             }
-            (SummaryKind::Hll, SummaryParams::Hll { precision }) => (
-                SketchKindHandle::Hll,
-                SketchConfig::Hll {
-                    precision: precision.into(),
-                },
-            ),
-            (SummaryKind::Cms, SummaryParams::Cms { width, depth }) => (
-                SketchKindHandle::CountMin,
-                SketchConfig::CountMin {
-                    rows: depth as i32,
-                    cols: width as i32,
-                },
-            ),
-            (SummaryKind::CmsWithHeap, SummaryParams::CmsWithHeap { width, depth, .. }) => (
-                SketchKindHandle::CmsWithHeap,
-                SketchConfig::CountMin {
-                    rows: depth as i32,
-                    cols: width as i32,
-                },
-            ),
-            (SummaryKind::CountSketch, SummaryParams::CountSketch { width, depth }) => (
-                SketchKindHandle::CountSketch,
-                SketchConfig::CountSketch {
-                    rows: depth as i32,
-                    cols: width as i32,
-                },
-            ),
-            (
-                SummaryKind::CountSketchWithHeap,
-                SummaryParams::CountSketchWithHeap { width, depth, .. },
-            ) => (
-                SketchKindHandle::CountSketchWithHeap,
-                SketchConfig::CountSketch {
-                    rows: depth as i32,
-                    cols: width as i32,
-                },
-            ),
-            _ => return None,
-        };
-        Some(AggKind::Sketch {
-            kind,
-            config: physical,
-            spatial_filter_canonical: config.spatial_filter_normalized.clone(),
         })
-    });
+        .or_else(|| {
+            config.accumulator_spec().ok().and_then(|spec| {
+                let SummaryFamilyType::Sketch(kind, _) = spec.family else {
+                    return None;
+                };
+                let algorithm = kind.algorithm().clone();
+                let physical = match (kind.algorithm(), kind.params()) {
+                    (Algorithm::DDSketch, SketchParams::DDSketch { alpha }) => {
+                        SketchConfig::DDSketch {
+                            relative_accuracy: *alpha,
+                        }
+                    }
+                    (Algorithm::Kll, SketchParams::Kll { k }) => SketchConfig::Kll { k: *k },
+                    (Algorithm::Hll, SketchParams::Hll { precision }) => SketchConfig::Hll {
+                        precision: (*precision).into(),
+                    },
+                    (Algorithm::Cms, SketchParams::Cms { width, depth })
+                    | (Algorithm::CmsWithHeap, SketchParams::CmsWithHeap { width, depth, .. }) => {
+                        SketchConfig::CountMin {
+                            rows: *depth as i32,
+                            cols: *width as i32,
+                        }
+                    }
+                    (Algorithm::CountSketch, SketchParams::CountSketch { width, depth })
+                    | (
+                        Algorithm::CountSketchWithHeap,
+                        SketchParams::CountSketchWithHeap { width, depth, .. },
+                    ) => SketchConfig::CountSketch {
+                        rows: *depth as i32,
+                        cols: *width as i32,
+                    },
+                    _ => return None,
+                };
+                Some(AggKind::Sketch {
+                    algorithm,
+                    config: physical,
+                    spatial_filter_canonical: config.spatial_filter_normalized.clone(),
+                })
+            })
+        });
 
     sketch.unwrap_or_else(|| AggKind::ExactAgg {
         agg_type: config.aggregation_type,
@@ -203,19 +206,21 @@ impl AggKind {
     pub fn capability_and_accuracy(&self) -> (Capability, Option<AccuracyBound>) {
         match self {
             Self::ExactAgg { agg_type, .. } => (Capability::ExactAgg(*agg_type), None),
-            Self::Sketch { kind, config, .. } => {
-                let capability = match kind {
-                    SketchKindHandle::DDSketch | SketchKindHandle::Kll => {
-                        Capability::QuantileApprox(*kind)
+            Self::Sketch {
+                algorithm, config, ..
+            } => {
+                let capability = match algorithm {
+                    SketchAlgorithm::DDSketch | SketchAlgorithm::Kll => {
+                        Capability::QuantileApprox(Some(algorithm.clone()))
                     }
-                    SketchKindHandle::Hll => Capability::CardinalityApprox,
-                    SketchKindHandle::CountMin | SketchKindHandle::CountSketch => {
-                        Capability::FrequencyEstimate(*kind)
+                    SketchAlgorithm::Hll => Capability::CardinalityApprox,
+                    SketchAlgorithm::Cms | SketchAlgorithm::CountSketch => {
+                        Capability::FrequencyEstimate(Some(algorithm.clone()))
                     }
-                    SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
-                        Capability::FrequencyTopk(*kind)
+                    SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap => {
+                        Capability::FrequencyTopk(Some(algorithm.clone()))
                     }
-                    SketchKindHandle::Any => Capability::QuantileApprox(*kind),
+                    SketchAlgorithm::Kmv | SketchAlgorithm::Theta => Capability::CardinalityApprox,
                 };
                 (capability, Some(AccuracyBound::from_config(config)))
             }
@@ -499,5 +504,42 @@ impl AggPayload {
             AggPayload::Sketch(s) => s.bytes.len() + std::mem::size_of::<SketchSampleState>(),
             AggPayload::ExactAgg(p) => p.approx_memory_bytes(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asap_types::{enums::WindowKind, KeyByLabelNames};
+    use std::collections::HashMap;
+
+    #[test]
+    fn hll_envelope_config_is_registered_as_a_sketch() {
+        let config = asap_types::aggregation_config::AggregationConfig::new(
+            AggregationType::HLL,
+            String::new(),
+            HashMap::from([("precision".to_string(), serde_json::json!(12))]),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            60,
+            60,
+            WindowKind::Tumbling,
+            String::new(),
+            "unique_users".to_string(),
+            None,
+            None,
+            None,
+        );
+
+        assert!(matches!(
+            agg_kind_for_config(&config),
+            AggKind::Sketch {
+                algorithm: SketchAlgorithm::Hll,
+                config: SketchConfig::Hll { precision: 12 },
+                ..
+            }
+        ));
     }
 }

@@ -364,7 +364,7 @@ mod tests {
         assert!(matches!(
             meta.agg_kind,
             AggKind::Sketch {
-                kind: crate::storage_engines::sketch_db::data::SketchKindHandle::DDSketch,
+                algorithm: crate::storage_engines::sketch_db::data::SketchAlgorithm::DDSketch,
                 ..
             }
         ));
