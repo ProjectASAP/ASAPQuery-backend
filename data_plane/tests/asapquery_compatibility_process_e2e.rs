@@ -470,10 +470,46 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         "true"
     );
 
+    // PR-derived negative half of the executable matrix. These queries are
+    // accepted by ASAPQuery, but their warm plans are tracked by the linked
+    // backend/Planner issues. Until those land, the production binary must
+    // fall back atomically rather than partially evaluating a warm subtree.
+    let fallback_matrix = [
+        // ASAPQuery #700; backend #503.
+        "avg_over_time(asap_demo_gauge[5s])",
+        "count(asap_demo_gauge)",
+        "avg(asap_demo_gauge)",
+        // ASAPQuery #629/#700; backend #432.
+        "topk(5, asap_demo_gauge)",
+        // ASAPQuery #256/#572/#577/#644; Planner #343, backend #504.
+        "rate(asap_demo_counter_total[5s]) + rate(asap_demo_counter_total[5s])",
+        "rate(asap_demo_counter_total[5s]) / 2",
+        // ASAPQuery #466/#640; backend #473.
+        "sum_over_time(asap_demo_gauge[10s])",
+    ];
+    for query in fallback_matrix {
+        let response: Value = client
+            .get(format!("{backend}/api/v1/query"))
+            .query(&[
+                ("query", query.to_string()),
+                ("time", first_eval.to_string()),
+            ])
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("fallback request failed for {query}: {error}"))
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("fallback JSON failed for {query}: {error}"));
+        assert_eq!(
+            response["data"]["result"][0]["metric"]["fallback"], "true",
+            "unsupported matrix row must fall back atomically: {query}: {response}"
+        );
+    }
+
     let calls = fallback_calls.lock().await;
     assert_eq!(
         calls.len(),
-        2,
+        2 + fallback_matrix.len(),
         "planned queries unexpectedly fell back: {calls:?}"
     );
     assert_eq!(calls[0].0, "instant");
