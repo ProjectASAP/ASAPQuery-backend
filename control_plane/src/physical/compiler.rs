@@ -216,12 +216,14 @@ pub struct PrecomputePlan {
 #[serde(rename_all = "snake_case")]
 pub enum IngestProtocol {
     ModifiedOtlpMetricsV1,
+    PrometheusRemoteWriteV1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TimestampUnit {
     UnixNanoseconds,
+    UnixMilliseconds,
 }
 
 /// Backend ingress semantics installed with the precompute projection. This
@@ -331,7 +333,7 @@ pub struct ProducerContract {
 pub enum PrecomputePlanError {
     #[error("PrecomputePlan envelope does not match BackendPlan identity/lifecycle")]
     PlanIdentityMismatch,
-    #[error("precompute ingest endpoint must be /v1/metrics")]
+    #[error("unsupported precompute ingest protocol/endpoint/identity contract")]
     UnsupportedIngestEndpoint,
     #[error("duplicate materialization {0}")]
     DuplicateMaterialization(u64),
@@ -417,6 +419,32 @@ impl PrecomputePlan {
         Ok(plan)
     }
 
+    /// Build the backend-local projection used when raw Prometheus samples
+    /// are precomputed inside ASAPQuery rather than by ASAPCollector.
+    pub fn build_backend_local(
+        envelope: PlanEnvelope,
+        materializations: Vec<asap_types::PrecomputeMaterialization>,
+        backend_plan: &BackendPlan,
+    ) -> Result<Self, PrecomputePlanError> {
+        let mut plan = Self::build(
+            envelope,
+            materializations,
+            backend_plan,
+            &["backend-local".into()],
+        )?;
+        plan.ingest = IngestContract {
+            protocol: IngestProtocol::PrometheusRemoteWriteV1,
+            endpoint_path: "/api/v1/write".into(),
+            timestamp_unit: TimestampUnit::UnixMilliseconds,
+            require_plan_identity: false,
+            require_materialization_identity: false,
+            require_registered_producer: false,
+        };
+        plan.producers.clear();
+        plan.validate_against_backend(backend_plan)?;
+        Ok(plan)
+    }
+
     pub fn runtime_materializations(
         &self,
     ) -> Result<HashMap<u64, asap_types::PrecomputeMaterialization>, PrecomputePlanError> {
@@ -430,11 +458,23 @@ impl PrecomputePlan {
     }
 
     pub fn validate(&self) -> Result<(), PrecomputePlanError> {
-        if self.ingest.endpoint_path != "/v1/metrics"
-            || !self.ingest.require_plan_identity
-            || !self.ingest.require_materialization_identity
-            || !self.ingest.require_registered_producer
-        {
+        let valid_ingest = match self.ingest.protocol {
+            IngestProtocol::ModifiedOtlpMetricsV1 => {
+                self.ingest.endpoint_path == "/v1/metrics"
+                    && self.ingest.timestamp_unit == TimestampUnit::UnixNanoseconds
+                    && self.ingest.require_plan_identity
+                    && self.ingest.require_materialization_identity
+                    && self.ingest.require_registered_producer
+            }
+            IngestProtocol::PrometheusRemoteWriteV1 => {
+                self.ingest.endpoint_path == "/api/v1/write"
+                    && self.ingest.timestamp_unit == TimestampUnit::UnixMilliseconds
+                    && !self.ingest.require_plan_identity
+                    && !self.ingest.require_materialization_identity
+                    && !self.ingest.require_registered_producer
+            }
+        };
+        if !valid_ingest {
             return Err(PrecomputePlanError::UnsupportedIngestEndpoint);
         }
         let mut materializations = BTreeSet::new();
@@ -495,8 +535,10 @@ impl PrecomputePlan {
             }
             produced.insert(producer.materialization);
         }
-        if let Some(missing) = materializations.difference(&produced).next() {
-            return Err(PrecomputePlanError::MissingProducer(missing.0));
+        if self.ingest.require_registered_producer {
+            if let Some(missing) = materializations.difference(&produced).next() {
+                return Err(PrecomputePlanError::MissingProducer(missing.0));
+            }
         }
         Ok(())
     }
@@ -2331,6 +2373,36 @@ mod tests {
                 "ddsketch" | "kll"
             ));
         }
+    }
+
+    #[test]
+    fn backend_local_precompute_contract_has_no_collector_producers() {
+        let bundle = PhysicalCompiler
+            .compile(
+                request("q-quantile", "quantile_over_time(0.99, m[1m])"),
+                environment(10_000),
+            )
+            .expect("compile");
+        let plan = PrecomputePlan::build_backend_local(
+            bundle.envelope.clone(),
+            bundle.precompute_plan.materializations.clone(),
+            &bundle.backend_plan,
+        )
+        .expect("backend-local contract");
+
+        assert_eq!(
+            plan.ingest.protocol,
+            IngestProtocol::PrometheusRemoteWriteV1
+        );
+        assert_eq!(plan.ingest.endpoint_path, "/api/v1/write");
+        assert_eq!(plan.ingest.timestamp_unit, TimestampUnit::UnixMilliseconds);
+        assert!(plan.producers.is_empty());
+        plan.validate_against_backend(&bundle.backend_plan)
+            .expect("valid backend-local projection");
+        TransmissionPlan::build(bundle.envelope, &plan, &BTreeMap::new())
+            .expect("empty backend-local transmission contract")
+            .validate(&plan)
+            .expect("valid empty transmission plan");
     }
 
     #[test]

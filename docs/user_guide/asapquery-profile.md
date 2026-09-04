@@ -17,7 +17,7 @@ Then start the backend:
 ```bash
 cargo run -p data_plane -- \
   --profile asapquery \
-  --streaming-config data_plane/examples/asapquery/streaming-config.yaml \
+  --physical-plan /etc/asapquery/physical-plan.json \
   --prometheus-server http://127.0.0.1:9090 \
   --forward-unsupported-queries \
   --http-port 9091 \
@@ -26,7 +26,8 @@ cargo run -p data_plane -- \
 
 The profile checks Prometheus's `/-/healthy` endpoint before opening its public
 listener. It rejects OTLP ingest, monitor coordination, persistence, backfill,
-schema eviction, and archive routing flags. Remote Write and PromQL share the
+schema eviction, archive routing flags, and the legacy `--streaming-config`
+bootstrap. Remote Write and PromQL share the
 backend listener:
 
 - `POST /api/v1/write`
@@ -53,7 +54,24 @@ Receiver evidence is exported from `/metrics` as
 `asap_remote_write_rejected_requests_total`, and
 `asap_remote_write_bytes_total`.
 
-The example streaming config is a checked-in precompute-plan fixture. Startup
-loading of canonical `QueryWorkload` and `DataWorkload` snapshots and automatic
-backend-only compilation remain required before the profile meets the complete
-compatibility contract in the design document.
+`physical-plan.json` is the JSON representation accepted by
+`POST /api/v1/physical-plan`: a `PrecomputePlan`, `TransmissionPlan`, encoded
+`BackendPlan`, and authoritative `QueryPlan` DAG with one shared plan identity
+and version. For this profile, the precompute ingest contract must be
+`prometheus_remote_write_v1` at `/api/v1/write`; raw writes are rejected if a
+different plan is active. Startup validates all fingerprints, schemas, query
+bindings, lifecycle fields, and transmission rules before constructing the
+single active snapshot. Runtime replacement uses `POST /api/v1/physical-plan`
+to stage the complete successor and `POST /api/v1/physical-plan/activate` for
+the atomic cutover. The partial `/streaming-config` and `/backend-plan` install
+handles are not attached in this profile.
+
+Query serving uses only the installed `QueryPlan` DAG. A query absent from that
+DAG is a capability miss and goes to the exact Prometheus fallback; the backend
+does not search materialization candidates while serving.
+
+Automatic startup compilation from canonical `QueryWorkload` and
+`DataWorkload` snapshots is not part of this phase. Until the workload types
+have a stable serialized contract and the physical compiler supports a
+backend-only deployment target, the artifact must be produced offline by the
+planner/control-plane pipeline.

@@ -519,6 +519,8 @@ impl HttpServer {
             .route(range_query_endpoint, get(handle_range_query))
             .route(range_query_endpoint, post(handle_range_query_post))
             .route(runtime_info_path, get(handle_runtime_info))
+            .route("/metrics", get(handle_metrics))
+            .route("/api/v1/health", get(handle_health))
             .route(
                 "/api/v1/write",
                 post(handle_prometheus_remote_write)
@@ -2223,8 +2225,66 @@ mod tests {
     }
 
     async fn setup_remote_write_test_server() -> (u16, PrometheusRemoteWriteReceiver) {
+        use control_plane::physical::compiler::{
+            FrameIdentityContract, IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan,
+            SequenceScope, TimestampUnit, TransmissionPlan, PLANNER_REVISION,
+        };
         let streaming_config = Arc::new(StreamingConfig::default());
-        let hot_reload = HotReloadStreamingConfig::new((*streaming_config).clone());
+        let envelope = PlanEnvelope {
+            plan_id: 7,
+            plan_version: 1,
+            generated_at_unix_ms: 0,
+            activation_unix_ms: 1,
+            expiry_unix_ms: None,
+            backend_compat: control_plane::backend_plan::BACKEND_COMPAT.into(),
+            planner_revision: PLANNER_REVISION.into(),
+            capability_snapshot_id: "test".into(),
+        };
+        let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(
+            crate::storage_engines::types::ActivePhysicalPlan {
+                precompute_plan: PrecomputePlan {
+                    envelope: envelope.clone(),
+                    ingest: IngestContract {
+                        protocol: IngestProtocol::PrometheusRemoteWriteV1,
+                        endpoint_path: "/api/v1/write".into(),
+                        timestamp_unit: TimestampUnit::UnixMilliseconds,
+                        require_plan_identity: false,
+                        require_materialization_identity: false,
+                        require_registered_producer: false,
+                    },
+                    schemas: Vec::new(),
+                    producers: Vec::new(),
+                    materializations: Vec::new(),
+                },
+                transmission_plan: TransmissionPlan {
+                    envelope,
+                    frame_identity: FrameIdentityContract {
+                        identity_version: 1,
+                        sequence_scope: SequenceScope::MaterializationSeriesProducerEpoch,
+                        require_checkpoint_for_full: true,
+                        require_base_checkpoint_for_delta: true,
+                    },
+                    rules: Vec::new(),
+                },
+                runtime_config: streaming_config.clone(),
+                backend_plan: Arc::new(control_plane::backend_plan::BackendPlan {
+                    plan_id: 7,
+                    plan_version: 1,
+                    activation_unix_ms: 1,
+                    backend_compat: control_plane::backend_plan::BACKEND_COMPAT.into(),
+                    ..Default::default()
+                }),
+                query_plan: Arc::new(control_plane::query_plan::QueryPlan {
+                    plan_id: 7,
+                    plan_version: 1,
+                    entries: Default::default(),
+                }),
+                storage_routing: Arc::new(
+                    crate::storage_engines::types::BackendStorageRouting::empty(),
+                ),
+            },
+        );
+        let hot_reload = HotReloadStreamingConfig::from_active(active.clone());
         let (sender, _worker) = mpsc::channel(8);
         let ingest = Arc::new(IngestState {
             router: SeriesRouter::new(vec![sender]),
@@ -2249,6 +2309,7 @@ mod tests {
             Arc::new(ASAPQueryEngine::new(streaming_config, 15_000)),
             Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
         )
+        .with_active_physical_plan(active)
         .with_remote_write(receiver.clone());
         (server.start_test_server().await.unwrap(), receiver)
     }
@@ -2284,6 +2345,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accepted.status().as_u16(), StatusCode::NO_CONTENT.as_u16());
+        let ready = client
+            .get(format!("http://127.0.0.1:{port}/api/v1/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ready.status().as_u16(), StatusCode::OK.as_u16());
         assert_eq!(
             receiver
                 .stats()
@@ -5303,14 +5370,44 @@ async fn handle_prometheus_remote_write(
             error @ (crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::Backpressure(
                 _,
             )
-            | crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::DedupCapacity(_)),
+            | crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::DedupCapacity(_)
+            | crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::InactivePhysicalPlan),
         ) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }
 
-async fn handle_health() -> &'static str {
-    "ok"
+async fn handle_health(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if state.remote_write.is_some() {
+        let Some(active) = state
+            .active_physical_plan
+            .as_ref()
+            .map(|handle| handle.snapshot())
+        else {
+            return (StatusCode::SERVICE_UNAVAILABLE, "no active PhysicalPlan").into_response();
+        };
+        let now = unix_time_ms();
+        let lifecycle_ready = active.backend_plan.plan_id != 0
+            && active.backend_plan.activation_unix_ms <= now
+            && active
+                .backend_plan
+                .expiry_unix_ms
+                .is_none_or(|expiry| now < expiry);
+        let ingest_ready = matches!(
+            active.precompute_plan.ingest.protocol,
+            control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
+        ) && active.precompute_plan.ingest.endpoint_path == "/api/v1/write";
+        if !lifecycle_ready || !ingest_ready {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "active PhysicalPlan is not ready for Remote Write",
+            )
+                .into_response();
+        }
+    }
+    (StatusCode::OK, "ok").into_response()
 }
 
 /// Return list of metrics currently in the store.
@@ -5520,15 +5617,85 @@ async fn handle_post_backend_plan(
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-#[derive(serde::Deserialize)]
-struct PhysicalPlanInstallRequest {
-    precompute_plan: control_plane::physical::compiler::PrecomputePlan,
-    transmission_plan: control_plane::physical::compiler::TransmissionPlan,
-    backend_plan: Vec<u8>,
-    query_plan: control_plane::query_plan::QueryPlan,
-    storage_routing: Option<serde_json::Value>,
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalPlanInstallRequest {
+    pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
+    pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
+    pub backend_plan: Vec<u8>,
+    pub query_plan: control_plane::query_plan::QueryPlan,
+    pub storage_routing: Option<serde_json::Value>,
     #[serde(default)]
-    adaptation_evidence: Vec<control_plane::physical::compiler::RuntimeAdaptationEvidence>,
+    pub adaptation_evidence: Vec<control_plane::physical::compiler::RuntimeAdaptationEvidence>,
+}
+
+/// Decode and cross-validate every backend view before it can become visible.
+/// Used by both startup artifact loading and the staged HTTP install path.
+pub fn build_active_physical_plan(
+    request: PhysicalPlanInstallRequest,
+    default_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
+) -> Result<crate::storage_engines::types::ActivePhysicalPlan, String> {
+    use std::collections::BTreeSet;
+    let runtime_materializations = request
+        .precompute_plan
+        .runtime_materializations()
+        .map_err(|error| format!("PrecomputePlan validation error: {error}"))?;
+    request
+        .transmission_plan
+        .validate(&request.precompute_plan)
+        .map_err(|error| format!("TransmissionPlan validation error: {error}"))?;
+    let backend_plan = control_plane::backend_plan::BackendPlan::decode(&request.backend_plan)
+        .map_err(|error| format!("BackendPlan decode error: {error}"))?;
+    backend_plan
+        .validate()
+        .map_err(|error| format!("BackendPlan validation error: {error}"))?;
+    request
+        .precompute_plan
+        .validate_against_backend(&backend_plan)
+        .map_err(|error| format!("PrecomputePlan validation error: {error}"))?;
+    let envelope = &request.precompute_plan.envelope;
+    if request.query_plan.plan_id != backend_plan.plan_id
+        || request.query_plan.plan_version != backend_plan.plan_version
+        || envelope.plan_id != backend_plan.plan_id
+        || envelope.plan_version != backend_plan.plan_version
+        || envelope.activation_unix_ms != backend_plan.activation_unix_ms
+        || envelope.expiry_unix_ms != backend_plan.expiry_unix_ms
+        || envelope.backend_compat != backend_plan.backend_compat
+        || request.transmission_plan.envelope != *envelope
+    {
+        return Err("physical subplans have different plan identity/version".into());
+    }
+    let runtime_config =
+        crate::storage_engines::types::StreamingConfig::new(runtime_materializations);
+    let config_fps: BTreeSet<u64> = runtime_config.aggregation_configs.keys().copied().collect();
+    let plan_fps: BTreeSet<u64> = backend_plan
+        .materializations
+        .keys()
+        .map(|fp| fp.0)
+        .collect();
+    if config_fps != plan_fps {
+        return Err("PrecomputePlan and BackendPlan materialization fingerprints differ".into());
+    }
+    let typed_fps: BTreeSet<_> = backend_plan.materializations.keys().copied().collect();
+    request
+        .query_plan
+        .validate(&typed_fps)
+        .map_err(|error| format!("QueryPlan validation error: {error}"))?;
+    let storage_routing = match request.storage_routing.as_ref() {
+        Some(value) => Arc::new(
+            crate::storage_engines::types::BackendStorageRouting::from_json_payload(value)
+                .map_err(|error| format!("BackendStorageRouting build error: {error:#}"))?,
+        ),
+        None => default_routing,
+    };
+    Ok(crate::storage_engines::types::ActivePhysicalPlan {
+        precompute_plan: request.precompute_plan,
+        transmission_plan: request.transmission_plan,
+        runtime_config: Arc::new(runtime_config),
+        backend_plan: Arc::new(backend_plan),
+        query_plan: Arc::new(request.query_plan),
+        storage_routing,
+    })
 }
 
 /// Validate and stage all backend views. Staging never changes query routing;
@@ -5539,7 +5706,6 @@ async fn handle_post_physical_plan(
 ) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
-    use std::collections::BTreeSet;
 
     let Some(active_handle) = state.active_physical_plan.as_ref() else {
         return (
@@ -5559,26 +5725,6 @@ async fn handle_post_physical_plan(
         )
             .into_response();
     };
-    let runtime_materializations =
-        match request.precompute_plan.runtime_materializations() {
-            Ok(materializations) => materializations,
-            Err(error) => return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                axum::Json(serde_json::json!({
-                    "status": "error", "error": format!("PrecomputePlan validation error: {error}")
-                })),
-            )
-                .into_response(),
-        };
-    if let Err(error) = request.transmission_plan.validate(&request.precompute_plan) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            axum::Json(serde_json::json!({
-                "status": "error", "error": format!("TransmissionPlan validation error: {error}")
-            })),
-        )
-            .into_response();
-    }
     let current = active_handle.snapshot();
     if current.transmission_plan.envelope.plan_id != 0 {
         if let Err(error) = current.transmission_plan.authorize_successor(
@@ -5596,120 +5742,36 @@ async fn handle_post_physical_plan(
                 .into_response();
         }
     }
-    let new_config = crate::storage_engines::types::StreamingConfig::new(runtime_materializations);
-    let new_plan = match control_plane::backend_plan::BackendPlan::decode(&request.backend_plan) {
-        Ok(plan) => plan,
+    let _guard = state.physical_plan_lock.lock().await;
+    let active = match build_active_physical_plan(request, current.storage_routing.clone()) {
+        Ok(active) => active,
         Err(error) => {
             return (
-                StatusCode::BAD_REQUEST,
-                axum::Json(serde_json::json!({
-                    "status": "error", "error": format!("BackendPlan decode error: {error}")
-                })),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(serde_json::json!({"status": "error", "error": error})),
             )
-                .into_response()
+                .into_response();
         }
     };
-    if let Err(error) = new_plan.validate() {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            axum::Json(serde_json::json!({
-                "status": "error", "error": format!("BackendPlan validation error: {error}")
-            })),
-        )
-            .into_response();
-    }
-    if let Err(error) = request.precompute_plan.validate_against_backend(&new_plan) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            axum::Json(serde_json::json!({
-                "status": "error", "error": format!("PrecomputePlan validation error: {error}")
-            })),
-        )
-            .into_response();
-    }
-    if request.query_plan.plan_id != new_plan.plan_id
-        || request.query_plan.plan_version != new_plan.plan_version
-        || request.precompute_plan.envelope.plan_id != new_plan.plan_id
-        || request.precompute_plan.envelope.plan_version != new_plan.plan_version
-        || request.precompute_plan.envelope.activation_unix_ms != new_plan.activation_unix_ms
-        || request.precompute_plan.envelope.expiry_unix_ms != new_plan.expiry_unix_ms
-        || request.precompute_plan.envelope.backend_compat != new_plan.backend_compat
+    if state.remote_write.is_some()
+        && (active.backend_plan.plan_id == 0
+            || !matches!(
+                active.precompute_plan.ingest.protocol,
+                control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
+            )
+            || active.precompute_plan.ingest.endpoint_path != "/api/v1/write")
     {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             axum::Json(serde_json::json!({
-                "status": "error", "error": "physical subplans have different plan identity/version"
-            })),
-        )
-            .into_response();
-    }
-    let config_fps: BTreeSet<u64> = new_config.aggregation_configs.keys().copied().collect();
-    let plan_fps: BTreeSet<u64> = new_plan.materializations.keys().map(|fp| fp.0).collect();
-    if config_fps != plan_fps {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            axum::Json(serde_json::json!({
                 "status": "error",
-                "error": "streaming-config and BackendPlan materialization fingerprints differ"
+                "error": "Remote Write listener requires a non-bootstrap prometheus_remote_write_v1 plan at /api/v1/write"
             })),
         )
             .into_response();
     }
-    for schema in &request.precompute_plan.schemas {
-        let Some(materialization) = new_plan.materializations.get(&schema.materialization) else {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                axum::Json(serde_json::json!({
-                    "status": "error", "error": "PrecomputePlan schema is absent from BackendPlan"
-                })),
-            )
-                .into_response();
-        };
-        if control_plane::physical::compiler::StateFamilyContract::try_from(&materialization.family)
-            != Ok(schema.family.clone())
-        {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                axum::Json(serde_json::json!({
-                    "status": "error", "error": "PrecomputePlan and BackendPlan schema semantics differ"
-                })),
-            )
-                .into_response();
-        }
-    }
-    let typed_plan_fps: BTreeSet<_> = new_plan.materializations.keys().copied().collect();
-    if let Err(error) = request.query_plan.validate(&typed_plan_fps) {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            axum::Json(serde_json::json!({
-                "status": "error", "error": format!("QueryPlan validation error: {error}")
-            })),
-        )
-            .into_response();
-    }
-    let new_routing = match request.storage_routing.as_ref() {
-        Some(value) => match crate::storage_engines::types::BackendStorageRouting::from_json_payload(value) {
-            Ok(routing) => Some(routing),
-            Err(error) => return (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({
-                "status": "error", "error": format!("BackendStorageRouting build error: {error:#}")
-            }))).into_response(),
-        },
-        None => None,
-    };
-    let new_routing = new_routing
-        .map(Arc::new)
-        .unwrap_or_else(|| active_handle.snapshot().storage_routing.clone());
-
-    let _guard = state.physical_plan_lock.lock().await;
-    let plan_id = new_plan.plan_id;
-    let active = crate::storage_engines::types::ActivePhysicalPlan {
-        precompute_plan: request.precompute_plan,
-        transmission_plan: request.transmission_plan,
-        runtime_config: Arc::new(new_config),
-        backend_plan: Arc::new(new_plan),
-        query_plan: Arc::new(request.query_plan),
-        storage_routing: new_routing,
-    };
+    let plan_id = active.backend_plan.plan_id;
+    let materialization_count = active.precompute_plan.materializations.len();
     let plan_version = active.backend_plan.plan_version;
     let now = unix_time_ms();
     if let Err(error) = lifecycle.stage(active, now) {
@@ -5723,7 +5785,7 @@ async fn handle_post_physical_plan(
         StatusCode::ACCEPTED,
         axum::Json(serde_json::json!({
             "status": "staged", "plan_id": plan_id, "plan_version": plan_version,
-            "materialization_count": plan_fps.len()
+            "materialization_count": materialization_count
         })),
     )
         .into_response()

@@ -34,6 +34,13 @@ enum RuntimeProfile {
     Asapquery,
 }
 
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -42,9 +49,14 @@ struct Args {
     #[arg(long, value_enum, default_value = "distributed")]
     profile: RuntimeProfile,
 
-    /// File path for streaming_config
+    /// Legacy bootstrap streaming config (distributed profile only).
     #[arg(long)]
-    streaming_config: String,
+    streaming_config: Option<String>,
+
+    /// JSON physical-plan artifact. Required by the backend-local profile;
+    /// all runtime/query views are validated and installed as one snapshot.
+    #[arg(long)]
+    physical_plan: Option<std::path::PathBuf>,
 
     /// Cleanup policy for SketchStore retention.
     /// `circular_buffer`: keep the N most recent windows per agg
@@ -330,7 +342,16 @@ struct Args {
 
 fn validate_profile(args: &Args) -> Result<()> {
     if args.profile != RuntimeProfile::Asapquery {
+        if args.streaming_config.is_none() {
+            return Err("the distributed profile requires --streaming-config".into());
+        }
         return Ok(());
+    }
+    if args.streaming_config.is_some() {
+        return Err("--profile asapquery rejects --streaming-config; use --physical-plan".into());
+    }
+    if args.physical_plan.is_none() {
+        return Err("--profile asapquery requires --physical-plan".into());
     }
     let mut excluded = Vec::new();
     if args.enable_otel_ingest {
@@ -436,7 +457,57 @@ async fn main() -> Result<()> {
         );
     }
 
-    let streaming_config = Arc::new(read_streaming_config(&args.streaming_config)?);
+    let startup_physical_plan = if let Some(path) = args.physical_plan.as_ref() {
+        let bytes = fs::read(path)?;
+        let artifact: data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest =
+            serde_json::from_slice(&bytes).map_err(|error| {
+                format!(
+                    "failed to decode physical plan artifact {}: {error}",
+                    path.display()
+                )
+            })?;
+        let active = data_plane::drivers::query::servers::http::build_active_physical_plan(
+            artifact,
+            Arc::new(data_plane::storage_engines::types::BackendStorageRouting::empty()),
+        )
+        .map_err(|error| format!("invalid physical plan artifact {}: {error}", path.display()))?;
+        if args.profile == RuntimeProfile::Asapquery
+            && (active.backend_plan.plan_id == 0
+                || !matches!(
+                    active.precompute_plan.ingest.protocol,
+                    control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
+                )
+                || active.precompute_plan.ingest.endpoint_path != "/api/v1/write")
+        {
+            return Err("the asapquery profile requires a non-bootstrap physical plan declaring prometheus_remote_write_v1 at /api/v1/write".into());
+        }
+        let now = unix_time_ms();
+        if active.backend_plan.activation_unix_ms > now {
+            return Err(format!(
+                "physical plan activation {} is later than startup time {now}",
+                active.backend_plan.activation_unix_ms
+            )
+            .into());
+        }
+        if active
+            .backend_plan
+            .expiry_unix_ms
+            .is_some_and(|expiry| expiry <= now)
+        {
+            return Err("physical plan artifact is expired".into());
+        }
+        Some(active)
+    } else {
+        None
+    };
+    let streaming_config = match startup_physical_plan.as_ref() {
+        Some(active) => active.runtime_config.clone(),
+        None => Arc::new(read_streaming_config(
+            args.streaming_config
+                .as_deref()
+                .expect("validated distributed streaming config"),
+        )?),
+    };
     info!(
         "Loaded streaming config with {} entries",
         streaming_config.get_all_aggregation_configs().len()
@@ -594,7 +665,7 @@ async fn main() -> Result<()> {
         },
         rules: Vec::new(),
     };
-    let active_physical_plan = data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(
+    let initial_active_plan = startup_physical_plan.unwrap_or_else(|| {
         data_plane::storage_engines::types::ActivePhysicalPlan {
             precompute_plan: initial_precompute_plan,
             transmission_plan: initial_transmission_plan,
@@ -604,8 +675,10 @@ async fn main() -> Result<()> {
             storage_routing: Arc::new(
                 data_plane::storage_engines::types::BackendStorageRouting::empty(),
             ),
-        },
-    );
+        }
+    });
+    let active_physical_plan =
+        data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(initial_active_plan);
     let hot_reload_config =
         data_plane::storage_engines::types::HotReloadStreamingConfig::from_active(
             active_physical_plan.clone(),
@@ -914,10 +987,16 @@ async fn main() -> Result<()> {
     // lifecycle transitions at the sid level via the shared
     // `SketchStore` (already passed in below).
     let mut server = HttpServer::new(http_config, engine, sketch_index.clone())
-        .with_hot_reload_config(hot_reload_config.clone())
-        .with_hot_reload_backend_plan(hot_reload_backend_plan.clone())
         .with_active_physical_plan(active_physical_plan.clone())
         .with_probe_cache(probe_cache.clone());
+    if args.profile == RuntimeProfile::Distributed {
+        // Legacy partial-document endpoints remain available to distributed
+        // deployments. The compatibility profile deliberately exposes only
+        // the atomic PhysicalPlan stage/activate lifecycle.
+        server = server
+            .with_hot_reload_config(hot_reload_config.clone())
+            .with_hot_reload_backend_plan(hot_reload_backend_plan.clone());
+    }
 
     if args.enable_remote_write || args.profile == RuntimeProfile::Asapquery {
         let receiver = PrometheusRemoteWriteReceiver::new(
@@ -1338,7 +1417,39 @@ fn setup_logging(
 
 #[cfg(test)]
 mod tests {
+    use super::{validate_profile, Args};
+    use clap::Parser;
     use data_plane::drivers::AdapterConfig;
+
+    #[test]
+    fn asapquery_requires_atomic_physical_plan_not_streaming_config() {
+        let valid = Args::try_parse_from([
+            "data_plane",
+            "--profile",
+            "asapquery",
+            "--physical-plan",
+            "plan.json",
+            "--forward-unsupported-queries",
+        ])
+        .unwrap();
+        assert!(validate_profile(&valid).is_ok());
+
+        let legacy = Args::try_parse_from([
+            "data_plane",
+            "--profile",
+            "asapquery",
+            "--streaming-config",
+            "streaming.yaml",
+            "--physical-plan",
+            "plan.json",
+            "--forward-unsupported-queries",
+        ])
+        .unwrap();
+        assert!(validate_profile(&legacy)
+            .unwrap_err()
+            .to_string()
+            .contains("rejects --streaming-config"));
+    }
 
     // Step-1 of the JSONL deprecation refactor deleted the
     // §5.2 `ColdFallback` adapter and the
