@@ -8,6 +8,9 @@ use std::collections::HashMap;
 
 use asap_types::Statistic;
 
+const RESET_AWARE_WIRE_MAGIC: &[u8; 8] = b"ASAPINC2";
+const RESET_AWARE_WIRE_EXTENSION_LEN: usize = 8 + 8 + 8;
+
 /// Accumulator for tracking increases in counter metrics
 /// Stores the starting and last seen measurements with timestamps
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,26 +19,97 @@ pub struct IncreaseAccumulator {
     pub starting_timestamp: i64,
     pub last_seen_measurement: Measurement,
     pub last_seen_timestamp: i64,
+    /// Sum of monotonic deltas, adding the post-reset value whenever the
+    /// counter decreases. This is the reset correction Prometheus applies.
+    #[serde(default)]
+    pub total_increase: f64,
+    #[serde(default)]
+    pub sample_count: u64,
 }
 
 impl IncreaseAccumulator {
+    /// Return the number of bytes occupied by one accumulator at the start of
+    /// `buffer`. Old persisted values end after `last_seen_timestamp`; reset-
+    /// aware values carry a magic-prefixed extension. The magic makes this
+    /// safe when the buffer also contains the next keyed entry.
+    pub(crate) fn serialized_len_from_prefix(
+        buffer: &[u8],
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        if buffer.len() < 4 {
+            return Err("Buffer too short for starting measurement length".into());
+        }
+        let starting_len = u32::from_le_bytes(buffer[0..4].try_into()?) as usize;
+        let last_len_offset = 4usize
+            .checked_add(starting_len)
+            .and_then(|offset| offset.checked_add(8))
+            .ok_or("IncreaseAccumulator length overflow")?;
+        if buffer.len() < last_len_offset + 4 {
+            return Err("Buffer too short for last seen measurement length".into());
+        }
+        let last_len =
+            u32::from_le_bytes(buffer[last_len_offset..last_len_offset + 4].try_into()?) as usize;
+        let legacy_len = last_len_offset
+            .checked_add(4)
+            .and_then(|offset| offset.checked_add(last_len))
+            .and_then(|offset| offset.checked_add(8))
+            .ok_or("IncreaseAccumulator length overflow")?;
+        if buffer.len() < legacy_len {
+            return Err("Buffer too short for last seen timestamp".into());
+        }
+        let has_extension = buffer.len() >= legacy_len + RESET_AWARE_WIRE_EXTENSION_LEN
+            && &buffer[legacy_len..legacy_len + RESET_AWARE_WIRE_MAGIC.len()]
+                == RESET_AWARE_WIRE_MAGIC;
+        Ok(legacy_len
+            + if has_extension {
+                RESET_AWARE_WIRE_EXTENSION_LEN
+            } else {
+                0
+            })
+    }
+
     pub fn new(
         starting_measurement: Measurement,
         starting_timestamp: i64,
         last_seen_measurement: Measurement,
         last_seen_timestamp: i64,
     ) -> Self {
+        let total_increase = if last_seen_timestamp <= starting_timestamp {
+            0.0
+        } else if last_seen_measurement.value >= starting_measurement.value {
+            last_seen_measurement.value - starting_measurement.value
+        } else {
+            last_seen_measurement.value
+        };
+        let sample_count = if last_seen_timestamp > starting_timestamp {
+            2
+        } else {
+            1
+        };
         Self {
             starting_measurement,
             starting_timestamp,
             last_seen_measurement,
             last_seen_timestamp,
+            total_increase,
+            sample_count,
         }
     }
 
     pub fn update(&mut self, measurement: Measurement, timestamp: i64) {
+        if timestamp < self.last_seen_timestamp {
+            return;
+        }
+        if timestamp == self.last_seen_timestamp {
+            return;
+        }
+        if measurement.value >= self.last_seen_measurement.value {
+            self.total_increase += measurement.value - self.last_seen_measurement.value;
+        } else {
+            self.total_increase += measurement.value;
+        }
         self.last_seen_measurement = measurement;
         self.last_seen_timestamp = timestamp;
+        self.sample_count = self.sample_count.saturating_add(1);
     }
 
     pub fn deserialize_from_json(data: &Value) -> Result<Self, Box<dyn std::error::Error>> {
@@ -50,12 +124,19 @@ impl IncreaseAccumulator {
             .as_i64()
             .ok_or("Missing or invalid 'last_seen_timestamp' field")?;
 
-        Ok(Self::new(
+        let mut accumulator = Self::new(
             starting_measurement,
             starting_timestamp,
             last_seen_measurement,
             last_seen_timestamp,
-        ))
+        );
+        accumulator.total_increase = data["total_increase"]
+            .as_f64()
+            .unwrap_or(accumulator.total_increase);
+        accumulator.sample_count = data["sample_count"]
+            .as_u64()
+            .unwrap_or(accumulator.sample_count);
+        Ok(accumulator)
     }
 
     pub fn deserialize_from_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
@@ -132,12 +213,30 @@ impl IncreaseAccumulator {
             buffer[offset + 7],
         ]);
 
-        Ok(Self::new(
+        let mut accumulator = Self::new(
             starting_measurement,
             starting_timestamp,
             last_seen_measurement,
             last_seen_timestamp,
-        ))
+        );
+        offset += 8;
+        if buffer.len() >= offset + RESET_AWARE_WIRE_EXTENSION_LEN
+            && &buffer[offset..offset + RESET_AWARE_WIRE_MAGIC.len()] == RESET_AWARE_WIRE_MAGIC
+        {
+            offset += RESET_AWARE_WIRE_MAGIC.len();
+            accumulator.total_increase = f64::from_le_bytes(
+                buffer[offset..offset + 8]
+                    .try_into()
+                    .expect("checked total-increase bytes"),
+            );
+            offset += 8;
+            accumulator.sample_count = u64::from_le_bytes(
+                buffer[offset..offset + 8]
+                    .try_into()
+                    .expect("checked sample-count bytes"),
+            );
+        }
+        Ok(accumulator)
     }
 }
 
@@ -148,6 +247,8 @@ impl SerializableToSink for IncreaseAccumulator {
             "starting_timestamp": self.starting_timestamp,
             "last_seen_measurement": self.last_seen_measurement.serialize_to_json(),
             "last_seen_timestamp": self.last_seen_timestamp,
+            "total_increase": self.total_increase,
+            "sample_count": self.sample_count,
         })
     }
 
@@ -170,6 +271,9 @@ impl SerializableToSink for IncreaseAccumulator {
 
         // Last seen timestamp
         buffer.extend_from_slice(&self.last_seen_timestamp.to_le_bytes());
+        buffer.extend_from_slice(RESET_AWARE_WIRE_MAGIC);
+        buffer.extend_from_slice(&self.total_increase.to_le_bytes());
+        buffer.extend_from_slice(&self.sample_count.to_le_bytes());
 
         buffer
     }
@@ -183,16 +287,21 @@ impl MergeableAccumulator<IncreaseAccumulator> for IncreaseAccumulator {
             return Err("No accumulators to merge".into());
         }
 
+        let mut accumulators = accumulators;
+        accumulators.sort_by_key(|accumulator| accumulator.starting_timestamp);
         let mut result = accumulators[0].clone();
 
         for acc in &accumulators[1..] {
-            // Use the earlier starting point
-            if acc.starting_timestamp < result.starting_timestamp {
-                result.starting_measurement = acc.starting_measurement.clone();
-                result.starting_timestamp = acc.starting_timestamp;
+            if acc.starting_timestamp > result.last_seen_timestamp {
+                result.total_increase +=
+                    if acc.starting_measurement.value >= result.last_seen_measurement.value {
+                        acc.starting_measurement.value - result.last_seen_measurement.value
+                    } else {
+                        acc.starting_measurement.value
+                    };
             }
-
-            // Use the later last seen point
+            result.total_increase += acc.total_increase;
+            result.sample_count = result.sample_count.saturating_add(acc.sample_count);
             if acc.last_seen_timestamp > result.last_seen_timestamp {
                 result.last_seen_measurement = acc.last_seen_measurement.clone();
                 result.last_seen_timestamp = acc.last_seen_timestamp;
@@ -262,10 +371,13 @@ impl AggregateCore for IncreaseAccumulator {
         &self,
         statistic: asap_types::Statistic,
         _key: &Option<crate::KeyByLabelValues>,
-        _query_kwargs: &std::collections::HashMap<String, String>,
+        query_kwargs: &std::collections::HashMap<String, String>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
         use crate::storage_engines::types::SingleSubpopulationAggregate;
-        self.query(statistic, None)
+        self.query(
+            statistic,
+            (!query_kwargs.is_empty()).then_some(query_kwargs),
+        )
     }
 }
 
@@ -275,24 +387,9 @@ impl SingleSubpopulationAggregate for IncreaseAccumulator {
         statistic: Statistic,
         query_kwargs: Option<&HashMap<String, String>>,
     ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
-        // IncreaseAccumulator doesn't use query_kwargs, assert it's None
-        if query_kwargs.is_some() {
-            return Err("IncreaseAccumulator does not support query parameters".into());
-        }
-
         match statistic {
-            Statistic::Increase => {
-                Ok(self.last_seen_measurement.value - self.starting_measurement.value)
-            }
-            Statistic::Rate => {
-                // Convert to per second; timestamps are in milliseconds
-                let time_diff = (self.last_seen_timestamp - self.starting_timestamp) as f64;
-                if time_diff <= 0.0 {
-                    return Err("Invalid time difference for rate calculation".into());
-                }
-                let value_diff = self.last_seen_measurement.value - self.starting_measurement.value;
-                Ok(value_diff / time_diff * 1000.0)
-            }
+            Statistic::Increase => Ok(self.extrapolated_value(query_kwargs, false)?),
+            Statistic::Rate => Ok(self.extrapolated_value(query_kwargs, true)?),
             // For instant `sum [by (...)] (counter_metric)` Prometheus
             // sums the latest cumulative value of each matching series.
             // The IncreaseAccumulator already tracks that latest value
@@ -311,6 +408,65 @@ impl SingleSubpopulationAggregate for IncreaseAccumulator {
 
     fn clone_boxed(&self) -> Box<dyn SingleSubpopulationAggregate> {
         Box::new(self.clone())
+    }
+}
+
+impl IncreaseAccumulator {
+    fn extrapolated_value(
+        &self,
+        query_kwargs: Option<&HashMap<String, String>>,
+        is_rate: bool,
+    ) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
+        if self.sample_count < 2 || self.last_seen_timestamp <= self.starting_timestamp {
+            return Err("at least two ordered counter samples are required".into());
+        }
+        let sampled_interval = (self.last_seen_timestamp - self.starting_timestamp) as f64 / 1000.0;
+        let Some(kwargs) = query_kwargs else {
+            return Ok(if is_rate {
+                self.total_increase / sampled_interval
+            } else {
+                self.total_increase
+            });
+        };
+        let range_start = kwargs
+            .get("range_start_ms")
+            .ok_or("missing range_start_ms")?
+            .parse::<i64>()?;
+        let range_end = kwargs
+            .get("range_end_ms")
+            .ok_or("missing range_end_ms")?
+            .parse::<i64>()?;
+        if range_end <= range_start {
+            return Err("invalid counter evaluation range".into());
+        }
+
+        let mut duration_to_start =
+            (self.starting_timestamp.saturating_sub(range_start)) as f64 / 1000.0;
+        let duration_to_end = (range_end.saturating_sub(self.last_seen_timestamp)) as f64 / 1000.0;
+        let average_sample_interval = sampled_interval / (self.sample_count - 1) as f64;
+        let extrapolation_threshold = average_sample_interval * 1.1;
+
+        if self.total_increase > 0.0 && self.starting_measurement.value >= 0.0 {
+            let duration_to_zero =
+                sampled_interval * (self.starting_measurement.value / self.total_increase);
+            duration_to_start = duration_to_start.min(duration_to_zero);
+        }
+        let mut extrapolate_to = sampled_interval;
+        extrapolate_to += if duration_to_start < extrapolation_threshold {
+            duration_to_start.max(0.0)
+        } else {
+            average_sample_interval / 2.0
+        };
+        extrapolate_to += if duration_to_end < extrapolation_threshold {
+            duration_to_end.max(0.0)
+        } else {
+            average_sample_interval / 2.0
+        };
+        let mut factor = extrapolate_to / sampled_interval;
+        if is_rate {
+            factor /= (range_end - range_start) as f64 / 1000.0;
+        }
+        Ok(self.total_increase * factor)
     }
 }
 
@@ -429,6 +585,33 @@ mod tests {
     }
 
     #[test]
+    fn prometheus_counter_reset_and_boundary_extrapolation() {
+        let mut acc = IncreaseAccumulator::new(
+            Measurement::new(10.0),
+            10_000,
+            Measurement::new(10.0),
+            10_000,
+        );
+        acc.update(Measurement::new(20.0), 20_000);
+        acc.update(Measurement::new(3.0), 30_000);
+        acc.update(Measurement::new(13.0), 50_000);
+        assert_eq!(acc.total_increase, 23.0);
+        assert_eq!(acc.sample_count, 4);
+
+        let kwargs = HashMap::from([
+            ("range_start_ms".into(), "0".into()),
+            ("range_end_ms".into(), "60000".into()),
+        ]);
+        let increase =
+            crate::SingleSubpopulationAggregate::query(&acc, Statistic::Increase, Some(&kwargs))
+                .unwrap();
+        let rate = crate::SingleSubpopulationAggregate::query(&acc, Statistic::Rate, Some(&kwargs))
+            .unwrap();
+        assert!((increase - 34.5).abs() < 1e-12);
+        assert!((rate - 0.575).abs() < 1e-12);
+    }
+
+    #[test]
     fn test_increase_accumulator_sum_is_latest_cumulative_value() {
         // Instant `sum (<counter>)` semantics: the per-series summand is
         // the latest cumulative counter value. Two series with latest
@@ -517,6 +700,13 @@ mod tests {
             acc.last_seen_timestamp,
             deserialized_bytes.last_seen_timestamp
         );
+        assert_eq!(acc.total_increase, deserialized_bytes.total_increase);
+        assert_eq!(acc.sample_count, deserialized_bytes.sample_count);
+
+        let legacy = &bytes[..bytes.len() - RESET_AWARE_WIRE_EXTENSION_LEN];
+        let legacy_value = IncreaseAccumulator::deserialize_from_bytes(legacy).unwrap();
+        assert_eq!(legacy_value.total_increase, 15.0);
+        assert_eq!(legacy_value.sample_count, 2);
     }
 
     #[test]

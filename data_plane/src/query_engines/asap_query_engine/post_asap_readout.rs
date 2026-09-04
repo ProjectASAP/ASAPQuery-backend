@@ -174,6 +174,34 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                     .collect::<Result<Vec<_>, _>>()
                     .map(PhysicalQueryOutput::Value)
             }
+            QueryPlanNode::ExactReadout { readout, .. } => {
+                let [PhysicalQueryOutput::State(groups)] = inputs else {
+                    return Err(PhysicalNodeError::ExpectedState);
+                };
+                groups
+                    .iter()
+                    .map(|(key, state)| {
+                        state
+                            .exact_value_for(
+                                *readout,
+                                &None,
+                                self.context.t0_ms,
+                                self.context.t1_ms,
+                            )
+                            .map(|value| {
+                                (
+                                    key.clone(),
+                                    SummaryValue::Points(
+                                        vec![(self.context.t1_ms as i64, value)],
+                                        state.exact_coverage(),
+                                    ),
+                                )
+                            })
+                            .ok_or(PhysicalNodeError::ExpectedState)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(PhysicalQueryOutput::Value)
+            }
             QueryPlanNode::SummaryMerge { .. } => {
                 let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<GroupState>> =
                     BTreeMap::new();
@@ -603,5 +631,75 @@ mod tests {
         // same semantics as `SummaryValue::coverage()`, reconfirmed for
         // `exact_coverage` by this module's A0 test in `summary_executor.rs`.
         assert_eq!(outcome.coverage, Some((2_000, 2_000)));
+    }
+
+    #[test]
+    fn exact_query_plan_rate_uses_reset_aware_readout() {
+        let idx = SketchStore::new();
+        let policy = asap_types::PolicyFingerprint(777);
+        idx.register(SketchInstanceMetadata {
+            sid: 7,
+            metric_name: "requests_total".into(),
+            group_by_keys: std::collections::BTreeSet::new(),
+            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Increase)),
+            agg_kind: AggKind::ExactAgg {
+                agg_type: asap_types::AggregationType::Increase,
+                parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: None,
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: policy,
+        });
+        use crate::storage_engines::types::Measurement;
+        let mut accumulator = crate::precompute_engine::operators::IncreaseAccumulator::new(
+            Measurement::new(10.0),
+            10_000,
+            Measurement::new(10.0),
+            10_000,
+        );
+        accumulator.update(Measurement::new(20.0), 20_000);
+        accumulator.update(Measurement::new(3.0), 30_000);
+        accumulator.update(Measurement::new(13.0), 50_000);
+        idx.append_precompute(7, BTreeMap::new(), (0, 60_000), Box::new(accumulator));
+
+        let entry = control_plane::query_plan::QueryPlanEntry {
+            query_id: "q-rate".into(),
+            canonical_promql: "rate(requests_total[1m])".into(),
+            root: control_plane::query_plan::QueryNodeId(0),
+            nodes: BTreeMap::from([
+                (
+                    control_plane::query_plan::QueryNodeId(0),
+                    QueryPlanNode::ExactReadout {
+                        input: control_plane::query_plan::QueryNodeId(1),
+                        readout: control_plane::query_plan::ExactReadout::Rate,
+                    },
+                ),
+                (
+                    control_plane::query_plan::QueryNodeId(1),
+                    QueryPlanNode::ReadMaterialization {
+                        binding: control_plane::query_plan::MaterializationBinding {
+                            materialization: policy,
+                            metric: "requests_total".into(),
+                            sid_grouping: vec![],
+                            output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
+                            window_ms: 60_000,
+                        },
+                    },
+                ),
+            ]),
+            instant: control_plane::query_plan::InstantExecution {
+                lookback_ms: 60_000,
+                full_history: false,
+                cumulative_readout: true,
+            },
+            fallback: control_plane::query_plan::FallbackPolicy::ExactBackend,
+        };
+        let outcome = execute_query_plan_readout(&idx, &entry, 0, 60_000, true)
+            .expect("execute exact rate DAG");
+        let value = outcome.series[0].1[0].1;
+        assert!((value - 0.575).abs() < 1e-12, "reset-aware rate={value}");
     }
 }

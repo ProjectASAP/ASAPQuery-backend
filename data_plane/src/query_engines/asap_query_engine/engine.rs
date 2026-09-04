@@ -339,21 +339,10 @@ impl ASAPQueryEngine {
     /// `handle_range_query_promql` returns `None`.
     ///
     /// Time semantics follow Prometheus's
-    /// `/api/v1/query_range?start&end&step` spec: the result is a
-    /// `matrix` (one row per series, each row carrying multiple
-    /// (timestamp, value) samples). The warm-tier reducer naturally
-    /// produces one sample per window_close in `[start, end]`, so
-    /// the matrix is sampled at the underlying aggregation's window
-    /// boundaries — typically a finer grid than the user's `step`
-    /// when window_size < step. (The Prometheus spec says
-    /// evaluate at each step `t = start, start+step, …, end`; the
-    /// warm tier returns at native window-close granularity instead.
-    /// This is more data, not less — clients that expect exact step
-    /// timestamps can downsample, or route step-precise queries to
-    /// the cold tier via the EngineRouter.)
-    ///
-    /// `step` is currently accepted for API compatibility but unused
-    /// — see the granularity-mismatch note above.
+    /// `/api/v1/query_range?start&end&step` contract: the immutable
+    /// QueryPlan is evaluated independently at `start + n*step`, and
+    /// the result contains exactly those timestamps. Native summary
+    /// pane boundaries are an internal detail and never become API steps.
     pub async fn execute_range_promql_modern(
         &self,
         query: &str,
@@ -379,12 +368,12 @@ impl ASAPQueryEngine {
                         physical_plan.backend_plan.plan_version,
                         readiness_requirement(query_entry),
                     ));
-                    crate::query_engines::asap_query_engine::live_serve::serve_from_query_plan(
+                    crate::query_engines::asap_query_engine::live_serve::serve_range_steps_from_query_plan(
                         idx,
                         query_entry,
                         start_ms,
                         end_ms,
-                        false,
+                        step_ms,
                     )
                 }
                 Err(reason) => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(reason.to_string())),
@@ -658,15 +647,24 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         query: &str,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.execute_at(query, now_ms).await
+    }
+
+    async fn execute_at(
+        &self,
+        query: &str,
+        now_ms: u64,
+    ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
+    {
         // One authoritative warm path: ASAPPlanner post-ASAP DAG →
         // BackendPlan/materialization resolver → SID lookup → DAG executor.
         // A typed resolver/executor error becomes CapabilityMiss, which lets
         // EngineRouter continue to the archive backend.
         if let Some(idx) = self.sketch_index.as_ref() {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
             let physical_plan = self.physical_plan_snapshot();
             let mut readiness = None;
             let planned = match physical_plan.as_ref() {

@@ -241,6 +241,10 @@ pub enum QueryPlanNode {
         input: QueryNodeId,
         query: QueryReadout,
     },
+    ExactReadout {
+        input: QueryNodeId,
+        readout: ExactReadout,
+    },
     SummaryMerge {
         inputs: Vec<QueryNodeId>,
     },
@@ -253,10 +257,20 @@ impl QueryPlanNode {
     pub fn inputs(&self) -> &[QueryNodeId] {
         match self {
             Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => &[],
-            Self::SummaryEstimate { input, .. } => std::slice::from_ref(input),
+            Self::SummaryEstimate { input, .. } | Self::ExactReadout { input, .. } => {
+                std::slice::from_ref(input)
+            }
             Self::SummaryMerge { inputs } => inputs,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExactReadout {
+    Sum,
+    Increase,
+    Rate,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -325,19 +339,24 @@ where
                 reduction,
                 child,
                 ..
-            } => {
-                if !matches!(
-                    family,
-                    SummaryFamilyType::ExactAggregate(..) | SummaryFamilyType::Sketch(..)
-                ) {
-                    return Err(QueryPlanError::UnsupportedNode(format!(
-                        "summary family {family:?}"
-                    )));
+            } => match family {
+                SummaryFamilyType::ExactAggregate(..) | SummaryFamilyType::Sketch(..) => {
+                    let mut binding = (self.bind)(node, family)?;
+                    binding.output_grouping = physical_grouping(reduction, child)?;
+                    if let Some(readout) = exact_readout(family) {
+                        let input = QueryNodeId(self.next_id);
+                        self.next_id += 1;
+                        self.nodes
+                            .insert(input, QueryPlanNode::ReadMaterialization { binding });
+                        QueryPlanNode::ExactReadout { input, readout }
+                    } else {
+                        QueryPlanNode::ReadMaterialization { binding }
+                    }
                 }
-                let mut binding = (self.bind)(node, family)?;
-                binding.output_grouping = physical_grouping(reduction, child)?;
-                QueryPlanNode::ReadMaterialization { binding }
-            }
+                other => QueryPlanNode::ExactFallback {
+                    reason: format!("summary family {other:?} is not executable by the warm tier"),
+                },
+            },
             SummaryExpr::SummaryEstimate {
                 summary_input,
                 query,
@@ -371,6 +390,16 @@ where
         };
         self.nodes.insert(id, physical);
         Ok(id)
+    }
+}
+
+fn exact_readout(family: &SummaryFamilyType) -> Option<ExactReadout> {
+    use planner_types::post_asap::ExactKind;
+    match family {
+        SummaryFamilyType::ExactAggregate(ExactKind::Sum, _) => Some(ExactReadout::Sum),
+        SummaryFamilyType::ExactAggregate(ExactKind::Increase, _) => Some(ExactReadout::Increase),
+        SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => Some(ExactReadout::Rate),
+        _ => None,
     }
 }
 

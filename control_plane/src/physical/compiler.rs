@@ -1713,13 +1713,14 @@ impl PhysicalCompiler {
             for (ordinal, selected) in selected.into_iter().enumerate() {
                 let metric = selected.metric.clone();
                 let aggregation_id = format!("{}:{ordinal}:{}", query.query_id, metric);
+                // Rate is a readout over the same reset-aware counter state
+                // as Increase. Keep that semantic distinction in QueryPlan,
+                // while the physical store binds both to Increase state.
+                let physical_family = physical_materialization_family(&selected.family);
                 let aggregation = BackendAggregation {
                     aggregation_id: aggregation_id.clone(),
                     metric_name: metric.clone(),
-                    family: SummaryFamilyType::Sketch(
-                        selected.kind.clone(),
-                        planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
-                    ),
+                    family: physical_family,
                     window_secs: query.window_secs,
                     spatial_filter: String::new(),
                     grouping: query.group_by.clone(),
@@ -1756,16 +1757,18 @@ impl PhysicalCompiler {
                     }
                 }
                 aggregations.push(aggregation);
-                readouts.push(BackendReadout {
-                    aggregation_id,
-                    op: selected.readout.clone(),
-                });
+                if let Some(readout) = selected.readout.clone() {
+                    readouts.push(BackendReadout {
+                        aggregation_id,
+                        op: readout,
+                    });
+                }
                 collector_materializations.push(CollectorMaterialization {
                     query_id: query.query_id.clone(),
                     materialization,
                     metric: metric.clone(),
-                    algorithm: format!("{:?}", selected.kind.algorithm()).to_ascii_lowercase(),
-                    parameters: sketch_params_json(&selected.params),
+                    algorithm: selected.algorithm,
+                    parameters: selected.parameters,
                     group_by: query.group_by.clone(),
                     window_secs: query.window_secs,
                     abstract_window_framework: planner_selection.window_framework.clone(),
@@ -1909,7 +1912,7 @@ impl PhysicalCompiler {
                                 fingerprint.0
                             ))
                         })?;
-                    if &materialization.family != node_family
+                    if materialization.family != physical_materialization_family(node_family)
                         || materialization.window.size_ms != query.window_secs.saturating_mul(1_000)
                         || materialization.group_by != query.group_by
                     {
@@ -2264,12 +2267,13 @@ fn select_lifecycle(
     })
 }
 
-struct SelectedSketch {
+struct SelectedMaterialization {
     node_identity: usize,
     metric: String,
-    kind: planner_types::post_asap::SketchKind,
-    params: planner_types::post_asap::SketchParams,
-    readout: SketchQuery,
+    family: SummaryFamilyType,
+    readout: Option<SketchQuery>,
+    algorithm: String,
+    parameters: Value,
 }
 
 /// Collect every executable materialization leaf in the selected post-ASAP
@@ -2280,11 +2284,11 @@ struct SelectedSketch {
 /// fallback node and no unused warm state is provisioned.
 fn collect_selected_materializations(
     node: &Rc<SummaryNode>,
-) -> Result<Vec<SelectedSketch>, String> {
+) -> Result<Vec<SelectedMaterialization>, String> {
     fn walk(
         node: &Rc<SummaryNode>,
         readout: Option<&SketchQuery>,
-        selected: &mut Vec<SelectedSketch>,
+        selected: &mut Vec<SelectedMaterialization>,
     ) -> Result<(), String> {
         match &node.expr {
             SummaryExpr::SummaryEstimate {
@@ -2304,14 +2308,34 @@ fn collect_selected_materializations(
                     let metric = summary_agg_metric(node).ok_or_else(|| {
                         "SummaryAgg has no unique time-series source in post-ASAP IR".to_string()
                     })?;
-                    selected.push(SelectedSketch {
+                    selected.push(SelectedMaterialization {
                         node_identity: Rc::as_ptr(node) as usize,
                         metric,
-                        kind: kind.clone(),
-                        params: kind.params().clone(),
-                        readout: readout.clone(),
+                        family: SummaryFamilyType::Sketch(
+                            kind.clone(),
+                            planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
+                        ),
+                        readout: Some(readout.clone()),
+                        algorithm: format!("{:?}", kind.algorithm()).to_ascii_lowercase(),
+                        parameters: sketch_params_json(kind.params()),
                     });
                 }
+            }
+            SummaryExpr::SummaryAgg {
+                family: SummaryFamilyType::ExactAggregate(kind, params),
+                ..
+            } => {
+                let metric = summary_agg_metric(node).ok_or_else(|| {
+                    "SummaryAgg has no unique time-series source in post-ASAP IR".to_string()
+                })?;
+                selected.push(SelectedMaterialization {
+                    node_identity: Rc::as_ptr(node) as usize,
+                    metric,
+                    family: SummaryFamilyType::ExactAggregate(kind.clone(), params.clone()),
+                    readout: None,
+                    algorithm: format!("{kind:?}").to_ascii_lowercase(),
+                    parameters: Value::Object(Default::default()),
+                });
             }
             SummaryExpr::KeepPreAsap(_)
             | SummaryExpr::SummaryAgg { .. }
@@ -2325,6 +2349,18 @@ fn collect_selected_materializations(
     let mut selected = Vec::new();
     walk(node, None, &mut selected)?;
     Ok(selected)
+}
+
+fn physical_materialization_family(family: &SummaryFamilyType) -> SummaryFamilyType {
+    match family {
+        SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Rate, _) => {
+            SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Increase,
+                planner_types::post_asap::ExactParams::Increase,
+            )
+        }
+        _ => family.clone(),
+    }
 }
 
 fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
@@ -2686,6 +2722,53 @@ mod tests {
         assert!(bundle.precompute_plan.producers.is_empty());
         assert_eq!(bundle.query_plan.entries.len(), 1);
         assert_eq!(bundle.envelope.planner_revision, PLANNER_REVISION);
+    }
+
+    #[test]
+    fn backend_local_compiler_materializes_declared_exact_promql_cases() {
+        for (query_id, promql, expected_readout) in [
+            (
+                "q-rate",
+                "rate(m[1m])",
+                crate::query_plan::ExactReadout::Rate,
+            ),
+            (
+                "q-increase",
+                "increase(m[1m])",
+                crate::query_plan::ExactReadout::Increase,
+            ),
+            (
+                "q-sum",
+                "sum_over_time(m[1m])",
+                crate::query_plan::ExactReadout::Sum,
+            ),
+        ] {
+            let mut deployment = environment(10_000);
+            deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+            deployment.collector_ids.clear();
+            let plan = PhysicalCompiler
+                .compile(request(query_id, promql), deployment)
+                .unwrap_or_else(|error| panic!("{promql} must compile: {error}"));
+            assert_eq!(plan.backend_plan.materializations.len(), 1, "{promql}");
+            assert_eq!(plan.query_plan.entries.len(), 1, "{promql}");
+            assert!(plan.collector_plans.is_empty(), "{promql}");
+            let entry = plan.query_plan.entries.values().next().unwrap();
+            assert!(matches!(
+                entry.nodes.get(&entry.root),
+                Some(crate::query_plan::QueryPlanNode::ExactReadout { readout, .. })
+                    if *readout == expected_readout
+            ));
+            if expected_readout == crate::query_plan::ExactReadout::Rate {
+                let materialization = plan.backend_plan.materializations.values().next().unwrap();
+                assert_eq!(
+                    materialization.family,
+                    SummaryFamilyType::ExactAggregate(
+                        planner_types::post_asap::ExactKind::Increase,
+                        planner_types::post_asap::ExactParams::Increase,
+                    )
+                );
+            }
+        }
     }
 
     #[test]

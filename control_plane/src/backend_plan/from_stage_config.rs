@@ -77,7 +77,36 @@ pub fn from_stage_config(
         );
     }
 
-    let mut routing = Vec::with_capacity(cfg.readouts.len());
+    // Exact aggregates are already finalized by their accumulator and do not
+    // have a SketchQuery readout node. Their warm route therefore comes from
+    // the physical aggregation itself; approximate routes remain readout-
+    // driven below.
+    let mut routing = cfg
+        .aggregations
+        .iter()
+        .filter_map(|agg| {
+            let planner_types::post_asap::SummaryFamilyType::ExactAggregate(kind, _) = &agg.family
+            else {
+                return None;
+            };
+            let fingerprint = *fingerprint_by_agg_id.get(agg.aggregation_id.as_str())?;
+            let agg_type = match kind {
+                planner_types::post_asap::ExactKind::Sum
+                | planner_types::post_asap::ExactKind::Count => asap_types::AggregationType::Sum,
+                planner_types::post_asap::ExactKind::MinMax => asap_types::AggregationType::MinMax,
+                planner_types::post_asap::ExactKind::Increase
+                | planner_types::post_asap::ExactKind::Rate => {
+                    asap_types::AggregationType::Increase
+                }
+            };
+            Some(RoutingEntry {
+                satisfies: Capability::ExactAgg(agg_type),
+                materialization: fingerprint,
+                storage_backend: StorageBackend::SketchStore,
+            })
+        })
+        .collect::<Vec<_>>();
+    routing.reserve(cfg.readouts.len());
     for readout in &cfg.readouts {
         let Some(&fingerprint) = fingerprint_by_agg_id.get(readout.aggregation_id.as_str()) else {
             // Orphan readout (no matching aggregation in this cycle's
@@ -94,11 +123,14 @@ pub fn from_stage_config(
             continue;
         };
         let satisfies = capability_for_readout(agg, &readout.op)?;
-        routing.push(RoutingEntry {
+        let route = RoutingEntry {
             satisfies,
             materialization: fingerprint,
             storage_backend: StorageBackend::SketchStore,
-        });
+        };
+        if !routing.contains(&route) {
+            routing.push(route);
+        }
     }
 
     let plan_monitors = monitors
