@@ -251,7 +251,7 @@ fn execute_physical_query_plan(
         },
     };
     let output = physical_dag::execute(entry, &runtime)
-        .map_err(|error| LoweringSkip::ExecuteFailed(error.to_string()))?;
+        .map_err(|error| LoweringSkip::ExecuteFailed(format!("{error:?}")))?;
     match output {
         PhysicalQueryOutput::Value(values) => {
             let mut coverage = None;

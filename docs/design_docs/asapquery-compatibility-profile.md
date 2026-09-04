@@ -1,6 +1,6 @@
 # ASAPQuery compatibility profile
 
-> Status: proposed MVP architecture and implementation contract
+> Status: implemented by the compatibility stack (pending merge)
 >
 > Reference: [ProjectASAP/ASAPQuery at `9fb051a`](https://github.com/ProjectASAP/ASAPQuery/tree/9fb051aa798361fca8e3012835412cb6fa338a0c)
 >
@@ -15,10 +15,8 @@ external collectors, accept materialized summaries over modified OTLP, use
 multiple storage tiers, and compile distributed physical plans. This profile
 does not remove those capabilities. It defines the target configuration required
 for ASAPQuery-compatible behavior and gives that configuration an independent
-end-to-end acceptance target. It is not yet a strict subset of the implemented
-runtime because Remote Write ingestion must first be restored as an optional
-backend component. After that work lands, selecting this profile is a strict
-configuration subset of the broader product.
+end-to-end acceptance target. Selecting `--profile asapquery` is now a strict,
+startup-validated subset of the broader runtime.
 
 The user-visible goal is the same drop-in shape as ASAPQuery:
 
@@ -98,18 +96,20 @@ configured QueryWorkload + DataWorkload
                     │
                     ▼
       backend-only physical compiler
-             │              │
-             ▼              ▼
-       PrecomputePlan   BackendPlan
-             │              │
-             ▼              ▼
-        precompute     store + query router
+        │          │          │
+        ▼          ▼          ▼
+ PrecomputePlan BackendPlan QueryPlan DAG
+        │          │          │
+        ▼          ▼          ▼
+   precompute    catalog   SID-bound executor
 ```
 
-The plan has no collector projection. One compile produces a backend-local
-`PrecomputePlan` and `BackendPlan` from the same selected Post-ASAP candidate.
-`PrecomputePlan` is an internal typed projection/section of `BackendPlan`, not a
-separately published protocol. They share plan and materialization identities.
+The plan has no collector projection. One compile produces an atomic
+`PhysicalPlan` containing sibling backend-local `PrecomputePlan`, `BackendPlan`,
+and `QueryPlan` sections from the same selected Post-ASAP candidate.
+`PrecomputePlan` directly is the runtime precompute contract; there is no second
+streaming-config semantic model or lossy conversion step. All sections share
+plan and materialization identities.
 One immutable version installs the precompute configuration, store catalog, and
 inactive query routes atomically. Materialization readiness is runtime state:
 each route becomes eligible for summary serving only after its required windows
@@ -139,8 +139,8 @@ For the first MVP, operators provide immutable `QueryWorkload` and
    `DataWorkload`;
 3. enumerates only backend-local implementations for Planner candidates;
 4. returns implementation-cost evidence needed for selection;
-5. compiles the selected candidate into matching PrecomputePlan and BackendPlan
-   views; and
+5. compiles the selected candidate into matching PrecomputePlan, BackendPlan,
+   and QueryPlan views; and
 6. stages and atomically activates those views.
 
 It does not enumerate SDK or Collector placements in this profile. A Planner
@@ -245,7 +245,8 @@ and `timeout`, plus configured tenant and authorization context; it does not
 require byte-for-byte reproduction of the incoming HTTP request. Routing has two
 successful outcomes:
 
-1. execute the active BackendPlan readout when compatible summary state has
+1. execute the active QueryPlan DAG, whose materialization bindings were
+   resolved from BackendPlan, when compatible summary state has
    complete and fresh coverage; or
 2. forward a semantically equivalent request to the configured Prometheus
    endpoint.
@@ -272,7 +273,7 @@ start backend
   -> verify Prometheus fallback health
   -> load configured QueryWorkload and DataWorkload snapshots
   -> run Planner candidate search and selection
-  -> compile PrecomputePlan + BackendPlan
+  -> compile one PhysicalPlan (PrecomputePlan + BackendPlan + QueryPlan)
   -> atomically install precompute + catalog + inactive routes under one version
   -> accept Remote Write and forward every query to Prometheus
   -> enter Materializing state
@@ -297,40 +298,34 @@ same atomic cutover and warmup rules.
 | --- | --- | --- |
 | Ingest source | Prometheus Remote Write raw samples | Collector materializations over modified OTLP and other explicit profiles |
 | Summary construction | Backend-local only | Collector or backend placement |
-| Physical outputs | PrecomputePlan + BackendPlan | SDKPlan/CollectorPlan/TransmissionPlan/BackendPlan views as applicable |
+| Physical outputs | PrecomputePlan + BackendPlan + QueryPlan | CollectorPlan/PrecomputePlan/TransmissionPlan/BackendPlan/QueryPlan views as applicable |
 | Query protocol | Prometheus HTTP / PromQL | Additional protocols may be supported |
 | Exact fallback | Upstream Prometheus | Prometheus or another compiled storage/query route |
 | Storage required for MVP | In-process warm summary state | Warm, durable, archive, and remote tiers |
 | Sampling and delta | Disabled | Optional physical mechanisms |
 
-This table describes the intended product boundary, not the current
-implementation state. The compatibility profile is a restricted target profile,
-but it is not a strict subset of the backend executable today because some of
-its required adapters were removed. Once those adapters are restored behind the
-explicit profile, every enabled component belongs to ASAPQuery-backend and the
-selected runtime configuration is a strict subset of the broader product.
+The compatibility profile is a restricted runtime configuration. Every enabled
+component belongs to ASAPQuery-backend; broader distributed features remain
+available only outside this profile.
 
 The profile is also not a literal subset of historical ASAPQuery internals. It
 preserves the relevant external behavior while adding the current canonical
 ASAPPlanner types, versioned physical compilation, readiness evidence, and
 stronger activation and retry contracts.
 
-## Current implementation gap
+## Implementation status
 
-Against ASAPQuery-backend
-[`d1498fd`](https://github.com/ProjectASAP/ASAPQuery-backend/tree/d1498fd191b5f782e743c2d0f27a382b5c69f432):
-
-| Area | Reusable today | Required change |
+| Area | Implemented contract | Executable evidence |
 | --- | --- | --- |
-| Prometheus query adapter and fallback client | Present | Bind them to the compatibility profile and its BackendPlan readiness checks. |
-| Streaming precompute workers and accumulators | Present, with substantial divergence and newer backend fixes | Complete the ASAPQuery bug-fix parity audit, migrate applicable fixes with regression tests, and explicitly reject fixes for intentionally retired features. The known missing active-ingest wall-clock fix must measure pane idleness from last touch rather than pane creation. Then admit raw Remote Write samples through a dedicated adapter and add Prometheus semantic conformance coverage. |
-| Hot-reload plan/store/query snapshots | Partial | Install PrecomputePlan and BackendPlan as one atomic version. |
-| Prometheus Remote Write decoder/listener | Removed from the current backend path | Restore the narrow v1 adapter from the reference behavior without restoring other legacy connectors. Preserve stale-marker semantics and retry-safe batch application. |
-| Workload input | Canonical Planner integration is present | Load deterministic `QueryWorkload` and `DataWorkload` snapshots at startup; online observation is optional after the MVP. |
-| Collector/OTLP path | Present in the broader product | Disable it in this profile; do not make it a test or startup dependency. |
-| Compatibility E2E | Missing | Add a Prometheus + backend + synthetic writer/query test and demo. |
+| Startup/profile | Collector-free startup, excluded-component validation, fallback health gate | `data_plane` profile tests and production-process E2E |
+| Physical planning | Canonical workload snapshot to one atomic PrecomputePlan/BackendPlan/QueryPlan bundle | `compatibility_demo_snapshot_compiles_the_complete_query_matrix` |
+| Remote Write | Strict v1 decoding, stale handling, limits, retry-safe deduplication and backpressure | receiver unit tests plus process E2E replay/corrupt-batch assertions |
+| Precompute/store | Raw samples use the planned family; first catch-up batches close all complete windows; sketch and exact payloads share canonical SID semantics | worker/store tests and four-family process matrix |
+| Query execution | QueryPlan-only serving-time lookup, node-level materialization binding, generic DAG traversal, exact fallback | instant/range process matrix and fallback request capture |
+| Atomic activation | Versioned stage/activate snapshot and materialization readiness state | physical-plan endpoint tests and `/physical-plan/status` assertions |
+| Real deployment | Prometheus remote_write with no Collector | `./scripts/e2e.sh asapquery-demo` |
 
-## Phased implementation
+## Implemented phases
 
 ### Phase A: profile and startup contract
 
@@ -357,12 +352,13 @@ overloaded requests cannot leave untracked mutations while returning success.
 ### Phase C: backend-only planning
 
 Load the configured query and data workload snapshots, call the pinned
-ASAPPlanner, enumerate backend-local implementations, and compile one
-PrecomputePlan plus BackendPlan. Do not create or wait for CollectorPlan.
+ASAPPlanner, enumerate backend-local implementations, and compile one atomic
+PhysicalPlan with PrecomputePlan, BackendPlan, and QueryPlan. Do not create or
+wait for CollectorPlan.
 
 Acceptance: captured Planner input, selected Post-ASAP candidate,
-PrecomputePlan, and BackendPlan are deterministic golden artifacts with matching
-plan/materialization/window/family/parameter identities.
+PrecomputePlan, BackendPlan, and QueryPlan are deterministic golden artifacts
+with matching plan/materialization/window/family/parameter identities.
 
 ### Phase D: atomic activation and warmup
 
@@ -389,8 +385,9 @@ are equivalent to direct Prometheus calls.
 
 ### Phase F: compatibility demo
 
-Run Prometheus with `remote_write` configured to the backend, start the backend
-with fixed workload snapshots, send their corresponding repeating queries
+`./scripts/e2e.sh asapquery-demo` runs Prometheus with `remote_write` configured
+to the backend, starts the backend with fixed workload snapshots, sends their
+corresponding repeating queries
 through the backend, wait for planning and warmup, and capture route decisions
 and resource measurements.
 
@@ -437,8 +434,13 @@ dependencies of the Remote Write profile.
 
 ## MVP completion criterion
 
-The profile is complete when a clean checkout can run one documented command
-that starts Prometheus and ASAPQuery-backend without ASAPCollector, ingests only
+The executable completion command is:
+
+```bash
+./scripts/e2e.sh asapquery-demo
+```
+
+It starts Prometheus and ASAPQuery-backend without ASAPCollector, ingests only
 through Prometheus Remote Write, plans from the configured workloads, activates a
 backend-local summary, serves both the declared sum and sketch-backed quantile
 compatibility cases plus Prometheus `rate` and `increase` through both instant

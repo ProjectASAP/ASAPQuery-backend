@@ -749,6 +749,22 @@ async fn process_query_request(
 /// single-target metrics keep their original semantics — every shape
 /// resolves to the one configured backend.
 fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> StorageBackend {
+    // A non-bootstrap atomic PhysicalPlan owns routing. Every request first
+    // enters the ASAP engine, where QueryPlan lookup either executes its
+    // compiler-bound DAG or returns an explicit fallback reason. Consulting
+    // the legacy shape/SID candidate heuristics here would bypass QueryPlan
+    // (and can also discard the request's explicit evaluation timestamp).
+    if state.active_physical_plan.as_ref().is_some_and(|active| {
+        let snapshot = active.snapshot();
+        snapshot.query_plan.plan_id != 0 && !snapshot.query_plan.entries.is_empty()
+    }) {
+        debug!(
+            tenant,
+            query, "resolve_metric_storage: active QueryPlan owns warm/fallback routing"
+        );
+        return StorageBackend::SketchStore;
+    }
+
     if let Some(routing_handle) = state.backend_storage_routing.as_ref() {
         // Phase α: snapshot the hot-reload handle once per request,
         // scoped to this request's tenant. The snapshot resolves to
@@ -1197,11 +1213,10 @@ async fn process_via_simple_engine(
                 Err(status) => status.into_response(),
             }
         }
-        Err(_) => {
+        Err(error) => {
             debug!(
-                "Modern execute() returned CapabilityMiss for query='{}', \
-                 falling through to fallback / unsupported",
-                parsed_request.query
+                "Modern execute() returned {error} for query='{}', falling through to fallback / unsupported",
+                parsed_request.query,
             );
             let total_duration = start_time.elapsed();
             debug!(
@@ -1971,7 +1986,7 @@ async fn process_range_query_request(
 
     let router_result = state
         .query_router
-        .execute_range_for_tier(
+        .execute_range_for_tier_routed(
             &parsed_request.query,
             stat,
             accuracy,
@@ -1984,7 +1999,7 @@ async fn process_range_query_request(
         .await;
 
     match router_result {
-        Ok(query_result) => {
+        Ok((query_result, data_source_id)) => {
             let query_duration = query_start_time.elapsed();
             debug!(
                 "EngineRouter range dispatch took: {:.2}ms",
@@ -2003,7 +2018,9 @@ async fn process_range_query_request(
                 )
                 .await
             {
-                Ok(response) => response.into_response(),
+                Ok(response) => {
+                    annotate_data_source(response.into_response(), data_source_id).await
+                }
                 Err(status) => status.into_response(),
             }
         }

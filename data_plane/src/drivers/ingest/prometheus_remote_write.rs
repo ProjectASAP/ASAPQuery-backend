@@ -461,13 +461,7 @@ fn route_messages(
                 })
                 .collect();
             let attrs_fp = super::canonical_attrs_fingerprint(&grouping_pairs);
-            let agg_kind = crate::storage_engines::sketch_db::data::AggKind::ExactAgg {
-                agg_type: config.aggregation_type,
-                parameters_canonical: crate::storage_engines::sketch_db::data::canonical_parameters(
-                    &config.parameters,
-                ),
-                spatial_filter_canonical: config.spatial_filter_normalized.clone(),
-            };
+            let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(config);
             let sid = ingest.series_resolver.resolve(
                 &config.metric,
                 &attrs_fp,

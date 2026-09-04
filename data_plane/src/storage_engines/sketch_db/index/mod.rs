@@ -1855,16 +1855,7 @@ impl SketchStore {
         // samples by sid up-front) skip the resolver round-trip by
         // invoking the sid-direct sibling.
         let (attrs_fp, _label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
-        let agg_kind = AggKind::ExactAgg {
-            agg_type: agg_cfg.aggregation_type,
-            parameters_canonical: canonical_parameters(&agg_cfg.parameters),
-            // The canonical spatial-filter participates in sid identity
-            // so filter-distinct policies don't collide on the same
-            // (metric, attrs, agg_kind) tuple. `spatial_filter_normalized`
-            // is the canonicalized form produced by
-            // `asap_types::utils::normalize_spatial_filter`.
-            spatial_filter_canonical: agg_cfg.spatial_filter_normalized.clone(),
-        };
+        let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg);
         // Sid mint delegated to the caller's closure — typically
         // `|m, fp, ak| series_resolver.resolve(m, fp, ak)`. Keeps the
         // SketchStore free of any layer-inverted dependency on the
@@ -1899,11 +1890,8 @@ impl SketchStore {
     ) -> Option<u64> {
         let (_attrs_fp, label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
         let key_names = &agg_cfg.grouping_labels.labels;
-        let agg_kind = AggKind::ExactAgg {
-            agg_type: agg_cfg.aggregation_type,
-            parameters_canonical: canonical_parameters(&agg_cfg.parameters),
-            spatial_filter_canonical: agg_cfg.spatial_filter_normalized.clone(),
-        };
+        let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg);
+        let (capability, accuracy) = agg_kind.capability_and_accuracy();
 
         match self.instance(sid) {
             None => {
@@ -1920,9 +1908,9 @@ impl SketchStore {
                     sid,
                     metric_name: agg_cfg.metric.clone(),
                     group_by_keys,
-                    capability: Some(Capability::ExactAgg(agg_cfg.aggregation_type)),
+                    capability: Some(capability),
                     agg_kind,
-                    accuracy: None,
+                    accuracy,
                     first_seen_unix_ms: output.start_timestamp as i64,
                     retired_at_ms: None,
                     expires_at_ms: None,
@@ -1941,12 +1929,23 @@ impl SketchStore {
         }
 
         let window = (output.start_timestamp, output.end_timestamp);
-        self.append_precompute(
-            sid,
-            label_values_map,
-            window,
-            accumulator.clone_boxed_core(),
-        );
+        match crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg) {
+            AggKind::Sketch { .. } => self.append_sample(
+                sid,
+                label_values_map,
+                window,
+                SketchSampleState {
+                    bytes: accumulator.serialize_to_bytes(),
+                    encoding: SketchEncoding::MsgpackFull,
+                },
+            ),
+            AggKind::ExactAgg { .. } => self.append_precompute(
+                sid,
+                label_values_map,
+                window,
+                accumulator.clone_boxed_core(),
+            ),
+        }
         Some(sid)
     }
 

@@ -1,0 +1,16 @@
+global:
+  scrape_interval: 1s
+  evaluation_interval: 1s
+
+scrape_configs:
+  - job_name: asapquery-demo-source
+    honor_labels: true
+    static_configs:
+      - targets: ["127.0.0.1:19092"]
+
+remote_write:
+  - url: http://127.0.0.1:19091/api/v1/write
+    queue_config:
+      min_shards: 1
+      max_shards: 1
+      batch_send_deadline: 1s

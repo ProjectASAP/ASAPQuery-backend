@@ -128,6 +128,101 @@ pub enum AggKind {
     },
 }
 
+/// Resolve the physical state family produced by a precompute policy. This is
+/// shared by SID minting and store registration so a sketch policy can never
+/// be minted as `ExactAgg` and later registered as `Sketch` (or vice versa).
+pub fn agg_kind_for_config(config: &asap_types::aggregation_config::AggregationConfig) -> AggKind {
+    use asap_types::{SummaryKind, SummaryParams};
+
+    let sketch = config.accumulator_spec().ok().and_then(|spec| {
+        let (kind, physical) = match (spec.kind, spec.params) {
+            (SummaryKind::DDSketch, SummaryParams::DDSketch { alpha }) => (
+                SketchKindHandle::DDSketch,
+                SketchConfig::DDSketch {
+                    relative_accuracy: alpha,
+                },
+            ),
+            (SummaryKind::Kll, SummaryParams::Kll { k }) => {
+                (SketchKindHandle::Kll, SketchConfig::Kll { k })
+            }
+            (SummaryKind::Hll, SummaryParams::Hll { precision }) => (
+                SketchKindHandle::Hll,
+                SketchConfig::Hll {
+                    precision: precision.into(),
+                },
+            ),
+            (SummaryKind::Cms, SummaryParams::Cms { width, depth }) => (
+                SketchKindHandle::CountMin,
+                SketchConfig::CountMin {
+                    rows: depth as i32,
+                    cols: width as i32,
+                },
+            ),
+            (SummaryKind::CmsWithHeap, SummaryParams::CmsWithHeap { width, depth, .. }) => (
+                SketchKindHandle::CmsWithHeap,
+                SketchConfig::CountMin {
+                    rows: depth as i32,
+                    cols: width as i32,
+                },
+            ),
+            (SummaryKind::CountSketch, SummaryParams::CountSketch { width, depth }) => (
+                SketchKindHandle::CountSketch,
+                SketchConfig::CountSketch {
+                    rows: depth as i32,
+                    cols: width as i32,
+                },
+            ),
+            (
+                SummaryKind::CountSketchWithHeap,
+                SummaryParams::CountSketchWithHeap { width, depth, .. },
+            ) => (
+                SketchKindHandle::CountSketchWithHeap,
+                SketchConfig::CountSketch {
+                    rows: depth as i32,
+                    cols: width as i32,
+                },
+            ),
+            _ => return None,
+        };
+        Some(AggKind::Sketch {
+            kind,
+            config: physical,
+            spatial_filter_canonical: config.spatial_filter_normalized.clone(),
+        })
+    });
+
+    sketch.unwrap_or_else(|| AggKind::ExactAgg {
+        agg_type: config.aggregation_type,
+        parameters_canonical: canonical_parameters(&config.parameters),
+        spatial_filter_canonical: config.spatial_filter_normalized.clone(),
+    })
+}
+
+impl AggKind {
+    /// Runtime query capability and accuracy metadata implied by this state.
+    pub fn capability_and_accuracy(&self) -> (Capability, Option<AccuracyBound>) {
+        match self {
+            Self::ExactAgg { agg_type, .. } => (Capability::ExactAgg(*agg_type), None),
+            Self::Sketch { kind, config, .. } => {
+                let capability = match kind {
+                    SketchKindHandle::DDSketch | SketchKindHandle::Kll => {
+                        Capability::QuantileApprox(*kind)
+                    }
+                    SketchKindHandle::Hll => Capability::CardinalityApprox,
+                    SketchKindHandle::CountMin | SketchKindHandle::CountSketch => {
+                        Capability::FrequencyEstimate(*kind)
+                    }
+                    SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
+                        Capability::FrequencyTopk(*kind)
+                    }
+                    SketchKindHandle::Any => Capability::QuantileApprox(*kind),
+                };
+                (capability, Some(AccuracyBound::from_config(config)))
+            }
+        }
+    }
+}
+
 /// Render a `HashMap<String, Value>` of parameters into the canonical
 /// string form `AggKind::ExactAgg::parameters_canonical` expects.
 /// Keys sorted lexicographically; each value via `serde_json`.

@@ -395,7 +395,15 @@ impl Worker {
         }
         let state = self.group_states.get_mut(&sid).unwrap();
 
-        // Find the max timestamp in this batch to advance the watermark
+        // Find the timestamp span in this batch. A first batch may contain
+        // several windows (Prometheus commonly sends catch-up samples after
+        // startup), so its minimum timestamp is also the initial closure
+        // scan boundary.
+        let batch_min_ts = samples
+            .iter()
+            .map(|(_, ts, _)| *ts)
+            .min()
+            .unwrap_or(i64::MIN);
         let batch_max_ts = samples
             .iter()
             .map(|(_, ts, _)| *ts)
@@ -475,9 +483,14 @@ impl Worker {
         }
 
         // Check for closed windows
+        let closure_scan_start = if previous_closure_watermark == i64::MIN {
+            batch_min_ts
+        } else {
+            previous_closure_watermark
+        };
         let closed = state
             .window_manager
-            .closed_windows(previous_closure_watermark, event_watermark);
+            .closed_windows(closure_scan_start, event_watermark);
 
         for window_start in &closed {
             let (_, window_end) = state.window_manager.window_bounds(*window_start);
@@ -2411,6 +2424,53 @@ aggregations:
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].0.start_timestamp, 0);
         assert_eq!(emitted[0].0.end_timestamp, 10_000);
+    }
+
+    #[test]
+    fn first_catch_up_batch_closes_every_complete_window() {
+        let config = make_agg_config(
+            1,
+            "cpu",
+            AggregationType::SingleSubpopulation,
+            "Sum",
+            5,
+            0,
+            vec![],
+        );
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker_with_lateness(
+            HashMap::from([(1, config)]),
+            sink.clone(),
+            false,
+            0,
+            LateDataPolicy::Drop,
+            0,
+        );
+
+        worker
+            .process_group_samples(
+                1,
+                PolicyFingerprint(1),
+                "",
+                group_samples(
+                    "cpu",
+                    vec![
+                        (500, 1.0),
+                        (4_200, 2.0),
+                        (5_400, 3.0),
+                        (9_400, 4.0),
+                        (10_500, 5.0),
+                    ],
+                ),
+            )
+            .unwrap();
+
+        let emitted = sink.drain();
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0].0.start_timestamp, 0);
+        assert_eq!(emitted[0].0.end_timestamp, 5_000);
+        assert_eq!(emitted[1].0.start_timestamp, 5_000);
+        assert_eq!(emitted[1].0.end_timestamp, 10_000);
     }
 
     #[test]
