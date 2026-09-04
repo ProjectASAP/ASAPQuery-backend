@@ -1,0 +1,79 @@
+{
+  "snapshot_version": 1,
+  "query_workload": {
+    "language": "prom_q_l",
+    "query_batch": null,
+    "repeating_queries": [
+      {
+        "query": "quantile_over_time(0.99, m[1m])",
+        "demand": { "fixed_interval": 10000 },
+        "requirements": {
+          "accuracy": {
+            "explicit": {
+              "EpsilonDelta": { "epsilon": 0.01, "delta": 0.01 }
+            }
+          },
+          "response_latency": "unspecified"
+        },
+        "predictability": { "predictable": { "known_at": null } },
+        "time_selection": {
+          "scope": "real_time",
+          "lookback": 60000,
+          "as_of": null
+        }
+      }
+    ],
+    "data_workload": {
+      "arrival": "continuously_ingesting",
+      "ingestion_volume": { "value": null, "source": "unknown", "observed_at_ms": null, "valid_for_ms": null },
+      "ingestion_rate": { "value": 100.0, "source": "declared", "observed_at_ms": null, "valid_for_ms": null },
+      "input_cardinality": { "value": null, "source": "unknown", "observed_at_ms": null, "valid_for_ms": null },
+      "distribution": { "value": null, "source": "unknown", "observed_at_ms": null, "valid_for_ms": null }
+    }
+  },
+  "data_workload": {
+    "arrival": "continuously_ingesting",
+    "ingestion_volume": { "value": null, "source": "unknown", "observed_at_ms": null, "valid_for_ms": null },
+    "ingestion_rate": { "value": 100.0, "source": "declared", "observed_at_ms": null, "valid_for_ms": null },
+    "input_cardinality": { "value": null, "source": "unknown", "observed_at_ms": null, "valid_for_ms": null },
+    "distribution": { "value": null, "source": "unknown", "observed_at_ms": null, "valid_for_ms": null }
+  },
+  "implementation": {
+    "lifecycle_costs": {
+      "build": 10.0,
+      "maintenance_per_update": 0.001,
+      "read": 0.1,
+      "retention_per_second": 0.001,
+      "retirement": 1.0
+    },
+    "evidence_observed_at_unix_ms": 9500,
+    "evidence_valid_for_ms": 60000,
+    "horizon_seconds": 300.0,
+    "window_implementation_id": "backend-tumbling-v1",
+    "state_layout": "anchored-pane-v1",
+    "implementation_cost": {
+      "model_version": "compat-cost-v1",
+      "workload_fingerprint": "replaced-with-canonical-promql",
+      "observed_at_unix_ms": 9500,
+      "valid_for_ms": 60000,
+      "horizon_seconds": 300.0,
+      "cpu_cost": 1.0,
+      "peak_memory_bytes": 1024,
+      "network_bytes": 0,
+      "storage_bytes": 512,
+      "source_scan_bytes": 0,
+      "weighted_cost": 1.0
+    }
+  },
+  "environment": {
+    "target": "backend_local_remote_write",
+    "collector_ids": [],
+    "capability_snapshot_id": "asapquery-local-v1",
+    "observed_at_unix_ms": 10000,
+    "max_evidence_age_ms": 60000,
+    "plan_version": 1,
+    "activation_unix_ms": 10000,
+    "expiry_unix_ms": null,
+    "backend_compat": "asap-query-backend.v1"
+  }
+}

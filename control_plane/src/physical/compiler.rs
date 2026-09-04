@@ -22,8 +22,8 @@ use planner_types::post_asap::{
 use planner_types::pre_asap::QueryExpr;
 use planner_types::workload::{
     AccuracyRequirement, DataArrival, DataWorkload, DurationMs, Evidence, EvidenceSource,
-    Predictability, Query, QueryLanguage, QueryRequirements, QueryTimeScope, QueryWorkload, Rate,
-    RepeatedDemand, RepeatingEntry, RepetitionInterval, TimeSelection,
+    Predictability, Query, QueryLanguage, QueryRecurrence, QueryRequirements, QueryTimeScope,
+    QueryWorkload, Rate, RepeatedDemand, RepeatingEntry, RepetitionInterval, TimeSelection,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -42,7 +42,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "739753e33e096c01faccca8e7a1e3da5ad3aab9c";
+pub const PLANNER_REVISION: &str = "cb50219c582d43f53ab77d3a595bd1ea4a9aa119";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
@@ -140,8 +140,10 @@ pub struct TopKMembershipEvidence {
     pub source: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DeploymentEnvironment {
+    pub target: PhysicalDeploymentTarget,
     pub collector_ids: Vec<String>,
     pub capability_snapshot_id: String,
     pub observed_at_unix_ms: u64,
@@ -150,6 +152,39 @@ pub struct DeploymentEnvironment {
     pub activation_unix_ms: u64,
     pub expiry_unix_ms: Option<u64>,
     pub backend_compat: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicalDeploymentTarget {
+    DistributedCollectors,
+    BackendLocalRemoteWrite,
+}
+
+/// Versioned startup input for the Collector-free compatibility profile.
+/// Query/data semantics use ASAPPlanner's canonical workload types directly;
+/// this wrapper adds only backend-owned implementation evidence and lifecycle
+/// identity required to choose a concrete physical realization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BackendLocalPlanningSnapshot {
+    pub snapshot_version: u32,
+    pub query_workload: QueryWorkload,
+    pub data_workload: DataWorkload,
+    pub implementation: BackendLocalImplementation,
+    pub environment: DeploymentEnvironment,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BackendLocalImplementation {
+    pub lifecycle_costs: LifecycleCostEvidence,
+    pub evidence_observed_at_unix_ms: u64,
+    pub evidence_valid_for_ms: u64,
+    pub horizon_seconds: f64,
+    pub window_implementation_id: String,
+    pub state_layout: String,
+    pub implementation_cost: ImplementationCostEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1418,6 +1453,8 @@ fn authorize_u64_change(
 
 #[derive(Debug, Error)]
 pub enum CompileError {
+    #[error("invalid backend-local workload snapshot: {0}")]
+    Snapshot(String),
     #[error("planner revision mismatch: request={request}, compiler={compiler}")]
     PlannerRevision {
         request: String,
@@ -1459,6 +1496,138 @@ impl AccuracyEvidenceProvider for QueryEvidence<'_> {
 #[derive(Debug, Default)]
 pub struct PhysicalCompiler;
 
+impl BackendLocalPlanningSnapshot {
+    /// Invoke the pinned Planner from canonical startup workloads and compile
+    /// one backend-local PhysicalPlan. No CollectorPlan is produced and no
+    /// precompiled serving artifact is accepted at this boundary.
+    pub fn compile(self) -> Result<PhysicalPlan, CompileError> {
+        if self.snapshot_version != 1 {
+            return Err(CompileError::Snapshot(format!(
+                "unsupported workload snapshot version {}",
+                self.snapshot_version
+            )));
+        }
+        if self.environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite {
+            return Err(CompileError::Snapshot(
+                "compatibility workload requires backend_local_remote_write target".into(),
+            ));
+        }
+        let mut workload = self.query_workload;
+        if let Some(embedded) = &workload.data_workload {
+            if embedded != &self.data_workload {
+                return Err(CompileError::Snapshot(
+                    "embedded and standalone DataWorkload snapshots disagree".into(),
+                ));
+            }
+        }
+        workload.data_workload = Some(self.data_workload.clone());
+        workload
+            .validate()
+            .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+        if workload.language != QueryLanguage::PromQL {
+            return Err(CompileError::Snapshot(
+                "ASAPQuery compatibility profile accepts PromQL workloads only".into(),
+            ));
+        }
+        let ingestion_rate = self
+            .data_workload
+            .ingestion_rate
+            .value_at(self.environment.observed_at_unix_ms)
+            .copied()
+            .ok_or_else(|| {
+                CompileError::Snapshot("DataWorkload requires fresh ingestion_rate evidence".into())
+            })?;
+        let entries = workload.entries().collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Err(CompileError::Snapshot(
+                "QueryWorkload must contain at least one query".into(),
+            ));
+        }
+        let mut queries = Vec::with_capacity(entries.len());
+        for (index, entry) in entries.into_iter().enumerate() {
+            let evaluation_interval_ms = match entry.recurrence {
+                QueryRecurrence::Repeated(RepeatedDemand::FixedInterval(interval)) => interval.0,
+                _ => {
+                    return Err(CompileError::Snapshot(format!(
+                        "query {index} must use fixed-interval repeated demand in the MVP profile"
+                    )))
+                }
+            };
+            let lookback_ms = entry
+                .time_selection
+                .lookback
+                .ok_or_else(|| {
+                    CompileError::Snapshot(format!("query {index} requires an explicit lookback"))
+                })?
+                .0;
+            if lookback_ms == 0 || lookback_ms % 1_000 != 0 {
+                return Err(CompileError::Snapshot(format!(
+                    "query {index} lookback must be a positive whole number of seconds"
+                )));
+            }
+            let accuracy = entry.requirements.accuracy.target();
+            let query_string = entry.query.0;
+            let parsed =
+                crate::query_parser::parse_query_expr_canonical(&query_string, accuracy.clone())
+                    .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
+            let metadata = crate::query_parser::qe_to_parsed_query(&parsed);
+            if metadata.metric_name.is_empty() {
+                return Err(CompileError::Snapshot(format!(
+                    "query {index} has no unique time-series source"
+                )));
+            }
+            if !metadata.label_filters.is_empty() {
+                return Err(CompileError::Snapshot(format!(
+                    "query {index} uses label filters not yet represented by the physical materialization contract"
+                )));
+            }
+            let lifecycle = LifecyclePlanningInput {
+                evaluation_interval_ms,
+                ingestion_rate_per_second: ingestion_rate.0,
+                evidence_observed_at_unix_ms: self.implementation.evidence_observed_at_unix_ms,
+                evidence_valid_for_ms: self.implementation.evidence_valid_for_ms,
+                horizon_seconds: self.implementation.horizon_seconds,
+                costs: self.implementation.lifecycle_costs.clone(),
+            };
+            let post_asap = select_post_asap(&parsed, accuracy.clone(), &lifecycle, None)
+                .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
+            let mut cost = self.implementation.implementation_cost.clone();
+            cost.workload_fingerprint =
+                canonical_promql(&query_string).map_err(CompileError::QueryPlan)?;
+            cost.horizon_seconds = self.implementation.horizon_seconds;
+            queries.push(PlanningQuery {
+                query_id: format!("compat-query-{index}"),
+                query_string,
+                post_asap,
+                source: Source::TimeSeries {
+                    metric: metadata.metric_name,
+                },
+                window_secs: lookback_ms / 1_000,
+                group_by: metadata.group_by_labels,
+                accuracy,
+                lifecycle,
+                window_implementations: vec![WindowImplementationCandidate {
+                    implementation_id: self.implementation.window_implementation_id.clone(),
+                    framework: SummaryWindowFramework::Tumbling,
+                    window_secs: lookback_ms / 1_000,
+                    pane_secs: lookback_ms / 1_000,
+                    state_layout: self.implementation.state_layout.clone(),
+                    cost,
+                }],
+                runtime_policy: RuntimeRulePolicy::default(),
+            });
+        }
+        PhysicalCompiler.compile(
+            PlanningRequest {
+                queries,
+                evidence: HashMap::new(),
+                planner_revision: PLANNER_REVISION.into(),
+            },
+            self.environment,
+        )
+    }
+}
+
 impl PhysicalCompiler {
     pub fn compile(
         &self,
@@ -1469,6 +1638,14 @@ impl PhysicalCompiler {
             return Err(CompileError::PlannerRevision {
                 request: request.planner_revision,
                 compiler: PLANNER_REVISION,
+            });
+        }
+        if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite
+            && !environment.collector_ids.is_empty()
+        {
+            return Err(CompileError::Query {
+                query_id: "deployment-target".into(),
+                reason: "backend-local target cannot declare Collector producers".into(),
             });
         }
 
@@ -1547,7 +1724,12 @@ impl PhysicalCompiler {
                     spatial_filter: String::new(),
                     grouping: query.group_by.clone(),
                     item_label: None,
-                    aggregation_input: AggregationInput::SketchEnvelope,
+                    aggregation_input: match environment.target {
+                        PhysicalDeploymentTarget::DistributedCollectors => {
+                            AggregationInput::SketchEnvelope
+                        }
+                        PhysicalDeploymentTarget::BackendLocalRemoteWrite => AggregationInput::Raw,
+                    },
                 };
                 let precompute_materialization =
                     backend_plan::aggregation_config_for_materialization(&aggregation)?;
@@ -1635,7 +1817,10 @@ impl PhysicalCompiler {
                 output_representation: OutputRepresentation::SummaryState,
             });
         }
-        let producer_ids = environment.collector_ids.clone();
+        let producer_ids = match environment.target {
+            PhysicalDeploymentTarget::DistributedCollectors => environment.collector_ids.clone(),
+            PhysicalDeploymentTarget::BackendLocalRemoteWrite => Vec::new(),
+        };
         // Several queries/readouts may intentionally share one maintained
         // summary. PrecomputePlan is keyed by physical identity, not query ID.
         let mut materializations_by_fingerprint = BTreeMap::new();
@@ -1647,12 +1832,21 @@ impl PhysicalCompiler {
                 .or_insert(materialization);
         }
         let materializations = materializations_by_fingerprint.into_values().collect();
-        let precompute_plan = PrecomputePlan::build(
-            envelope.clone(),
-            materializations,
-            &backend_plan,
-            &producer_ids,
-        )
+        let precompute_plan = match environment.target {
+            PhysicalDeploymentTarget::DistributedCollectors => PrecomputePlan::build(
+                envelope.clone(),
+                materializations,
+                &backend_plan,
+                &producer_ids,
+            ),
+            PhysicalDeploymentTarget::BackendLocalRemoteWrite => {
+                PrecomputePlan::build_backend_local(
+                    envelope.clone(),
+                    materializations,
+                    &backend_plan,
+                )
+            }
+        }
         .map_err(|error| CompileError::Query {
             query_id: "precompute-plan".into(),
             reason: error.to_string(),
@@ -2169,6 +2363,7 @@ mod tests {
 
     fn environment(now: u64) -> DeploymentEnvironment {
         DeploymentEnvironment {
+            target: PhysicalDeploymentTarget::DistributedCollectors,
             collector_ids: vec!["edge-a".into(), "edge-b".into()],
             capability_snapshot_id: "caps-7".into(),
             observed_at_unix_ms: now,
@@ -2403,6 +2598,113 @@ mod tests {
             .expect("empty backend-local transmission contract")
             .validate(&plan)
             .expect("valid empty transmission plan");
+    }
+
+    #[test]
+    fn canonical_workload_snapshot_invokes_backend_local_planning() {
+        let data_workload = DataWorkload {
+            arrival: DataArrival::ContinuouslyIngesting,
+            ingestion_rate: Evidence {
+                value: Some(Rate(100.0)),
+                source: EvidenceSource::Declared,
+                observed_at_ms: None,
+                valid_for_ms: None,
+            },
+            ..DataWorkload::default()
+        };
+        let query_workload = QueryWorkload {
+            language: QueryLanguage::PromQL,
+            query_batch: None,
+            repeating_queries: Some(vec![RepeatingEntry {
+                query: Query("quantile_over_time(0.99, m[1m])".into()),
+                demand: RepeatedDemand::FixedInterval(RepetitionInterval(10_000)),
+                requirements: QueryRequirements {
+                    accuracy: AccuracyRequirement::Explicit(AccuracyTarget::EpsilonDelta {
+                        epsilon: 0.01,
+                        delta: 0.01,
+                    }),
+                    ..QueryRequirements::default()
+                },
+                predictability: Predictability::Predictable { known_at: None },
+                time_selection: TimeSelection {
+                    scope: QueryTimeScope::RealTime,
+                    lookback: Some(DurationMs(60_000)),
+                    as_of: None,
+                },
+            }]),
+            data_workload: Some(data_workload.clone()),
+        };
+        let mut environment = environment(10_000);
+        environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        environment.collector_ids.clear();
+        let template = request("template", "quantile_over_time(0.99, m[1m])")
+            .queries
+            .remove(0);
+        let snapshot = BackendLocalPlanningSnapshot {
+            snapshot_version: 1,
+            query_workload,
+            data_workload,
+            implementation: BackendLocalImplementation {
+                lifecycle_costs: template.lifecycle.costs,
+                evidence_observed_at_unix_ms: 9_500,
+                evidence_valid_for_ms: 60_000,
+                horizon_seconds: 300.0,
+                window_implementation_id: "backend-tumbling-v1".into(),
+                state_layout: "anchored-pane-v1".into(),
+                implementation_cost: template.window_implementations[0].cost.clone(),
+            },
+            environment,
+        };
+        let first = snapshot
+            .clone()
+            .compile()
+            .expect("first deterministic plan");
+        let second = snapshot
+            .clone()
+            .compile()
+            .expect("second deterministic plan");
+        assert_eq!(first.envelope, second.envelope);
+        assert_eq!(first.backend_plan, second.backend_plan);
+        assert_eq!(first.query_plan, second.query_plan);
+        assert_eq!(first.transmission_plan, second.transmission_plan);
+        assert_eq!(
+            serde_json::to_value(&first.precompute_plan).unwrap(),
+            serde_json::to_value(&second.precompute_plan).unwrap()
+        );
+
+        let encoded = serde_json::to_vec(&snapshot).expect("serialize startup snapshot");
+        let decoded: BackendLocalPlanningSnapshot =
+            serde_json::from_slice(&encoded).expect("deserialize startup snapshot");
+        let bundle = decoded.compile().expect("canonical startup planning");
+
+        assert!(bundle.collector_plans.is_empty());
+        assert!(bundle.transmission_plan.rules.is_empty());
+        assert_eq!(
+            bundle.precompute_plan.ingest.protocol,
+            IngestProtocol::PrometheusRemoteWriteV1
+        );
+        assert!(bundle.precompute_plan.producers.is_empty());
+        assert_eq!(bundle.query_plan.entries.len(), 1);
+        assert_eq!(bundle.envelope.planner_revision, PLANNER_REVISION);
+    }
+
+    #[test]
+    fn checked_in_backend_local_snapshot_is_canonical_and_compilable() {
+        let source = include_str!("../../../docs/examples/asapquery-planning-snapshot.json");
+        let snapshot: BackendLocalPlanningSnapshot =
+            serde_json::from_str(source).expect("strict canonical workload fixture");
+        let encoded = serde_json::to_value(&snapshot).expect("canonical snapshot value");
+        let fixture: serde_json::Value = serde_json::from_str(source).expect("fixture JSON");
+        assert_eq!(encoded, fixture);
+
+        let plan = snapshot.compile().expect("fixture compiles");
+        assert!(plan.collector_plans.is_empty());
+        assert!(plan.transmission_plan.rules.is_empty());
+        assert_eq!(
+            plan.precompute_plan.ingest.protocol,
+            IngestProtocol::PrometheusRemoteWriteV1
+        );
+        assert_eq!(plan.query_plan.entries.len(), 1);
     }
 
     #[test]

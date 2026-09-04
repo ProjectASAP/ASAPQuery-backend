@@ -17,7 +17,7 @@ Then start the backend:
 ```bash
 cargo run -p data_plane -- \
   --profile asapquery \
-  --physical-plan /etc/asapquery/physical-plan.json \
+  --planning-snapshot /etc/asapquery/workload.json \
   --prometheus-server http://127.0.0.1:9090 \
   --forward-unsupported-queries \
   --http-port 9091 \
@@ -54,7 +54,21 @@ Receiver evidence is exported from `/metrics` as
 `asap_remote_write_rejected_requests_total`, and
 `asap_remote_write_bytes_total`.
 
-`physical-plan.json` is the JSON representation accepted by
+`workload.json` is a versioned `BackendLocalPlanningSnapshot`. Its
+`query_workload` and `data_workload` fields deserialize directly into the
+canonical ASAPPlanner types; `implementation` contains only backend-owned
+cost/window evidence, and `environment.target` must be
+`backend_local_remote_write`. Startup validates the workload, calls the pinned
+ASAPPlanner, compiles matching PrecomputePlan/BackendPlan/QueryPlan views, and
+installs the resulting immutable snapshot before accepting traffic. It does
+not create or wait for a CollectorPlan.
+
+A complete canonical input is checked in at
+`docs/examples/asapquery-planning-snapshot.json`.
+
+For reproducibility/debugging, `--physical-plan` remains an alternative to
+`--planning-snapshot`; exactly one is required. `physical-plan.json` is the
+JSON representation accepted by
 `POST /api/v1/physical-plan`: a `PrecomputePlan`, `TransmissionPlan`, encoded
 `BackendPlan`, and authoritative `QueryPlan` DAG with one shared plan identity
 and version. For this profile, the precompute ingest contract must be
@@ -70,8 +84,7 @@ Query serving uses only the installed `QueryPlan` DAG. A query absent from that
 DAG is a capability miss and goes to the exact Prometheus fallback; the backend
 does not search materialization candidates while serving.
 
-Automatic startup compilation from canonical `QueryWorkload` and
-`DataWorkload` snapshots is not part of this phase. Until the workload types
-have a stable serialized contract and the physical compiler supports a
-backend-only deployment target, the artifact must be produced offline by the
-planner/control-plane pipeline.
+Snapshot schema version `1` currently accepts fixed-interval repeating PromQL
+queries with explicit whole-second lookbacks and fresh ingestion-rate
+evidence. Unsupported snapshot semantics fail startup rather than silently
+inventing cost or placement evidence.

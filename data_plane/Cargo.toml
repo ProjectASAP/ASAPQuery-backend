@@ -36,9 +36,9 @@ control_plane = { path = "../control_plane" }
 # `L4Node` renamed to `SummaryNode` (ASAPPlanner#217); its fields
 # (`SummaryExpr::Logical(Box<QueryExpr>)`, `SummaryAgg { col: ColumnRef,
 # reduction: Reduction, .. }`) are `pre_asap` types, in the same crate now
-# (not a separate `asap-ir` import) -- `find_candidates` still needs to
-# walk/match them directly.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "739753e33e096c01faccca8e7a1e3da5ad3aab9c" }
+# (not a separate `asap-ir` import). Query serving consumes the compiled
+# QueryPlan; these types are used at physical-plan compilation boundaries.
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "cb50219c582d43f53ab77d3a595bd1ea4a9aa119" }
 
 # Shared external (workspace)
 serde.workspace = true
