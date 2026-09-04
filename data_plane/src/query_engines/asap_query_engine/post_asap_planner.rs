@@ -14,7 +14,7 @@
 //! a genuine planning decision, and planning already made it once, for
 //! real, when this metric's workload was planned — that decision is what
 //! `data_plane`'s ingest path actually registered in the `SketchStore`
-//! (`AggKind::Sketch { kind, config, .. }`). Serving time must reproduce
+//! (`AggKind::Sketch { algorithm: kind, config, .. }`). Serving time must reproduce
 //! THAT decision, not independently re-derive a fresh one from a
 //! hardcoded accuracy target: doing so picks whatever family/params an
 //! accuracy-driven cost model prefers in the abstract (e.g. DDSketch
@@ -44,7 +44,6 @@ use control_plane::physical::post_asap::cost_model::ObservedFamilyCostModel;
 use control_plane::physical::post_asap::{
     bind_query_expr_with_cost_model, BindingError, PhysicalExpr, PostAsapPlan,
 };
-use control_plane::physical::runtime_capability::SketchKindHandle;
 use control_plane::types_v2::AccuracyTarget;
 
 use crate::query_engines::asap_query_engine::summary_executor::find_metric_in_query_expr;
@@ -119,11 +118,11 @@ pub enum LoweringSkip {
 // The semantic tree returned by ASAPPlanner is `post_asap::SummaryNode`; this
 // module does not claim or recreate an ASAPPlanner "L4" IR.
 
-/// Map a registered sid's `(SketchKindHandle, SketchConfig)` — the
+/// Map a registered sid's `(SketchAlgorithm, SketchConfig)` — the
 /// durable record of what planning actually decided for this metric — to
 /// the `(SketchAlgorithm, SketchParams)` pair `ObservedFamilyCostModel`
 /// needs to reproduce that decision exactly. `None` for shapes this
-/// deployment doesn't map (e.g. `SketchKindHandle::Any`, which is an
+/// deployment doesn't map (e.g. an unsupported algorithm, which is an
 /// analysis-time wildcard that's never actually registered on a sid).
 ///
 /// Heap-bearing kinds (`CmsWithHeap`/`CountSketchWithHeap`) reuse their
@@ -133,34 +132,34 @@ pub enum LoweringSkip {
 /// only compares `width`/`depth` for these kinds, so it doesn't affect
 /// matching.
 fn observed_summary_params(
-    kind: SketchKindHandle,
+    kind: SketchAlgorithm,
     config: &SketchConfig,
 ) -> Option<(SketchAlgorithm, SketchParams)> {
     const PLACEHOLDER_HEAP_SIZE: u32 = 100;
     match (kind, config) {
-        (SketchKindHandle::DDSketch, SketchConfig::DDSketch { relative_accuracy }) => Some((
+        (SketchAlgorithm::DDSketch, SketchConfig::DDSketch { relative_accuracy }) => Some((
             SketchAlgorithm::DDSketch,
             SketchParams::DDSketch {
                 alpha: *relative_accuracy,
             },
         )),
-        (SketchKindHandle::Kll, SketchConfig::Kll { k }) => {
+        (SketchAlgorithm::Kll, SketchConfig::Kll { k }) => {
             Some((SketchAlgorithm::Kll, SketchParams::Kll { k: *k }))
         }
-        (SketchKindHandle::Hll, SketchConfig::Hll { precision }) => Some((
+        (SketchAlgorithm::Hll, SketchConfig::Hll { precision }) => Some((
             SketchAlgorithm::Hll,
             SketchParams::Hll {
                 precision: *precision as u8,
             },
         )),
-        (SketchKindHandle::CountMin, SketchConfig::CountMin { rows, cols }) => Some((
+        (SketchAlgorithm::Cms, SketchConfig::CountMin { rows, cols }) => Some((
             SketchAlgorithm::Cms,
             SketchParams::Cms {
                 width: *cols as u32,
                 depth: *rows as u32,
             },
         )),
-        (SketchKindHandle::CmsWithHeap, SketchConfig::CountMin { rows, cols }) => Some((
+        (SketchAlgorithm::CmsWithHeap, SketchConfig::CountMin { rows, cols }) => Some((
             SketchAlgorithm::CmsWithHeap,
             SketchParams::CmsWithHeap {
                 width: *cols as u32,
@@ -168,23 +167,21 @@ fn observed_summary_params(
                 heap_size: PLACEHOLDER_HEAP_SIZE,
             },
         )),
-        (SketchKindHandle::CountSketch, SketchConfig::CountSketch { rows, cols }) => Some((
+        (SketchAlgorithm::CountSketch, SketchConfig::CountSketch { rows, cols }) => Some((
             SketchAlgorithm::CountSketch,
             SketchParams::CountSketch {
                 width: *cols as u32,
                 depth: *rows as u32,
             },
         )),
-        (SketchKindHandle::CountSketchWithHeap, SketchConfig::CountSketch { rows, cols }) => {
-            Some((
-                SketchAlgorithm::CountSketchWithHeap,
-                SketchParams::CountSketchWithHeap {
-                    width: *cols as u32,
-                    depth: *rows as u32,
-                    heap_size: PLACEHOLDER_HEAP_SIZE,
-                },
-            ))
-        }
+        (SketchAlgorithm::CountSketchWithHeap, SketchConfig::CountSketch { rows, cols }) => Some((
+            SketchAlgorithm::CountSketchWithHeap,
+            SketchParams::CountSketchWithHeap {
+                width: *cols as u32,
+                depth: *rows as u32,
+                heap_size: PLACEHOLDER_HEAP_SIZE,
+            },
+        )),
         _ => None,
     }
 }
@@ -204,7 +201,11 @@ fn observed_family_for_metric(
 ) -> Option<(SketchAlgorithm, SketchParams)> {
     for sid in index.instances_matching(metric, &Default::default()) {
         let found = index.with_instance(sid, |m| match &m.agg_kind {
-            AggKind::Sketch { kind, config, .. } => observed_summary_params(*kind, config),
+            AggKind::Sketch {
+                algorithm: kind,
+                config,
+                ..
+            } => observed_summary_params(kind.clone(), config),
             AggKind::ExactAgg { .. } => None,
         });
         if let Some(Some(observed)) = found {
@@ -217,8 +218,8 @@ fn observed_family_for_metric(
 /// Look up what family/params `plan` says is materialized for `metric` —
 /// the `BackendPlan`-sourced sibling of [`observed_family_for_metric`].
 /// Unlike that function, no reconstruction is needed:
-/// `Materialization.kind`/`.params` already ARE the pair this needs,
-/// straight off the wire the control plane pushed. Returns the first
+/// `Materialization.family` already carries the canonical `SketchKind` this
+/// needs, straight off the wire the control plane pushed. Returns the first
 /// matching materialization found (mirrors
 /// `observed_family_for_metric`'s "first sketch-typed one found"
 /// semantics); `None` when the plan has no materialization for this
@@ -243,12 +244,12 @@ fn observed_families_for_metric_from_plan(
         {
             return None;
         }
-        // `Materialization.kind`/`.params` are the flat type (spans
-        // exact accumulators too) -- narrow to the sketch-only pair
-        // this function returns, skipping exact-accumulator
-        // materializations (mirrors `observed_family_for_metric`'s
-        // "first sketch-typed one found" semantics).
-        Some((m.kind.as_sketch_kind()?, m.params.as_sketch_params()?))
+        match &m.family {
+            planner_types::post_asap::SummaryFamilyType::Sketch(kind, _) => {
+                Some((kind.algorithm().clone(), kind.params().clone()))
+            }
+            _ => None,
+        }
     }).collect()
 }
 
@@ -289,27 +290,20 @@ pub fn resolve_materializations_for_post_asap(
                     .ok_or_else(|| {
                         LoweringSkip::NoWarmRoute("summary has no time-series source".into())
                     })?;
-                let (kind, params): (asap_types::SummaryKind, asap_types::SummaryParams) =
-                    match family {
-                        planner_types::post_asap::SummaryFamilyType::ExactAggregate(
-                            kind,
-                            params,
-                        ) => (kind.clone().into(), params.clone().into()),
-                        planner_types::post_asap::SummaryFamilyType::Sketch(kind, _) => {
-                            (kind.clone().into(), kind.params().clone().into())
-                        }
-                        _ => {
-                            return Err(LoweringSkip::NoWarmRoute(format!(
-                                "unsupported maintained family for metric `{metric}`"
-                            )))
-                        }
-                    };
+                if !matches!(
+                    family,
+                    planner_types::post_asap::SummaryFamilyType::ExactAggregate(..)
+                        | planner_types::post_asap::SummaryFamilyType::Sketch(..)
+                ) {
+                    return Err(LoweringSkip::NoWarmRoute(format!(
+                        "unsupported maintained family for metric `{metric}`"
+                    )));
+                }
                 let matches: Vec<_> = plan.routing.iter().filter_map(|route| {
                     (route.storage_backend == control_plane::backend_plan::StorageBackend::SketchStore
                         && plan.materializations.get(&route.materialization).is_some_and(|m| {
                             matches!(&m.source, planner_types::pre_asap::Source::TimeSeries { metric: mm } if mm == &metric)
-                                && m.kind == kind
-                                && m.params == params
+                                && &m.family == family
                                 && m.spatial_filter == spatial_filter
                                 && required_groups.iter().all(|key| m.group_by.contains(key))
                                 && m.window.size_ms <= query_window_ms
@@ -318,7 +312,7 @@ pub fn resolve_materializations_for_post_asap(
                 }).collect();
                 if matches.is_empty() {
                     return Err(LoweringSkip::NoWarmRoute(format!(
-                        "no warm BackendPlan route for metric `{metric}` and family `{kind:?}`"
+                        "no warm BackendPlan route for metric `{metric}` and family `{family:?}`"
                     )));
                 }
                 resolved.extend(matches);
@@ -584,12 +578,8 @@ fn ensure_warm_runtime_support(
             ensure_warm_runtime_support(child, source_has_filter)
         }
         SummaryExpr::SummaryEstimate {
-            summary_input: _,
-            query: SketchQuery::PointCount { value: Some(_), .. },
-        } => Err(LoweringSkip::KeyedFrequency),
-        SummaryExpr::SummaryEstimate {
             summary_input,
-            query: SketchQuery::PointCount { .. },
+            query: SketchQuery::PointCount { value: None, .. },
         } if source_has_filter => Err(LoweringSkip::KeyedFrequency),
         SummaryExpr::SummaryEstimate { summary_input, .. } => {
             ensure_warm_runtime_support(summary_input, source_has_filter)
@@ -604,6 +594,36 @@ fn ensure_warm_runtime_support(
         _ => Err(LoweringSkip::NoWarmRoute(
             "post-ASAP operator is not executable by the warm runtime".into(),
         )),
+    }
+}
+
+/// Bind the conventional PromQL `item="..."` equality matcher to a frequency
+/// point readout. The Planner DAG owns the `SketchQuery`; this adapter only
+/// supplies the literal value that the PromQL frontend currently leaves as
+/// `None`.
+fn bind_point_count_filter(node: &mut Rc<SummaryNode>, key: &str, value: &str) -> bool {
+    let node = Rc::make_mut(node);
+    match &mut node.expr {
+        SummaryExpr::SummaryEstimate {
+            query:
+                planner_types::post_asap::SketchQuery::PointCount {
+                    key: point_key,
+                    value: point_value,
+                },
+            ..
+        } if point_value.is_none() => {
+            *point_key = planner_types::pre_asap::ColumnRef::Named(key.to_string());
+            *point_value = Some(value.to_string());
+            true
+        }
+        SummaryExpr::SummaryAgg { child, .. } => bind_point_count_filter(child, key, value),
+        SummaryExpr::SummaryEstimate { summary_input, .. } => {
+            bind_point_count_filter(summary_input, key, value)
+        }
+        SummaryExpr::SummaryMerge { children } => children
+            .iter_mut()
+            .any(|child| bind_point_count_filter(child, key, value)),
+        _ => false,
     }
 }
 
@@ -630,8 +650,7 @@ pub fn plan_promql_to_post_asap(
     // independently re-derive one -- see this module's docs. Prefer
     // reading it straight off an installed `BackendPlan`'s
     // materializations when one covers this metric --
-    // `Materialization.kind`/`.params` already ARE the
-    // `(SketchAlgorithm, SketchParams)` pair this needs, no
+    // `Materialization.family` already carries the canonical `SketchKind`, no
     // `AggregationConfig` reconstruction required (design-backend-plan-wire-format.md
     // §5). Otherwise fall back to the `SketchStore`-reconstruction path
     // (`observed_family_for_metric`), which is `None` when this metric
@@ -681,10 +700,19 @@ pub fn plan_promql_to_post_asap(
         };
 
         match physical {
-            PhysicalExpr::Committed(PostAsapPlan::Summary(node)) => {
+            PhysicalExpr::Committed(PostAsapPlan::Summary(mut node)) => {
                 if matches!(node.expr, SummaryExpr::KeepPreAsap(_)) {
                     last_skip = LoweringSkip::NotRealized;
                 } else {
+                    if let Ok(parsed) =
+                        control_plane::query_parser::parse_query(query, accuracy.clone())
+                    {
+                        if parsed.label_filters.len() == 1 {
+                            if let Some(value) = parsed.label_filters.get("item") {
+                                bind_point_count_filter(&mut node, "item", value);
+                            }
+                        }
+                    }
                     if let Err(skip) = ensure_warm_runtime_support(&node, source_has_filter) {
                         last_skip = skip;
                         continue;
@@ -865,7 +893,7 @@ mod tests {
     mod backend_plan_cutover {
         use super::*;
         use crate::storage_engines::sketch_db::index::{
-            AccuracyBound, Capability, SketchInstanceMetadata, SketchKindHandle,
+            AccuracyBound, Capability, SketchAlgorithm, SketchInstanceMetadata,
         };
         use asap_types::enums::WindowKind;
         use control_plane::backend_plan::{
@@ -880,9 +908,9 @@ mod tests {
                 sid: 1,
                 metric_name: metric.to_string(),
                 group_by_keys: Default::default(),
-                capability: Some(Capability::QuantileApprox(SketchKindHandle::Kll)),
+                capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::Kll))),
                 agg_kind: AggKind::Sketch {
-                    kind: SketchKindHandle::Kll,
+                    algorithm: SketchAlgorithm::Kll,
                     config: cfg.clone(),
                     spatial_filter_canonical: String::new(),
                 },
@@ -912,14 +940,16 @@ mod tests {
                     group_by: Vec::new(),
                     rollup: Vec::new(),
                     spatial_filter: String::new(),
-                    // `Materialization.kind`/`.params` span both exact
-                    // accumulators and sketches -- the flat
-                    // `asap_types::SummaryKind`, not this file's own
-                    // `planner_types::post_asap::SketchAlgorithm` import (see
-                    // `physical::colored_dag::emitter`'s `use
-                    // asap_types::{...}` note in control_plane).
-                    kind: asap_types::SummaryKind::DDSketch,
-                    params: asap_types::SummaryParams::DDSketch { alpha: 0.01 },
+                    // `Materialization.family` is Planner's canonical
+                    // `SummaryFamilyType`; its sketch branch carries a
+                    // validated `SketchKind` (category + algorithm + params).
+                    family: planner_types::post_asap::SummaryFamilyType::Sketch(
+                        planner_types::post_asap::SketchKind::new(
+                            SketchAlgorithm::DDSketch,
+                            SketchParams::DDSketch { alpha: 0.01 },
+                        ),
+                        planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
+                    ),
                     col: ColumnRef::SampleValue,
                     retention: None,
                     lifecycle: None,
@@ -930,7 +960,7 @@ mod tests {
                 generated_at_unix_ms: 0,
                 materializations,
                 routing: vec![RoutingEntry {
-                    satisfies: Capability::QuantileApprox(SketchKindHandle::DDSketch),
+                    satisfies: Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch)),
                     materialization: fingerprint,
                     storage_backend: StorageBackend::SketchStore,
                 }],

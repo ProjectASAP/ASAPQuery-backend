@@ -42,7 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use xxhash_rust::xxh64::xxh64;
 
-use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig, SketchKindHandle};
+use crate::storage_engines::sketch_db::data::{AggKind, SketchAlgorithm, SketchConfig};
 use crate::storage_engines::sketch_db::index::{SketchInstanceMetadata, SketchStore};
 use crate::storage_engines::sketch_db::lifecycle::AggStatus;
 
@@ -228,12 +228,12 @@ impl AggSignatureGroup {
 fn encode_agg_kind(agg_kind: &AggKind, buf: &mut Vec<u8>) {
     match agg_kind {
         AggKind::Sketch {
-            kind,
+            algorithm: kind,
             config,
             spatial_filter_canonical,
         } => {
             buf.push(b'S');
-            buf.push(sketch_kind_byte(*kind));
+            buf.push(sketch_algorithm_byte(kind.clone()));
             encode_sketch_config(config, buf);
             buf.push(b'F');
             buf.extend_from_slice(spatial_filter_canonical.as_bytes());
@@ -253,16 +253,17 @@ fn encode_agg_kind(agg_kind: &AggKind, buf: &mut Vec<u8>) {
     }
 }
 
-fn sketch_kind_byte(k: SketchKindHandle) -> u8 {
+fn sketch_algorithm_byte(k: SketchAlgorithm) -> u8 {
     match k {
-        SketchKindHandle::DDSketch => 1,
-        SketchKindHandle::Kll => 2,
-        SketchKindHandle::Hll => 3,
-        SketchKindHandle::CountSketch => 4,
-        SketchKindHandle::CountMin => 5,
-        SketchKindHandle::CmsWithHeap => 6,
-        SketchKindHandle::CountSketchWithHeap => 7,
-        SketchKindHandle::Any => 0,
+        SketchAlgorithm::DDSketch => 1,
+        SketchAlgorithm::Kll => 2,
+        SketchAlgorithm::Hll => 3,
+        SketchAlgorithm::CountSketch => 4,
+        SketchAlgorithm::Cms => 5,
+        SketchAlgorithm::CmsWithHeap => 6,
+        SketchAlgorithm::CountSketchWithHeap => 7,
+        SketchAlgorithm::Kmv => 8,
+        SketchAlgorithm::Theta => 9,
     }
 }
 
@@ -318,7 +319,7 @@ mod tests {
             sid,
             metric_name: metric.into(),
             group_by_keys: BTreeSet::new(),
-            capability: Some(Capability::QuantileApprox(SketchKindHandle::DDSketch)),
+            capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),
             agg_kind,
             accuracy: None,
             first_seen_unix_ms: first_seen,

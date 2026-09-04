@@ -129,7 +129,7 @@ where
 fn planned_capability(
     node: &planner_types::post_asap::SummaryNode,
 ) -> Option<(String, Capability)> {
-    use crate::physical::runtime_capability::SketchKindHandle;
+    use crate::physical::runtime_capability::SketchAlgorithm;
     use planner_types::post_asap::{SketchQuery, SummaryExpr, SummaryFamilyType};
 
     fn metric(node: &planner_types::post_asap::SummaryNode) -> Option<String> {
@@ -164,19 +164,22 @@ fn planned_capability(
         }
     }
 
-    fn handle(family: &SummaryFamilyType) -> Option<SketchKindHandle> {
+    fn handle(family: &SummaryFamilyType) -> Option<SketchAlgorithm> {
         let SummaryFamilyType::Sketch(kind, _) = family else {
             return None;
         };
-        Some(match asap_types::SummaryKind::from(kind.clone()) {
-            asap_types::SummaryKind::DDSketch => SketchKindHandle::DDSketch,
-            asap_types::SummaryKind::Kll => SketchKindHandle::Kll,
-            asap_types::SummaryKind::Hll => SketchKindHandle::Hll,
-            asap_types::SummaryKind::Cms => SketchKindHandle::CountMin,
-            asap_types::SummaryKind::CmsWithHeap => SketchKindHandle::CmsWithHeap,
-            asap_types::SummaryKind::CountSketch => SketchKindHandle::CountSketch,
-            asap_types::SummaryKind::CountSketchWithHeap => SketchKindHandle::CountSketchWithHeap,
-            _ => return None,
+        Some(match kind.algorithm() {
+            planner_types::post_asap::SketchAlgorithm::DDSketch => SketchAlgorithm::DDSketch,
+            planner_types::post_asap::SketchAlgorithm::Kll => SketchAlgorithm::Kll,
+            planner_types::post_asap::SketchAlgorithm::Hll => SketchAlgorithm::Hll,
+            planner_types::post_asap::SketchAlgorithm::Cms => SketchAlgorithm::Cms,
+            planner_types::post_asap::SketchAlgorithm::CmsWithHeap => SketchAlgorithm::CmsWithHeap,
+            planner_types::post_asap::SketchAlgorithm::CountSketch => SketchAlgorithm::CountSketch,
+            planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap => {
+                SketchAlgorithm::CountSketchWithHeap
+            }
+            planner_types::post_asap::SketchAlgorithm::Kmv
+            | planner_types::post_asap::SketchAlgorithm::Theta => return None,
         })
     }
 
@@ -190,21 +193,26 @@ fn planned_capability(
                 return None;
             };
             match query {
-                SketchQuery::Quantile { .. } => Capability::QuantileApprox(handle(family)?),
+                SketchQuery::Quantile { .. } => Capability::QuantileApprox(Some(handle(family)?)),
                 SketchQuery::Cardinality => Capability::CardinalityApprox,
-                SketchQuery::PointCount { .. } => Capability::FrequencyEstimate(handle(family)?),
-                SketchQuery::TopK { .. } => Capability::FrequencyTopk(handle(family)?),
+                SketchQuery::PointCount { .. } => {
+                    Capability::FrequencyEstimate(Some(handle(family)?))
+                }
+                SketchQuery::TopK { .. } => Capability::FrequencyTopk(Some(handle(family)?)),
             }
         }
         SummaryExpr::SummaryAgg {
             family: SummaryFamilyType::ExactAggregate(kind, _),
             ..
         } => {
-            let agg = match asap_types::SummaryKind::from(kind.clone()) {
-                asap_types::SummaryKind::Sum => asap_types::AggregationType::Sum,
-                asap_types::SummaryKind::Increase => asap_types::AggregationType::Increase,
-                asap_types::SummaryKind::MinMax => asap_types::AggregationType::MinMax,
-                _ => return None,
+            let agg = match kind {
+                planner_types::post_asap::ExactKind::Sum
+                | planner_types::post_asap::ExactKind::Count => asap_types::AggregationType::Sum,
+                planner_types::post_asap::ExactKind::Increase
+                | planner_types::post_asap::ExactKind::Rate => {
+                    asap_types::AggregationType::Increase
+                }
+                planner_types::post_asap::ExactKind::MinMax => asap_types::AggregationType::MinMax,
             };
             Capability::ExactAgg(agg)
         }

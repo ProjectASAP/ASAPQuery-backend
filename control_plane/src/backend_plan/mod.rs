@@ -7,8 +7,9 @@
 //! `proto/backend_plan.proto`), and the conversions between them.
 //!
 //! Deliberately reuses this deployment's existing canonical vocabulary
-//! rather than re-encoding it: `planner_types::post_asap::{SummaryKind, SummaryParams}`
-//! for the materialization payload (no separate `ExactAggregate` variant —
+//! rather than re-encoding it: `planner_types::post_asap::SummaryFamilyType`
+//! for the materialization payload (including canonical `ExactKind` and
+//! `SketchKind` choices; no backend-owned summary-family enum —
 //! see the design doc §3 for why), `asap_ir`/`crate::intent_algebra`'s
 //! `Source`/`ColumnRef`/`WindowKind` for the L3 IR fragments,
 //! `crate::physical::runtime_capability::Capability` for routing, and
@@ -33,14 +34,18 @@ pub use from_stage_config::from_stage_config;
 
 use std::collections::HashMap;
 
+pub use asap_types::StorageBackend;
 use asap_types::{AggregationType, MonitorSpec, PolicyFingerprint};
-use asap_types::{SummaryKind, SummaryParams};
 use prost::Message as _;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::physical::runtime_capability::{Capability, SketchKindHandle};
+use crate::physical::runtime_capability::Capability;
 use asap_types::enums::WindowKind;
+use planner_types::post_asap::{
+    EvaluationSchedule, ExactKind, ExactParams, GroupingStrategy, OutputRepresentation,
+    SketchAlgorithm, SketchKind, SketchParams, SummaryFamilyType, SummaryMaintenanceLifecycle,
+    SummaryMaintenanceLifecycleGuarantee, SummaryMaintenanceMode,
+};
 use planner_types::pre_asap::{ColumnRef, Source};
 
 /// Errors decoding a `BackendPlan` (or one of its parts) from its proto
@@ -202,59 +207,69 @@ impl TryFrom<proto::ColumnRef> for ColumnRef {
     }
 }
 
-// ── SummaryKind / SummaryParams ─────────────────────────────────────────────
+// ── SummaryFamilyType wire adapter ──────────────────────────────────────────
 //
-// `SummaryParams`'s wire form is a single self-describing `oneof` --
-// `SummaryKind` is always recoverable from which arm is set, so encoding
-// only ever needs `&SummaryParams`. Decoding produces the `(SummaryKind,
-// SummaryParams)` pair `Materialization` needs.
+// The legacy `SummaryParams` protobuf is a single self-describing `oneof`.
+// Encoding and decoding keep that wire compatibility at the boundary while
+// the domain model carries Planner's canonical `SummaryFamilyType`.
 
-impl From<&SummaryParams> for proto::SummaryParams {
-    fn from(p: &SummaryParams) -> Self {
+impl From<&SummaryFamilyType> for proto::SummaryParams {
+    fn from(family: &SummaryFamilyType) -> Self {
         use proto::summary_params::Params as Wire;
-        let params = match p {
-            SummaryParams::Sum => Wire::Sum(true),
-            SummaryParams::Count => Wire::Count(true),
-            SummaryParams::MinMax => Wire::MinMax(true),
-            SummaryParams::Increase => Wire::Increase(true),
-            SummaryParams::Rate => Wire::Rate(true),
-            SummaryParams::Kll { k } => Wire::Kll(proto::KllParams { k: *k }),
-            SummaryParams::Cms { width, depth } => Wire::Cms(proto::CmsParams {
-                width: *width,
-                depth: *depth,
-            }),
-            SummaryParams::Hll { precision } => Wire::Hll(proto::HllParams {
-                precision: *precision as u32,
-            }),
-            SummaryParams::DDSketch { alpha } => {
-                Wire::Ddsketch(proto::DdSketchParams { alpha: *alpha })
+        let params = match family {
+            SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum) => Wire::Sum(true),
+            SummaryFamilyType::ExactAggregate(ExactKind::Count, ExactParams::Count) => {
+                Wire::Count(true)
             }
-            SummaryParams::CmsWithHeap {
-                width,
-                depth,
-                heap_size,
-            } => Wire::CmsWithHeap(proto::CmsWithHeapParams {
-                width: *width,
-                depth: *depth,
-                heap_size: *heap_size,
-            }),
-            SummaryParams::Kmv { k } => Wire::Kmv(proto::KmvParams { k: *k }),
-            SummaryParams::Theta { k } => Wire::Theta(proto::ThetaParams { k: *k }),
-            SummaryParams::CountSketch { width, depth } => {
-                Wire::CountSketch(proto::CountSketchParams {
+            SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax) => {
+                Wire::MinMax(true)
+            }
+            SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase) => {
+                Wire::Increase(true)
+            }
+            SummaryFamilyType::ExactAggregate(ExactKind::Rate, ExactParams::Rate) => {
+                Wire::Rate(true)
+            }
+            SummaryFamilyType::Sketch(kind, _) => match kind.params() {
+                SketchParams::Kll { k } => Wire::Kll(proto::KllParams { k: *k }),
+                SketchParams::Cms { width, depth } => Wire::Cms(proto::CmsParams {
                     width: *width,
                     depth: *depth,
-                })
-            }
-            SummaryParams::CountSketchWithHeap {
-                width,
-                depth,
-                heap_size,
-            } => Wire::CountSketchWithHeap(proto::CountSketchWithHeapParams {
-                width: *width,
-                depth: *depth,
-                heap_size: *heap_size,
-            }),
+                }),
+                SketchParams::Hll { precision } => Wire::Hll(proto::HllParams {
+                    precision: *precision as u32,
+                }),
+                SketchParams::DDSketch { alpha } => {
+                    Wire::Ddsketch(proto::DdSketchParams { alpha: *alpha })
+                }
+                SketchParams::CmsWithHeap {
+                    width,
+                    depth,
+                    heap_size,
+                } => Wire::CmsWithHeap(proto::CmsWithHeapParams {
+                    width: *width,
+                    depth: *depth,
+                    heap_size: *heap_size,
+                }),
+                SketchParams::Kmv { k } => Wire::Kmv(proto::KmvParams { k: *k }),
+                SketchParams::Theta { k } => Wire::Theta(proto::ThetaParams { k: *k }),
+                SketchParams::CountSketch { width, depth } => {
+                    Wire::CountSketch(proto::CountSketchParams {
+                        width: *width,
+                        depth: *depth,
+                    })
+                }
+                SketchParams::CountSketchWithHeap {
+                    width,
+                    depth,
+                    heap_size,
+                } => Wire::CountSketchWithHeap(proto::CountSketchWithHeapParams {
+                    width: *width,
+                    depth: *depth,
+                    heap_size: *heap_size,
+                }),
+            },
+            other => panic!("BackendPlan cannot encode unsupported summary family {other:?}"),
         };
         proto::SummaryParams {
             params: Some(params),
@@ -262,59 +277,61 @@ impl From<&SummaryParams> for proto::SummaryParams {
     }
 }
 
-/// Decode a wire `SummaryParams` back to the `(SummaryKind, SummaryParams)`
-/// pair. Not a `TryFrom` impl because the single wire message decodes to
-/// TWO domain values (`SummaryKind` is implied, not carried separately on
-/// the wire) — see this module's doc.
-pub fn decode_summary_params(
-    p: proto::SummaryParams,
-) -> Result<(SummaryKind, SummaryParams), DecodeError> {
+/// Decode the legacy wire `SummaryParams` into Planner's canonical family.
+pub fn decode_summary_params(p: proto::SummaryParams) -> Result<SummaryFamilyType, DecodeError> {
     use proto::summary_params::Params as Wire;
     let params = p.params.ok_or(DecodeError::MissingOneof("SummaryParams"))?;
+    let exact = |kind, params| SummaryFamilyType::ExactAggregate(kind, params);
+    let sketch = |algorithm, params| {
+        SummaryFamilyType::Sketch(
+            SketchKind::new(algorithm, params),
+            GroupingStrategy::PerSubpopulationInstance,
+        )
+    };
     Ok(match params {
-        Wire::Sum(_) => (SummaryKind::Sum, SummaryParams::Sum),
-        Wire::Count(_) => (SummaryKind::Count, SummaryParams::Count),
-        Wire::MinMax(_) => (SummaryKind::MinMax, SummaryParams::MinMax),
-        Wire::Increase(_) => (SummaryKind::Increase, SummaryParams::Increase),
-        Wire::Rate(_) => (SummaryKind::Rate, SummaryParams::Rate),
-        Wire::Kll(k) => (SummaryKind::Kll, SummaryParams::Kll { k: k.k }),
-        Wire::Cms(c) => (
-            SummaryKind::Cms,
-            SummaryParams::Cms {
+        Wire::Sum(_) => exact(ExactKind::Sum, ExactParams::Sum),
+        Wire::Count(_) => exact(ExactKind::Count, ExactParams::Count),
+        Wire::MinMax(_) => exact(ExactKind::MinMax, ExactParams::MinMax),
+        Wire::Increase(_) => exact(ExactKind::Increase, ExactParams::Increase),
+        Wire::Rate(_) => exact(ExactKind::Rate, ExactParams::Rate),
+        Wire::Kll(k) => sketch(SketchAlgorithm::Kll, SketchParams::Kll { k: k.k }),
+        Wire::Cms(c) => sketch(
+            SketchAlgorithm::Cms,
+            SketchParams::Cms {
                 width: c.width,
                 depth: c.depth,
             },
         ),
-        Wire::Hll(h) => (
-            SummaryKind::Hll,
-            SummaryParams::Hll {
+        Wire::Hll(h) => sketch(
+            SketchAlgorithm::Hll,
+            SketchParams::Hll {
                 precision: h.precision as u8,
             },
         ),
-        Wire::Ddsketch(d) => (
-            SummaryKind::DDSketch,
-            SummaryParams::DDSketch { alpha: d.alpha },
+        Wire::Ddsketch(d) => sketch(
+            SketchAlgorithm::DDSketch,
+            SketchParams::DDSketch { alpha: d.alpha },
         ),
-        Wire::CmsWithHeap(c) => (
-            SummaryKind::CmsWithHeap,
-            SummaryParams::CmsWithHeap {
+        Wire::CmsWithHeap(c) => sketch(
+            SketchAlgorithm::CmsWithHeap,
+            SketchParams::CmsWithHeap {
                 width: c.width,
                 depth: c.depth,
                 heap_size: c.heap_size,
             },
         ),
-        Wire::Kmv(k) => (SummaryKind::Kmv, SummaryParams::Kmv { k: k.k }),
-        Wire::Theta(t) => (SummaryKind::Theta, SummaryParams::Theta { k: t.k }),
-        Wire::CountSketch(c) => (
-            SummaryKind::CountSketch,
-            SummaryParams::CountSketch {
+        Wire::Kmv(k) => sketch(SketchAlgorithm::Kmv, SketchParams::Kmv { k: k.k }),
+        Wire::Theta(t) => sketch(SketchAlgorithm::Theta, SketchParams::Theta { k: t.k }),
+        Wire::CountSketch(c) => sketch(
+            SketchAlgorithm::CountSketch,
+            SketchParams::CountSketch {
                 width: c.width,
                 depth: c.depth,
             },
         ),
-        Wire::CountSketchWithHeap(c) => (
-            SummaryKind::CountSketchWithHeap,
-            SummaryParams::CountSketchWithHeap {
+        Wire::CountSketchWithHeap(c) => sketch(
+            SketchAlgorithm::CountSketchWithHeap,
+            SketchParams::CountSketchWithHeap {
                 width: c.width,
                 depth: c.depth,
                 heap_size: c.heap_size,
@@ -323,37 +340,37 @@ pub fn decode_summary_params(
     })
 }
 
-// ── SketchKindHandle / AggregationType / Capability ─────────────────────────
+// ── SketchAlgorithm / AggregationType / Capability ─────────────────────────
 
-impl From<SketchKindHandle> for proto::SketchKindHandle {
-    fn from(h: SketchKindHandle) -> Self {
+impl From<Option<SketchAlgorithm>> for proto::SketchKindHandle {
+    fn from(h: Option<SketchAlgorithm>) -> Self {
         match h {
-            SketchKindHandle::DDSketch => proto::SketchKindHandle::Ddsketch,
-            SketchKindHandle::Kll => proto::SketchKindHandle::Kll,
-            SketchKindHandle::Hll => proto::SketchKindHandle::Hll,
-            SketchKindHandle::CountSketch => proto::SketchKindHandle::CountSketch,
-            SketchKindHandle::CountMin => proto::SketchKindHandle::CountMin,
-            SketchKindHandle::CmsWithHeap => proto::SketchKindHandle::CmsWithHeap,
-            SketchKindHandle::CountSketchWithHeap => proto::SketchKindHandle::CountSketchWithHeap,
-            SketchKindHandle::Any => proto::SketchKindHandle::Any,
+            Some(SketchAlgorithm::DDSketch) => Self::Ddsketch,
+            Some(SketchAlgorithm::Kll) => Self::Kll,
+            Some(SketchAlgorithm::Hll) => Self::Hll,
+            Some(SketchAlgorithm::CountSketch) => Self::CountSketch,
+            Some(SketchAlgorithm::Cms) => Self::CountMin,
+            Some(SketchAlgorithm::CmsWithHeap) => Self::CmsWithHeap,
+            Some(SketchAlgorithm::CountSketchWithHeap) => Self::CountSketchWithHeap,
+            Some(SketchAlgorithm::Kmv | SketchAlgorithm::Theta) | None => Self::Any,
         }
     }
 }
 
-impl TryFrom<proto::SketchKindHandle> for SketchKindHandle {
+impl TryFrom<proto::SketchKindHandle> for Option<SketchAlgorithm> {
     type Error = DecodeError;
     fn try_from(h: proto::SketchKindHandle) -> Result<Self, DecodeError> {
         match h {
-            proto::SketchKindHandle::Ddsketch => Ok(SketchKindHandle::DDSketch),
-            proto::SketchKindHandle::Kll => Ok(SketchKindHandle::Kll),
-            proto::SketchKindHandle::Hll => Ok(SketchKindHandle::Hll),
-            proto::SketchKindHandle::CountSketch => Ok(SketchKindHandle::CountSketch),
-            proto::SketchKindHandle::CountMin => Ok(SketchKindHandle::CountMin),
-            proto::SketchKindHandle::CmsWithHeap => Ok(SketchKindHandle::CmsWithHeap),
+            proto::SketchKindHandle::Ddsketch => Ok(Some(SketchAlgorithm::DDSketch)),
+            proto::SketchKindHandle::Kll => Ok(Some(SketchAlgorithm::Kll)),
+            proto::SketchKindHandle::Hll => Ok(Some(SketchAlgorithm::Hll)),
+            proto::SketchKindHandle::CountSketch => Ok(Some(SketchAlgorithm::CountSketch)),
+            proto::SketchKindHandle::CountMin => Ok(Some(SketchAlgorithm::Cms)),
+            proto::SketchKindHandle::CmsWithHeap => Ok(Some(SketchAlgorithm::CmsWithHeap)),
             proto::SketchKindHandle::CountSketchWithHeap => {
-                Ok(SketchKindHandle::CountSketchWithHeap)
+                Ok(Some(SketchAlgorithm::CountSketchWithHeap))
             }
-            proto::SketchKindHandle::Any => Ok(SketchKindHandle::Any),
+            proto::SketchKindHandle::Any => Ok(None),
             proto::SketchKindHandle::Unspecified => Err(DecodeError::UnknownEnumValue {
                 field: "SketchKindHandle",
                 value: proto::SketchKindHandle::Unspecified as i32,
@@ -424,14 +441,14 @@ impl From<&Capability> for proto::Capability {
         use proto::capability::Capability as Wire;
         let capability = match c {
             Capability::QuantileApprox(h) => {
-                Wire::QuantileApprox(proto::SketchKindHandle::from(*h) as i32)
+                Wire::QuantileApprox(proto::SketchKindHandle::from(h.clone()) as i32)
             }
             Capability::CardinalityApprox => Wire::CardinalityApprox(true),
             Capability::FrequencyEstimate(h) => {
-                Wire::FrequencyEstimate(proto::SketchKindHandle::from(*h) as i32)
+                Wire::FrequencyEstimate(proto::SketchKindHandle::from(h.clone()) as i32)
             }
             Capability::FrequencyTopk(h) => {
-                Wire::FrequencyTopk(proto::SketchKindHandle::from(*h) as i32)
+                Wire::FrequencyTopk(proto::SketchKindHandle::from(h.clone()) as i32)
             }
             Capability::ExactAgg(a) => Wire::ExactAgg(proto::AggregationType::from(*a) as i32),
         };
@@ -446,7 +463,7 @@ impl TryFrom<proto::Capability> for Capability {
     fn try_from(c: proto::Capability) -> Result<Self, DecodeError> {
         use proto::capability::Capability as Wire;
         let decode_handle =
-            |v: i32, field: &'static str| -> Result<SketchKindHandle, DecodeError> {
+            |v: i32, field: &'static str| -> Result<Option<SketchAlgorithm>, DecodeError> {
                 proto::SketchKindHandle::try_from(v)
                     .map_err(|_| DecodeError::UnknownEnumValue { field, value: v })?
                     .try_into()
@@ -485,16 +502,6 @@ impl TryFrom<proto::Capability> for Capability {
 //    data_plane::storage_engines::types::StorageBackend, which this
 //    mirrors -- see that type's own doc and asap_types::MonitorSpec's for
 //    the same constraint) ───────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum StorageBackend {
-    #[default]
-    SketchStore,
-    GorillaObjectStore,
-    DoubleWrite,
-    PrometheusRemote,
-}
 
 impl From<StorageBackend> for proto::StorageBackend {
     fn from(b: StorageBackend) -> Self {
@@ -594,40 +601,73 @@ pub struct Materialization {
     pub group_by: Vec<String>,
     pub rollup: Vec<String>,
     pub spatial_filter: String,
-    pub kind: SummaryKind,
-    pub params: SummaryParams,
+    pub family: SummaryFamilyType,
     pub col: ColumnRef,
     pub retention: Option<RetentionPolicy>,
-    pub lifecycle: Option<SummaryMaintenanceLifecycle>,
+    pub lifecycle: Option<SummaryMaintenanceLifecycleGuarantee>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SummaryMaintenanceLifecycle {
-    pub kind: String,
-    pub maintenance_mode: String,
-    pub evaluation_schedule: String,
-    pub output_representation: String,
-}
-
-impl From<&SummaryMaintenanceLifecycle> for proto::SummaryMaintenanceLifecycle {
-    fn from(value: &SummaryMaintenanceLifecycle) -> Self {
+impl From<&SummaryMaintenanceLifecycleGuarantee> for proto::SummaryMaintenanceLifecycle {
+    fn from(value: &SummaryMaintenanceLifecycleGuarantee) -> Self {
         Self {
-            kind: value.kind.clone(),
-            maintenance_mode: value.maintenance_mode.clone(),
-            evaluation_schedule: value.evaluation_schedule.clone(),
-            output_representation: value.output_representation.clone(),
+            kind: match value.summary_maintenance_lifecycle {
+                SummaryMaintenanceLifecycle::Ephemeral => "ephemeral",
+                SummaryMaintenanceLifecycle::Prepared { .. } => "prepared",
+                SummaryMaintenanceLifecycle::Shared { .. } => "shared",
+                SummaryMaintenanceLifecycle::ContinuouslyMaintained => "continuously_maintained",
+            }
+            .into(),
+            maintenance_mode: value.summary_maintenance_mode.as_str().into(),
+            evaluation_schedule: match value.evaluation_schedule {
+                EvaluationSchedule::OneShot => "one_shot",
+                EvaluationSchedule::PerUpdate => "per_update",
+                EvaluationSchedule::OnRead => "on_read",
+            }
+            .into(),
+            output_representation: match value.output_representation {
+                OutputRepresentation::PlainRows => "plain_rows",
+                OutputRepresentation::SummaryState => "summary_state",
+                OutputRepresentation::FinalizedValue => "finalized_value",
+            }
+            .into(),
         }
     }
 }
 
-impl From<proto::SummaryMaintenanceLifecycle> for SummaryMaintenanceLifecycle {
-    fn from(value: proto::SummaryMaintenanceLifecycle) -> Self {
-        Self {
-            kind: value.kind,
-            maintenance_mode: value.maintenance_mode,
-            evaluation_schedule: value.evaluation_schedule,
-            output_representation: value.output_representation,
-        }
+impl TryFrom<proto::SummaryMaintenanceLifecycle> for SummaryMaintenanceLifecycleGuarantee {
+    type Error = DecodeError;
+
+    fn try_from(value: proto::SummaryMaintenanceLifecycle) -> Result<Self, Self::Error> {
+        let summary_maintenance_lifecycle = match value.kind.as_str() {
+            "ephemeral" => SummaryMaintenanceLifecycle::Ephemeral,
+            "continuously_maintained" => SummaryMaintenanceLifecycle::ContinuouslyMaintained,
+            // Prepared/Shared carry timestamps/retention that the v1 wire message cannot
+            // represent. Reject them instead of manufacturing a lossy Planner value.
+            other => return Err(DecodeError::UnsupportedLifecycle(other.into())),
+        };
+        let summary_maintenance_mode = match value.maintenance_mode.as_str() {
+            "direct_build" => SummaryMaintenanceMode::DirectBuild,
+            "incremental" => SummaryMaintenanceMode::Incremental,
+            other => return Err(DecodeError::UnsupportedLifecycle(other.into())),
+        };
+        let evaluation_schedule = match value.evaluation_schedule.as_str() {
+            "one_shot" => EvaluationSchedule::OneShot,
+            "per_update" => EvaluationSchedule::PerUpdate,
+            "on_read" => EvaluationSchedule::OnRead,
+            other => return Err(DecodeError::UnsupportedLifecycle(other.into())),
+        };
+        let output_representation = match value.output_representation.as_str() {
+            "plain_rows" => OutputRepresentation::PlainRows,
+            "summary_state" => OutputRepresentation::SummaryState,
+            "finalized_value" => OutputRepresentation::FinalizedValue,
+            other => return Err(DecodeError::UnsupportedLifecycle(other.into())),
+        };
+        Ok(Self {
+            summary_maintenance_lifecycle,
+            summary_maintenance_mode,
+            evaluation_schedule,
+            output_representation,
+        })
     }
 }
 
@@ -640,7 +680,7 @@ impl From<&Materialization> for proto::Materialization {
             group_by: m.group_by.clone(),
             rollup: m.rollup.clone(),
             spatial_filter: m.spatial_filter.clone(),
-            params: Some((&m.params).into()),
+            params: Some((&m.family).into()),
             col: Some((&m.col).into()),
             retention: m.retention.as_ref().map(Into::into),
             lifecycle: m.lifecycle.as_ref().map(Into::into),
@@ -651,26 +691,11 @@ impl From<&Materialization> for proto::Materialization {
 impl TryFrom<proto::Materialization> for Materialization {
     type Error = DecodeError;
     fn try_from(m: proto::Materialization) -> Result<Self, DecodeError> {
-        let (kind, params) = decode_summary_params(
+        let family = decode_summary_params(
             m.params
                 .ok_or(DecodeError::MissingOneof("Materialization.params"))?,
         )?;
-        let lifecycle = m.lifecycle.map(SummaryMaintenanceLifecycle::from);
-        if let Some(lifecycle) = &lifecycle {
-            if lifecycle.kind != "continuously_maintained"
-                || lifecycle.maintenance_mode != "incremental"
-                || lifecycle.evaluation_schedule != "per_update"
-                || lifecycle.output_representation != "summary_state"
-            {
-                return Err(DecodeError::UnsupportedLifecycle(format!(
-                    "{}/{}/{}/{}",
-                    lifecycle.kind,
-                    lifecycle.maintenance_mode,
-                    lifecycle.evaluation_schedule,
-                    lifecycle.output_representation
-                )));
-            }
-        }
+        let lifecycle = m.lifecycle.map(TryInto::try_into).transpose()?;
         Ok(Materialization {
             fingerprint: PolicyFingerprint(m.fingerprint),
             source: m
@@ -684,8 +709,7 @@ impl TryFrom<proto::Materialization> for Materialization {
             group_by: m.group_by,
             rollup: m.rollup,
             spatial_filter: m.spatial_filter,
-            kind,
-            params,
+            family,
             col: m
                 .col
                 .ok_or(DecodeError::MissingOneof("Materialization.col"))?
@@ -821,7 +845,7 @@ impl BackendPlan {
             if materialization.window.slide_ms == Some(0) {
                 return Err(ValidationError::ZeroSlide { fingerprint: key.0 });
             }
-            if !kind_params_match(&materialization.kind, &materialization.params) {
+            if !summary_family_is_valid(&materialization.family) {
                 return Err(ValidationError::KindParamsMismatch { fingerprint: key.0 });
             }
         }
@@ -841,46 +865,49 @@ impl BackendPlan {
     }
 }
 
-fn kind_params_match(kind: &SummaryKind, params: &SummaryParams) -> bool {
+fn summary_family_is_valid(family: &SummaryFamilyType) -> bool {
     matches!(
-        (kind, params),
-        (SummaryKind::Sum, SummaryParams::Sum)
-            | (SummaryKind::Count, SummaryParams::Count)
-            | (SummaryKind::MinMax, SummaryParams::MinMax)
-            | (SummaryKind::Increase, SummaryParams::Increase)
-            | (SummaryKind::Rate, SummaryParams::Rate)
-            | (SummaryKind::Kll, SummaryParams::Kll { .. })
-            | (SummaryKind::Cms, SummaryParams::Cms { .. })
-            | (SummaryKind::Hll, SummaryParams::Hll { .. })
-            | (SummaryKind::DDSketch, SummaryParams::DDSketch { .. })
-            | (SummaryKind::CmsWithHeap, SummaryParams::CmsWithHeap { .. })
-            | (SummaryKind::Kmv, SummaryParams::Kmv { .. })
-            | (SummaryKind::Theta, SummaryParams::Theta { .. })
-            | (SummaryKind::CountSketch, SummaryParams::CountSketch { .. })
-            | (
-                SummaryKind::CountSketchWithHeap,
-                SummaryParams::CountSketchWithHeap { .. }
-            )
+        family,
+        SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum)
+            | SummaryFamilyType::ExactAggregate(ExactKind::Count, ExactParams::Count)
+            | SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax)
+            | SummaryFamilyType::ExactAggregate(ExactKind::Increase, ExactParams::Increase)
+            | SummaryFamilyType::ExactAggregate(ExactKind::Rate, ExactParams::Rate)
+            | SummaryFamilyType::Sketch(..)
     )
 }
 
 fn materialization_satisfies(required: &Capability, m: &Materialization) -> bool {
-    let available = match m.kind {
-        SummaryKind::DDSketch => Capability::QuantileApprox(SketchKindHandle::DDSketch),
-        SummaryKind::Kll => Capability::QuantileApprox(SketchKindHandle::Kll),
-        SummaryKind::Hll => Capability::CardinalityApprox,
-        SummaryKind::Cms => Capability::FrequencyEstimate(SketchKindHandle::CountMin),
-        SummaryKind::CountSketch => Capability::FrequencyEstimate(SketchKindHandle::CountSketch),
-        SummaryKind::CmsWithHeap => Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap),
-        SummaryKind::CountSketchWithHeap => {
-            Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap)
+    let available = match &m.family {
+        SummaryFamilyType::Sketch(kind, _) => match kind.algorithm() {
+            SketchAlgorithm::DDSketch => {
+                Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))
+            }
+            SketchAlgorithm::Kll => Capability::QuantileApprox(Some(SketchAlgorithm::Kll)),
+            SketchAlgorithm::Hll => Capability::CardinalityApprox,
+            SketchAlgorithm::Cms => Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms)),
+            SketchAlgorithm::CountSketch => {
+                Capability::FrequencyEstimate(Some(SketchAlgorithm::CountSketch))
+            }
+            SketchAlgorithm::CmsWithHeap => {
+                Capability::FrequencyTopk(Some(SketchAlgorithm::CmsWithHeap))
+            }
+            SketchAlgorithm::CountSketchWithHeap => {
+                Capability::FrequencyTopk(Some(SketchAlgorithm::CountSketchWithHeap))
+            }
+            SketchAlgorithm::Kmv | SketchAlgorithm::Theta => return false,
+        },
+        SummaryFamilyType::ExactAggregate(ExactKind::Sum, _) => {
+            Capability::ExactAgg(AggregationType::Sum)
         }
-        SummaryKind::Sum => Capability::ExactAgg(AggregationType::Sum),
-        SummaryKind::MinMax => Capability::ExactAgg(AggregationType::MinMax),
-        SummaryKind::Increase => Capability::ExactAgg(AggregationType::Increase),
-        SummaryKind::Count | SummaryKind::Rate | SummaryKind::Kmv | SummaryKind::Theta => {
-            return false
+        SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _) => {
+            Capability::ExactAgg(AggregationType::MinMax)
         }
+        SummaryFamilyType::ExactAggregate(ExactKind::Increase, _) => {
+            Capability::ExactAgg(AggregationType::Increase)
+        }
+        SummaryFamilyType::ExactAggregate(ExactKind::Count | ExactKind::Rate, _) => return false,
+        _ => return false,
     };
     required.is_satisfied_by(&available)
 }
@@ -890,11 +917,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn sample_materialization(
-        fingerprint: u64,
-        kind: SummaryKind,
-        params: SummaryParams,
-    ) -> Materialization {
+    fn sample_materialization(fingerprint: u64, family: SummaryFamilyType) -> Materialization {
         Materialization {
             fingerprint: PolicyFingerprint(fingerprint),
             source: Source::TimeSeries {
@@ -908,19 +931,29 @@ mod tests {
             group_by: vec!["zone".to_string()],
             rollup: vec![],
             spatial_filter: String::new(),
-            kind,
-            params,
+            family,
             col: ColumnRef::SampleValue,
             retention: Some(RetentionPolicy {
                 num_aggregates_to_retain: Some(1000),
             }),
-            lifecycle: Some(SummaryMaintenanceLifecycle {
-                kind: "continuously_maintained".into(),
-                maintenance_mode: "incremental".into(),
-                evaluation_schedule: "per_update".into(),
-                output_representation: "summary_state".into(),
+            lifecycle: Some(SummaryMaintenanceLifecycleGuarantee {
+                summary_maintenance_lifecycle: SummaryMaintenanceLifecycle::ContinuouslyMaintained,
+                summary_maintenance_mode: SummaryMaintenanceMode::Incremental,
+                evaluation_schedule: EvaluationSchedule::PerUpdate,
+                output_representation: OutputRepresentation::SummaryState,
             }),
         }
+    }
+
+    fn exact(kind: ExactKind, params: ExactParams) -> SummaryFamilyType {
+        SummaryFamilyType::ExactAggregate(kind, params)
+    }
+
+    fn sketch(algorithm: SketchAlgorithm, params: SketchParams) -> SummaryFamilyType {
+        SummaryFamilyType::Sketch(
+            SketchKind::new(algorithm, params),
+            GroupingStrategy::PerSubpopulationInstance,
+        )
     }
 
     fn sample_plan() -> BackendPlan {
@@ -928,13 +961,16 @@ mod tests {
         // Approximate sketch.
         materializations.insert(
             PolicyFingerprint(1),
-            sample_materialization(1, SummaryKind::Kll, SummaryParams::Kll { k: 200 }),
+            sample_materialization(
+                1,
+                sketch(SketchAlgorithm::Kll, SketchParams::Kll { k: 200 }),
+            ),
         );
         // Exact accumulator -- same `SummaryKind`/`SummaryParams` vocabulary,
         // no separate wire representation (design doc §3).
         materializations.insert(
             PolicyFingerprint(2),
-            sample_materialization(2, SummaryKind::Sum, SummaryParams::Sum),
+            sample_materialization(2, exact(ExactKind::Sum, ExactParams::Sum)),
         );
 
         BackendPlan {
@@ -943,7 +979,7 @@ mod tests {
             materializations,
             routing: vec![
                 RoutingEntry {
-                    satisfies: Capability::QuantileApprox(SketchKindHandle::Any),
+                    satisfies: Capability::QuantileApprox(None),
                     materialization: PolicyFingerprint(1),
                     storage_backend: StorageBackend::SketchStore,
                 },
@@ -968,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_lifecycle_fails_closed_on_decode() {
+    fn ephemeral_lifecycle_round_trips() {
         let mut plan = sample_plan();
         plan.materializations
             .values_mut()
@@ -977,11 +1013,9 @@ mod tests {
             .lifecycle
             .as_mut()
             .unwrap()
-            .kind = "ephemeral".into();
-        assert!(matches!(
-            BackendPlan::decode(&plan.encode_to_vec()),
-            Err(DecodeError::UnsupportedLifecycle(_))
-        ));
+            .summary_maintenance_lifecycle = SummaryMaintenanceLifecycle::Ephemeral;
+        let decoded = BackendPlan::decode(&plan.encode_to_vec()).expect("decode");
+        assert_eq!(decoded, plan);
     }
 
     #[test]
@@ -994,87 +1028,87 @@ mod tests {
 
     #[test]
     fn kll_survives_round_trip_with_kind_and_params_agreeing() {
-        let m = sample_materialization(1, SummaryKind::Kll, SummaryParams::Kll { k: 200 });
+        let m = sample_materialization(
+            1,
+            sketch(SketchAlgorithm::Kll, SketchParams::Kll { k: 200 }),
+        );
         let wire = proto::Materialization::from(&m);
         let back = Materialization::try_from(wire).expect("decode must succeed");
-        assert_eq!(back.kind, SummaryKind::Kll);
-        assert_eq!(back.params, SummaryParams::Kll { k: 200 });
+        assert_eq!(back.family, m.family);
         assert_eq!(back, m);
     }
 
     #[test]
     fn sum_is_exact_and_carries_no_tuning_parameters() {
-        let m = sample_materialization(2, SummaryKind::Sum, SummaryParams::Sum);
+        let m = sample_materialization(2, exact(ExactKind::Sum, ExactParams::Sum));
         let wire = proto::Materialization::from(&m);
         let back = Materialization::try_from(wire).expect("decode must succeed");
-        assert!(back.kind.is_exact());
+        assert!(matches!(back.family, SummaryFamilyType::ExactAggregate(..)));
         assert_eq!(back, m);
     }
 
     #[test]
     fn every_summary_kind_round_trips() {
-        let cases = [
-            (SummaryKind::Sum, SummaryParams::Sum),
-            (SummaryKind::Count, SummaryParams::Count),
-            (SummaryKind::MinMax, SummaryParams::MinMax),
-            (SummaryKind::Increase, SummaryParams::Increase),
-            (SummaryKind::Rate, SummaryParams::Rate),
-            (SummaryKind::Kll, SummaryParams::Kll { k: 200 }),
-            (
-                SummaryKind::Cms,
-                SummaryParams::Cms {
+        let cases = vec![
+            exact(ExactKind::Sum, ExactParams::Sum),
+            exact(ExactKind::Count, ExactParams::Count),
+            exact(ExactKind::MinMax, ExactParams::MinMax),
+            exact(ExactKind::Increase, ExactParams::Increase),
+            exact(ExactKind::Rate, ExactParams::Rate),
+            sketch(SketchAlgorithm::Kll, SketchParams::Kll { k: 200 }),
+            sketch(
+                SketchAlgorithm::Cms,
+                SketchParams::Cms {
                     width: 64,
                     depth: 4,
                 },
             ),
-            (SummaryKind::Hll, SummaryParams::Hll { precision: 14 }),
-            (
-                SummaryKind::DDSketch,
-                SummaryParams::DDSketch { alpha: 0.01 },
+            sketch(SketchAlgorithm::Hll, SketchParams::Hll { precision: 14 }),
+            sketch(
+                SketchAlgorithm::DDSketch,
+                SketchParams::DDSketch { alpha: 0.01 },
             ),
-            (
-                SummaryKind::CmsWithHeap,
-                SummaryParams::CmsWithHeap {
+            sketch(
+                SketchAlgorithm::CmsWithHeap,
+                SketchParams::CmsWithHeap {
                     width: 64,
                     depth: 4,
                     heap_size: 10,
                 },
             ),
-            (SummaryKind::Kmv, SummaryParams::Kmv { k: 1024 }),
-            (SummaryKind::Theta, SummaryParams::Theta { k: 1024 }),
-            (
-                SummaryKind::CountSketch,
-                SummaryParams::CountSketch {
+            sketch(SketchAlgorithm::Kmv, SketchParams::Kmv { k: 1024 }),
+            sketch(SketchAlgorithm::Theta, SketchParams::Theta { k: 1024 }),
+            sketch(
+                SketchAlgorithm::CountSketch,
+                SketchParams::CountSketch {
                     width: 64,
                     depth: 4,
                 },
             ),
-            (
-                SummaryKind::CountSketchWithHeap,
-                SummaryParams::CountSketchWithHeap {
+            sketch(
+                SketchAlgorithm::CountSketchWithHeap,
+                SketchParams::CountSketchWithHeap {
                     width: 64,
                     depth: 4,
                     heap_size: 10,
                 },
             ),
         ];
-        for (kind, params) in cases {
-            let wire = proto::SummaryParams::from(&params);
-            let (decoded_kind, decoded_params) =
-                decode_summary_params(wire).expect("decode must succeed");
-            assert_eq!(decoded_kind, kind, "kind mismatch for {params:?}");
-            assert_eq!(decoded_params, params);
+        for family in cases {
+            let wire = proto::SummaryParams::from(&family);
+            let decoded = decode_summary_params(wire).expect("decode must succeed");
+            assert_eq!(decoded, family);
         }
     }
 
     #[test]
     fn every_capability_variant_round_trips() {
         let cases = [
-            Capability::QuantileApprox(SketchKindHandle::DDSketch),
-            Capability::QuantileApprox(SketchKindHandle::Any),
+            Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch)),
+            Capability::QuantileApprox(None),
             Capability::CardinalityApprox,
-            Capability::FrequencyEstimate(SketchKindHandle::CountMin),
-            Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap),
+            Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms)),
+            Capability::FrequencyTopk(Some(SketchAlgorithm::CmsWithHeap)),
             Capability::ExactAgg(AggregationType::Sum),
             Capability::ExactAgg(AggregationType::MultipleSubpopulation),
         ];

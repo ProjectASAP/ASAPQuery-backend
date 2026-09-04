@@ -219,7 +219,7 @@ impl EngineRouter {
         accuracy: AccuracyTarget,
         metric_storage: StorageBackend,
     ) -> Result<QueryResult, EngineRouterError> {
-        let backends = compatible_storage_backends(stat, accuracy, metric_storage);
+        let backends = compatible_storage_backends(stat, &accuracy, metric_storage);
         debug!(
             query = query,
             stat = ?stat,
@@ -354,7 +354,7 @@ impl EngineRouter {
         step_ms: u64,
         tier: RangeTier,
     ) -> Result<QueryResult, EngineRouterError> {
-        let mut backends = compatible_storage_backends(stat, accuracy, metric_storage);
+        let mut backends = compatible_storage_backends(stat, &accuracy, metric_storage);
         if matches!(tier, RangeTier::WarmOnly) {
             // Drop the archive leg: a range fully inside warm retention
             // must never be answered (empty) by the archive.
@@ -517,7 +517,7 @@ mod tests {
             .execute(
                 "sum_over_time(foo[5m])",
                 Statistic::Sum,
-                AccuracyTarget::Approximate,
+                AccuracyTarget::Epsilon(0.01),
                 StorageBackend::SketchStore,
             )
             .await;
@@ -574,7 +574,7 @@ mod tests {
             .execute(
                 "sum_over_time(foo[5m])",
                 Statistic::Sum,
-                AccuracyTarget::Approximate,
+                AccuracyTarget::Epsilon(0.01),
                 StorageBackend::DoubleWrite,
             )
             .await;
@@ -593,7 +593,7 @@ mod tests {
             .execute(
                 "sum_over_time(foo[5m])",
                 Statistic::Sum,
-                AccuracyTarget::Approximate,
+                AccuracyTarget::Epsilon(0.01),
                 StorageBackend::SketchStore,
             )
             .await;
@@ -627,7 +627,7 @@ mod tests {
             .execute(
                 "sum_over_time(foo[5m])",
                 Statistic::Sum,
-                AccuracyTarget::Approximate,
+                AccuracyTarget::Epsilon(0.01),
                 StorageBackend::SketchStore,
             )
             .await;
@@ -685,7 +685,7 @@ mod tests {
             .execute(
                 "sum_over_time(foo[5m])",
                 Statistic::Sum,
-                AccuracyTarget::Approximate,
+                AccuracyTarget::Epsilon(0.01),
                 StorageBackend::SketchStore,
             )
             .await;
@@ -771,7 +771,7 @@ mod tests {
             .execute_range(
                 "rate(http_requests_total[1m])",
                 Statistic::Sum,
-                AccuracyTarget::Approximate,
+                AccuracyTarget::Epsilon(0.01),
                 StorageBackend::SketchStore,
                 1_700_000_000_000,
                 1_700_003_600_000,
@@ -803,7 +803,7 @@ mod tests {
             .execute_range(
                 "rate(http_requests_total[1m])",
                 Statistic::Sum,
-                AccuracyTarget::Approximate,
+                AccuracyTarget::Epsilon(0.01),
                 StorageBackend::SketchStore,
                 0,
                 1_000,
@@ -885,7 +885,7 @@ mod tests {
             .execute_range_for_tier(
                 "sum_over_time(http_requests_total[300s])",
                 Statistic::Sum,
-                AccuracyTarget::Approximate,
+                AccuracyTarget::Epsilon(0.01),
                 // Cold metric resolves to the archive axis, but the range
                 // is recent so the HTTP layer marks it WarmOnly.
                 StorageBackend::GorillaObjectStore,
@@ -927,7 +927,7 @@ mod tests {
             .execute_range_for_tier(
                 "quantile_over_time(0.99, latency_ms[300s])",
                 Statistic::Sum,
-                AccuracyTarget::Approximate,
+                AccuracyTarget::Epsilon(0.01),
                 StorageBackend::GorillaObjectStore,
                 1_700_000_000_000,
                 1_700_000_300_000,
@@ -963,7 +963,7 @@ mod tests {
             .execute_range_for_tier(
                 "sum_over_time(http_requests_total[300s])",
                 Statistic::Sum,
-                AccuracyTarget::Approximate,
+                AccuracyTarget::Epsilon(0.01),
                 StorageBackend::GorillaObjectStore,
                 1_600_000_000_000,
                 1_600_000_300_000,

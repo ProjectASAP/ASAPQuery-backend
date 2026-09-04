@@ -16,14 +16,14 @@
 //!   * `FrequencyTopk`    → CountSketch | CountMinSketch   (heap layered on the same matrix)
 //!   * `ExactAgg`         → ∅  (served by the exact-aggregation / archive path, not a sketch)
 //!
-//! When a capability binds a *concrete* `SketchKindHandle` (not `Any`), the
+//! When a capability binds a *concrete* `SketchAlgorithm` (not `Any`), the
 //! result is exactly that one family; `Any` expands to the full candidate set.
 //!
 //! Moved out of `physical::post_asap` (Stage 4 of the `physical::post_asap`
 //! re-layering) — this is a query-planning concern (its one caller is
 //! [`crate::query_planning`]), not L4 IR.
 
-use crate::physical::runtime_capability::{Capability, SketchKindHandle};
+use crate::physical::runtime_capability::{Capability, SketchAlgorithm};
 use crate::types::SketchType;
 
 /// Map a sketch handle to the allocatable control-plane [`SketchType`].
@@ -33,18 +33,16 @@ use crate::types::SketchType;
 /// heap is an allocation detail layered on the same sketch, not a distinct
 /// allocatable family. `Any` is an analysis-time wildcard with no single
 /// concrete family, so it returns `None`.
-pub fn sketch_type_for_handle(h: SketchKindHandle) -> Option<SketchType> {
+pub fn sketch_type_for_algorithm(h: SketchAlgorithm) -> Option<SketchType> {
     match h {
-        SketchKindHandle::DDSketch => Some(SketchType::DDSketch),
-        SketchKindHandle::Kll => Some(SketchType::KLL),
-        SketchKindHandle::Hll => Some(SketchType::HLL),
-        SketchKindHandle::CountSketch | SketchKindHandle::CountSketchWithHeap => {
+        SketchAlgorithm::DDSketch => Some(SketchType::DDSketch),
+        SketchAlgorithm::Kll => Some(SketchType::KLL),
+        SketchAlgorithm::Hll => Some(SketchType::HLL),
+        SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap => {
             Some(SketchType::CountSketch)
         }
-        SketchKindHandle::CountMin | SketchKindHandle::CmsWithHeap => {
-            Some(SketchType::CountMinSketch)
-        }
-        SketchKindHandle::Any => None,
+        SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap => Some(SketchType::CountMinSketch),
+        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => None,
     }
 }
 
@@ -56,10 +54,10 @@ pub fn sketch_type_for_handle(h: SketchKindHandle) -> Option<SketchType> {
 /// no-op (the caller routes it to cold/exact instead).
 pub fn sketch_families_for_capability(cap: &Capability) -> Vec<SketchType> {
     match cap {
-        Capability::QuantileApprox(h) => concrete_or(*h, &[SketchType::DDSketch, SketchType::KLL]),
+        Capability::QuantileApprox(h) => concrete_or(h, &[SketchType::DDSketch, SketchType::KLL]),
         Capability::CardinalityApprox => vec![SketchType::HLL],
         Capability::FrequencyEstimate(h) | Capability::FrequencyTopk(h) => {
-            concrete_or(*h, &[SketchType::CountSketch, SketchType::CountMinSketch])
+            concrete_or(h, &[SketchType::CountSketch, SketchType::CountMinSketch])
         }
         Capability::ExactAgg(_) => Vec::new(),
     }
@@ -84,8 +82,8 @@ where
     out
 }
 
-fn concrete_or(h: SketchKindHandle, any_set: &[SketchType]) -> Vec<SketchType> {
-    match sketch_type_for_handle(h) {
+fn concrete_or(h: &Option<SketchAlgorithm>, any_set: &[SketchType]) -> Vec<SketchType> {
+    match h.clone().and_then(sketch_type_for_algorithm) {
         Some(t) => vec![t],
         None => any_set.to_vec(),
     }
@@ -98,19 +96,20 @@ mod tests {
 
     #[test]
     fn quantile_any_expands_to_ddsketch_and_kll() {
-        let fams =
-            sketch_families_for_capability(&Capability::QuantileApprox(SketchKindHandle::Any));
+        let fams = sketch_families_for_capability(&Capability::QuantileApprox(None));
         assert_eq!(fams, vec![SketchType::DDSketch, SketchType::KLL]);
     }
 
     #[test]
     fn quantile_concrete_handle_pins_one_family() {
         assert_eq!(
-            sketch_families_for_capability(&Capability::QuantileApprox(SketchKindHandle::DDSketch)),
+            sketch_families_for_capability(&Capability::QuantileApprox(Some(
+                SketchAlgorithm::DDSketch
+            ))),
             vec![SketchType::DDSketch]
         );
         assert_eq!(
-            sketch_families_for_capability(&Capability::QuantileApprox(SketchKindHandle::Kll)),
+            sketch_families_for_capability(&Capability::QuantileApprox(Some(SketchAlgorithm::Kll))),
             vec![SketchType::KLL]
         );
     }
@@ -127,20 +126,20 @@ mod tests {
     fn frequency_families_and_heap_collapse() {
         // bare frequency: Any -> both matrix families
         assert_eq!(
-            sketch_families_for_capability(&Capability::FrequencyEstimate(SketchKindHandle::Any)),
+            sketch_families_for_capability(&Capability::FrequencyEstimate(None)),
             vec![SketchType::CountSketch, SketchType::CountMinSketch]
         );
         // heap-bearing handles collapse to their matrix family
         assert_eq!(
-            sketch_families_for_capability(&Capability::FrequencyTopk(
-                SketchKindHandle::CmsWithHeap
-            )),
+            sketch_families_for_capability(&Capability::FrequencyTopk(Some(
+                SketchAlgorithm::CmsWithHeap
+            ))),
             vec![SketchType::CountMinSketch]
         );
         assert_eq!(
-            sketch_families_for_capability(&Capability::FrequencyTopk(
-                SketchKindHandle::CountSketchWithHeap
-            )),
+            sketch_families_for_capability(&Capability::FrequencyTopk(Some(
+                SketchAlgorithm::CountSketchWithHeap
+            ))),
             vec![SketchType::CountSketch]
         );
     }
@@ -157,9 +156,9 @@ mod tests {
         // a query set needing {quantile, cardinality, quantile-again} ->
         // DDSketch, KLL, HLL with no duplicate DDSketch/KLL.
         let caps = vec![
-            Capability::QuantileApprox(SketchKindHandle::Any),
+            Capability::QuantileApprox(None),
             Capability::CardinalityApprox,
-            Capability::QuantileApprox(SketchKindHandle::DDSketch),
+            Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch)),
         ];
         let got = required_sketches_for_capabilities(&caps);
         assert_eq!(

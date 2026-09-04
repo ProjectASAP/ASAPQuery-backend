@@ -1319,7 +1319,7 @@ async fn process_via_router(
     // metrics; for `GorillaObjectStore`-only deploys the dispatch
     // is a function of `metric_storage` alone.
     let stat = Statistic::Sum;
-    let accuracy = AccuracyTarget::Approximate;
+    let accuracy = AccuracyTarget::Epsilon(0.01);
 
     let router_result = state
         .query_router
@@ -1840,7 +1840,7 @@ async fn process_range_query_request(
     // an `Exact` range query will route straight to the archive via the
     // shared policy table.
     let stat = Statistic::Sum;
-    let accuracy = AccuracyTarget::Approximate;
+    let accuracy = AccuracyTarget::Epsilon(0.01);
 
     // Warm-vs-archive routing fix: split by the warm-retention boundary
     // rather than "archive-on ⇒ everything to archive". When the
@@ -3739,7 +3739,7 @@ aggregations:
         // `ColdJsonlFallback` last-resort slot; the surviving
         // failover surface is ASAP-tier sketch ↔ Gorilla-S3 archive.
         // The HTTP handler dispatches with default
-        // `(Statistic::Sum, AccuracyTarget::Approximate)`, so for a
+        // `(Statistic::Sum, AccuracyTarget::Epsilon(_))`, so for a
         // `DoubleWrite` metric the compatibility list is
         // `[SketchStore, GorillaObjectStore]` and the ASAP-tier
         // mock answers first. The archive must NOT be hit (no

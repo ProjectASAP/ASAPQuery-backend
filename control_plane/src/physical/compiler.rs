@@ -15,7 +15,8 @@ use asap_aware_mapping::{
 };
 use planner_types::post_asap::{
     CompositionOperator, EvaluationSchedule, OutputRepresentation, SketchQuery, SummaryExpr,
-    SummaryFamilyType, SummaryMaintenanceLifecycle, SummaryMaintenanceMode, SummaryNode,
+    SummaryFamilyType, SummaryMaintenanceLifecycle, SummaryMaintenanceLifecycleGuarantee,
+    SummaryMaintenanceMode, SummaryNode,
 };
 use planner_types::pre_asap::QueryExpr;
 use planner_types::workload::{
@@ -253,19 +254,18 @@ impl PhysicalCompiler {
                 }
             };
             let aggregation_id = format!("{}:{}", query.query_id, metric);
-            let kind = asap_types::SummaryKind::from(selected.kind.clone());
-            let params = asap_types::SummaryParams::from(selected.params.clone());
             aggregations.push(BackendAggregation {
                 aggregation_id: aggregation_id.clone(),
                 metric_name: metric.clone(),
-                sketch_kind: kind,
-                sketch_params: params,
+                family: SummaryFamilyType::Sketch(
+                    selected.kind.clone(),
+                    planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
+                ),
                 window_secs: query.window_secs,
                 spatial_filter: String::new(),
                 grouping: query.group_by.clone(),
                 item_label: None,
                 aggregation_input: AggregationInput::SketchEnvelope,
-                agg_type_override: None,
             });
             readouts.push(BackendReadout {
                 aggregation_id,
@@ -301,11 +301,11 @@ impl PhysicalCompiler {
             environment.observed_at_unix_ms,
         )?;
         for materialization in backend_plan.materializations.values_mut() {
-            materialization.lifecycle = Some(backend_plan::SummaryMaintenanceLifecycle {
-                kind: "continuously_maintained".into(),
-                maintenance_mode: "incremental".into(),
-                evaluation_schedule: "per_update".into(),
-                output_representation: "summary_state".into(),
+            materialization.lifecycle = Some(SummaryMaintenanceLifecycleGuarantee {
+                summary_maintenance_lifecycle: SummaryMaintenanceLifecycle::ContinuouslyMaintained,
+                summary_maintenance_mode: SummaryMaintenanceMode::Incremental,
+                evaluation_schedule: EvaluationSchedule::PerUpdate,
+                output_representation: OutputRepresentation::SummaryState,
             });
         }
         let collector_plans = environment
@@ -649,8 +649,8 @@ mod tests {
                 .lifecycle
                 .as_ref()
                 .unwrap()
-                .kind,
-            "continuously_maintained"
+                .summary_maintenance_lifecycle,
+            SummaryMaintenanceLifecycle::ContinuouslyMaintained
         );
         assert_eq!(bundle.backend_plan.routing.len(), 1);
         for plan in &bundle.collector_plans {

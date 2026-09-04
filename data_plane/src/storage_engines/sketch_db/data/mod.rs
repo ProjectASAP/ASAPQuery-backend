@@ -39,7 +39,7 @@
 //!
 //! ## Re-exports for callers
 //!
-//! - [`Capability`] / [`SketchKindHandle`] — the canonical
+//! - [`Capability`] / [`SketchAlgorithm`] — the canonical
 //!   control-plane-side capability vocabulary.
 //! - [`AggregationType`] — the agg-type enum that
 //!   `AggKind::ExactAgg` carries.
@@ -56,7 +56,7 @@
 // `is_satisfied_by` (used by the engine ASAP-tier hook) lives on the
 // control-plane-side `Capability` impl.
 
-pub use control_plane::physical::runtime_capability::{Capability, SketchKindHandle};
+pub use control_plane::physical::runtime_capability::{Capability, SketchAlgorithm};
 
 /// Re-export so callers don't need to depend on promql_utilities
 /// directly for the agg_type tag.
@@ -96,7 +96,7 @@ pub enum AggKind {
     /// Payload at storage layer is an encoded byte string
     /// (`SketchSampleState`).
     Sketch {
-        kind: SketchKindHandle,
+        algorithm: SketchAlgorithm,
         config: SketchConfig,
         /// Canonical form of the policy's spatial-filter predicate,
         /// produced by [`asap_types::utils::normalize_spatial_filter`]
@@ -170,13 +170,13 @@ impl AggKind {
     pub fn canonical_string(&self) -> String {
         match self {
             AggKind::Sketch {
-                kind,
+                algorithm: kind,
                 config,
                 spatial_filter_canonical,
             } => {
                 format!(
                     "sketch:{}:{}:filter={}",
-                    sketch_kind_canonical(*kind),
+                    sketch_algorithm_canonical(kind.clone()),
                     sketch_config_canonical(config),
                     spatial_filter_canonical,
                 )
@@ -199,20 +199,21 @@ impl AggKind {
     }
 }
 
-fn sketch_kind_canonical(k: SketchKindHandle) -> &'static str {
+fn sketch_algorithm_canonical(k: SketchAlgorithm) -> &'static str {
     match k {
-        SketchKindHandle::DDSketch => "DDSketch",
-        SketchKindHandle::Kll => "Kll",
-        SketchKindHandle::Hll => "Hll",
-        SketchKindHandle::CountSketch => "CountSketch",
-        SketchKindHandle::CountMin => "CountMin",
-        SketchKindHandle::CmsWithHeap => "CmsWithHeap",
-        SketchKindHandle::CountSketchWithHeap => "CountSketchWithHeap",
+        SketchAlgorithm::DDSketch => "DDSketch",
+        SketchAlgorithm::Kll => "Kll",
+        SketchAlgorithm::Hll => "Hll",
+        SketchAlgorithm::CountSketch => "CountSketch",
+        SketchAlgorithm::Cms => "CountMin",
+        SketchAlgorithm::CmsWithHeap => "CmsWithHeap",
+        SketchAlgorithm::CountSketchWithHeap => "CountSketchWithHeap",
         // `Any` is the analysis-time wildcard; never reaches the
         // ingest path which detects a concrete kind from the OTLP
         // wire variant. Mapping it to a unique tag anyway keeps the
         // canonical form total.
-        SketchKindHandle::Any => "Any",
+        SketchAlgorithm::Kmv => "Kmv",
+        SketchAlgorithm::Theta => "Theta",
     }
 }
 

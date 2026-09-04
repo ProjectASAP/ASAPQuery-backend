@@ -321,8 +321,10 @@ fn bind_cms_topk_tight_recall_picks_countsketch() {
 fn bind_cms_topk_picks_cost_min_meeting_sla() {
     use crate::physical::deployment_cost::wire::WireCostTable;
     let table = WireCostTable::default();
-    let cms = table.for_kind(&SketchAlgorithm::Cms).per_flush();
-    let cs = table.for_kind(&SketchAlgorithm::CountSketch).per_flush();
+    let cms = table.for_algorithm(&SketchAlgorithm::Cms).per_flush();
+    let cs = table
+        .for_algorithm(&SketchAlgorithm::CountSketch)
+        .per_flush();
     assert!(
         cms < cs,
         "CMS-heap ({cms} B) must be cheaper than CountSketch ({cs} B) on the wire"
@@ -667,7 +669,7 @@ fn phase_b_e2e_quantile_over_time_binds_to_quantile_sketch() {
         "quantile_over_time(0.99, http_request_duration_seconds[5m])",
         AccuracyTarget::Epsilon(0.01),
     );
-    let kind = crate::emit::extract_root_sketch_kind(&bound);
+    let kind = crate::emit::extract_root_sketch_algorithm(&bound);
     assert!(
         matches!(
             kind,
@@ -684,7 +686,7 @@ fn phase_b_e2e_quantile_over_time_binds_to_quantile_sketch() {
 /// `sum_over_time.yaml` — the legacy planner produces an exact-sum
 /// aggregation row (no summary). Control plane path: `Aggregate{Sum}` over
 /// `Window` → binds to an exact accumulator (`SummaryAgg{Sum}`), which is
-/// neither an approximate summary (so `extract_root_sketch_kind`, which
+/// neither an approximate summary (so `extract_root_sketch_algorithm`, which
 /// excludes exact accumulators — see its doc comment — returns `None`)
 /// nor archive-routed.
 #[test]
@@ -694,7 +696,7 @@ fn phase_b_e2e_sum_over_time_falls_through_to_logical() {
         AccuracyTarget::Epsilon(0.01),
     );
     assert!(
-        crate::emit::extract_root_sketch_kind(&bound).is_none(),
+        crate::emit::extract_root_sketch_algorithm(&bound).is_none(),
         "sum_over_time should not produce an approximate summary"
     );
     assert!(
@@ -717,7 +719,7 @@ fn phase_b_e2e_sum_by_preserves_grouping_label() {
         AccuracyTarget::Epsilon(0.01),
     );
     // No approximate summary family for plain Sum.
-    assert!(crate::emit::extract_root_sketch_kind(&bound).is_none());
+    assert!(crate::emit::extract_root_sketch_algorithm(&bound).is_none());
     // The end shape may carry `Logical(Aggregate{by, ...})` beneath a
     // `SummaryAgg{Sum}` wrapper, or `Logical(Window{...})` when the
     // ParsedQuery → QueryExpr lowering drops the Aggregate (legacy
@@ -750,7 +752,7 @@ fn phase_b_e2e_rate_falls_through_to_logical() {
         "rate(http_requests_total[5m])",
         AccuracyTarget::Epsilon(0.01),
     );
-    assert!(crate::emit::extract_root_sketch_kind(&bound).is_none());
+    assert!(crate::emit::extract_root_sketch_algorithm(&bound).is_none());
     assert!(
         !binding_is_archive(&bound),
         "Rate is ASAP-tier, not archive"
@@ -803,7 +805,7 @@ fn phase_b_e2e_archive_only_e2e_binding() {
         "archive-only intent must surface archive flag through L4 binding"
     );
     // No approximate summary fires for archive-only intents.
-    assert!(crate::emit::extract_root_sketch_kind(&bound).is_none());
+    assert!(crate::emit::extract_root_sketch_algorithm(&bound).is_none());
 }
 
 /// Cross-cutting: every Phase β archive-only intent reaches

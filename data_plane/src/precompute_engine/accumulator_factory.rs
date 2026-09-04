@@ -10,19 +10,19 @@ use crate::storage_engines::types::{
 use asap_types::aggregation_config::AggregationConfig;
 // Step 5 (sketch-identity unification, see
 // scratchpad/artifacts/enum-unification-plan.md): dispatch below is
-// driven by `AccumulatorSpec` (SummaryKind + typed SummaryParams +
+// driven by `AccumulatorSpec` (SummaryFamilyType + typed family parameters +
 // keyed-axis grouping) instead of raw `AggregationType` +
 // `aggregation_sub_type` string matching. Numeric params come straight
-// off `spec.params` (typed, no HashMap lookups) except `cms_params`,
-// kept as a raw-`parameters` read for the one case `SummaryParams` has
-// no field for: HydraKLL's `(row, col)` tiling grid (see
+// off the committed family's typed params (no HashMap lookups) except
+// `cms_params`, kept as a raw-`parameters` read for the one case Planner's
+// family parameters have no field for: HydraKLL's `(row, col)` tiling grid (see
 // `asap_types::accumulator_spec`'s module doc for why). `cms_params`
 // now lives there — the only place that still needs the other three
 // former local helpers (`kll_k_param`, `heap_size_param`,
 // `ddsketch_alpha_param`) is that module's own `AccumulatorSpec`
 // construction, so they aren't re-imported here.
 use asap_types::accumulator_spec::{cms_params, AccumulatorSpecError};
-use asap_types::{SummaryKind, SummaryParams};
+use planner_types::post_asap::{ExactKind, SketchAlgorithm, SketchParams, SummaryFamilyType};
 
 /// Generate the two boilerplate clone-based `AccumulatorUpdater` methods
 /// for updaters whose inner `acc` field implements `Clone + AggregateCore`.
@@ -688,12 +688,12 @@ impl AccumulatorUpdater for CmsHeapAccumulatorUpdater {
 /// Keyed point-frequency updater backed by a real `asap_sketchlib::CountSketch`
 /// (signed rows, median-of-rows estimator) — distinct math from
 /// `CmsAccumulatorUpdater`'s CMS (min-of-rows). Closes, on the raw-metric
-/// ingest path, the conflation bug where `SummaryKind::CountSketch` silently
+/// ingest path, the conflation bug where `SketchAlgorithm::CountSketch` silently
 /// shared `CmsAccumulatorUpdater` with bare CMS.
 ///
 /// As with bare CMS, each raw Prometheus sample contributes its `value`.
 /// Unit event counting must be selected explicitly by a future typed plan
-/// contract rather than being implied by `SummaryKind::CountSketch`.
+/// contract rather than being implied by `SketchAlgorithm::CountSketch`.
 pub struct CountSketchAccumulatorUpdater {
     acc: CountSketchAccumulator,
     row_num: usize,
@@ -904,73 +904,74 @@ fn topk_weight_param(config: &AggregationConfig) -> TopkWeight {
 // Factory function
 // ---------------------------------------------------------------------------
 
-/// Read the KLL `k` out of `SummaryParams::Kll`. `accumulator_spec()`
-/// always pairs `SummaryKind::Kll` with `SummaryParams::Kll`, so the
+/// Read the KLL `k` out of `SketchParams::Kll`. `accumulator_spec()`
+/// always builds a `SketchKind` whose `SketchAlgorithm::Kll` is paired with
+/// `SketchParams::Kll`, so the
 /// other arm is unreachable from a `spec` this module builds itself.
-fn kll_k(params: &SummaryParams) -> u16 {
+fn kll_k(params: &SketchParams) -> u16 {
     match params {
         // Lossless: `accumulator_spec()` only ever stores a value that
         // already fit in `u16` (via `kll_k_param`'s own `u16::try_from`
         // fallback) widened to `u32`.
-        SummaryParams::Kll { k } => *k as u16,
+        SketchParams::Kll { k } => *k as u16,
         other => unreachable!(
-            "accumulator_spec() paired SummaryKind::Kll with non-Kll params: {other:?}"
+            "accumulator_spec() paired SketchAlgorithm::Kll with non-Kll params: {other:?}"
         ),
     }
 }
 
-/// Read `(width, depth)` out of `SummaryParams::Cms` or `::CountSketch`
+/// Read `(width, depth)` out of `SketchParams::Cms` or `::CountSketch`
 /// — same shape, different variant per bare-sketch identity.
-fn cms_dims(params: &SummaryParams) -> (usize, usize) {
+fn cms_dims(params: &SketchParams) -> (usize, usize) {
     match params {
-        SummaryParams::Cms { width, depth } | SummaryParams::CountSketch { width, depth } => {
+        SketchParams::Cms { width, depth } | SketchParams::CountSketch { width, depth } => {
             (*width as usize, *depth as usize)
         }
         other => unreachable!(
-            "accumulator_spec() paired SummaryKind::Cms/CountSketch with unexpected params: {other:?}"
+            "accumulator_spec() paired SketchAlgorithm::Cms/CountSketch with unexpected params: {other:?}"
         ),
     }
 }
 
-/// Read `(width, depth, heap_size)` out of `SummaryParams::CmsWithHeap`
+/// Read `(width, depth, heap_size)` out of `SketchParams::CmsWithHeap`
 /// or `::CountSketchWithHeap`.
-fn cms_heap_dims(params: &SummaryParams) -> (usize, usize, usize) {
+fn cms_heap_dims(params: &SketchParams) -> (usize, usize, usize) {
     match params {
-        SummaryParams::CmsWithHeap {
+        SketchParams::CmsWithHeap {
             width,
             depth,
             heap_size,
         }
-        | SummaryParams::CountSketchWithHeap {
+        | SketchParams::CountSketchWithHeap {
             width,
             depth,
             heap_size,
         } => (*width as usize, *depth as usize, *heap_size as usize),
         other => unreachable!(
-            "accumulator_spec() paired a WithHeap SummaryKind with unexpected params: {other:?}"
+            "accumulator_spec() paired a WithHeap SketchAlgorithm with unexpected params: {other:?}"
         ),
     }
 }
 
-/// Read the DDSketch relative-accuracy `alpha` out of `SummaryParams::DDSketch`.
-fn ddsketch_alpha(params: &SummaryParams) -> f64 {
+/// Read the DDSketch relative-accuracy `alpha` out of `SketchParams::DDSketch`.
+fn ddsketch_alpha(params: &SketchParams) -> f64 {
     match params {
-        SummaryParams::DDSketch { alpha } => *alpha,
+        SketchParams::DDSketch { alpha } => *alpha,
         other => unreachable!(
-            "accumulator_spec() paired SummaryKind::DDSketch with non-DDSketch params: {other:?}"
+            "accumulator_spec() paired SketchAlgorithm::DDSketch with non-DDSketch params: {other:?}"
         ),
     }
 }
 
 /// Create an appropriate `AccumulatorUpdater` from an `AggregationConfig`.
 ///
-/// Dispatches on [`asap_types::AccumulatorSpec`] — `SummaryKind` identity
+/// Dispatches on [`asap_types::AccumulatorSpec`] — `SummaryFamilyType` identity
 /// plus the keyed/unkeyed `grouping` axis — instead of the pre-Step-5
 /// `AggregationType` + `aggregation_sub_type` string combo. See
 /// `asap_types::accumulator_spec`'s module doc for why min/max direction,
 /// HydraKLL's `(row, col)` tiling, and top-k `weight_mode` still read
-/// `config` directly rather than going through `SummaryParams` — none of
-/// those three have a field in ASAPController's upstream type to live in.
+/// `config` directly rather than going through Planner family parameters —
+/// none of those three have a field in the Planner-owned types.
 pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn AccumulatorUpdater> {
     let spec = match config.accumulator_spec() {
         Ok(spec) => spec,
@@ -1003,39 +1004,53 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
 
     let keyed = spec.grouping.is_some();
 
-    match (&spec.kind, keyed) {
-        (SummaryKind::Sum, false) => Box::new(SumAccumulatorUpdater::new()),
-        (SummaryKind::Sum, true) => Box::new(MultipleSumAccumulatorUpdater::new()),
+    match (&spec.family, keyed) {
+        (SummaryFamilyType::ExactAggregate(ExactKind::Sum, _), false) => {
+            Box::new(SumAccumulatorUpdater::new())
+        }
+        (SummaryFamilyType::ExactAggregate(ExactKind::Sum, _), true) => {
+            Box::new(MultipleSumAccumulatorUpdater::new())
+        }
 
-        // Min/max direction isn't part of `SummaryParams::MinMax`
+        // Min/max direction isn't part of `ExactParams::MinMax`
         // (upstream models no direction axis) — read straight off
         // `aggregation_sub_type`, exactly as the pre-Step-5 dispatch did
         // for the direct `AggregationType::MinMax`/`MultipleMinMax`
         // arms. `accumulator_spec()` only resolves a wrapper's sub_type
-        // to `SummaryKind::MinMax` for an exact "Min"/"min"/"Max"/"max"
+        // to `ExactKind::MinMax` for an exact "Min"/"min"/"Max"/"max"
         // match, so re-deriving via `eq_ignore_ascii_case("max")` here
         // reproduces the same true/false split for that path too.
-        (SummaryKind::MinMax, false) => Box::new(MinMaxAccumulatorUpdater::new(
-            config.aggregation_sub_type.eq_ignore_ascii_case("max"),
-        )),
-        (SummaryKind::MinMax, true) => Box::new(MultipleMinMaxAccumulatorUpdater::new(
-            config.aggregation_sub_type.eq_ignore_ascii_case("max"),
-        )),
+        (SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _), false) => Box::new(
+            MinMaxAccumulatorUpdater::new(config.aggregation_sub_type.eq_ignore_ascii_case("max")),
+        ),
+        (SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _), true) => {
+            Box::new(MultipleMinMaxAccumulatorUpdater::new(
+                config.aggregation_sub_type.eq_ignore_ascii_case("max"),
+            ))
+        }
 
-        (SummaryKind::Increase, false) => Box::new(IncreaseAccumulatorUpdater::new()),
-        (SummaryKind::Increase, true) => Box::new(MultipleIncreaseAccumulatorUpdater::new()),
+        (SummaryFamilyType::ExactAggregate(ExactKind::Increase, _), false) => {
+            Box::new(IncreaseAccumulatorUpdater::new())
+        }
+        (SummaryFamilyType::ExactAggregate(ExactKind::Increase, _), true) => {
+            Box::new(MultipleIncreaseAccumulatorUpdater::new())
+        }
 
-        (SummaryKind::Kll, false) => Box::new(KllAccumulatorUpdater::new(kll_k(&spec.params))),
+        (SummaryFamilyType::Sketch(kind, _), false)
+            if kind.algorithm() == &SketchAlgorithm::Kll =>
+        {
+            Box::new(KllAccumulatorUpdater::new(kll_k(kind.params())))
+        }
         // HydraKLL: `k` comes off the typed params like the unkeyed case,
-        // but the `(row, col)` tiling grid has no `SummaryParams::Kll`
+        // but the `(row, col)` tiling grid has no `SketchParams::Kll`
         // field to live in (see `asap_types::accumulator_spec`'s module
         // doc) — read it the same way bare CMS does, via `cms_params`.
-        (SummaryKind::Kll, true) => {
+        (SummaryFamilyType::Sketch(kind, _), true) if kind.algorithm() == &SketchAlgorithm::Kll => {
             let (row_num, col_num) = cms_params(config);
             Box::new(HydraKllAccumulatorUpdater::new(
                 row_num,
                 col_num,
-                kll_k(&spec.params),
+                kll_k(kind.params()),
             ))
         }
 
@@ -1043,8 +1058,8 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
         // can't actually arise here today (no `AggregationType` resolves to
         // bare Cms unkeyed — see accumulator_spec.rs), matched anyway as a
         // safe default.
-        (SummaryKind::Cms, _) => {
-            let (row_num, col_num) = cms_dims(&spec.params);
+        (SummaryFamilyType::Sketch(kind, _), _) if kind.algorithm() == &SketchAlgorithm::Cms => {
+            let (row_num, col_num) = cms_dims(kind.params());
             Box::new(CmsAccumulatorUpdater::new(row_num, col_num))
         }
 
@@ -1052,8 +1067,10 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
         // dedicated `CountSketchAccumulatorUpdater` (previously conflated
         // with `CmsAccumulatorUpdater`'s CMS min-math — see that struct's
         // doc).
-        (SummaryKind::CountSketch, _) => {
-            let (row_num, col_num) = cms_dims(&spec.params);
+        (SummaryFamilyType::Sketch(kind, _), _)
+            if kind.algorithm() == &SketchAlgorithm::CountSketch =>
+        {
+            let (row_num, col_num) = cms_dims(kind.params());
             Box::new(CountSketchAccumulatorUpdater::new(row_num, col_num))
         }
 
@@ -1065,8 +1082,10 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
         // count for genuine frequency-top-k (`weight_mode: count`). The OTLP
         // modified-sketch path builds the heap agent-side and uses
         // `SketchEnvelope` ingest, not this raw arm.
-        (SummaryKind::CmsWithHeap, _) => {
-            let (row_num, col_num, heap_size) = cms_heap_dims(&spec.params);
+        (SummaryFamilyType::Sketch(kind, _), _)
+            if kind.algorithm() == &SketchAlgorithm::CmsWithHeap =>
+        {
+            let (row_num, col_num, heap_size) = cms_heap_dims(kind.params());
             Box::new(CmsHeapAccumulatorUpdater::new(
                 row_num,
                 col_num,
@@ -1078,8 +1097,10 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
         // Heap-bearing top-k variant, real CountSketch math (previously
         // conflated with `CmsHeapAccumulatorUpdater`'s CMS-with-heap — see
         // `CountSketchWithHeapAccumulatorUpdater`'s doc).
-        (SummaryKind::CountSketchWithHeap, _) => {
-            let (row_num, col_num, heap_size) = cms_heap_dims(&spec.params);
+        (SummaryFamilyType::Sketch(kind, _), _)
+            if kind.algorithm() == &SketchAlgorithm::CountSketchWithHeap =>
+        {
+            let (row_num, col_num, heap_size) = cms_heap_dims(kind.params());
             Box::new(CountSketchWithHeapAccumulatorUpdater::new(
                 row_num,
                 col_num,
@@ -1088,23 +1109,27 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             ))
         }
 
-        (SummaryKind::DDSketch, _) => Box::new(DDSketchAccumulatorUpdater::new(ddsketch_alpha(
-            &spec.params,
-        ))),
+        (SummaryFamilyType::Sketch(kind, _), _)
+            if kind.algorithm() == &SketchAlgorithm::DDSketch =>
+        {
+            Box::new(DDSketchAccumulatorUpdater::new(ddsketch_alpha(
+                kind.params(),
+            )))
+        }
 
-        // `SummaryKind::Hll` / `Count` / `Rate` / `Kmv` / `Theta`: no
+        // unsupported HLL, Count, Rate, Kmv, and Theta families: no
         // `AggregationType` resolves to one of these via
         // `accumulator_spec()`'s `Ok` path today — HLL is caught by
         // `AccumulatorSpecError::UnmappedAggregationType` above (see its
         // doc for why: a pre-existing gap, not introduced here), and the
         // other four have no `AggregationType` counterpart at all. Kept
         // as an explicit warning fallback rather than `unreachable!()`
-        // so a future `SummaryKind` this dispatch doesn't yet know how
+        // so a future `SummaryFamilyType` this dispatch doesn't yet know how
         // to build fails safe instead of panicking.
-        (other_kind, keyed) => {
+        (other_family, keyed) => {
             tracing::warn!(
-                "SummaryKind {:?} (keyed={}) has no accumulator_factory mapping, defaulting to Sum",
-                other_kind,
+                "SummaryFamilyType {:?} (keyed={}) has no accumulator_factory mapping, defaulting to Sum",
+                other_family,
                 keyed
             );
             Box::new(SumAccumulatorUpdater::new())
@@ -1452,7 +1477,7 @@ mod tests {
     }
 
     /// Same as `ranked_topk`, but for the real `CountSketchWithHeapAccumulator`
-    /// (median-of-signed-rows) built by `SummaryKind::CountSketchWithHeap` —
+    /// (median-of-signed-rows) built by `SketchAlgorithm::CountSketchWithHeap` —
     /// no longer conflated with the CMS-family accumulator above.
     fn ranked_topk_cs(acc: &dyn AggregateCore) -> Vec<(String, f64)> {
         let heap = acc

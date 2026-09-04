@@ -91,11 +91,11 @@ impl Matcher for SummaryFamilyMatcher {
 /// `Sketch` arm, exposed directly for callers that only have bare kinds
 /// (no [`planner_types::post_asap::SketchParams`]) to compare.
 /// `control_plane::physical::runtime_capability::Capability::is_satisfied_by`
-/// is the first such caller: its `SketchKindHandle` query-side dispatch
+/// is the first such caller: its `SketchAlgorithm` query-side dispatch
 /// tag never carries params, so constructing a full
 /// `Implementation::Sketch{kind, params}` just to discard the params
 /// would mean fabricating meaningless param values. See that module's
-/// doc for why `Capability`/`SketchKindHandle` themselves aren't deleted
+/// doc for why `Capability`/`SketchAlgorithm` themselves aren't deleted
 /// outright (`scratchpad/artifacts/enum-unification-plan.md` §8 Step 4).
 pub fn sketch_family_satisfied(required: &SketchAlgorithm, available: &SketchAlgorithm) -> bool {
     let req_family = summary_family(required);

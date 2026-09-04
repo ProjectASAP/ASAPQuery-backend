@@ -42,7 +42,7 @@
 //! diagnosis. The record stores serializable PRIMITIVES — the
 //! `Capability` / `AccuracyBound` are DERIVED on load from `agg_kind`
 //! exactly as the ingest path derives them, so this module needs no
-//! serde on the control-plane `Capability` / `SketchKindHandle` enums.
+//! serde on the control-plane `Capability` / `SketchAlgorithm` enums.
 
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::storage_engines::sketch_db::data::{
-    AccuracyBound, AggKind, Capability, SketchConfig, SketchKindHandle,
+    AccuracyBound, AggKind, Capability, SketchAlgorithm, SketchConfig,
 };
 use crate::storage_engines::types::AggregationType;
 
@@ -119,32 +119,37 @@ impl From<&SketchConfigRec> for SketchConfig {
     }
 }
 
-/// Stable string form of a [`SketchKindHandle`] for the sidecar. Mirrors
-/// `sketch_kind_canonical` but is owned by the persistence layer so the
+/// Stable string form of a [`SketchAlgorithm`] for the sidecar. Mirrors
+/// `sketch_algorithm_canonical` but is owned by the persistence layer so the
 /// on-disk vocabulary is stable independent of any upstream rename.
-fn sketch_kind_to_str(k: SketchKindHandle) -> &'static str {
+fn sketch_algorithm_to_str(k: SketchAlgorithm) -> &'static str {
     match k {
-        SketchKindHandle::DDSketch => "DDSketch",
-        SketchKindHandle::Kll => "Kll",
-        SketchKindHandle::Hll => "Hll",
-        SketchKindHandle::CountSketch => "CountSketch",
-        SketchKindHandle::CountMin => "CountMin",
-        SketchKindHandle::CmsWithHeap => "CmsWithHeap",
-        SketchKindHandle::CountSketchWithHeap => "CountSketchWithHeap",
-        SketchKindHandle::Any => "Any",
+        SketchAlgorithm::DDSketch => "DDSketch",
+        SketchAlgorithm::Kll => "Kll",
+        SketchAlgorithm::Hll => "Hll",
+        SketchAlgorithm::CountSketch => "CountSketch",
+        SketchAlgorithm::Cms => "CountMin",
+        SketchAlgorithm::CmsWithHeap => "CmsWithHeap",
+        SketchAlgorithm::CountSketchWithHeap => "CountSketchWithHeap",
+        SketchAlgorithm::Kmv => "Kmv",
+        SketchAlgorithm::Theta => "Theta",
     }
 }
 
-fn sketch_kind_from_str(s: &str) -> Option<SketchKindHandle> {
+fn sketch_algorithm_from_str(s: &str) -> Option<SketchAlgorithm> {
     Some(match s {
-        "DDSketch" => SketchKindHandle::DDSketch,
-        "Kll" => SketchKindHandle::Kll,
-        "Hll" => SketchKindHandle::Hll,
-        "CountSketch" => SketchKindHandle::CountSketch,
-        "CountMin" => SketchKindHandle::CountMin,
-        "CmsWithHeap" => SketchKindHandle::CmsWithHeap,
-        "CountSketchWithHeap" => SketchKindHandle::CountSketchWithHeap,
-        "Any" => SketchKindHandle::Any,
+        "DDSketch" => SketchAlgorithm::DDSketch,
+        "Kll" => SketchAlgorithm::Kll,
+        "Hll" => SketchAlgorithm::Hll,
+        "CountSketch" => SketchAlgorithm::CountSketch,
+        "CountMin" => SketchAlgorithm::Cms,
+        "CmsWithHeap" => SketchAlgorithm::CmsWithHeap,
+        "CountSketchWithHeap" => SketchAlgorithm::CountSketchWithHeap,
+        "Kmv" => SketchAlgorithm::Kmv,
+        "Theta" => SketchAlgorithm::Theta,
+        // `Any` was never a valid stored implementation. Reject legacy
+        // sidecars that contain it instead of inventing an algorithm.
+        "Any" => return None,
         _ => return None,
     })
 }
@@ -169,11 +174,11 @@ impl From<&AggKind> for AggKindRec {
     fn from(a: &AggKind) -> Self {
         match a {
             AggKind::Sketch {
-                kind,
+                algorithm: kind,
                 config,
                 spatial_filter_canonical,
             } => AggKindRec::Sketch {
-                sketch_kind: sketch_kind_to_str(*kind).to_string(),
+                sketch_kind: sketch_algorithm_to_str(kind.clone()).to_string(),
                 config: config.into(),
                 spatial_filter_canonical: spatial_filter_canonical.clone(),
             },
@@ -201,7 +206,7 @@ impl AggKindRec {
                 config,
                 spatial_filter_canonical,
             } => AggKind::Sketch {
-                kind: sketch_kind_from_str(sketch_kind)?,
+                algorithm: sketch_algorithm_from_str(sketch_kind)?,
                 config: config.into(),
                 spatial_filter_canonical: spatial_filter_canonical.clone(),
             },
@@ -265,20 +270,20 @@ impl SidMetaRecord {
     pub fn capability(&self) -> Option<Capability> {
         let agg_kind = self.agg_kind()?;
         Some(match agg_kind {
-            AggKind::Sketch { kind, .. } => match kind {
-                SketchKindHandle::DDSketch | SketchKindHandle::Kll => {
-                    Capability::QuantileApprox(kind)
+            AggKind::Sketch {
+                algorithm: kind, ..
+            } => match kind {
+                SketchAlgorithm::DDSketch | SketchAlgorithm::Kll => {
+                    Capability::QuantileApprox(Some(kind))
                 }
-                SketchKindHandle::Hll => Capability::CardinalityApprox,
-                SketchKindHandle::CountSketch | SketchKindHandle::CountMin => {
-                    Capability::FrequencyEstimate(kind)
+                SketchAlgorithm::Hll => Capability::CardinalityApprox,
+                SketchAlgorithm::CountSketch | SketchAlgorithm::Cms => {
+                    Capability::FrequencyEstimate(Some(kind))
                 }
-                SketchKindHandle::CmsWithHeap | SketchKindHandle::CountSketchWithHeap => {
-                    Capability::FrequencyTopk(kind)
+                SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap => {
+                    Capability::FrequencyTopk(Some(kind))
                 }
-                // Defensive: `Any` is a control-plane wildcard that should
-                // never reach the index; mirror the ingest fallback.
-                SketchKindHandle::Any => Capability::QuantileApprox(kind),
+                SketchAlgorithm::Kmv | SketchAlgorithm::Theta => Capability::CardinalityApprox,
             },
             AggKind::ExactAgg { agg_type, .. } => Capability::ExactAgg(agg_type),
         })
@@ -411,7 +416,7 @@ mod tests {
             "http_latency".into(),
             vec!["host".into(), "zone".into()],
             &AggKind::Sketch {
-                kind: SketchKindHandle::Kll,
+                algorithm: SketchAlgorithm::Kll,
                 config: SketchConfig::Kll { k: 200 },
                 spatial_filter_canonical: String::new(),
             },
@@ -475,7 +480,7 @@ mod tests {
         let kll = sketch_meta(1);
         assert!(matches!(
             kll.capability(),
-            Some(Capability::QuantileApprox(SketchKindHandle::Kll))
+            Some(Capability::QuantileApprox(Some(SketchAlgorithm::Kll)))
         ));
         assert!(kll.accuracy().is_some());
 

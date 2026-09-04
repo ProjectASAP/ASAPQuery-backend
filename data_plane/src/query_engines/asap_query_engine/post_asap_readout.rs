@@ -212,7 +212,7 @@ mod tests {
     use super::*;
     use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig};
     use crate::storage_engines::sketch_db::index::{
-        AccuracyBound, Capability, SketchInstanceMetadata, SketchKindHandle, SketchSampleState,
+        AccuracyBound, Capability, SketchAlgorithm, SketchInstanceMetadata, SketchSampleState,
     };
 
     fn accuracy() -> AccuracyTarget {
@@ -235,7 +235,7 @@ mod tests {
             group_by_keys,
             capability: Some(Capability::CardinalityApprox),
             agg_kind: AggKind::Sketch {
-                kind: SketchKindHandle::Hll,
+                algorithm: SketchAlgorithm::Hll,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },
@@ -275,9 +275,9 @@ mod tests {
             sid: 1,
             metric_name: "latency_ms".to_string(),
             group_by_keys: std::collections::BTreeSet::new(),
-            capability: Some(Capability::QuantileApprox(SketchKindHandle::DDSketch)),
+            capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),
             agg_kind: AggKind::Sketch {
-                kind: SketchKindHandle::DDSketch,
+                algorithm: SketchAlgorithm::DDSketch,
                 config: cfg.clone(),
                 spatial_filter_canonical: String::new(),
             },

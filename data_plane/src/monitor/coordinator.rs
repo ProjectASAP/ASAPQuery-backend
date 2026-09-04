@@ -39,25 +39,7 @@ use super::sampling_alloc::epsilon_sample_floor;
 /// for identity/config-schema compatibility (a monitor is still keyed by
 /// `(agg_id, key)`, and `key` is only meaningful for `CmsPoint`) even though
 /// no functional-specific THRESHOLDING happens here anymore.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Functional {
-    #[default]
-    Sum,
-    CmsPoint,
-    LinearBuckets,
-}
-
-impl Functional {
-    /// Parse the pushed-config functional string (`streaming_config` /
-    /// `emit/monitor.rs` use the same names). Unknown ⇒ `Sum`.
-    pub fn from_name(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "cms_point" | "cms" => Functional::CmsPoint,
-            "linear_buckets" | "linear" => Functional::LinearBuckets,
-            _ => Functional::Sum,
-        }
-    }
-}
+pub use asap_types::MonitorFunctional as Functional;
 
 /// Static configuration for one monitor, sourced from the streaming-config
 /// `monitors:` section.

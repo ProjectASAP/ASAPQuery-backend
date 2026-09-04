@@ -295,7 +295,7 @@ fn build_asap_sketches_config(sp: &EdgeSketchProcessor, window_secs: Option<u64>
     // the DAG walk; it just doesn't reach the wire here.
     m.insert(
         "sketch_kind".into(),
-        Value::String(sketch_kind_tag(&sp.sketch_kind).into()),
+        Value::String(sketch_algorithm_tag(&sp.sketch_algorithm).into()),
     );
     match &sp.sketch_params {
         SketchParams::Kll { k } => {
@@ -335,7 +335,7 @@ fn build_asap_sketches_config(sp: &EdgeSketchProcessor, window_secs: Option<u64>
     Value::Mapping(m)
 }
 
-fn sketch_kind_tag(kind: &SketchAlgorithm) -> &'static str {
+fn sketch_algorithm_tag(kind: &SketchAlgorithm) -> &'static str {
     match kind {
         SketchAlgorithm::Kll => "kll",
         SketchAlgorithm::DDSketch => "ddsketch",
@@ -404,7 +404,7 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "ddsketch".to_string(),
-                sketch_kind: SketchAlgorithm::DDSketch,
+                sketch_algorithm: SketchAlgorithm::DDSketch,
                 sketch_params: SketchParams::DDSketch { alpha: 0.01 },
                 aggregation_id: "agg0".to_string(),
             }],

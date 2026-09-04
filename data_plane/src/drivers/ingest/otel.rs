@@ -39,6 +39,7 @@ use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
 use asap_sketchlib::MessagePackCodec;
 use axum::{body::Bytes, extract::State, routing::post, Json, Router};
 use flate2::read::GzDecoder;
+use planner_types::post_asap::SketchAlgorithm;
 use prost::Message;
 use std::sync::Arc;
 use std::time::Instant;
@@ -594,7 +595,7 @@ fn flush_barrier_drops(_state: &IngestState, drops: &HashMap<u64, u64>, driver_t
 /// `reconcile_from_streaming_config` derives from the same config; the
 /// modified-OTLP first-class sketch path takes a different sid-
 /// resolution route inside `route_modified_otlp_sketches_to_precompute`
-/// because it carries per-DP `(SketchKindHandle, SketchConfig)` and
+/// because it carries per-DP `(SketchAlgorithm, SketchConfig)` and
 /// must distinguish (e.g.) DDSketch vs Kll over the same series.
 fn resolve_bucket_sid_for_agg_config(
     ingest_state: &Arc<IngestState>,
@@ -948,7 +949,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         d.data_points
                             .iter()
                             .map(|dp| ModifiedOtlpSketchDp {
-                                kind: SketchKind::DdSketch,
+                                algorithm: SketchAlgorithm::DDSketch,
                                 attrs: merge_point_attributes(&base_labels, &dp.attributes),
                                 time_unix_nano: dp.time_unix_nano,
                                 sketch: dp.sketch.clone(),
@@ -965,7 +966,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         k.data_points
                             .iter()
                             .map(|dp| ModifiedOtlpSketchDp {
-                                kind: SketchKind::Kll,
+                                algorithm: SketchAlgorithm::Kll,
                                 attrs: merge_point_attributes(&base_labels, &dp.attributes),
                                 time_unix_nano: dp.time_unix_nano,
                                 sketch: dp.sketch.clone(),
@@ -985,7 +986,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         c.data_points
                             .iter()
                             .map(|dp| ModifiedOtlpSketchDp {
-                                kind: SketchKind::CountSketch,
+                                algorithm: SketchAlgorithm::CountSketch,
                                 attrs: merge_point_attributes(&base_labels, &dp.attributes),
                                 time_unix_nano: dp.time_unix_nano,
                                 sketch: dp.sketch.clone(),
@@ -1005,7 +1006,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         c.data_points
                             .iter()
                             .map(|dp| ModifiedOtlpSketchDp {
-                                kind: SketchKind::CountMin,
+                                algorithm: SketchAlgorithm::Cms,
                                 attrs: merge_point_attributes(&base_labels, &dp.attributes),
                                 time_unix_nano: dp.time_unix_nano,
                                 sketch: dp.sketch.clone(),
@@ -1023,7 +1024,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         h.data_points
                             .iter()
                             .map(|dp| ModifiedOtlpSketchDp {
-                                kind: SketchKind::Hll,
+                                algorithm: SketchAlgorithm::Hll,
                                 attrs: merge_point_attributes(&base_labels, &dp.attributes),
                                 time_unix_nano: dp.time_unix_nano,
                                 sketch: dp.sketch.clone(),
@@ -1052,7 +1053,8 @@ async fn route_modified_otlp_sketches_to_precompute(
                 // determines the suffix for the whole metric.
                 let canonical_name: String = match dps.first() {
                     Some(first) => {
-                        canonical_sketch_metric_name(&metric.name, first.kind).to_string()
+                        canonical_sketch_metric_name(&metric.name, first.algorithm.clone())
+                            .to_string()
                     }
                     None => metric.name.clone(),
                 };
@@ -1143,7 +1145,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                         // Build the canonical AggKind string for this DP so
                         // the resolver's cache key is `(metric, fp, agg_kind)`.
                         // Two DPs over the same (metric, attrs) but different
-                        // sketch kinds/configs (e.g. DDSketch vs Kll, or two
+                        // sketch algorithms/configs (e.g. DDSketch vs Kll, or two
                         // DDSketches at different relative_accuracy) get
                         // SEPARATE sids — matching the identity model the
                         // retired `compute_sketch_sid` hashed over. For the
@@ -1161,9 +1163,9 @@ async fn route_modified_otlp_sketches_to_precompute(
                         // frames would mint distinct sids and the upgrade
                         // could never fire (the analyzer would also see two
                         // candidates for one logical series).
-                        let kind_for_sid = base_sketch_kind_handle(sketch_kind_handle_for(&dp));
+                        let algorithm_for_sid = base_sketch_algorithm(sketch_algorithm_for(&dp));
                         let agg_kind = crate::storage_engines::sketch_db::data::AggKind::Sketch {
-                            kind: kind_for_sid,
+                            algorithm: algorithm_for_sid,
                             config: dp.container_config.clone(),
                             // OTel-ingest path: no per-DP spatial filter applies
                             // at this layer (the agent has already filtered
@@ -1219,25 +1221,25 @@ async fn route_modified_otlp_sketches_to_precompute(
                     // and its key set IS the group-by KEY set.
                     {
                         use crate::storage_engines::sketch_db::index::{
-                            AccuracyBound, Capability, SketchEncoding, SketchInstanceMetadata,
-                            SketchKindHandle, SketchSampleState,
+                            AccuracyBound, Capability, SketchAlgorithm, SketchEncoding,
+                            SketchInstanceMetadata, SketchSampleState,
                         };
                         use std::collections::{BTreeMap, BTreeSet};
 
                         if ingest_state.sketch_index.instance(sid).is_none() {
-                            let kind = sketch_kind_handle_for(&dp);
-                            let cap = match kind {
-                                SketchKindHandle::DDSketch | SketchKindHandle::Kll => {
-                                    Capability::QuantileApprox(kind)
+                            let algorithm = sketch_algorithm_for(&dp);
+                            let cap = match algorithm {
+                                SketchAlgorithm::DDSketch | SketchAlgorithm::Kll => {
+                                    Capability::QuantileApprox(Some(algorithm.clone()))
                                 }
-                                SketchKindHandle::Hll => Capability::CardinalityApprox,
+                                SketchAlgorithm::Hll => Capability::CardinalityApprox,
                                 // Heap-LESS frequency sketches answer bare
                                 // frequency point queries (no top-k); index
                                 // them as FrequencyEstimate so a `topk(...)`
                                 // query routes to archive (or to a different
                                 // sid that carries a heap-bearing variant).
-                                SketchKindHandle::CountSketch | SketchKindHandle::CountMin => {
-                                    Capability::FrequencyEstimate(kind)
+                                SketchAlgorithm::CountSketch | SketchAlgorithm::Cms => {
+                                    Capability::FrequencyEstimate(Some(algorithm.clone()))
                                 }
                                 // Heap-BEARING frequency sketches answer
                                 // both point-frequency AND top-k. We register
@@ -1246,19 +1248,13 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 // `is_satisfied_by` for FrequencyEstimate
                                 // explicitly accepts heap-bearing variants,
                                 // so bare-frequency queries still route here.
-                                SketchKindHandle::CmsWithHeap
-                                | SketchKindHandle::CountSketchWithHeap => {
-                                    Capability::FrequencyTopk(kind)
+                                SketchAlgorithm::CmsWithHeap
+                                | SketchAlgorithm::CountSketchWithHeap => {
+                                    Capability::FrequencyTopk(Some(algorithm.clone()))
                                 }
-                                // `Any` is the control-plane-side analysis-
-                                // time wildcard — it should never appear
-                                // on the ingest path (which detects a
-                                // concrete sketch kind from the OTLP
-                                // wire variant). Default defensively to
-                                // QuantileApprox so a stray `Any`
-                                // doesn't panic; the analyzer's
-                                // `is_satisfied_by` rejects mismatches.
-                                SketchKindHandle::Any => Capability::QuantileApprox(kind),
+                                SketchAlgorithm::Kmv | SketchAlgorithm::Theta => {
+                                    Capability::CardinalityApprox
+                                }
                             };
                             let group_by_keys: BTreeSet<String> =
                                 dp.attrs.keys().cloned().collect();
@@ -1280,7 +1276,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             let policy_fp = derive_sketch_policy_fp(
                                 ingest_state,
                                 &canonical_name,
-                                kind,
+                                algorithm.clone(),
                                 &cfg,
                                 &group_by_keys,
                             );
@@ -1308,7 +1304,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 capability: Some(cap),
                                 agg_kind:
                                     crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                                        kind,
+                                        algorithm,
                                         config: cfg.clone(),
                                         spatial_filter_canonical: String::new(),
                                     },
@@ -1333,26 +1329,27 @@ async fn route_modified_otlp_sketches_to_precompute(
                             // top-k queries here. Never downgrades: we only
                             // act when the current cap is heap-LESS frequency
                             // and the incoming frame actually carries a heap.
-                            let incoming_kind = sketch_kind_handle_for(&dp);
-                            let upgrade_to = match (&existing.capability, incoming_kind) {
+                            let incoming_algorithm = sketch_algorithm_for(&dp);
+                            let upgrade_to = match (&existing.capability, incoming_algorithm) {
                                 (
-                                    Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
-                                    SketchKindHandle::CmsWithHeap,
-                                ) => Some(SketchKindHandle::CmsWithHeap),
+                                    Some(Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms))),
+                                    SketchAlgorithm::CmsWithHeap,
+                                ) => Some(SketchAlgorithm::CmsWithHeap),
                                 (
-                                    Some(Capability::FrequencyEstimate(
-                                        SketchKindHandle::CountSketch,
-                                    )),
-                                    SketchKindHandle::CountSketchWithHeap,
-                                ) => Some(SketchKindHandle::CountSketchWithHeap),
+                                    Some(Capability::FrequencyEstimate(Some(
+                                        SketchAlgorithm::CountSketch,
+                                    ))),
+                                    SketchAlgorithm::CountSketchWithHeap,
+                                ) => Some(SketchAlgorithm::CountSketchWithHeap),
                                 _ => None,
                             };
-                            if let Some(new_kind) = upgrade_to {
+                            if let Some(new_algorithm) = upgrade_to {
                                 let mut upgraded = existing;
-                                upgraded.capability = Some(Capability::FrequencyTopk(new_kind));
+                                upgraded.capability =
+                                    Some(Capability::FrequencyTopk(Some(new_algorithm.clone())));
                                 upgraded.agg_kind =
                                     crate::storage_engines::sketch_db::index::AggKind::Sketch {
-                                        kind: new_kind,
+                                        algorithm: new_algorithm.clone(),
                                         config: dp.container_config.clone(),
                                         spatial_filter_canonical: String::new(),
                                     };
@@ -1365,8 +1362,8 @@ async fn route_modified_otlp_sketches_to_precompute(
                                     "OTLP sketch sid {} upgraded {:?} -> FrequencyTopk({:?}) \
                                      on heap-bearing frame (metric={}, encoding={})",
                                     sid,
-                                    SketchKindHandle::CountMin,
-                                    new_kind,
+                                    SketchAlgorithm::Cms,
+                                    new_algorithm,
                                     metric.name,
                                     dp.encoding
                                 );
@@ -1449,7 +1446,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 // unchanged "drop until the next full frame"
                                 // behavior.
                                 match empty_accumulator_for_delta_bootstrap(
-                                    dp.kind,
+                                    dp.algorithm.clone(),
                                     &dp.container_config,
                                     dp.encoding,
                                 ) {
@@ -1460,7 +1457,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                              accumulator (metric={}, \
                                              series_key={}, kind={:?}, \
                                              encoding={})",
-                                            metric.name, series_key, dp.kind, dp.encoding
+                                            metric.name, series_key, dp.algorithm, dp.encoding
                                         );
                                         // Treat the freshly-minted empty base
                                         // as belonging to THIS delta's window
@@ -1483,7 +1480,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                              (metric={}, series_key={}, kind={:?}); \
                                              dropping — agent must resend the next full \
                                              frame",
-                                            metric.name, series_key, dp.kind
+                                            metric.name, series_key, dp.algorithm
                                         );
                                         continue;
                                     }
@@ -1505,7 +1502,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                             merged.reset_to_empty();
                         }
                         if let Err(e) = apply_modified_otlp_delta_bytes(
-                            dp.kind,
+                            dp.algorithm.clone(),
                             dp.encoding,
                             &mut merged,
                             &dp.sketch,
@@ -1521,7 +1518,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                  bytes={}): {} — falling through to §5.2 \
                                  fallback",
                                 metric.name,
-                                dp.kind,
+                                dp.algorithm,
                                 dp.encoding,
                                 dp.sketch.len(),
                                 e
@@ -1541,7 +1538,11 @@ async fn route_modified_otlp_sketches_to_precompute(
                         ingest_state.note_window_and_sweep(dp.start_time_unix_nano);
                         merged
                     } else {
-                        match decode_modified_otlp_sketch_bytes(dp.kind, dp.encoding, &dp.sketch) {
+                        match decode_modified_otlp_sketch_bytes(
+                            dp.algorithm.clone(),
+                            dp.encoding,
+                            &dp.sketch,
+                        ) {
                             Ok(acc) => {
                                 ingest_state.sketch_snapshots.insert(
                                     series_key.clone(),
@@ -1574,7 +1575,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                          validation (metric={}, kind={:?}, \
                                          encoding={}, bytes={}): {}",
                                         metric.name,
-                                        dp.kind,
+                                        dp.algorithm,
                                         dp.encoding,
                                         dp.sketch.len(),
                                         msg
@@ -1586,7 +1587,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                          bytes={}): {} — falling through to §5.2 \
                                          fallback",
                                         metric.name,
-                                        dp.kind,
+                                        dp.algorithm,
                                         dp.encoding,
                                         dp.sketch.len(),
                                         msg
@@ -1714,9 +1715,9 @@ async fn route_modified_otlp_sketches_to_precompute(
     }
 }
 
-/// Map `SketchKindHandle` to the corresponding wire-format
+/// Map `SketchAlgorithm` to the corresponding wire-format
 /// `AggregationType`. Inverse direction is in
-/// `sketch_kind_handle_for` above. Used by
+/// `sketch_algorithm_for` above. Used by
 /// [`derive_sketch_policy_fp`] to find the policy whose
 /// `AggregationConfig.aggregation_type` matches a freshly-ingested
 /// sketch.
@@ -1724,20 +1725,20 @@ async fn route_modified_otlp_sketches_to_precompute(
 /// `Any` is a control-plane analysis-time wildcard — it doesn't
 /// appear on the ingest path. Returns `None` so the policy lookup
 /// fails the (rare) defensive path explicitly.
-fn aggregation_type_for_sketch_handle(
-    handle: crate::storage_engines::sketch_db::index::SketchKindHandle,
+fn aggregation_type_for_sketch_algorithm(
+    handle: crate::storage_engines::sketch_db::index::SketchAlgorithm,
 ) -> Option<asap_types::AggregationType> {
-    use crate::storage_engines::sketch_db::index::SketchKindHandle;
+    use crate::storage_engines::sketch_db::index::SketchAlgorithm;
     use asap_types::AggregationType;
     match handle {
-        SketchKindHandle::DDSketch => Some(AggregationType::DDSketch),
-        SketchKindHandle::Kll => Some(AggregationType::DatasketchesKLL),
-        SketchKindHandle::Hll => Some(AggregationType::HLL),
-        SketchKindHandle::CountSketch => Some(AggregationType::CountSketch),
-        SketchKindHandle::CountSketchWithHeap => Some(AggregationType::CountSketchWithHeap),
-        SketchKindHandle::CountMin => Some(AggregationType::CountMinSketch),
-        SketchKindHandle::CmsWithHeap => Some(AggregationType::CountMinSketchWithHeap),
-        SketchKindHandle::Any => None,
+        SketchAlgorithm::DDSketch => Some(AggregationType::DDSketch),
+        SketchAlgorithm::Kll => Some(AggregationType::DatasketchesKLL),
+        SketchAlgorithm::Hll => Some(AggregationType::HLL),
+        SketchAlgorithm::CountSketch => Some(AggregationType::CountSketch),
+        SketchAlgorithm::CountSketchWithHeap => Some(AggregationType::CountSketchWithHeap),
+        SketchAlgorithm::Cms => Some(AggregationType::CountMinSketch),
+        SketchAlgorithm::CmsWithHeap => Some(AggregationType::CountMinSketchWithHeap),
+        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => None,
     }
 }
 
@@ -1792,7 +1793,7 @@ fn sketch_config_to_params(
 /// `PolicyRegistry`, and asks `find_policy_by_content` for the
 /// fingerprint of a policy whose contents match. Returns
 /// `PolicyFingerprint::UNSET` when:
-///   1. The `SketchKindHandle::Any` wildcard reached this path
+///   1. An unsupported planner algorithm reached this path
 ///      (defensive — shouldn't happen).
 ///   2. No policy in the registry matches.
 ///   3. Multiple policies match (would-have-been-a-bug case;
@@ -1805,11 +1806,11 @@ fn sketch_config_to_params(
 fn derive_sketch_policy_fp(
     ingest_state: &IngestState,
     metric: &str,
-    kind: crate::storage_engines::sketch_db::index::SketchKindHandle,
+    kind: crate::storage_engines::sketch_db::index::SketchAlgorithm,
     cfg: &crate::storage_engines::sketch_db::data::SketchConfig,
     group_by_keys: &std::collections::BTreeSet<String>,
 ) -> asap_types::PolicyFingerprint {
-    let Some(agg_type) = aggregation_type_for_sketch_handle(kind) else {
+    let Some(agg_type) = aggregation_type_for_sketch_algorithm(kind) else {
         return asap_types::PolicyFingerprint::UNSET;
     };
     let params = sketch_config_to_params(cfg);
@@ -1821,7 +1822,7 @@ fn derive_sketch_policy_fp(
 }
 
 /// Phase 5 helper — map a `ModifiedOtlpSketchDp` to the matching
-/// `SketchKindHandle` so registration and capability classification
+/// `SketchAlgorithm` so registration and capability classification
 /// share one source of truth.
 ///
 /// CMS-with-heap detection: the OTLP `CountMinSketch` wire struct
@@ -1859,7 +1860,7 @@ fn derive_sketch_policy_fp(
 ///
 /// Per `docs/design_docs/series-identity.md`, the summary *family*
 /// is a wire-level attribute (carried here in `agg_kind` /
-/// [`SketchKindHandle`]), NOT a name suffix; storage + query must be
+/// [`SketchAlgorithm`]), NOT a name suffix; storage + query must be
 /// keyed on the raw SDK metric name. This helper applies that
 /// canonicalization at the ingest seam so the backend resolves
 /// correctly regardless of whether the deployed agent still suffixes.
@@ -1868,13 +1869,16 @@ fn derive_sketch_policy_fp(
 /// sketch kind, so a metric a user legitimately named `foo_hll` that
 /// arrives as a KLL sketch is left untouched, and the operation is a
 /// no-op (and therefore safe / idempotent) once agents stop suffixing.
-fn canonical_sketch_metric_name<'a>(name: &'a str, kind: SketchKind) -> &'a str {
-    let suffix: &str = match kind {
-        SketchKind::DdSketch => "_ddsketch",
-        SketchKind::Kll => "_kll",
-        SketchKind::Hll => "_hll",
-        SketchKind::CountSketch => "_countsketch",
-        SketchKind::CountMin => "_countminsketch",
+fn canonical_sketch_metric_name<'a>(name: &'a str, algorithm: SketchAlgorithm) -> &'a str {
+    let suffix: &str = match algorithm {
+        SketchAlgorithm::DDSketch => "_ddsketch",
+        SketchAlgorithm::Kll => "_kll",
+        SketchAlgorithm::Hll => "_hll",
+        SketchAlgorithm::CountSketch => "_countsketch",
+        SketchAlgorithm::Cms => "_countminsketch",
+        // These algorithms do not currently have modified-OTLP
+        // containers in this receiver, so there is no suffix to strip.
+        _ => return name,
     };
     // Only strip when there's a non-empty base left over (so a metric
     // literally named `_kll` is never collapsed to the empty string).
@@ -1923,26 +1927,26 @@ fn dp_carries_heap(dp: &ModifiedOtlpSketchDp) -> bool {
 /// heap is enrichment on the same substrate, not a different series). The
 /// CAPABILITY still tracks the heap via the metadata upgrade path. All
 /// other handles pass through unchanged.
-fn base_sketch_kind_handle(
-    kind: crate::storage_engines::sketch_db::index::SketchKindHandle,
-) -> crate::storage_engines::sketch_db::index::SketchKindHandle {
-    use crate::storage_engines::sketch_db::index::SketchKindHandle;
+fn base_sketch_algorithm(
+    kind: crate::storage_engines::sketch_db::index::SketchAlgorithm,
+) -> crate::storage_engines::sketch_db::index::SketchAlgorithm {
+    use crate::storage_engines::sketch_db::index::SketchAlgorithm;
     match kind {
-        SketchKindHandle::CmsWithHeap => SketchKindHandle::CountMin,
-        SketchKindHandle::CountSketchWithHeap => SketchKindHandle::CountSketch,
+        SketchAlgorithm::CmsWithHeap => SketchAlgorithm::Cms,
+        SketchAlgorithm::CountSketchWithHeap => SketchAlgorithm::CountSketch,
         other => other,
     }
 }
 
-fn sketch_kind_handle_for(
+fn sketch_algorithm_for(
     dp: &ModifiedOtlpSketchDp,
-) -> crate::storage_engines::sketch_db::index::SketchKindHandle {
-    use crate::storage_engines::sketch_db::index::SketchKindHandle;
-    match dp.kind {
-        SketchKind::DdSketch => SketchKindHandle::DDSketch,
-        SketchKind::Kll => SketchKindHandle::Kll,
-        SketchKind::Hll => SketchKindHandle::Hll,
-        SketchKind::CountSketch => {
+) -> crate::storage_engines::sketch_db::index::SketchAlgorithm {
+    use crate::storage_engines::sketch_db::index::SketchAlgorithm;
+    match dp.algorithm.clone() {
+        SketchAlgorithm::DDSketch => SketchAlgorithm::DDSketch,
+        SketchAlgorithm::Kll => SketchAlgorithm::Kll,
+        SketchAlgorithm::Hll => SketchAlgorithm::Hll,
+        SketchAlgorithm::CountSketch => {
             // Mirror the CountMin branch: CountSketch-with-heap
             // payloads share the same outer msgpack envelope
             // (`CountMinSketchWithHeapSerialized` — see the comment
@@ -1953,11 +1957,11 @@ fn sketch_kind_handle_for(
             // decode AND the heap is non-empty; otherwise stay with
             // vanilla `CountSketch`.
             if dp_carries_heap(dp) {
-                return SketchKindHandle::CountSketchWithHeap;
+                return SketchAlgorithm::CountSketchWithHeap;
             }
-            SketchKindHandle::CountSketch
+            SketchAlgorithm::CountSketch
         }
-        SketchKind::CountMin => {
+        SketchAlgorithm::Cms => {
             // Try a no-cost peek: msgpack-encoded CMS-with-heap payloads
             // round-trip through asap_sketchlib's
             // `CountMinSketchWithHeap::deserialize_msgpack`. If the
@@ -1966,10 +1970,11 @@ fn sketch_kind_handle_for(
             // CmsWithHeap so ASAP-tier `topk` can read the heap.
             // Otherwise stay with vanilla `CountMin`.
             if dp_carries_heap(dp) {
-                return SketchKindHandle::CmsWithHeap;
+                return SketchAlgorithm::CmsWithHeap;
             }
-            SketchKindHandle::CountMin
+            SketchAlgorithm::Cms
         }
+        other => other,
     }
 }
 
@@ -1990,22 +1995,11 @@ fn encoding_to_handle(
     }
 }
 
-/// Sketch family carried by a modified-OTLP `*SketchDataPoint`. Used by
-/// the encoding dispatcher in `decode_modified_otlp_sketch_bytes`.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SketchKind {
-    DdSketch,
-    Kll,
-    CountSketch,
-    CountMin,
-    Hll,
-}
-
 /// A single modified-OTLP sketch data point flattened across the five
 /// per-variant data-point types so the routing loop can treat them
 /// uniformly.
 struct ModifiedOtlpSketchDp {
-    kind: SketchKind,
+    algorithm: SketchAlgorithm,
     attrs: HashMap<String, String>,
     time_unix_nano: u64,
     sketch: Vec<u8>,
@@ -2028,15 +2022,15 @@ struct ModifiedOtlpSketchDp {
 /// Decode the typed `sketch` bytes from a modified-OTLP
 /// `*SketchDataPoint` into a concrete `AggregateCore`.
 ///
-/// Dispatches on the `(SketchKind, encoding)` pair. For each
-/// `(kind, _ENCODING_PROTO)` pair we call the matching accumulator's
+/// Dispatches on the `(SketchAlgorithm, encoding)` pair. For each
+/// `(algorithm, _ENCODING_PROTO)` pair we call the matching accumulator's
 /// `from_sketchlib_proto_bytes` constructor. Variants without a
 /// constructor today return `Err`; the caller falls through to §5.2
 /// fallback so the user still gets a correct answer. Per-variant
 /// decoders are tracked in PR C (task #8) and PR I (task #14, for
 /// `_ENCODING_MSGPACK` parity).
 fn decode_modified_otlp_sketch_bytes(
-    kind: SketchKind,
+    algorithm: SketchAlgorithm,
     encoding: i32,
     bytes: &[u8],
 ) -> Result<Box<dyn AggregateCore>, Box<dyn std::error::Error>> {
@@ -2057,7 +2051,7 @@ fn decode_modified_otlp_sketch_bytes(
     //   4  — ENCODING_MSGPACK_DELTA  (MSGPACK diff; not yet wired)
 
     match encoding {
-        ENCODING_PROTO => match kind {
+        ENCODING_PROTO => match algorithm {
             // Phase 3 step 3: DDSketch and KLL envelope-parsing /
             // sketch reconstruction route through the shared
             // `edge_runtime_adapter`, which delegates to
@@ -2070,7 +2064,7 @@ fn decode_modified_otlp_sketch_bytes(
             // tracked under ProjectASAP/ASAPCollector#243 — until it
             // lands those three sketches keep using the backend's
             // existing per-accumulator decoder.
-            SketchKind::DdSketch => {
+            SketchAlgorithm::DDSketch => {
                 use crate::precompute_engine::operators::edge_runtime_adapter::{
                     reconstruct_via_runtime, ReconstructedSketch, SketchType as RtSketchType,
                 };
@@ -2098,7 +2092,7 @@ fn decode_modified_otlp_sketch_bytes(
                     )?)),
                 }
             }
-            SketchKind::Kll => {
+            SketchAlgorithm::Kll => {
                 use crate::precompute_engine::operators::edge_runtime_adapter::{
                     reconstruct_via_runtime, ReconstructedSketch, SketchType as RtSketchType,
                 };
@@ -2123,27 +2117,30 @@ fn decode_modified_otlp_sketch_bytes(
                     )),
                 }
             }
-            SketchKind::CountMin => Ok(Box::new(
+            SketchAlgorithm::Cms => Ok(Box::new(
                 CountMinSketchAccumulator::from_sketchlib_proto_bytes(bytes)?,
             )),
-            SketchKind::CountSketch => Ok(Box::new(
+            SketchAlgorithm::CountSketch => Ok(Box::new(
                 CountSketchAccumulator::from_sketchlib_proto_bytes(bytes)?,
             )),
-            SketchKind::Hll => Ok(Box::new(HllSketchAccumulator::from_sketchlib_proto_bytes(
+            SketchAlgorithm::Hll => Ok(Box::new(HllSketchAccumulator::from_sketchlib_proto_bytes(
                 bytes,
             )?)),
+            other => {
+                Err(format!("modified-OTLP PROTO decoding is not implemented for {other:?}").into())
+            }
         },
-        ENCODING_MSGPACK => match kind {
-            SketchKind::CountMin => Ok(Box::new(CountMinSketchAccumulator::from_msgpack_bytes(
+        ENCODING_MSGPACK => match algorithm {
+            SketchAlgorithm::Cms => Ok(Box::new(CountMinSketchAccumulator::from_msgpack_bytes(
                 bytes,
             )?)),
-            SketchKind::CountSketch => {
+            SketchAlgorithm::CountSketch => {
                 // Heap-bearing CountSketch full frame: the bytes are the
                 // `{sketch,topk_heap,heap_size}` envelope (a DIFFERENT inner
                 // field order than the plain CountSketch msgpack), so
                 // `CountSketch::from_msgpack` can't parse it. Try the heap
                 // decode FIRST when the heap is non-empty (the same promotion
-                // gate `sketch_kind_handle_for` uses); cache THAT heap
+                // gate `sketch_algorithm_for` uses); cache THAT heap
                 // accumulator as the per-series base so a later MSGPACK_DELTA
                 // frame applies its matrix delta + heap onto a heap
                 // accumulator. Fall back to the plain CountSketch decode for
@@ -2167,11 +2164,17 @@ fn decode_modified_otlp_sketch_bytes(
                 }
                 Ok(Box::new(CountSketchAccumulator::from_msgpack_bytes(bytes)?))
             }
-            SketchKind::Kll => Ok(Box::new(DatasketchesKLLAccumulator::from_msgpack_bytes(
+            SketchAlgorithm::Kll => Ok(Box::new(DatasketchesKLLAccumulator::from_msgpack_bytes(
                 bytes,
             )?)),
-            SketchKind::DdSketch => Ok(Box::new(DDSketchAccumulator::from_msgpack_bytes(bytes)?)),
-            SketchKind::Hll => Ok(Box::new(HllSketchAccumulator::from_msgpack_bytes(bytes)?)),
+            SketchAlgorithm::DDSketch => {
+                Ok(Box::new(DDSketchAccumulator::from_msgpack_bytes(bytes)?))
+            }
+            SketchAlgorithm::Hll => Ok(Box::new(HllSketchAccumulator::from_msgpack_bytes(bytes)?)),
+            other => Err(format!(
+                "modified-OTLP MSGPACK decoding is not implemented for {other:?}"
+            )
+            .into()),
         },
         ENCODING_PROTO_DELTA => Err(format!(
             "sketch encoding PROTO_DELTA (2) is not standalone-decodable — \
@@ -2214,7 +2217,7 @@ fn decode_modified_otlp_sketch_bytes(
 /// deltas. Those keep the unchanged "drop until the next full frame"
 /// behavior.
 fn empty_accumulator_for_delta_bootstrap(
-    kind: SketchKind,
+    algorithm: SketchAlgorithm,
     config: &crate::storage_engines::sketch_db::index::SketchConfig,
     encoding: i32,
 ) -> Option<Box<dyn AggregateCore>> {
@@ -2224,8 +2227,8 @@ fn empty_accumulator_for_delta_bootstrap(
     };
     use crate::storage_engines::sketch_db::index::SketchConfig;
 
-    match (kind, config) {
-        (SketchKind::Hll, SketchConfig::Hll { precision }) => {
+    match (algorithm, config) {
+        (SketchAlgorithm::Hll, SketchConfig::Hll { precision }) => {
             use asap_sketchlib::HllVariant;
             // Regular is the default agent variant; HLL's additive delta
             // merge tolerates an empty same-precision base.
@@ -2234,10 +2237,10 @@ fn empty_accumulator_for_delta_bootstrap(
                 *precision,
             )))
         }
-        (SketchKind::CountMin, SketchConfig::CountMin { rows, cols }) => Some(Box::new(
+        (SketchAlgorithm::Cms, SketchConfig::CountMin { rows, cols }) => Some(Box::new(
             CountMinSketchAccumulator::new(*rows as usize, *cols as usize),
         )),
-        (SketchKind::CountSketch, SketchConfig::CountSketch { rows, cols }) => {
+        (SketchAlgorithm::CountSketch, SketchConfig::CountSketch { rows, cols }) => {
             // A heap-bearing DELTA-HEAP frame must reconstruct onto a heap
             // accumulator (the apply path downcasts to
             // `CountSketchWithHeapAccumulator`); a plain matrix delta
@@ -2287,7 +2290,7 @@ const ENCODING_MSGPACK_DELTA: i32 = 4;
 /// KLL/CountSketch/CountMinSketch deltas are deferred to follow-ups
 /// as their delta codecs land.
 pub(crate) fn apply_modified_otlp_delta_bytes(
-    kind: SketchKind,
+    algorithm: SketchAlgorithm,
     encoding: i32,
     existing: &mut Box<dyn AggregateCore>,
     bytes: &[u8],
@@ -2297,8 +2300,8 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
         DDSketchAccumulator, HllSketchAccumulator,
     };
 
-    match (encoding, kind) {
-        (ENCODING_PROTO_DELTA, SketchKind::DdSketch) => {
+    match (encoding, algorithm) {
+        (ENCODING_PROTO_DELTA, SketchAlgorithm::DDSketch) => {
             let dd = existing
                 .as_any_mut()
                 .downcast_mut::<DDSketchAccumulator>()
@@ -2308,7 +2311,7 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
                 )?;
             dd.apply_proto_delta_bytes(bytes)
         }
-        (ENCODING_PROTO_DELTA, SketchKind::Hll) => {
+        (ENCODING_PROTO_DELTA, SketchAlgorithm::Hll) => {
             let hll = existing
                 .as_any_mut()
                 .downcast_mut::<HllSketchAccumulator>()
@@ -2318,7 +2321,7 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
                 )?;
             hll.apply_proto_delta_bytes(bytes)
         }
-        (ENCODING_PROTO_DELTA, SketchKind::CountSketch) => {
+        (ENCODING_PROTO_DELTA, SketchAlgorithm::CountSketch) => {
             let cs = existing
                 .as_any_mut()
                 .downcast_mut::<CountSketchAccumulator>()
@@ -2328,7 +2331,7 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
                 )?;
             cs.apply_proto_delta_bytes(bytes)
         }
-        (ENCODING_PROTO_DELTA, SketchKind::CountMin) => {
+        (ENCODING_PROTO_DELTA, SketchAlgorithm::Cms) => {
             let cms = existing
                 .as_any_mut()
                 .downcast_mut::<CountMinSketchAccumulator>()
@@ -2343,7 +2346,7 @@ pub(crate) fn apply_modified_otlp_delta_bytes(
              DDSketch / HLL / CountSketch / CountMin are wired"
         )
         .into()),
-        (ENCODING_MSGPACK_DELTA, SketchKind::CountSketch) => {
+        (ENCODING_MSGPACK_DELTA, SketchAlgorithm::CountSketch) => {
             // DELTA-HEAP frame for the heap-bearing CountSketch: a sparse
             // signed matrix delta + the full top-k heap. The cached base is
             // a heap accumulator (window-1 full frame decoded via
@@ -2723,30 +2726,36 @@ mod canonical_metric_name_tests {
     #[test]
     fn strips_matching_family_suffix() {
         assert_eq!(
-            canonical_sketch_metric_name("request_size_bytes_kll", SketchKind::Kll),
+            canonical_sketch_metric_name("request_size_bytes_kll", SketchAlgorithm::Kll),
             "request_size_bytes"
         );
         assert_eq!(
-            canonical_sketch_metric_name("http_requests_total_latency_ms_kll", SketchKind::Kll),
+            canonical_sketch_metric_name(
+                "http_requests_total_latency_ms_kll",
+                SketchAlgorithm::Kll
+            ),
             "http_requests_total_latency_ms"
         );
         assert_eq!(
-            canonical_sketch_metric_name("unique_users_per_min_hll", SketchKind::Hll),
+            canonical_sketch_metric_name("unique_users_per_min_hll", SketchAlgorithm::Hll),
             "unique_users_per_min"
         );
         assert_eq!(
-            canonical_sketch_metric_name("top_endpoint_qps_countsketch", SketchKind::CountSketch),
+            canonical_sketch_metric_name(
+                "top_endpoint_qps_countsketch",
+                SketchAlgorithm::CountSketch
+            ),
             "top_endpoint_qps"
         );
         assert_eq!(
             canonical_sketch_metric_name(
                 "endpoint_request_freq_countminsketch",
-                SketchKind::CountMin
+                SketchAlgorithm::Cms
             ),
             "endpoint_request_freq"
         );
         assert_eq!(
-            canonical_sketch_metric_name("latency_ddsketch", SketchKind::DdSketch),
+            canonical_sketch_metric_name("latency_ddsketch", SketchAlgorithm::DDSketch),
             "latency"
         );
     }
@@ -2756,11 +2765,11 @@ mod canonical_metric_name_tests {
         // Once agents stop suffixing (series-identity
         // Phase 1), the strip must be a no-op.
         assert_eq!(
-            canonical_sketch_metric_name("request_size_bytes", SketchKind::Kll),
+            canonical_sketch_metric_name("request_size_bytes", SketchAlgorithm::Kll),
             "request_size_bytes"
         );
         assert_eq!(
-            canonical_sketch_metric_name("unique_users_per_min", SketchKind::Hll),
+            canonical_sketch_metric_name("unique_users_per_min", SketchAlgorithm::Hll),
             "unique_users_per_min"
         );
     }
@@ -2772,7 +2781,7 @@ mod canonical_metric_name_tests {
         // actual sketch kind, so we never collapse a legitimately-named
         // metric onto a different one.
         assert_eq!(
-            canonical_sketch_metric_name("my_metric_hll", SketchKind::Kll),
+            canonical_sketch_metric_name("my_metric_hll", SketchAlgorithm::Kll),
             "my_metric_hll"
         );
     }
@@ -2782,7 +2791,7 @@ mod canonical_metric_name_tests {
         // A metric literally named `_kll` (base would be empty) is left
         // intact rather than emptied.
         assert_eq!(
-            canonical_sketch_metric_name("_kll", SketchKind::Kll),
+            canonical_sketch_metric_name("_kll", SketchAlgorithm::Kll),
             "_kll"
         );
     }
@@ -2901,7 +2910,7 @@ mod series_key_roundtrip_tests {
 mod policy_fp_lookup_tests {
     use super::*;
     use crate::storage_engines::sketch_db::data::SketchConfig;
-    use crate::storage_engines::sketch_db::index::SketchKindHandle;
+    use crate::storage_engines::sketch_db::index::SketchAlgorithm;
     use asap_types::AggregationType;
 
     #[test]
@@ -2910,32 +2919,32 @@ mod policy_fp_lookup_tests {
         // Drift surfaces as policy lookups that silently miss because
         // the handle resolves to an `AggregationType` no policy uses.
         assert_eq!(
-            aggregation_type_for_sketch_handle(SketchKindHandle::DDSketch),
+            aggregation_type_for_sketch_algorithm(SketchAlgorithm::DDSketch),
             Some(AggregationType::DDSketch)
         );
         assert_eq!(
-            aggregation_type_for_sketch_handle(SketchKindHandle::Kll),
+            aggregation_type_for_sketch_algorithm(SketchAlgorithm::Kll),
             Some(AggregationType::DatasketchesKLL)
         );
         assert_eq!(
-            aggregation_type_for_sketch_handle(SketchKindHandle::Hll),
+            aggregation_type_for_sketch_algorithm(SketchAlgorithm::Hll),
             Some(AggregationType::HLL)
         );
         assert_eq!(
-            aggregation_type_for_sketch_handle(SketchKindHandle::CountMin),
+            aggregation_type_for_sketch_algorithm(SketchAlgorithm::Cms),
             Some(AggregationType::CountMinSketch)
         );
         assert_eq!(
-            aggregation_type_for_sketch_handle(SketchKindHandle::CmsWithHeap),
+            aggregation_type_for_sketch_algorithm(SketchAlgorithm::CmsWithHeap),
             Some(AggregationType::CountMinSketchWithHeap)
         );
         assert_eq!(
-            aggregation_type_for_sketch_handle(SketchKindHandle::CountSketch),
+            aggregation_type_for_sketch_algorithm(SketchAlgorithm::CountSketch),
             Some(AggregationType::CountSketch)
         );
         // `Any` is a control-plane wildcard, not a real DP shape.
         assert_eq!(
-            aggregation_type_for_sketch_handle(SketchKindHandle::Any),
+            aggregation_type_for_sketch_algorithm(SketchAlgorithm::Kmv),
             None
         );
     }
@@ -3005,7 +3014,7 @@ mod dispatcher_tests {
         .encode_to_vec();
 
         apply_modified_otlp_delta_bytes(
-            SketchKind::DdSketch,
+            SketchAlgorithm::DDSketch,
             ENCODING_PROTO_DELTA,
             &mut acc,
             &bytes,
@@ -3037,8 +3046,13 @@ mod dispatcher_tests {
         }
         .encode_to_vec();
 
-        apply_modified_otlp_delta_bytes(SketchKind::Hll, ENCODING_PROTO_DELTA, &mut acc, &bytes)
-            .expect("apply ok");
+        apply_modified_otlp_delta_bytes(
+            SketchAlgorithm::Hll,
+            ENCODING_PROTO_DELTA,
+            &mut acc,
+            &bytes,
+        )
+        .expect("apply ok");
 
         let hll = acc.as_any().downcast_ref::<HllSketchAccumulator>().unwrap();
         assert_eq!(hll.inner.registers, vec![4, 5, 6, 7]);
@@ -3049,7 +3063,7 @@ mod dispatcher_tests {
         let mut acc: Box<dyn AggregateCore> =
             Box::new(HllSketchAccumulator::new(HllVariant::Regular, 2));
         let err = apply_modified_otlp_delta_bytes(
-            SketchKind::DdSketch,
+            SketchAlgorithm::DDSketch,
             ENCODING_PROTO_DELTA,
             &mut acc,
             &[0u8; 4],
@@ -3062,17 +3076,21 @@ mod dispatcher_tests {
     #[test]
     fn apply_rejects_full_state_encoding() {
         let mut acc: Box<dyn AggregateCore> = Box::new(DDSketchAccumulator::new(0.01));
-        let err =
-            apply_modified_otlp_delta_bytes(SketchKind::DdSketch, ENCODING_PROTO, &mut acc, &[])
-                .expect_err("expected full-state-rejection error")
-                .to_string();
+        let err = apply_modified_otlp_delta_bytes(
+            SketchAlgorithm::DDSketch,
+            ENCODING_PROTO,
+            &mut acc,
+            &[],
+        )
+        .expect_err("expected full-state-rejection error")
+        .to_string();
         assert!(err.contains("full-state frame"));
     }
 
     #[test]
     fn decode_rejects_delta_encoding_with_helpful_message() {
         let err = match decode_modified_otlp_sketch_bytes(
-            SketchKind::DdSketch,
+            SketchAlgorithm::DDSketch,
             ENCODING_PROTO_DELTA,
             &[],
         ) {
@@ -3339,7 +3357,7 @@ mod sid_resolution_tests {
         let mut attrs = HashMap::new();
         attrs.insert("zone".to_string(), "z0".to_string());
         let series_key = format_series_key(
-            canonical_sketch_metric_name("http_latency_ms", SketchKind::DdSketch),
+            canonical_sketch_metric_name("http_latency_ms", SketchAlgorithm::DDSketch),
             &attrs,
         );
 
@@ -3674,7 +3692,7 @@ mod sid_resolution_tests {
         let mut attrs = HashMap::new();
         attrs.insert("svc".to_string(), "auth".to_string());
         let series_key = format_series_key(
-            canonical_sketch_metric_name("frequency_metric", SketchKind::CountMin),
+            canonical_sketch_metric_name("frequency_metric", SketchAlgorithm::Cms),
             &attrs,
         );
         {
@@ -3746,7 +3764,7 @@ mod sid_resolution_tests {
         let mut attrs = HashMap::new();
         attrs.insert("svc".to_string(), "auth".to_string());
         let series_key = format_series_key(
-            canonical_sketch_metric_name("cardinality_metric", SketchKind::Hll),
+            canonical_sketch_metric_name("cardinality_metric", SketchAlgorithm::Hll),
             &attrs,
         );
         {
@@ -3810,7 +3828,7 @@ mod sid_resolution_tests {
         let mut attrs = HashMap::new();
         attrs.insert("zone".to_string(), "z0".to_string());
         let series_key = format_series_key(
-            canonical_sketch_metric_name("dd_latency_ms", SketchKind::DdSketch),
+            canonical_sketch_metric_name("dd_latency_ms", SketchAlgorithm::DDSketch),
             &attrs,
         );
         assert!(
@@ -3838,7 +3856,7 @@ mod sid_resolution_tests {
     /// frame arrives for the same sid. One-way; never downgrades.
     #[tokio::test]
     async fn heap_bearing_frame_upgrades_cms_sid_capability() {
-        use crate::storage_engines::sketch_db::index::{Capability, SketchKindHandle};
+        use crate::storage_engines::sketch_db::index::{Capability, SketchAlgorithm};
         use asap_sketchlib::{CountMinSketchWithHeap, MessagePackCodec};
 
         let (state, drain) = make_state().await;
@@ -3864,7 +3882,7 @@ mod sid_resolution_tests {
         let meta1 = state.sketch_index.instance(sid).expect("sid registered");
         assert_eq!(
             meta1.capability,
-            Some(Capability::FrequencyEstimate(SketchKindHandle::CountMin)),
+            Some(Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms))),
             "heap-less first frame registers FrequencyEstimate(CountMin)"
         );
 
@@ -3895,7 +3913,9 @@ mod sid_resolution_tests {
             .expect("sid still registered");
         assert_eq!(
             meta2.capability,
-            Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap)),
+            Some(Capability::FrequencyTopk(Some(
+                SketchAlgorithm::CmsWithHeap
+            ))),
             "heap-bearing frame upgrades the sid to FrequencyTopk(CmsWithHeap)"
         );
         // Still one instance — the upgrade is an in-place overwrite, not a
@@ -3921,7 +3941,9 @@ mod sid_resolution_tests {
             .expect("sid still registered");
         assert_eq!(
             meta3.capability,
-            Some(Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap)),
+            Some(Capability::FrequencyTopk(Some(
+                SketchAlgorithm::CmsWithHeap
+            ))),
             "a later heap-less frame never downgrades the capability"
         );
 

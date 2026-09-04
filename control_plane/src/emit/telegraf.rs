@@ -165,7 +165,7 @@ fn emit_processors_allsketches(
     // internal emit plumbing; it just doesn't reach the wire here.
     out.push_str(&format!(
         "  sketch_kind = \"{}\"\n",
-        sketch_kind_tag(&sp.sketch_kind)
+        sketch_algorithm_tag(&sp.sketch_algorithm)
     ));
     match &sp.sketch_params {
         SketchParams::Kll { k } => {
@@ -207,7 +207,7 @@ fn emit_processors_allsketches(
     out.push('\n');
 }
 
-fn sketch_kind_tag(kind: &SketchAlgorithm) -> &'static str {
+fn sketch_algorithm_tag(kind: &SketchAlgorithm) -> &'static str {
     match kind {
         SketchAlgorithm::Kll => "kll",
         SketchAlgorithm::DDSketch => "ddsketch",
@@ -327,7 +327,7 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "ddsketch".to_string(),
-                sketch_kind: SketchAlgorithm::DDSketch,
+                sketch_algorithm: SketchAlgorithm::DDSketch,
                 sketch_params: SketchParams::DDSketch { alpha: 0.01 },
                 aggregation_id: "agg0".to_string(),
             }],
@@ -536,7 +536,7 @@ mod tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "KLL".to_string(),
-                sketch_kind: SketchAlgorithm::Kll,
+                sketch_algorithm: SketchAlgorithm::Kll,
                 sketch_params: SketchParams::Kll { k: 200 },
                 aggregation_id: "agg0".to_string(),
             }],

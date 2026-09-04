@@ -685,19 +685,25 @@ mod tests {
             AggregationInput, BackendAggregation, BackendReadout,
         };
         use planner_types::post_asap::SketchQuery;
-        use planner_types::post_asap::{SketchAlgorithm, SketchParams};
+        use planner_types::post_asap::{
+            GroupingStrategy, SketchAlgorithm, SketchKind, SketchParams, SummaryFamilyType,
+        };
         BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 aggregation_id: agg_id.to_string(),
                 metric_name: metric.to_string(),
-                sketch_kind: SketchAlgorithm::DDSketch.into(),
-                sketch_params: SketchParams::DDSketch { alpha: 0.01 }.into(),
+                family: SummaryFamilyType::Sketch(
+                    SketchKind::new(
+                        SketchAlgorithm::DDSketch,
+                        SketchParams::DDSketch { alpha: 0.01 },
+                    ),
+                    GroupingStrategy::PerSubpopulationInstance,
+                ),
                 grouping: vec![],
                 item_label: None,
                 spatial_filter: String::new(),
                 window_secs: 60,
                 aggregation_input: AggregationInput::SketchEnvelope,
-                agg_type_override: None,
             }],
             readouts: vec![BackendReadout {
                 aggregation_id: agg_id.to_string(),

@@ -24,7 +24,7 @@ use asap_sketchlib::DdSketch;
 use prost::Message;
 
 use data_plane::storage_engines::sketch_db::data::{
-    AccuracyBound, AggKind, Capability, SketchConfig, SketchEncoding, SketchKindHandle,
+    AccuracyBound, AggKind, Capability, SketchAlgorithm, SketchConfig, SketchEncoding,
     SketchSampleState,
 };
 use data_plane::storage_engines::sketch_db::index::{SketchInstanceMetadata, SketchStore};
@@ -54,10 +54,10 @@ fn dd_meta(sid: u64) -> SketchInstanceMetadata {
         sid,
         metric_name: "bench_metric".into(),
         group_by_keys: BTreeSet::new(),
-        capability: Some(Capability::QuantileApprox(SketchKindHandle::DDSketch)),
+        capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))),
         accuracy: Some(AccuracyBound::from_config(&cfg)),
         agg_kind: AggKind::Sketch {
-            kind: SketchKindHandle::DDSketch,
+            algorithm: SketchAlgorithm::DDSketch,
             config: cfg,
             spatial_filter_canonical: String::new(),
         },

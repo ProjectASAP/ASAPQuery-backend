@@ -9,7 +9,7 @@
 //! this session's `delta_apply.rs`/`decoders.rs` fix on the read side.
 //! Before this file existed, `accumulator_factory.rs`'s raw-metric
 //! ingest dispatch built a `CountMinSketchWithHeapAccumulator` (CMS math)
-//! for `SummaryKind::CountSketchWithHeap` sids -- the same conflation bug
+//! for `SketchAlgorithm::CountSketchWithHeap` sids -- the same conflation bug
 //! already fixed on the read side, now closed on the write side too.
 
 use crate::storage_engines::types::{

@@ -258,7 +258,7 @@ fn apply_cold_format_from_env(edge_cfg: &mut EdgeStageConfig) {
 // HashMap — the typed bootstrap / replan paths emitted single-pipeline
 // YAML and the routing-connector path stayed dormant.
 //
-// `extract_root_sketch_kind` walks a `PhysicalExpr` tree and returns the
+// `extract_root_sketch_algorithm` walks a `PhysicalExpr` tree and returns the
 // committed sketch family — looking through `SketchEstimate`,
 // `SketchAgg`, `SketchMerge`, `LetBinding`, and `RawAtEdgeSketchAtBackend`.
 // `SketchAgg::sketch_type` is the canonical source of truth (the typed
@@ -284,7 +284,7 @@ fn apply_cold_format_from_env(edge_cfg: &mut EdgeStageConfig) {
 /// (`Logical`-only, unresolved `Ref`, raw Mode-3 archive). These map
 /// onto the raw-passthrough default pipeline in the routing emitter,
 /// which is correct.
-pub fn extract_root_sketch_kind(expr: &PhysicalExpr) -> Option<SketchAlgorithm> {
+pub fn extract_root_sketch_algorithm(expr: &PhysicalExpr) -> Option<SketchAlgorithm> {
     match expr {
         PhysicalExpr::Committed(plan) => extract_from_plan(plan),
         PhysicalExpr::RawAtEdgeSketchAtBackend { family, .. } => Some(family.clone()),
@@ -394,7 +394,7 @@ pub fn collect_metric_to_family(
             else {
                 continue;
             };
-            if let Some(kind) = extract_root_sketch_kind(&deployment_expr) {
+            if let Some(kind) = extract_root_sketch_algorithm(&deployment_expr) {
                 out.entry(entry.metric_name.clone())
                     .or_default()
                     .insert(kind);
@@ -772,7 +772,7 @@ mod runtime_tests {
             window_secs: Some(60),
             sketch_processors: vec![EdgeSketchProcessor {
                 processor_name: "ddsketch".to_string(),
-                sketch_kind: SketchAlgorithm::DDSketch,
+                sketch_algorithm: SketchAlgorithm::DDSketch,
                 sketch_params: SketchParams::DDSketch { alpha: 0.01 },
                 aggregation_id: "agg0".to_string(),
             }],

@@ -20,13 +20,12 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use asap_types::SummaryKind;
 use asap_types::{MonitorSpec, PolicyFingerprint, PrecomputeMaterialization, QueryLanguage};
 
 use crate::emit::monitor::{agg_id_for_metric, MonitorIntent};
 use crate::emit::stage_config::build_backend_aggregation_json;
 use crate::physical::colored_dag::emitter::{BackendAggregation, BackendStageConfig};
-use crate::physical::runtime_capability::{Capability, SketchKindHandle};
+use crate::physical::runtime_capability::{Capability, SketchAlgorithm};
 use asap_types::enums::WindowKind;
 use planner_types::pre_asap::{ColumnRef, Source};
 
@@ -53,10 +52,7 @@ pub fn from_stage_config(
         let fingerprint = fingerprint.policy_fingerprint();
         fingerprint_by_agg_id.insert(agg.aggregation_id.as_str(), fingerprint);
 
-        let (kind, params) = match &agg.agg_type_override {
-            Some(exact_type) => exact_kind_params_for_override(exact_type)?,
-            None => (agg.sketch_kind.clone(), agg.sketch_params.clone()),
-        };
+        let family = agg.family.clone();
 
         materializations.insert(
             fingerprint,
@@ -73,8 +69,7 @@ pub fn from_stage_config(
                 group_by: agg.grouping.clone(),
                 rollup: Vec::new(),
                 spatial_filter: asap_types::utils::normalize_spatial_filter(&agg.spatial_filter),
-                kind,
-                params,
+                family,
                 col: ColumnRef::SampleValue,
                 retention: None,
                 lifecycle: None,
@@ -147,25 +142,6 @@ pub fn aggregation_config_for_materialization(
         .context("build AggregationConfig from synthesized aggregation JSON")
 }
 
-/// Option B (post-#287) exact-agg override: `s` is already the wire
-/// `aggregationType` string (e.g. `"Sum"`) — parse it via
-/// `AggregationType::FromStr` (same parser
-/// `AggregationConfig::from_yaml_data` uses) and carry it as the
-/// matching `SummaryKind`/`SummaryParams` exact-agg pair.
-fn exact_kind_params_for_override(
-    exact_type: &str,
-) -> Result<(SummaryKind, asap_types::SummaryParams)> {
-    use asap_types::SummaryParams;
-    match exact_type {
-        "Sum" => Ok((SummaryKind::Sum, SummaryParams::Sum)),
-        "Count" => Ok((SummaryKind::Count, SummaryParams::Count)),
-        "MinMax" => Ok((SummaryKind::MinMax, SummaryParams::MinMax)),
-        "Increase" => Ok((SummaryKind::Increase, SummaryParams::Increase)),
-        "Rate" => Ok((SummaryKind::Rate, SummaryParams::Rate)),
-        other => anyhow::bail!("unrecognized agg_type_override {other:?} — no SummaryKind mapping"),
-    }
-}
-
 /// Capability this readout satisfies, given the aggregation it reads
 /// from. Exact-agg overrides always report `Capability::ExactAgg`
 /// (mirrors the wire's `aggregationType` bypass — see
@@ -180,36 +156,47 @@ fn capability_for_readout(
     use asap_types::AggregationType;
     use planner_types::post_asap::SketchQuery;
 
-    if let Some(exact_type) = &agg.agg_type_override {
-        let agg_type: AggregationType = exact_type
-            .parse()
-            .map_err(|e: String| anyhow::anyhow!("agg_type_override {exact_type:?}: {e}"))?;
-        return Ok(Capability::ExactAgg(agg_type));
+    match &agg.family {
+        planner_types::post_asap::SummaryFamilyType::ExactAggregate(kind, _) => {
+            let agg_type = match kind {
+                planner_types::post_asap::ExactKind::Sum => AggregationType::Sum,
+                // The backend implements exact count with its sum-as-count
+                // accumulator; `ExactKind::Count` remains the canonical
+                // planner identity at the domain boundary.
+                planner_types::post_asap::ExactKind::Count => AggregationType::Sum,
+                planner_types::post_asap::ExactKind::MinMax => AggregationType::MinMax,
+                planner_types::post_asap::ExactKind::Increase
+                | planner_types::post_asap::ExactKind::Rate => AggregationType::Increase,
+            };
+            Ok(Capability::ExactAgg(agg_type))
+        }
+        planner_types::post_asap::SummaryFamilyType::Sketch(kind, _) => {
+            let handle = sketch_algorithm_handle(kind.algorithm())?;
+            Ok(match op {
+                SketchQuery::Quantile { .. } => Capability::QuantileApprox(Some(handle)),
+                SketchQuery::Cardinality => Capability::CardinalityApprox,
+                SketchQuery::PointCount { .. } => Capability::FrequencyEstimate(Some(handle)),
+                SketchQuery::TopK { .. } => Capability::FrequencyTopk(Some(handle)),
+            })
+        }
+        other => anyhow::bail!("unsupported backend summary family {other:?}"),
     }
-
-    let handle = sketch_kind_handle(&agg.sketch_kind)?;
-    Ok(match op {
-        SketchQuery::Quantile { .. } => Capability::QuantileApprox(handle),
-        SketchQuery::Cardinality => Capability::CardinalityApprox,
-        SketchQuery::PointCount { .. } => Capability::FrequencyEstimate(handle),
-        SketchQuery::TopK { .. } => Capability::FrequencyTopk(handle),
-    })
 }
 
-/// Map a `SummaryKind` to the `SketchKindHandle` it identifies as. Only
-/// covers the families real `Bind*` rules actually produce for sketch
-/// aggregations — mirrors `emit::stage_config::sketch_kind_to_backend_type`'s
-/// exhaustive match (and its `unreachable!()` for non-sketch kinds).
-fn sketch_kind_handle(kind: &SummaryKind) -> Result<SketchKindHandle> {
+/// Validate that a Planner `SketchAlgorithm` is implemented by this runtime.
+fn sketch_algorithm_handle(
+    kind: &planner_types::post_asap::SketchAlgorithm,
+) -> Result<SketchAlgorithm> {
+    use planner_types::post_asap::SketchAlgorithm;
     Ok(match kind {
-        SummaryKind::DDSketch => SketchKindHandle::DDSketch,
-        SummaryKind::Kll => SketchKindHandle::Kll,
-        SummaryKind::Hll => SketchKindHandle::Hll,
-        SummaryKind::CountSketch => SketchKindHandle::CountSketch,
-        SummaryKind::Cms => SketchKindHandle::CountMin,
-        SummaryKind::CmsWithHeap => SketchKindHandle::CmsWithHeap,
-        SummaryKind::CountSketchWithHeap => SketchKindHandle::CountSketchWithHeap,
-        other => anyhow::bail!("no SketchKindHandle mapping for non-sketch SummaryKind {other:?}"),
+        SketchAlgorithm::DDSketch => SketchAlgorithm::DDSketch,
+        SketchAlgorithm::Kll => SketchAlgorithm::Kll,
+        SketchAlgorithm::Hll => SketchAlgorithm::Hll,
+        SketchAlgorithm::CountSketch => SketchAlgorithm::CountSketch,
+        SketchAlgorithm::Cms => SketchAlgorithm::Cms,
+        SketchAlgorithm::CmsWithHeap => SketchAlgorithm::CmsWithHeap,
+        SketchAlgorithm::CountSketchWithHeap => SketchAlgorithm::CountSketchWithHeap,
+        other => anyhow::bail!("SketchAlgorithm {other:?} is not implemented by this runtime"),
     })
 }
 
@@ -217,30 +204,31 @@ fn sketch_kind_handle(kind: &SummaryKind) -> Result<SketchKindHandle> {
 mod tests {
     use super::*;
     use crate::physical::colored_dag::emitter::{AggregationInput, BackendReadout};
-    use asap_types::{
-        AggregationType, KeyByLabelNames, SummaryParams, WindowKind as AsapWindowKind,
+    use asap_types::{AggregationType, KeyByLabelNames, WindowKind as AsapWindowKind};
+    use planner_types::post_asap::{
+        GroupingStrategy, SketchAlgorithm, SketchKind, SketchParams, SketchQuery, SummaryFamilyType,
     };
-    use planner_types::post_asap::SketchQuery;
     use std::collections::HashMap as StdHashMap;
 
     fn agg(
         aggregation_id: &str,
         metric_name: &str,
-        sketch_kind: SummaryKind,
-        sketch_params: SummaryParams,
+        algorithm: SketchAlgorithm,
+        sketch_params: SketchParams,
         grouping: Vec<String>,
     ) -> BackendAggregation {
         BackendAggregation {
             aggregation_id: aggregation_id.to_string(),
             metric_name: metric_name.to_string(),
-            sketch_kind,
-            sketch_params,
+            family: SummaryFamilyType::Sketch(
+                SketchKind::new(algorithm, sketch_params),
+                GroupingStrategy::PerSubpopulationInstance,
+            ),
             window_secs: 60,
             spatial_filter: String::new(),
             grouping,
             item_label: None,
             aggregation_input: AggregationInput::SketchEnvelope,
-            agg_type_override: None,
         }
     }
 
@@ -248,33 +236,37 @@ mod tests {
     /// (non-JSON-round-trip) reader would build for this fixture, so the
     /// parity test doesn't just check the implementation against itself.
     fn hand_built_config(agg: &BackendAggregation) -> PrecomputeMaterialization {
-        let parameters: StdHashMap<String, serde_json::Value> = match &agg.sketch_params {
-            SummaryParams::DDSketch { alpha } => {
+        let (kind, params) = match &agg.family {
+            SummaryFamilyType::Sketch(kind, _) => (kind.algorithm(), kind.params()),
+            other => unreachable!("fixture only uses sketches, got {other:?}"),
+        };
+        let parameters: StdHashMap<String, serde_json::Value> = match params {
+            SketchParams::DDSketch { alpha } => {
                 StdHashMap::from([("alpha".to_string(), serde_json::json!(alpha))])
             }
-            SummaryParams::Hll { precision } => {
+            SketchParams::Hll { precision } => {
                 StdHashMap::from([("precision".to_string(), serde_json::json!(precision))])
             }
-            SummaryParams::CountSketchWithHeap { width, depth, .. } => StdHashMap::from([
+            SketchParams::CountSketchWithHeap { width, depth, .. } => StdHashMap::from([
                 ("w".to_string(), serde_json::json!(width)),
                 ("d".to_string(), serde_json::json!(depth)),
                 ("with_heap".to_string(), serde_json::json!(true)),
             ]),
-            SummaryParams::Cms { width, depth } => StdHashMap::from([
+            SketchParams::Cms { width, depth } => StdHashMap::from([
                 ("w".to_string(), serde_json::json!(width)),
                 ("d".to_string(), serde_json::json!(depth)),
             ]),
             other => unreachable!("fixture doesn't exercise {other:?}"),
         };
         PrecomputeMaterialization::new(
-            match agg.sketch_kind {
-                SummaryKind::DDSketch => AggregationType::DDSketch,
-                SummaryKind::Kll => AggregationType::DatasketchesKLL,
-                SummaryKind::Hll => AggregationType::HLL,
-                SummaryKind::Cms => AggregationType::CountMinSketch,
-                SummaryKind::CmsWithHeap => AggregationType::CountMinSketchWithHeap,
-                SummaryKind::CountSketch => AggregationType::CountSketch,
-                SummaryKind::CountSketchWithHeap => AggregationType::CountSketchWithHeap,
+            match kind {
+                SketchAlgorithm::DDSketch => AggregationType::DDSketch,
+                SketchAlgorithm::Kll => AggregationType::DatasketchesKLL,
+                SketchAlgorithm::Hll => AggregationType::HLL,
+                SketchAlgorithm::Cms => AggregationType::CountMinSketch,
+                SketchAlgorithm::CmsWithHeap => AggregationType::CountMinSketchWithHeap,
+                SketchAlgorithm::CountSketch => AggregationType::CountSketch,
+                SketchAlgorithm::CountSketchWithHeap => AggregationType::CountSketchWithHeap,
                 _ => unreachable!("fixture only uses sketch-typed kinds"),
             },
             String::new(),
@@ -300,15 +292,15 @@ mod tests {
                 agg(
                     "agg0",
                     "http_latency_ms",
-                    SummaryKind::DDSketch,
-                    SummaryParams::DDSketch { alpha: 0.01 },
+                    SketchAlgorithm::DDSketch,
+                    SketchParams::DDSketch { alpha: 0.01 },
                     Vec::new(),
                 ),
                 agg(
                     "agg1",
                     "http_requests_total",
-                    SummaryKind::Hll,
-                    SummaryParams::Hll { precision: 14 },
+                    SketchAlgorithm::Hll,
+                    SketchParams::Hll { precision: 14 },
                     vec!["zone".to_string()],
                 ),
             ],
@@ -355,16 +347,24 @@ mod tests {
             .values()
             .find(|m| matches!(m.source, Source::TimeSeries { ref metric } if metric == "http_latency_ms"))
             .expect("ddsketch materialization present");
-        assert_eq!(ddsketch.kind, SummaryKind::DDSketch);
-        assert_eq!(ddsketch.params, SummaryParams::DDSketch { alpha: 0.01 });
+        assert!(matches!(
+            &ddsketch.family,
+            planner_types::post_asap::SummaryFamilyType::Sketch(kind, _)
+                if kind.algorithm() == &planner_types::post_asap::SketchAlgorithm::DDSketch
+                    && kind.params() == &planner_types::post_asap::SketchParams::DDSketch { alpha: 0.01 }
+        ));
 
         let hll = plan
             .materializations
             .values()
             .find(|m| matches!(m.source, Source::TimeSeries { ref metric } if metric == "http_requests_total"))
             .expect("hll materialization present");
-        assert_eq!(hll.kind, SummaryKind::Hll);
-        assert_eq!(hll.params, SummaryParams::Hll { precision: 14 });
+        assert!(matches!(
+            &hll.family,
+            planner_types::post_asap::SummaryFamilyType::Sketch(kind, _)
+                if kind.algorithm() == &planner_types::post_asap::SketchAlgorithm::Hll
+                    && kind.params() == &planner_types::post_asap::SketchParams::Hll { precision: 14 }
+        ));
         assert_eq!(hll.group_by, vec!["zone".to_string()]);
     }
 
@@ -387,7 +387,7 @@ mod tests {
             .expect("routing entry for ddsketch");
         assert_eq!(
             quantile_entry.satisfies,
-            Capability::QuantileApprox(SketchKindHandle::DDSketch)
+            Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch))
         );
 
         let hll_fp = plan
@@ -411,8 +411,8 @@ mod tests {
                 agg(
                     "agg0",
                     "endpoint_count",
-                    SummaryKind::CountSketchWithHeap,
-                    SummaryParams::CountSketchWithHeap {
+                    SketchAlgorithm::CountSketchWithHeap,
+                    SketchParams::CountSketchWithHeap {
                         width: 2048,
                         depth: 5,
                         heap_size: 10,
@@ -422,8 +422,8 @@ mod tests {
                 agg(
                     "agg1",
                     "endpoint_hits",
-                    SummaryKind::Cms,
-                    SummaryParams::Cms {
+                    SketchAlgorithm::Cms,
+                    SketchParams::Cms {
                         width: 4096,
                         depth: 4,
                     },
@@ -446,7 +446,7 @@ mod tests {
         };
         let plan = from_stage_config(&cfg, &[], 1, 0).expect("build plan");
         let topk_entry = plan.routing.iter().find(|r| {
-            r.satisfies == Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap)
+            r.satisfies == Capability::FrequencyTopk(Some(SketchAlgorithm::CountSketchWithHeap))
         });
         assert!(
             topk_entry.is_some(),
@@ -457,7 +457,7 @@ mod tests {
         let freq_entry = plan
             .routing
             .iter()
-            .find(|r| r.satisfies == Capability::FrequencyEstimate(SketchKindHandle::CountMin));
+            .find(|r| r.satisfies == Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms)));
         assert!(
             freq_entry.is_some(),
             "expected a FrequencyEstimate routing entry: {:?}",
@@ -467,14 +467,19 @@ mod tests {
 
     #[test]
     fn exact_agg_override_reports_exact_agg_capability() {
-        let mut a = agg(
-            "agg0",
-            "http_requests_total",
-            SummaryKind::Sum, // sentinel value, suppressed by the override
-            SummaryParams::Sum,
-            vec!["zone".to_string()],
-        );
-        a.agg_type_override = Some("Sum".to_string());
+        let a = BackendAggregation {
+            aggregation_id: "agg0".into(),
+            metric_name: "http_requests_total".into(),
+            family: SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Sum,
+                planner_types::post_asap::ExactParams::Sum,
+            ),
+            window_secs: 60,
+            spatial_filter: String::new(),
+            grouping: vec!["zone".to_string()],
+            item_label: None,
+            aggregation_input: AggregationInput::Raw,
+        };
         let cfg = BackendStageConfig {
             aggregations: vec![a],
             readouts: vec![BackendReadout {
@@ -488,8 +493,13 @@ mod tests {
             .iter()
             .next()
             .expect("one materialization");
-        assert!(m.kind.is_exact());
-        assert_eq!(m.kind, SummaryKind::Sum);
+        assert!(matches!(
+            m.family,
+            planner_types::post_asap::SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Sum,
+                planner_types::post_asap::ExactParams::Sum
+            )
+        ));
 
         let entry = &plan.routing[0];
         assert_eq!(entry.satisfies, Capability::ExactAgg(AggregationType::Sum));

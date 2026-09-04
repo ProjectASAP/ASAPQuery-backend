@@ -650,25 +650,39 @@ impl Replanner {
             AggRole::Other => None,
             AggRole::Quantile | AggRole::Topk => None,
         };
-        let agg_type_override = agg_type_override?.to_string();
+        let exact_kind = match agg_type_override? {
+            "Sum" => planner_types::post_asap::ExactKind::Sum,
+            "Count" => planner_types::post_asap::ExactKind::Count,
+            "MinMax" => planner_types::post_asap::ExactKind::MinMax,
+            "Increase" | "Rate" => planner_types::post_asap::ExactKind::Increase,
+            _ => return None,
+        };
+        let exact_params = match &exact_kind {
+            planner_types::post_asap::ExactKind::Sum => planner_types::post_asap::ExactParams::Sum,
+            planner_types::post_asap::ExactKind::Count => {
+                planner_types::post_asap::ExactParams::Count
+            }
+            planner_types::post_asap::ExactKind::MinMax => {
+                planner_types::post_asap::ExactParams::MinMax
+            }
+            planner_types::post_asap::ExactKind::Increase => {
+                planner_types::post_asap::ExactParams::Increase
+            }
+            planner_types::post_asap::ExactKind::Rate => {
+                planner_types::post_asap::ExactParams::Rate
+            }
+        };
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendStageConfig,
         };
-        use planner_types::post_asap::{SketchAlgorithm, SketchParams};
+        use planner_types::post_asap::SummaryFamilyType;
         let window_secs = workload.time_window.as_secs().max(1);
         Some(BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 item_label: None,
                 aggregation_id: format!("exact-{}-{}", workload.metric_name, role),
                 metric_name: workload.metric_name.clone(),
-                // Sentinel sketch_kind / sketch_params — `agg_type_override`
-                // takes precedence in `build_backend_aggregation_json`, so
-                // these are not emitted on the wire. DDSketch is the
-                // chosen sentinel because every backend that recognises
-                // `AggregationType::FromStr` also accepts DDSketch (and
-                // we don't have a `SketchAlgorithm::None` variant today).
-                sketch_kind: SketchAlgorithm::DDSketch.into(),
-                sketch_params: SketchParams::DDSketch { alpha: 0.01 }.into(),
+                family: SummaryFamilyType::ExactAggregate(exact_kind, exact_params),
                 window_secs,
                 spatial_filter: String::new(),
                 grouping: workload.group_by_labels.clone(),
@@ -676,7 +690,6 @@ impl Replanner {
                 // ships counter samples; the backend's
                 // SumAccumulator integrates them).
                 aggregation_input: AggregationInput::Raw,
-                agg_type_override: Some(agg_type_override),
             }],
             // No readout entries — ExactAgg produces the answer
             // directly; the readout dispatch happens at PromQL eval
@@ -1250,7 +1263,6 @@ mod tests {
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendStageConfig,
         };
-        use planner_types::post_asap::{SketchAlgorithm, SketchParams};
 
         let (url, hits) = start_repost_mock().await;
         let client = StdArc::new(BackendClient::new(url));
@@ -1300,13 +1312,14 @@ mod tests {
                         item_label: None,
                         aggregation_id: "exact-http_requests_total-sum".to_string(),
                         metric_name: "http_requests_total".to_string(),
-                        sketch_kind: SketchAlgorithm::DDSketch.into(),
-                        sketch_params: SketchParams::DDSketch { alpha: 0.01 }.into(),
+                        family: planner_types::post_asap::SummaryFamilyType::ExactAggregate(
+                            planner_types::post_asap::ExactKind::Sum,
+                            planner_types::post_asap::ExactParams::Sum,
+                        ),
                         grouping: vec!["zone".to_string()],
                         spatial_filter: String::new(),
                         window_secs: 60,
                         aggregation_input: AggregationInput::Raw,
-                        agg_type_override: Some("Sum".to_string()),
                     }],
                     readouts: Vec::new(),
                 },

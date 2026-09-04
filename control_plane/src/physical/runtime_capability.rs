@@ -3,12 +3,12 @@
 //! Step 2a of the architectural refactor originally consolidated four
 //! overlapping capability tables into this module. The performance /
 //! cost-model half of that consolidation — [`SketchCapability`] /
-//! `SupportedIntent` / `default_capability_table` / `load_capability_overrides`
+//! `default_capability_table` / `load_capability_overrides`
 //! — moved to `crate::physical::deployment_cost::sketch_capability` (Stage 4 of the
 //! `physical::post_asap` re-layering): it's a cost-model concern read by the
 //! optimizer and physical planner, not L4 IR. What's left here:
 //!
-//! - [`Capability`] / [`SketchKindHandle`] — query-side capability tag,
+//! - [`Capability`] / [`SketchAlgorithm`] — query-side capability tag,
 //!   used by the ASAP-tier reducer in `asap-query-engine` to dispatch
 //!   PromQL → per-Capability sketch evaluation.
 //! - [`capability_for`] — the **semantic** intent → ASAP-tier dispatch
@@ -22,13 +22,13 @@
 use crate::physical::post_asap::matcher::sketch_family_satisfied;
 use crate::types_v2::AccuracyTarget;
 use asap_types::AggregationType;
-use planner_types::post_asap::SketchAlgorithm;
+pub use planner_types::post_asap::SketchAlgorithm;
 use planner_types::pre_asap::AggIntent;
 
 // ── Query-side capability tag ────────────────────────────────────────────────
 
 /// Warm-tier capability tag. One variant per logical query family the
-/// ASAP tier can answer. The inner [`SketchKindHandle`] is the
+/// ASAP tier can answer. The inner [`SketchAlgorithm`] is the
 /// implementation choice (e.g. DDSketch vs KLL for `QuantileApprox`).
 /// Query routing keys on the variant, not the implementation, so two
 /// CMS instances and one CountSketch instance for the same metric-and-
@@ -44,7 +44,7 @@ pub enum Capability {
     /// Approximate quantile via DDSketch / KLL / t-digest. The handle's
     /// `Any` variant means "any quantile-family sketch satisfies"; a
     /// concrete handle means "must be exactly this family".
-    QuantileApprox(SketchKindHandle),
+    QuantileApprox(Option<SketchAlgorithm>),
     /// Approximate cardinality via HLL / theta-sketch / linear-counting.
     /// No inner handle — cardinality has a single canonical family
     /// today (HLL).
@@ -56,12 +56,12 @@ pub enum Capability {
     /// additional info layered on top of the sketch matrix), so
     /// `is_satisfied_by` allows {CountMin, CountSketch, CmsWithHeap,
     /// CountSketchWithHeap} on the available side.
-    FrequencyEstimate(SketchKindHandle),
+    FrequencyEstimate(Option<SketchAlgorithm>),
     /// Heavy-hitter top-k via CMS-with-heap or CountSketch-with-heap.
     /// Heap-BEARING — only handles that carry an item universe in their
     /// wire format can answer this. `Any` required matches either
     /// `CmsWithHeap` or `CountSketchWithHeap`.
-    FrequencyTopk(SketchKindHandle),
+    FrequencyTopk(Option<SketchAlgorithm>),
     /// Exact-aggregation ASAP-tier state — Sum / Count / MinMax / Avg /
     /// Rate / Increase / SetAggregator etc. Backed by a per-accumulator
     /// payload (`AggPayload::ExactAgg` in the data plane). One variant
@@ -293,36 +293,10 @@ impl OuterAgg {
     }
 }
 
-/// Compact, hashable handle for sketch implementation choice. Mirrors
-/// `planner_types::post_asap::SummaryKind` but adds the `Any` query-side wildcard
-/// (not a sketch family — a dispatch hint).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SketchKindHandle {
-    DDSketch,
-    Kll,
-    Hll,
-    CountSketch,
-    CountMin,
-    /// CMS paired with a Misra-Gries / heavy-hitter heap. Distinct from
-    /// `CountMin` because vanilla CMS carries no item universe — the
-    /// heap is what lets the ASAP-tier reducer enumerate top-k items
-    /// without an external item list.
-    CmsWithHeap,
-    /// CountSketch paired with a heavy-hitter heap. Same role as
-    /// `CmsWithHeap` but on the CountSketch substrate (balanced /
-    /// zero-mean error instead of CMS's one-sided bias).
-    CountSketchWithHeap,
-    /// "Any implementation that satisfies the family". Analysis-time
-    /// wildcard, never indexed against a concrete sketch instance.
-    /// Consumed by [`Capability::is_satisfied_by`].
-    Any,
-}
-
 impl Capability {
     /// True when an indexed sketch instance's capability satisfies the
-    /// query's required capability. `SketchKindHandle::Any` on the
-    /// query side is a wildcard that matches any concrete handle in
-    /// the same family.
+    /// query's required capability. `None` on the query side means any
+    /// algorithm in that capability family.
     ///
     /// `self` is the **required** capability (from the analyzer);
     /// `indexed` is the **available** capability (from the sketch
@@ -341,7 +315,7 @@ impl Capability {
     pub fn is_satisfied_by(&self, indexed: &Capability) -> bool {
         match (self, indexed) {
             (Capability::QuantileApprox(req), Capability::QuantileApprox(have)) => {
-                sketch_kinds_compatible(*req, SketchAlgorithm::Kll, *have, SketchAlgorithm::Kll)
+                sketch_algorithms_compatible(req, SketchAlgorithm::Kll, have, SketchAlgorithm::Kll)
             }
             // Cardinality has no inner handle; family match is total.
             (Capability::CardinalityApprox, Capability::CardinalityApprox) => true,
@@ -350,10 +324,10 @@ impl Capability {
             // stand-in would let a heap-less available sketch wrongly
             // satisfy a top-k requirement (see `resolve_handle`'s doc).
             (Capability::FrequencyTopk(req), Capability::FrequencyTopk(have)) => {
-                sketch_kinds_compatible(
-                    *req,
+                sketch_algorithms_compatible(
+                    req,
                     SketchAlgorithm::CmsWithHeap,
-                    *have,
+                    have,
                     SketchAlgorithm::CmsWithHeap,
                 )
             }
@@ -364,13 +338,13 @@ impl Capability {
             // the sketch matrix). A heap-bearing `FrequencyTopk` indexed
             // capability ALSO satisfies a bare-frequency required capability.
             (Capability::FrequencyEstimate(req), Capability::FrequencyEstimate(have)) => {
-                sketch_kinds_compatible(*req, SketchAlgorithm::Cms, *have, SketchAlgorithm::Cms)
+                sketch_algorithms_compatible(req, SketchAlgorithm::Cms, have, SketchAlgorithm::Cms)
             }
             (Capability::FrequencyEstimate(req), Capability::FrequencyTopk(have)) => {
-                sketch_kinds_compatible(
-                    *req,
+                sketch_algorithms_compatible(
+                    req,
                     SketchAlgorithm::Cms,
-                    *have,
+                    have,
                     SketchAlgorithm::CmsWithHeap,
                 )
             }
@@ -398,68 +372,18 @@ impl Capability {
     }
 }
 
-/// Map a concrete [`SketchKindHandle`] to its [`SketchAlgorithm`]
-/// equivalent. `Any` has no single equivalent by design — resolve it to
-/// a concrete per-family stand-in via [`resolve_handle`] before calling
-/// this.
-fn to_summary_kind(h: SketchKindHandle) -> Option<SketchAlgorithm> {
-    match h {
-        SketchKindHandle::DDSketch => Some(SketchAlgorithm::DDSketch),
-        SketchKindHandle::Kll => Some(SketchAlgorithm::Kll),
-        SketchKindHandle::Hll => Some(SketchAlgorithm::Hll),
-        SketchKindHandle::CountSketch => Some(SketchAlgorithm::CountSketch),
-        SketchKindHandle::CountMin => Some(SketchAlgorithm::Cms),
-        SketchKindHandle::CmsWithHeap => Some(SketchAlgorithm::CmsWithHeap),
-        SketchKindHandle::CountSketchWithHeap => Some(SketchAlgorithm::CountSketchWithHeap),
-        // Defensive: `Any` should never reach this function directly —
-        // every call site resolves it via `resolve_handle` first. `None`
-        // here means "does not satisfy anything", the safe default.
-        SketchKindHandle::Any => None,
-    }
-}
-
-/// Resolve a [`SketchKindHandle`] to the [`SketchAlgorithm`] fed into
-/// [`sketch_family_satisfied`]. `Any` (the query-side "any
-/// implementation in this family satisfies" wildcard) resolves to
-/// `any_stand_in` — a concrete per-family placeholder — because
-/// `SketchAlgorithm` has no wildcard concept of its own;
-/// `sketch_family_satisfied`'s same-family-satisfies rule already
-/// treats every member of a family as interchangeable, so picking ANY
-/// concrete family member as the stand-in reproduces the wildcard's
-/// effect (`enum-unification-plan.md` §8 Step 4's investigation note).
-///
-/// The one place this needs care: [`Capability::FrequencyTopk`]'s stand-in
-/// must be the heap-bearing `CmsWithHeap`, never bare `Cms` — bare `Cms`
-/// and `CmsWithHeap` are the SAME family (`Frequency`/`FrequencyTopk` are
-/// related by the asymmetric "heap satisfies bare" rule, not equal), so a
-/// bare stand-in would let a heap-less available sketch wrongly satisfy a
-/// top-k requirement. Every `FrequencyTopk` call site in this module
-/// passes `SketchAlgorithm::CmsWithHeap` as `any_stand_in` for exactly this
-/// reason.
-fn resolve_handle(h: SketchKindHandle, any_stand_in: SketchAlgorithm) -> Option<SketchAlgorithm> {
-    match h {
-        SketchKindHandle::Any => Some(any_stand_in),
-        other => to_summary_kind(other),
-    }
-}
-
-/// Resolve both sides of a handle comparison and delegate to
-/// [`sketch_family_satisfied`]. `false` if either side fails to resolve
-/// (only possible today via the defensive `to_summary_kind` fallback,
-/// since `resolve_handle` always resolves `Any`).
-fn sketch_kinds_compatible(
-    required: SketchKindHandle,
+/// Resolve optional query-side algorithm constraints and delegate family
+/// compatibility to the ASAPPlanner algorithm taxonomy. `None` means any
+/// algorithm in the capability's category; it is not a fake algorithm.
+fn sketch_algorithms_compatible(
+    required: &Option<SketchAlgorithm>,
     required_any_stand_in: SketchAlgorithm,
-    available: SketchKindHandle,
+    available: &Option<SketchAlgorithm>,
     available_any_stand_in: SketchAlgorithm,
 ) -> bool {
-    match (
-        resolve_handle(required, required_any_stand_in),
-        resolve_handle(available, available_any_stand_in),
-    ) {
-        (Some(r), Some(a)) => sketch_family_satisfied(&r, &a),
-        _ => false,
-    }
+    let required = required.as_ref().unwrap_or(&required_any_stand_in);
+    let available = available.as_ref().unwrap_or(&available_any_stand_in);
+    sketch_family_satisfied(required, available)
 }
 
 /// True when `available` is the multi-population equivalent of
@@ -543,7 +467,7 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
             // CountSketchWithHeap works (the heap is additional
             // info that the FrequencyTopk path uses). `Any` here
             // means the optimizer picks the cheapest indexed sid.
-            Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
+            Some(Capability::FrequencyEstimate(None))
         };
     }
     match intent {
@@ -555,16 +479,16 @@ pub fn capability_for(intent: &AggIntent) -> Option<Capability> {
             Some(Capability::ExactAgg(AggregationType::Increase))
         }
         AggIntent::Quantile { accuracy, .. } if !is_exact(accuracy) => {
-            Some(Capability::QuantileApprox(SketchKindHandle::Any))
+            Some(Capability::QuantileApprox(None))
         }
         AggIntent::Cardinality { accuracy, .. } if !is_exact(accuracy) => {
             Some(Capability::CardinalityApprox)
         }
         AggIntent::TopK { accuracy, .. } if !is_exact(accuracy) => {
-            Some(Capability::FrequencyTopk(SketchKindHandle::Any))
+            Some(Capability::FrequencyTopk(None))
         }
         AggIntent::Count { accuracy } if !is_exact(accuracy) => {
-            Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
+            Some(Capability::FrequencyEstimate(None))
         }
         _ => None,
     }
@@ -581,7 +505,6 @@ fn is_exact(accuracy: &AccuracyTarget) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     // ── capability_for: AggIntent → Capability bridge ────────────────────
 
@@ -594,7 +517,7 @@ mod tests {
         };
         assert_eq!(
             capability_for(&intent),
-            Some(Capability::QuantileApprox(SketchKindHandle::Any))
+            Some(Capability::QuantileApprox(None))
         );
     }
 
@@ -653,7 +576,7 @@ mod tests {
         };
         assert_eq!(
             capability_for(&intent),
-            Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
+            Some(Capability::FrequencyEstimate(None))
         );
     }
 
@@ -733,7 +656,7 @@ mod tests {
         };
         assert_eq!(
             capability_for(&intent),
-            Some(Capability::FrequencyTopk(SketchKindHandle::Any))
+            Some(Capability::FrequencyTopk(None))
         );
     }
 
@@ -752,7 +675,7 @@ mod tests {
         let intent = crate::planner_selection::frequency(AccuracyTarget::Epsilon(0.01), None);
         assert_eq!(
             capability_for(&intent),
-            Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
+            Some(Capability::FrequencyEstimate(None))
         );
     }
 
@@ -767,7 +690,7 @@ mod tests {
         );
         assert_eq!(
             capability_for(&intent),
-            Some(Capability::FrequencyEstimate(SketchKindHandle::Any))
+            Some(Capability::FrequencyEstimate(None))
         );
     }
 
@@ -798,9 +721,9 @@ mod tests {
 
     #[test]
     fn is_satisfied_by_any_wildcard_matches_concrete() {
-        let required = Capability::QuantileApprox(SketchKindHandle::Any);
-        let indexed_dd = Capability::QuantileApprox(SketchKindHandle::DDSketch);
-        let indexed_kll = Capability::QuantileApprox(SketchKindHandle::Kll);
+        let required = Capability::QuantileApprox(None);
+        let indexed_dd = Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch));
+        let indexed_kll = Capability::QuantileApprox(Some(SketchAlgorithm::Kll));
         assert!(required.is_satisfied_by(&indexed_dd));
         assert!(required.is_satisfied_by(&indexed_kll));
     }
@@ -818,15 +741,15 @@ mod tests {
         // to spell out `Any` or a concrete kind. Harmless in practice:
         // `capability_for` never emits a concrete `QuantileApprox` handle
         // (always `Any`), so this path is exercised only defensively.
-        let required = Capability::QuantileApprox(SketchKindHandle::DDSketch);
-        let indexed_dd = Capability::QuantileApprox(SketchKindHandle::DDSketch);
-        let indexed_kll = Capability::QuantileApprox(SketchKindHandle::Kll);
+        let required = Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch));
+        let indexed_dd = Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch));
+        let indexed_kll = Capability::QuantileApprox(Some(SketchAlgorithm::Kll));
         assert!(required.is_satisfied_by(&indexed_dd));
         assert!(required.is_satisfied_by(&indexed_kll));
 
         // Still cross-family-incompatible: a concrete quantile requirement
         // is never satisfied by a cardinality-family available handle.
-        let indexed_hll = Capability::QuantileApprox(SketchKindHandle::Hll);
+        let indexed_hll = Capability::QuantileApprox(Some(SketchAlgorithm::Hll));
         assert!(!required.is_satisfied_by(&indexed_hll));
     }
 
@@ -839,20 +762,20 @@ mod tests {
 
     #[test]
     fn is_satisfied_by_different_families_are_incompatible() {
-        let required = Capability::QuantileApprox(SketchKindHandle::Any);
+        let required = Capability::QuantileApprox(None);
         let indexed = Capability::CardinalityApprox;
         assert!(!required.is_satisfied_by(&indexed));
 
-        let required = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
-        let indexed = Capability::QuantileApprox(SketchKindHandle::DDSketch);
+        let required = Capability::FrequencyTopk(Some(SketchAlgorithm::CmsWithHeap));
+        let indexed = Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch));
         assert!(!required.is_satisfied_by(&indexed));
     }
 
     #[test]
     fn is_satisfied_by_topk_handles_must_match() {
-        let required = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
-        let indexed_with_heap = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
-        let indexed_no_heap = Capability::FrequencyTopk(SketchKindHandle::CountMin);
+        let required = Capability::FrequencyTopk(Some(SketchAlgorithm::CmsWithHeap));
+        let indexed_with_heap = Capability::FrequencyTopk(Some(SketchAlgorithm::CmsWithHeap));
+        let indexed_no_heap = Capability::FrequencyTopk(Some(SketchAlgorithm::Cms));
         assert!(required.is_satisfied_by(&indexed_with_heap));
         assert!(!required.is_satisfied_by(&indexed_no_heap));
     }
@@ -863,10 +786,10 @@ mod tests {
         // capability declares itself as `FrequencyTopk(CountMin)` (an
         // ill-formed catalog entry), the satisfaction check must reject
         // it — top-k cannot enumerate items off a heap-less sketch.
-        let required_any = Capability::FrequencyTopk(SketchKindHandle::Any);
-        let required_concrete = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
-        let indexed_heapless = Capability::FrequencyTopk(SketchKindHandle::CountMin);
-        let indexed_heapless_cs = Capability::FrequencyTopk(SketchKindHandle::CountSketch);
+        let required_any = Capability::FrequencyTopk(None);
+        let required_concrete = Capability::FrequencyTopk(Some(SketchAlgorithm::CmsWithHeap));
+        let indexed_heapless = Capability::FrequencyTopk(Some(SketchAlgorithm::Cms));
+        let indexed_heapless_cs = Capability::FrequencyTopk(Some(SketchAlgorithm::CountSketch));
         assert!(!required_any.is_satisfied_by(&indexed_heapless));
         assert!(!required_any.is_satisfied_by(&indexed_heapless_cs));
         assert!(!required_concrete.is_satisfied_by(&indexed_heapless));
@@ -875,9 +798,9 @@ mod tests {
     #[test]
     fn is_satisfied_by_frequency_topk_any_matches_either_heap() {
         // `Any` required for top-k accepts either heap-bearing handle.
-        let required = Capability::FrequencyTopk(SketchKindHandle::Any);
-        let cms_heap = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
-        let cs_heap = Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
+        let required = Capability::FrequencyTopk(None);
+        let cms_heap = Capability::FrequencyTopk(Some(SketchAlgorithm::CmsWithHeap));
+        let cs_heap = Capability::FrequencyTopk(Some(SketchAlgorithm::CountSketchWithHeap));
         assert!(required.is_satisfied_by(&cms_heap));
         assert!(required.is_satisfied_by(&cs_heap));
     }
@@ -888,11 +811,11 @@ mod tests {
         // frequency-family sketch — heap-less AND heap-bearing both work
         // (the heap is additional metadata; the underlying CMS / CS
         // matrix answers the point query either way).
-        let required = Capability::FrequencyEstimate(SketchKindHandle::Any);
-        let cms = Capability::FrequencyEstimate(SketchKindHandle::CountMin);
-        let cs = Capability::FrequencyEstimate(SketchKindHandle::CountSketch);
-        let cms_heap = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
-        let cs_heap = Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
+        let required = Capability::FrequencyEstimate(None);
+        let cms = Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms));
+        let cs = Capability::FrequencyEstimate(Some(SketchAlgorithm::CountSketch));
+        let cms_heap = Capability::FrequencyTopk(Some(SketchAlgorithm::CmsWithHeap));
+        let cs_heap = Capability::FrequencyTopk(Some(SketchAlgorithm::CountSketchWithHeap));
         assert!(required.is_satisfied_by(&cms));
         assert!(required.is_satisfied_by(&cs));
         assert!(required.is_satisfied_by(&cms_heap));
@@ -901,13 +824,13 @@ mod tests {
 
     #[test]
     fn is_satisfied_by_frequency_estimate_rejects_non_frequency_family() {
-        let required = Capability::FrequencyEstimate(SketchKindHandle::Any);
+        let required = Capability::FrequencyEstimate(None);
         // QuantileApprox / CardinalityApprox don't answer frequency.
-        let q = Capability::QuantileApprox(SketchKindHandle::DDSketch);
+        let q = Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch));
         let c = Capability::CardinalityApprox;
         // FrequencyEstimate with a non-frequency-family handle on the
         // available side is also rejected (defensive).
-        let bad = Capability::FrequencyEstimate(SketchKindHandle::Hll);
+        let bad = Capability::FrequencyEstimate(Some(SketchAlgorithm::Hll));
         assert!(!required.is_satisfied_by(&q));
         assert!(!required.is_satisfied_by(&c));
         assert!(!required.is_satisfied_by(&bad));
@@ -939,18 +862,20 @@ mod tests {
         // with QuantileApprox / CardinalityApprox / FrequencyEstimate /
         // FrequencyTopk.
         let required = Capability::ExactAgg(AggregationType::Sum);
-        assert!(!required.is_satisfied_by(&Capability::QuantileApprox(SketchKindHandle::DDSketch)));
+        assert!(
+            !required.is_satisfied_by(&Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch)))
+        );
         assert!(!required.is_satisfied_by(&Capability::CardinalityApprox));
         assert!(
-            !required.is_satisfied_by(&Capability::FrequencyEstimate(SketchKindHandle::CountMin))
+            !required.is_satisfied_by(&Capability::FrequencyEstimate(Some(SketchAlgorithm::Cms)))
         );
-        assert!(
-            !required.is_satisfied_by(&Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap))
-        );
+        assert!(!required.is_satisfied_by(&Capability::FrequencyTopk(Some(
+            SketchAlgorithm::CmsWithHeap
+        ))));
 
         // And the reverse — a sketch-family required capability must
         // not match an ExactAgg-backed sid.
-        let sketch_required = Capability::QuantileApprox(SketchKindHandle::Any);
+        let sketch_required = Capability::QuantileApprox(None);
         let exact_indexed = Capability::ExactAgg(AggregationType::DatasketchesKLL);
         assert!(!sketch_required.is_satisfied_by(&exact_indexed));
     }
@@ -1059,11 +984,12 @@ mod tests {
         // `CountSketchWithHeap` is the CountSketch counterpart to
         // `CmsWithHeap`. Construct a `FrequencyTopk` capability around
         // it and verify it satisfies an `Any`-required top-k.
-        let cap = Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
-        let required = Capability::FrequencyTopk(SketchKindHandle::Any);
+        let cap = Capability::FrequencyTopk(Some(SketchAlgorithm::CountSketchWithHeap));
+        let required = Capability::FrequencyTopk(None);
         assert!(required.is_satisfied_by(&cap));
         // And the concrete-against-concrete (same handle) case matches.
-        let required_concrete = Capability::FrequencyTopk(SketchKindHandle::CountSketchWithHeap);
+        let required_concrete =
+            Capability::FrequencyTopk(Some(SketchAlgorithm::CountSketchWithHeap));
         assert!(required_concrete.is_satisfied_by(&cap));
         // Intentional broadening vs. this module's pre-`sketch_family_satisfied`
         // behavior: CMS and CountSketch are the SAME frequency family in
@@ -1076,11 +1002,11 @@ mod tests {
         // `capability_for` always emits `Any` for `FrequencyTopk`, never a
         // concrete handle, so this exact combination never arises from a
         // real query.
-        let required_cms = Capability::FrequencyTopk(SketchKindHandle::CmsWithHeap);
+        let required_cms = Capability::FrequencyTopk(Some(SketchAlgorithm::CmsWithHeap));
         assert!(required_cms.is_satisfied_by(&cap));
         // Still cross-family-incompatible: a heap-bearing requirement is
         // never satisfied by a bare (heap-less) available handle.
-        let bare = Capability::FrequencyTopk(SketchKindHandle::CountMin);
+        let bare = Capability::FrequencyTopk(Some(SketchAlgorithm::Cms));
         assert!(!required_cms.is_satisfied_by(&bare));
     }
 

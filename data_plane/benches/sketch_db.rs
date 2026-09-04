@@ -35,8 +35,8 @@ use prost::Message;
 
 use data_plane::precompute_engine::operators::SumAccumulator;
 use data_plane::storage_engines::sketch_db::data::{
-    AccuracyBound, AggKind, AggregationType, Capability, SketchConfig, SketchEncoding,
-    SketchKindHandle,
+    AccuracyBound, AggKind, AggregationType, Capability, SketchAlgorithm, SketchConfig,
+    SketchEncoding,
 };
 use data_plane::storage_engines::sketch_db::index::{SketchInstanceMetadata, SketchStore};
 use data_plane::storage_engines::SketchSampleState;
@@ -105,18 +105,22 @@ fn sample(bytes: Vec<u8>) -> SketchSampleState {
 
 // ── Metadata builders ───────────────────────────────────────────────────────
 
-fn sketch_meta(sid: u64, kind: SketchKindHandle, config: SketchConfig) -> SketchInstanceMetadata {
+fn sketch_meta(
+    sid: u64,
+    algorithm: SketchAlgorithm,
+    config: SketchConfig,
+) -> SketchInstanceMetadata {
     SketchInstanceMetadata {
         sid,
         metric_name: "bench_metric".into(),
         group_by_keys: BTreeSet::new(),
-        capability: Some(match kind {
-            SketchKindHandle::Hll => Capability::CardinalityApprox,
-            _ => Capability::QuantileApprox(kind),
+        capability: Some(match algorithm {
+            SketchAlgorithm::Hll => Capability::CardinalityApprox,
+            _ => Capability::QuantileApprox(Some(algorithm.clone())),
         }),
         accuracy: Some(AccuracyBound::from_config(&config)),
         agg_kind: AggKind::Sketch {
-            kind,
+            algorithm,
             config,
             spatial_filter_canonical: String::new(),
         },
@@ -146,10 +150,10 @@ fn precompute_meta(sid: u64, metric: &str, agg_type: AggregationType) -> SketchI
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct KindCase {
     name: &'static str,
-    kind: SketchKindHandle,
+    algorithm: SketchAlgorithm,
     build: fn() -> (SketchConfig, Vec<u8>),
 }
 
@@ -176,17 +180,17 @@ fn hll_small() -> (SketchConfig, Vec<u8>) {
 const KINDS: &[KindCase] = &[
     KindCase {
         name: "DDSketch",
-        kind: SketchKindHandle::DDSketch,
+        algorithm: SketchAlgorithm::DDSketch,
         build: dd_small,
     },
     KindCase {
         name: "KLL",
-        kind: SketchKindHandle::Kll,
+        algorithm: SketchAlgorithm::Kll,
         build: kll_small,
     },
     KindCase {
         name: "HLL",
-        kind: SketchKindHandle::Hll,
+        algorithm: SketchAlgorithm::Hll,
         build: hll_small,
     },
 ];
@@ -215,7 +219,11 @@ fn bench_append_sample(c: &mut Criterion) {
                         || {
                             let store = SketchStore::new();
                             for sid in 0..num_sids as u64 {
-                                store.register(sketch_meta(sid + 1, kind.kind, cfg.clone()));
+                                store.register(sketch_meta(
+                                    sid + 1,
+                                    kind.algorithm.clone(),
+                                    cfg.clone(),
+                                ));
                             }
                             (store, 0u64)
                         },
@@ -284,10 +292,10 @@ fn bench_append_precompute(c: &mut Criterion) {
 
 // ── query_range ─────────────────────────────────────────────────────────────
 
-fn build_populated_store(depth: u64, kind: KindCase, sid: u64) -> SketchStore {
+fn build_populated_store(depth: u64, kind: &KindCase, sid: u64) -> SketchStore {
     let store = SketchStore::new();
     let (cfg, payload_bytes) = (kind.build)();
-    store.register(sketch_meta(sid, kind.kind, cfg));
+    store.register(sketch_meta(sid, kind.algorithm.clone(), cfg));
     for i in 0..depth {
         let win = (1_000 + i * 10, 1_000 + i * 10 + 10);
         store.append_sample(sid, BTreeMap::new(), win, sample(payload_bytes.clone()));
@@ -302,7 +310,7 @@ fn bench_query_range(c: &mut Criterion) {
     let sid = 1u64;
     for kind in KINDS {
         for depth in [10u64, 100, 1_000] {
-            let store = build_populated_store(depth, *kind, sid);
+            let store = build_populated_store(depth, kind, sid);
             let full_end = 1_000 + depth * 10 + 10;
             let cases = [
                 ("w=1", (1_000u64, 1_010u64)),
