@@ -1,8 +1,8 @@
 use crate::drivers::query::adapters::{ParsedQueryRequest, ParsedRangeQueryRequest};
 use axum::{
     body::Bytes,
-    extract::{Form, Query, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Form, Query, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
@@ -151,6 +151,7 @@ pub struct HttpServer {
     physical_plan_lock: Arc<tokio::sync::Mutex<()>>,
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
     physical_plan_lifecycle: Option<crate::storage_engines::types::PhysicalPlanLifecycle>,
+    remote_write: Option<crate::drivers::ingest::PrometheusRemoteWriteReceiver>,
 }
 
 #[derive(Clone)]
@@ -179,6 +180,7 @@ struct AppState {
     physical_plan_lock: Arc<tokio::sync::Mutex<()>>,
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
     physical_plan_lifecycle: Option<crate::storage_engines::types::PhysicalPlanLifecycle>,
+    remote_write: Option<crate::drivers::ingest::PrometheusRemoteWriteReceiver>,
 }
 
 impl HttpServer {
@@ -206,7 +208,17 @@ impl HttpServer {
             physical_plan_lock: Arc::new(tokio::sync::Mutex::new(())),
             active_physical_plan: None,
             physical_plan_lifecycle: None,
+            remote_write: None,
         }
+    }
+
+    /// Enable Prometheus Remote Write v1 on the same public HTTP listener.
+    pub fn with_remote_write(
+        mut self,
+        receiver: crate::drivers::ingest::PrometheusRemoteWriteReceiver,
+    ) -> Self {
+        self.remote_write = Some(receiver);
+        self
     }
 
     /// Plug an additional [`QueryEngine`] into the capability router.
@@ -367,6 +379,11 @@ impl HttpServer {
         );
         info!("Runtime info endpoint: {}", runtime_info_path);
 
+        let request_body_limit = self
+            .remote_write
+            .as_ref()
+            .map(|receiver| receiver.config().max_compressed_bytes)
+            .unwrap_or(2 * 1024 * 1024);
         let app_state = AppState {
             config: self.config.clone(),
             query_engine: self.query_engine,
@@ -383,6 +400,7 @@ impl HttpServer {
             physical_plan_lock: self.physical_plan_lock.clone(),
             active_physical_plan: self.active_physical_plan.clone(),
             physical_plan_lifecycle: self.physical_plan_lifecycle.clone(),
+            remote_write: self.remote_write.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -396,6 +414,11 @@ impl HttpServer {
             .route(runtime_info_path, post(handle_runtime_info))
             .route("/metrics", get(handle_metrics))
             .route("/api/v1/health", get(handle_health))
+            .route(
+                "/api/v1/write",
+                post(handle_prometheus_remote_write)
+                    .layer(DefaultBodyLimit::max(request_body_limit)),
+            )
             .route("/api/v1/store/metrics", get(handle_store_metrics))
             .route(
                 "/api/v1/streaming-config",
@@ -464,6 +487,11 @@ impl HttpServer {
         let query_endpoint = adapter.get_query_endpoint();
         let runtime_info_path = adapter.get_runtime_info_path();
 
+        let request_body_limit = self
+            .remote_write
+            .as_ref()
+            .map(|receiver| receiver.config().max_compressed_bytes)
+            .unwrap_or(2 * 1024 * 1024);
         let app_state = AppState {
             config: self.config.clone(),
             query_engine: self.query_engine.clone(),
@@ -480,6 +508,7 @@ impl HttpServer {
             physical_plan_lock: self.physical_plan_lock.clone(),
             active_physical_plan: self.active_physical_plan.clone(),
             physical_plan_lifecycle: self.physical_plan_lifecycle.clone(),
+            remote_write: self.remote_write.clone(),
         };
 
         let range_query_endpoint = adapter.get_range_query_endpoint();
@@ -490,6 +519,11 @@ impl HttpServer {
             .route(range_query_endpoint, get(handle_range_query))
             .route(range_query_endpoint, post(handle_range_query_post))
             .route(runtime_info_path, get(handle_runtime_info))
+            .route(
+                "/api/v1/write",
+                post(handle_prometheus_remote_write)
+                    .layer(DefaultBodyLimit::max(request_body_limit)),
+            )
             .route(
                 "/api/v1/streaming-config",
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
@@ -1746,12 +1780,37 @@ fn query_status_label(response: &Response) -> &'static str {
 // Metrics Handler
 // ============================================================
 
-async fn handle_metrics() -> impl IntoResponse {
+async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let encoder = prometheus::TextEncoder::new();
     let metric_families = prometheus::gather();
     let mut buffer = Vec::new();
     prometheus::Encoder::encode(&encoder, &metric_families, &mut buffer)
         .unwrap_or_else(|e| tracing::error!("Failed to encode metrics: {}", e));
+    if let Some(receiver) = state.remote_write.as_ref() {
+        use std::sync::atomic::Ordering;
+        let stats = receiver.stats();
+        let extra = format!(
+            "# TYPE asap_remote_write_requests_total counter\n\
+             asap_remote_write_requests_total {}\n\
+             # TYPE asap_remote_write_samples_total counter\n\
+             asap_remote_write_samples_total {}\n\
+             # TYPE asap_remote_write_stale_markers_total counter\n\
+             asap_remote_write_stale_markers_total {}\n\
+             # TYPE asap_remote_write_duplicates_total counter\n\
+             asap_remote_write_duplicates_total {}\n\
+             # TYPE asap_remote_write_rejected_requests_total counter\n\
+             asap_remote_write_rejected_requests_total {}\n\
+             # TYPE asap_remote_write_bytes_total counter\n\
+             asap_remote_write_bytes_total {}\n",
+            stats.requests.load(Ordering::Relaxed),
+            stats.samples.load(Ordering::Relaxed),
+            stats.stale_markers.load(Ordering::Relaxed),
+            stats.duplicates.load(Ordering::Relaxed),
+            stats.rejected_requests.load(Ordering::Relaxed),
+            stats.bytes.load(Ordering::Relaxed),
+        );
+        buffer.extend_from_slice(extra.as_bytes());
+    }
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -2077,10 +2136,19 @@ async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drivers::ingest::prometheus_remote_write::{
+        Label, PrometheusRemoteWriteConfig, PrometheusRemoteWriteReceiver, Sample, TimeSeries,
+        WriteRequest,
+    };
+    use crate::precompute_engine::ingest_handler::{IngestObservability, IngestState};
+    use crate::precompute_engine::series_router::SeriesRouter;
     use crate::query_engines::ASAPQueryEngine;
     use crate::storage_engines::types::{HotReloadStreamingConfig, StreamingConfig};
+    use prost::Message;
     use reqwest::Client;
+    use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     // ── warm-vs-archive range routing: tier classification ──────────────
     // The defect is that a recent (warm-resident, not-yet-archived) range
@@ -2152,6 +2220,90 @@ mod tests {
 
     async fn setup_test_server() -> u16 {
         setup_test_server_with_hot_reload(None).await
+    }
+
+    async fn setup_remote_write_test_server() -> (u16, PrometheusRemoteWriteReceiver) {
+        let streaming_config = Arc::new(StreamingConfig::default());
+        let hot_reload = HotReloadStreamingConfig::new((*streaming_config).clone());
+        let (sender, _worker) = mpsc::channel(8);
+        let ingest = Arc::new(IngestState {
+            router: SeriesRouter::new(vec![sender]),
+            samples_ingested: AtomicU64::new(0),
+            samples_blocked_by_schema_barrier: AtomicU64::new(0),
+            hot_reload_config: hot_reload,
+            pass_raw_samples: false,
+            sketch_snapshots: dashmap::DashMap::new(),
+            series_resolver: Arc::new(crate::drivers::ingest::SeriesIdResolver::new()),
+            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            observability: IngestObservability::default(),
+        });
+        let receiver =
+            PrometheusRemoteWriteReceiver::new(PrometheusRemoteWriteConfig::default(), ingest);
+        let adapter_config = AdapterConfig::prometheus_promql("http://127.0.0.1:9".into(), false);
+        let server = HttpServer::new(
+            HttpServerConfig {
+                port: 0,
+                handle_http_requests: true,
+                adapter_config,
+            },
+            Arc::new(ASAPQueryEngine::new(streaming_config, 15_000)),
+            Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+        )
+        .with_remote_write(receiver.clone());
+        (server.start_test_server().await.unwrap(), receiver)
+    }
+
+    #[tokio::test]
+    async fn remote_write_http_contract_accepts_v1_and_rejects_wrong_encoding() {
+        let (port, receiver) = setup_remote_write_test_server().await;
+        let request = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![Label {
+                    name: "__name__".into(),
+                    value: "up".into(),
+                }],
+                samples: vec![Sample {
+                    value: 1.0,
+                    timestamp: 123,
+                }],
+                exemplars: Vec::new(),
+                histograms: Vec::new(),
+            }],
+        };
+        let body = snap::raw::Encoder::new()
+            .compress_vec(&request.encode_to_vec())
+            .unwrap();
+        let client = Client::new();
+        let accepted = client
+            .post(format!("http://127.0.0.1:{port}/api/v1/write"))
+            .header("content-encoding", "snappy")
+            .header("content-type", "application/x-protobuf")
+            .header("x-prometheus-remote-write-version", "0.1.0")
+            .body(body.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(accepted.status().as_u16(), StatusCode::NO_CONTENT.as_u16());
+        assert_eq!(
+            receiver
+                .stats()
+                .samples
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        let rejected = client
+            .post(format!("http://127.0.0.1:{port}/api/v1/write"))
+            .header("content-encoding", "gzip")
+            .header("content-type", "application/x-protobuf")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            rejected.status().as_u16(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE.as_u16()
+        );
     }
 
     async fn setup_test_server_with_hot_reload(
@@ -5083,6 +5235,80 @@ aggregations:
 }
 
 /// Health check endpoint for DataCollector controller to verify backend is alive.
+async fn handle_prometheus_remote_write(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(receiver) = state.remote_write.as_ref() else {
+        return (StatusCode::NOT_FOUND, "Remote Write is disabled").into_response();
+    };
+    let content_encoding = headers
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok());
+    if !content_encoding.is_some_and(|value| value.eq_ignore_ascii_case("snappy")) {
+        return (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Content-Encoding must be snappy",
+        )
+            .into_response();
+    }
+    if let Some(content_type) = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        if !content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/x-protobuf"))
+        {
+            return (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Content-Type must be application/x-protobuf",
+            )
+                .into_response();
+        }
+    }
+    if let Some(version) = headers
+        .get("x-prometheus-remote-write-version")
+        .and_then(|value| value.to_str().ok())
+    {
+        if version != "0.1.0" {
+            return (
+                StatusCode::BAD_REQUEST,
+                "only Prometheus Remote Write v1 (0.1.0) is supported",
+            )
+                .into_response();
+        }
+    }
+
+    match receiver.accept(&body) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(
+            crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::CompressedTooLarge(
+                _,
+            )
+            | crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::DecompressedTooLarge(
+                _,
+            )
+            | crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::TooManySeries {
+                ..
+            }
+            | crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::TooManySamples(
+                _,
+            ),
+        ) => (StatusCode::PAYLOAD_TOO_LARGE, "Remote Write request exceeds configured limits")
+            .into_response(),
+        Err(
+            error @ (crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::Backpressure(
+                _,
+            )
+            | crate::drivers::ingest::prometheus_remote_write::RemoteWriteError::DedupCapacity(_)),
+        ) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
 async fn handle_health() -> &'static str {
     "ok"
 }
