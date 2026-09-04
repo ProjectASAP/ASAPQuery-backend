@@ -451,9 +451,21 @@ async fn main() -> Result<()> {
             .cloned()
             .collect(),
     };
+    let initial_transmission_plan = control_plane::physical::compiler::TransmissionPlan {
+        envelope: initial_precompute_plan.envelope.clone(),
+        frame_identity: control_plane::physical::compiler::FrameIdentityContract {
+            identity_version: 1,
+            sequence_scope:
+                control_plane::physical::compiler::SequenceScope::MaterializationWindowProducerEpoch,
+            require_checkpoint_for_full: true,
+            require_base_checkpoint_for_delta: true,
+        },
+        rules: Vec::new(),
+    };
     let active_physical_plan = data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(
         data_plane::storage_engines::types::ActivePhysicalPlan {
             precompute_plan: initial_precompute_plan,
+            transmission_plan: initial_transmission_plan,
             runtime_config: streaming_config.clone(),
             backend_plan: Arc::new(initial_backend_plan),
             query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
@@ -819,6 +831,7 @@ async fn main() -> Result<()> {
         let current = active_physical_plan.snapshot();
         active_physical_plan.swap(data_plane::storage_engines::types::ActivePhysicalPlan {
             precompute_plan: current.precompute_plan.clone(),
+            transmission_plan: current.transmission_plan.clone(),
             runtime_config: current.runtime_config.clone(),
             backend_plan: current.backend_plan.clone(),
             query_plan: current.query_plan.clone(),

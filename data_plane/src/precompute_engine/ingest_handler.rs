@@ -180,6 +180,12 @@ impl IngestState {
         self.hot_reload_config.snapshot()
     }
 
+    pub fn physical_plan_snapshot(
+        &self,
+    ) -> Option<Arc<crate::storage_engines::types::ActivePhysicalPlan>> {
+        self.hot_reload_config.physical_plan_snapshot()
+    }
+
     /// RES-1 — record that a per-series snapshot base for `window_start`
     /// was just (re)inserted, then opportunistically sweep stale entries.
     ///

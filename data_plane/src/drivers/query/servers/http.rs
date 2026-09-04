@@ -5297,6 +5297,7 @@ async fn handle_post_backend_plan(
 #[derive(serde::Deserialize)]
 struct PhysicalPlanInstallRequest {
     precompute_plan: control_plane::physical::compiler::PrecomputePlan,
+    transmission_plan: control_plane::physical::compiler::TransmissionPlan,
     backend_plan: Vec<u8>,
     query_plan: control_plane::query_plan::QueryPlan,
     storage_routing: Option<serde_json::Value>,
@@ -5341,6 +5342,15 @@ async fn handle_post_physical_plan(
             )
                 .into_response(),
         };
+    if let Err(error) = request.transmission_plan.validate(&request.precompute_plan) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": format!("TransmissionPlan validation error: {error}")
+            })),
+        )
+            .into_response();
+    }
     let new_config = crate::storage_engines::types::StreamingConfig::new(runtime_materializations);
     let new_plan = match control_plane::backend_plan::BackendPlan::decode(&request.backend_plan) {
         Ok(plan) => plan,
@@ -5449,6 +5459,7 @@ async fn handle_post_physical_plan(
     let plan_id = new_plan.plan_id;
     let active = crate::storage_engines::types::ActivePhysicalPlan {
         precompute_plan: request.precompute_plan,
+        transmission_plan: request.transmission_plan,
         runtime_config: Arc::new(new_config),
         backend_plan: Arc::new(new_plan),
         query_plan: Arc::new(request.query_plan),

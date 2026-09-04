@@ -87,6 +87,7 @@ use crate::storage_engines::types::StreamingConfig;
 #[derive(Debug, Clone)]
 pub struct ActivePhysicalPlan {
     pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
+    pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
     pub runtime_config: Arc<StreamingConfig>,
     pub backend_plan: Arc<control_plane::backend_plan::BackendPlan>,
     pub query_plan: Arc<control_plane::query_plan::QueryPlan>,
@@ -570,6 +571,10 @@ impl HotReloadStreamingConfig {
             .unwrap_or_else(|| self.inner.load_full())
     }
 
+    pub fn physical_plan_snapshot(&self) -> Option<Arc<ActivePhysicalPlan>> {
+        self.active.as_ref().map(|active| active.snapshot())
+    }
+
     /// Atomically replace the current config. The previous `Arc` is
     /// dropped when the last reader holding it goes out of scope.
     /// Returns the `Arc` that was just replaced, for callers that
@@ -631,6 +636,25 @@ mod tests {
                 schemas: Vec::new(),
                 producers: Vec::new(),
                 materializations: Vec::new(),
+            },
+            transmission_plan: control_plane::physical::compiler::TransmissionPlan {
+                envelope: control_plane::physical::compiler::PlanEnvelope {
+                    plan_id,
+                    plan_version,
+                    generated_at_unix_ms: activation_unix_ms,
+                    activation_unix_ms,
+                    expiry_unix_ms,
+                    backend_compat: "asap-query-backend.v1".into(),
+                    planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
+                    capability_snapshot_id: "test".into(),
+                },
+                frame_identity: control_plane::physical::compiler::FrameIdentityContract {
+                    identity_version: 1,
+                    sequence_scope: control_plane::physical::compiler::SequenceScope::MaterializationWindowProducerEpoch,
+                    require_checkpoint_for_full: true,
+                    require_base_checkpoint_for_delta: true,
+                },
+                rules: Vec::new(),
             },
             runtime_config: Arc::new(StreamingConfig::new(HashMap::new())),
             backend_plan: Arc::new(control_plane::backend_plan::BackendPlan {

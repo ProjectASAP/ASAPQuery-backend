@@ -366,6 +366,7 @@ impl BackendClient {
     pub async fn post_physical_plan_typed(
         &self,
         precompute_plan: &crate::physical::compiler::PrecomputePlan,
+        transmission_plan: &crate::physical::compiler::TransmissionPlan,
         backend_plan: Vec<u8>,
         query_plan: &crate::query_plan::QueryPlan,
         storage_routing: Option<serde_json::Value>,
@@ -376,6 +377,7 @@ impl BackendClient {
             .post(&url)
             .json(&serde_json::json!({
             "precompute_plan": precompute_plan,
+            "transmission_plan": transmission_plan,
             "backend_plan": backend_plan,
             "query_plan": query_plan,
             "storage_routing": storage_routing,

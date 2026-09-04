@@ -145,7 +145,7 @@ pub struct DeploymentEnvironment {
     pub backend_compat: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanEnvelope {
     pub plan_id: u64,
     pub plan_version: u64,
@@ -188,6 +188,7 @@ pub struct CollectorPlan {
     pub collector_id: String,
     pub envelope: PlanEnvelope,
     pub materializations: Vec<CollectorMaterialization>,
+    pub transmission_rules: Vec<TransmissionRule>,
 }
 
 /// Backend-side materialization projection consumed by the streaming
@@ -229,7 +230,7 @@ pub struct IngestContract {
     pub require_registered_producer: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum StateEncoding {
     SketchlibProtobufV1,
@@ -525,8 +526,236 @@ pub struct PhysicalPlan {
     pub envelope: PlanEnvelope,
     pub collector_plans: Vec<CollectorPlan>,
     pub precompute_plan: PrecomputePlan,
+    pub transmission_plan: TransmissionPlan,
     pub backend_plan: BackendPlan,
     pub query_plan: QueryPlan,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum TransmissionMode {
+    Full,
+    Delta,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceScope {
+    MaterializationWindowProducerEpoch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FrameIdentityContract {
+    pub identity_version: u32,
+    pub sequence_scope: SequenceScope,
+    pub require_checkpoint_for_full: bool,
+    pub require_base_checkpoint_for_delta: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct TransmissionRule {
+    pub materialization: asap_types::PolicyFingerprint,
+    pub producer_id: String,
+    pub schema_id: String,
+    pub mode: TransmissionMode,
+    pub encoding: StateEncoding,
+    pub emit_every_ms: u64,
+    pub full_checkpoint_every_ms: Option<u64>,
+    pub destination_ref: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TransmissionPlan {
+    pub envelope: PlanEnvelope,
+    pub frame_identity: FrameIdentityContract,
+    pub rules: Vec<TransmissionRule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryFrameKind {
+    Full,
+    Delta,
+}
+
+/// Identity attached to every summary record. Window bounds come from the
+/// data point; the remaining fields are carried as reserved `asap.frame.*`
+/// attributes until the modified-OTLP schema gains a dedicated message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryFrameIdentity {
+    pub identity_version: u32,
+    pub plan_id: u64,
+    pub plan_version: u64,
+    pub backend_compat: String,
+    pub materialization: asap_types::PolicyFingerprint,
+    pub schema_id: String,
+    pub producer_id: String,
+    pub producer_epoch: String,
+    /// Canonical identity of the output series inside the materialization.
+    /// This remains stable when the sender switches between attribute-bearing
+    /// and SID-only frames, and prevents two series from sharing a receipt.
+    pub series_fingerprint: String,
+    pub window_start_unix_nano: u64,
+    pub window_end_unix_nano: u64,
+    pub sequence: u64,
+    pub kind: SummaryFrameKind,
+    pub encoding: StateEncoding,
+    pub checkpoint_id: Option<String>,
+    pub base_checkpoint_id: Option<String>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum TransmissionPlanError {
+    #[error("TransmissionPlan envelope differs from PrecomputePlan")]
+    EnvelopeMismatch,
+    #[error("transmission rules do not exactly match precompute producer bindings")]
+    ProducerSetMismatch,
+    #[error("invalid transmission rule for producer {0}")]
+    InvalidRule(String),
+    #[error("frame identity is invalid: {0}")]
+    InvalidFrame(String),
+    #[error("frame has no matching transmission rule")]
+    UnknownFrame,
+}
+
+impl TransmissionPlan {
+    pub fn build(
+        envelope: PlanEnvelope,
+        precompute: &PrecomputePlan,
+    ) -> Result<Self, TransmissionPlanError> {
+        if envelope != precompute.envelope {
+            return Err(TransmissionPlanError::EnvelopeMismatch);
+        }
+        let schemas: BTreeMap<_, _> = precompute
+            .schemas
+            .iter()
+            .map(|schema| (schema.materialization, schema))
+            .collect();
+        let rules = precompute
+            .producers
+            .iter()
+            .map(|producer| {
+                let schema = schemas
+                    .get(&producer.materialization)
+                    .expect("validated PrecomputePlan schema binding");
+                let materialization = precompute
+                    .materializations
+                    .iter()
+                    .find(|m| m.policy_fingerprint() == producer.materialization)
+                    .expect("validated PrecomputePlan materialization binding");
+                TransmissionRule {
+                    materialization: producer.materialization,
+                    producer_id: producer.producer_id.clone(),
+                    schema_id: producer.schema_id.clone(),
+                    mode: TransmissionMode::Full,
+                    encoding: schema.encodings[0].clone(),
+                    emit_every_ms: materialization.window_size.saturating_mul(1_000),
+                    full_checkpoint_every_ms: None,
+                    destination_ref: "asapquery-backend".into(),
+                }
+            })
+            .collect();
+        let plan = Self {
+            envelope,
+            frame_identity: FrameIdentityContract {
+                identity_version: 1,
+                sequence_scope: SequenceScope::MaterializationWindowProducerEpoch,
+                require_checkpoint_for_full: true,
+                require_base_checkpoint_for_delta: true,
+            },
+            rules,
+        };
+        plan.validate(precompute)?;
+        Ok(plan)
+    }
+
+    pub fn validate(&self, precompute: &PrecomputePlan) -> Result<(), TransmissionPlanError> {
+        if self.envelope != precompute.envelope {
+            return Err(TransmissionPlanError::EnvelopeMismatch);
+        }
+        let expected: BTreeSet<_> = precompute
+            .producers
+            .iter()
+            .map(|producer| {
+                (
+                    producer.materialization,
+                    producer.producer_id.as_str(),
+                    producer.schema_id.as_str(),
+                )
+            })
+            .collect();
+        let actual: BTreeSet<_> = self
+            .rules
+            .iter()
+            .map(|rule| {
+                (
+                    rule.materialization,
+                    rule.producer_id.as_str(),
+                    rule.schema_id.as_str(),
+                )
+            })
+            .collect();
+        if expected != actual || actual.len() != self.rules.len() {
+            return Err(TransmissionPlanError::ProducerSetMismatch);
+        }
+        for rule in &self.rules {
+            if rule.emit_every_ms == 0
+                || rule.destination_ref.is_empty()
+                || (rule.mode == TransmissionMode::Delta
+                    && rule
+                        .full_checkpoint_every_ms
+                        .map_or(true, |value| value == 0))
+            {
+                return Err(TransmissionPlanError::InvalidRule(rule.producer_id.clone()));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_frame(
+        &self,
+        frame: &SummaryFrameIdentity,
+    ) -> Result<(), TransmissionPlanError> {
+        if frame.identity_version != self.frame_identity.identity_version
+            || frame.plan_id != self.envelope.plan_id
+            || frame.plan_version != self.envelope.plan_version
+            || frame.backend_compat != self.envelope.backend_compat
+            || frame.producer_epoch.is_empty()
+            || frame.series_fingerprint.is_empty()
+            || frame.sequence == 0
+            || frame.window_start_unix_nano >= frame.window_end_unix_nano
+            || (frame.kind == SummaryFrameKind::Full
+                && self.frame_identity.require_checkpoint_for_full
+                && frame.checkpoint_id.is_none())
+            || (frame.kind == SummaryFrameKind::Delta
+                && self.frame_identity.require_base_checkpoint_for_delta
+                && frame.base_checkpoint_id.is_none())
+        {
+            return Err(TransmissionPlanError::InvalidFrame(
+                "identity/lifecycle/window/checkpoint fields do not satisfy the active contract"
+                    .into(),
+            ));
+        }
+        let mode = match frame.kind {
+            SummaryFrameKind::Full => TransmissionMode::Full,
+            SummaryFrameKind::Delta => TransmissionMode::Delta,
+        };
+        if self.rules.iter().any(|rule| {
+            rule.materialization == frame.materialization
+                && rule.producer_id == frame.producer_id
+                && rule.schema_id == frame.schema_id
+                && rule.mode == mode
+                && rule.encoding == frame.encoding
+        }) {
+            Ok(())
+        } else {
+            Err(TransmissionPlanError::UnknownFrame)
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -717,15 +946,7 @@ impl PhysicalCompiler {
                 output_representation: OutputRepresentation::SummaryState,
             });
         }
-        let collector_plans = environment
-            .collector_ids
-            .into_iter()
-            .map(|collector_id| CollectorPlan {
-                collector_id,
-                envelope: envelope.clone(),
-                materializations: collector_materializations.clone(),
-            })
-            .collect::<Vec<_>>();
+        let producer_ids = environment.collector_ids.clone();
         // Several queries/readouts may intentionally share one maintained
         // summary. PrecomputePlan is keyed by physical identity, not query ID.
         let mut materializations_by_fingerprint = BTreeMap::new();
@@ -737,10 +958,6 @@ impl PhysicalCompiler {
                 .or_insert(materialization);
         }
         let materializations = materializations_by_fingerprint.into_values().collect();
-        let producer_ids = collector_plans
-            .iter()
-            .map(|plan| plan.collector_id.clone())
-            .collect::<Vec<_>>();
         let precompute_plan = PrecomputePlan::build(
             envelope.clone(),
             materializations,
@@ -751,6 +968,25 @@ impl PhysicalCompiler {
             query_id: "precompute-plan".into(),
             reason: error.to_string(),
         })?;
+        let transmission_plan = TransmissionPlan::build(envelope.clone(), &precompute_plan)
+            .map_err(|error| CompileError::Query {
+                query_id: "transmission-plan".into(),
+                reason: error.to_string(),
+            })?;
+        let collector_plans = producer_ids
+            .into_iter()
+            .map(|collector_id| CollectorPlan {
+                transmission_rules: transmission_plan
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.producer_id == collector_id)
+                    .cloned()
+                    .collect(),
+                collector_id,
+                envelope: envelope.clone(),
+                materializations: collector_materializations.clone(),
+            })
+            .collect::<Vec<_>>();
         let materialization_fingerprints: BTreeSet<_> =
             backend_plan.materializations.keys().copied().collect();
         let mut query_entries = BTreeMap::new();
@@ -850,6 +1086,7 @@ impl PhysicalCompiler {
             envelope,
             collector_plans,
             precompute_plan,
+            transmission_plan,
             backend_plan,
             query_plan,
         })
@@ -934,6 +1171,14 @@ fn state_schema_id(fingerprint: asap_types::PolicyFingerprint) -> String {
 fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> {
     match family {
         SummaryFamilyType::ExactAggregate(..) => vec![StateEncoding::ExactAccumulatorV1],
+        SummaryFamilyType::Sketch(kind, _)
+            if matches!(
+                kind.algorithm(),
+                SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap
+            ) =>
+        {
+            vec![StateEncoding::SketchCoreMsgpackV1]
+        }
         SummaryFamilyType::Sketch(..) => vec![
             StateEncoding::SketchlibProtobufV1,
             StateEncoding::SketchCoreMsgpackV1,
@@ -1319,6 +1564,40 @@ mod tests {
         assert_eq!(bundle.precompute_plan.producers.len(), 2);
         assert_eq!(bundle.precompute_plan.ingest.endpoint_path, "/v1/metrics");
         bundle.precompute_plan.validate().expect("runtime contract");
+        bundle
+            .transmission_plan
+            .validate(&bundle.precompute_plan)
+            .expect("transmission contract");
+        assert_eq!(bundle.transmission_plan.rules.len(), 2);
+        let rule = &bundle.transmission_plan.rules[0];
+        let frame = SummaryFrameIdentity {
+            identity_version: 1,
+            plan_id: bundle.envelope.plan_id,
+            plan_version: bundle.envelope.plan_version,
+            backend_compat: bundle.envelope.backend_compat.clone(),
+            materialization: rule.materialization,
+            schema_id: rule.schema_id.clone(),
+            producer_id: rule.producer_id.clone(),
+            producer_epoch: "boot-1".into(),
+            series_fingerprint: "service=api".into(),
+            window_start_unix_nano: 1,
+            window_end_unix_nano: 2,
+            sequence: 1,
+            kind: SummaryFrameKind::Full,
+            encoding: rule.encoding.clone(),
+            checkpoint_id: Some("checkpoint-1".into()),
+            base_checkpoint_id: None,
+        };
+        bundle
+            .transmission_plan
+            .validate_frame(&frame)
+            .expect("matching frame identity");
+        let mut wrong_version = frame;
+        wrong_version.plan_version += 1;
+        assert!(matches!(
+            bundle.transmission_plan.validate_frame(&wrong_version),
+            Err(TransmissionPlanError::InvalidFrame(_))
+        ));
         assert_eq!(bundle.backend_plan.materializations.len(), 1);
         assert_eq!(
             bundle
@@ -1368,6 +1647,7 @@ mod tests {
             assert_eq!(plan.envelope, bundle.envelope);
             assert_eq!(plan.materializations[0].metric, "m");
             assert_eq!(plan.materializations[0].window_secs, 60);
+            assert_eq!(plan.transmission_rules.len(), 1);
             assert_eq!(
                 plan.materializations[0].abstract_window_framework,
                 SummaryWindowFramework::Tumbling
