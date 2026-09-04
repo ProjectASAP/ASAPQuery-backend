@@ -210,13 +210,57 @@ impl GroupState {
             for acc in windows.values() {
                 merged = Some(match merged.take() {
                     None => acc.clone_boxed_core(),
-                    Some(m) => m.merge_with(acc.as_ref()).ok()?,
+                    Some(current) => current.merge_with(acc.as_ref()).ok()?,
                 });
             }
         }
         merged?
             .query_statistic(stat, key, &std::collections::HashMap::new())
             .ok()
+    }
+
+    /// Finalize a compiler-declared exact readout. Rate and increase share
+    /// reset-aware Increase state physically, but remain distinct operations
+    /// in QueryPlan so serving never infers semantics from PromQL text.
+    pub fn exact_value_for(
+        &self,
+        readout: control_plane::query_plan::ExactReadout,
+        key: &Option<KeyByLabelValues>,
+        range_start_ms: u64,
+        range_end_ms: u64,
+    ) -> Option<f64> {
+        let GroupState::ExactAgg { entries, agg_type } = self else {
+            return None;
+        };
+        let stat = match (readout, agg_type) {
+            (
+                control_plane::query_plan::ExactReadout::Sum,
+                AggregationType::Sum | AggregationType::MultipleSum,
+            ) => asap_types::Statistic::Sum,
+            (
+                control_plane::query_plan::ExactReadout::Increase,
+                AggregationType::Increase | AggregationType::MultipleIncrease,
+            ) => asap_types::Statistic::Increase,
+            (
+                control_plane::query_plan::ExactReadout::Rate,
+                AggregationType::Increase | AggregationType::MultipleIncrease,
+            ) => asap_types::Statistic::Rate,
+            _ => return None,
+        };
+        let mut merged: Option<Box<dyn AggregateCore>> = None;
+        for windows in entries {
+            for acc in windows.values() {
+                merged = Some(match merged.take() {
+                    None => acc.clone_boxed_core(),
+                    Some(m) => m.merge_with(acc.as_ref()).ok()?,
+                });
+            }
+        }
+        let query_kwargs = std::collections::HashMap::from([
+            ("range_start_ms".to_string(), range_start_ms.to_string()),
+            ("range_end_ms".to_string(), range_end_ms.to_string()),
+        ]);
+        merged?.query_statistic(stat, key, &query_kwargs).ok()
     }
 
     /// Coverage analog of `exact_value` — folds `(min_window_end_ms,

@@ -158,7 +158,11 @@ impl PrometheusHttpAdapter {
                 .as_secs_f64()
         };
 
-        Ok(ParsedQueryRequest { query, time })
+        Ok(ParsedQueryRequest {
+            query,
+            time,
+            timeout: params.get("timeout").cloned(),
+        })
     }
 
     /// Helper to parse range query parameters
@@ -206,6 +210,7 @@ impl PrometheusHttpAdapter {
             start,
             end,
             step,
+            timeout: params.get("timeout").cloned(),
         })
     }
 }

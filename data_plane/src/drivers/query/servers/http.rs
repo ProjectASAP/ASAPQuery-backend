@@ -72,6 +72,22 @@ fn extract_tenant(headers: &axum::http::HeaderMap) -> String {
         .unwrap_or_else(|| crate::query_engines::routing::DEFAULT_TENANT.to_string())
 }
 
+/// Copy only request context that is safe and meaningful for the configured
+/// Prometheus fallback. Hop-by-hop and client-controlled transport headers are
+/// intentionally excluded.
+fn extract_fallback_headers(headers: &HeaderMap) -> HashMap<String, String> {
+    const FORWARDED: [&str; 3] = ["authorization", "x-scope-orgid", "x-asap-tenant"];
+    FORWARDED
+        .into_iter()
+        .filter_map(|name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(|value| (name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct HttpServerConfig {
     pub port: u16,
@@ -1143,7 +1159,16 @@ async fn process_via_simple_engine(
     );
     use crate::drivers::query::adapters::QueryExecutionResult;
     use crate::query_engines::routing::query_engine_routing::QueryEngine;
-    match state.query_engine.execute(&parsed_request.query).await {
+    let evaluation_ms = if parsed_request.time > 0.0 {
+        (parsed_request.time * 1_000.0) as u64
+    } else {
+        unix_time_ms()
+    };
+    match state
+        .query_engine
+        .execute_at(&parsed_request.query, evaluation_ms)
+        .await
+    {
         Ok(query_result) => {
             let query_duration = query_start_time.elapsed();
             debug!(
@@ -1529,6 +1554,7 @@ async fn handle_instant_query(
     // `X-ASAP-Tenant` header (default `"default"`). Captured before
     // `parse_get_request` consumes `query_params`.
     let tenant = extract_tenant(&headers);
+    let forwarding_headers = extract_fallback_headers(&headers);
 
     let parsed_request = match state.adapter.parse_get_request(query_params).await {
         Ok(req) => {
@@ -1555,7 +1581,7 @@ async fn handle_instant_query(
         &state,
         &parsed_request,
         start_time,
-        HashMap::new(),
+        forwarding_headers,
         engine_override,
         &tenant,
     )
@@ -1599,13 +1625,7 @@ async fn handle_instant_query_post(
     let start_time = Instant::now();
     debug!("=== INCOMING POST REQUEST ===");
 
-    // Extract headers we want to forward
-    let mut forwarding_headers = HashMap::new();
-    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth.to_str() {
-            forwarding_headers.insert("Authorization".to_string(), auth_str.to_string());
-        }
-    }
+    let forwarding_headers = extract_fallback_headers(&headers);
 
     // Check content type to determine how to parse the body
     let content_type = headers
@@ -1871,6 +1891,8 @@ async fn process_range_query_request(
     state: &AppState,
     parsed_request: &ParsedRangeQueryRequest,
     start_time: Instant,
+    forwarding_headers: HashMap<String, String>,
+    tenant: &str,
 ) -> Response {
     // Check if handling is enabled
     if !state.config.handle_http_requests {
@@ -1913,11 +1935,7 @@ async fn process_range_query_request(
     let end_ms = (parsed_request.end * 1000.0) as u64;
     let step_ms = (parsed_request.step * 1000.0) as u64;
 
-    // Range handlers don't read the `X-ASAP-Tenant` header, so resolve
-    // the metric's storage axis against the `default` tenant's routing
-    // table — the same resolution the instant path applies when no
-    // tenant header is present.
-    let metric_storage = resolve_metric_storage(state, &parsed_request.query, "default");
+    let metric_storage = resolve_metric_storage(state, &parsed_request.query, tenant);
 
     // Match the instant path's hardcoding of `(Sum, Approximate)`.
     // TODO: derive `accuracy` (and `stat`) from the request rather than
@@ -1995,16 +2013,26 @@ async fn process_range_query_request(
                 registered = ?registered,
                 "EngineRouter (range): no engine registered for any compatible backend",
             );
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "status": "error",
-                    "errorType": "internal",
-                    "error": format!(
-                        "no engine registered for any compatible backend; tried {tried:?}, registered={registered:?}"
-                    )})),
-            )
-                .into_response()
+            if let Some(fallback) = &state.fallback {
+                match fallback
+                    .execute_range_query_with_headers(parsed_request, forwarding_headers)
+                    .await
+                {
+                    Ok(response) => response.into_response(),
+                    Err(status) => status.into_response(),
+                }
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({
+                        "status": "error",
+                        "errorType": "internal",
+                        "error": format!(
+                            "no engine registered for any compatible backend; tried {tried:?}, registered={registered:?}"
+                        )})),
+                )
+                    .into_response()
+            }
         }
         Err(EngineRouterError::AllFailed { last }) => {
             use crate::query_engines::EngineError;
@@ -2021,9 +2049,19 @@ async fn process_range_query_request(
                          falling through to unsupported",
                         parsed_request.query
                     );
-                    match state.adapter.format_unsupported_query_response().await {
-                        Ok(json) => json.into_response(),
-                        Err(status) => status.into_response(),
+                    if let Some(fallback) = &state.fallback {
+                        match fallback
+                            .execute_range_query_with_headers(parsed_request, forwarding_headers)
+                            .await
+                        {
+                            Ok(response) => response.into_response(),
+                            Err(status) => status.into_response(),
+                        }
+                    } else {
+                        match state.adapter.format_unsupported_query_response().await {
+                            Ok(json) => json.into_response(),
+                            Err(status) => status.into_response(),
+                        }
                     }
                 }
                 EngineError::Backend { .. } => (
@@ -2041,6 +2079,7 @@ async fn process_range_query_request(
 
 async fn handle_range_query(
     query_params: Query<HashMap<String, String>>,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
     let _timer = srv_metrics::start_query_timer(srv_metrics::QUERY_TYPE_RANGE);
@@ -2068,13 +2107,25 @@ async fn handle_range_query(
             };
         }
     };
+    let tenant = extract_tenant(&headers);
 
-    let response = process_range_query_request(&state, &parsed_request, start_time).await;
+    let response = process_range_query_request(
+        &state,
+        &parsed_request,
+        start_time,
+        extract_fallback_headers(&headers),
+        &tenant,
+    )
+    .await;
     srv_metrics::record_query_outcome(srv_metrics::QUERY_TYPE_RANGE, query_status_label(&response));
     response
 }
 
-async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> Response {
+async fn handle_range_query_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let _timer = srv_metrics::start_query_timer(srv_metrics::QUERY_TYPE_RANGE);
     let start_time = Instant::now();
     debug!("=== INCOMING RANGE QUERY POST REQUEST ===");
@@ -2129,8 +2180,16 @@ async fn handle_range_query_post(State(state): State<AppState>, body: Bytes) -> 
             };
         }
     };
+    let tenant = extract_tenant(&headers);
 
-    let response = process_range_query_request(&state, &parsed_request, start_time).await;
+    let response = process_range_query_request(
+        &state,
+        &parsed_request,
+        start_time,
+        extract_fallback_headers(&headers),
+        &tenant,
+    )
+    .await;
     srv_metrics::record_query_outcome(srv_metrics::QUERY_TYPE_RANGE, query_status_label(&response));
     response
 }

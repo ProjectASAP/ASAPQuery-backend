@@ -87,6 +87,18 @@ pub trait QueryEngine: Send + Sync {
     /// Answer `query` against this engine's storage tier.
     async fn execute(&self, query: &str) -> Result<QueryResult, EngineError>;
 
+    /// Evaluate an instant query at an explicit Unix-millisecond timestamp.
+    /// Engines without a time-aware implementation retain their existing
+    /// behavior; the ASAP QueryPlan runtime overrides this method.
+    async fn execute_at(
+        &self,
+        query: &str,
+        evaluation_ms: u64,
+    ) -> Result<QueryResult, EngineError> {
+        let _ = evaluation_ms;
+        self.execute(query).await
+    }
+
     /// Forward a range query to this engine's storage tier.
     ///
     /// Params are milliseconds since epoch. The default returns `CapabilityMiss`

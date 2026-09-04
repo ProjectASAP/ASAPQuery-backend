@@ -16,6 +16,8 @@ use crate::query_engines::QueryResult;
 pub struct ParsedQueryRequest {
     pub query: String,
     pub time: f64,
+    /// Prometheus timeout syntax, preserved verbatim for exact fallback.
+    pub timeout: Option<String>,
 }
 
 /// Parsed range query request with validated parameters
@@ -25,6 +27,8 @@ pub struct ParsedRangeQueryRequest {
     pub start: f64, // epoch seconds
     pub end: f64,   // epoch seconds
     pub step: f64,  // seconds, must be multiple of tumbling window
+    /// Prometheus timeout syntax, preserved verbatim for exact fallback.
+    pub timeout: Option<String>,
 }
 
 /// Result of query execution (before formatting for protocol)
