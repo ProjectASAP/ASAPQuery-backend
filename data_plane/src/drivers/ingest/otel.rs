@@ -2203,7 +2203,7 @@ fn preflight_summary_frames(
                 .map(|entry| (entry.core.clone_boxed_core(), entry.window_start))
                 .or_else(|| {
                     empty_accumulator_for_delta_bootstrap(
-                        dp.kind,
+                        dp.algorithm.clone(),
                         &dp.container_config,
                         dp.encoding,
                     )
@@ -2215,8 +2215,13 @@ fn preflight_summary_frames(
             if base_window_start != dp.start_time_unix_nano {
                 base.reset_to_empty();
             }
-            apply_modified_otlp_delta_bytes(dp.kind, dp.encoding, &mut base, &dp.sketch)
-                .map_err(|error| format!("invalid delta frame for {metric_name}: {error}"))?;
+            apply_modified_otlp_delta_bytes(
+                dp.algorithm.clone(),
+                dp.encoding,
+                &mut base,
+                &dp.sketch,
+            )
+            .map_err(|error| format!("invalid delta frame for {metric_name}: {error}"))?;
         }
 
         // Attribute-elided retries can recover the policy from their known

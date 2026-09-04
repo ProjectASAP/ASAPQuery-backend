@@ -1121,7 +1121,7 @@ impl TransmissionPlan {
 
 fn validate_runtime_rule_policy(
     rule: &TransmissionRule,
-    family: &asap_types::SummaryKind,
+    family: &StateFamilyContract,
 ) -> Result<(), TransmissionPlanError> {
     let invalid = |reason: &str| TransmissionPlanError::InvalidRuntimePolicy {
         producer_id: rule.producer_id.clone(),
@@ -1138,11 +1138,17 @@ fn validate_runtime_rule_policy(
         let supported = matches!(
             (family, *estimator),
             (
-                asap_types::SummaryKind::Hll,
-                SamplingEstimator::HashThreshold
+                StateFamilyContract::Sketch {
+                    algorithm: SketchAlgorithm::Hll,
+                    ..
+                },
+                SamplingEstimator::HashThreshold,
             ) | (
-                asap_types::SummaryKind::Cms | asap_types::SummaryKind::CmsWithHeap,
-                SamplingEstimator::GeometricAdmission
+                StateFamilyContract::Sketch {
+                    algorithm: SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap,
+                    ..
+                },
+                SamplingEstimator::GeometricAdmission,
             )
         );
         if !supported {
@@ -1163,12 +1169,15 @@ fn validate_runtime_rule_policy(
         }
         if !matches!(
             family,
-            asap_types::SummaryKind::DDSketch
-                | asap_types::SummaryKind::Hll
-                | asap_types::SummaryKind::Cms
-                | asap_types::SummaryKind::CmsWithHeap
-                | asap_types::SummaryKind::CountSketch
-                | asap_types::SummaryKind::CountSketchWithHeap
+            StateFamilyContract::Sketch {
+                algorithm: SketchAlgorithm::DDSketch
+                    | SketchAlgorithm::Hll
+                    | SketchAlgorithm::Cms
+                    | SketchAlgorithm::CmsWithHeap
+                    | SketchAlgorithm::CountSketch
+                    | SketchAlgorithm::CountSketchWithHeap,
+                ..
+            }
         ) {
             return Err(invalid(
                 "delta transmission is not implemented for the materialization family",
@@ -1177,7 +1186,10 @@ fn validate_runtime_rule_policy(
         if let Some(gos) = &delta.gos {
             if !matches!(
                 family,
-                asap_types::SummaryKind::CountSketch | asap_types::SummaryKind::CountSketchWithHeap
+                StateFamilyContract::Sketch {
+                    algorithm: SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap,
+                    ..
+                }
             ) || !gos.epsilon_staleness.is_finite()
                 || !(0.0..=1.0).contains(&gos.epsilon_staleness)
                 || gos.epsilon_staleness == 0.0
@@ -2524,10 +2536,20 @@ mod tests {
             probability: 0.5,
             estimator: SamplingEstimator::HashThreshold,
         };
-        validate_runtime_rule_policy(&rule, &asap_types::SummaryKind::Hll)
-            .expect("HLL supports hash-threshold sampling");
+        let hll = StateFamilyContract::Sketch {
+            algorithm: SketchAlgorithm::Hll,
+            parameters: SketchParams::Hll { precision: 14 },
+        };
+        let count_sketch = StateFamilyContract::Sketch {
+            algorithm: SketchAlgorithm::CountSketch,
+            parameters: SketchParams::CountSketch {
+                width: 128,
+                depth: 4,
+            },
+        };
+        validate_runtime_rule_policy(&rule, &hll).expect("HLL supports hash-threshold sampling");
         assert!(matches!(
-            validate_runtime_rule_policy(&rule, &asap_types::SummaryKind::CountSketch),
+            validate_runtime_rule_policy(&rule, &count_sketch),
             Err(TransmissionPlanError::InvalidRuntimePolicy { .. })
         ));
 
@@ -2542,10 +2564,9 @@ mod tests {
                 threshold_mode: GosThresholdMode::Isotropic,
             }),
         });
-        validate_runtime_rule_policy(&rule, &asap_types::SummaryKind::CountSketch)
-            .expect("CountSketch supports delta GOS");
+        validate_runtime_rule_policy(&rule, &count_sketch).expect("CountSketch supports delta GOS");
         assert!(matches!(
-            validate_runtime_rule_policy(&rule, &asap_types::SummaryKind::Hll),
+            validate_runtime_rule_policy(&rule, &hll),
             Err(TransmissionPlanError::InvalidRuntimePolicy { .. })
         ));
     }
