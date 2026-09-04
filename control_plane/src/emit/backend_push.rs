@@ -255,6 +255,7 @@ async fn push_documents_coupled(
     let transmission_plan = match crate::physical::compiler::TransmissionPlan::build(
         precompute_plan.envelope.clone(),
         precompute_plan,
+        &Default::default(),
     ) {
         Ok(plan) => plan,
         Err(error) => {
@@ -271,6 +272,7 @@ async fn push_documents_coupled(
                 plan_bytes.clone(),
                 &query_plan,
                 Some(routing.clone()),
+                &[],
             )
             .await
         {

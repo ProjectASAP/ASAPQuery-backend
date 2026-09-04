@@ -153,6 +153,22 @@ materializations are accepted; table sources and unexecutable selected families
 return `CompileError`. Versioned stage/activate/drain/retire lifecycle is part
 of publication; richer topology placement remains follow-up work.
 
+`TransmissionRule.runtime_policy` is the single physical contract for sampling,
+delta gating, and GOS. Sampling is typed by its implemented estimator; GOS is a
+CountSketch delta policy, not a summary family. Unsupported family/policy
+combinations fail compilation. Delta rules declare a periodic full-checkpoint
+cadence and accept both deltas and their recovery full frames.
+
+Runtime feedback cannot mutate an active rule. `authorize_successor` accepts
+only the next `plan_version`, requires fresh evidence for the exact
+plan/materialization/schema/producer tuple, and bounds each permitted knob by
+the active rule's guardrails. Family, parameters, grouping, window, schema,
+encoding, destination, mode, and checkpoint semantics stay fixed; changing
+them requires ordinary recompilation and staged activation.
+The atomic physical-plan publication carries the evidence records alongside
+the successor; the backend performs this authorization before staging it, so a
+caller cannot bypass guardrails by posting a changed rule directly.
+
 Output definitions:
 
 | Output | Definition |
@@ -280,15 +296,23 @@ matching raw transmission and ingest/archive declarations.
 Until modified OTLP has dedicated identity fields, Collector attaches reserved
 data-point attributes under `asap.frame.*`: identity version, plan ID/version,
 backend compatibility, materialization and schema IDs, producer ID/epoch,
-canonical series fingerprint, sequence, full/delta kind, encoding, and
+canonical series identity, sequence, full/delta kind, encoding, and
 checkpoint/base IDs. Window start/end
 remain the typed data-point timestamps. The backend removes reserved attributes
 before building the series label key and rejects the complete request before
-writing any frame when one identity, schema, encoding, materialization, or full
+writing any frame when one identity, schema, encoding, materialization, or
 payload does not match the active TransmissionPlan. HTTP 2xx / gRPC OK is the
 delivery acknowledgement. Retrying the same full frame is idempotent because
 the identity selects the same SID, label set, and window replacement; no second
-application-level ACK or transport WAL is part of this contract.
+application-level ACK or transport WAL is part of this contract. Receiver
+lineage is scoped by plan/version, materialization, concrete series, producer,
+and producer epoch; sequence/checkpoint continuity crosses logical windows,
+while every frame still identifies its own window. Grouped frames retain labels;
+the singleton ungrouped series uses `<global>` as its identity. Exact retries
+are ignored idempotently; a missing base or sequence gap leaves the lineage
+incomplete until a newer full checkpoint arrives. Lineage receipts are not a
+second durable transport log: after backend restart the receiver safely rejects
+deltas until the producer supplies a new full checkpoint.
 
 The compiler error must identify an unsupported capability, invalid placement,
 window incompatibility, identity conflict, or invalid selected guarantee. It

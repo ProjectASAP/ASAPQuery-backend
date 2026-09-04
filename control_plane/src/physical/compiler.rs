@@ -65,6 +65,10 @@ pub struct PlanningQuery {
     /// identities and exposes only framework + complete weighted cost to
     /// Planner. An empty or stale set fails closed.
     pub window_implementations: Vec<WindowImplementationCandidate>,
+    /// Physical runtime policy selected for this Planner materialization.
+    /// It is validated against the selected summary family during physical
+    /// compilation and becomes part of the immutable plan generation.
+    pub runtime_policy: RuntimeRulePolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -438,6 +442,18 @@ impl PrecomputePlan {
                 ));
             }
         }
+        let mut schema_ids = BTreeSet::new();
+        for schema in &self.schemas {
+            if schema.schema_id.trim().is_empty()
+                || !schema_ids.insert(schema.schema_id.as_str())
+                || schema.schema_version == 0
+                || schema.encodings.is_empty()
+            {
+                return Err(PrecomputePlanError::InvalidSchema {
+                    schema_id: schema.schema_id.clone(),
+                });
+            }
+        }
         let schemas: BTreeSet<_> = self
             .schemas
             .iter()
@@ -445,13 +461,6 @@ impl PrecomputePlan {
             .collect();
         if schemas != materializations || schemas.len() != self.schemas.len() {
             return Err(PrecomputePlanError::SchemaSetMismatch);
-        }
-        for schema in &self.schemas {
-            if schema.schema_version == 0 || schema.encodings.is_empty() {
-                return Err(PrecomputePlanError::InvalidSchema {
-                    schema_id: schema.schema_id.clone(),
-                });
-            }
         }
         let schema_by_materialization: BTreeMap<_, _> = self
             .schemas
@@ -541,7 +550,7 @@ pub enum TransmissionMode {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SequenceScope {
-    MaterializationWindowProducerEpoch,
+    MaterializationSeriesProducerEpoch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -553,7 +562,7 @@ pub struct FrameIdentityContract {
     pub require_base_checkpoint_for_delta: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransmissionRule {
     pub materialization: asap_types::PolicyFingerprint,
@@ -564,9 +573,210 @@ pub struct TransmissionRule {
     pub emit_every_ms: u64,
     pub full_checkpoint_every_ms: Option<u64>,
     pub destination_ref: String,
+    /// Plan-owned runtime knobs. These values are part of the immutable plan
+    /// generation; live feedback may only change them by publishing a
+    /// successor generation accepted by [`TransmissionPlan::authorize_successor`].
+    #[serde(default)]
+    pub runtime_policy: RuntimeRulePolicy,
 }
 
+/// How the collector admits updates before sketch maintenance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SamplingPolicy {
+    Disabled,
+    Fixed {
+        /// Probability in `(0, 1]`; `1` is valid but should normally be
+        /// represented by `Disabled`.
+        probability: f64,
+        estimator: SamplingEstimator,
+    },
+}
+
+impl Default for SamplingPolicy {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+impl SamplingPolicy {
+    /// Build the fixed physical knob from the controller's canonical
+    /// epsilon-floor allocator. Degenerate budgets/rates disable sampling.
+    pub fn from_accuracy_budget(
+        epsilon_sampling: f64,
+        updates_per_window: f64,
+        estimator: SamplingEstimator,
+    ) -> Self {
+        if !epsilon_sampling.is_finite()
+            || epsilon_sampling <= 0.0
+            || !updates_per_window.is_finite()
+            || updates_per_window <= 0.0
+        {
+            return Self::Disabled;
+        }
+        let probability =
+            crate::epsilon_alloc::derive_sample_p(epsilon_sampling, updates_per_window);
+        if probability >= 1.0 {
+            Self::Disabled
+        } else {
+            Self::Fixed {
+                probability,
+                estimator,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplingEstimator {
+    /// Hash-threshold element sampling, used by cardinality summaries.
+    HashThreshold,
+    /// Geometric admission/Nitro-style update sampling, used by frequency
+    /// summaries. The sketch readout carries the corresponding correction.
+    GeometricAdmission,
+}
+
+/// Norm-adaptive Group-of-Sketches delta gating. GOS is meaningful only for
+/// CountSketch families and only when the transmission rule is in delta mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct GosPolicy {
+    pub epsilon_staleness: f64,
+    pub sites: u32,
+    pub threshold_mode: GosThresholdMode,
+}
+
+impl GosPolicy {
+    /// Allocate the deterministic staleness share with the same linear-peel
+    /// composition used by `epsilon_alloc`. `None` means the selected sketch
+    /// already consumes the budget or communication has no allocated weight.
+    pub fn from_accuracy_budget(
+        epsilon_total: f64,
+        epsilon_sketch: f64,
+        sites: u32,
+        edge_cpu_weight: f64,
+        communication_weight: f64,
+        threshold_mode: GosThresholdMode,
+    ) -> Option<Self> {
+        if !epsilon_total.is_finite()
+            || !epsilon_sketch.is_finite()
+            || !(0.0..=1.0).contains(&epsilon_total)
+            || epsilon_sketch < 0.0
+            || !edge_cpu_weight.is_finite()
+            || edge_cpu_weight < 0.0
+            || !communication_weight.is_finite()
+            || communication_weight <= 0.0
+        {
+            return None;
+        }
+        let (_, epsilon_staleness) = crate::epsilon_alloc::split_budget(
+            epsilon_total,
+            epsilon_sketch,
+            edge_cpu_weight,
+            communication_weight,
+        );
+        (epsilon_staleness.is_finite() && epsilon_staleness > 0.0).then_some(Self {
+            epsilon_staleness,
+            sites: sites.max(1),
+            threshold_mode,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GosThresholdMode {
+    Isotropic,
+    Anisotropic,
+}
+
+/// Sparse-delta semantics within a delta transmission rule. An absolute
+/// threshold of zero sends every changed cell. When `gos` is present it
+/// replaces the fixed threshold with the GOS norm-adaptive threshold.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DeltaPolicy {
+    pub absolute_threshold: f64,
+    pub gos: Option<GosPolicy>,
+}
+
+/// Inclusive bounds for one floating-point adaptation knob.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveF64Bounds {
+    pub min: f64,
+    pub max: f64,
+    pub max_step: f64,
+}
+
+/// Inclusive bounds for one integer adaptation knob.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AdaptiveU64Bounds {
+    pub min: u64,
+    pub max: u64,
+    pub max_step: u64,
+}
+
+/// Guardrails for telemetry-driven runtime adaptation. This is an
+/// authorization contract, not an instruction to mutate the active plan.
+/// Every accepted change becomes a staged successor PhysicalPlan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeAdaptationPolicy {
+    pub enabled: bool,
+    pub not_before_unix_ms: u64,
+    pub max_evidence_age_ms: u64,
+    pub min_evidence_samples: u64,
+    pub sample_probability: Option<AdaptiveF64Bounds>,
+    pub emit_every_ms: Option<AdaptiveU64Bounds>,
+    pub delta_threshold: Option<AdaptiveF64Bounds>,
+    pub gos_epsilon_staleness: Option<AdaptiveF64Bounds>,
+}
+
+impl Default for RuntimeAdaptationPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            not_before_unix_ms: 0,
+            max_evidence_age_ms: 0,
+            min_evidence_samples: 0,
+            sample_probability: None,
+            emit_every_ms: None,
+            delta_threshold: None,
+            gos_epsilon_staleness: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeRulePolicy {
+    #[serde(default)]
+    pub sampling: SamplingPolicy,
+    pub delta: Option<DeltaPolicy>,
+    #[serde(default)]
+    pub adaptation: RuntimeAdaptationPolicy,
+}
+
+/// Identity and sufficiency information for evidence authorizing one rule's
+/// successor knobs. Raw measurements remain in the runtime-samples store; the
+/// authorization boundary needs only their exact provenance and sample count.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeAdaptationEvidence {
+    pub plan_id: u64,
+    pub plan_version: u64,
+    pub materialization: asap_types::PolicyFingerprint,
+    pub producer_id: String,
+    pub schema_id: String,
+    pub producer_version: String,
+    pub observed_at_unix_ms: u64,
+    pub sample_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransmissionPlan {
     pub envelope: PlanEnvelope,
@@ -592,13 +802,11 @@ pub struct SummaryFrameIdentity {
     pub plan_version: u64,
     pub backend_compat: String,
     pub materialization: asap_types::PolicyFingerprint,
+    /// Canonical producer-side identity for one concrete retained-label group.
+    pub series_identity: String,
     pub schema_id: String,
     pub producer_id: String,
     pub producer_epoch: String,
-    /// Canonical identity of the output series inside the materialization.
-    /// This remains stable when the sender switches between attribute-bearing
-    /// and SID-only frames, and prevents two series from sharing a receipt.
-    pub series_fingerprint: String,
     pub window_start_unix_nano: u64,
     pub window_end_unix_nano: u64,
     pub sequence: u64,
@@ -620,12 +828,24 @@ pub enum TransmissionPlanError {
     InvalidFrame(String),
     #[error("frame has no matching transmission rule")]
     UnknownFrame,
+    #[error("runtime policy for producer {producer_id} is invalid: {reason}")]
+    InvalidRuntimePolicy { producer_id: String, reason: String },
+    #[error("runtime adaptation successor is invalid: {0}")]
+    InvalidSuccessor(String),
+    #[error("runtime adaptation evidence for producer {0} is missing or invalid")]
+    InvalidAdaptationEvidence(String),
+    #[error("runtime adaptation for producer {producer_id} exceeds guardrails: {knob}")]
+    AdaptationOutOfBounds {
+        producer_id: String,
+        knob: &'static str,
+    },
 }
 
 impl TransmissionPlan {
     pub fn build(
         envelope: PlanEnvelope,
         precompute: &PrecomputePlan,
+        runtime_policies: &BTreeMap<asap_types::PolicyFingerprint, RuntimeRulePolicy>,
     ) -> Result<Self, TransmissionPlanError> {
         if envelope != precompute.envelope {
             return Err(TransmissionPlanError::EnvelopeMismatch);
@@ -647,15 +867,27 @@ impl TransmissionPlan {
                     .iter()
                     .find(|m| m.policy_fingerprint() == producer.materialization)
                     .expect("validated PrecomputePlan materialization binding");
+                let runtime_policy = runtime_policies
+                    .get(&producer.materialization)
+                    .cloned()
+                    .unwrap_or_default();
+                let mode = if runtime_policy.delta.is_some() {
+                    TransmissionMode::Delta
+                } else {
+                    TransmissionMode::Full
+                };
+                let emit_every_ms = materialization.window_size.saturating_mul(1_000);
                 TransmissionRule {
                     materialization: producer.materialization,
                     producer_id: producer.producer_id.clone(),
                     schema_id: producer.schema_id.clone(),
-                    mode: TransmissionMode::Full,
+                    mode,
                     encoding: schema.encodings[0].clone(),
-                    emit_every_ms: materialization.window_size.saturating_mul(1_000),
-                    full_checkpoint_every_ms: None,
+                    emit_every_ms,
+                    full_checkpoint_every_ms: (mode == TransmissionMode::Delta)
+                        .then(|| emit_every_ms.saturating_mul(10)),
                     destination_ref: "asapquery-backend".into(),
+                    runtime_policy,
                 }
             })
             .collect();
@@ -663,7 +895,7 @@ impl TransmissionPlan {
             envelope,
             frame_identity: FrameIdentityContract {
                 identity_version: 1,
-                sequence_scope: SequenceScope::MaterializationWindowProducerEpoch,
+                sequence_scope: SequenceScope::MaterializationSeriesProducerEpoch,
                 require_checkpoint_for_full: true,
                 require_base_checkpoint_for_delta: true,
             },
@@ -703,15 +935,145 @@ impl TransmissionPlan {
             return Err(TransmissionPlanError::ProducerSetMismatch);
         }
         for rule in &self.rules {
+            let valid_checkpoint_cadence = match (rule.mode, rule.full_checkpoint_every_ms) {
+                (TransmissionMode::Full, None) => true,
+                (TransmissionMode::Delta, Some(full_every)) => {
+                    rule.emit_every_ms > 0
+                        && full_every >= rule.emit_every_ms
+                        && full_every % rule.emit_every_ms == 0
+                }
+                _ => false,
+            };
             if rule.emit_every_ms == 0
                 || rule.destination_ref.is_empty()
-                || (rule.mode == TransmissionMode::Delta
-                    && rule
-                        .full_checkpoint_every_ms
-                        .map_or(true, |value| value == 0))
+                || !valid_checkpoint_cadence
             {
                 return Err(TransmissionPlanError::InvalidRule(rule.producer_id.clone()));
             }
+            let schema = precompute
+                .schemas
+                .iter()
+                .find(|schema| schema.materialization == rule.materialization)
+                .expect("producer set validation guarantees a matching schema");
+            if !schema.encodings.contains(&rule.encoding) {
+                return Err(TransmissionPlanError::InvalidRule(rule.producer_id.clone()));
+            }
+            validate_runtime_rule_policy(rule, &schema.family)?;
+        }
+        Ok(())
+    }
+
+    /// Authorize a telemetry-driven successor without mutating this active
+    /// plan. Semantic identity, codecs, destination, transmission mode and
+    /// checkpoint cadence remain fixed. Only explicitly bounded runtime knobs
+    /// may move, and each changed rule needs fresh evidence attributed to the
+    /// exact active generation.
+    pub fn authorize_successor(
+        &self,
+        successor: &TransmissionPlan,
+        evidence: &[RuntimeAdaptationEvidence],
+        now_unix_ms: u64,
+    ) -> Result<(), TransmissionPlanError> {
+        if successor.envelope.plan_id != self.envelope.plan_id
+            || successor.envelope.plan_version != self.envelope.plan_version.saturating_add(1)
+            || successor.envelope.backend_compat != self.envelope.backend_compat
+            || successor.envelope.planner_revision != self.envelope.planner_revision
+            || successor.envelope.capability_snapshot_id != self.envelope.capability_snapshot_id
+            || successor.envelope.generated_at_unix_ms < self.envelope.generated_at_unix_ms
+            || successor.envelope.activation_unix_ms < successor.envelope.generated_at_unix_ms
+            || successor.rules.len() != self.rules.len()
+            || successor.frame_identity != self.frame_identity
+        {
+            return Err(TransmissionPlanError::InvalidSuccessor(
+                "successor must be the next version of the same semantic/capability generation"
+                    .into(),
+            ));
+        }
+
+        for current in &self.rules {
+            let Some(next) = successor.rules.iter().find(|candidate| {
+                candidate.materialization == current.materialization
+                    && candidate.producer_id == current.producer_id
+                    && candidate.schema_id == current.schema_id
+            }) else {
+                return Err(TransmissionPlanError::InvalidSuccessor(format!(
+                    "missing rule for producer {}",
+                    current.producer_id
+                )));
+            };
+            if current.mode != next.mode
+                || current.encoding != next.encoding
+                || current.full_checkpoint_every_ms != next.full_checkpoint_every_ms
+                || current.destination_ref != next.destination_ref
+                || current.runtime_policy.adaptation != next.runtime_policy.adaptation
+                || sampling_estimator(&current.runtime_policy.sampling)
+                    != sampling_estimator(&next.runtime_policy.sampling)
+                || delta_shape(&current.runtime_policy.delta)
+                    != delta_shape(&next.runtime_policy.delta)
+            {
+                return Err(TransmissionPlanError::InvalidSuccessor(format!(
+                    "rule identity/codec/mode/guardrails drifted for producer {}",
+                    current.producer_id
+                )));
+            }
+            if current.emit_every_ms == next.emit_every_ms
+                && current.runtime_policy.sampling == next.runtime_policy.sampling
+                && current.runtime_policy.delta == next.runtime_policy.delta
+            {
+                continue;
+            }
+            let policy = &current.runtime_policy.adaptation;
+            if !policy.enabled || now_unix_ms < policy.not_before_unix_ms {
+                return Err(TransmissionPlanError::AdaptationOutOfBounds {
+                    producer_id: current.producer_id.clone(),
+                    knob: "adaptation_disabled_or_in_cooldown",
+                });
+            }
+            let has_evidence = evidence.iter().any(|item| {
+                item.plan_id == self.envelope.plan_id
+                    && item.plan_version == self.envelope.plan_version
+                    && item.materialization == current.materialization
+                    && item.producer_id == current.producer_id
+                    && item.schema_id == current.schema_id
+                    && !item.producer_version.trim().is_empty()
+                    && item.sample_count >= policy.min_evidence_samples
+                    && item.observed_at_unix_ms <= now_unix_ms
+                    && now_unix_ms.saturating_sub(item.observed_at_unix_ms)
+                        <= policy.max_evidence_age_ms
+            });
+            if !has_evidence {
+                return Err(TransmissionPlanError::InvalidAdaptationEvidence(
+                    current.producer_id.clone(),
+                ));
+            }
+            authorize_f64_change(
+                sampling_probability(&current.runtime_policy.sampling),
+                sampling_probability(&next.runtime_policy.sampling),
+                policy.sample_probability.as_ref(),
+                &current.producer_id,
+                "sample_probability",
+            )?;
+            authorize_u64_change(
+                current.emit_every_ms,
+                next.emit_every_ms,
+                policy.emit_every_ms.as_ref(),
+                &current.producer_id,
+                "emit_every_ms",
+            )?;
+            authorize_f64_change(
+                delta_threshold(&current.runtime_policy.delta),
+                delta_threshold(&next.runtime_policy.delta),
+                policy.delta_threshold.as_ref(),
+                &current.producer_id,
+                "delta_threshold",
+            )?;
+            authorize_f64_change(
+                gos_epsilon(&current.runtime_policy.delta),
+                gos_epsilon(&next.runtime_policy.delta),
+                policy.gos_epsilon_staleness.as_ref(),
+                &current.producer_id,
+                "gos_epsilon_staleness",
+            )?;
         }
         Ok(())
     }
@@ -724,8 +1086,8 @@ impl TransmissionPlan {
             || frame.plan_id != self.envelope.plan_id
             || frame.plan_version != self.envelope.plan_version
             || frame.backend_compat != self.envelope.backend_compat
+            || frame.series_identity.is_empty()
             || frame.producer_epoch.is_empty()
-            || frame.series_fingerprint.is_empty()
             || frame.sequence == 0
             || frame.window_start_unix_nano >= frame.window_end_unix_nano
             || (frame.kind == SummaryFrameKind::Full
@@ -740,21 +1102,272 @@ impl TransmissionPlan {
                     .into(),
             ));
         }
-        let mode = match frame.kind {
-            SummaryFrameKind::Full => TransmissionMode::Full,
-            SummaryFrameKind::Delta => TransmissionMode::Delta,
-        };
         if self.rules.iter().any(|rule| {
             rule.materialization == frame.materialization
                 && rule.producer_id == frame.producer_id
                 && rule.schema_id == frame.schema_id
-                && rule.mode == mode
+                // A delta rule necessarily emits periodic full checkpoints;
+                // a full-only rule must never emit deltas.
+                && (frame.kind == SummaryFrameKind::Full
+                    || rule.mode == TransmissionMode::Delta)
                 && rule.encoding == frame.encoding
         }) {
             Ok(())
         } else {
             Err(TransmissionPlanError::UnknownFrame)
         }
+    }
+}
+
+fn validate_runtime_rule_policy(
+    rule: &TransmissionRule,
+    family: &StateFamilyContract,
+) -> Result<(), TransmissionPlanError> {
+    let invalid = |reason: &str| TransmissionPlanError::InvalidRuntimePolicy {
+        producer_id: rule.producer_id.clone(),
+        reason: reason.into(),
+    };
+    if let SamplingPolicy::Fixed {
+        probability,
+        estimator,
+    } = &rule.runtime_policy.sampling
+    {
+        if !probability.is_finite() || !(0.0..=1.0).contains(probability) || *probability == 0.0 {
+            return Err(invalid("sample probability must be finite and in (0, 1]"));
+        }
+        let supported = matches!(
+            (family, *estimator),
+            (
+                StateFamilyContract::Sketch {
+                    algorithm: SketchAlgorithm::Hll,
+                    ..
+                },
+                SamplingEstimator::HashThreshold,
+            ) | (
+                StateFamilyContract::Sketch {
+                    algorithm: SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap,
+                    ..
+                },
+                SamplingEstimator::GeometricAdmission,
+            )
+        );
+        if !supported {
+            return Err(invalid(
+                "sampling estimator is not implemented for the materialization family",
+            ));
+        }
+    }
+
+    if (rule.mode == TransmissionMode::Delta) != rule.runtime_policy.delta.is_some() {
+        return Err(invalid(
+            "delta policy must be present exactly when transmission mode is delta",
+        ));
+    }
+    if let Some(delta) = &rule.runtime_policy.delta {
+        if !delta.absolute_threshold.is_finite() || delta.absolute_threshold < 0.0 {
+            return Err(invalid("delta threshold must be finite and non-negative"));
+        }
+        if !matches!(
+            family,
+            StateFamilyContract::Sketch {
+                algorithm: SketchAlgorithm::DDSketch
+                    | SketchAlgorithm::Hll
+                    | SketchAlgorithm::Cms
+                    | SketchAlgorithm::CmsWithHeap
+                    | SketchAlgorithm::CountSketch
+                    | SketchAlgorithm::CountSketchWithHeap,
+                ..
+            }
+        ) {
+            return Err(invalid(
+                "delta transmission is not implemented for the materialization family",
+            ));
+        }
+        if let Some(gos) = &delta.gos {
+            if !matches!(
+                family,
+                StateFamilyContract::Sketch {
+                    algorithm: SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap,
+                    ..
+                }
+            ) || !gos.epsilon_staleness.is_finite()
+                || !(0.0..=1.0).contains(&gos.epsilon_staleness)
+                || gos.epsilon_staleness == 0.0
+                || gos.sites == 0
+            {
+                return Err(invalid(
+                    "GOS requires a CountSketch family, epsilon in (0, 1], and at least one site",
+                ));
+            }
+        }
+    }
+
+    let adaptation = &rule.runtime_policy.adaptation;
+    if adaptation.enabled
+        && (adaptation.max_evidence_age_ms == 0 || adaptation.min_evidence_samples == 0)
+    {
+        return Err(invalid(
+            "enabled adaptation requires non-zero evidence age and sample-count requirements",
+        ));
+    }
+    validate_f64_bounds(adaptation.sample_probability.as_ref(), 0.0, 1.0)
+        .map_err(|reason| invalid(reason))?;
+    validate_f64_bounds(adaptation.delta_threshold.as_ref(), 0.0, f64::MAX)
+        .map_err(|reason| invalid(reason))?;
+    validate_f64_bounds(adaptation.gos_epsilon_staleness.as_ref(), 0.0, 1.0)
+        .map_err(|reason| invalid(reason))?;
+    if let Some(bounds) = &adaptation.emit_every_ms {
+        if bounds.min == 0
+            || bounds.min > bounds.max
+            || bounds.max_step == 0
+            || !(bounds.min..=bounds.max).contains(&rule.emit_every_ms)
+        {
+            return Err(invalid("emit interval guardrails are invalid"));
+        }
+    }
+    if let Some(bounds) = &adaptation.sample_probability {
+        let current = sampling_probability(&rule.runtime_policy.sampling);
+        if current < bounds.min || current > bounds.max {
+            return Err(invalid(
+                "current sampling probability is outside guardrails",
+            ));
+        }
+    }
+    if let Some(bounds) = &adaptation.delta_threshold {
+        let Some(current) = rule
+            .runtime_policy
+            .delta
+            .as_ref()
+            .map(|policy| policy.absolute_threshold)
+        else {
+            return Err(invalid("delta guardrails require an active delta policy"));
+        };
+        if current < bounds.min || current > bounds.max {
+            return Err(invalid("current delta threshold is outside guardrails"));
+        }
+    }
+    if let Some(bounds) = &adaptation.gos_epsilon_staleness {
+        let Some(current) = rule
+            .runtime_policy
+            .delta
+            .as_ref()
+            .and_then(|policy| policy.gos.as_ref())
+            .map(|gos| gos.epsilon_staleness)
+        else {
+            return Err(invalid("GOS guardrails require an active GOS policy"));
+        };
+        if current < bounds.min || current > bounds.max {
+            return Err(invalid("current GOS epsilon is outside guardrails"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_f64_bounds(
+    bounds: Option<&AdaptiveF64Bounds>,
+    domain_min: f64,
+    domain_max: f64,
+) -> Result<(), &'static str> {
+    let Some(bounds) = bounds else {
+        return Ok(());
+    };
+    if !bounds.min.is_finite()
+        || !bounds.max.is_finite()
+        || !bounds.max_step.is_finite()
+        || bounds.min < domain_min
+        || bounds.max > domain_max
+        || bounds.min > bounds.max
+        || bounds.max_step <= 0.0
+    {
+        Err("floating-point adaptation guardrails are invalid")
+    } else {
+        Ok(())
+    }
+}
+
+fn sampling_probability(policy: &SamplingPolicy) -> f64 {
+    match policy {
+        SamplingPolicy::Disabled => 1.0,
+        SamplingPolicy::Fixed { probability, .. } => *probability,
+    }
+}
+
+fn sampling_estimator(policy: &SamplingPolicy) -> Option<SamplingEstimator> {
+    match policy {
+        SamplingPolicy::Disabled => None,
+        SamplingPolicy::Fixed { estimator, .. } => Some(*estimator),
+    }
+}
+
+fn delta_threshold(policy: &Option<DeltaPolicy>) -> f64 {
+    policy
+        .as_ref()
+        .map(|policy| policy.absolute_threshold)
+        .unwrap_or(0.0)
+}
+
+fn gos_epsilon(policy: &Option<DeltaPolicy>) -> f64 {
+    policy
+        .as_ref()
+        .and_then(|policy| policy.gos.as_ref())
+        .map(|gos| gos.epsilon_staleness)
+        .unwrap_or(0.0)
+}
+
+fn delta_shape(policy: &Option<DeltaPolicy>) -> Option<(Option<(u32, GosThresholdMode)>,)> {
+    policy.as_ref().map(|policy| {
+        (policy
+            .gos
+            .as_ref()
+            .map(|gos| (gos.sites, gos.threshold_mode)),)
+    })
+}
+
+fn authorize_f64_change(
+    current: f64,
+    next: f64,
+    bounds: Option<&AdaptiveF64Bounds>,
+    producer_id: &str,
+    knob: &'static str,
+) -> Result<(), TransmissionPlanError> {
+    if current == next {
+        return Ok(());
+    }
+    let allowed = bounds.is_some_and(|bounds| {
+        next.is_finite()
+            && (bounds.min..=bounds.max).contains(&next)
+            && (next - current).abs() <= bounds.max_step
+    });
+    if allowed {
+        Ok(())
+    } else {
+        Err(TransmissionPlanError::AdaptationOutOfBounds {
+            producer_id: producer_id.into(),
+            knob,
+        })
+    }
+}
+
+fn authorize_u64_change(
+    current: u64,
+    next: u64,
+    bounds: Option<&AdaptiveU64Bounds>,
+    producer_id: &str,
+    knob: &'static str,
+) -> Result<(), TransmissionPlanError> {
+    if current == next {
+        return Ok(());
+    }
+    let allowed = bounds.is_some_and(|bounds| {
+        (bounds.min..=bounds.max).contains(&next) && current.abs_diff(next) <= bounds.max_step
+    });
+    if allowed {
+        Ok(())
+    } else {
+        Err(TransmissionPlanError::AdaptationOutOfBounds {
+            producer_id: producer_id.into(),
+            knob,
+        })
     }
 }
 
@@ -817,6 +1430,7 @@ impl PhysicalCompiler {
         let mut aggregations = Vec::with_capacity(request.queries.len());
         let mut readouts = Vec::with_capacity(request.queries.len());
         let mut collector_materializations = Vec::with_capacity(request.queries.len());
+        let mut runtime_policies = BTreeMap::new();
 
         for query in &request.queries {
             let evidence = request.evidence.get(&query.query_id);
@@ -885,6 +1499,18 @@ impl PhysicalCompiler {
             let precompute_materialization =
                 backend_plan::aggregation_config_for_materialization(&aggregation)?;
             let materialization = precompute_materialization.policy_fingerprint();
+            if let Some(existing) =
+                runtime_policies.insert(materialization, query.runtime_policy.clone())
+            {
+                if existing != query.runtime_policy {
+                    return Err(CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason:
+                            "queries sharing one materialization specify different runtime policies"
+                                .into(),
+                    });
+                }
+            }
             aggregations.push(aggregation);
             readouts.push(BackendReadout {
                 aggregation_id,
@@ -968,11 +1594,12 @@ impl PhysicalCompiler {
             query_id: "precompute-plan".into(),
             reason: error.to_string(),
         })?;
-        let transmission_plan = TransmissionPlan::build(envelope.clone(), &precompute_plan)
-            .map_err(|error| CompileError::Query {
-                query_id: "transmission-plan".into(),
-                reason: error.to_string(),
-            })?;
+        let transmission_plan =
+            TransmissionPlan::build(envelope.clone(), &precompute_plan, &runtime_policies)
+                .map_err(|error| CompileError::Query {
+                    query_id: "transmission-plan".into(),
+                    reason: error.to_string(),
+                })?;
         let collector_plans = producer_ids
             .into_iter()
             .map(|collector_id| CollectorPlan {
@@ -1195,7 +1822,8 @@ fn validate_evidence(
     let age = env
         .observed_at_unix_ms
         .saturating_sub(evidence.observed_at_unix_ms);
-    let valid = evidence.selected_lower_bound.is_finite()
+    let valid = evidence.observed_at_unix_ms <= env.observed_at_unix_ms
+        && evidence.selected_lower_bound.is_finite()
         && evidence.excluded_upper_bound.is_finite()
         && evidence.selected_lower_bound > evidence.excluded_upper_bound
         && (0.0..=1.0).contains(&evidence.interval_failure_probability)
@@ -1249,7 +1877,8 @@ fn validate_window_implementations(
         let age = environment
             .observed_at_unix_ms
             .saturating_sub(evidence.observed_at_unix_ms);
-        let valid = !candidate.implementation_id.trim().is_empty()
+        let valid = evidence.observed_at_unix_ms <= environment.observed_at_unix_ms
+            && !candidate.implementation_id.trim().is_empty()
             && ids.insert(candidate.implementation_id.clone())
             && !candidate.state_layout.trim().is_empty()
             && !evidence.model_version.trim().is_empty()
@@ -1539,6 +2168,7 @@ mod tests {
                         weighted_cost: 1.0,
                     },
                 }],
+                runtime_policy: RuntimeRulePolicy::default(),
             }],
             evidence: evidence_by_query,
             planner_revision: PLANNER_REVISION.into(),
@@ -1576,10 +2206,10 @@ mod tests {
             plan_version: bundle.envelope.plan_version,
             backend_compat: bundle.envelope.backend_compat.clone(),
             materialization: rule.materialization,
+            series_identity: "service=checkout,zone=a".into(),
             schema_id: rule.schema_id.clone(),
             producer_id: rule.producer_id.clone(),
             producer_epoch: "boot-1".into(),
-            series_fingerprint: "service=api".into(),
             window_start_unix_nano: 1,
             window_end_unix_nano: 2,
             sequence: 1,
@@ -1744,6 +2374,30 @@ mod tests {
     }
 
     #[test]
+    fn precompute_plan_rejects_empty_or_duplicate_schema_ids() {
+        let bundle = PhysicalCompiler
+            .compile(
+                request("q-quantile", "quantile_over_time(0.99, m[1m])"),
+                environment(10_000),
+            )
+            .expect("compile schema");
+
+        let mut empty = bundle.precompute_plan.clone();
+        empty.schemas[0].schema_id.clear();
+        assert!(matches!(
+            empty.validate(),
+            Err(PrecomputePlanError::InvalidSchema { .. })
+        ));
+
+        let mut duplicate = bundle.precompute_plan;
+        duplicate.schemas.push(duplicate.schemas[0].clone());
+        assert!(matches!(
+            duplicate.validate(),
+            Err(PrecomputePlanError::InvalidSchema { .. })
+        ));
+    }
+
+    #[test]
     fn topk_fails_closed_without_membership_evidence() {
         assert!(request_with_evidence("q-topk", "topk(5, m)", None).is_err());
     }
@@ -1766,6 +2420,35 @@ mod tests {
             .compile(request, environment(100_000))
             .expect_err("stale certificate must fail");
         assert!(matches!(error, CompileError::InvalidEvidence { .. }));
+    }
+
+    #[test]
+    fn future_topk_and_window_evidence_are_rejected() {
+        let topk = request_with_evidence(
+            "q-topk",
+            "topk(5, count_over_time(m[1m]))",
+            Some(TopKMembershipEvidence {
+                selected_lower_bound: 101.0,
+                excluded_upper_bound: 100.0,
+                interval_failure_probability: 0.005,
+                observed_at_unix_ms: 10_001,
+                source: "runtime-margin-monitor".into(),
+            }),
+        )
+        .expect("selection occurs before deployment-time freshness validation");
+        assert!(matches!(
+            PhysicalCompiler.compile(topk, environment(10_000)),
+            Err(CompileError::InvalidEvidence { .. })
+        ));
+
+        let mut window = request("q-window", "quantile_over_time(0.99, m[1m])");
+        window.queries[0].window_implementations[0]
+            .cost
+            .observed_at_unix_ms = 10_001;
+        assert!(matches!(
+            PhysicalCompiler.compile(window, environment(10_000)),
+            Err(CompileError::Lifecycle { .. })
+        ));
     }
 
     #[test]
@@ -1812,6 +2495,209 @@ mod tests {
         assert!(matches!(
             PhysicalCompiler.compile(request, environment(10_000)),
             Err(CompileError::Lifecycle { .. })
+        ));
+    }
+
+    #[test]
+    fn runtime_policy_uses_canonical_sampling_and_gos_allocators() {
+        let sampling = SamplingPolicy::from_accuracy_budget(
+            0.05,
+            1_000.0,
+            SamplingEstimator::GeometricAdmission,
+        );
+        let SamplingPolicy::Fixed { probability, .. } = sampling else {
+            panic!("positive budget and rate must enable sampling");
+        };
+        assert!((probability - 1.0 / 3.5).abs() < 1e-9);
+
+        let gos =
+            GosPolicy::from_accuracy_budget(0.1, 0.03, 4, 1.0, 1.0, GosThresholdMode::Isotropic)
+                .expect("positive communication allocation");
+        assert!((gos.epsilon_staleness - 0.035).abs() < 1e-12);
+        assert_eq!(gos.sites, 4);
+    }
+
+    #[test]
+    fn runtime_policy_is_family_and_mode_checked() {
+        let bundle = PhysicalCompiler
+            .compile(
+                request("q", "quantile_over_time(0.99, m[1m])"),
+                environment(10_000),
+            )
+            .expect("compile");
+        let mut rule = bundle.transmission_plan.rules[0].clone();
+        let mut invalid_encoding = bundle.transmission_plan.clone();
+        invalid_encoding.rules[0].encoding = StateEncoding::ExactAccumulatorV1;
+        assert!(matches!(
+            invalid_encoding.validate(&bundle.precompute_plan),
+            Err(TransmissionPlanError::InvalidRule(_))
+        ));
+        rule.runtime_policy.sampling = SamplingPolicy::Fixed {
+            probability: 0.5,
+            estimator: SamplingEstimator::HashThreshold,
+        };
+        let hll = StateFamilyContract::Sketch {
+            algorithm: SketchAlgorithm::Hll,
+            parameters: SketchParams::Hll { precision: 14 },
+        };
+        let count_sketch = StateFamilyContract::Sketch {
+            algorithm: SketchAlgorithm::CountSketch,
+            parameters: SketchParams::CountSketch {
+                width: 128,
+                depth: 4,
+            },
+        };
+        validate_runtime_rule_policy(&rule, &hll).expect("HLL supports hash-threshold sampling");
+        assert!(matches!(
+            validate_runtime_rule_policy(&rule, &count_sketch),
+            Err(TransmissionPlanError::InvalidRuntimePolicy { .. })
+        ));
+
+        rule.runtime_policy.sampling = SamplingPolicy::Disabled;
+        rule.mode = TransmissionMode::Delta;
+        rule.full_checkpoint_every_ms = Some(300_000);
+        rule.runtime_policy.delta = Some(DeltaPolicy {
+            absolute_threshold: 0.0,
+            gos: Some(GosPolicy {
+                epsilon_staleness: 0.02,
+                sites: 2,
+                threshold_mode: GosThresholdMode::Isotropic,
+            }),
+        });
+        validate_runtime_rule_policy(&rule, &count_sketch).expect("CountSketch supports delta GOS");
+        assert!(matches!(
+            validate_runtime_rule_policy(&rule, &hll),
+            Err(TransmissionPlanError::InvalidRuntimePolicy { .. })
+        ));
+    }
+
+    #[test]
+    fn compiler_emits_delta_rule_and_accepts_periodic_full_checkpoint() {
+        let mut request = request_with_evidence(
+            "q-topk",
+            "topk(5, count_over_time(m[1m]))",
+            Some(TopKMembershipEvidence {
+                selected_lower_bound: 101.0,
+                excluded_upper_bound: 100.0,
+                interval_failure_probability: 0.005,
+                observed_at_unix_ms: 9_500,
+                source: "runtime-margin-monitor".into(),
+            }),
+        )
+        .expect("frequency selection");
+        request.queries[0].runtime_policy.delta = Some(DeltaPolicy {
+            absolute_threshold: 0.0,
+            gos: None,
+        });
+        let bundle = PhysicalCompiler
+            .compile(request, environment(10_000))
+            .expect("delta-capable physical plan");
+        let rule = &bundle.transmission_plan.rules[0];
+        assert_eq!(rule.mode, TransmissionMode::Delta);
+        assert!(rule.full_checkpoint_every_ms.is_some());
+
+        for (kind, sequence) in [(SummaryFrameKind::Full, 1), (SummaryFrameKind::Delta, 2)] {
+            let frame = SummaryFrameIdentity {
+                identity_version: 1,
+                plan_id: bundle.envelope.plan_id,
+                plan_version: bundle.envelope.plan_version,
+                backend_compat: bundle.envelope.backend_compat.clone(),
+                materialization: rule.materialization,
+                series_identity: "service=checkout,zone=a".into(),
+                schema_id: rule.schema_id.clone(),
+                producer_id: rule.producer_id.clone(),
+                producer_epoch: "boot-1".into(),
+                window_start_unix_nano: 1,
+                window_end_unix_nano: 2,
+                sequence,
+                encoding: rule.encoding.clone(),
+                checkpoint_id: (kind == SummaryFrameKind::Full).then(|| "cp-1".into()),
+                base_checkpoint_id: (kind == SummaryFrameKind::Delta).then(|| "cp-1".into()),
+                kind,
+            };
+            bundle
+                .transmission_plan
+                .validate_frame(&frame)
+                .expect("delta rule accepts its deltas and recovery full frames");
+        }
+    }
+
+    #[test]
+    fn runtime_adaptation_requires_fresh_exact_evidence_and_successor_version() {
+        let bundle = PhysicalCompiler
+            .compile(
+                request("q", "quantile_over_time(0.99, m[1m])"),
+                environment(10_000),
+            )
+            .expect("compile");
+        let mut current = bundle.transmission_plan;
+        let rule = &mut current.rules[0];
+        rule.runtime_policy.adaptation = RuntimeAdaptationPolicy {
+            enabled: true,
+            not_before_unix_ms: 10_500,
+            max_evidence_age_ms: 5_000,
+            min_evidence_samples: 100,
+            sample_probability: None,
+            emit_every_ms: Some(AdaptiveU64Bounds {
+                min: 30_000,
+                max: 120_000,
+                max_step: 10_000,
+            }),
+            delta_threshold: None,
+            gos_epsilon_staleness: None,
+        };
+        let mut successor = current.clone();
+        successor.envelope.plan_version += 1;
+        successor.envelope.generated_at_unix_ms = 11_000;
+        successor.envelope.activation_unix_ms = 11_000;
+        successor.rules[0].emit_every_ms += 5_000;
+        let evidence = RuntimeAdaptationEvidence {
+            plan_id: current.envelope.plan_id,
+            plan_version: current.envelope.plan_version,
+            materialization: current.rules[0].materialization,
+            producer_id: current.rules[0].producer_id.clone(),
+            schema_id: current.rules[0].schema_id.clone(),
+            producer_version: "collector.v1".into(),
+            observed_at_unix_ms: 10_900,
+            sample_count: 100,
+        };
+        current
+            .authorize_successor(&successor, std::slice::from_ref(&evidence), 11_000)
+            .expect("bounded change with exact fresh evidence");
+
+        let mut oversized = successor.clone();
+        oversized.rules[0].emit_every_ms += 20_000;
+        assert!(matches!(
+            current.authorize_successor(&oversized, std::slice::from_ref(&evidence), 11_000),
+            Err(TransmissionPlanError::AdaptationOutOfBounds { .. })
+        ));
+        let stale = RuntimeAdaptationEvidence {
+            observed_at_unix_ms: 1,
+            ..evidence.clone()
+        };
+        assert!(matches!(
+            current.authorize_successor(&successor, &[stale], 11_000),
+            Err(TransmissionPlanError::InvalidAdaptationEvidence(_))
+        ));
+        let future = RuntimeAdaptationEvidence {
+            observed_at_unix_ms: 11_001,
+            ..evidence
+        };
+        assert!(matches!(
+            current.authorize_successor(&successor, &[future], 11_000),
+            Err(TransmissionPlanError::InvalidAdaptationEvidence(_))
+        ));
+        let mut different_plan_id = successor.clone();
+        different_plan_id.envelope.plan_id += 1;
+        assert!(matches!(
+            current.authorize_successor(&different_plan_id, &[], 11_000),
+            Err(TransmissionPlanError::InvalidSuccessor(_))
+        ));
+        let mut in_place = successor;
+        in_place.envelope.plan_version = current.envelope.plan_version;
+        assert!(matches!(
+            current.authorize_successor(&in_place, &[], 11_000),
+            Err(TransmissionPlanError::InvalidSuccessor(_))
         ));
     }
 }

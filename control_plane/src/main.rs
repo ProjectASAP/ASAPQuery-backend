@@ -583,6 +583,8 @@ struct PhysicalPlanQueryRequest {
     accuracy: types_v2::AccuracyTarget,
     lifecycle: physical::compiler::LifecyclePlanningInput,
     window_implementations: Vec<physical::compiler::WindowImplementationCandidate>,
+    #[serde(default)]
+    runtime_policy: physical::compiler::RuntimeRulePolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -593,6 +595,8 @@ struct CompileAndPublishPhysicalPlanRequest {
     capability_snapshot_id: String,
     #[serde(default)]
     evidence: HashMap<String, physical::compiler::TopKMembershipEvidence>,
+    #[serde(default)]
+    runtime_adaptation_evidence: Vec<physical::compiler::RuntimeAdaptationEvidence>,
     planner_revision: String,
     max_evidence_age_ms: u64,
     plan_version: u64,
@@ -624,10 +628,11 @@ async fn handle_compile_and_publish_physical_plan(
     State(st): State<AppState>,
     Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
 ) -> impl IntoResponse {
-    let (bundle, collector_ids, apply_timeout) = match compile_physical_plan_request(request) {
-        Ok(compiled) => compiled,
-        Err(response) => return response.into_response(),
-    };
+    let (bundle, collector_ids, apply_timeout, adaptation_evidence) =
+        match compile_physical_plan_request(request) {
+            Ok(compiled) => compiled,
+            Err(response) => return response.into_response(),
+        };
 
     let Some(backend) = st.backend_client.as_ref() else {
         return (
@@ -654,6 +659,7 @@ async fn handle_compile_and_publish_physical_plan(
             bundle.backend_plan.encode_to_vec(),
             &bundle.query_plan,
             None,
+            &adaptation_evidence,
         )
         .await
     {
@@ -714,7 +720,15 @@ async fn handle_compile_and_publish_physical_plan(
 // Only the Send-safe compiled bundle crosses an await point.
 fn compile_physical_plan_request(
     request: CompileAndPublishPhysicalPlanRequest,
-) -> Result<(physical::compiler::PhysicalPlan, Vec<String>, Duration), (StatusCode, String)> {
+) -> Result<
+    (
+        physical::compiler::PhysicalPlan,
+        Vec<String>,
+        Duration,
+        Vec<physical::compiler::RuntimeAdaptationEvidence>,
+    ),
+    (StatusCode, String),
+> {
     if request.queries.is_empty() || request.collector_ids.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -780,6 +794,7 @@ fn compile_physical_plan_request(
             accuracy: query.accuracy,
             lifecycle: query.lifecycle,
             window_implementations: query.window_implementations,
+            runtime_policy: query.runtime_policy,
         });
     }
 
@@ -804,7 +819,12 @@ fn compile_physical_plan_request(
         Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
     };
     let apply_timeout = Duration::from_millis(request.apply_timeout_ms);
-    Ok((bundle, request.collector_ids, apply_timeout))
+    Ok((
+        bundle,
+        request.collector_ids,
+        apply_timeout,
+        request.runtime_adaptation_evidence,
+    ))
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────

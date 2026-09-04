@@ -5301,6 +5301,8 @@ struct PhysicalPlanInstallRequest {
     backend_plan: Vec<u8>,
     query_plan: control_plane::query_plan::QueryPlan,
     storage_routing: Option<serde_json::Value>,
+    #[serde(default)]
+    adaptation_evidence: Vec<control_plane::physical::compiler::RuntimeAdaptationEvidence>,
 }
 
 /// Validate and stage all backend views. Staging never changes query routing;
@@ -5350,6 +5352,23 @@ async fn handle_post_physical_plan(
             })),
         )
             .into_response();
+    }
+    let current = active_handle.snapshot();
+    if current.transmission_plan.envelope.plan_id != 0 {
+        if let Err(error) = current.transmission_plan.authorize_successor(
+            &request.transmission_plan,
+            &request.adaptation_evidence,
+            unix_time_ms(),
+        ) {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(serde_json::json!({
+                    "status": "error",
+                    "error": format!("runtime adaptation authorization error: {error}")
+                })),
+            )
+                .into_response();
+        }
     }
     let new_config = crate::storage_engines::types::StreamingConfig::new(runtime_materializations);
     let new_plan = match control_plane::backend_plan::BackendPlan::decode(&request.backend_plan) {

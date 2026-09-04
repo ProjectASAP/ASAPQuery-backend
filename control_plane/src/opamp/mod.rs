@@ -54,6 +54,7 @@ pub const PLAN_STATUS_MESSAGE: &str = "plan_status";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CollectorPlanStatusKind {
+    Staged,
     Applied,
     Failed,
 }
@@ -283,8 +284,8 @@ impl OpampServer {
     }
 
     /// Publish all per-target physical plans and require an exact semantic
-    /// APPLIED report from every Collector. Config hashes are deliberately not
-    /// accepted as plan activation evidence.
+    /// STAGED report from every Collector. Activation is synchronized later at
+    /// the envelope timestamp; config hashes are not accepted as evidence.
     pub async fn publish_collector_plans(
         &self,
         plans: &[crate::physical::compiler::CollectorPlan],
@@ -327,7 +328,7 @@ impl OpampServer {
                     plan_id: plan.envelope.plan_id,
                     plan_version: plan.envelope.plan_version,
                 })?;
-            if report.status != CollectorPlanStatusKind::Applied {
+            if report.status != CollectorPlanStatusKind::Staged {
                 return Err(CollectorPlanPublishError::Rejected {
                     collector_id: plan.collector_id.clone(),
                     plan_id: report.plan_id,
@@ -1044,6 +1045,7 @@ mod tests {
                 emit_every_ms: 60_000,
                 full_checkpoint_every_ms: None,
                 destination_ref: "asapquery-backend".into(),
+                runtime_policy: crate::physical::compiler::RuntimeRulePolicy::default(),
             }],
         }
     }
@@ -1065,7 +1067,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_plan_publication_waits_for_capability_and_exact_applied_status() {
+    async fn typed_plan_publication_waits_for_capability_and_exact_staged_status() {
         let (srv, addr) = start_server().await;
         let mut agent_ws = connect_ws_client(addr, "edge-a", "agent").await;
 
@@ -1105,7 +1107,7 @@ mod tests {
         let status = serde_json::to_vec(&CollectorPlanStatus {
             plan_id: 42,
             plan_version: 1,
-            status: CollectorPlanStatusKind::Applied,
+            status: CollectorPlanStatusKind::Staged,
             error: None,
         })
         .unwrap();
@@ -1126,7 +1128,7 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].plan_id, 42);
         assert_eq!(reports[0].plan_version, 1);
-        assert_eq!(reports[0].status, CollectorPlanStatusKind::Applied);
+        assert_eq!(reports[0].status, CollectorPlanStatusKind::Staged);
     }
 
     #[tokio::test]

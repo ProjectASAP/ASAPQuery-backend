@@ -1,6 +1,7 @@
 pub mod accumulator_factory;
 pub mod config;
 mod engine;
+pub mod frame_lineage;
 pub mod ingest_handler;
 mod metrics;
 pub mod operators;
