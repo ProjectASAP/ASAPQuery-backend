@@ -366,6 +366,35 @@ impl EngineRouter {
         step_ms: u64,
         tier: RangeTier,
     ) -> Result<QueryResult, EngineRouterError> {
+        self.execute_range_for_tier_routed(
+            query,
+            stat,
+            accuracy,
+            metric_storage,
+            start_ms,
+            end_ms,
+            step_ms,
+            tier,
+        )
+        .await
+        .map(|(result, _)| result)
+    }
+
+    /// Range dispatch with the identity of the engine that produced the
+    /// successful result. Transport adapters use this to annotate responses
+    /// without guessing whether the router took its fallback leg.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_range_for_tier_routed(
+        &self,
+        query: &str,
+        stat: Statistic,
+        accuracy: AccuracyTarget,
+        metric_storage: StorageBackend,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+        tier: RangeTier,
+    ) -> Result<(QueryResult, &'static str), EngineRouterError> {
         let mut backends = compatible_storage_backends(stat, &accuracy, metric_storage);
         if matches!(tier, RangeTier::WarmOnly) {
             // Drop the archive leg: a range fully inside warm retention
@@ -405,7 +434,7 @@ impl EngineRouter {
                         backend = ?backend,
                         "router: range dispatch succeeded",
                     );
-                    return Ok(result);
+                    return Ok((result, id));
                 }
                 Err(e) => {
                     warn!(

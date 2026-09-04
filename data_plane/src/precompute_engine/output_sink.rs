@@ -241,7 +241,7 @@ impl OutputSink for NoopOutputSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::precompute_engine::operators::SumAccumulator;
+    use crate::precompute_engine::operators::{DDSketchAccumulator, SumAccumulator};
     use crate::storage_engines::sketch_db::index::{AggKind, SidLookup};
     use crate::storage_engines::types::{KeyByLabelValues, StreamingConfig};
     use asap_types::aggregation_config::AggregationConfig;
@@ -330,6 +330,48 @@ mod tests {
             ),
             "ExactAgg sids carry an ExactAgg capability"
         );
+    }
+
+    #[test]
+    fn sketch_policy_is_registered_and_stored_as_sketch_state() {
+        let mut cfg = sum_agg_config(8, "latency", &[]);
+        cfg.aggregation_type = AggregationType::DDSketch;
+        cfg.parameters
+            .insert("alpha".into(), serde_json::json!(0.01));
+        let policy_fp = cfg.policy_fp_u64();
+        let hot_reload =
+            HotReloadStreamingConfig::new(StreamingConfig::new(HashMap::from([(policy_fp, cfg)])));
+        let sketch_index = Arc::new(SketchStore::new());
+        let sink = SketchStoreSink::new(
+            sketch_index.clone(),
+            hot_reload,
+            Arc::new(SeriesIdResolver::new()),
+        );
+        let mut accumulator = DDSketchAccumulator::new(0.01);
+        accumulator.inner.update(42.0);
+
+        sink.emit_batch(vec![(
+            PrecomputedOutput::new(1_000, 2_000, None, asap_types::PolicyFingerprint(policy_fp)),
+            Box::new(accumulator),
+        )])
+        .expect("emit sketch");
+
+        let meta = sketch_index
+            .list_by_status(crate::storage_engines::sketch_db::lifecycle::AggStatus::Active)
+            .into_iter()
+            .next()
+            .expect("registered sketch SID");
+        assert!(matches!(
+            meta.agg_kind,
+            AggKind::Sketch {
+                algorithm: crate::storage_engines::sketch_db::data::SketchAlgorithm::DDSketch,
+                ..
+            }
+        ));
+        assert_eq!(sketch_index.query_range(meta.sid, 1_000, 2_000).len(), 1);
+        assert!(sketch_index
+            .query_exact_agg_range(meta.sid, 1_000, 2_000)
+            .is_empty());
     }
 
     #[test]

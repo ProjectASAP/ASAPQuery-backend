@@ -26,6 +26,8 @@ Targets:
   contracts       Shared Rust type/protobuf wire contracts
   control-plane   Planner HTTP, OpAMP, publication, and runtime feedback
   data-plane      Query, routing, storage, ingest adapter, and lifecycle tests
+  asapquery       Collector-free Remote Write -> QueryPlan process conformance
+  asapquery-demo  Run the real Prometheus compatibility demo (requires Docker)
   differential    Production DDSketch PromQL vs deterministic raw-value oracle
   sketch-oracles  Every sketch via production binary + independent raw oracle
   monitor         Real monitor gRPC transport tests
@@ -105,6 +107,22 @@ data_plane() {
     rust_test data_plane --test component_process_e2e
 
     differential
+}
+
+asapquery() {
+    CURRENT_STAGE="asapquery/physical-compile"
+    say "asapquery: canonical workload -> backend-local atomic PhysicalPlan"
+    rust_test control_plane compatibility_demo_snapshot_compiles_the_complete_query_matrix
+
+    CURRENT_STAGE="asapquery/production-process"
+    say "asapquery: Remote Write -> precompute/store -> QueryPlan DAG -> fallback"
+    rust_test data_plane --test asapquery_compatibility_process_e2e
+}
+
+asapquery_demo() {
+    CURRENT_STAGE="asapquery/real-prometheus-demo"
+    say "asapquery: real Prometheus Remote Write compatibility demo"
+    "${REPO_DIR}/demos/asapquery/run.sh"
 }
 
 differential() {
@@ -204,6 +222,8 @@ main() {
         contracts) need cargo; contracts ;;
         control-plane) need cargo; control_plane ;;
         data-plane) need cargo; data_plane ;;
+        asapquery) need cargo; asapquery ;;
+        asapquery-demo) need cargo; asapquery_demo ;;
         differential) need cargo; differential ;;
         sketch-oracles) need cargo; sketch_oracles ;;
         monitor) need cargo; monitor ;;

@@ -4,6 +4,24 @@ The `asapquery` runtime profile runs without ASAPCollector. It accepts
 Prometheus Remote Write v1 and sends unsupported or not-yet-ready PromQL to the
 same Prometheus server as an exact fallback.
 
+For a complete, self-checking run with a real Prometheus server:
+
+```bash
+./scripts/e2e.sh asapquery-demo
+```
+
+The command builds the production backend, starts pinned Prometheus and
+Pushgateway containers, drives raw samples (including a counter reset), checks
+all declared instant and range warm queries, compares an unplanned query with a
+direct Prometheus fallback response, and writes status/results/metrics under
+`target/asapquery-demo-evidence`. It requires Docker, `curl`, and Python 3.
+
+For the hermetic production-process conformance suite (no Docker):
+
+```bash
+./scripts/e2e.sh asapquery
+```
+
 Start Prometheus first, configure it to write to the backend, and keep its
 normal local storage enabled:
 

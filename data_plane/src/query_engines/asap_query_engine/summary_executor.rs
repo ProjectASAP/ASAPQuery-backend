@@ -369,9 +369,10 @@ impl QueryExecutionContext<'_> {
         let mut sids = self.index.sids_for_policy(binding.materialization);
         sids.sort_unstable();
         sids.dedup();
+        let mut matched_metadata = 0usize;
         let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<GroupState>> = BTreeMap::new();
 
-        for sid in sids {
+        for sid in sids.iter().copied() {
             let candidate = self
                 .index
                 .with_instance(sid, |meta| {
@@ -390,6 +391,7 @@ impl QueryExecutionContext<'_> {
                 })
                 .flatten();
             let Some(candidate) = candidate else { continue };
+            matched_metadata += 1;
             match candidate {
                 Candidate::Sketch(kind) => {
                     let Some(series) = self
@@ -432,6 +434,15 @@ impl QueryExecutionContext<'_> {
             }
         }
         if by_group.is_empty() {
+            tracing::debug!(
+                metric = %binding.metric,
+                materialization = %binding.materialization,
+                ?sids,
+                matched_metadata,
+                t0_ms = self.t0_ms,
+                t1_ms = self.t1_ms,
+                "bound materialization produced no readable state"
+            );
             return Err(SummaryExecutorError::NoCandidates);
         }
         by_group

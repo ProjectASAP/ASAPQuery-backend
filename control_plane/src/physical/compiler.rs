@@ -2791,6 +2791,28 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_demo_snapshot_compiles_the_complete_query_matrix() {
+        let source =
+            include_str!("../../../docs/examples/asapquery-compatibility-demo-snapshot.json");
+        let snapshot: BackendLocalPlanningSnapshot =
+            serde_json::from_str(source).expect("strict compatibility demo fixture");
+        let plan = snapshot.compile().expect("compatibility demo compiles");
+
+        assert!(plan.collector_plans.is_empty());
+        assert!(plan.transmission_plan.rules.is_empty());
+        assert_eq!(plan.query_plan.entries.len(), 4);
+        assert_eq!(plan.precompute_plan.materializations.len(), 3);
+        for query in [
+            "rate(asap_demo_counter_total[5s])",
+            "increase(asap_demo_counter_total[5s])",
+            "sum_over_time(asap_demo_gauge[5s])",
+            "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
+        ] {
+            assert!(plan.query_plan.lookup(query).is_ok(), "missing {query}");
+        }
+    }
+
+    #[test]
     fn multiple_readouts_share_one_precompute_materialization() {
         let mut planning_request = request("q-p90", "quantile_over_time(0.90, m[1m])");
         let second = request("q-p99", "quantile_over_time(0.99, m[1m])")
