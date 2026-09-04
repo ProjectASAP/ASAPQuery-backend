@@ -13,12 +13,15 @@ typed `BackendPlan` plus one target-specific `CollectorPlan` per Collector.
   ingestion rate/freshness, optimization horizon, and primitive state costs);
 - `collector_ids`: the required OpAMP agent IDs;
 - `capability_snapshot_id` and the exact `planner_revision`;
+- `plan_version`, activation/optional expiry timestamps, and the exact backend
+  compatibility identity;
 - optional per-query TopK evidence, with `max_evidence_age_ms`; and
 - `apply_timeout_ms` (default 10000).
 
 Unknown JSON fields, empty target/query sets, zero windows/timeouts, stale
 evidence, and a Planner revision mismatch are rejected. The response is only
-successful after every target has applied the same generated `plan_id`.
+successful only after every target has applied the exact generated
+`(plan_id, plan_version)` and the backend activates that generation.
 
 The physical compiler passes normalized recurrence, data-arrival evidence,
 runtime capabilities, and costs to ASAPPlanner's summary-maintenance lifecycle
@@ -36,25 +39,24 @@ validate request and compile one bundle
 preflight every Collector capability
               |
               v
-POST typed BackendPlan protobuf; require 2xx
+POST one atomic PrecomputePlan + BackendPlan + QueryPlan bundle (stage)
               |
               v
 publish target-specific CollectorPlans over OpAMP
               |
               v
-require exact (agent_id, plan_id, APPLIED) from every target
+require exact (agent_id, plan_id, plan_version, APPLIED) from every target
+              |
+              v
+wait until activation and atomically activate backend snapshot
 ```
 
-Preflight happens before backend mutation. Publication repeats capability
-validation to close disconnect races. A missing backend endpoint, backend
-non-2xx, Collector disconnect, timeout, malformed report, wrong plan ID, or
-`FAILED` status fails the request. This path intentionally does not inherit the
-legacy replanner's best-effort behavior.
-
-The MVP endpoint installs the backend before enabling new producers. It does
-not claim distributed atomic activation or rollback; those remain post-MVP
-work. If a Collector fails after backend installation, the backend has a
-superset accepting view but the request fails and no success is reported.
+Preflight happens before staging. Publication repeats capability validation to
+close disconnect races. A missing backend endpoint, backend non-2xx, Collector
+disconnect, timeout, malformed report, wrong identity/version, incompatible
+schema, or `FAILED` status fails the request. A failed rollout leaves the
+previous active generation untouched; a staged generation never serves before
+explicit activation.
 
 ## OpAMP custom capability
 
@@ -71,7 +73,7 @@ The exact capability and message types shared with ASAPCollector are:
 status payload is strict JSON:
 
 ```json
-{"plan_id": 42, "status": "APPLIED", "error": null}
+{"plan_id": 42, "plan_version": 3, "status": "APPLIED", "error": null}
 ```
 
 `status` is exactly `APPLIED` or `FAILED`. Transport/config acknowledgements
@@ -81,8 +83,8 @@ another Collector's plan.
 
 ## Backend wire contract
 
-The matching `BackendPlan` uses the protobuf contract documented in
-`control_plane/docs/design-backend-plan-wire-format.md` and is sent to
-`POST /api/v1/backend-plan` with `application/x-protobuf`. Both projections
-carry the same numeric `plan_id`; the compiler, not either transport, owns the
-materialization choice.
+The matching BackendPlan protobuf is embedded with the typed PrecomputePlan
+and QueryPlan in `POST /api/v1/physical-plan`. The backend validates all shared
+identities, fingerprints, schemas, parameters, producers, and lifecycle fields
+before returning `staged`; `POST /api/v1/physical-plan/activate` performs the
+single immutable-snapshot swap.

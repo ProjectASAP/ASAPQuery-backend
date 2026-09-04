@@ -1016,6 +1016,7 @@ mod tests {
             },
             materializations: vec![crate::physical::compiler::CollectorMaterialization {
                 query_id: "q".into(),
+                materialization: asap_types::PolicyFingerprint(1),
                 metric: "requests".into(),
                 algorithm: "hll".into(),
                 parameters: serde_json::json!({"precision": 14}),

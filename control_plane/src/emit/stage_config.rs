@@ -3142,24 +3142,33 @@ fn sketch_params_to_json(p: &SketchParams) -> JsonValue {
         SketchParams::Kll { k } => json!({ "k": k }),
         SketchParams::DDSketch { alpha } => json!({ "alpha": alpha }),
         SketchParams::Hll { precision } => json!({ "precision": precision }),
-        // Cms/CmsWithHeap: matches the pre-split shape exactly — the old
-        // `SketchParams::Cms` arm never emitted `with_heap` in JSON even
-        // though `CmsParams.with_heap` existed as a field; heap-bearing
-        // and bare CMS produced identical wire JSON. `heap_size` is a
-        // new field with no wire representation here (nothing on the
-        // real backend wire path reads it — see `bind_cms_topk.rs`).
-        SketchParams::Cms { width, depth } | SketchParams::CmsWithHeap { width, depth, .. } => {
-            json!({ "w": width, "d": depth })
-        }
+        SketchParams::Cms { width, depth } => json!({ "w": width, "d": depth }),
+        SketchParams::CmsWithHeap {
+            width,
+            depth,
+            heap_size,
+        } => json!({
+            "w": width,
+            "d": depth,
+            "with_heap": true,
+            "heap_size": heap_size,
+        }),
         // CountSketch/CountSketchWithHeap: the old arm always emitted
         // `with_heap` (from `CountSketchParams.with_heap: bool`);
         // that boolean is now the kind identity itself.
         SketchParams::CountSketch { width, depth } => {
             json!({ "w": width, "d": depth, "with_heap": false })
         }
-        SketchParams::CountSketchWithHeap { width, depth, .. } => {
-            json!({ "w": width, "d": depth, "with_heap": true })
-        }
+        SketchParams::CountSketchWithHeap {
+            width,
+            depth,
+            heap_size,
+        } => json!({
+            "w": width,
+            "d": depth,
+            "with_heap": true,
+            "heap_size": heap_size,
+        }),
         // Exact accumulators never reach here -- see
         // `sketch_kind_to_backend_type`'s doc.
         SketchParams::Kmv { .. } | SketchParams::Theta { .. } => unreachable!(

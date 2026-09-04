@@ -5330,15 +5330,18 @@ async fn handle_post_physical_plan(
         )
             .into_response();
     };
-    let new_config = crate::storage_engines::types::StreamingConfig::new(
-        request
-            .precompute_plan
-            .materializations
-            .iter()
-            .cloned()
-            .map(|config| (config.policy_fp_u64(), config))
-            .collect(),
-    );
+    let runtime_materializations =
+        match request.precompute_plan.runtime_materializations() {
+            Ok(materializations) => materializations,
+            Err(error) => return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(serde_json::json!({
+                    "status": "error", "error": format!("PrecomputePlan validation error: {error}")
+                })),
+            )
+                .into_response(),
+        };
+    let new_config = crate::storage_engines::types::StreamingConfig::new(runtime_materializations);
     let new_plan = match control_plane::backend_plan::BackendPlan::decode(&request.backend_plan) {
         Ok(plan) => plan,
         Err(error) => {
@@ -5356,6 +5359,15 @@ async fn handle_post_physical_plan(
             StatusCode::UNPROCESSABLE_ENTITY,
             axum::Json(serde_json::json!({
                 "status": "error", "error": format!("BackendPlan validation error: {error}")
+            })),
+        )
+            .into_response();
+    }
+    if let Err(error) = request.precompute_plan.validate_against_backend(&new_plan) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(serde_json::json!({
+                "status": "error", "error": format!("PrecomputePlan validation error: {error}")
             })),
         )
             .into_response();
@@ -5387,6 +5399,28 @@ async fn handle_post_physical_plan(
             })),
         )
             .into_response();
+    }
+    for schema in &request.precompute_plan.schemas {
+        let Some(materialization) = new_plan.materializations.get(&schema.materialization) else {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(serde_json::json!({
+                    "status": "error", "error": "PrecomputePlan schema is absent from BackendPlan"
+                })),
+            )
+                .into_response();
+        };
+        if control_plane::physical::compiler::StateFamilyContract::try_from(&materialization.family)
+            != Ok(schema.family.clone())
+        {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                axum::Json(serde_json::json!({
+                    "status": "error", "error": "PrecomputePlan and BackendPlan schema semantics differ"
+                })),
+            )
+                .into_response();
+        }
     }
     let typed_plan_fps: BTreeSet<_> = new_plan.materializations.keys().copied().collect();
     if let Err(error) = request.query_plan.validate(&typed_plan_fps) {

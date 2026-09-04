@@ -120,6 +120,10 @@ pub struct DeploymentEnvironment {
     pub capability_snapshot_id: String,
     pub observed_at_unix_ms: u64,
     pub max_evidence_age_ms: u64,
+    pub plan_version: u64,
+    pub activation_unix_ms: u64,
+    pub expiry_unix_ms: Option<u64>,
+    pub backend_compat: String,
 }
 
 pub struct PhysicalPlan {
@@ -138,13 +142,14 @@ Supporting public types:
 | `DeploymentEnvironment` | Target collector IDs, capability snapshot identity, planning time, and evidence freshness policy. |
 | `PlanEnvelope` | Shared deterministic `plan_id`, generation time, capability snapshot, and Planner revision. |
 | `CollectorPlan` | Serializable execution projection consumed by ASAPCollector. |
-| `PrecomputePlan` | Config-driven aggregation/window projection consumed by the backend streaming precompute engine. |
+| `PrecomputePlan` | Authoritative materialization, ingest, state-schema, and producer contract consumed directly by the backend runtime. |
 | `BackendPlan` | Versioned public data-plane materialization/routing contract defined in this repository. |
+| `QueryPlan` | Canonical-query keyed executable DAG with exact materialization bindings and fallback policy. |
 
-Current MVP limits are explicit: time-series sources and sketch
-materializations are supported; table sources and non-sketch selected families
-return `CompileError`. Runtime activation/expiry and richer topology placement
-remain publication-layer work and are not claimed by this compiler API.
+Current MVP limits are explicit: time-series sources and supported summary
+materializations are accepted; table sources and unexecutable selected families
+return `CompileError`. Versioned stage/activate/drain/retire lifecycle is part
+of publication; richer topology placement remains follow-up work.
 
 Output definitions:
 
@@ -152,7 +157,7 @@ Output definitions:
 | --- | --- |
 | `envelope` | Shared plan/version/activation/compatibility identity. |
 | `collector_plans` | One plan per targeted collector, following ASAPCollector's public CollectorPlan schema. |
-| `precompute_plan` | Aggregation definitions emitted to `/api/v1/streaming-config`; contains no query-string jobs. |
+| `precompute_plan` | Materializations plus `/v1/metrics` ingest semantics, typed state schemas/encodings, and allowed producers; it is installed directly and contains no query-string jobs. |
 | `backend_plan` | Matching data-plane materialization and routing contract. |
 | `query_plan` | Canonical query identity, explicit fallback policy, node-ID DAG, and exact per-node materialization bindings. |
 
