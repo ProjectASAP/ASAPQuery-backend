@@ -14,9 +14,10 @@ use asap_aware_mapping::{
     SummaryMaintenanceLifecycleCapabilities, SummaryMaintenanceLifecycleCostInputs, WorkloadDemand,
 };
 use planner_types::post_asap::{
-    CompositionOperator, EvaluationSchedule, OutputRepresentation, SketchQuery, SummaryExpr,
-    SummaryFamilyType, SummaryMaintenanceLifecycle, SummaryMaintenanceLifecycleGuarantee,
-    SummaryMaintenanceMode, SummaryNode, SummaryWindowFramework,
+    CompositionOperator, EvaluationSchedule, OutputRepresentation, SketchAlgorithm, SketchParams,
+    SketchQuery, SummaryExpr, SummaryFamilyType, SummaryMaintenanceLifecycle,
+    SummaryMaintenanceLifecycleGuarantee, SummaryMaintenanceMode, SummaryNode,
+    SummaryWindowFramework,
 };
 use planner_types::pre_asap::QueryExpr;
 use planner_types::workload::{
@@ -236,6 +237,54 @@ pub enum StateEncoding {
     ExactAccumulatorV1,
 }
 
+/// Serializable physical state identity derived from Planner's canonical
+/// summary family. This is a wire DTO, not a second planning algebra.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "family", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StateFamilyContract {
+    Exact {
+        kind: ExactStateKind,
+    },
+    Sketch {
+        algorithm: SketchAlgorithm,
+        parameters: SketchParams,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExactStateKind {
+    Sum,
+    Count,
+    MinMax,
+    Increase,
+    Rate,
+}
+
+impl TryFrom<&SummaryFamilyType> for StateFamilyContract {
+    type Error = ();
+
+    fn try_from(family: &SummaryFamilyType) -> Result<Self, Self::Error> {
+        use planner_types::post_asap::ExactKind;
+        Ok(match family {
+            SummaryFamilyType::ExactAggregate(kind, _) => Self::Exact {
+                kind: match kind {
+                    ExactKind::Sum => ExactStateKind::Sum,
+                    ExactKind::Count => ExactStateKind::Count,
+                    ExactKind::MinMax => ExactStateKind::MinMax,
+                    ExactKind::Increase => ExactStateKind::Increase,
+                    ExactKind::Rate => ExactStateKind::Rate,
+                },
+            },
+            SummaryFamilyType::Sketch(kind, _) => Self::Sketch {
+                algorithm: kind.algorithm().clone(),
+                parameters: kind.params().clone(),
+            },
+            _ => return Err(()),
+        })
+    }
+}
+
 /// Decoder/schema contract for one content-addressed materialization.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -243,7 +292,7 @@ pub struct StateSchemaContract {
     pub schema_id: String,
     pub schema_version: u32,
     pub materialization: asap_types::PolicyFingerprint,
-    pub family: SummaryFamilyType,
+    pub family: StateFamilyContract,
     pub source: Source,
     pub value_column: planner_types::pre_asap::ColumnRef,
     pub group_by: Vec<String>,
@@ -282,6 +331,8 @@ pub enum PrecomputePlanError {
     SchemaSetMismatch,
     #[error("schema {schema_id} has invalid version or no encoding")]
     InvalidSchema { schema_id: String },
+    #[error("materialization {0} uses a summary family unsupported by the runtime schema")]
+    UnsupportedFamily(u64),
     #[error("producer {producer_id} references an unknown materialization or schema")]
     InvalidProducer { producer_id: String },
     #[error("materialization {0} has no registered producer")]
@@ -309,22 +360,26 @@ impl PrecomputePlan {
         let schemas = backend_plan
             .materializations
             .iter()
-            .map(|(fingerprint, materialization)| StateSchemaContract {
-                schema_id: state_schema_id(*fingerprint),
-                schema_version: 1,
-                materialization: *fingerprint,
-                family: materialization.family.clone(),
-                source: materialization.source.clone(),
-                value_column: materialization.col.clone(),
-                group_by: materialization.group_by.clone(),
-                window: StateWindowContract {
-                    kind: materialization.window.kind,
-                    size_ms: materialization.window.size_ms,
-                    slide_ms: materialization.window.slide_ms,
-                },
-                encodings: state_encodings(&materialization.family),
+            .map(|(fingerprint, materialization)| {
+                let family = StateFamilyContract::try_from(&materialization.family)
+                    .map_err(|_| PrecomputePlanError::UnsupportedFamily(fingerprint.0))?;
+                Ok(StateSchemaContract {
+                    schema_id: state_schema_id(*fingerprint),
+                    schema_version: 1,
+                    materialization: *fingerprint,
+                    family,
+                    source: materialization.source.clone(),
+                    value_column: materialization.col.clone(),
+                    group_by: materialization.group_by.clone(),
+                    window: StateWindowContract {
+                        kind: materialization.window.kind,
+                        size_ms: materialization.window.size_ms,
+                        slide_ms: materialization.window.slide_ms,
+                    },
+                    encodings: state_encodings(&materialization.family),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, PrecomputePlanError>>()?;
         let producers = producer_ids
             .iter()
             .flat_map(|producer_id| {
@@ -443,7 +498,9 @@ impl PrecomputePlan {
             else {
                 return Err(PrecomputePlanError::SchemaSetMismatch);
             };
-            if schema.family != materialization.family
+            let expected_family = StateFamilyContract::try_from(&materialization.family)
+                .map_err(|_| PrecomputePlanError::UnsupportedFamily(schema.materialization.0))?;
+            if schema.family != expected_family
                 || schema.schema_id != state_schema_id(schema.materialization)
                 || schema.source != materialization.source
                 || schema.value_column != materialization.col

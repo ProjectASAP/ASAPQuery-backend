@@ -5410,7 +5410,9 @@ async fn handle_post_physical_plan(
             )
                 .into_response();
         };
-        if materialization.kind != schema.family || materialization.params != schema.parameters {
+        if control_plane::physical::compiler::StateFamilyContract::try_from(&materialization.family)
+            != Ok(schema.family.clone())
+        {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 axum::Json(serde_json::json!({
