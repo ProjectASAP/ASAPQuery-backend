@@ -4,7 +4,7 @@
 //! deployment decision: evidence freshness, target capabilities, windows, the
 //! Collector execution projection, and the matching BackendPlan.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use asap_aware_mapping::cost_model::Cost;
@@ -16,7 +16,7 @@ use asap_aware_mapping::{
 use planner_types::post_asap::{
     CompositionOperator, EvaluationSchedule, OutputRepresentation, SketchQuery, SummaryExpr,
     SummaryFamilyType, SummaryMaintenanceLifecycle, SummaryMaintenanceLifecycleGuarantee,
-    SummaryMaintenanceMode, SummaryNode,
+    SummaryMaintenanceMode, SummaryNode, SummaryWindowFramework,
 };
 use planner_types::pre_asap::QueryExpr;
 use planner_types::workload::{
@@ -34,14 +34,21 @@ use crate::physical::colored_dag::emitter::{
     AggregationInput, BackendAggregation, BackendReadout, BackendStageConfig,
 };
 use crate::physical::post_asap::cost_model::ControlPlaneCostModel;
+use crate::query_plan::{
+    canonical_promql, FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping,
+    QueryPlan, QueryPlanEntry,
+};
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "5d0b6f6edcac65edc89a72051f37977ab0c83031";
+pub const PLANNER_REVISION: &str = "739753e33e096c01faccca8e7a1e3da5ad3aab9c";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
     pub query_id: String,
+    /// Catalog expression used only to build the stable QueryPlan identity.
+    /// The selected implementation comes from `post_asap`, never this text.
+    pub query_string: String,
     /// Planner-selected post-ASAP DAG. The physical compiler must not
     /// re-select a summary family from pre-ASAP input.
     pub post_asap: Rc<SummaryNode>,
@@ -52,6 +59,40 @@ pub struct PlanningQuery {
     pub group_by: Vec<String>,
     pub accuracy: AccuracyTarget,
     pub lifecycle: LifecyclePlanningInput,
+    /// Executor-feasible concrete realizations offered to Planner for its
+    /// abstract window-framework decision. The compiler retains physical
+    /// identities and exposes only framework + complete weighted cost to
+    /// Planner. An empty or stale set fails closed.
+    pub window_implementations: Vec<WindowImplementationCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementationCostEvidence {
+    pub model_version: String,
+    pub workload_fingerprint: String,
+    pub observed_at_unix_ms: u64,
+    pub valid_for_ms: u64,
+    pub horizon_seconds: f64,
+    pub cpu_cost: f64,
+    pub peak_memory_bytes: u64,
+    pub network_bytes: u64,
+    pub storage_bytes: u64,
+    pub source_scan_bytes: u64,
+    /// Dimensionally calibrated scalar passed to Planner for comparison.
+    pub weighted_cost: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WindowImplementationCandidate {
+    /// Backend-owned identity; never copied into Planner IR.
+    pub implementation_id: String,
+    pub framework: SummaryWindowFramework,
+    pub window_secs: u64,
+    pub pane_secs: u64,
+    pub state_layout: String,
+    pub cost: ImplementationCostEvidence,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -115,6 +156,10 @@ pub struct CollectorMaterialization {
     pub parameters: Value,
     pub group_by: Vec<String>,
     pub window_secs: u64,
+    pub abstract_window_framework: SummaryWindowFramework,
+    pub window_implementation_id: String,
+    pub pane_secs: u64,
+    pub state_layout: String,
     pub evidence_source: Option<String>,
     pub lifecycle: CollectorLifecycle,
 }
@@ -154,6 +199,7 @@ pub struct PhysicalPlan {
     pub collector_plans: Vec<CollectorPlan>,
     pub precompute_plan: PrecomputePlan,
     pub backend_plan: BackendPlan,
+    pub query_plan: QueryPlan,
 }
 
 #[derive(Debug, Error)]
@@ -171,6 +217,8 @@ pub enum CompileError {
     Lifecycle { query_id: String, reason: String },
     #[error("failed to construct BackendPlan: {0}")]
     BackendPlan(#[from] anyhow::Error),
+    #[error("failed to construct QueryPlan: {0}")]
+    QueryPlan(#[from] crate::query_plan::QueryPlanError),
 }
 
 struct QueryEvidence<'a>(Option<&'a TopKMembershipEvidence>);
@@ -229,6 +277,7 @@ impl PhysicalCompiler {
                 retention_cost_rate: Some(CostRate(query.lifecycle.costs.retention_per_second)),
                 retirement_cost: Some(Cost(query.lifecycle.costs.retirement)),
             };
+            let window_costs = validate_window_implementations(query, &environment)?;
             let model = ControlPlaneCostModel::new(query.accuracy.clone())
                 .with_summary_maintenance(
                     lifecycle_costs,
@@ -237,13 +286,23 @@ impl PhysicalCompiler {
                         merge: true,
                         delete: false,
                     },
-                );
+                )
+                .with_window_framework_costs(window_costs);
             let node = query.post_asap.clone();
             let selected = extract_selected(&node).ok_or_else(|| CompileError::Query {
                 query_id: query.query_id.clone(),
                 reason: "selected plan has no executable sketch materialization/readout".into(),
             })?;
-            let lifecycle = select_lifecycle(query, &node, &model, &environment)?;
+            let planner_selection = select_lifecycle(query, &node, &model, &environment)?;
+            let window_implementation = query
+                .window_implementations
+                .iter()
+                .filter(|candidate| candidate.framework == planner_selection.window_framework)
+                .min_by(|left, right| left.cost.weighted_cost.total_cmp(&right.cost.weighted_cost))
+                .ok_or_else(|| CompileError::Lifecycle {
+                    query_id: query.query_id.clone(),
+                    reason: "Planner selected a window framework without a retained concrete implementation".into(),
+                })?;
             let metric = match &query.source {
                 Source::TimeSeries { metric } => metric.clone(),
                 Source::Table { .. } => {
@@ -278,8 +337,12 @@ impl PhysicalCompiler {
                 parameters: sketch_params_json(&selected.params),
                 group_by: query.group_by.clone(),
                 window_secs: query.window_secs,
+                abstract_window_framework: planner_selection.window_framework,
+                window_implementation_id: window_implementation.implementation_id.clone(),
+                pane_secs: window_implementation.pane_secs,
+                state_layout: window_implementation.state_layout.clone(),
                 evidence_source: evidence.map(|e| e.source.clone()),
-                lifecycle,
+                lifecycle: planner_selection.lifecycle,
             });
         }
 
@@ -324,13 +387,143 @@ impl PhysicalCompiler {
                 .map(backend_plan::aggregation_config_for_materialization)
                 .collect::<Result<Vec<_>, _>>()?,
         };
+        let materialization_fingerprints: BTreeSet<_> =
+            backend_plan.materializations.keys().copied().collect();
+        let mut query_entries = BTreeMap::new();
+        for query in &request.queries {
+            let canonical = canonical_promql(&query.query_string)?;
+            let selected =
+                extract_selected(&query.post_asap).ok_or_else(|| CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason: "selected plan has no executable sketch materialization/readout".into(),
+                })?;
+            let family = SummaryFamilyType::Sketch(
+                selected.kind,
+                planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
+            );
+            let metric = match &query.source {
+                Source::TimeSeries { metric } => metric,
+                Source::Table { .. } => unreachable!("table source rejected above"),
+            };
+            let bound: BTreeSet<_> = backend_plan
+                .routing
+                .iter()
+                .filter_map(|route| {
+                    let materialization = backend_plan.materializations.get(&route.materialization)?;
+                    (route.storage_backend == backend_plan::StorageBackend::SketchStore
+                        && matches!(&materialization.source, Source::TimeSeries { metric: m } if m == metric)
+                        && materialization.family == family
+                        && materialization.window.size_ms == query.window_secs.saturating_mul(1_000)
+                        && materialization.group_by == query.group_by)
+                        .then_some(route.materialization)
+                })
+                .collect();
+            if bound.is_empty() {
+                return Err(CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason: "compiled BackendPlan has no exact materialization for QueryPlan"
+                        .into(),
+                });
+            }
+            let entry = QueryPlanEntry::compile_bound(
+                query.query_id.clone(),
+                canonical.clone(),
+                &query.post_asap,
+                InstantExecution {
+                    lookback_ms: query.window_secs.saturating_mul(1_000),
+                    full_history: false,
+                    cumulative_readout: true,
+                },
+                FallbackPolicy::ExactBackend,
+                |node, node_family| {
+                    let planned_metric = summary_agg_metric(node).ok_or_else(|| {
+                        crate::query_plan::QueryPlanError::Invalid(
+                            "materialized node has no unique time-series source".into(),
+                        )
+                    })?;
+                    if planned_metric != *metric {
+                        return Err(crate::query_plan::QueryPlanError::Invalid(format!(
+                            "catalog metric `{metric}` disagrees with post-ASAP source `{planned_metric}`"
+                        )));
+                    }
+                    let fingerprint = bound
+                        .iter()
+                        .find(|fingerprint| {
+                            backend_plan
+                                .materializations
+                                .get(fingerprint)
+                                .is_some_and(|m| &m.family == node_family)
+                        })
+                        .copied()
+                        .ok_or_else(|| {
+                            crate::query_plan::QueryPlanError::Invalid(format!(
+                                "no exact physical binding for {node_family:?}"
+                            ))
+                        })?;
+                    Ok(MaterializationBinding {
+                        materialization: fingerprint,
+                        metric: metric.clone(),
+                        sid_grouping: query.group_by.clone(),
+                        output_grouping: PhysicalGrouping::Reduce(query.group_by.clone()),
+                        window_ms: query.window_secs.saturating_mul(1_000),
+                    })
+                },
+            )?;
+            if query_entries.insert(canonical.clone(), entry).is_some() {
+                return Err(CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason: format!("duplicate canonical query identity `{canonical}`"),
+                });
+            }
+        }
+        let query_plan = QueryPlan {
+            plan_id,
+            entries: query_entries,
+        };
+        query_plan.validate(&materialization_fingerprints)?;
         Ok(PhysicalPlan {
             envelope,
             collector_plans,
             precompute_plan,
             backend_plan,
+            query_plan,
         })
     }
+}
+
+fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
+    fn walk(node: &SummaryNode, metrics: &mut BTreeSet<String>) {
+        match &node.expr {
+            SummaryExpr::KeepPreAsap(expr) => {
+                let parsed = crate::query_parser::qe_to_parsed_query(expr);
+                if !parsed.metric_name.is_empty() {
+                    metrics.insert(parsed.metric_name);
+                }
+            }
+            SummaryExpr::SummaryAgg { child, .. } => walk(child, metrics),
+            SummaryExpr::SummaryEstimate { summary_input, .. } => walk(summary_input, metrics),
+            SummaryExpr::SummaryMerge { children } => {
+                for child in children {
+                    walk(child, metrics);
+                }
+            }
+            SummaryExpr::SummaryJoin {
+                outer: left,
+                inner: right,
+                ..
+            }
+            | SummaryExpr::SummarySubtract { left, right } => {
+                walk(left, metrics);
+                walk(right, metrics);
+            }
+            SummaryExpr::SummaryDelete { summary_input, .. } => walk(summary_input, metrics),
+        }
+    }
+    let mut metrics = BTreeSet::new();
+    walk(node, &mut metrics);
+    (metrics.len() == 1)
+        .then(|| metrics.into_iter().next())
+        .flatten()
 }
 
 /// Planner-adapter selection step used before physical compilation. Keeping
@@ -416,12 +609,76 @@ fn validate_lifecycle_input(
     Ok(())
 }
 
+fn validate_window_implementations(
+    query: &PlanningQuery,
+    environment: &DeploymentEnvironment,
+) -> Result<Vec<(SummaryWindowFramework, Cost)>, CompileError> {
+    let mut ids = BTreeSet::new();
+    let mut cheapest = BTreeMap::<SummaryWindowFramework, f64>::new();
+    for candidate in &query.window_implementations {
+        let evidence = &candidate.cost;
+        let age = environment
+            .observed_at_unix_ms
+            .saturating_sub(evidence.observed_at_unix_ms);
+        let valid = !candidate.implementation_id.trim().is_empty()
+            && ids.insert(candidate.implementation_id.clone())
+            && !candidate.state_layout.trim().is_empty()
+            && !evidence.model_version.trim().is_empty()
+            && !evidence.workload_fingerprint.trim().is_empty()
+            && evidence.valid_for_ms != 0
+            && age <= environment.max_evidence_age_ms.min(evidence.valid_for_ms)
+            && evidence.horizon_seconds.is_finite()
+            && (evidence.horizon_seconds - query.lifecycle.horizon_seconds).abs() <= f64::EPSILON
+            && evidence.cpu_cost.is_finite()
+            && evidence.cpu_cost >= 0.0
+            && evidence.weighted_cost.is_finite()
+            && evidence.weighted_cost >= 0.0
+            && candidate.window_secs == query.window_secs
+            && candidate.pane_secs != 0
+            && candidate.pane_secs <= candidate.window_secs
+            && candidate.window_secs % candidate.pane_secs == 0
+            // Current Collector runtime contract is the MVP's anchored,
+            // tumbling implementation. Other Planner primitives become
+            // candidates only when an executor advertises full semantics.
+            && candidate.framework == SummaryWindowFramework::Tumbling
+            && candidate.pane_secs == candidate.window_secs;
+        if !valid {
+            return Err(CompileError::Lifecycle {
+                query_id: query.query_id.clone(),
+                reason: format!(
+                    "window implementation `{}` has incomplete, stale, incompatible, or duplicate physical evidence",
+                    candidate.implementation_id
+                ),
+            });
+        }
+        cheapest
+            .entry(candidate.framework.clone())
+            .and_modify(|cost| *cost = cost.min(evidence.weighted_cost))
+            .or_insert(evidence.weighted_cost);
+    }
+    if cheapest.is_empty() {
+        return Err(CompileError::Lifecycle {
+            query_id: query.query_id.clone(),
+            reason: "no complete executor-feasible window implementation evidence".into(),
+        });
+    }
+    Ok(cheapest
+        .into_iter()
+        .map(|(framework, cost)| (framework, Cost(cost)))
+        .collect())
+}
+
+struct PlannerPhysicalSelection {
+    lifecycle: CollectorLifecycle,
+    window_framework: SummaryWindowFramework,
+}
+
 fn select_lifecycle(
     query: &PlanningQuery,
     node: &SummaryNode,
     model: &ControlPlaneCostModel,
     environment: &DeploymentEnvironment,
-) -> Result<CollectorLifecycle, CompileError> {
+) -> Result<PlannerPhysicalSelection, CompileError> {
     let workload = QueryWorkload {
         language: QueryLanguage::PromQL,
         query_batch: None,
@@ -479,31 +736,42 @@ fn select_lifecycle(
             query_id: query.query_id.clone(),
             reason: "latest ASAPPlanner selected no executable Collector lifecycle".into(),
         })?;
-    Ok(CollectorLifecycle {
-        kind: match guarantee.summary_maintenance_lifecycle {
-            SummaryMaintenanceLifecycle::Ephemeral => "ephemeral",
-            SummaryMaintenanceLifecycle::Prepared { .. } => "prepared",
-            SummaryMaintenanceLifecycle::Shared { .. } => "shared",
-            SummaryMaintenanceLifecycle::ContinuouslyMaintained => "continuously_maintained",
-        }
-        .into(),
-        maintenance_mode: match guarantee.summary_maintenance_mode {
-            SummaryMaintenanceMode::DirectBuild => "direct_build",
-            SummaryMaintenanceMode::Incremental => "incremental",
-        }
-        .into(),
-        evaluation_schedule: match guarantee.evaluation_schedule {
-            EvaluationSchedule::OneShot => "one_shot",
-            EvaluationSchedule::PerUpdate => "per_update",
-            EvaluationSchedule::OnRead => "on_read",
-        }
-        .into(),
-        output_representation: match guarantee.output_representation {
-            OutputRepresentation::PlainRows => "plain_rows",
-            OutputRepresentation::SummaryState => "summary_state",
-            OutputRepresentation::FinalizedValue => "finalized_value",
-        }
-        .into(),
+    let window_framework = plan
+        .deployments
+        .first()
+        .and_then(|deployment| deployment.selected_window_framework.clone())
+        .ok_or_else(|| CompileError::Lifecycle {
+            query_id: query.query_id.clone(),
+            reason: "latest ASAPPlanner selected no window framework from the supplied physical evidence".into(),
+        })?;
+    Ok(PlannerPhysicalSelection {
+        lifecycle: CollectorLifecycle {
+            kind: match guarantee.summary_maintenance_lifecycle {
+                SummaryMaintenanceLifecycle::Ephemeral => "ephemeral",
+                SummaryMaintenanceLifecycle::Prepared { .. } => "prepared",
+                SummaryMaintenanceLifecycle::Shared { .. } => "shared",
+                SummaryMaintenanceLifecycle::ContinuouslyMaintained => "continuously_maintained",
+            }
+            .into(),
+            maintenance_mode: match guarantee.summary_maintenance_mode {
+                SummaryMaintenanceMode::DirectBuild => "direct_build",
+                SummaryMaintenanceMode::Incremental => "incremental",
+            }
+            .into(),
+            evaluation_schedule: match guarantee.evaluation_schedule {
+                EvaluationSchedule::OneShot => "one_shot",
+                EvaluationSchedule::PerUpdate => "per_update",
+                EvaluationSchedule::OnRead => "on_read",
+            }
+            .into(),
+            output_representation: match guarantee.output_representation {
+                OutputRepresentation::PlainRows => "plain_rows",
+                OutputRepresentation::SummaryState => "summary_state",
+                OutputRepresentation::FinalizedValue => "finalized_value",
+            }
+            .into(),
+        },
+        window_framework,
     })
 }
 
@@ -611,12 +879,33 @@ mod tests {
         Ok(PlanningRequest {
             queries: vec![PlanningQuery {
                 query_id: query_id.into(),
+                query_string: promql.into(),
                 post_asap,
                 source: Source::TimeSeries { metric: "m".into() },
                 window_secs: 60,
                 group_by: vec![],
                 accuracy,
                 lifecycle,
+                window_implementations: vec![WindowImplementationCandidate {
+                    implementation_id: "collector-tumbling-v1".into(),
+                    framework: SummaryWindowFramework::Tumbling,
+                    window_secs: 60,
+                    pane_secs: 60,
+                    state_layout: "anchored-pane-v1".into(),
+                    cost: ImplementationCostEvidence {
+                        model_version: "test-cost-v1".into(),
+                        workload_fingerprint: "test-workload".into(),
+                        observed_at_unix_ms: 9_500,
+                        valid_for_ms: 60_000,
+                        horizon_seconds: 300.0,
+                        cpu_cost: 1.0,
+                        peak_memory_bytes: 1_024,
+                        network_bytes: 512,
+                        storage_bytes: 512,
+                        source_scan_bytes: 0,
+                        weighted_cost: 1.0,
+                    },
+                }],
             }],
             evidence: evidence_by_query,
             planner_revision: PLANNER_REVISION.into(),
@@ -653,10 +942,49 @@ mod tests {
             SummaryMaintenanceLifecycle::ContinuouslyMaintained
         );
         assert_eq!(bundle.backend_plan.routing.len(), 1);
+        assert_eq!(bundle.query_plan.plan_id, bundle.envelope.plan_id);
+        let entry = bundle
+            .query_plan
+            .lookup("quantile_over_time( 0.99, m[1m] )")
+            .expect("canonical QueryPlan lookup");
+        assert_eq!(entry.query_id, "q-quantile");
+        assert_eq!(
+            entry
+                .nodes
+                .values()
+                .filter(|node| matches!(
+                    node,
+                    crate::query_plan::QueryPlanNode::ReadMaterialization { .. }
+                ))
+                .count(),
+            1
+        );
+        entry
+            .validate(
+                &bundle
+                    .backend_plan
+                    .materializations
+                    .keys()
+                    .copied()
+                    .collect(),
+            )
+            .expect("executable physical DAG");
+        let wire = serde_json::to_vec(&bundle.query_plan).expect("serialize QueryPlan");
+        let decoded: QueryPlan = serde_json::from_slice(&wire).expect("deserialize QueryPlan");
+        assert_eq!(decoded, bundle.query_plan);
         for plan in &bundle.collector_plans {
             assert_eq!(plan.envelope, bundle.envelope);
             assert_eq!(plan.materializations[0].metric, "m");
             assert_eq!(plan.materializations[0].window_secs, 60);
+            assert_eq!(
+                plan.materializations[0].abstract_window_framework,
+                SummaryWindowFramework::Tumbling
+            );
+            assert_eq!(
+                plan.materializations[0].window_implementation_id,
+                "collector-tumbling-v1"
+            );
+            assert_eq!(plan.materializations[0].pane_secs, 60);
             assert_eq!(
                 plan.materializations[0].lifecycle,
                 CollectorLifecycle {
@@ -671,6 +999,16 @@ mod tests {
                 "ddsketch" | "kll"
             ));
         }
+    }
+
+    #[test]
+    fn missing_window_implementation_evidence_fails_closed() {
+        let mut request = request("q-window", "quantile_over_time(0.99, m[1m])");
+        request.queries[0].window_implementations.clear();
+        let error = PhysicalCompiler
+            .compile(request, environment(10_000))
+            .expect_err("Planner must not receive a zero-cost invented window");
+        assert!(matches!(error, CompileError::Lifecycle { .. }));
     }
 
     #[test]

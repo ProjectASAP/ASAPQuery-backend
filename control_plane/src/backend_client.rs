@@ -367,6 +367,7 @@ impl BackendClient {
         &self,
         precompute_plan: &crate::physical::compiler::PrecomputePlan,
         backend_plan: Vec<u8>,
+        query_plan: &crate::query_plan::QueryPlan,
         storage_routing: Option<serde_json::Value>,
     ) -> std::result::Result<(), BackendPostError> {
         let url = derive_physical_plan_url(&self.endpoint);
@@ -376,6 +377,7 @@ impl BackendClient {
             .json(&serde_json::json!({
             "precompute_plan": precompute_plan,
             "backend_plan": backend_plan,
+            "query_plan": query_plan,
             "storage_routing": storage_routing,
             }))
             .send()

@@ -2231,10 +2231,7 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
                     encoding_to_tag(s.encoding),
                     s.bytes.clone(),
                 ),
-                AggPayload::ExactAgg(p) => (p.type_name().to_string(), 0u8, {
-                    use asap_types::traits::SerializableToSink;
-                    p.serialize_to_bytes()
-                }),
+                AggPayload::ExactAgg(p) => (p.type_name().to_string(), 0u8, p.serialize_to_bytes()),
             };
             approx_bytes += payload.approx_bytes();
             entries.push(EpochSnapshotEntry {

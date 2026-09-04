@@ -306,6 +306,114 @@ impl SummaryValue {
     }
 }
 
+impl QueryExecutionContext<'_> {
+    /// Resolve exactly one compiler-bound materialization. This is the formal
+    /// QueryPlan path: fingerprint -> SID is the only lookup; metadata checks
+    /// are integrity checks and never broaden the candidate set.
+    pub fn read_bound_materialization(
+        &self,
+        binding: &control_plane::query_plan::MaterializationBinding,
+    ) -> Result<Vec<(BTreeMap<String, String>, GroupState)>, SummaryExecutorError> {
+        use control_plane::query_plan::PhysicalGrouping;
+
+        enum Candidate {
+            Sketch(DeltaSketchKind),
+            ExactAgg(AggregationType),
+        }
+
+        let required_keys: BTreeSet<_> = binding.sid_grouping.iter().cloned().collect();
+        let mut sids = self.index.sids_for_policy(binding.materialization);
+        sids.sort_unstable();
+        sids.dedup();
+        let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<GroupState>> = BTreeMap::new();
+
+        for sid in sids {
+            let candidate = self
+                .index
+                .with_instance(sid, |meta| {
+                    if meta.policy_fp != binding.materialization
+                        || meta.metric_name != binding.metric
+                        || meta.group_by_keys != required_keys
+                    {
+                        return None;
+                    }
+                    match &meta.agg_kind {
+                        AggKind::Sketch {
+                            algorithm, config, ..
+                        } => to_delta_kind(algorithm.clone(), config).map(Candidate::Sketch),
+                        AggKind::ExactAgg { agg_type, .. } => Some(Candidate::ExactAgg(*agg_type)),
+                    }
+                })
+                .flatten();
+            let Some(candidate) = candidate else { continue };
+            match candidate {
+                Candidate::Sketch(kind) => {
+                    let Some(series) = self
+                        .index
+                        .query_range(sid, self.t0_ms, self.t1_ms)
+                        .into_iter()
+                        .next()
+                    else {
+                        continue;
+                    };
+                    let key = match &binding.output_grouping {
+                        PhysicalGrouping::PerEntity => series.series_label_values.clone(),
+                        PhysicalGrouping::Reduce(keys) => {
+                            project_group_key(keys, &series.series_label_values)
+                        }
+                    };
+                    by_group.entry(key).or_default().push(GroupState::Sketch {
+                        entries: vec![Rc::new(series)],
+                        kind,
+                    });
+                }
+                Candidate::ExactAgg(agg_type) => {
+                    let Some((labels, windows)) = self
+                        .index
+                        .query_exact_agg_range(sid, self.t0_ms, self.t1_ms)
+                        .into_iter()
+                        .next()
+                    else {
+                        continue;
+                    };
+                    let key = match &binding.output_grouping {
+                        PhysicalGrouping::PerEntity => labels,
+                        PhysicalGrouping::Reduce(keys) => project_group_key(keys, &labels),
+                    };
+                    by_group.entry(key).or_default().push(GroupState::ExactAgg {
+                        entries: vec![Rc::new(windows)],
+                        agg_type,
+                    });
+                }
+            }
+        }
+        if by_group.is_empty() {
+            return Err(SummaryExecutorError::NoCandidates);
+        }
+        by_group
+            .into_iter()
+            .map(|(key, states)| {
+                <Self as SummaryExecutor>::merge_states(self, states).map(|state| (key, state))
+            })
+            .collect()
+    }
+
+    pub fn readout_bound(
+        &self,
+        state: &GroupState,
+        query: &SketchQuery,
+    ) -> Result<SummaryValue, SummaryExecutorError> {
+        <Self as SummaryExecutor>::readout(self, state, query)
+    }
+
+    pub fn merge_bound_states(
+        &self,
+        states: Vec<GroupState>,
+    ) -> Result<GroupState, SummaryExecutorError> {
+        <Self as SummaryExecutor>::merge_states(self, states)
+    }
+}
+
 /// Fold `w_end` (a raw window-end timestamp, may be negative pre-epoch
 /// in principle) into a running `(min, max)` coverage accumulator —
 /// shared by `readout_cumulative`/`readout_per_window` so both compute
@@ -366,7 +474,21 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
             ExactAgg(AggregationType),
         }
 
-        let candidate_sids = self.index.instances_matching(&metric, &required_keys);
+        // A compiled QueryPlan resolves materializations before activation.
+        // Serving follows the direct fingerprint -> SID reverse index; it
+        // never scans metric registrations to discover a compatible family.
+        let candidate_sids = if let Some(allowed) = &self.allowed_materializations {
+            let mut sids: Vec<_> = allowed
+                .iter()
+                .flat_map(|fingerprint| self.index.sids_for_policy(*fingerprint))
+                .collect();
+            sids.sort_unstable();
+            sids.dedup();
+            sids
+        } else {
+            // Compatibility-only callers without a formal QueryPlan.
+            self.index.instances_matching(&metric, &required_keys)
+        };
         let mut out = Vec::new();
         for sid in candidate_sids {
             let candidate = self

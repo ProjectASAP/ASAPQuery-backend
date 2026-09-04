@@ -11,6 +11,7 @@
 
 pub mod engine;
 pub mod live_serve;
+pub mod physical_dag;
 pub mod post_asap_planner;
 pub mod post_asap_readout;
 pub mod summary_exec;

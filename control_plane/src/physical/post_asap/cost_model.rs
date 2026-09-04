@@ -35,11 +35,14 @@
 
 #![allow(dead_code)]
 
+use asap_aware_mapping::cost_model::{Cost, CostedSummaryDeployment};
 use asap_aware_mapping::{
-    CostModel, Implementation, SummaryMaintenanceCapabilities,
-    SummaryMaintenanceLifecycleCostInputs,
+    CompleteSummaryCandidateEstimate, CostModel, Horizon, Implementation,
+    SummaryMaintenanceCapabilities, SummaryMaintenanceLifecycleCostInputs,
 };
-use planner_types::post_asap::{SketchAlgorithm, SketchParams, SketchQuery};
+use planner_types::post_asap::{
+    SketchAlgorithm, SketchParams, SketchQuery, SummaryWindowFramework,
+};
 use planner_types::pre_asap::expr_ir::ColumnRef;
 
 use crate::physical::deployment_cost::wire::WireCostTable;
@@ -55,6 +58,7 @@ pub struct ControlPlaneCostModel {
     pub workload_accuracy: AccuracyTarget,
     lifecycle_costs: SummaryMaintenanceLifecycleCostInputs,
     summary_maintenance: SummaryMaintenanceCapabilities,
+    window_framework_costs: Vec<(SummaryWindowFramework, Cost)>,
 }
 
 impl ControlPlaneCostModel {
@@ -63,7 +67,20 @@ impl ControlPlaneCostModel {
             workload_accuracy,
             lifecycle_costs: SummaryMaintenanceLifecycleCostInputs::default(),
             summary_maintenance: SummaryMaintenanceCapabilities::default(),
+            window_framework_costs: Vec::new(),
         }
+    }
+
+    /// Bind the cheapest complete, workload-scoped physical realization for
+    /// each Planner-owned abstract window framework. Concrete implementation
+    /// identities stay in the physical compiler; only framework and cost
+    /// cross into Planner's candidate comparison.
+    pub fn with_window_framework_costs(
+        mut self,
+        costs: Vec<(SummaryWindowFramework, Cost)>,
+    ) -> Self {
+        self.window_framework_costs = costs;
+        self
     }
 
     pub fn with_summary_maintenance(
@@ -200,6 +217,50 @@ impl CostModel for ControlPlaneCostModel {
         _summary: &planner_types::post_asap::SummaryNode,
     ) -> SummaryMaintenanceCapabilities {
         self.summary_maintenance
+    }
+
+    fn complete_summary_candidate_estimate(
+        &self,
+        _root: &planner_types::post_asap::SummaryNode,
+        _target: Option<&planner_types::pre_asap::QueryExpr>,
+        deployments: &[CostedSummaryDeployment<'_>],
+        _horizon: Option<Horizon>,
+        _expected_reads: Option<f64>,
+        _required_accuracy: &[AccuracyTarget],
+    ) -> Option<CompleteSummaryCandidateEstimate> {
+        // One compiler candidate describes the complete concrete realization
+        // of this query DAG. The current executor exposes one anchored window
+        // framework across all reachable summary states; represent that full
+        // per-state assignment explicitly rather than relying on traversal
+        // order or leaving any state uncosted.
+        if deployments.is_empty() || self.window_framework_costs.is_empty() {
+            return None;
+        }
+        let lifecycle_cost: f64 = deployments
+            .iter()
+            .map(|deployment| deployment.selected_cost.0)
+            .sum();
+        self.window_framework_costs
+            .iter()
+            // GOS/error propagation is introduced by the later adaptation
+            // slice. Until then, do not claim an approximate exponential
+            // histogram window is exact.
+            .filter(|(framework, _)| {
+                !matches!(framework, SummaryWindowFramework::ExponentialHistogram)
+            })
+            .filter(|(_, cost)| cost.0.is_finite() && cost.0 >= 0.0)
+            .min_by(|left, right| left.1 .0.total_cmp(&right.1 .0))
+            .map(
+                |(framework, physical_cost)| CompleteSummaryCandidateEstimate {
+                    cost: Cost(lifecycle_cost + physical_cost.0),
+                    window_frameworks: vec![Some(framework.clone()); deployments.len()],
+                    window_accuracy_guarantee: Some(
+                        planner_types::post_asap::ResultGuarantee::exact(
+                            "backend exact window implementation",
+                        ),
+                    ),
+                },
+            )
     }
 
     fn rank_candidates(

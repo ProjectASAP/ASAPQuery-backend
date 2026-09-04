@@ -68,6 +68,7 @@ pub mod physical;
 pub mod pipeline;
 pub mod planner_selection;
 pub mod query_parser;
+pub mod query_plan;
 pub mod query_planning;
 pub mod replan;
 pub mod runtime_samples;

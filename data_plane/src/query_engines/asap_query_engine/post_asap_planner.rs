@@ -62,6 +62,12 @@ use crate::storage_engines::sketch_db::index::SketchStore;
 pub enum LoweringSkip {
     /// Operational kill switch disabled warm DAG execution.
     Disabled,
+    /// No exact identity exists in the active, control-plane-compiled
+    /// QueryPlan. This is a catalog miss, not an invitation to re-plan.
+    QueryNotPlanned(String),
+    /// The installed QueryPlan entry could not be reconstructed or failed
+    /// its internal contract. The request must fail closed.
+    InvalidQueryPlan(String),
     /// `parse_query_expr_canonical` failed — same failure mode the legacy
     /// parsing path tolerates and reports as an archive fallback reason.
     ParseFailed(String),

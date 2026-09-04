@@ -442,6 +442,7 @@ async fn main() -> Result<()> {
             precompute_plan: initial_precompute_plan,
             runtime_config: streaming_config.clone(),
             backend_plan: Arc::new(initial_backend_plan),
+            query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(
                 data_plane::storage_engines::types::BackendStorageRouting::empty(),
             ),
@@ -473,7 +474,7 @@ async fn main() -> Result<()> {
         // EngineError::CapabilityMiss when the ASAP tier is empty
         // / ghost / unknown.
         .with_sketch_index(sketch_index.clone())
-        .with_hot_reload_backend_plan(hot_reload_backend_plan.clone());
+        .with_active_physical_plan(active_physical_plan.clone());
         if let Some(control_plane_endpoint) = args.control_plane_endpoint.as_ref() {
             info!(
                 "Capability-miss notifications enabled → {}",
@@ -806,6 +807,7 @@ async fn main() -> Result<()> {
             precompute_plan: current.precompute_plan.clone(),
             runtime_config: current.runtime_config.clone(),
             backend_plan: current.backend_plan.clone(),
+            query_plan: current.query_plan.clone(),
             storage_routing: Arc::new(bootstrap_routing),
         });
     }

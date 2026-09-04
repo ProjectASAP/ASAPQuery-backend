@@ -5,13 +5,15 @@
 use std::collections::BTreeMap;
 
 use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome};
+use control_plane::query_plan::{QueryNodeId, QueryPlanNode};
 use control_plane::types_v2::AccuracyTarget;
 
+use crate::query_engines::asap_query_engine::physical_dag::{self, QueryNodeRuntime};
 use crate::query_engines::asap_query_engine::post_asap_planner::{
     execution_hints, plan_promql_to_post_asap, resolve_materializations_for_post_asap, LoweringSkip,
 };
 use crate::query_engines::asap_query_engine::summary_executor::{
-    QueryExecutionContext, SummaryValue,
+    GroupState, QueryExecutionContext, SummaryExecutorError, SummaryValue,
 };
 use crate::storage_engines::sketch_db::index::SketchStore;
 
@@ -83,6 +85,167 @@ pub fn execute_post_asap_readout(
         is_cumulative,
         backend_plan,
     )
+}
+
+/// Execute an already-bound QueryPlan entry.  This is the production serving
+/// path: no PromQL lowering, planner cost model, observed-family lookup, or
+/// BackendPlan materialization search occurs here.
+pub fn execute_query_plan_readout(
+    index: &SketchStore,
+    entry: &control_plane::query_plan::QueryPlanEntry,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    execute_physical_query_plan(index, entry, t0_ms, t1_ms, is_cumulative)
+}
+
+pub fn execute_query_plan_instant(
+    index: &SketchStore,
+    entry: &control_plane::query_plan::QueryPlanEntry,
+    now_ms: u64,
+) -> Result<(PostAsapReadoutOutcome, u64), LoweringSkip> {
+    let t0_ms = if entry.instant.full_history {
+        0
+    } else {
+        now_ms.saturating_sub(entry.instant.lookback_ms)
+    };
+    let outcome = execute_physical_query_plan(
+        index,
+        entry,
+        t0_ms,
+        now_ms,
+        entry.instant.cumulative_readout,
+    )?;
+    Ok((outcome, t0_ms))
+}
+
+#[derive(Clone)]
+enum PhysicalQueryOutput {
+    State(Vec<(BTreeMap<String, String>, GroupState)>),
+    Value(Vec<(BTreeMap<String, String>, SummaryValue)>),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum PhysicalNodeError {
+    #[error("materialization/store operation failed: {0:?}")]
+    Store(SummaryExecutorError),
+    #[error("node expected summary state input")]
+    ExpectedState,
+    #[error("physical fallback requested: {0}")]
+    Fallback(String),
+}
+
+struct PhysicalQueryRuntime<'a> {
+    context: QueryExecutionContext<'a>,
+}
+
+impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
+    type Output = PhysicalQueryOutput;
+    type Error = PhysicalNodeError;
+
+    fn execute_node(
+        &self,
+        _id: QueryNodeId,
+        node: &QueryPlanNode,
+        inputs: &[Self::Output],
+    ) -> Result<Self::Output, Self::Error> {
+        match node {
+            QueryPlanNode::ReadMaterialization { binding } => {
+                let groups = self
+                    .context
+                    .read_bound_materialization(binding)
+                    .map_err(PhysicalNodeError::Store)?;
+                Ok(PhysicalQueryOutput::State(groups))
+            }
+            QueryPlanNode::SummaryEstimate { query, .. } => {
+                let [PhysicalQueryOutput::State(groups)] = inputs else {
+                    return Err(PhysicalNodeError::ExpectedState);
+                };
+                let query: planner_types::post_asap::SketchQuery = query.clone().into();
+                groups
+                    .iter()
+                    .map(|(key, state)| {
+                        self.context
+                            .readout_bound(state, &query)
+                            .map(|value| (key.clone(), value))
+                            .map_err(PhysicalNodeError::Store)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(PhysicalQueryOutput::Value)
+            }
+            QueryPlanNode::SummaryMerge { .. } => {
+                let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<GroupState>> =
+                    BTreeMap::new();
+                for input in inputs {
+                    let PhysicalQueryOutput::State(groups) = input else {
+                        return Err(PhysicalNodeError::ExpectedState);
+                    };
+                    for (key, state) in groups {
+                        by_group.entry(key.clone()).or_default().push(state.clone());
+                    }
+                }
+                if by_group.is_empty() {
+                    return Err(PhysicalNodeError::ExpectedState);
+                }
+                by_group
+                    .into_iter()
+                    .map(|(key, states)| {
+                        self.context
+                            .merge_bound_states(states)
+                            .map(|state| (key, state))
+                            .map_err(PhysicalNodeError::Store)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(PhysicalQueryOutput::State)
+            }
+            QueryPlanNode::ExactFallback { reason } => {
+                Err(PhysicalNodeError::Fallback(reason.clone()))
+            }
+        }
+    }
+}
+
+fn execute_physical_query_plan(
+    index: &SketchStore,
+    entry: &control_plane::query_plan::QueryPlanEntry,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    let runtime = PhysicalQueryRuntime {
+        context: QueryExecutionContext {
+            index,
+            t0_ms,
+            t1_ms,
+            is_cumulative,
+            allowed_materializations: None,
+        },
+    };
+    let output = physical_dag::execute(entry, &runtime)
+        .map_err(|error| LoweringSkip::ExecuteFailed(error.to_string()))?;
+    match output {
+        PhysicalQueryOutput::Value(values) => {
+            let mut coverage = None;
+            let mut series = Vec::new();
+            for (group_key, value) in &values {
+                fold_coverage(&mut coverage, value.coverage());
+                series.extend(summary_value_to_series(group_key, value));
+            }
+            Ok(PostAsapReadoutOutcome { series, coverage })
+        }
+        PhysicalQueryOutput::State(groups) => {
+            let mut coverage = None;
+            let mut series = Vec::new();
+            for (group_key, state) in &groups {
+                fold_coverage(&mut coverage, state.exact_coverage());
+                if let Some(value) = state.exact_value(&None) {
+                    series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
+                }
+            }
+            Ok(PostAsapReadoutOutcome { series, coverage })
+        }
+    }
 }
 
 /// Plan and execute an instant query without consulting the legacy candidate
@@ -243,7 +406,7 @@ mod tests {
             first_seen_unix_ms: 0,
             retired_at_ms: None,
             expires_at_ms: None,
-            policy_fp: asap_types::PolicyFingerprint::UNSET,
+            policy_fp: asap_types::PolicyFingerprint(123),
         });
         use asap_sketchlib::{HllSketch, HllVariant, MessagePackCodec};
         let mut sk = HllSketch::new(HllVariant::Regular, 14);
@@ -302,6 +465,40 @@ mod tests {
             },
         );
         idx
+    }
+
+    #[test]
+    fn formal_query_plan_executes_only_its_bound_policy() {
+        let idx = SketchStore::new();
+        register_hll(&idx, 1, "api", &["a", "b"]);
+        register_hll(&idx, 2, "worker", &["b", "c"]);
+        let node = plan_promql_to_post_asap(&idx, "count(unique_users)", accuracy(), None)
+            .expect("compile-stage fixture");
+        let canonical = control_plane::query_plan::canonical_promql("count(unique_users)").unwrap();
+        let entry = control_plane::query_plan::QueryPlanEntry::compile_bound(
+            "q-cardinality".into(),
+            canonical,
+            &node,
+            control_plane::query_plan::InstantExecution {
+                lookback_ms: 60_000,
+                full_history: false,
+                cumulative_readout: true,
+            },
+            control_plane::query_plan::FallbackPolicy::ExactBackend,
+            |_node, _family| {
+                Ok(control_plane::query_plan::MaterializationBinding {
+                    materialization: asap_types::PolicyFingerprint(123),
+                    metric: "unique_users".into(),
+                    sid_grouping: vec!["service".into()],
+                    output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
+                    window_ms: 60_000,
+                })
+            },
+        )
+        .unwrap();
+        let result = execute_query_plan_readout(&idx, &entry, 1_000, 2_000, true)
+            .expect("execute formal QueryPlan");
+        assert!(!result.series.is_empty());
     }
 
     #[test]

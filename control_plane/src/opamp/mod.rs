@@ -1000,6 +1000,11 @@ mod tests {
                 parameters: serde_json::json!({"precision": 14}),
                 group_by: vec!["service".into()],
                 window_secs: 60,
+                abstract_window_framework:
+                    planner_types::post_asap::SummaryWindowFramework::Tumbling,
+                window_implementation_id: "collector-tumbling-v1".into(),
+                pane_secs: 60,
+                state_layout: "anchored-pane-v1".into(),
                 evidence_source: None,
                 lifecycle: crate::physical::compiler::CollectorLifecycle {
                     kind: "continuously_maintained".into(),

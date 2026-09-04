@@ -22,7 +22,8 @@ use control_plane::types_v2::AccuracyTarget;
 
 use crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip;
 use crate::query_engines::asap_query_engine::post_asap_readout::{
-    execute_post_asap_instant, execute_post_asap_readout,
+    execute_post_asap_instant, execute_post_asap_readout, execute_query_plan_instant,
+    execute_query_plan_readout,
 };
 use crate::storage_engines::sketch_db::index::SketchStore;
 use crate::storage_engines::sketch_db::query::ASAPTierResult;
@@ -166,6 +167,41 @@ pub fn serve_instant_from_summary_executor(
     }
     let (outcome, t0_ms) =
         execute_post_asap_instant(index, query, now_ms, live_accuracy(), backend_plan)?;
+    Ok((
+        ASAPTierResult {
+            series: outcome.series,
+            coverage: outcome.coverage,
+        },
+        t0_ms,
+    ))
+}
+
+pub fn serve_from_query_plan(
+    index: &SketchStore,
+    entry: &control_plane::query_plan::QueryPlanEntry,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+) -> Result<ASAPTierResult, LoweringSkip> {
+    if !summary_executor_live_enabled() {
+        return Err(LoweringSkip::Disabled);
+    }
+    let outcome = execute_query_plan_readout(index, entry, t0_ms, t1_ms, is_cumulative)?;
+    Ok(ASAPTierResult {
+        series: outcome.series,
+        coverage: outcome.coverage,
+    })
+}
+
+pub fn serve_instant_from_query_plan(
+    index: &SketchStore,
+    entry: &control_plane::query_plan::QueryPlanEntry,
+    now_ms: u64,
+) -> Result<(ASAPTierResult, u64), LoweringSkip> {
+    if !summary_executor_live_enabled() {
+        return Err(LoweringSkip::Disabled);
+    }
+    let (outcome, t0_ms) = execute_query_plan_instant(index, entry, now_ms)?;
     Ok((
         ASAPTierResult {
             series: outcome.series,

@@ -240,10 +240,24 @@ async fn push_documents_coupled(
             return (false, false, 0);
         }
     };
+    // The compatibility emitter has no Planner-selected query catalog.  It
+    // may still install producer/storage state, but publishes an empty
+    // QueryPlan so every serving request fails closed to the exact tier.
+    let query_plan = crate::query_plan::QueryPlan {
+        plan_id: crate::backend_plan::BackendPlan::decode(&plan_bytes)
+            .map(|plan| plan.plan_id)
+            .unwrap_or_default(),
+        entries: Default::default(),
+    };
 
     for attempt in 1..=RETRY_MAX_ATTEMPTS {
         match client
-            .post_physical_plan_typed(precompute_plan, plan_bytes.clone(), Some(routing.clone()))
+            .post_physical_plan_typed(
+                precompute_plan,
+                plan_bytes.clone(),
+                &query_plan,
+                Some(routing.clone()),
+            )
             .await
         {
             Ok(()) => return (true, true, attempt),
