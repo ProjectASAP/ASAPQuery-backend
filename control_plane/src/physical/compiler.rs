@@ -618,6 +618,19 @@ pub struct PhysicalPlan {
     pub transmission_plan: TransmissionPlan,
     pub backend_plan: BackendPlan,
     pub query_plan: QueryPlan,
+    /// Lifecycle component only, not a complete physical-plan comparison.
+    pub lifecycle_estimates: Vec<MaterializationLifecycleEstimate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MaterializationLifecycleEstimate {
+    pub materialization: asap_types::PolicyFingerprint,
+    pub consumer_query_ids: Vec<String>,
+    pub window_implementation_id: String,
+    pub horizon_seconds: f64,
+    pub expected_reads: f64,
+    pub expected_updates: f64,
+    pub lifecycle_cost: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1672,6 +1685,8 @@ impl PhysicalCompiler {
         // the planner DAG node identity across the workload; serving never scans
         // BackendPlan candidates to rediscover this decision.
         let mut node_bindings = HashMap::<usize, asap_types::PolicyFingerprint>::new();
+        let consumers = materialization_consumers(&request.queries, environment.target)?;
+        let mut lifecycle_estimates = BTreeMap::new();
 
         for query in &request.queries {
             let evidence = request.evidence.get(&query.query_id);
@@ -1725,16 +1740,6 @@ impl PhysicalCompiler {
             if selected.is_empty() {
                 continue;
             }
-            let planner_selection = select_lifecycle(query, &node, &model, &environment)?;
-            let window_implementation = query
-                .window_implementations
-                .iter()
-                .filter(|candidate| candidate.framework == planner_selection.window_framework)
-                .min_by(|left, right| left.cost.weighted_cost.total_cmp(&right.cost.weighted_cost))
-                .ok_or_else(|| CompileError::Lifecycle {
-                    query_id: query.query_id.clone(),
-                    reason: "Planner selected a window framework without a retained concrete implementation".into(),
-                })?;
             match &query.source {
                 Source::TimeSeries { .. } => {}
                 Source::Table { .. } => {
@@ -1755,26 +1760,49 @@ impl PhysicalCompiler {
                     SummaryFamilyType::ExactAggregate(kind, _) => {
                         format!("{kind:?}").to_ascii_lowercase()
                     }
-                    _ => selected.algorithm,
+                    _ => selected.algorithm.clone(),
                 };
-                let aggregation = BackendAggregation {
-                    aggregation_id: aggregation_id.clone(),
-                    metric_name: metric.clone(),
-                    family: physical_family,
-                    window_secs: query.window_secs,
-                    spatial_filter: String::new(),
-                    grouping: query.group_by.clone(),
-                    item_label: None,
-                    aggregation_input: match environment.target {
-                        PhysicalDeploymentTarget::DistributedCollectors => {
-                            AggregationInput::SketchEnvelope
-                        }
-                        PhysicalDeploymentTarget::BackendLocalRemoteWrite => AggregationInput::Raw,
-                    },
-                };
+                let aggregation = physical_aggregation(
+                    query,
+                    &selected,
+                    aggregation_id.clone(),
+                    environment.target,
+                );
                 let precompute_materialization =
                     backend_plan::aggregation_config_for_materialization(&aggregation)?;
                 let materialization = precompute_materialization.policy_fingerprint();
+                let state_consumers = consumers[&materialization]
+                    .iter()
+                    .map(|index| &request.queries[*index])
+                    .collect::<Vec<_>>();
+                let planner_selection = select_lifecycle(
+                    query,
+                    &selected.node,
+                    &model,
+                    &environment,
+                    &state_consumers,
+                )?;
+                let window_implementation = query.window_implementations.iter()
+                    .filter(|candidate| candidate.framework == planner_selection.window_framework)
+                    .min_by(|left, right| left.cost.weighted_cost.total_cmp(&right.cost.weighted_cost))
+                    .ok_or_else(|| CompileError::Lifecycle {
+                        query_id: query.query_id.clone(),
+                        reason: "Planner selected a window framework without a retained concrete implementation".into(),
+                    })?;
+                lifecycle_estimates
+                    .entry(materialization)
+                    .or_insert_with(|| MaterializationLifecycleEstimate {
+                        materialization,
+                        consumer_query_ids: state_consumers
+                            .iter()
+                            .map(|query| query.query_id.clone())
+                            .collect(),
+                        window_implementation_id: window_implementation.implementation_id.clone(),
+                        horizon_seconds: query.lifecycle.horizon_seconds,
+                        expected_reads: planner_selection.expected_reads,
+                        expected_updates: planner_selection.expected_updates,
+                        lifecycle_cost: planner_selection.lifecycle_cost,
+                    });
                 let binding_key = selected.node_identity;
                 if let Some(existing) = node_bindings.insert(binding_key, materialization) {
                     if existing != materialization {
@@ -2011,6 +2039,7 @@ impl PhysicalCompiler {
             transmission_plan,
             backend_plan,
             query_plan,
+            lifecycle_estimates: lifecycle_estimates.into_values().collect(),
         })
     }
 }
@@ -2274,6 +2303,9 @@ fn validate_window_implementations(
 struct PlannerPhysicalSelection {
     lifecycle: CollectorLifecycle,
     window_framework: SummaryWindowFramework,
+    expected_reads: f64,
+    expected_updates: f64,
+    lifecycle_cost: f64,
 }
 
 fn select_lifecycle(
@@ -2281,28 +2313,49 @@ fn select_lifecycle(
     node: &SummaryNode,
     model: &ControlPlaneCostModel,
     environment: &DeploymentEnvironment,
+    consumers: &[&PlanningQuery],
 ) -> Result<PlannerPhysicalSelection, CompileError> {
+    // Current lifecycle evidence is per producer with one unit read cost.
+    // Conflicting source/rate/horizon/cost snapshots cannot be averaged into
+    // invented evidence. Only recurrence may differ between consumers.
+    let mut common = query.lifecycle.clone();
+    common.evaluation_interval_ms = 0;
+    for consumer in consumers {
+        let mut input = consumer.lifecycle.clone();
+        input.evaluation_interval_ms = 0;
+        if input != common {
+            return Err(CompileError::Lifecycle {
+                query_id: consumer.query_id.clone(),
+                reason: "shared producer consumers have conflicting lifecycle evidence".into(),
+            });
+        }
+    }
     let workload = QueryWorkload {
         language: QueryLanguage::PromQL,
         query_batch: None,
-        repeating_queries: Some(vec![RepeatingEntry {
-            query: Query(query.query_id.clone()),
-            demand: RepeatedDemand::FixedInterval(RepetitionInterval(
-                query.lifecycle.evaluation_interval_ms,
-            )),
-            requirements: QueryRequirements {
-                accuracy: AccuracyRequirement::Explicit(query.accuracy.clone()),
-                ..QueryRequirements::default()
-            },
-            predictability: Predictability::Predictable { known_at: None },
-            time_selection: TimeSelection {
-                // Collector windows are retired as whole states. They do not
-                // claim deletion support for moving-window retractions.
-                scope: QueryTimeScope::Unknown,
-                lookback: Some(DurationMs(query.window_secs.saturating_mul(1_000))),
-                as_of: None,
-            },
-        }]),
+        repeating_queries: Some(
+            consumers
+                .iter()
+                .map(|query| RepeatingEntry {
+                    query: Query(query.query_id.clone()),
+                    demand: RepeatedDemand::FixedInterval(RepetitionInterval(
+                        query.lifecycle.evaluation_interval_ms,
+                    )),
+                    requirements: QueryRequirements {
+                        accuracy: AccuracyRequirement::Explicit(query.accuracy.clone()),
+                        ..QueryRequirements::default()
+                    },
+                    predictability: Predictability::Predictable { known_at: None },
+                    time_selection: TimeSelection {
+                        // Collector windows are retired as whole states. They do not
+                        // claim deletion support for moving-window retractions.
+                        scope: QueryTimeScope::Unknown,
+                        lookback: Some(DurationMs(query.window_secs.saturating_mul(1_000))),
+                        as_of: None,
+                    },
+                })
+                .collect(),
+        ),
         data_workload: Some(DataWorkload {
             arrival: DataArrival::ContinuouslyIngesting,
             ingestion_rate: Evidence {
@@ -2316,7 +2369,7 @@ fn select_lifecycle(
     };
     let plan = plan_summary_maintenance_lifecycles(
         Rc::new(node.clone()),
-        WorkloadDemand::new(&workload, &[0]),
+        WorkloadDemand::new(&workload, &(0..consumers.len()).collect::<Vec<_>>()),
         environment.observed_at_unix_ms,
         Some(Horizon(query.lifecycle.horizon_seconds)),
         SummaryMaintenanceLifecycleCapabilities {
@@ -2348,6 +2401,32 @@ fn select_lifecycle(
             reason: "latest ASAPPlanner selected no window framework from the supplied physical evidence".into(),
         })?;
     Ok(PlannerPhysicalSelection {
+        expected_reads: plan.expected_reads.ok_or_else(|| CompileError::Lifecycle {
+            query_id: query.query_id.clone(),
+            reason: "missing joint read demand".into(),
+        })?,
+        expected_updates: plan
+            .update_rate
+            .ok_or_else(|| CompileError::Lifecycle {
+                query_id: query.query_id.clone(),
+                reason: "missing source update demand".into(),
+            })?
+            .0
+            * query.lifecycle.horizon_seconds,
+        lifecycle_cost: plan.deployments[0]
+            .alternatives
+            .iter()
+            .find(|alternative| {
+                alternative.rejection.is_none()
+                    && alternative.summary_maintenance_lifecycle
+                        == guarantee.summary_maintenance_lifecycle
+            })
+            .and_then(|alternative| alternative.total_cost)
+            .ok_or_else(|| CompileError::Lifecycle {
+                query_id: query.query_id.clone(),
+                reason: "missing selected lifecycle cost".into(),
+            })?
+            .0,
         lifecycle: CollectorLifecycle {
             kind: match guarantee.summary_maintenance_lifecycle {
                 SummaryMaintenanceLifecycle::Ephemeral => "ephemeral",
@@ -2379,12 +2458,59 @@ fn select_lifecycle(
 }
 
 struct SelectedMaterialization {
+    node: Rc<SummaryNode>,
     node_identity: usize,
     metric: String,
     family: SummaryFamilyType,
     readout: Option<SketchQuery>,
     algorithm: String,
     parameters: Value,
+}
+
+fn physical_aggregation(
+    query: &PlanningQuery,
+    selected: &SelectedMaterialization,
+    aggregation_id: String,
+    target: PhysicalDeploymentTarget,
+) -> BackendAggregation {
+    BackendAggregation {
+        aggregation_id,
+        metric_name: selected.metric.clone(),
+        family: physical_materialization_family(&selected.family),
+        window_secs: query.window_secs,
+        spatial_filter: String::new(),
+        grouping: query.group_by.clone(),
+        item_label: None,
+        aggregation_input: match target {
+            PhysicalDeploymentTarget::DistributedCollectors => AggregationInput::SketchEnvelope,
+            PhysicalDeploymentTarget::BackendLocalRemoteWrite => AggregationInput::Raw,
+        },
+    }
+}
+
+fn materialization_consumers(
+    queries: &[PlanningQuery],
+    target: PhysicalDeploymentTarget,
+) -> Result<BTreeMap<asap_types::PolicyFingerprint, BTreeSet<usize>>, CompileError> {
+    let mut consumers = BTreeMap::<_, BTreeSet<_>>::new();
+    for (index, query) in queries.iter().enumerate() {
+        let states = collect_selected_materializations(&query.post_asap).map_err(|reason| {
+            CompileError::Query {
+                query_id: query.query_id.clone(),
+                reason,
+            }
+        })?;
+        for state in states {
+            let config = backend_plan::aggregation_config_for_materialization(
+                &physical_aggregation(query, &state, query.query_id.clone(), target),
+            )?;
+            consumers
+                .entry(config.policy_fingerprint())
+                .or_default()
+                .insert(index);
+        }
+    }
+    Ok(consumers)
 }
 
 /// Collect every executable materialization leaf in the selected post-ASAP
@@ -2443,6 +2569,7 @@ fn collect_selected_materializations(
                         "SummaryAgg has no unique time-series source in post-ASAP IR".to_string()
                     })?;
                     selected.push(SelectedMaterialization {
+                        node: Rc::clone(node),
                         node_identity: Rc::as_ptr(node) as usize,
                         metric,
                         family: SummaryFamilyType::Sketch(
@@ -2463,6 +2590,7 @@ fn collect_selected_materializations(
                     "SummaryAgg has no unique time-series source in post-ASAP IR".to_string()
                 })?;
                 selected.push(SelectedMaterialization {
+                    node: Rc::clone(node),
                     node_identity: Rc::as_ptr(node) as usize,
                     metric,
                     family: SummaryFamilyType::ExactAggregate(kind.clone(), params.clone()),
@@ -2682,6 +2810,55 @@ mod tests {
     fn shared_selection_rejects_incomplete_root_mapping() {
         let mut workload = request("q", "quantile_over_time(0.9, m[1m])");
         assert!(select_workload_roots(&mut workload.queries, vec![], &workload.evidence).is_err());
+    }
+
+    // Adding another readout adds recurring reads, not another update stream.
+    #[test]
+    fn joint_lifecycle_charges_shared_updates_once() {
+        let baseline = PhysicalCompiler
+            .compile(
+                request("q90", "quantile_over_time(0.9, m[1m])"),
+                environment(10000),
+            )
+            .unwrap();
+        let mut workload = request("q90", "quantile_over_time(0.9, m[1m])");
+        let mut second = request("q99", "quantile_over_time(0.99, m[1m])")
+            .queries
+            .remove(0);
+        second.lifecycle.evaluation_interval_ms = 20000;
+        workload.queries.push(second);
+        let shared = PhysicalCompiler
+            .compile(workload, environment(10000))
+            .unwrap();
+        assert_eq!(shared.lifecycle_estimates.len(), 1);
+        let estimate = &shared.lifecycle_estimates[0];
+        assert_eq!(estimate.consumer_query_ids, vec!["q90", "q99"]);
+        assert_eq!(estimate.expected_reads, 45.0);
+        assert_eq!(estimate.expected_updates, 30000.0);
+        assert!((estimate.lifecycle_cost - 45.8).abs() < 1e-9);
+        assert_eq!(
+            estimate.expected_updates,
+            baseline.lifecycle_estimates[0].expected_updates
+        );
+        assert!(
+            (estimate.lifecycle_cost - baseline.lifecycle_estimates[0].lifecycle_cost - 1.5).abs()
+                < 1e-9
+        );
+    }
+
+    // Unknown joint provenance cannot be replaced by whichever root came first.
+    #[test]
+    fn shared_lifecycle_rejects_conflicting_source_evidence() {
+        let mut workload = request("q90", "quantile_over_time(0.9, m[1m])");
+        let mut second = request("q99", "quantile_over_time(0.99, m[1m])")
+            .queries
+            .remove(0);
+        second.lifecycle.ingestion_rate_per_second = 200.0;
+        workload.queries.push(second);
+        assert!(matches!(
+            PhysicalCompiler.compile(workload, environment(10000)),
+            Err(CompileError::Lifecycle { .. })
+        ));
     }
 
     #[test]
