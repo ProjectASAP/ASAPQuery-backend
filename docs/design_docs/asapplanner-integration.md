@@ -276,6 +276,9 @@ rules. No dependency on DQC is needed to reuse strategies contributed by it.
 
 ## High-level migration
 
+See the [migration delivery plan](asapplanner-migration-plan.md) for PR-sized
+implementation slices, dependencies, regression fixtures and completion gates.
+
 | Milestone | System outcome | Acceptance |
 | --- | --- | --- |
 | 1. Audit the shared contract and entry points | Current canonical compilation and compatibility paths have explicit ownership | Document supported operators, sharing scope, profile limits and true IR gaps |
@@ -302,4 +305,3 @@ backend's scoped consolidation through steps 1–6.
 - [Backend plan runtime](../developer_docs/query-engine/backend-plan-runtime.md)
 - [ASAPQuery compatibility profile](asapquery-compatibility-profile.md)
 - [Runtime accuracy feedback](../developer_docs/control-plane/runtime-accuracy-feedback.md)
-
