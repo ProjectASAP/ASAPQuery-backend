@@ -505,6 +505,11 @@ pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
             ) && operator.vector_match.is_none()
                 && exact_value_executable(lhs)
                 && exact_value_executable(rhs)
+                && value_grouping(node).is_ok()
+                && match (value_source(lhs), value_source(rhs)) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => true,
+                }
         }
         SummaryExpr::SummaryAgg {
             family: SummaryFamilyType::ExactAggregate(kind, _),
@@ -513,14 +518,56 @@ pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
             ..
         } => {
             if matches!(child.expr, SummaryExpr::KeepPreAsap(_)) {
-                matches!(kind, ExactKind::Sum | ExactKind::Increase | ExactKind::Rate)
-                    || (matches!((kind, reduction), (ExactKind::Count, Reduction::PerEntity))
-                        && matches!(&child.expr, SummaryExpr::KeepPreAsap(expr) if matches!(expr.as_ref(), planner_types::pre_asap::QueryExpr::TimeRange { .. })))
+                matches!(&child.expr, SummaryExpr::KeepPreAsap(expr) if matches!(expr.as_ref(), planner_types::pre_asap::QueryExpr::TimeRange { child, .. } if matches!(child.as_ref(), planner_types::pre_asap::QueryExpr::Scan { .. })))
+                    && matches!(reduction, Reduction::PerEntity)
+                    && matches!(
+                        kind,
+                        ExactKind::Sum | ExactKind::Count | ExactKind::Increase | ExactKind::Rate
+                    )
             } else {
-                matches!(kind, ExactKind::Sum) && exact_value_executable(child)
+                // Raw producer grouping may move through additive reductions,
+                // but never through division or other value arithmetic.
+                matches!(kind, ExactKind::Sum)
+                    && matches!(child.expr, SummaryExpr::SummaryAgg { .. })
+                    && exact_value_executable(child)
             }
         }
         _ => false,
+    }
+}
+
+fn value_grouping(node: &SummaryNode) -> Result<Option<PhysicalGrouping>, QueryPlanError> {
+    match &node.expr {
+        SummaryExpr::KeepPreAsap(_) => Ok(None),
+        SummaryExpr::SummaryAgg {
+            reduction, child, ..
+        } => physical_grouping(reduction, child).map(Some),
+        SummaryExpr::BinaryOp { lhs, rhs, .. } => {
+            let left = value_grouping(lhs)?;
+            let right = value_grouping(rhs)?;
+            match (left, right) {
+                (Some(left), Some(right)) if left != right => Err(QueryPlanError::Invalid(
+                    "arithmetic operands require different producer grouping contracts".into(),
+                )),
+                (left, right) => Ok(left.or(right)),
+            }
+        }
+        _ => Err(QueryPlanError::Invalid(
+            "unsupported exact value grouping".into(),
+        )),
+    }
+}
+
+// The MVP QueryPlan evaluates all operands over one interval. Different
+// selectors/windows need per-operand time binding before they can be warm.
+fn value_source(node: &SummaryNode) -> Option<&planner_types::pre_asap::QueryExpr> {
+    match &node.expr {
+        SummaryExpr::SummaryAgg { child, .. } => match &child.expr {
+            SummaryExpr::KeepPreAsap(expr) => Some(expr),
+            _ => value_source(child),
+        },
+        SummaryExpr::BinaryOp { lhs, rhs, .. } => value_source(lhs).or_else(|| value_source(rhs)),
+        _ => None,
     }
 }
 
