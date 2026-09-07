@@ -233,6 +233,9 @@ impl GroupState {
             return None;
         };
         let stat = match (readout, agg_type) {
+            (control_plane::query_plan::ExactReadout::Count, AggregationType::Sum) => {
+                asap_types::Statistic::Count
+            }
             (
                 control_plane::query_plan::ExactReadout::Sum,
                 AggregationType::Sum | AggregationType::MultipleSum,
@@ -260,7 +263,11 @@ impl GroupState {
             ("range_start_ms".to_string(), range_start_ms.to_string()),
             ("range_end_ms".to_string(), range_end_ms.to_string()),
         ]);
-        merged?.query_statistic(stat, key, &query_kwargs).ok()
+        let merged = merged?;
+        if readout == control_plane::query_plan::ExactReadout::Count {
+            return merged.aux_stats().count.map(|count| count as f64);
+        }
+        merged.query_statistic(stat, key, &query_kwargs).ok()
     }
 
     /// Coverage analog of `exact_value` — folds `(min_window_end_ms,

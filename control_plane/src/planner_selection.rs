@@ -159,7 +159,13 @@ pub fn select_workload(
     accuracy: AccuracyTarget,
     cost_model: &dyn CostModel,
 ) -> Result<Vec<(usize, Rc<SummaryNode>)>, SelectionError> {
-    let strategies = asap_aware_mapping::default_strategies_with(cost_model);
+    // Canonical CSE still runs inside search_workload_with_targets. Do not
+    // offer CSE's per-invocation recompute alternative: this runtime currently
+    // provisions continuously maintained, content-addressed state only.
+    let strategies: Vec<Box<dyn ReplacementStrategy + '_>> = vec![
+        Box::new(SketchAlgorithmStrategy::new(cost_model)),
+        Box::new(asap_aware_mapping::SemanticEquivalentRewriteStrategy),
+    ];
     let space = asap_aware_mapping::search_workload_with_targets(
         roots
             .into_iter()

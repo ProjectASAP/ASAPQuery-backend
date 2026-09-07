@@ -137,6 +137,9 @@ impl QueryPlanEntry {
             )));
         }
         for (id, node) in &self.nodes {
+            if matches!(node, QueryPlanNode::Scalar { value } if !value.is_finite()) {
+                return Err(QueryPlanError::Invalid("non-finite scalar constant".into()));
+            }
             for input in node.inputs() {
                 if !self.nodes.contains_key(input) {
                     return Err(QueryPlanError::Invalid(format!(
@@ -234,6 +237,17 @@ pub enum PhysicalGrouping {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    Scalar {
+        value: f64,
+    },
+    Binary {
+        inputs: [QueryNodeId; 2],
+        operator: planner_types::pre_asap::ArithmeticOpKind,
+    },
+    ReduceSum {
+        input: QueryNodeId,
+        grouping: PhysicalGrouping,
+    },
     ReadMaterialization {
         binding: MaterializationBinding,
     },
@@ -256,10 +270,13 @@ pub enum QueryPlanNode {
 impl QueryPlanNode {
     pub fn inputs(&self) -> &[QueryNodeId] {
         match self {
-            Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => &[],
-            Self::SummaryEstimate { input, .. } | Self::ExactReadout { input, .. } => {
-                std::slice::from_ref(input)
+            Self::Scalar { .. } | Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => {
+                &[]
             }
+            Self::Binary { inputs, .. } => inputs,
+            Self::ReduceSum { input, .. }
+            | Self::SummaryEstimate { input, .. }
+            | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
             Self::SummaryMerge { inputs } => inputs,
         }
     }
@@ -269,6 +286,7 @@ impl QueryPlanNode {
 #[serde(rename_all = "snake_case")]
 pub enum ExactReadout {
     Sum,
+    Count,
     Increase,
     Rate,
 }
@@ -331,6 +349,49 @@ where
         self.next_id += 1;
         self.seen.insert(identity, id);
         let physical = match &node.expr {
+            SummaryExpr::BinaryOp { lhs, rhs, operator } if exact_value_executable(node) => {
+                let planner_types::pre_asap::BinaryOpKind::Arithmetic(operator) = &operator.kind
+                else {
+                    unreachable!()
+                };
+                QueryPlanNode::Binary {
+                    inputs: [self.lower(lhs)?, self.lower(rhs)?],
+                    operator: operator.clone(),
+                }
+            }
+            SummaryExpr::KeepPreAsap(expr) if scalar_literal(expr).is_some() => {
+                QueryPlanNode::Scalar {
+                    value: scalar_literal(expr).unwrap(),
+                }
+            }
+            SummaryExpr::SummaryAgg {
+                family:
+                    SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _),
+                child,
+                reduction,
+                ..
+            } if !matches!(child.expr, SummaryExpr::KeepPreAsap(_))
+                && exact_value_executable(node) =>
+            {
+                QueryPlanNode::ReduceSum {
+                    input: self.lower(child)?,
+                    grouping: physical_grouping(reduction, child)?,
+                }
+            }
+            SummaryExpr::SummaryAgg { child, .. }
+                if !matches!(child.expr, SummaryExpr::KeepPreAsap(_)) =>
+            {
+                QueryPlanNode::ExactFallback {
+                    reason: "unsupported exact operation over summary output".into(),
+                }
+            }
+            SummaryExpr::SummaryAgg {
+                family:
+                    SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _),
+                ..
+            } if !exact_value_executable(node) => QueryPlanNode::ExactFallback {
+                reason: "only temporal observation counts are supported".into(),
+            },
             SummaryExpr::BinaryOp { .. } | SummaryExpr::KeepPreAsap(_) => {
                 QueryPlanNode::ExactFallback {
                     reason: "post-ASAP node requires exact execution".into(),
@@ -346,10 +407,16 @@ where
                     let mut binding = (self.bind)(node, family)?;
                     binding.output_grouping = physical_grouping(reduction, child)?;
                     if let Some(readout) = exact_readout(family) {
-                        let input = QueryNodeId(self.next_id);
-                        self.next_id += 1;
-                        self.nodes
-                            .insert(input, QueryPlanNode::ReadMaterialization { binding });
+                        let existing = self.nodes.iter().find_map(|(id, node)| {
+                            matches!(node, QueryPlanNode::ReadMaterialization { binding: other } if other == &binding).then_some(*id)
+                        });
+                        let input = existing.unwrap_or_else(|| {
+                            let input = QueryNodeId(self.next_id);
+                            self.next_id += 1;
+                            self.nodes
+                                .insert(input, QueryPlanNode::ReadMaterialization { binding });
+                            input
+                        });
                         QueryPlanNode::ExactReadout { input, readout }
                     } else {
                         QueryPlanNode::ReadMaterialization { binding }
@@ -399,9 +466,61 @@ fn exact_readout(family: &SummaryFamilyType) -> Option<ExactReadout> {
     use planner_types::post_asap::ExactKind;
     match family {
         SummaryFamilyType::ExactAggregate(ExactKind::Sum, _) => Some(ExactReadout::Sum),
+        SummaryFamilyType::ExactAggregate(ExactKind::Count, _) => Some(ExactReadout::Count),
         SummaryFamilyType::ExactAggregate(ExactKind::Increase, _) => Some(ExactReadout::Increase),
         SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => Some(ExactReadout::Rate),
         _ => None,
+    }
+}
+
+fn scalar_literal(expr: &planner_types::pre_asap::QueryExpr) -> Option<f64> {
+    use planner_types::pre_asap::{QueryExpr, ScalarValue};
+    let value = match expr {
+        QueryExpr::PromqlScalarBridge(child) => return scalar_literal(child),
+        QueryExpr::Literal(ScalarValue::Float64(value)) => *value,
+        QueryExpr::Literal(ScalarValue::Int64(value)) => *value as f64,
+        _ => return None,
+    };
+    value.is_finite().then_some(value)
+}
+
+/// The current exact arithmetic adapter is deliberately narrower than PromQL:
+/// default vector matching, scalar literals and additive temporal readouts.
+/// Unsupported operands make the complete expression fall back.
+pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
+    use planner_types::post_asap::ExactKind;
+    if !node
+        .guarantee
+        .as_ref()
+        .is_some_and(|guarantee| guarantee.is_exact())
+    {
+        return false;
+    }
+    match &node.expr {
+        SummaryExpr::KeepPreAsap(expr) => scalar_literal(expr).is_some(),
+        SummaryExpr::BinaryOp { lhs, rhs, operator } => {
+            matches!(
+                operator.kind,
+                planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
+            ) && operator.vector_match.is_none()
+                && exact_value_executable(lhs)
+                && exact_value_executable(rhs)
+        }
+        SummaryExpr::SummaryAgg {
+            family: SummaryFamilyType::ExactAggregate(kind, _),
+            child,
+            reduction,
+            ..
+        } => {
+            if matches!(child.expr, SummaryExpr::KeepPreAsap(_)) {
+                matches!(kind, ExactKind::Sum | ExactKind::Increase | ExactKind::Rate)
+                    || (matches!((kind, reduction), (ExactKind::Count, Reduction::PerEntity))
+                        && matches!(&child.expr, SummaryExpr::KeepPreAsap(expr) if matches!(expr.as_ref(), planner_types::pre_asap::QueryExpr::TimeRange { .. })))
+            } else {
+                matches!(kind, ExactKind::Sum) && exact_value_executable(child)
+            }
+        }
+        _ => false,
     }
 }
 

@@ -1723,6 +1723,23 @@ impl PhysicalCompiler {
                     query_id: query.query_id.clone(),
                     reason,
                 })?;
+            if environment.target == PhysicalDeploymentTarget::DistributedCollectors
+                && selected.iter().any(|state| {
+                    matches!(
+                        state.family,
+                        SummaryFamilyType::ExactAggregate(
+                            planner_types::post_asap::ExactKind::Count,
+                            _
+                        )
+                    )
+                })
+            {
+                return Err(CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason: "observation-count readout requires the backend-local raw producer"
+                        .into(),
+                });
+            }
             if selected.is_empty() {
                 continue;
             }
@@ -2357,6 +2374,29 @@ fn collect_selected_materializations(
         selected: &mut Vec<SelectedMaterialization>,
     ) -> Result<(), String> {
         match &node.expr {
+            SummaryExpr::BinaryOp { lhs, rhs, .. }
+                if crate::query_plan::exact_value_executable(node) =>
+            {
+                walk(lhs, readout, selected)?;
+                walk(rhs, readout, selected)?;
+            }
+            SummaryExpr::SummaryAgg {
+                child,
+                family:
+                    SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _),
+                ..
+            } if !matches!(child.expr, SummaryExpr::KeepPreAsap(_))
+                && crate::query_plan::exact_value_executable(node) =>
+            {
+                walk(child, readout, selected)?;
+            }
+            SummaryExpr::SummaryAgg { child, .. }
+                if !matches!(child.expr, SummaryExpr::KeepPreAsap(_)) => {}
+            SummaryExpr::SummaryAgg {
+                family:
+                    SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _),
+                ..
+            } if !crate::query_plan::exact_value_executable(node) => {}
             SummaryExpr::SummaryEstimate {
                 summary_input,
                 query,
@@ -2420,6 +2460,14 @@ fn collect_selected_materializations(
 
 fn physical_materialization_family(family: &SummaryFamilyType) -> SummaryFamilyType {
     match family {
+        SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _) => {
+            // The local raw Sum updater retains the observation count alongside
+            // its sum. Both logical states can use this one concrete producer.
+            SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Sum,
+                planner_types::post_asap::ExactParams::Sum,
+            )
+        }
         SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Rate, _) => {
             SummaryFamilyType::ExactAggregate(
                 planner_types::post_asap::ExactKind::Increase,
@@ -2671,6 +2719,41 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn exact_dashboard_binds_sum_and_count_to_one_local_producer() {
+        // Both dashboard roots use one packed raw accumulator, with explicit readouts.
+        let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
+        entries[0].query = Query("sum by (service) (sum_over_time(m[1m]))".into());
+        entries[0].requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        let mut mean = entries[0].clone();
+        mean.query = Query(
+            "sum by (service) (sum_over_time(m[1m])) / sum by (service) (count_over_time(m[1m]))"
+                .into(),
+        );
+        entries.push(mean);
+        let bundle = snapshot.compile().unwrap();
+        assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+        assert_eq!(bundle.query_plan.entries.len(), 2);
+        for entry in bundle.query_plan.entries.values() {
+            assert!(
+                !entry.nodes.values().any(|node| matches!(
+                    node,
+                    crate::query_plan::QueryPlanNode::ExactFallback { .. }
+                )),
+                "{entry:?}"
+            );
+            assert_eq!(entry.materialization_bindings().len(), 1);
+        }
+        assert!(bundle.query_plan.entries.values().any(|entry| entry
+            .nodes
+            .values()
+            .any(|node| matches!(node, crate::query_plan::QueryPlanNode::Binary { .. }))));
     }
 
     #[test]
