@@ -38,7 +38,7 @@ control_plane = { path = "../control_plane" }
 # reduction: Reduction, .. }`) are `pre_asap` types, in the same crate now
 # (not a separate `asap-ir` import). Query serving consumes the compiled
 # QueryPlan; these types are used at physical-plan compilation boundaries.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "d0701dd4d4f0acb267b004c42ba30b2c9547ff7c" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "14a3b53ca9e1436273c3069b0810cb07d5d9287b" }
 
 # Shared external (workspace)
 serde.workspace = true
