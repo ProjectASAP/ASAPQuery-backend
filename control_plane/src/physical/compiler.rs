@@ -42,7 +42,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "cb50219c582d43f53ab77d3a595bd1ea4a9aa119";
+pub const PLANNER_REVISION: &str = "d0701dd4d4f0acb267b004c42ba30b2c9547ff7c";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
@@ -2009,6 +2009,10 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 walk(right, metrics);
             }
             SummaryExpr::SummaryDelete { summary_input, .. } => walk(summary_input, metrics),
+            SummaryExpr::BinaryOp { lhs, rhs, .. } => {
+                walk(lhs, metrics);
+                walk(rhs, metrics);
+            }
         }
     }
     let mut metrics = BTreeSet::new();
@@ -2366,7 +2370,8 @@ fn collect_selected_materializations(
                     parameters: Value::Object(Default::default()),
                 });
             }
-            SummaryExpr::KeepPreAsap(_)
+            SummaryExpr::BinaryOp { .. }
+            | SummaryExpr::KeepPreAsap(_)
             | SummaryExpr::SummaryAgg { .. }
             | SummaryExpr::SummaryJoin { .. }
             | SummaryExpr::SummarySubtract { .. }
