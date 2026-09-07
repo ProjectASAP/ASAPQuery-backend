@@ -8,7 +8,12 @@ Backend-specific implementation design notes are organized by component under
 [`../developer_docs`](../developer_docs/README.md). They explain current Rust
 internals and are subordinate to the shared system contracts.
 
-Backend-specific operating profiles:
+Backend-specific integration proposals and operating profiles:
+
+- [ASAPPlanner integration architecture](asapplanner-integration.md) proposes
+  the Planner/backend responsibility boundary, shared semantic DAG workflow,
+  and high-level consolidation milestones. It complements, rather than
+  duplicates, the canonical cross-component contracts above.
 
 - [ASAPQuery compatibility profile](asapquery-compatibility-profile.md) defines
   the smaller target configuration for Prometheus Remote Write, backend-local
