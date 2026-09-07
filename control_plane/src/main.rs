@@ -797,7 +797,9 @@ fn compile_physical_plan_request(
         });
     }
 
-    if let Err(error) = physical::compiler::select_workload_roots(&mut queries, canonical_roots, &request.evidence) {
+    if let Err(error) =
+        physical::compiler::select_workload_roots(&mut queries, canonical_roots, &request.evidence)
+    {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string()));
     }
 
