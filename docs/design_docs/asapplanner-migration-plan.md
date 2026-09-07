@@ -31,6 +31,17 @@ completion prerequisite.
 
 ## Delivery sequence and dependencies
 
+Implementation tracking:
+
+- Slice A: [PR #513](https://github.com/ProjectASAP/ASAPQuery-backend/pull/513)
+  implements compatible Collector producer deduplication and deployment-contract
+  conflict checks. All 638 control-plane library tests pass. It preserves
+  consumer-sensitive plan identity and rate/increase state compatibility.
+  Runtime update-count and actual Collector-consumption acceptance remain
+  slice E work; declaration-count tests do not complete those gates.
+- Slices B–F remain unimplemented by this migration series. Existing code and
+  overlapping PRs must be reused rather than re-created.
+
 | Slice | Repository | Depends on | Deliverable and acceptance |
 | --- | --- | --- | --- |
 | A. Safe physical state sharing | ASAPQuery-backend | Existing compiler | Deduplicate Collector declarations for compatible state; reject conflicting implementation/layout/lifecycle contracts; keep both query roots bound to one backend state |
@@ -175,4 +186,3 @@ workload-sharing migration is complete.
 The [architecture PR #512](https://github.com/ProjectASAP/ASAPQuery-backend/pull/512)
 tracks the design and this delivery plan. Implementation PRs should report the
 slice they complete, tests actually run, and remaining acceptance gaps.
-
