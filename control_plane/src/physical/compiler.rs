@@ -2829,6 +2829,33 @@ mod tests {
             .any(|node| matches!(node, crate::query_plan::QueryPlanNode::Binary { .. }))));
     }
 
+    // Grouping must not move through non-additive arithmetic during physical
+    // packing: SUM(instance SUM / instance COUNT) is not pooled SUM / COUNT.
+    #[test]
+    fn non_additive_entity_reduction_does_not_bind_pooled_state() {
+        for query in [
+            "sum by (service) (sum_over_time(m[1m]) / count_over_time(m[1m]))",
+            "sum by (service) (sum_over_time(m[1m])) / sum by (region) (count_over_time(m[1m]))",
+            "sum(m) / sum_over_time(m[1m])",
+            "sum_over_time(m[1m]) / count_over_time(m[5m])",
+            "sum_over_time(m[1m] offset 1h) / count_over_time(m[1m] offset 1h)",
+        ] {
+            let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+                "../../../docs/examples/asapquery-planning-snapshot.json"
+            ))
+            .unwrap();
+            let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
+            entries[0].query = Query(query.into());
+            entries[0].requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+            let bundle = snapshot.compile().unwrap();
+            assert!(bundle.precompute_plan.materializations.is_empty());
+            assert!(bundle.query_plan.entries.values().all(|entry| matches!(
+                entry.nodes[&entry.root],
+                crate::query_plan::QueryPlanNode::ExactFallback { .. }
+            )));
+        }
+    }
+
     #[test]
     fn canonical_snapshot_preserves_shared_bindings_after_serialization() {
         // Two different registered readouts survive publication with one state.
