@@ -117,8 +117,21 @@ fn build_workload(
 fn plan_backend_stage_config(
     workload: &QueryWorkload,
 ) -> control_plane::physical::colored_dag::BackendStageConfig {
-    let deployment_expr = control_plane::physical::workload_planner::bind_workload_typed(workload)
-        .expect("bind_workload_typed produced a PhysicalExpr");
+    let deployment_expr = if workload.metric_name == "top_endpoint_qps" {
+        let evidence = control_plane::physical::compiler::TopKMembershipEvidence {
+            selected_lower_bound: 101.0,
+            excluded_upper_bound: 100.0,
+            interval_failure_probability: 0.001,
+            observed_at_unix_ms: 1,
+            source: "self-contained-e2e-fixture".into(),
+        };
+        control_plane::physical::workload_planner::bind_workload_typed_with_topk_evidence(
+            workload, &evidence,
+        )
+    } else {
+        control_plane::physical::workload_planner::bind_workload_typed(workload)
+    }
+    .expect("typed workload binding produced a PhysicalExpr");
     let configs = control_plane::physical::stage_split::split_typed_three_stage(&deployment_expr)
         .expect("split_typed_three_stage produced per-stage configs");
     let mut backend_cfg = configs
