@@ -759,6 +759,7 @@ fn compile_physical_plan_request(
         .unwrap_or_default()
         .as_millis() as u64;
     let mut queries = Vec::with_capacity(request.queries.len());
+    let mut canonical_roots = Vec::with_capacity(request.queries.len());
     for query in request.queries {
         if query.query_id.trim().is_empty()
             || query.metric.trim().is_empty()
@@ -773,15 +774,11 @@ fn compile_physical_plan_request(
             Ok(expr) => expr,
             Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
         };
-        let post_asap = match physical::compiler::select_post_asap(
-            &expr,
-            query.accuracy.clone(),
-            &query.lifecycle,
-            request.evidence.get(&query.query_id),
-        ) {
+        let post_asap = match control_plane::planner_selection::keep_pre_asap(&expr) {
             Ok(plan) => plan,
             Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
         };
+        canonical_roots.push(std::rc::Rc::new(expr));
         queries.push(physical::compiler::PlanningQuery {
             query_id: query.query_id,
             query_string: query.query_string,
@@ -796,6 +793,10 @@ fn compile_physical_plan_request(
             window_implementations: query.window_implementations,
             runtime_policy: query.runtime_policy,
         });
+    }
+
+    if let Err(error) = physical::compiler::select_workload_roots(&mut queries, canonical_roots, &request.evidence) {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string()));
     }
 
     let bundle = match physical::compiler::PhysicalCompiler.compile(

@@ -159,11 +159,32 @@ pub fn select_workload(
     accuracy: AccuracyTarget,
     cost_model: &dyn CostModel,
 ) -> Result<Vec<(usize, Rc<SummaryNode>)>, SelectionError> {
+    select_workload_with_evidence(
+        roots,
+        accuracy,
+        cost_model,
+        &asap_aware_mapping::NoAccuracyEvidence,
+    )
+}
+
+/// The entire cohort uses the same scoped accuracy certificate; callers must
+/// not spread one query's evidence to unrelated workload roots.
+pub fn select_workload_with_evidence(
+    roots: Vec<(usize, Rc<QueryExpr>)>,
+    accuracy: AccuracyTarget,
+    cost_model: &dyn CostModel,
+    evidence: &dyn AccuracyEvidenceProvider,
+) -> Result<Vec<(usize, Rc<SummaryNode>)>, SelectionError> {
     // Canonical CSE still runs inside search_workload_with_targets. Do not
     // offer CSE's per-invocation recompute alternative: this runtime currently
     // provisions continuously maintained, content-addressed state only.
     let strategies: Vec<Box<dyn ReplacementStrategy + '_>> = vec![
-        Box::new(SketchAlgorithmStrategy::new(cost_model)),
+        Box::new(SketchAlgorithmStrategy::with_models_and_evidence(
+            cost_model,
+            &asap_aware_mapping::DefaultAccuracyModel,
+            &asap_aware_mapping::EqualSplitAllocator,
+            evidence,
+        )),
         Box::new(asap_aware_mapping::SemanticEquivalentRewriteStrategy),
     ];
     let space = asap_aware_mapping::search_workload_with_targets(
