@@ -1652,6 +1652,8 @@ impl PhysicalCompiler {
         let mut aggregations = Vec::with_capacity(request.queries.len());
         let mut readouts = Vec::with_capacity(request.queries.len());
         let mut collector_materializations = Vec::with_capacity(request.queries.len());
+        let mut plan_materializations = Vec::with_capacity(request.queries.len());
+        let mut shared_materializations = BTreeMap::new();
         let mut runtime_policies = BTreeMap::new();
         // Binding is established while compiling the physical
         // materializations, then consumed by QueryPlan lowering. The key is
@@ -1717,6 +1719,12 @@ impl PhysicalCompiler {
                 // as Increase. Keep that semantic distinction in QueryPlan,
                 // while the physical store binds both to Increase state.
                 let physical_family = physical_materialization_family(&selected.family);
+                let physical_algorithm = match &physical_family {
+                    SummaryFamilyType::ExactAggregate(kind, _) => {
+                        format!("{kind:?}").to_ascii_lowercase()
+                    }
+                    _ => selected.algorithm,
+                };
                 let aggregation = BackendAggregation {
                     aggregation_id: aggregation_id.clone(),
                     metric_name: metric.clone(),
@@ -1763,11 +1771,11 @@ impl PhysicalCompiler {
                         op: readout,
                     });
                 }
-                collector_materializations.push(CollectorMaterialization {
+                let collector_materialization = CollectorMaterialization {
                     query_id: query.query_id.clone(),
                     materialization,
                     metric: metric.clone(),
-                    algorithm: selected.algorithm,
+                    algorithm: physical_algorithm,
                     parameters: selected.parameters,
                     group_by: query.group_by.clone(),
                     window_secs: query.window_secs,
@@ -1777,11 +1785,32 @@ impl PhysicalCompiler {
                     state_layout: window_implementation.state_layout.clone(),
                     evidence_source: evidence.map(|e| e.source.clone()),
                     lifecycle: planner_selection.lifecycle.clone(),
-                });
+                };
+                // The store fingerprint identifies state, not its concrete
+                // deployment. Consumers may share it only when their selected
+                // implementations agree; otherwise publication would install
+                // conflicting producers for the same state identity.
+                let mut shared_contract = collector_materialization.clone();
+                // Keep every consumer in the existing plan identity even
+                // though the executable producer declaration is deduplicated.
+                plan_materializations.push(collector_materialization.clone());
+                shared_contract.query_id.clear();
+                if let Some(existing) = shared_materializations.get(&materialization) {
+                    if existing != &shared_contract {
+                        return Err(CompileError::Query {
+                            query_id: query.query_id.clone(),
+                            reason: "queries sharing one materialization specify conflicting deployment contracts"
+                                .into(),
+                        });
+                    }
+                } else {
+                    shared_materializations.insert(materialization, shared_contract);
+                    collector_materializations.push(collector_materialization);
+                }
             }
         }
 
-        let plan_id = stable_plan_id(&collector_materializations);
+        let plan_id = stable_plan_id(&plan_materializations);
         let envelope = PlanEnvelope {
             plan_id,
             plan_version: environment.plan_version,
@@ -2480,6 +2509,116 @@ mod tests {
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    #[test]
+    fn shared_materialization_is_emitted_once_for_every_runtime() {
+        for target in [
+            PhysicalDeploymentTarget::DistributedCollectors,
+            PhysicalDeploymentTarget::BackendLocalRemoteWrite,
+        ] {
+            let mut workload = request("q90", "quantile_over_time(0.90, m[1m])");
+            workload
+                .queries
+                .extend(request("q99", "quantile_over_time(0.99, m[1m])").queries);
+            let mut env = environment(10_000);
+            env.target = target;
+            if target == PhysicalDeploymentTarget::BackendLocalRemoteWrite {
+                env.collector_ids.clear();
+            }
+            let bundle = PhysicalCompiler
+                .compile(workload, env)
+                .expect("shared compile");
+            assert_eq!(bundle.query_plan.entries.len(), 2);
+            assert_eq!(bundle.backend_plan.materializations.len(), 1);
+            assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+            assert_eq!(bundle.precompute_plan.schemas.len(), 1);
+            let bindings = bundle
+                .query_plan
+                .entries
+                .values()
+                .map(|entry| entry.materialization_bindings()[0].materialization)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(bindings.len(), 1);
+            for collector in &bundle.collector_plans {
+                assert_eq!(collector.materializations.len(), 1);
+                assert!(bindings.contains(&collector.materializations[0].materialization));
+            }
+        }
+    }
+
+    #[test]
+    fn adding_shared_consumer_changes_plan_identity() {
+        let workload = request("q90", "quantile_over_time(0.90, m[1m])");
+        let one = PhysicalCompiler
+            .compile(workload, environment(10_000))
+            .unwrap();
+        let mut workload = request("q90", "quantile_over_time(0.90, m[1m])");
+        workload
+            .queries
+            .extend(request("q99", "quantile_over_time(0.99, m[1m])").queries);
+        let two = PhysicalCompiler
+            .compile(workload, environment(10_000))
+            .unwrap();
+        assert_ne!(one.envelope.plan_id, two.envelope.plan_id);
+        assert_eq!(two.collector_plans[0].materializations.len(), 1);
+    }
+
+    #[test]
+    fn different_sources_do_not_share_materializations() {
+        let mut workload = request("qm", "quantile_over_time(0.90, m[1m])");
+        let mut other = request("qn", "quantile_over_time(0.90, n[1m])");
+        other.queries[0].source = Source::TimeSeries { metric: "n".into() };
+        workload.queries.extend(other.queries);
+        let bundle = PhysicalCompiler
+            .compile(workload, environment(10_000))
+            .unwrap();
+        assert_eq!(bundle.backend_plan.materializations.len(), 2);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 2);
+        for collector in &bundle.collector_plans {
+            assert_eq!(collector.materializations.len(), 2);
+        }
+    }
+
+    #[test]
+    fn rate_and_increase_share_physical_counter_state() {
+        let mut workload = request("rate", "rate(m[1m])");
+        workload
+            .queries
+            .extend(request("increase", "increase(m[1m])").queries);
+        let bundle = PhysicalCompiler
+            .compile(workload, environment(10_000))
+            .unwrap();
+        assert_eq!(bundle.query_plan.entries.len(), 2);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+        for collector in &bundle.collector_plans {
+            assert_eq!(collector.materializations.len(), 1);
+            assert_eq!(collector.materializations[0].algorithm, "increase");
+        }
+    }
+
+    #[test]
+    fn shared_materialization_rejects_conflicting_deployment_contracts() {
+        for field in ["implementation", "layout"] {
+            let mut workload = request("q90", "quantile_over_time(0.90, m[1m])");
+            let mut other = request("q99", "quantile_over_time(0.99, m[1m])");
+            let implementation = &mut other.queries[0].window_implementations[0];
+            if field == "implementation" {
+                implementation.implementation_id = "another-implementation".into();
+            } else {
+                implementation.state_layout = "another-layout".into();
+            }
+            workload.queries.extend(other.queries);
+            let error = PhysicalCompiler
+                .compile(workload, environment(10_000))
+                .expect_err("conflicting shared state must fail before publication");
+            assert!(
+                error
+                    .to_string()
+                    .contains("conflicting deployment contracts"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
