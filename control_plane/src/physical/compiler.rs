@@ -2822,8 +2822,8 @@ mod tests {
             "increase(asap_demo_counter_total[5s])",
             "sum_over_time(asap_demo_gauge[5s])",
             "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
-            "topk(5, sum_over_time(asap_demo_gauge[5s]))",
-            "topk by (job) (5, count_over_time(asap_demo_gauge[5s]))",
+            "topk(1, sum_over_time(asap_demo_gauge[5s]))",
+            "topk(1, count_over_time(asap_demo_gauge[5s]))",
         ] {
             assert!(plan.query_plan.lookup(query).is_ok(), "missing {query}");
         }

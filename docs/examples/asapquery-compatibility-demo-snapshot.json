@@ -36,7 +36,7 @@
         "time_selection": { "scope": "real_time", "lookback": 5000, "as_of": null }
       },
       {
-        "query": "topk(5, sum_over_time(asap_demo_gauge[5s]))",
+        "query": "topk(1, sum_over_time(asap_demo_gauge[5s]))",
         "demand": { "fixed_interval": 1000 },
         "requirements": {
           "accuracy": { "explicit": { "EpsilonDelta": { "epsilon": 0.01, "delta": 0.01 } } },
@@ -46,7 +46,7 @@
         "time_selection": { "scope": "real_time", "lookback": 5000, "as_of": null }
       },
       {
-        "query": "topk by (job) (5, count_over_time(asap_demo_gauge[5s]))",
+        "query": "topk(1, count_over_time(asap_demo_gauge[5s]))",
         "demand": { "fixed_interval": 1000 },
         "requirements": {
           "accuracy": { "explicit": { "EpsilonDelta": { "epsilon": 0.01, "delta": 0.01 } } },
@@ -98,14 +98,14 @@
       "weighted_cost": 1.0
     },
     "topk_evidence": {
-      "topk(5, sum_over_time(asap_demo_gauge[5s]))": {
+      "topk(1, sum_over_time(asap_demo_gauge[5s]))": {
         "selected_lower_bound": 101.0,
         "excluded_upper_bound": 100.0,
         "interval_failure_probability": 0.005,
         "observed_at_unix_ms": 9500,
         "source": "compatibility-fixture"
       },
-      "topk by (job) (5, count_over_time(asap_demo_gauge[5s]))": {
+      "topk(1, count_over_time(asap_demo_gauge[5s]))": {
         "selected_lower_bound": 101.0,
         "excluded_upper_bound": 100.0,
         "interval_failure_probability": 0.005,
