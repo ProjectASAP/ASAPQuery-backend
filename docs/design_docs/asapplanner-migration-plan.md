@@ -31,16 +31,34 @@ completion prerequisite.
 
 ## Delivery sequence and dependencies
 
-Implementation tracking:
+Implementation tracking (PRs are not merged automatically):
 
-- Slice A: [PR #513](https://github.com/ProjectASAP/ASAPQuery-backend/pull/513)
-  implements compatible Collector producer deduplication and deployment-contract
-  conflict checks. All 638 control-plane library tests pass. It preserves
-  consumer-sensitive plan identity and rate/increase state compatibility.
-  Runtime update-count and actual Collector-consumption acceptance remain
-  slice E work; declaration-count tests do not complete those gates.
-- Slices B–F remain unimplemented by this migration series. Existing code and
-  overlapping PRs must be reused rather than re-created.
+| PR | Implemented scope |
+| --- | --- |
+| [Backend #513](https://github.com/ProjectASAP/ASAPQuery-backend/pull/513) | A: compatible physical producer deduplication and conflicting deployment-contract rejection |
+| [Backend #514](https://github.com/ProjectASAP/ASAPQuery-backend/pull/514) | B prerequisite: port the backend from its divergent historical pin to merged Planner APIs, including typed summary inputs |
+| [Planner #356](https://github.com/ProjectASAP/ASAPPlanner/pull/356) | B: reusable, scope-local typed post-ASAP subtree interning; includes schemas and guarantees in equivalence |
+| [Backend #515](https://github.com/ProjectASAP/ASAPQuery-backend/pull/515) | B: workload search, shared producer bindings and persistent query-root mapping |
+| [Backend #516](https://github.com/ProjectASAP/ASAPQuery-backend/pull/516) | C: backend-local packed SUM/observation-count state, exact readouts, additive reductions and constrained arithmetic; production HTTP acceptance |
+| [Backend #517](https://github.com/ProjectASAP/ASAPQuery-backend/pull/517) | E: current distributed publication/frame protocol, actual Collector validator, two shared readouts, failed staging and inactive-generation rejection |
+| [Backend #518](https://github.com/ProjectASAP/ASAPQuery-backend/pull/518) | B/F: one workload-selection adapter for canonical startup and compile-and-publish; query-scoped accuracy certificates |
+| [Backend #519](https://github.com/ProjectASAP/ASAPQuery-backend/pull/519) | D component: joint producer lifecycle demand, incompatible-evidence rejection and identity-keyed lifecycle estimates |
+| [Backend #520](https://github.com/ProjectASAP/ASAPQuery-backend/pull/520) | E: published config drives the actual Collector Rust update/window/emission loop; N raw observations yield N updates and one shared output |
+
+The backend PRs form a sequential review stack from #513 through #520;
+#515 additionally depends on Planner #356. #516 includes the fail-closed
+arithmetic regression fix, propagated through its dependent branches.
+The backend-local dashboard and distributed single-partition quantile examples
+have executable acceptance evidence. **The full migration is not yet complete:**
+whole-workload physical alternative costing remains open, as described below.
+
+Local verification of the combined stack: 648 control-plane library tests,
+28 control-plane binary tests, one control-plane integration test, 976
+data-plane library tests and three production-process tests passed. Planner
+#356 passed its 156 type-library tests and GitHub formatting/lint/test checks.
+The backend process tests cover the actual binaries and Collector Rust library,
+not production traffic or every Collector platform adapter. Local passes do
+not replace PR CI, review or the remaining migration gates.
 
 | Slice | Repository | Depends on | Deliverable and acceptance |
 | --- | --- | --- | --- |
@@ -122,6 +140,22 @@ denominator edge cases. Query results must match Prometheus labels, timestamps
 and numeric semantics. Until the whole expression is supported, preserve
 explicit fallback rather than claiming partial integration.
 
+The implemented backend-local example uses one raw accumulator that retains
+both sum and observation count. This is native physical packing of selected
+Planner operations, not a new backend semantic rewrite. The process test has
+two services: observations `[10]` and `[2, 4, 8]` across two API instances give
+SUM = 24, COUNT = 4 and weighted mean = 6; worker observations `[9, 15]` give
+SUM = 24, COUNT = 2 and mean = 12. Three registered consumers still configure
+one producer; a Remote Write retry does not double the counts. Range steps,
+output labels/timestamps and unaligned-window fallback are checked.
+
+Do not generalize that execution contract to `sum(sum_over_time(m) /
+count_over_time(m))`: summing per-instance means cannot pool samples first.
+Non-additive entity reduction, mismatched operand grouping/windows, shifted
+selectors and unverified instantaneous/temporal combinations remain explicit
+fallbacks. Unknown legacy observation counts also fail closed. Distributed
+observation-count readout is not advertised by this implementation.
+
 ## D. Workload-wide evidence and selection
 
 Today per-query lifecycle inputs are not proof of joint workload costing.
@@ -138,6 +172,34 @@ Acceptance: a shared alternative wins when its complete cost is lower, loses
 when retention/materialization overhead dominates, and is unavailable when
 any required capability/evidence is absent or stale. Adding another consumer
 must not double-count the producer's update stream.
+
+Implemented component: #519 gives each unique physical producer a
+`WorkloadDemand` containing all its consuming query entries. For a 300-second
+horizon, 100 updates/second and two consumers reading every 10 and 20 seconds,
+the demand is 30,000 updates and 45 reads. With build = 10, update = 0.001,
+read = 0.1, retention/second = 0.001 and retirement = 1, the lifecycle cost is
+45.8. Adding the second consumer increases cost by 1.5, not another build and
+update stream. Publication reports this component against the materialization
+and implementation identities; it is not a complete-plan total.
+
+Remaining implementation gate:
+
+1. Bind complete raw and post-ASAP alternatives to Planner's existing physical
+   evidence boundary (`PlannerPhysicalPlanProvider` / streaming evidence where
+   applicable). Include retained exact operators and every result root; do not
+   replace that boundary with another backend semantic DAG.
+2. Supply source-scoped, generation-bound statistics and calibration over one
+   horizon: scans, updates, retained/live state, materialization reads/writes,
+   transport and all result operators. The current opaque per-query window
+   cost cannot be split into those components or summed as a workload total.
+3. Connect complete evidence to alternative ranking before commitment, retain
+   the selected physical implementation identities, and verify both the
+   low-overhead sharing win and high-retention sharing loss. Missing or stale
+   evidence must leave an alternative unavailable, not cost it at zero.
+
+No complete provider is currently implemented by this PR series. Production
+calibration additionally needs evidence from the intended deployment; the
+small deterministic fixture costs are not production measurements.
 
 ## E. Runtime and deployment acceptance
 
@@ -157,6 +219,13 @@ Start backend-local, then validate the distributed profile independently.
 
 Unit-level declaration counts do not replace runtime update-count tests.
 
+Current evidence combines real backend executables with the actual Collector
+Rust runtime library. The test's host adapter supplies OpAMP acknowledgements
+and frame metadata; it does not launch a platform-specific Collector binary.
+Platform adapter rollout and concurrent successful-generation cutover remain
+separate acceptance gates. Existing readiness/lifecycle unit tests are reused;
+they are not described as a production rollout rehearsal.
+
 ## F. Retire duplicate selection safely
 
 Inventory canonical startup compilation, explicit compile-and-publish,
@@ -171,6 +240,14 @@ grouping or lifecycle reselection is not.
 Do not remove QueryPlan, PrecomputePlan, physical deployment selection,
 exact fallback, or profile-specific adapters merely because their types are
 different from post-ASAP IR.
+
+Call-site audit: production instant/range serving already requires an active
+physical QueryPlan and declines absent or unregistered routes. The old
+summary-selection serving branches in `engine.rs` are `cfg(test)` fixtures.
+#518 unifies the two first-class compilation entry points. Legacy flat-workload
+demo/configuration adapters remain separate compatibility paths; they must not
+be presented as migrated canonical-workload entry points or removed without
+their own parity/retirement decision.
 
 ## Existing PR coordination
 
