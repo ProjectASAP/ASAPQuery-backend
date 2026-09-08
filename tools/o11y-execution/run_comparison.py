@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import resource
 import subprocess
 import sys
 import time
@@ -91,11 +90,26 @@ def main():
             save(folder / "command.json", command)
             subprocess.run(command, check=True)
         finally:
+            cleanup_errors = []
             for name, child in children.items():
-                evidence.setdefault(name, {})["termination"] = stop(child)
-            save(folder / "service-lifecycle.json", evidence)
-            for log in logs:
-                log.close()
+                try:
+                    evidence.setdefault(name, {})["termination"] = stop(child)
+                except Exception as error:
+                    # An error collecting one service must not orphan the other.
+                    evidence.setdefault(name, {})["termination_error"] = repr(error)
+                    cleanup_errors.append(f"{name}: {error}")
+                    try:
+                        child.kill()
+                        child.wait(timeout=10)
+                    except Exception as kill_error:
+                        evidence[name]["cleanup_error"] = repr(kill_error)
+            try:
+                save(folder / "service-lifecycle.json", evidence)
+            finally:
+                for log in logs:
+                    log.close()
+            if cleanup_errors and sys.exc_info()[0] is None:
+                raise RuntimeError("Service cleanup failed: " + "; ".join(cleanup_errors))
         print(f"completed trial {trial}: {folder}", flush=True)
 
 
