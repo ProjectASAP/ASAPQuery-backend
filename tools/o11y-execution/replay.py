@@ -5,6 +5,8 @@ from decimal import Decimal
 import hashlib
 import json
 import math
+import os
+import resource
 from pathlib import Path
 import re
 import socket
@@ -14,6 +16,22 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+from compare import compare_results, process_snapshot, process_delta, summarize
+
+PROCESS_IDS = {}
+
+
+def constrain_process(pid, cpus, address_space_bytes=None):
+    """Match schedulable CPUs for all existing threads, including Go workers."""
+    if cpus:
+        for task in Path(f"/proc/{pid}/task").iterdir():
+            try:
+                os.sched_setaffinity(int(task.name), cpus)
+            except ProcessLookupError:
+                pass
+    if address_space_bytes:
+        resource.prlimit(pid, resource.RLIMIT_AS, (address_space_bytes, address_space_bytes))
 
 
 def classify(response, headers=None):
@@ -124,7 +142,7 @@ def encode_write(rows):
     return varint(length) + literal + wire
 
 
-def request(url, data=None, headers=None):
+def _http_request(url, data=None, headers=None):
     start = time.perf_counter_ns()
     try:
         with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers or {}), timeout=60) as response:
@@ -135,9 +153,30 @@ def request(url, data=None, headers=None):
             body = {"raw": body.decode(errors="replace")}
         return {"http_status": status, "response": body, "headers": {k.lower(): v for k, v in received.items()},
                 "elapsed_ns": time.perf_counter_ns() - start}
+    except urllib.error.HTTPError as error:
+        raw = error.read()
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeDecodeError):
+            body = {"status": "error", "error": str(error), "raw": raw.decode(errors="replace")}
+        return {"http_status": error.code, "response": body,
+                "headers": {k.lower(): v for k, v in error.headers.items()},
+                "elapsed_ns": time.perf_counter_ns() - start}
     except (OSError, urllib.error.URLError) as error:
         return {"http_status": getattr(error, "code", None), "response": {"status": "error", "error": str(error)},
                 "headers": {}, "elapsed_ns": time.perf_counter_ns() - start}
+
+
+def process_snapshots():
+    return {name: process_snapshot(pid) for name, pid in PROCESS_IDS.items()}
+
+
+def request(url, data=None, headers=None):
+    before = process_snapshots()
+    result = _http_request(url, data, headers)
+    after = process_snapshots()
+    result["process_resources"] = {name: process_delta(before.get(name), after.get(name)) for name in PROCESS_IDS}
+    return result
 
 
 def write_json(path, value):
@@ -164,17 +203,28 @@ def ingest(rows, endpoints, output):
                 raise RuntimeError(f"ingestion failed at batch {offset}; inspect partial acceptance before retry")
 
 
-def replay(queries, backend, output, repetitions):
+def replay(queries, backend, output, repetitions, exact_url=None):
     rows = []
     for repeat in range(repetitions):
-        for query in queries:
+        for query_index, query in enumerate(queries):
+            exact_first = (repeat + query_index) % 2 == 0
             params = urllib.parse.urlencode({"query": query["query"], "time": f'{query["eval_timestamp_ms"] / 1000:.3f}'})
+            # Alternate paired order to expose, rather than always favor, cache/order effects.
+            exact = None
+            if exact_url and exact_first:
+                exact = request(exact_url.rstrip("/") + "/api/v1/query?" + params)
             answer = request(backend.rstrip("/") + "/api/v1/query?" + params)
+            if exact_url and exact is None:
+                exact = request(exact_url.rstrip("/") + "/api/v1/query?" + params)
             route = classify(answer["response"], answer["headers"])
             if answer["http_status"] != 200:
                 route = "failed"
             rows.append({**query, "repetition": repeat, "phase": "first_pass" if repeat == 0 else "repeat",
                          "execution": route, **answer})
+            if exact is not None:
+                rows[-1]["exact"] = exact
+                rows[-1]["comparison"] = compare_results(answer["response"], exact["response"])
+                rows[-1]["pair_order"] = "exact_first" if exact_first else "backend_first"
             write_json(output / "queries.json", rows)
     return rows
 
@@ -187,6 +237,14 @@ def main():
     parser.add_argument("--compiler", type=Path, required=True)
     parser.add_argument("--data-plane", type=Path, required=True)
     parser.add_argument("--exact-url", required=True, help="dedicated empty Prometheus with Remote Write receiver enabled")
+    parser.add_argument("--compare", action="store_true", help="execute a matched exact request for every corpus occurrence")
+    parser.add_argument("--exact-pid", type=int, help="local Prometheus PID for Linux CPU/RSS evidence; never stopped by this runner")
+    parser.add_argument("--exact-storage", type=Path, help="baseline Prometheus data directory for logical on-disk byte count")
+    parser.add_argument("--fallback-storage", type=Path, help="fallback Prometheus data directory for logical on-disk byte count")
+    parser.add_argument("--fallback-url", help="separate fresh Prometheus for backend fallback; defaults to exact-url")
+    parser.add_argument("--fallback-pid", type=int)
+    parser.add_argument("--cpu-affinity", help="comma-separated permitted CPU IDs; enforced on backend and supplied Prometheus PIDs")
+    parser.add_argument("--address-space-bytes", type=int, help="same RLIMIT_AS for backend and supplied Prometheus; virtual memory, not RSS cap")
     parser.add_argument("--port", type=int, default=18089)
     parser.add_argument("--settle-seconds", type=float, default=0, help="deprecated; completion uses explicit finite-input drain")
     parser.add_argument("--repetitions", type=int, default=2)
@@ -194,9 +252,32 @@ def main():
     args = parser.parse_args()
     if args.repetitions < 1 or not 0 <= args.settle_seconds <= 60:
         parser.error("positive repetitions and settle-seconds in [0, 60] required")
+    cpus = {int(x) for x in args.cpu_affinity.split(",")} if args.cpu_affinity else None
+    if cpus and not cpus <= os.sched_getaffinity(0):
+        parser.error("requested CPUs must be available to the runner")
+    if args.address_space_bytes is not None and args.address_space_bytes <= 0:
+        parser.error("address-space-bytes must be positive")
+    if (cpus or args.address_space_bytes) and not args.exact_pid:
+        parser.error("enforced resource comparison requires --exact-pid")
+    if args.fallback_url and args.fallback_url.rstrip("/") == args.exact_url.rstrip("/"):
+        parser.error("fallback-url must be a separate service")
+    if args.fallback_url and (cpus or args.address_space_bytes) and not args.fallback_pid:
+        parser.error("resource enforcement also requires --fallback-pid")
+    if args.fallback_url and args.exact_pid is not None and args.exact_pid == args.fallback_pid:
+        parser.error("baseline and fallback must use distinct processes")
+    if args.exact_storage and args.fallback_storage and args.exact_storage.resolve() == args.fallback_storage.resolve():
+        parser.error("baseline and fallback must use distinct storage directories")
+    fallback_url = args.fallback_url or args.exact_url
+    for pid in [args.exact_pid, args.fallback_pid]:
+        if pid is not None:
+            if process_snapshot(pid) is None:
+                parser.error("service PID must be readable and live")
+            constrain_process(pid, cpus, args.address_space_bytes)
     corpus = json.loads(args.queries.read_text())
     queries = validate_workload(json.loads(args.snapshot.read_text()), corpus)
     samples = parse_samples(args.metrics.read_text().splitlines())
+    if args.exact_pid is not None and process_snapshot(args.exact_pid) is None:
+        parser.error("exact-pid must name a readable live local process")
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", args.port))
     args.output.mkdir(parents=True, exist_ok=False)
@@ -207,21 +288,37 @@ def main():
                   "query_occurrences": len(queries), "configuration": {k: str(v) for k, v in vars(args).items()},
                   "limitations": ["generator provenance must be supplied separately", "first pass is not a guaranteed cold cache", "finite-input drain closes trailing panes and permanently seals Remote Write; no live-ingestion claim"]}
     write_json(args.output / "run.json", provenance)
+    planning_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     with (args.output / "planning.stderr").open("w") as log:
         compiled = subprocess.run([str(args.compiler.resolve()), str(args.snapshot.resolve())], check=True,
                                   stdout=subprocess.PIPE, stderr=log, text=True)
+    planning_after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    planning_resources = {"cpu_ns": int(((planning_after.ru_utime + planning_after.ru_stime) -
+                                         (planning_before.ru_utime + planning_before.ru_stime)) * 1e9),
+                          "children_lifetime_peak_rss_bytes": planning_after.ru_maxrss * 1024}
     plan = json.loads(compiled.stdout)
     write_json(args.output / "planning.json", plan)
     artifact = args.output / "install.json"
     write_json(artifact, plan["install_request"])
     backend = f"http://127.0.0.1:{args.port}"
     command = [str(args.data_plane.resolve()), "--profile", "asapquery", "--physical-plan", str(artifact.resolve()),
-               "--prometheus-server", args.exact_url, "--forward-unsupported-queries", "--http-port", str(args.port),
+               "--prometheus-server", fallback_url, "--forward-unsupported-queries", "--http-port", str(args.port),
                "--output-dir", str((args.output / "backend").resolve()), "--precompute-allowed-lateness-ms", "0",
                "--precompute-flush-interval-ms", "25"]
     write_json(args.output / "command.json", command)
     with (args.output / "backend.log").open("w") as log:
-        child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+        def limits():
+            if cpus:
+                os.sched_setaffinity(0, cpus)
+            if args.address_space_bytes:
+                resource.setrlimit(resource.RLIMIT_AS, (args.address_space_bytes, args.address_space_bytes))
+        child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, preexec_fn=limits)
+        PROCESS_IDS["backend"] = child.pid
+        if args.exact_pid is not None:
+            PROCESS_IDS["exact_service"] = args.exact_pid
+        if args.fallback_pid is not None:
+            PROCESS_IDS["fallback_service"] = args.fallback_pid
+        phases = {"startup": process_snapshots()}
         try:
             for _ in range(120):
                 if child.poll() is not None:
@@ -239,16 +336,69 @@ def main():
             if not any(p["plan_id"] == envelope["plan_id"] and p["plan_version"] == envelope["plan_version"]
                        and p["phase"] == "active" for p in installed["response"].get("plans", [])):
                 raise RuntimeError("runtime has not activated the selected plan generation")
-            ingest(samples, [args.exact_url, backend], args.output)
+            phases["before_ingest"] = process_snapshots()
+            ingest_start = time.perf_counter_ns()
+            ingest(samples, list(dict.fromkeys([args.exact_url, fallback_url, backend])), args.output)
             drained = request(backend + "/api/v1/precompute/drain", b"")
             write_json(args.output / "drain.json", drained)
             if drained["http_status"] != 200 or drained["response"].get("complete") is not True:
                 raise RuntimeError("finite-input materialization drain failed; see drain.json")
-            results = replay(queries, backend, args.output, args.repetitions)
-            write_json(args.output / "store.json", request(backend + "/api/v1/store/metrics"))
+            ingest_elapsed = time.perf_counter_ns() - ingest_start
+            phases["after_ingest_and_drain"] = process_snapshots()
+            write_json(args.output / "store-after-build.json", request(backend + "/api/v1/store/metrics"))
+            write_json(args.output / "process-phases.json", phases)
+            results = replay(queries, backend, args.output, args.repetitions, args.exact_url if args.compare else None)
+            phases["after_queries"] = process_snapshots()
+            write_json(args.output / "process-phases.json", phases)
+            store = request(backend + "/api/v1/store/metrics")
+            write_json(args.output / "store.json", store)
+            def disk_bytes(path):
+                return sum(p.stat().st_size for p in path.rglob("*") if p.is_file()) if path else None
+            storage = {"backend_output_bytes": disk_bytes(args.output / "backend"),
+                       "baseline_prometheus_bytes": disk_bytes(args.exact_storage),
+                       "fallback_prometheus_bytes": disk_bytes(args.fallback_storage),
+                       "backend_store": store,
+                       "scope": "logical file bytes including WAL; backend output also contains logs; concurrent snapshots are approximate"}
+            write_json(args.output / "storage.json", storage)
             write_json(args.output / "completion.json", {"complete": True,
                        "execution_counts": {k: sum(r["execution"] == k for r in results) for k in ["warm", "exact_fallback", "failed"]},
                        "benefit_claim": None})
+            if args.compare:
+                report = {"schema_version": 1, "all_requests": summarize(results),
+                          "by_phase": {phase: summarize([r for r in results if r["phase"] == phase])
+                                       for phase in ["first_pass", "repeat"]},
+                          "by_query_occurrence": {query["id"]: summarize([r for r in results if r["id"] == query["id"]])
+                                                  for query in queries},
+                          "by_execution": {route: summarize([r for r in results if r["execution"] == route])
+                                           for route in ["warm", "exact_fallback", "failed"]},
+                          "estimated_cost": plan["cost_comparison"],
+                          "measurement_units": {"latency": "nanoseconds", "cpu": "process CPU nanoseconds", "memory": "bytes"},
+                          "resource_limits": {"cpu_affinity": sorted(cpus) if cpus else None,
+                                              "address_space_bytes": args.address_space_bytes,
+                                              "scope": "per process; backend fallback service charged separately"},
+                          "separate_fallback_endpoint": bool(args.fallback_url),
+                          "isolated_baseline_service": bool(args.fallback_url and args.exact_pid and args.fallback_pid and args.exact_pid != args.fallback_pid),
+                          "measured_ingest_and_drain_wall_ns": ingest_elapsed,
+                          "planning_wall_ns": plan["planning_elapsed_ns"],
+                          "process_phases": phases,
+                          "planning_resources": planning_resources,
+                          "storage": storage,
+                          "phase_resources": {name: {service: process_delta(phases[before].get(service), phases[after].get(service))
+                                                     for service in PROCESS_IDS}
+                                              for name, before, after in [
+                                                  ("startup", "startup", "before_ingest"),
+                                                  ("ingest_and_build", "before_ingest", "after_ingest_and_drain"),
+                                                  ("queries", "after_ingest_and_drain", "after_queries")]},
+                          "estimated_vs_measured_cost_ratio": None,
+                          "acceptance_complete": False,
+                          "limitations": ["No common conversion from provider cost units to measured resource units",
+                              *([] if args.fallback_url else ["Exact service is shared with fallback; caches are not isolated"]),
+                              *([] if cpus else ["CPU affinity is not enforced"]),
+                              "RLIMIT_AS is virtual address space, not physical-memory or aggregate multi-process CPU enforcement",
+                              "Raw process RSS is not summary state size; store.json retains backend counters",
+                              "Service startup before supplied PID attachment and isolated cold-cache runs remain unmeasured",
+                              "Query equality on one dataset is not a formal approximation confidence guarantee"]}
+                write_json(args.output / "comparison.json", report)
         finally:
             child.terminate()
             try:

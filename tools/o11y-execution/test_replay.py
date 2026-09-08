@@ -1,7 +1,10 @@
 """Behavioral tests for the real-workload replay boundary (not speedup evidence)."""
 import unittest
+from unittest.mock import patch
+from tempfile import TemporaryDirectory
+from pathlib import Path
 
-from replay import classify, validate_workload, encode_write, parse_samples
+from replay import classify, validate_workload, encode_write, parse_samples, replay
 
 
 class ReplayTests(unittest.TestCase):
@@ -33,6 +36,16 @@ class ReplayTests(unittest.TestCase):
         rows = parse_samples(['# TYPE x histogram', 'x_bucket{le="1",job="a"} 2 1.234'])
         self.assertEqual(rows, [({"__name__": "x_bucket", "le": "1", "job": "a"}, 2.0, 1234)])
         self.assertTrue(encode_write(rows))
+
+    def test_odd_corpus_alternates_pair_order_across_repetitions(self):
+        """An odd corpus must not fix every occurrence to the same pair order."""
+        response = {"http_status": 200, "headers": {}, "elapsed_ns": 1,
+                    "response": {"status": "success", "infos": ["data_source: asap_query"],
+                                 "data": {"resultType": "vector", "result": []}}}
+        with TemporaryDirectory() as directory, patch("replay.request", return_value=response):
+            rows = replay([{"id": "q", "query": "up", "eval_timestamp_ms": 0}],
+                          "http://backend", Path(directory), 2, "http://exact")
+        self.assertEqual([r["pair_order"] for r in rows], ["exact_first", "backend_first"])
 
     def test_bad_input_fails_before_any_ingest(self):
         """No silent sample drops, duplicate samples, or time reordering."""

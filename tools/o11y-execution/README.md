@@ -57,12 +57,62 @@ classification. Forwarded responses carry a backend-owned `x-asap-execution`
 header; an unmarked success is not counted as warm or fallback. `ingestion.json`
 records accepted batches; acceptance does not prove worker completion.
 
-The settle interval is recorded, not a completion barrier. The first traversal is
+The runner waits for the finite-input completion barrier. The first traversal is
 called `first_pass`, not “cold cache”; later traversals are `repeat`. All failures
 and fallback responses remain in the denominator. A completion file means the
-replay finished, **not** that accuracy or benefit acceptance passed. The next
-stacked PR adds matched exact queries and measurement/reporting.
+replay finished, **not** that accuracy or benefit acceptance passed.
 
+## Matched exact comparison
+
+Add `--compare --exact-pid PID` to the same command. PID must identify the local
+Prometheus serving `--exact-url`; verify that association before running. If it is
+remote, omit PID: exact-service CPU and memory stay unavailable. The runner never
+stops this externally managed process. Prometheus must have the same data and
+evaluation range; both endpoints receive identical encoded sample batches.
+
+Every occurrence is queried against both endpoints with identical PromQL and
+time, alternating request order. Results are matched by full label set and sample
+timestamp, not row order. `comparison.json` reports missing/extra series and
+samples, completeness, absolute/relative error, zero-denominator mismatches,
+failures, first-pass/repeat latency distributions and sequential service rate.
+Duplicate series, failed responses, unsupported response types and warnings make
+a result uncomparable. Matching one dataset is not a formal confidence guarantee.
+
+The latency ratio is emitted only when **all** matched responses are exact-equal
+and successful. Approximate discrepancies are still reported, but no arbitrary
+error threshold is substituted for each query's accuracy contract. Fallbacks
+remain in the totals. The ratio measures query service time only, never amortized
+end-to-end savings. Raw per-request timings allow other analyses without hiding
+the unsuccessful portion of the workload.
+
+Linux process counters are captured around HTTP calls and at startup, ingestion
+and query boundaries. Backend calls also record exact-service CPU when available,
+so forwarded work is visible. Ingestion journal timings and phase snapshots expose
+the construction/update interval, including the finite-input drain. Counters
+include background work and have CPU-tick resolution. RSS/HWM are **whole-process**
+memory, not summary heap; HWM is process-lifetime peak, not isolated phase peak.
+`store.json` preserves the backend's raw state counters. `--cpu-affinity` applies
+one CPU set to the backend and supplied Prometheus processes/threads.
+`--address-space-bytes` applies the same RLIMIT_AS, which limits virtual address
+space, not RSS or combined process memory. These controls are optional and their
+presence is recorded; they do not establish a full cgroup resource budget.
+
+Use `--fallback-url` and `--fallback-pid` for a separate fresh Prometheus instance,
+keeping `--exact-url`/`--exact-pid` for the baseline. Identical process IDs and
+storage paths are rejected. Both receive identical input batches. Backend CPU
+includes its fallback service CPU; baseline CPU remains separate. With no
+separate fallback service, the report preserves the shared-cache limitation.
+`--exact-storage` and `--fallback-storage` record logical file sizes separately;
+backend output file sizes include logs and are not retained summary heap sizes.
+
+The provider's estimated costs are preserved next to measured quantities without
+pretending abstract model units are CPU nanoseconds. End-to-end benefit and
+estimated/measured cost ratios remain null until their units, lifecycle scope,
+exact-service startup/storage costs and resource budgets are matched. Separate
+fresh-process/cache-controlled trials, a retained-state measurement, calibration
+provenance and real-corpus execution evidence are still required before declaring
+the five #524 acceptance criteria complete. A shared fallback/baseline service
+can transfer cache warmth; alternating order does not eliminate this confound.
 
 ## Finite-input completion
 
