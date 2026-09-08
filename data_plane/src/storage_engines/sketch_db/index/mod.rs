@@ -1862,7 +1862,11 @@ impl SketchStore {
         // resolver type (which lives in `drivers::ingest`). Tests
         // pass either a real local resolver or a counter-mock
         // closure.
-        let agg_kind_canonical = agg_kind.canonical_string();
+        let agg_kind_canonical = format!(
+            "{}|{}",
+            agg_kind.canonical_string(),
+            agg_cfg.policy_fingerprint()
+        );
         let sid = mint_sid(&agg_cfg.metric, &attrs_fp, &agg_kind_canonical);
         self.ingest_precompute_with_sid(sid, agg_cfg, output, accumulator)
     }

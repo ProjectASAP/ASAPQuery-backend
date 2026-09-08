@@ -41,6 +41,40 @@ use asap_types::Statistic;
 /// unknown value returns 400.
 pub const ENGINE_OVERRIDE_HEADER: &str = "X-ASAP-Engine";
 pub const ENGINE_OVERRIDE_QUERY_PARAM: &str = "engine";
+/// Per-request accuracy contract. `exact` routes ASAP-managed metrics directly
+/// to the archive; `approximate` (the default) keeps warm-first failover.
+pub const ACCURACY_HEADER: &str = "X-ASAP-Accuracy";
+
+fn extract_accuracy(headers: &HeaderMap) -> Result<AccuracyTarget, String> {
+    let Some(value) = headers.get(ACCURACY_HEADER) else {
+        return Ok(AccuracyTarget::Epsilon(0.01));
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| format!("{ACCURACY_HEADER} must be valid UTF-8"))?
+        .trim();
+    if value.eq_ignore_ascii_case("exact") {
+        Ok(AccuracyTarget::Exact)
+    } else if value.eq_ignore_ascii_case("approximate") {
+        Ok(AccuracyTarget::Epsilon(0.01))
+    } else {
+        Err(format!(
+            "invalid {ACCURACY_HEADER} value {value:?}; expected `exact` or `approximate`"
+        ))
+    }
+}
+
+fn invalid_accuracy_response(error: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "status": "error",
+            "errorType": "bad_data",
+            "error": error,
+        })),
+    )
+        .into_response()
+}
 
 /// Per-request tenant header (per-tenant `BackendStorageRouting`,
 /// follow-up to PR #333).
@@ -449,6 +483,10 @@ impl HttpServer {
             )
             .route("/api/v1/physical-plan", post(handle_post_physical_plan))
             .route(
+                "/api/v1/physical-plan/discard",
+                post(handle_discard_physical_plan),
+            )
+            .route(
                 "/api/v1/physical-plan/activate",
                 post(handle_activate_physical_plan),
             )
@@ -555,6 +593,10 @@ impl HttpServer {
             )
             .route("/api/v1/physical-plan", post(handle_post_physical_plan))
             .route(
+                "/api/v1/physical-plan/discard",
+                post(handle_discard_physical_plan),
+            )
+            .route(
                 "/api/v1/physical-plan/activate",
                 post(handle_activate_physical_plan),
             )
@@ -617,6 +659,7 @@ async fn process_query_request(
     start_time: Instant,
     headers: HashMap<String, String>,
     engine_override: Option<String>,
+    accuracy: AccuracyTarget,
     tenant: &str,
 ) -> Response {
     // Check if handling is enabled
@@ -721,10 +764,12 @@ async fn process_query_request(
         state.hot_reload_config.is_some(),
     );
 
-    if matches!(metric_storage, StorageBackend::SketchStore) {
+    if matches!(metric_storage, StorageBackend::SketchStore)
+        && !matches!(accuracy, AccuracyTarget::Exact)
+    {
         process_via_simple_engine(state, parsed_request, start_time, headers).await
     } else {
-        process_via_router(state, parsed_request, start_time, metric_storage).await
+        process_via_router(state, parsed_request, start_time, metric_storage, accuracy).await
     }
 }
 
@@ -1381,16 +1426,9 @@ async fn process_via_named_engine(
 /// * `metric_storage` — looked up from the hot-reload `StreamingConfig`
 ///   by the caller.
 ///
-/// The remaining two — `Statistic` + `AccuracyTarget` — would
-/// normally be derived by parsing the PromQL AST. Pre-Phase-6 we don't
-/// have an HTTP-side parser wired in; the router's
-/// [`compatible_storage_backends`] consults them only for the
-/// `DoubleWrite` head-selection heuristic (other deploy shapes
-/// degenerate to a fixed list keyed only by `metric_storage`), so
-/// defaulting to `(Sum, Approximate)` is safe for `GorillaObjectStore`-
-/// only deploys. A follow-up will thread
-/// the real values through once the Phase-6 query-tracker exposes
-/// them per request.
+/// `Statistic` remains a shape-derived follow-up. `AccuracyTarget` is
+/// supplied by the caller through [`ACCURACY_HEADER`] and defaults to
+/// approximate when the header is absent.
 ///
 /// Map `EngineRouterError` variants to HTTP statuses:
 /// * `NoEngineRegistered` → 503 (configuration bug — restart with the
@@ -1404,6 +1442,7 @@ async fn process_via_router(
     parsed_request: &ParsedQueryRequest,
     start_time: Instant,
     metric_storage: StorageBackend,
+    accuracy: AccuracyTarget,
 ) -> Response {
     use crate::drivers::query::adapters::QueryExecutionResult;
     use crate::query_engines::EngineError;
@@ -1414,20 +1453,16 @@ async fn process_via_router(
         parsed_request.query, metric_storage,
     );
 
-    // Default `(Sum, Approximate)` — see fn doc above. The router's
-    // capability table only consults these axes for `DoubleWrite`
-    // metrics; for `GorillaObjectStore`-only deploys the dispatch
-    // is a function of `metric_storage` alone.
+    // Statistic is not currently used by the routing policy. Accuracy is
+    // the validated request contract threaded in by the HTTP handler.
     let stat = Statistic::Sum;
-    let accuracy = AccuracyTarget::Epsilon(0.01);
-
     let router_result = state
         .query_router
-        .execute(&parsed_request.query, stat, accuracy, metric_storage)
+        .execute_routed(&parsed_request.query, stat, accuracy, metric_storage)
         .await;
 
     match router_result {
-        Ok(query_result) => {
+        Ok((query_result, data_source_id)) => {
             let query_duration = query_start_time.elapsed();
             debug!(
                 "EngineRouter dispatch took: {:.2}ms; result: {:?}",
@@ -1459,9 +1494,7 @@ async fn process_via_router(
                 .format_success_response(&execution_result)
                 .await
             {
-                Ok(response) => {
-                    annotate_data_source(response, metric_storage.data_source_id()).await
-                }
+                Ok(response) => annotate_data_source(response, data_source_id).await,
                 Err(status) => status.into_response(),
             }
         }
@@ -1565,6 +1598,10 @@ async fn handle_instant_query(
     // strips the param out (it doesn't, but reading the source of
     // truth keeps this robust to adapter changes).
     let engine_override = extract_engine_override(&headers, &query_params.0);
+    let accuracy = match extract_accuracy(&headers) {
+        Ok(accuracy) => accuracy,
+        Err(error) => return invalid_accuracy_response(error),
+    };
     // Per-tenant `BackendStorageRouting`: read the tenant id from the
     // `X-ASAP-Tenant` header (default `"default"`). Captured before
     // `parse_get_request` consumes `query_params`.
@@ -1598,6 +1635,7 @@ async fn handle_instant_query(
         start_time,
         forwarding_headers,
         engine_override,
+        accuracy,
         &tenant,
     )
     .await;
@@ -1641,6 +1679,10 @@ async fn handle_instant_query_post(
     debug!("=== INCOMING POST REQUEST ===");
 
     let forwarding_headers = extract_fallback_headers(&headers);
+    let accuracy = match extract_accuracy(&headers) {
+        Ok(accuracy) => accuracy,
+        Err(error) => return invalid_accuracy_response(error),
+    };
 
     // Check content type to determine how to parse the body
     let content_type = headers
@@ -1761,6 +1803,7 @@ async fn handle_instant_query_post(
         start_time,
         forwarding_headers,
         engine_override,
+        accuracy,
         &tenant,
     )
     .await;
@@ -1907,6 +1950,7 @@ async fn process_range_query_request(
     parsed_request: &ParsedRangeQueryRequest,
     start_time: Instant,
     forwarding_headers: HashMap<String, String>,
+    accuracy: AccuracyTarget,
     tenant: &str,
 ) -> Response {
     // Check if handling is enabled
@@ -1952,14 +1996,9 @@ async fn process_range_query_request(
 
     let metric_storage = resolve_metric_storage(state, &parsed_request.query, tenant);
 
-    // Match the instant path's hardcoding of `(Sum, Approximate)`.
-    // TODO: derive `accuracy` (and `stat`) from the request rather than
-    // pinning Approximate — once the request carries an accuracy hint,
-    // an `Exact` range query will route straight to the archive via the
-    // shared policy table.
+    // Statistic is not currently used by the routing policy. Accuracy is
+    // the validated request contract threaded in by the HTTP handler.
     let stat = Statistic::Sum;
-    let accuracy = AccuracyTarget::Epsilon(0.01);
-
     // Warm-vs-archive routing fix: split by the warm-retention boundary
     // rather than "archive-on ⇒ everything to archive". When the
     // requested `[start_ms, end_ms]` window lies entirely inside the
@@ -2104,6 +2143,10 @@ async fn handle_range_query(
     debug!("=== INCOMING RANGE QUERY GET REQUEST ===");
     debug!("Raw query params: {:?}", query_params.0);
 
+    let accuracy = match extract_accuracy(&headers) {
+        Ok(accuracy) => accuracy,
+        Err(error) => return invalid_accuracy_response(error),
+    };
     let parsed_request = match state.adapter.parse_range_get_request(query_params).await {
         Ok(req) => {
             debug!(
@@ -2131,6 +2174,7 @@ async fn handle_range_query(
         &parsed_request,
         start_time,
         extract_fallback_headers(&headers),
+        accuracy,
         &tenant,
     )
     .await;
@@ -2146,6 +2190,10 @@ async fn handle_range_query_post(
     let _timer = srv_metrics::start_query_timer(srv_metrics::QUERY_TYPE_RANGE);
     let start_time = Instant::now();
     debug!("=== INCOMING RANGE QUERY POST REQUEST ===");
+    let accuracy = match extract_accuracy(&headers) {
+        Ok(accuracy) => accuracy,
+        Err(error) => return invalid_accuracy_response(error),
+    };
 
     // Parse the body as form data
     let body_str = match String::from_utf8(body.to_vec()) {
@@ -2204,6 +2252,7 @@ async fn handle_range_query_post(
         &parsed_request,
         start_time,
         extract_fallback_headers(&headers),
+        accuracy,
         &tenant,
     )
     .await;
@@ -3747,6 +3796,23 @@ aggregations:
         fn capabilities(&self) -> EngineCapabilities {
             self.caps
         }
+
+        async fn execute_range(
+            &self,
+            _query: &str,
+            _start_ms: u64,
+            _end_ms: u64,
+            _step_ms: u64,
+        ) -> Result<QueryResult, EngineError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.outcome {
+                MockOutcome::OkEmpty => Ok(QueryResult::matrix(Vec::new())),
+                MockOutcome::Backend => Err(EngineError::backend(
+                    self.caps.data_source_id,
+                    "simulated backend failure",
+                )),
+            }
+        }
     }
 
     /// Build an `HttpServer` whose router holds the supplied set of
@@ -3865,6 +3931,90 @@ aggregations:
             infos.iter().any(|v| v.as_str() == Some(&want)),
             "expected `{want}` in infos, got {infos:?}",
         );
+    }
+
+    #[test]
+    fn accuracy_header_parses_explicit_contract_and_rejects_typos() {
+        let mut headers = HeaderMap::new();
+        assert!(matches!(
+            extract_accuracy(&headers),
+            Ok(AccuracyTarget::Epsilon(_))
+        ));
+        headers.insert(ACCURACY_HEADER, "exact".parse().unwrap());
+        assert!(matches!(
+            extract_accuracy(&headers),
+            Ok(AccuracyTarget::Exact)
+        ));
+        headers.insert(ACCURACY_HEADER, "approximate".parse().unwrap());
+        assert!(matches!(
+            extract_accuracy(&headers),
+            Ok(AccuracyTarget::Epsilon(_))
+        ));
+        headers.insert(ACCURACY_HEADER, "best-effort".parse().unwrap());
+        assert!(extract_accuracy(&headers).is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_accuracy_header_bypasses_warm_tier_for_archive() {
+        let (archive, archive_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+        let server_port = setup_test_server_with_router(
+            StorageBackend::SketchStore,
+            vec![archive as Arc<dyn QueryEngine>],
+        )
+        .await;
+        let response = Client::new()
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .header(ACCURACY_HEADER, "exact")
+            .query(&[("query", "sum_over_time(foo[5m])"), ("time", "1700000000")])
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_data_source(&body, StorageBackend::GorillaObjectStore.data_source_id());
+        assert_eq!(archive_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_accuracy_header_routes_range_query_to_archive() {
+        let (archive, archive_calls) =
+            MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
+        let server_port = setup_test_server_with_router(
+            StorageBackend::SketchStore,
+            vec![archive as Arc<dyn QueryEngine>],
+        )
+        .await;
+        let response = Client::new()
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query_range"))
+            .header(ACCURACY_HEADER, "exact")
+            .query(&[
+                ("query", "sum_over_time(foo[5m])"),
+                ("start", "1699999940"),
+                ("end", "1700000000"),
+                ("step", "10"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_data_source(&body, StorageBackend::GorillaObjectStore.data_source_id());
+        assert_eq!(archive_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_accuracy_header_returns_bad_request() {
+        let server_port =
+            setup_test_server_with_router(StorageBackend::SketchStore, Vec::new()).await;
+        let response = Client::new()
+            .get(format!("http://127.0.0.1:{server_port}/api/v1/query"))
+            .header(ACCURACY_HEADER, "best-effort")
+            .query(&[("query", "sum_over_time(foo[5m])")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -5932,6 +6082,24 @@ async fn handle_activate_physical_plan(
         })),
     )
         .into_response()
+}
+
+async fn handle_discard_physical_plan(
+    State(state): State<AppState>,
+    axum::Json(request): axum::Json<ActivatePhysicalPlanRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(lifecycle) = state.physical_plan_lifecycle.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "physical-plan lifecycle is not attached",
+        )
+            .into_response();
+    };
+    match lifecycle.discard_staged(request.plan_id, request.plan_version) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
 }
 
 async fn handle_physical_plan_status(State(state): State<AppState>) -> axum::response::Response {

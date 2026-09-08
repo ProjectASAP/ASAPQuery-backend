@@ -264,7 +264,7 @@ mod tests {
             spatial_filter: String::new(),
             grouping,
             item_label: None,
-            topk_weight: None,
+            heap_update_mode: None,
             aggregation_input: AggregationInput::SketchEnvelope,
         }
     }
@@ -470,10 +470,7 @@ mod tests {
             readouts: vec![
                 BackendReadout {
                     aggregation_id: "agg0".into(),
-                    op: SketchQuery::TopK {
-                        k: 10,
-                        weight: planner_types::post_asap::TopKWeight::Value,
-                    },
+                    op: SketchQuery::TopK { k: 10 },
                 },
                 BackendReadout {
                     aggregation_id: "agg1".into(),
@@ -518,7 +515,7 @@ mod tests {
             spatial_filter: String::new(),
             grouping: vec!["zone".to_string()],
             item_label: None,
-            topk_weight: None,
+            heap_update_mode: None,
             aggregation_input: AggregationInput::Raw,
         };
         let cfg = BackendStageConfig {

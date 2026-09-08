@@ -231,6 +231,21 @@ impl EngineRouter {
         accuracy: AccuracyTarget,
         metric_storage: StorageBackend,
     ) -> Result<QueryResult, EngineRouterError> {
+        self.execute_routed(query, stat, accuracy, metric_storage)
+            .await
+            .map(|(result, _)| result)
+    }
+
+    /// Instant dispatch that also returns the canonical id of the engine that
+    /// answered. HTTP callers use this to report truthful provenance after a
+    /// warm-to-archive routing decision.
+    pub async fn execute_routed(
+        &self,
+        query: &str,
+        stat: Statistic,
+        accuracy: AccuracyTarget,
+        metric_storage: StorageBackend,
+    ) -> Result<(QueryResult, &'static str), EngineRouterError> {
         let backends = compatible_storage_backends(stat, &accuracy, metric_storage);
         debug!(
             query = query,
@@ -261,7 +276,7 @@ impl EngineRouter {
                         backend = ?backend,
                         "router: dispatch succeeded",
                     );
-                    return Ok(result);
+                    return Ok((result, id));
                 }
                 Err(e) => {
                     warn!(
