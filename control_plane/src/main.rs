@@ -618,6 +618,7 @@ struct CompileAndPublishPhysicalPlanResponse {
     status: &'static str,
     generated_at_unix_ms: u64,
     collector_ids: Vec<String>,
+    lifecycle_estimates: Vec<physical::compiler::MaterializationLifecycleEstimate>,
 }
 
 /// Compile one Planner IR decision into matching Collector, Precompute, and Backend views
@@ -712,6 +713,7 @@ async fn handle_compile_and_publish_physical_plan(
         status: "active",
         generated_at_unix_ms: bundle.envelope.generated_at_unix_ms,
         collector_ids,
+        lifecycle_estimates: bundle.lifecycle_estimates,
     })
     .into_response()
 }
