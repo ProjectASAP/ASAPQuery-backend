@@ -495,7 +495,8 @@ mod tests {
         assert_eq!(only(v), 7.0);
     }
 
-    /// Expressions outside the supported column/unit-weight contract fail before lookup.
+    /// Legacy candidate lookup cannot discard keyed items or constant weights
+    /// when adapting the planner's typed update contract.
     #[test]
     fn unsupported_update_semantics_fail_before_candidate_lookup() {
         use planner_types::post_asap::{SummaryInputExpr, SummaryUpdate};
