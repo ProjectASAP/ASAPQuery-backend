@@ -44,16 +44,21 @@ Implementation tracking (PRs are not merged automatically):
 | [Backend #518](https://github.com/ProjectASAP/ASAPQuery-backend/pull/518) | B/F: one workload-selection adapter for canonical startup and compile-and-publish; query-scoped accuracy certificates |
 | [Backend #519](https://github.com/ProjectASAP/ASAPQuery-backend/pull/519) | D component: joint producer lifecycle demand, incompatible-evidence rejection and identity-keyed lifecycle estimates |
 | [Backend #520](https://github.com/ProjectASAP/ASAPQuery-backend/pull/520) | E: published config drives the actual Collector Rust update/window/emission loop; N raw observations yield N updates and one shared output |
+| [Backend #521](https://github.com/ProjectASAP/ASAPQuery-backend/pull/521) | E: failed staging cleanup permits retry; concurrent readers survive successful same-semantic generation cutover; retired frames are rejected |
+| [Backend #522](https://github.com/ProjectASAP/ASAPQuery-backend/pull/522) | D: provider-priced complete bound-workload selection, strict v2 startup evidence, read-only quote preparation, live publication/reporting and process acceptance |
 
-The backend PRs form a sequential review stack from #513 through #520;
+The backend PRs form a sequential review stack from #513 through #522;
 #515 additionally depends on Planner #356. #516 includes the fail-closed
 arithmetic regression fix, propagated through its dependent branches.
 The backend-local dashboard and distributed single-partition quantile examples
-have executable acceptance evidence. **The full migration is not yet complete:**
-whole-workload physical alternative costing remains open, as described below.
+have executable acceptance evidence, including complete cost-based selection
+and same-semantic generation cutover. The supported-profile implementation
+is in the review stack, not yet merged or deployed. Production calibration,
+platform-specific rollout and broader semantic workload replacement are not
+claimed complete by these fixtures.
 
-Local verification of the combined stack: 648 control-plane library tests,
-28 control-plane binary tests, one control-plane integration test, 976
+Local verification of the combined stack: 654 control-plane library tests,
+28 control-plane binary tests, one control-plane integration test, 977
 data-plane library tests and three production-process tests passed. Planner
 #356 passed its 156 type-library tests and GitHub formatting/lint/test checks.
 The backend process tests cover the actual binaries and Collector Rust library,
@@ -182,24 +187,35 @@ read = 0.1, retention/second = 0.001 and retirement = 1, the lifecycle cost is
 update stream. Publication reports this component against the materialization
 and implementation identities; it is not a complete-plan total.
 
-Remaining implementation gate:
+Implemented selection: #522 compares complete bound alternatives before
+commitment. A provider prices source upkeep, each shared state's build/update/
+residency/retirement per location, transport, every reachable query operator,
+and results over one common horizon. Query work is multiplied by recurrence;
+shared maintenance is not multiplied by consumer count. Native exact fallback
+includes its service's input upkeep as well as full native query execution.
 
-1. Bind complete raw and post-ASAP alternatives to Planner's existing physical
-   evidence boundary (`PlannerPhysicalPlanProvider` / streaming evidence where
-   applicable). Include retained exact operators and every result root; do not
-   replace that boundary with another backend semantic DAG.
-2. Supply source-scoped, generation-bound statistics and calibration over one
-   horizon: scans, updates, retained/live state, materialization reads/writes,
-   transport and all result operators. The current opaque per-query window
-   cost cannot be split into those components or summed as a workload total.
-3. Connect complete evidence to alternative ranking before commitment, retain
-   the selected physical implementation identities, and verify both the
-   low-overhead sharing win and high-retention sharing loss. Missing or stale
-   evidence must leave an alternative unavailable, not cost it at zero.
+The default inventory is the Planner-selected continuously maintained workload
+and its whole-workload exact alternative. The comparison interface also accepts
+additional Planner-authorized, bindable forests; this is not exhaustive search
+over all engines or lifecycle variants. Tests prove both the sharing win and
+high-retention loss, and reject missing, stale, mismatched or infeasible quotes.
 
-No complete provider is currently implemented by this PR series. Production
-calibration additionally needs evidence from the intended deployment; the
-small deterministic fixture costs are not production measurements.
+Implementation refinement: pricing uses a flat coverage manifest over the
+existing bound physical projection, not another semantic DAG. It does not
+populate `PlannerPhysicalPlanProvider` with guessed source statistics or split
+the older opaque per-query window scalar into fabricated components. Providers
+must quote the actual source scope, state layout, implementation and capability
+generation. The selected plan and report retain those identities.
+
+Version-2 canonical snapshots require complete evidence. Live requests can
+obtain requirements from the read-only `cost-manifests` endpoint before
+publication. Version 1 and live requests without quotes remain explicitly
+uncosted compatibility paths. See the [provider workflow in #522](https://github.com/ProjectASAP/ASAPQuery-backend/blob/feat/complete-workload-cost-selection/docs/examples/workload-cost-evidence.md).
+
+Production calibration still requires evidence from the intended deployment;
+the deterministic fixture costs are not production measurements. The provider
+attests exact-backend access and resource feasibility; a low cost alone does
+not establish either.
 
 ## E. Runtime and deployment acceptance
 
@@ -222,9 +238,13 @@ Unit-level declaration counts do not replace runtime update-count tests.
 Current evidence combines real backend executables with the actual Collector
 Rust runtime library. The test's host adapter supplies OpAMP acknowledgements
 and frame metadata; it does not launch a platform-specific Collector binary.
-Platform adapter rollout and concurrent successful-generation cutover remain
-separate acceptance gates. Existing readiness/lifecycle unit tests are reused;
-they are not described as a production rollout rehearsal.
+In #521, failed Collector staging is discarded without touching the active
+snapshot; the same successor version can then be retried successfully while
+queries run. Old-generation frames are rejected after cutover and successor
+frames become queryable. #522 exercises this flow with costed publication.
+This verifies same-semantic runtime generation replacement, not arbitrary
+semantic workload replacement or a platform-specific production rollout.
+Platform adapter rollout remains a deployment acceptance step.
 
 ## F. Retire duplicate selection safely
 
