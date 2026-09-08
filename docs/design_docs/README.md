@@ -8,10 +8,15 @@ Backend-specific implementation design notes are organized by component under
 [`../developer_docs`](../developer_docs/README.md). They explain current Rust
 internals and are subordinate to the shared system contracts.
 
-Proposals for shared-contract review (not duplicate normative specifications):
+Proposals for shared-contract review:
 
-- [Self-Describing Summary (SDS)](self-describing-summary.md): Schema,
-  Dictionary and Record structure definitions.
+- [ASAPPlanner integration architecture](asapplanner-integration.md) proposes
+  the Planner/backend responsibility boundary, shared semantic DAG workflow,
+  and high-level consolidation milestones.
+- [Self-Describing Summary (SDS)](self-describing-summary.md) defines the proposed
+  Summary Descriptor, Data Descriptor and Summary Instance layers.
+
+These proposals complement the canonical cross-component contracts above.
 
 Backend-specific operating profiles:
 
