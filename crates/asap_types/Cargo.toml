@@ -30,4 +30,4 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 # exactly (`control_plane/Cargo.toml`) -- two different revs of the same
 # git dependency in one workspace resolve to two distinct Rust types that
 # won't unify.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "14a3b53ca9e1436273c3069b0810cb07d5d9287b" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "378a7547ede629a64e84c9f7c810226ce196cce9" }
