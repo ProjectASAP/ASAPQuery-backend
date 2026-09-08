@@ -3485,6 +3485,32 @@ mod tests {
         assert!(native.precompute_plan.materializations.is_empty());
     }
 
+    #[test]
+    fn composable_per_entity_window_uses_raw_rows_instead_of_pooled_state() {
+        use crate::query_plan::{logical::LogicalOperator, QueryPlanNode};
+        let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query("sum_over_time(m[1m])".into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        let plan = snapshot.compile().unwrap();
+        assert!(plan.precompute_plan.materializations.is_empty());
+        let entry = plan.query_plan.lookup("sum_over_time(m[1m])").unwrap();
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::Scan { .. },
+                ..
+            }
+        )));
+        assert!(entry.nodes.values().all(|node| !matches!(
+            node,
+            QueryPlanNode::ReadMaterialization { .. } | QueryPlanNode::ExactFallback { .. }
+        )));
+    }
+
     // Each operand retains its source and range rather than borrowing the root window.
     #[test]
     fn composable_binary_binds_independent_source_windows() {
@@ -3602,8 +3628,9 @@ mod tests {
         ))
         .unwrap();
         let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
+        entries[0].query = Query("sum(sum_over_time(m[1m]))".into());
         let mut second = entries[0].clone();
-        second.query = Query("quantile_over_time(0.90, m[1m])".into());
+        second.query = Query("sum(sum_over_time(m[1m])) * 2".into());
         entries.push(second);
         let bundle = snapshot.compile().unwrap();
         assert_eq!(bundle.query_plan.entries.len(), 2);
@@ -3790,7 +3817,7 @@ mod tests {
             language: QueryLanguage::PromQL,
             query_batch: None,
             repeating_queries: Some(vec![RepeatingEntry {
-                query: Query("quantile_over_time(0.99, m[1m])".into()),
+                query: Query("sum(sum_over_time(m[1m]))".into()),
                 demand: RepeatedDemand::FixedInterval(RepetitionInterval(10_000)),
                 requirements: QueryRequirements {
                     accuracy: AccuracyRequirement::Explicit(AccuracyTarget::EpsilonDelta {
@@ -3811,7 +3838,7 @@ mod tests {
         let mut environment = environment(10_000);
         environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         environment.collector_ids.clear();
-        let template = request("template", "quantile_over_time(0.99, m[1m])")
+        let template = request("template", "sum(sum_over_time(m[1m]))")
             .queries
             .remove(0);
         let snapshot = BackendLocalPlanningSnapshot {
@@ -3923,7 +3950,7 @@ mod tests {
     }
 
     #[test]
-    fn checked_in_backend_local_snapshot_is_canonical_and_compilable() {
+    fn checked_in_per_entity_snapshot_preserves_native_alternative() {
         let source = include_str!("../../../docs/examples/asapquery-planning-snapshot.json");
         let snapshot: BackendLocalPlanningSnapshot =
             serde_json::from_str(source).expect("strict canonical workload fixture");
@@ -3931,7 +3958,21 @@ mod tests {
         let fixture: serde_json::Value = serde_json::from_str(source).expect("fixture JSON");
         assert_eq!(encoded, fixture);
 
-        let plan = snapshot.compile().expect("fixture compiles");
+        assert!(snapshot
+            .clone()
+            .compile()
+            .unwrap_err()
+            .to_string()
+            .contains("native residual substitution requires an exact selected value"));
+        let (request, environment) = snapshot.planning_request().unwrap();
+        let native = crate::physical::workload_cost::with_exact_alternative(request)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let plan = PhysicalCompiler
+            .compile(native, environment)
+            .expect("native fixture compiles");
+        assert!(plan.precompute_plan.materializations.is_empty());
         assert!(plan.collector_plans.is_empty());
         assert!(plan.transmission_plan.rules.is_empty());
         assert_eq!(
@@ -3942,17 +3983,30 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_demo_snapshot_compiles_the_complete_query_matrix() {
+    fn compatibility_demo_preserves_complete_native_query_matrix() {
         let source =
             include_str!("../../../docs/examples/asapquery-compatibility-demo-snapshot.json");
         let snapshot: BackendLocalPlanningSnapshot =
             serde_json::from_str(source).expect("strict compatibility demo fixture");
-        let plan = snapshot.compile().expect("compatibility demo compiles");
+        assert!(snapshot
+            .clone()
+            .compile()
+            .unwrap_err()
+            .to_string()
+            .contains("native residual substitution requires an exact selected value"));
+        let (request, environment) = snapshot.planning_request().unwrap();
+        let native = crate::physical::workload_cost::with_exact_alternative(request)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let plan = PhysicalCompiler
+            .compile(native, environment)
+            .expect("native demo compiles");
 
         assert!(plan.collector_plans.is_empty());
         assert!(plan.transmission_plan.rules.is_empty());
         assert_eq!(plan.query_plan.entries.len(), 6);
-        assert_eq!(plan.precompute_plan.materializations.len(), 4);
+        assert!(plan.precompute_plan.materializations.is_empty());
         for query in [
             "rate(asap_demo_counter_total[5s])",
             "increase(asap_demo_counter_total[5s])",
