@@ -158,12 +158,16 @@ pub fn execute<E: SummaryExecutor>(
             reduction,
             ..
         } => {
-            let col = match input.item.as_ref().unwrap_or(&input.weight) {
-                planner_types::post_asap::SummaryInputExpr::Column(col) => col.clone(),
-                planner_types::post_asap::SummaryInputExpr::Constant(value) if *value == 1.0 => {
-                    ColumnRef::SampleValue
+            // This legacy adapter forwards one value column, not a complete
+            // keyed item/weight contract. Do not silently treat a unit-weight
+            // count as a sample-value sum or drop the weight of a keyed update.
+            let col = match (&input.item, &input.weight) {
+                (None, planner_types::post_asap::SummaryInputExpr::Column(col)) => col.clone(),
+                _ => {
+                    return Err(ExecError::NotYetSupported(
+                        "keyed or non-column summary update",
+                    ))
                 }
-                _ => return Err(ExecError::NotYetSupported("summary update expression")),
             };
             let tagged = exec.find_candidates(family, &col, reduction, child)?;
             if tagged.is_empty() {
@@ -489,6 +493,63 @@ mod tests {
             panic!("expected a value");
         };
         assert_eq!(only(v), 7.0);
+    }
+
+    /// Legacy candidate lookup cannot discard keyed items or constant weights
+    /// when adapting the planner's typed update contract.
+    #[test]
+    fn unsupported_update_semantics_fail_before_candidate_lookup() {
+        use planner_types::post_asap::{SummaryInputExpr, SummaryUpdate};
+        let exec = MockExecutor::new();
+        exec.register(7.0);
+        for input in [
+            SummaryUpdate {
+                item: Some(SummaryInputExpr::Column(ColumnRef::Named("key".into()))),
+                weight: SummaryInputExpr::Column(ColumnRef::SampleValue),
+            },
+            SummaryUpdate {
+                item: None,
+                weight: SummaryInputExpr::Constant(1.0),
+            },
+        ] {
+            let mut tree = agg_node(sum(), logical_node());
+            let SummaryExpr::SummaryAgg { input: update, .. } = &mut Rc::make_mut(&mut tree).expr
+            else {
+                unreachable!()
+            };
+            *update = input;
+            assert!(matches!(
+                execute(&tree, &exec),
+                Err(ExecError::NotYetSupported(
+                    "keyed or non-column summary update"
+                ))
+            ));
+        }
+    }
+
+    /// Binary summaries remain explicit unsupported execution until value and
+    /// label/time matching are implemented by the warm tier.
+    #[test]
+    fn binary_summary_is_not_executed_as_one_operand() {
+        let child = logical_node();
+        let tree = SummaryNode {
+            expr: SummaryExpr::BinaryOp {
+                lhs: child.clone(),
+                rhs: child.clone(),
+                operator: planner_types::post_asap::BinaryOperator {
+                    kind: planner_types::pre_asap::BinaryOpKind::Arithmetic(
+                        planner_types::pre_asap::ArithmeticOpKind::Div,
+                    ),
+                    vector_match: None,
+                },
+            },
+            schema: child.schema.clone(),
+            guarantee: None,
+        };
+        assert!(matches!(
+            execute(&tree, &MockExecutor::new()),
+            Err(ExecError::NotYetSupported("BinaryOp"))
+        ));
     }
 
     #[test]

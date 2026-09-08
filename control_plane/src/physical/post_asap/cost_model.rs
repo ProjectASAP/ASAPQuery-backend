@@ -36,6 +36,11 @@
 #![allow(dead_code)]
 
 use asap_aware_mapping::cost_model::{Cost, CostedSummaryDeployment};
+use asap_aware_mapping::empirical_comparison::{
+    recommend_offline, OfflineComparisonEvidence, OfflineComparisonRequest, OfflineRecommendation,
+    SketchConfiguration,
+};
+use asap_aware_mapping::empirical_cost::EmpiricalEvidenceProvider;
 use asap_aware_mapping::{
     CompleteSummaryCandidateEstimate, CostModel, Horizon, Implementation,
     SummaryMaintenanceCapabilities, SummaryMaintenanceLifecycleCostInputs,
@@ -59,6 +64,8 @@ pub struct ControlPlaneCostModel {
     lifecycle_costs: SummaryMaintenanceLifecycleCostInputs,
     summary_maintenance: SummaryMaintenanceCapabilities,
     window_framework_costs: Vec<(SummaryWindowFramework, Cost)>,
+    offline_evidence: Option<EmpiricalEvidenceProvider>,
+    offline_frequency_comparison: Option<(OfflineComparisonEvidence, OfflineComparisonRequest)>,
 }
 
 impl ControlPlaneCostModel {
@@ -68,7 +75,142 @@ impl ControlPlaneCostModel {
             lifecycle_costs: SummaryMaintenanceLifecycleCostInputs::default(),
             summary_maintenance: SummaryMaintenanceCapabilities::default(),
             window_framework_costs: Vec::new(),
+            offline_evidence: None,
+            offline_frequency_comparison: None,
         }
+    }
+
+    /// Use offline update CPU evidence for algorithm ordering. Physical costs
+    /// and accuracy guarantees retain their deployment-specific contracts.
+    pub fn with_offline_evidence(mut self, evidence: EmpiricalEvidenceProvider) -> Self {
+        self.offline_evidence = Some(evidence);
+        self
+    }
+
+    pub fn offline_evidence(&self) -> Option<&EmpiricalEvidenceProvider> {
+        self.offline_evidence.as_ref()
+    }
+
+    /// Opt into a fixed-snapshot frequency comparison. The caller asserts that
+    /// the explicit point queries use the supplied integer-key distribution and
+    /// offline probe population. The observed mean is an acceptance criterion
+    /// over that population, not a per-key or real-time error guarantee.
+    pub fn with_offline_frequency_comparison(
+        mut self,
+        evidence: OfflineComparisonEvidence,
+        request: OfflineComparisonRequest,
+    ) -> Self {
+        self.offline_frequency_comparison = Some((evidence, request));
+        self
+    }
+
+    /// Explain the same recommendation used by the frequency extension binder.
+    /// Exact selection and any unavailable comparison preserve exact execution.
+    pub fn offline_frequency_recommendation(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<OfflineRecommendation, String> {
+        let (evidence, request) = self
+            .offline_frequency_comparison
+            .as_ref()
+            .ok_or("offline frequency comparison is not configured")?;
+        if payload
+            .get("item_label")
+            .and_then(|v| v.as_str())
+            .is_none_or(str::is_empty)
+            || payload
+                .get("item_value")
+                .and_then(|v| v.as_str())
+                .and_then(|v| v.parse::<i64>().ok())
+                .is_none()
+        {
+            return Err(
+                "offline point-frequency comparison requires an explicit integer item readout"
+                    .into(),
+            );
+        }
+        let accuracy: AccuracyTarget = serde_json::from_value(
+            payload
+                .get("accuracy")
+                .cloned()
+                .ok_or("missing frequency accuracy")?,
+        )
+        .map_err(|error| error.to_string())?;
+        let (eps, delta) = self
+            .combined_eps_delta(&accuracy)
+            .ok_or("exact accuracy requires exact execution")?;
+        if !eps.is_finite()
+            || eps <= 0.0
+            || eps >= 1.0
+            || !delta.is_finite()
+            || delta <= 0.0
+            || delta >= 1.0
+        {
+            return Err("invalid frequency accuracy budget".into());
+        }
+        let (width, depth) = Self::cms_width_depth(eps, delta);
+        let width = width
+            .checked_next_power_of_two()
+            .ok_or("frequency width overflows")?;
+        let mut request = request.clone();
+        // Only CMS is supported by the backend's frequency capability table.
+        // Caller-supplied minima cannot weaken workload/intent requirements.
+        request.formal_minimums = Some(vec![SketchConfiguration {
+            algorithm: SketchAlgorithm::Cms,
+            params: SketchParams::Cms { width, depth },
+        }]);
+        evidence
+            .sketch_evidence
+            .validate()
+            .map_err(|error| error.to_string())?;
+        // Exclude layouts the backend cannot instantiate before selecting the
+        // winner, so a cheap unsupported width cannot hide a legal measured one.
+        let mut evidence = evidence.clone();
+        evidence.sketch_evidence.records.retain(|row| {
+            row.algorithm == SketchAlgorithm::Cms
+                && matches!(&row.params, SketchParams::Cms { width, .. } if width.is_power_of_two())
+        });
+        evidence.query_bindings.retain(|binding| {
+            evidence
+                .sketch_evidence
+                .records
+                .iter()
+                .any(|row| row.id == binding.record_id)
+        });
+        recommend_offline(&evidence, &request)
+    }
+
+    fn rank_with_offline_evidence(
+        &self,
+        intent: &AggIntent,
+        defaults: Vec<SketchAlgorithm>,
+    ) -> Vec<SketchAlgorithm> {
+        let Some(provider) = &self.offline_evidence else {
+            return defaults;
+        };
+        let accuracy = intent_accuracy(intent);
+        if matches!(accuracy, AccuracyTarget::Exact) {
+            return defaults;
+        }
+        let (eps, delta) = asap_aware_mapping::replacement::accuracy_budget(&accuracy);
+        // Compare the parameters this deployment will actually bind, not the
+        // planner's default sizing or another benchmark configuration.
+        let costs: Option<Vec<_>> = defaults
+            .iter()
+            .map(|algorithm| {
+                let params = self.size_params(algorithm.clone(), intent, eps, delta);
+                let row = provider.lookup(algorithm, &params).ok()?;
+                Some((
+                    algorithm.clone(),
+                    row.metrics.resources.cpu.update_cpu_ns.as_ref()?.value,
+                ))
+            })
+            .collect();
+        let Some(mut costs) = costs else {
+            return defaults;
+        };
+        costs.sort_by(|left, right| left.1.total_cmp(&right.1));
+        costs.into_iter().map(|(algorithm, _)| algorithm).collect()
     }
 
     /// Bind the cheapest complete, workload-scoped physical realization for
@@ -269,7 +411,7 @@ impl CostModel for ControlPlaneCostModel {
         intent: &AggIntent,
         candidates: &[SketchAlgorithm],
     ) -> Vec<SketchAlgorithm> {
-        match intent {
+        let defaults = match intent {
             // bind_ddsketch_quantile (priority 6) always wins the old
             // dispatcher's tie-break over bind_kll_quantile (priority 5)
             // whenever both can bind (see bind_kll_quantile.rs's
@@ -301,7 +443,8 @@ impl CostModel for ControlPlaneCostModel {
             // binds one family for each; asap-plan's static order already
             // puts it first (`summary_candidates`), nothing to reorder.
             _ => candidates.to_vec(),
-        }
+        };
+        self.rank_with_offline_evidence(intent, defaults)
     }
 
     fn size_params(
@@ -385,6 +528,19 @@ impl CostModel for ControlPlaneCostModel {
     fn realize_extension(&self, ext_kind: &str, payload: &serde_json::Value) -> Implementation {
         if ext_kind != FREQUENCY_EXT_KIND {
             return Implementation::PassThrough;
+        }
+        if self.offline_frequency_comparison.is_some() {
+            return self
+                .offline_frequency_recommendation(payload)
+                .ok()
+                .and_then(|recommendation| recommendation.selected_sketch().cloned())
+                .map(|configuration| {
+                    Implementation::Sketch(planner_types::post_asap::SketchKind::new(
+                        configuration.algorithm,
+                        configuration.params,
+                    ))
+                })
+                .unwrap_or(Implementation::PassThrough);
         }
         let Some(accuracy) = payload
             .get("accuracy")
