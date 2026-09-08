@@ -3924,7 +3924,7 @@ mod tests {
     #[test]
     fn tumbling_sizes_are_selected_by_cost_and_installed() {
         for (small_cost, expected_secs, expected_id) in [(0.1, 10, "small"), (10.0, 60, "large")] {
-            let mut request = request("q", "sum_over_time(m[1m])");
+            let mut request = request("q", "sum(sum_over_time(m[1m]))");
             let query = &mut request.queries[0];
             let mut small = query.window_implementations[0].clone();
             small.implementation_id = "small".into();
@@ -3943,7 +3943,10 @@ mod tests {
                 .next()
                 .unwrap();
             assert_eq!(materialization.window.size_ms, expected_secs * 1000);
-            let entry = bundle.query_plan.lookup("sum_over_time(m[1m])").unwrap();
+            let entry = bundle
+                .query_plan
+                .lookup("sum(sum_over_time(m[1m]))")
+                .unwrap();
             assert_eq!(entry.instant.lookback_ms, 60_000);
             assert_eq!(
                 entry.materialization_bindings()[0].window_ms,
@@ -3959,8 +3962,10 @@ mod tests {
     // Distinct logical cohorts cannot silently coalesce using only the first quote.
     #[test]
     fn selected_panes_reject_unpriced_cross_cohort_coalescing() {
-        let mut workload = request("q20", "sum_over_time(m[20s])");
-        let mut second = request("q40", "sum_over_time(m[40s])").queries.remove(0);
+        let mut workload = request("q20", "sum(sum_over_time(m[20s]))");
+        let mut second = request("q40", "sum(sum_over_time(m[40s]))")
+            .queries
+            .remove(0);
         workload.queries[0].window_secs = 20;
         workload.queries[0].window_implementations[0].window_secs = 20;
         second.window_secs = 40;
@@ -3982,7 +3987,7 @@ mod tests {
     // Non-divisor panes cannot reconstruct a lookback from whole states.
     #[test]
     fn tumbling_sizes_reject_non_divisors() {
-        let mut request = request("q", "sum_over_time(m[1m])");
+        let mut request = request("q", "sum(sum_over_time(m[1m]))");
         request.queries[0].window_implementations[0].pane_secs = 7;
         let mut env = environment(10_000);
         env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;

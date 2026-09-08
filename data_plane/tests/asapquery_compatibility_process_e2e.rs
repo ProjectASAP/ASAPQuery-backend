@@ -1253,6 +1253,11 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         .unwrap();
     snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
         planner_types::workload::Query("rate(asap_demo_counter_total[1m])".into());
+    // This fixture constructs an old envelope counter over whole retired panes,
+    // not a real-time retracting raw counter (which Planner correctly refuses).
+    snapshot.query_workload.repeating_queries.as_mut().unwrap()[0]
+        .time_selection
+        .scope = planner_types::workload::QueryTimeScope::Unknown;
     let (mut legacy_request, mut environment) = snapshot.planning_request().unwrap();
     let query = &mut legacy_request.queries[0];
     let parsed = control_plane::query_parser::parse_query_expr_canonical(
