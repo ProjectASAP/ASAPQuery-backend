@@ -174,7 +174,14 @@ fn offline_frequency_filters_backend_layout_before_comparison() {
         width: 1500,
         depth: 5,
     };
-    unsupported.metrics.resources.cpu.update_cpu_ns.as_mut().unwrap().value = 0.001;
+    unsupported
+        .metrics
+        .resources
+        .cpu
+        .update_cpu_ns
+        .as_mut()
+        .unwrap()
+        .value = 0.001;
     let mut query_binding = evidence.query_bindings[1].clone();
     query_binding.record_id = unsupported.id.clone();
     evidence.query_bindings.push(query_binding);
