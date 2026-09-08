@@ -129,6 +129,7 @@ crc32fast = "1.4"
 # none of them.
 
 [dev-dependencies]
+asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "378a7547ede629a64e84c9f7c810226ce196cce9" }
 tempfile = "3.20.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio-tungstenite = "0.21"

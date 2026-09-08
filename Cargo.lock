@@ -980,6 +980,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "arrow",
+ "asap-aware-mapping",
  "asap-precompute-rs",
  "asap-types",
  "asap_otel_proto",

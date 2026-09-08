@@ -117,6 +117,266 @@ fn is_warm(response: &Value) -> bool {
     })
 }
 
+// Both heap implementations must execute registered temporal counts through
+// an installed QueryPlan, retaining all three ranked identities and values.
+#[tokio::test]
+async fn registered_temporal_topk_cms_heap() {
+    registered_temporal_topk(planner_types::post_asap::SketchAlgorithm::CmsWithHeap).await;
+}
+
+#[tokio::test]
+async fn registered_temporal_topk_count_sketch_heap() {
+    registered_temporal_topk(planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap).await;
+}
+
+async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlgorithm) {
+    use control_plane::physical::compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler};
+    use planner_types::post_asap::{CompositionOperator, SketchQuery, SummaryFamilyType};
+    const QUERY: &str = "topk(3, count_over_time(top_endpoint_qps[5s]))";
+    struct Evidence;
+    impl asap_aware_mapping::AccuracyEvidenceProvider for Evidence {
+        fn propagation_stats(
+            &self,
+            op: &CompositionOperator,
+            _: &SummaryFamilyType,
+            _: Option<&SketchQuery>,
+        ) -> asap_aware_mapping::PropagationStats {
+            if matches!(op, CompositionOperator::TopKSelection) {
+                asap_aware_mapping::PropagationStats {
+                    topk_selected_lower_bound: Some(95.0),
+                    topk_excluded_upper_bound: Some(80.0),
+                    topk_interval_failure_probability: Some(0.001),
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            }
+        }
+    }
+    let mut fixture: Value = serde_json::from_str(include_str!(
+        "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+    ))
+    .unwrap();
+    let mut entry = fixture["query_workload"]["repeating_queries"][5].clone();
+    entry["query"] = QUERY.into();
+    entry["requirements"]["accuracy"] =
+        serde_json::json!({"explicit": {"EpsilonDelta": {"epsilon": 0.05, "delta": 0.05}}});
+    fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
+    fixture["implementation"]["topk_evidence"] = serde_json::json!({
+        QUERY: {
+            "selected_lower_bound": 95.0, "excluded_upper_bound": 80.0,
+            "interval_failure_probability": 0.001, "observed_at_unix_ms": 9500,
+            "source": "deterministic-count-ranking-fixture"
+        }
+    });
+    let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture).unwrap();
+    let (mut request, environment) = snapshot.planning_request().unwrap();
+    let query = &mut request.queries[0];
+    let expr =
+        control_plane::query_parser::parse_query_expr_canonical(QUERY, query.accuracy.clone())
+            .unwrap();
+    let model = control_plane::physical::post_asap::cost_model::ForcedFamilyCostModel::new(
+        query.accuracy.clone(),
+        algorithm.clone(),
+    );
+    query.post_asap = control_plane::planner_selection::select_summary_with_evidence(
+        &expr,
+        &model,
+        &asap_aware_mapping::DefaultAccuracyModel,
+        &asap_aware_mapping::EqualSplitAllocator,
+        &Evidence,
+    )
+    .unwrap();
+    let plan = PhysicalCompiler.compile(request, environment).unwrap();
+    assert_eq!(plan.precompute_plan.materializations.len(), 1);
+    use data_plane::storage_engines::types::AggregationType;
+    let expected_type = match algorithm {
+        planner_types::post_asap::SketchAlgorithm::CmsWithHeap => {
+            AggregationType::CountMinSketchWithHeap
+        }
+        planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap => {
+            AggregationType::CountSketchWithHeap
+        }
+        _ => panic!("fixture requires a heap implementation"),
+    };
+    assert_eq!(
+        plan.precompute_plan.materializations[0].aggregation_type,
+        expected_type
+    );
+    assert_eq!(
+        plan.precompute_plan.materializations[0].parameters["weight_mode"],
+        "count"
+    );
+    let artifact = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
+        precompute_plan: plan.precompute_plan,
+        transmission_plan: plan.transmission_plan,
+        backend_plan: plan.backend_plan.encode_to_vec(),
+        query_plan: plan.query_plan,
+        storage_routing: None,
+        adaptation_evidence: vec![],
+    };
+    let output = tempfile::tempdir().unwrap();
+    let mut artifact_file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&mut artifact_file, &artifact).unwrap();
+    let port = unused_port();
+    let fallback = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fallback_url = format!("http://{}", fallback.local_addr().unwrap());
+    let fallback_task = tokio::spawn(async move {
+        axum::serve(fallback, Router::new()
+            .route("/-/healthy", get(|| async { "healthy" }))
+            .route("/api/v1/query", get(|| async { Json(serde_json::json!({
+                "status": "error", "errorType": "execution", "error": "fixture exact backend unavailable"
+            })) }))).await.unwrap();
+    });
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_data_plane"))
+            .args(["--profile", "asapquery", "--physical-plan"])
+            .arg(artifact_file.path())
+            .args([
+                "--forward-unsupported-queries",
+                "--prometheus-server",
+                &fallback_url,
+            ])
+            .args(["--http-port", &port.to_string(), "--output-dir"])
+            .arg(output.path())
+            .args([
+                "--precompute-allowed-lateness-ms",
+                "0",
+                "--precompute-flush-interval-ms",
+                "25",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let client = reqwest::Client::new();
+    let backend = format!("http://127.0.0.1:{port}");
+    wait_until_ready(&client, &format!("{backend}/api/v1/health"), &mut child.0).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let base = now - now.rem_euclid(5000) - 20000;
+    let counts = [
+        ("alpha", 100),
+        ("beta", 50),
+        ("gamma", 200),
+        ("delta", 75),
+        ("epsilon", 10),
+        ("zeta", 150),
+    ];
+    let samples = WriteRequest {
+        timeseries: counts
+            .iter()
+            .map(|(item, count)| {
+                // Non-unit values distinguish count updates from accidental weighted sums.
+                let points = (0..2)
+                    .flat_map(|window| {
+                        (0..*count).map(move |i| (base + window * 5000 + 10 + i * 20, 17.0))
+                    })
+                    .collect::<Vec<_>>();
+                series_with_labels("top_endpoint_qps", &[("endpoint", item)], &points)
+            })
+            .collect(),
+    };
+    assert_eq!(remote_write(&client, &backend, &samples).await, 204);
+    let watermark = WriteRequest {
+        timeseries: vec![series_with_labels(
+            "top_endpoint_qps",
+            &[("endpoint", "gamma")],
+            &[(base + 10500, 17.0)],
+        )],
+    };
+    assert_eq!(remote_write(&client, &backend, &watermark).await, 204);
+    assert_eq!(remote_write(&client, &backend, &samples).await, 204);
+    let timestamp = (base + 5000) as f64 / 1000.0;
+    let instant = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let response: Value = client
+                .get(format!("{backend}/api/v1/query"))
+                .query(&[
+                    ("query", QUERY.to_string()),
+                    ("time", timestamp.to_string()),
+                ])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if response["status"] == "success" && is_warm(&response) {
+                break response;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("registered TopK must become warm within 30s");
+    let expected = [("gamma", 200.0), ("zeta", 150.0), ("alpha", 100.0)];
+    let assert_ranks = |response: &Value, range: bool| {
+        assert_eq!(response["status"], "success", "{response}");
+        assert!(is_warm(response), "{response}");
+        let rows = response["data"]["result"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{response}");
+        for (item, count) in expected {
+            let row = rows
+                .iter()
+                .find(|row| {
+                    row["metric"]["item"].as_str()
+                        == Some(format!("top_endpoint_qps{{endpoint=\"{item}\"}}").as_str())
+                })
+                .unwrap_or_else(|| panic!("missing {item}: {response}"));
+            let points = if range {
+                let points = row["values"].as_array().unwrap();
+                assert_eq!(points.len(), 2);
+                points.clone()
+            } else {
+                vec![row["value"].clone()]
+            };
+            for (index, point) in points.iter().enumerate() {
+                assert_eq!(point[0].as_f64(), Some(timestamp + index as f64 * 5.0));
+                assert_eq!(
+                    point[1].as_str().unwrap().parse::<f64>().unwrap(),
+                    count,
+                    "{response}"
+                );
+            }
+        }
+    };
+    assert_ranks(&instant, false);
+    let range: Value = client
+        .get(format!("{backend}/api/v1/query_range"))
+        .query(&[
+            ("query", QUERY.to_string()),
+            ("start", timestamp.to_string()),
+            ("end", (timestamp + 5.0).to_string()),
+            ("step", "5".into()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ranks(&range, true);
+    let unregistered: Value = client
+        .get(format!("{backend}/api/v1/query"))
+        .query(&[("query", "topk(3, top_endpoint_qps)")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        unregistered["status"], "error",
+        "unregistered query must not replan: {unregistered}"
+    );
+    assert_eq!(unregistered["error"], "fixture exact backend unavailable");
+    fallback_task.abort();
+}
+
 // Three registered consumers must observe one raw SUM/count producer, including
 // uneven instance sample counts and Remote Write retries.
 #[tokio::test]
