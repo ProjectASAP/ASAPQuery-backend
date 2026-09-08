@@ -8,6 +8,11 @@ Backend-specific implementation design notes are organized by component under
 [`../developer_docs`](../developer_docs/README.md). They explain current Rust
 internals and are subordinate to the shared system contracts.
 
+Proposals for shared-contract review (not duplicate normative specifications):
+
+- [Self-Describing Summary (SDS)](self-describing-summary.md): Schema,
+  Dictionary and Record structure definitions.
+
 Backend-specific operating profiles:
 
 - [ASAPQuery compatibility profile](asapquery-compatibility-profile.md) defines
