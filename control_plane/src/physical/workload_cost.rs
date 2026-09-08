@@ -461,10 +461,13 @@ mod tests {
     use super::*;
 
     fn fixture() -> BackendLocalPlanningSnapshot {
-        serde_json::from_str(include_str!(
+        let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
-        .unwrap()
+        .unwrap();
+        snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+            planner_types::workload::Query("sum(sum_over_time(m[1m]))".into());
+        snapshot
     }
 
     fn quoted() -> (
@@ -663,7 +666,7 @@ mod tests {
         let mut shared = request.clone();
         let mut second = shared.queries[0].clone();
         second.query_id = "second-consumer".into();
-        second.query_string = "quantile_over_time(0.5, m[1m])".into();
+        second.query_string = "sum(count_over_time(m[1m]))".into();
         let entries = shared
             .query_workload
             .as_mut()

@@ -1,7 +1,7 @@
 //! Black-box acceptance test for the collector-free ASAPQuery profile.
 //!
 //! Starts the production binary from a canonical workload snapshot, ingests
-//! only Prometheus Remote Write v1, exercises safe warm families and counter fallback
+//! only Prometheus Remote Write v1, exercises safe warm families and per-series fallback
 //! through instant and range APIs, and verifies exact fallback request parity.
 
 use std::collections::HashMap;
@@ -930,11 +930,12 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let first_eval = (base + 5_000) as f64 / 1_000.0;
     let second_eval = (base + 10_000) as f64 / 1_000.0;
     let backend_log = output_dir.path().join("query_engine.log");
-    // Counter roots retain the complete exact request until independent series
-    // reset/timestamp state is represented by the backend raw producer.
+    // Counter and bare per-series quantile roots retain the complete exact request
+    // until raw producers can preserve the required per-series state.
     for query in [
         "rate(asap_demo_counter_total[5s])",
         "increase(asap_demo_counter_total[5s])",
+        "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
     ] {
         let instant: Value = client
             .get(format!("{backend}/api/v1/query"))
@@ -970,15 +971,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let sum = wait_for_warm_instant(
         &client,
         &backend,
-        "sum_over_time(asap_demo_gauge[5s])",
-        first_eval,
-        &backend_log,
-    )
-    .await;
-    let quantile = wait_for_warm_instant(
-        &client,
-        &backend,
-        "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
+        "sum(sum_over_time(asap_demo_gauge[5s]))",
         first_eval,
         &backend_log,
     )
@@ -1023,15 +1016,9 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         "asap_demo_gauge{job=\"api\"}"
     );
     assert!((first_value(&sum, "value").expect("sum value") - 240.0).abs() < 1e-9);
-    let quantile_value = first_value(&quantile, "value").expect("quantile value");
-    assert!(
-        (19.0..=31.0).contains(&quantile_value),
-        "unexpected p50: {quantile_value}; response={quantile}"
-    );
 
     for query in [
-        "sum_over_time(asap_demo_gauge[5s])",
-        "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
+        "sum(sum_over_time(asap_demo_gauge[5s]))",
         "topk(1, sum_over_time(asap_demo_gauge[5s]))",
         "topk(1, count_over_time(asap_demo_gauge[5s]))",
     ] {
@@ -1141,7 +1128,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
 
     // Readiness polling may briefly reach the exact fallback before a newly
     // closed warm window is visible. Every planned query above was required
-    // to converge to a warm answer; isolate the explicit fallback assertions.
+    // to converge to its declared warm or exact tier; isolate further fallback assertions.
     fallback_calls.lock().await.clear();
 
     let fallback_instant: Value = client
@@ -1252,7 +1239,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let materializations = status["materializations"]
         .as_array()
         .expect("materialization statuses");
-    assert_eq!(materializations.len(), 4);
+    assert_eq!(materializations.len(), 3);
     assert!(materializations
         .iter()
         .all(|entry| entry["phase"] == "serving"));
