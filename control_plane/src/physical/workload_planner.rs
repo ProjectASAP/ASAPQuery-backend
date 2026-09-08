@@ -809,6 +809,15 @@ mod tests {
         assert!(bind_workload_typed(&w).is_none());
         let bound = bind_workload_typed_with_topk_evidence(&w, &topk_evidence())
             .expect("evidenced top_endpoint_qps must bind");
+        // Count-ranked producers must not revert to value-weighted runtime defaults.
+        let configs = crate::physical::stage_split::split_typed_three_stage(&bound).unwrap();
+        let backend = configs
+            .get(&crate::physical::colored_dag::StageId::Backend)
+            .unwrap();
+        let crate::physical::colored_dag::StageConfig::Backend(backend) = backend else {
+            panic!("expected backend config");
+        };
+        assert_eq!(backend.aggregations[0].heap_update_mode, Some("count"));
         assert_eq!(
             extract_family(&bound),
             Some(SketchAlgorithm::CountSketchWithHeap),
