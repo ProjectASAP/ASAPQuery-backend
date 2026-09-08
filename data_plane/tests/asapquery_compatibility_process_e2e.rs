@@ -381,6 +381,16 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
 // uneven instance sample counts and Remote Write retries.
 #[tokio::test]
 async fn shared_exact_dashboard_executes_selected_workload() {
+    run_shared_dashboard(false).await;
+}
+
+// A selected 5s pane serves advancing 10s lookbacks through the production HTTP path.
+#[tokio::test]
+async fn repeated_dashboard_executes_multiple_selected_panes() {
+    run_shared_dashboard(true).await;
+}
+
+async fn run_shared_dashboard(multi_pane: bool) {
     let fallback_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let fallback_address = fallback_listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -394,8 +404,16 @@ async fn shared_exact_dashboard_executes_selected_workload() {
         "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
     ))
     .unwrap();
-    let sum = "sum by (service) (sum_over_time(asap_demo_gauge[5s]))";
-    let count = "sum by (service) (count_over_time(asap_demo_gauge[5s]))";
+    let sum = if multi_pane {
+        "sum by (service) (sum_over_time(asap_demo_gauge[10s]))"
+    } else {
+        "sum by (service) (sum_over_time(asap_demo_gauge[5s]))"
+    };
+    let count = if multi_pane {
+        "sum by (service) (count_over_time(asap_demo_gauge[10s]))"
+    } else {
+        "sum by (service) (count_over_time(asap_demo_gauge[5s]))"
+    };
     let mean = format!("{sum} / {count}");
     let mut entry = snapshot["query_workload"]["repeating_queries"][2].clone();
     snapshot["query_workload"]["repeating_queries"] = Value::Array(
@@ -409,6 +427,25 @@ async fn shared_exact_dashboard_executes_selected_workload() {
     );
     let mut typed: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
         serde_json::from_value(snapshot.clone()).unwrap();
+    if multi_pane {
+        for entry in typed.query_workload.repeating_queries.as_mut().unwrap() {
+            entry.time_selection.lookback = Some(planner_types::workload::DurationMs(10_000));
+        }
+        let (request, _) = typed.clone().planning_request().unwrap();
+        for query in request.queries {
+            let mut candidates = query.window_implementations;
+            let mut small = candidates[0].clone();
+            small.implementation_id = "five-second-pane".into();
+            small.pane_secs = 5;
+            small.cost.weighted_cost = 0.0;
+            candidates[0].cost.weighted_cost = 10.0;
+            candidates.push(small);
+            typed
+                .implementation
+                .window_candidates
+                .insert(query.query_string, candidates);
+        }
+    }
     let (request, environment) = typed.clone().planning_request().unwrap();
     let candidates =
         control_plane::physical::workload_cost::with_exact_alternative(request).unwrap();
@@ -449,6 +486,16 @@ async fn shared_exact_dashboard_executes_selected_workload() {
     assert!(plan.cost_comparison.is_some());
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
     assert_eq!(plan.query_plan.entries.len(), 3);
+    if multi_pane {
+        assert_eq!(
+            plan.lifecycle_estimates[0].window_implementation_id,
+            "five-second-pane"
+        );
+        for entry in plan.query_plan.entries.values() {
+            assert_eq!(entry.instant.lookback_ms, 10_000);
+            assert_eq!(entry.materialization_bindings()[0].window_ms, 5_000);
+        }
+    }
     let snapshot_path = output_dir.path().join("snapshot.json");
     std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
     let port = unused_port();
@@ -497,7 +544,15 @@ async fn shared_exact_dashboard_executes_selected_workload() {
     };
     let request = WriteRequest {
         timeseries: vec![
-            labeled("api", "a", &[(base + 500, 10.0)]),
+            if multi_pane {
+                labeled(
+                    "api",
+                    "a",
+                    &[(base, 10000.0), (base + 500, 10.0), (base + 5000, 6.0)],
+                )
+            } else {
+                labeled("api", "a", &[(base + 500, 10.0)])
+            },
             labeled(
                 "api",
                 "b",
@@ -518,22 +573,51 @@ async fn shared_exact_dashboard_executes_selected_workload() {
     assert_eq!(remote_write(&client, &backend, &advance).await, 204);
     let final_advance = WriteRequest {
         timeseries: vec![
-            labeled("api", "a", &[(base + 10500, 1000.0)]),
+            if multi_pane {
+                labeled("api", "a", &[(base + 10000, 7.0), (base + 10500, 1000.0)])
+            } else {
+                labeled("api", "a", &[(base + 10500, 1000.0)])
+            },
             labeled("api", "b", &[(base + 10500, 1000.0)]),
             labeled("worker", "c", &[(base + 10500, 1000.0)]),
         ],
     };
     assert_eq!(remote_write(&client, &backend, &final_advance).await, 204);
+    if multi_pane {
+        let close_third = WriteRequest {
+            timeseries: vec![
+                labeled("api", "a", &[(base + 15500, 9999.0)]),
+                labeled("api", "b", &[(base + 15500, 9999.0)]),
+                labeled("worker", "c", &[(base + 15500, 9999.0)]),
+            ],
+        };
+        assert_eq!(remote_write(&client, &backend, &close_third).await, 204);
+    }
+    let evaluation = base + if multi_pane { 10000 } else { 5000 };
     for (query, expected) in [
-        (sum, [24.0, 24.0]),
-        (count, [4.0, 2.0]),
-        (mean.as_str(), [6.0, 12.0]),
+        (
+            sum,
+            if multi_pane {
+                [237.0, 124.0]
+            } else {
+                [24.0, 24.0]
+            },
+        ),
+        (count, if multi_pane { [8.0, 3.0] } else { [4.0, 2.0] }),
+        (
+            mean.as_str(),
+            if multi_pane {
+                [237.0 / 8.0, 124.0 / 3.0]
+            } else {
+                [6.0, 12.0]
+            },
+        ),
     ] {
         let result = wait_for_warm_instant(
             &client,
             &backend,
             query,
-            (base + 5000) as f64 / 1000.0,
+            evaluation as f64 / 1000.0,
             &output_dir.path().join("query_engine.log"),
         )
         .await;
@@ -550,7 +634,7 @@ async fn shared_exact_dashboard_executes_selected_workload() {
             );
             assert_eq!(
                 row["value"][0].as_f64().unwrap(),
-                (base + 5000) as f64 / 1000.0
+                evaluation as f64 / 1000.0
             );
         }
     }
@@ -558,8 +642,8 @@ async fn shared_exact_dashboard_executes_selected_workload() {
         .get(format!("{backend}/api/v1/query_range"))
         .query(&[
             ("query", mean.clone()),
-            ("start", ((base + 5000) as f64 / 1000.0).to_string()),
-            ("end", ((base + 10000) as f64 / 1000.0).to_string()),
+            ("start", (evaluation as f64 / 1000.0).to_string()),
+            ("end", ((evaluation + 5000) as f64 / 1000.0).to_string()),
             ("step", "5".into()),
         ])
         .send()
@@ -572,14 +656,26 @@ async fn shared_exact_dashboard_executes_selected_workload() {
     for row in result["data"]["result"].as_array().unwrap() {
         let values = row["values"].as_array().unwrap();
         assert_eq!(values.len(), 2, "{result}");
-        assert_eq!(values[1][1], "100", "{result}");
+        assert_eq!(
+            values[1][1],
+            if multi_pane {
+                if row["metric"]["service"] == "api" {
+                    "441.4"
+                } else {
+                    "550"
+                }
+            } else {
+                "100"
+            },
+            "{result}"
+        );
     }
     // Unaligned intervals cannot be answered by whole tumbling states.
     let result: Value = client
         .get(format!("{backend}/api/v1/query"))
         .query(&[
             ("query", mean),
-            ("time", ((base + 5001) as f64 / 1000.0).to_string()),
+            ("time", ((evaluation + 1) as f64 / 1000.0).to_string()),
         ])
         .send()
         .await
@@ -1157,6 +1253,11 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         .unwrap();
     snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
         planner_types::workload::Query("rate(asap_demo_counter_total[1m])".into());
+    // This fixture constructs an old envelope counter over whole retired panes,
+    // not a real-time retracting raw counter (which Planner correctly refuses).
+    snapshot.query_workload.repeating_queries.as_mut().unwrap()[0]
+        .time_selection
+        .scope = planner_types::workload::QueryTimeScope::Unknown;
     let (mut legacy_request, mut environment) = snapshot.planning_request().unwrap();
     let query = &mut legacy_request.queries[0];
     let parsed = control_plane::query_parser::parse_query_expr_canonical(

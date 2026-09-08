@@ -2991,6 +2991,11 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
             obj.insert("weight_mode".into(), JsonValue::String(mode.into()));
         }
     }
+    // PromQL range selectors are (start, end]. Encode the boundary convention
+    // in state identity so legacy half-open panes cannot satisfy this binding.
+    if matches!(agg.aggregation_input, AggregationInput::Raw) {
+        parameters["promql_right_closed"] = json!(true);
+    }
     let aggregation_input = match agg.aggregation_input {
         AggregationInput::SketchEnvelope => "sketch_envelope",
         AggregationInput::Raw => "raw",

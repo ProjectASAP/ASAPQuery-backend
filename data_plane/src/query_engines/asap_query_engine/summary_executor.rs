@@ -372,6 +372,42 @@ impl QueryExecutionContext<'_> {
             ExactAgg(AggregationType),
         }
 
+        // A missing pane can mean delayed ingestion, not an empty interval.
+        // Until explicit empty-pane completion exists, multi-pane reads require
+        // every pane for each stored series, before any cross-series merge.
+        let check_panes = |ends: Vec<i64>| -> Result<(), SummaryExecutorError> {
+            let width = binding.window_ms;
+            if width == 0 {
+                return Err(SummaryExecutorError::Unsupported("zero pane width"));
+            }
+            if self.t1_ms.saturating_sub(self.t0_ms) <= width {
+                return Ok(());
+            }
+            if self.t0_ms % width != 0 || self.t1_ms % width != 0 {
+                return Err(SummaryExecutorError::Unsupported("partial pane interval"));
+            }
+            let mut expected = self.t0_ms.checked_add(width);
+            for end in ends {
+                let Ok(end) = u64::try_from(end) else {
+                    continue;
+                };
+                if end <= self.t0_ms {
+                    continue;
+                } // delta decoding carry-in is not an answer pane
+                if Some(end) != expected {
+                    return Err(SummaryExecutorError::Unsupported(
+                        "missing materialized pane",
+                    ));
+                }
+                expected = end.checked_add(width);
+            }
+            if expected != self.t1_ms.checked_add(width) {
+                return Err(SummaryExecutorError::Unsupported(
+                    "incomplete materialized panes",
+                ));
+            }
+            Ok(())
+        };
         let required_keys: BTreeSet<_> = binding.sid_grouping.iter().cloned().collect();
         let mut sids = self.index.sids_for_policy(binding.materialization);
         sids.sort_unstable();
@@ -407,8 +443,10 @@ impl QueryExecutionContext<'_> {
                         .into_iter()
                         .next()
                     else {
+                        check_panes(Vec::new())?;
                         continue;
                     };
+                    check_panes(series.samples.keys().copied().collect())?;
                     let key = match &binding.output_grouping {
                         PhysicalGrouping::PerEntity => series.series_label_values.clone(),
                         PhysicalGrouping::Reduce(keys) => {
@@ -427,8 +465,10 @@ impl QueryExecutionContext<'_> {
                         .into_iter()
                         .next()
                     else {
+                        check_panes(Vec::new())?;
                         continue;
                     };
+                    check_panes(windows.keys().copied().collect())?;
                     let key = match &binding.output_grouping {
                         PhysicalGrouping::PerEntity => labels,
                         PhysicalGrouping::Reduce(keys) => project_group_key(keys, &labels),

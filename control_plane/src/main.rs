@@ -826,6 +826,7 @@ fn compile_physical_plan_request(
     }
 
     let planning_request = physical::compiler::PlanningRequest {
+        query_workload: None,
         queries,
         evidence: request.evidence,
         planner_revision: request.planner_revision,
