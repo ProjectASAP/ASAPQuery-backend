@@ -63,7 +63,7 @@ pub struct ControlPlaneCostModel {
     pub workload_accuracy: AccuracyTarget,
     lifecycle_costs: SummaryMaintenanceLifecycleCostInputs,
     summary_maintenance: SummaryMaintenanceCapabilities,
-    window_framework_costs: Vec<(SummaryWindowFramework, Cost)>,
+    window_framework_costs: Vec<(Option<String>, SummaryWindowFramework, Cost)>,
     offline_evidence: Option<EmpiricalEvidenceProvider>,
     offline_frequency_comparison: Option<(OfflineComparisonEvidence, OfflineComparisonRequest)>,
 }
@@ -213,15 +213,27 @@ impl ControlPlaneCostModel {
         costs.into_iter().map(|(algorithm, _)| algorithm).collect()
     }
 
-    /// Bind the cheapest complete, workload-scoped physical realization for
-    /// each Planner-owned abstract window framework. Concrete implementation
-    /// identities stay in the physical compiler; only framework and cost
-    /// cross into Planner's candidate comparison.
+    /// Keep concrete physical identities in Planner's complete-candidate estimate,
+    /// including distinct pane sizes using the same abstract window framework.
+    pub fn with_window_implementation_costs(
+        mut self,
+        costs: Vec<(String, SummaryWindowFramework, Cost)>,
+    ) -> Self {
+        self.window_framework_costs = costs
+            .into_iter()
+            .map(|(id, framework, cost)| (Some(id), framework, cost))
+            .collect();
+        self
+    }
+
     pub fn with_window_framework_costs(
         mut self,
         costs: Vec<(SummaryWindowFramework, Cost)>,
     ) -> Self {
-        self.window_framework_costs = costs;
+        self.window_framework_costs = costs
+            .into_iter()
+            .map(|(framework, cost)| (None, framework, cost))
+            .collect();
         self
     }
 
@@ -387,14 +399,19 @@ impl CostModel for ControlPlaneCostModel {
             // GOS/error propagation is introduced by the later adaptation
             // slice. Until then, do not claim an approximate exponential
             // histogram window is exact.
-            .filter(|(framework, _)| {
+            .filter(|(_, framework, _)| {
                 !matches!(framework, SummaryWindowFramework::ExponentialHistogram)
             })
-            .filter(|(_, cost)| cost.0.is_finite() && cost.0 >= 0.0)
-            .min_by(|left, right| left.1 .0.total_cmp(&right.1 .0))
+            .filter(|(_, _, cost)| cost.0.is_finite() && cost.0 >= 0.0)
+            .min_by(|left, right| {
+                left.2
+                     .0
+                    .total_cmp(&right.2 .0)
+                    .then_with(|| left.0.cmp(&right.0))
+            })
             .map(
-                |(framework, physical_cost)| CompleteSummaryCandidateEstimate {
-                    physical_plan_id: None,
+                |(id, framework, physical_cost)| CompleteSummaryCandidateEstimate {
+                    physical_plan_id: id.clone(),
                     cost: Cost(lifecycle_cost + physical_cost.0),
                     window_frameworks: vec![Some(framework.clone()); deployments.len()],
                     window_accuracy_guarantee: Some(

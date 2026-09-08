@@ -587,6 +587,14 @@ mod tests {
         ] {
             let (mut request, env) = fixture().planning_request().unwrap();
             request.queries[0].query_string = query.into();
+            request
+                .query_workload
+                .as_mut()
+                .unwrap()
+                .repeating_queries
+                .as_mut()
+                .unwrap()[0]
+                .query = planner_types::workload::Query(query.into());
             let exact = with_exact_alternative(request).unwrap().pop().unwrap();
             let plan = PhysicalCompiler
                 .compile(exact.clone(), env.clone())
@@ -728,6 +736,16 @@ mod tests {
         let mut second = shared.queries[0].clone();
         second.query_id = "second-consumer".into();
         second.query_string = "sum(sum_over_time(m[1m])) * 2".into();
+        let entries = shared
+            .query_workload
+            .as_mut()
+            .unwrap()
+            .repeating_queries
+            .as_mut()
+            .unwrap();
+        let mut demand = entries[0].clone();
+        demand.query = planner_types::workload::Query(second.query_string.clone());
+        entries.push(demand);
         shared.queries.push(second);
         let roots = shared
             .queries

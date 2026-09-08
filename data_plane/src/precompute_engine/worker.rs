@@ -407,18 +407,33 @@ impl Worker {
         }
         let state = self.group_states.get_mut(&sid).unwrap();
 
+        // Keep original timestamps inside accumulators (notably rate/increase),
+        // shifting only pane membership and closure watermark for PromQL (a,b].
+        let right_closed = state
+            .config
+            .parameters
+            .get("promql_right_closed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let pane_timestamp = |ts: i64| {
+            if right_closed {
+                ts.saturating_sub(1)
+            } else {
+                ts
+            }
+        };
         // Find the timestamp span in this batch. A first batch may contain
         // several windows (Prometheus commonly sends catch-up samples after
         // startup), so its minimum timestamp is also the initial closure
         // scan boundary.
         let batch_min_ts = samples
             .iter()
-            .map(|(_, ts, _)| *ts)
+            .map(|(_, ts, _)| pane_timestamp(*ts))
             .min()
             .unwrap_or(i64::MIN);
         let batch_max_ts = samples
             .iter()
-            .map(|(_, ts, _)| *ts)
+            .map(|(_, ts, _)| pane_timestamp(*ts))
             .max()
             .unwrap_or(i64::MIN);
         let previous_event_time = state.max_event_time_ms;
@@ -435,8 +450,9 @@ impl Worker {
         // Route each sample to its pane
         for (series_key, ts, val) in &samples {
             let too_late = previous_event_time != i64::MIN
-                && *ts < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
-            let pane_start = state.window_manager.pane_start_for(*ts);
+                && pane_timestamp(*ts)
+                    < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
+            let pane_start = state.window_manager.pane_start_for(pane_timestamp(*ts));
             let pane_end = pane_start + state.window_manager.slide_interval_ms();
             let pane_closed = !state.active_panes.contains_key(&pane_start)
                 && previous_closure_watermark >= pane_start + state.window_manager.window_size_ms();
