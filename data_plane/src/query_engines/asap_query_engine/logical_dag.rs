@@ -26,6 +26,7 @@ struct Point {
     value: Option<f64>,
 }
 struct Series {
+    max_index: std::sync::OnceLock<super::range_max_index::RangeMaxIndex>,
     labels: Labels,
     points: Vec<Point>,
 }
@@ -85,15 +86,45 @@ impl PreparedSamples {
                 }
             }
             points.dedup_by_key(|point| point.timestamp_ms);
-            series.push(Series { labels, points });
+            series.push(Series {
+                labels,
+                points,
+                max_index: Default::default(),
+            });
         }
         Ok(Self { series })
+    }
+    pub fn prepare_range_max_indexes(&self, metrics: &BTreeSet<String>) {
+        for series in &self.series {
+            if series
+                .labels
+                .get("__name__")
+                .is_some_and(|metric| metrics.contains(metric))
+            {
+                series.max_index.get_or_init(|| {
+                    super::range_max_index::RangeMaxIndex::new(
+                        series.points.iter().map(|point| point.value),
+                    )
+                });
+            }
+        }
+    }
+    pub fn range_max_index_bytes(&self) -> usize {
+        self.series
+            .iter()
+            .filter_map(|series| series.max_index.get())
+            .map(|index| index.estimated_bytes())
+            .sum()
     }
     pub fn estimated_bytes(&self) -> usize {
         self.series
             .iter()
             .map(|series| {
                 std::mem::size_of::<Series>()
+                    + series
+                        .max_index
+                        .get()
+                        .map_or(0, |index| index.estimated_bytes())
                     + series.points.capacity() * std::mem::size_of::<Point>()
                     + series
                         .labels
@@ -276,6 +307,11 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 .ok_or_else(|| miss("missing logical input"))
         };
         match operator {
+            LogicalOperator::ReadRangeMaxIndex {
+                metric,
+                matchers,
+                range_ms,
+            } => self.range_max_index(&metric, &matchers, range_ms, at),
             LogicalOperator::Scan {
                 metric,
                 matchers,
@@ -418,6 +454,57 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 Ok(Value::Matrix(values.into_iter().collect(), start, end))
             }
         }
+    }
+    fn range_max_index(
+        &mut self,
+        metric: &str,
+        matchers: &[LabelMatcher],
+        range_ms: u64,
+        at: i64,
+    ) -> Result<Value, EngineError> {
+        for matcher in matchers {
+            if matches!(matcher.operation, LabelMatch::Regex | LabelMatch::NotRegex)
+                && !self.regexes.contains_key(&matcher.value)
+            {
+                let regex = regex::Regex::new(&format!("(?s)^(?:{})$", matcher.value))
+                    .map_err(|e| miss(format!("unsupported regex: {e}")))?;
+                self.regexes.insert(matcher.value.clone(), regex);
+            }
+        }
+        let start = at
+            .checked_sub(i64::try_from(range_ms).map_err(|_| miss("range overflow"))?)
+            .ok_or_else(|| miss("range overflow"))?;
+        let mut values = Vec::new();
+        for series in self.series {
+            if series.labels.get("__name__").map(String::as_str) != Some(metric)
+                || !matchers.iter().all(|matcher| {
+                    let value = series
+                        .labels
+                        .get(&matcher.name)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    match matcher.operation {
+                        LabelMatch::Equal => value == matcher.value,
+                        LabelMatch::NotEqual => value != matcher.value,
+                        LabelMatch::Regex => self.regexes[&matcher.value].is_match(value),
+                        LabelMatch::NotRegex => !self.regexes[&matcher.value].is_match(value),
+                    }
+                })
+            {
+                continue;
+            }
+            let lo = series.points.partition_point(|p| p.timestamp_ms <= start);
+            let hi = series.points.partition_point(|p| p.timestamp_ms <= at);
+            let index = series.max_index.get_or_init(|| {
+                super::range_max_index::RangeMaxIndex::new(series.points.iter().map(|p| p.value))
+            });
+            // Count only real index access, never a generic scan or successful binding.
+            self.stats.summary_readout_evaluations += 1;
+            if let Some(value) = index.query(lo, hi) {
+                values.push((no_name(series.labels.clone()), value));
+            }
+        }
+        Ok(Value::Vector(values))
     }
     fn scan(
         &mut self,
@@ -763,6 +850,175 @@ mod tests {
         };
         result.values.into_iter().map(|p| p.value).collect()
     }
+    #[test]
+    fn indexed_max_preserves_filters_labels_boundaries_and_real_readout_provenance() {
+        let mut samples = vec![
+            sample(
+                "service_retry_queue_depth",
+                "user-service",
+                1_000,
+                Some(999.),
+            ),
+            sample("service_retry_queue_depth", "user-service", 1_001, Some(4.)),
+            sample("service_retry_queue_depth", "user-service", 2_056, Some(8.)),
+            sample(
+                "service_retry_queue_depth",
+                "order-service",
+                2_000,
+                Some(30.),
+            ),
+        ];
+        let mut extra = sample(
+            "service_retry_queue_depth",
+            "user-service",
+            1_500,
+            Some(11.),
+        );
+        extra.labels.insert("instance".into(), "other".into());
+        samples.push(extra);
+        let prepared = PreparedSamples::new(&samples).unwrap();
+        assert_eq!(prepared.range_max_index_bytes(), 0);
+        for selector in [
+            r#"job="user-service""#,
+            r#"job=~".+""#,
+            r#"job!="order-service",absent="""#,
+            r#"job!~"order.*""#,
+        ] {
+            let query = format!("max_over_time(service_retry_queue_depth{{{selector}}}[1056ms])");
+            let raw = entry(&query);
+            let mut indexed = raw.clone();
+            let scan = raw
+                .nodes
+                .values()
+                .find_map(|node| match node {
+                    QueryPlanNode::Logical {
+                        operator:
+                            LogicalOperator::Scan {
+                                metric: Some(metric),
+                                matchers,
+                                range_ms: Some(range_ms),
+                                ..
+                            },
+                        ..
+                    } => Some(LogicalOperator::ReadRangeMaxIndex {
+                        metric: metric.clone(),
+                        matchers: matchers.clone(),
+                        range_ms: *range_ms,
+                    }),
+                    _ => None,
+                })
+                .unwrap();
+            indexed.nodes = [(
+                indexed.root,
+                QueryPlanNode::Logical {
+                    operator: scan,
+                    inputs: vec![],
+                },
+            )]
+            .into();
+            for at in [2056, 2057, 2500, 4000] {
+                let (expected, _) =
+                    execute_prepared_with_stats(&raw, &prepared, at, |_, _| unreachable!())
+                        .unwrap();
+                let (actual, stats) =
+                    execute_prepared_with_stats(&indexed, &prepared, at, |_, _| unreachable!())
+                        .unwrap();
+                assert_eq!(
+                    serde_json::to_value(actual).unwrap(),
+                    serde_json::to_value(expected).unwrap(),
+                    "{query} at {at}"
+                );
+                assert_eq!(stats.raw_scan_evaluations, 0);
+                assert!(stats.summary_readout_evaluations > 0);
+            }
+        }
+        let bytes = prepared.range_max_index_bytes();
+        assert!(bytes > 0 && bytes < prepared.estimated_bytes());
+    }
+
+    #[test]
+    fn real_planner_max_index_matches_exact_at_56_seconds_and_rebuilds_after_input() {
+        use crate::query_engines::raw_store::RawSampleStore;
+        use control_plane::physical::compiler::BackendLocalPlanningSnapshot;
+        let query = r#"max_over_time(service_cache_refresh_lag_seconds{job="user-service"}[12h])"#;
+        let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let q = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        q.query = planner_types::workload::Query(query.into());
+        q.requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
+            planner_types::types::AccuracyTarget::Exact,
+        );
+        let plan = snapshot.compile().unwrap();
+        let installed = plan.query_plan.lookup(query).unwrap();
+        assert!(installed.nodes.values().any(|n| matches!(
+            n,
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::ReadRangeMaxIndex { .. },
+                ..
+            }
+        )));
+        let at = 1_788_891_296_000_i64;
+        let start = at - 43_200_000;
+        let metric = "service_cache_refresh_lag_seconds";
+        let samples = [
+            sample(metric, "user-service", start, Some(999.)),
+            sample(metric, "user-service", start + 1, Some(4.)),
+            sample(metric, "user-service", at, Some(8.)),
+            sample(metric, "order-service", at, Some(500.)),
+        ];
+        let metrics = BTreeSet::from([metric.into()]);
+        let store = RawSampleStore::default();
+        store.append_admitted(1, 1, &samples, &metrics, false);
+        let first = store.snapshot(1, 1).unwrap();
+        first.prepare_range_max_indexes(&metrics);
+        let bytes = store.range_max_index_bytes();
+        assert!(bytes > 0);
+        let execute_index = |data: &PreparedSamples| {
+            execute_prepared_with_stats(installed, data, at as u64, |_, _| unreachable!()).unwrap()
+        };
+        let (actual, stats) = execute_index(&first);
+        let expected = execute(&entry(query), &samples, at as u64).unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        assert_eq!(stats.raw_scan_evaluations, 0);
+        assert_eq!(stats.summary_readout_evaluations, 1);
+        assert_eq!(
+            store.range_max_index_bytes(),
+            bytes,
+            "query must reuse eager state"
+        );
+        store.append_admitted(
+            1,
+            1,
+            &[sample(metric, "user-service", at - 1, Some(20.))],
+            &metrics,
+            false,
+        );
+        assert_eq!(
+            store.range_max_index_bytes(),
+            0,
+            "admission must invalidate prior index"
+        );
+        let next = store.snapshot(1, 1).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&first, &next));
+        next.prepare_range_max_indexes(&metrics);
+        let (QueryResult::Vector(updated), _) = execute_index(&next) else {
+            panic!()
+        };
+        assert_eq!(updated.values[0].value, 20.);
+        let (QueryResult::Vector(old), _) = execute_index(&first) else {
+            panic!()
+        };
+        assert_eq!(
+            old.values[0].value, 8.,
+            "in-flight snapshot remains coherent"
+        );
+    }
+
     // Regex alternation remains fully anchored and missing labels compare as empty.
     #[test]
     fn anchored_matchers_and_missing_labels() {

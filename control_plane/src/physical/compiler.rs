@@ -2014,7 +2014,7 @@ impl PhysicalCompiler {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             stable_workload_plan_id(&plan_materializations, &request.queries).hash(&mut hash);
-            "typed-local-residual-v1".hash(&mut hash);
+            "typed-local-residual-v2-range-max-index".hash(&mut hash);
             for query in &request.queries {
                 format!("{:?}", query.post_asap).hash(&mut hash);
             }

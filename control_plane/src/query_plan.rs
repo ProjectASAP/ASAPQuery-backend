@@ -429,6 +429,18 @@ where
         let id = QueryNodeId(self.next_id);
         self.next_id += 1;
         self.seen.insert(identity, id);
+        if let Some(original) = &self.logical_source {
+            if let Some(operator) = logical::selected_range_max_index(original, node)? {
+                self.nodes.insert(
+                    id,
+                    QueryPlanNode::Logical {
+                        operator,
+                        inputs: vec![],
+                    },
+                );
+                return Ok(id);
+            }
+        }
         let residual = match (&self.logical_source, &node.expr) {
             (Some(original), SummaryExpr::KeepPreAsap(expr)) => {
                 Some(logical::residual_nodes(original, expr)?)

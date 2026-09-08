@@ -203,13 +203,32 @@ impl PrometheusRemoteWriteReceiver {
                 .ingest
                 .physical_plan_snapshot()
                 .ok_or_else(|| "active plan disappeared during input drain".to_string())?;
-            self.inner
+            let prepared = self
+                .inner
                 .raw_store
                 .snapshot(
                     plan.precompute_plan.envelope.plan_id,
                     plan.precompute_plan.envelope.plan_version,
                 )
                 .map_err(|error| error.to_string())?;
+            let metrics = plan
+                .query_plan
+                .entries
+                .values()
+                .flat_map(|entry| entry.nodes.values())
+                .filter_map(|node| match node {
+                    control_plane::query_plan::QueryPlanNode::Logical {
+                        operator:
+                            control_plane::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
+                                metric,
+                                ..
+                            },
+                        ..
+                    } => Some(metric.clone()),
+                    _ => None,
+                })
+                .collect();
+            prepared.prepare_range_max_indexes(&metrics);
         }
         Ok(())
     }
@@ -341,6 +360,16 @@ impl PrometheusRemoteWriteReceiver {
                     } else {
                         all_metrics = true;
                     }
+                } else if let control_plane::query_plan::QueryPlanNode::Logical {
+                    operator:
+                        control_plane::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
+                            metric,
+                            ..
+                        },
+                    ..
+                } = node
+                {
+                    raw_metrics.insert(metric.clone());
                 }
             }
         }
@@ -609,11 +638,12 @@ mod tests {
     }
 
     fn physical_config(streaming: StreamingConfig) -> HotReloadStreamingConfig {
-        physical_config_with_raw(streaming, false)
+        physical_config_with_raw(streaming, false, false)
     }
     fn physical_config_with_raw(
         streaming: StreamingConfig,
         retain_raw: bool,
+        indexed: bool,
     ) -> HotReloadStreamingConfig {
         use control_plane::physical::compiler::{
             FrameIdentityContract, IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan,
@@ -671,11 +701,19 @@ mod tests {
                 nodes: std::collections::BTreeMap::from([(
                     id,
                     QueryPlanNode::Logical {
-                        operator: control_plane::query_plan::logical::LogicalOperator::Scan {
-                            metric: Some("requests_total".into()),
-                            matchers: vec![],
-                            range_ms: None,
-                            offset_ms: 0,
+                        operator: if indexed {
+                            control_plane::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
+                                metric: "requests_total".into(),
+                                matchers: vec![],
+                                range_ms: 60_000,
+                            }
+                        } else {
+                            control_plane::query_plan::logical::LogicalOperator::Scan {
+                                metric: Some("requests_total".into()),
+                                matchers: vec![],
+                                range_ms: None,
+                                offset_ms: 0,
+                            }
                         },
                         inputs: vec![],
                     },
@@ -716,6 +754,12 @@ mod tests {
     fn configured_receiver_with_raw(
         retain_raw: bool,
     ) -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
+        configured_receiver_with_index(retain_raw, false)
+    }
+    fn configured_receiver_with_index(
+        retain_raw: bool,
+        indexed: bool,
+    ) -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
         use asap_types::enums::WindowKind;
         use asap_types::{AggregationConfig, AggregationType, KeyByLabelNames};
         let aggregation = AggregationConfig {
@@ -743,7 +787,7 @@ mod tests {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: physical_config_with_raw(streaming, retain_raw),
+            hot_reload_config: physical_config_with_raw(streaming, retain_raw, indexed),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
@@ -810,6 +854,33 @@ mod tests {
         let (native, _worker) = configured_receiver();
         native.accept(&one_sample(1.0)).unwrap();
         assert_eq!(native.raw_store().sample_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn finite_drain_eagerly_builds_installed_range_max_index() {
+        let (receiver, mut worker) = configured_receiver_with_index(true, true);
+        receiver.accept(&one_sample(3.0)).unwrap();
+        assert_eq!(
+            receiver.raw_store().sample_count(),
+            1,
+            "index-only plan must retain admitted input"
+        );
+        assert_eq!(receiver.raw_store().range_max_index_bytes(), 0);
+        let handle = receiver.clone();
+        let drain = tokio::spawn(async move { handle.drain().await });
+        assert!(matches!(
+            worker.recv().await.unwrap(),
+            WorkerMessage::GroupSamples { .. }
+        ));
+        let WorkerMessage::Drain(reply) = worker.recv().await.unwrap() else {
+            panic!()
+        };
+        reply.send(Ok(())).unwrap();
+        drain.await.unwrap().unwrap();
+        assert!(
+            receiver.raw_store().range_max_index_bytes() > 0,
+            "complete must include index construction before query calibration"
+        );
     }
 
     // Closing finite input prevents writes racing behind the completion barrier.

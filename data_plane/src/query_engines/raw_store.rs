@@ -95,6 +95,14 @@ impl RawSampleStore {
         Ok(prepared)
     }
 
+    pub fn range_max_index_bytes(&self) -> usize {
+        let state = self.generation.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .prepared
+            .as_ref()
+            .map_or(0, |p| p.range_max_index_bytes())
+    }
+
     pub fn sample_count(&self) -> usize {
         self.generation
             .lock()
