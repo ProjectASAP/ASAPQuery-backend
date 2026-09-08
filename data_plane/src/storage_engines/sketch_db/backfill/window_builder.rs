@@ -50,44 +50,16 @@
 use crate::precompute_engine::accumulator_factory::{
     create_accumulator_updater, AccumulatorUpdater,
 };
-use crate::precompute_engine::worker::parse_labels_from_series_key;
+use crate::precompute_engine::worker::apply_sample;
 use crate::storage_engines::sketch_db::backfill::raw_sample_reader::RawSample;
-use crate::storage_engines::types::{AggregateCore, KeyByLabelValues};
+use crate::storage_engines::types::AggregateCore;
 use asap_types::aggregation_config::AggregationConfig;
-
-/// Extract the MultipleSubpopulation aggregated-label key from a
-/// Prometheus-style series key. Duplicated from
-/// `precompute_engine::worker::extract_aggregated_key_from_series`
-/// (which is file-private). Kept here so the backfill module
-/// doesn't force a `pub(crate)` on a live-path helper — the
-/// dependency is one-way: worker does NOT import anything from
-/// backfill.
-///
-/// The implementation must track the live one exactly; the
-/// end-to-end determinism test in `backfill_processor.rs` will
-/// fail if they drift.
-fn extract_aggregated_key(series_key: &str, config: &AggregationConfig) -> KeyByLabelValues {
-    let labels = parse_labels_from_series_key(series_key);
-    let mut values = Vec::new();
-    for label_name in &config.aggregated_labels.labels {
-        if let Some(val) = labels.get(label_name.as_str()) {
-            values.push(val.to_string());
-        } else {
-            values.push(String::new());
-        }
-    }
-    KeyByLabelValues::new_with_labels(values)
-}
 
 /// Construct the accumulator for one `(agg_id, window)` pair by
 /// feeding `samples` in order into a fresh `AccumulatorUpdater`.
 ///
-/// Sample format: `samples[i].labels` is the full series key
-/// (Prometheus-style `metric{k="v",…}`); the function extracts
-/// the MultipleSubpopulation key from the series key using the
-/// same helper the live worker uses
-/// (`extract_aggregated_key_from_series`), so the keyed dispatch
-/// is bit-identical.
+/// Samples carry full series keys. Replay uses the live worker's sample
+/// dispatch so keyed identity and update semantics remain identical.
 ///
 /// Ordering contract: samples are consumed in the iteration order
 /// of the input `Vec`. §10.5 requires that the caller preserve
@@ -101,15 +73,14 @@ pub fn build_backfilled_accumulator(
     samples: &[RawSample],
 ) -> Box<dyn AggregateCore> {
     let mut updater: Box<dyn AccumulatorUpdater> = create_accumulator_updater(config);
-    if updater.is_keyed() {
-        for s in samples {
-            let key = extract_aggregated_key(&s.labels, config);
-            updater.update_keyed(&key, s.value, s.timestamp_ms);
-        }
-    } else {
-        for s in samples {
-            updater.update_single(s.value, s.timestamp_ms);
-        }
+    for sample in samples {
+        apply_sample(
+            &mut *updater,
+            &sample.labels,
+            sample.value,
+            sample.timestamp_ms,
+            config,
+        );
     }
     updater.take_accumulator()
 }
@@ -148,6 +119,59 @@ mod tests {
             labels: labels.to_string(),
             timestamp_ms: ts,
             value: v,
+        }
+    }
+
+    // Replay must preserve each series and rank by the selected update mode.
+    #[test]
+    fn backfilled_topk_preserves_series_and_weight_mode() {
+        use crate::precompute_engine::operators::{
+            CountMinSketchWithHeapAccumulator, CountSketchWithHeapAccumulator,
+        };
+        for kind in [
+            AggregationType::CountMinSketchWithHeap,
+            AggregationType::CountSketchWithHeap,
+        ] {
+            for mode in ["count", "value"] {
+                let mut config = sum_config();
+                config.aggregation_type = kind;
+                config.parameters = serde_json::from_value(serde_json::json!({
+                    "d": 4, "w": 1024, "heap_size": 10, "weight_mode": mode
+                }))
+                .unwrap();
+                let samples = vec![
+                    raw("m{svc=\"a\"}", 10, 100.0),
+                    raw("m{svc=\"b\"}", 20, 2.0),
+                    raw("m{svc=\"b\"}", 30, 3.0),
+                ];
+                let acc = build_backfilled_accumulator(&config, &samples);
+                let mut ranked: Vec<(String, f64)> = if let Some(heap) =
+                    acc.as_any()
+                        .downcast_ref::<CountMinSketchWithHeapAccumulator>()
+                {
+                    heap.inner
+                        .topk_heap_items()
+                        .into_iter()
+                        .map(|i| (i.key, i.value))
+                        .collect()
+                } else {
+                    acc.as_any()
+                        .downcast_ref::<CountSketchWithHeapAccumulator>()
+                        .unwrap()
+                        .inner
+                        .topk_heap_items()
+                        .into_iter()
+                        .map(|i| (i.key, i.value))
+                        .collect()
+                };
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let expected = if mode == "count" {
+                    vec![("m{svc=\"b\"}".into(), 2.0), ("m{svc=\"a\"}".into(), 1.0)]
+                } else {
+                    vec![("m{svc=\"a\"}".into(), 100.0), ("m{svc=\"b\"}".into(), 5.0)]
+                };
+                assert_eq!(ranked, expected, "{kind:?} {mode}");
+            }
         }
     }
 

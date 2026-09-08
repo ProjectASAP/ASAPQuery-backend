@@ -1191,7 +1191,7 @@ pub fn decode_label_value(s: &str) -> std::borrow::Cow<'_, str> {
 /// the key dimension *inside* the sketch (e.g., which bucket in a CMS, which
 /// entry in a MultipleSumAccumulator's HashMap). This matches the Arroyo SQL
 /// pattern: `udf(concat_ws(';', aggregated_labels), value)`.
-fn apply_sample(
+pub(crate) fn apply_sample(
     updater: &mut dyn AccumulatorUpdater,
     series_key: &str,
     val: f64,
