@@ -51,11 +51,20 @@ async fn wait_until_ready(client: &reqwest::Client, url: &str, child: &mut Child
 }
 
 fn series(metric: &str, samples: &[(i64, f64)]) -> TimeSeries {
+    series_with_labels(metric, &[], samples)
+}
+
+fn series_with_labels(metric: &str, labels: &[(&str, &str)], samples: &[(i64, f64)]) -> TimeSeries {
+    let mut wire_labels = vec![Label {
+        name: "__name__".into(),
+        value: metric.into(),
+    }];
+    wire_labels.extend(labels.iter().map(|(name, value)| Label {
+        name: (*name).into(),
+        value: (*value).into(),
+    }));
     TimeSeries {
-        labels: vec![Label {
-            name: "__name__".into(),
-            value: metric.into(),
-        }],
+        labels: wire_labels,
         samples: samples
             .iter()
             .map(|(timestamp, value)| Sample {
@@ -481,8 +490,9 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
                     (base + 9_400, 12.0),
                 ],
             ),
-            series(
+            series_with_labels(
                 "asap_demo_gauge",
+                &[("job", "api")],
                 &[
                     (base + 500, 1.0),
                     (base + 1_700, 2.0),
@@ -492,6 +502,20 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
                     (base + 6_600, 6.0),
                     (base + 8_100, 7.0),
                     (base + 9_400, 8.0),
+                ],
+            ),
+            series_with_labels(
+                "asap_demo_gauge",
+                &[("job", "worker")],
+                &[(base + 700, 100.0), (base + 3_100, 100.0)],
+            ),
+            series_with_labels(
+                "asap_demo_gauge",
+                &[("job", "cron")],
+                &[
+                    (base + 900, 10.0),
+                    (base + 2_100, 10.0),
+                    (base + 3_700, 10.0),
                 ],
             ),
             series(
@@ -513,7 +537,11 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let watermark_advance = WriteRequest {
         timeseries: vec![
             series("asap_demo_counter_total", &[(base + 10_500, 15.0)]),
-            series("asap_demo_gauge", &[(base + 10_500, 9.0)]),
+            series_with_labels(
+                "asap_demo_gauge",
+                &[("job", "api")],
+                &[(base + 10_500, 9.0)],
+            ),
             series("asap_demo_latency_ms", &[(base + 10_500, 55.0)]),
         ],
     };
@@ -568,10 +596,49 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         &backend_log,
     )
     .await;
+    let topk_sum = wait_for_warm_instant(
+        &client,
+        &backend,
+        "topk(1, sum_over_time(asap_demo_gauge[5s]))",
+        first_eval,
+        &backend_log,
+    )
+    .await;
+    let topk_count = wait_for_warm_instant(
+        &client,
+        &backend,
+        "topk(1, count_over_time(asap_demo_gauge[5s]))",
+        first_eval,
+        &backend_log,
+    )
+    .await;
+    assert_eq!(
+        first_value(&topk_sum, "value"),
+        Some(200.0),
+        "value-weighted Top-K must select worker: {topk_sum}"
+    );
+    assert_eq!(
+        first_value(&topk_count, "value"),
+        Some(4.0),
+        "count-weighted Top-K must select api: {topk_count}"
+    );
+    assert_eq!(topk_sum["data"]["result"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        topk_count["data"]["result"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        topk_sum["data"]["result"][0]["metric"]["item"],
+        "asap_demo_gauge{job=\"worker\"}"
+    );
+    assert_eq!(
+        topk_count["data"]["result"][0]["metric"]["item"],
+        "asap_demo_gauge{job=\"api\"}"
+    );
     let rate_value = first_value(&rate, "value").expect("rate value");
     let increase_value = first_value(&increase, "value").expect("increase value");
     assert!((rate_value * 5.0 - increase_value).abs() < 1e-9);
-    assert!((first_value(&sum, "value").expect("sum value") - 10.0).abs() < 1e-9);
+    assert!((first_value(&sum, "value").expect("sum value") - 240.0).abs() < 1e-9);
     let quantile_value = first_value(&quantile, "value").expect("quantile value");
     assert!(
         (19.0..=31.0).contains(&quantile_value),
@@ -583,6 +650,8 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         "increase(asap_demo_counter_total[5s])",
         "sum_over_time(asap_demo_gauge[5s])",
         "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
+        "topk(1, sum_over_time(asap_demo_gauge[5s]))",
+        "topk(1, count_over_time(asap_demo_gauge[5s]))",
     ] {
         let response: Value = client
             .get(format!("{backend}/api/v1/query_range"))
@@ -603,6 +672,40 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
             is_warm(&response),
             "{query} did not use warm tier: {response}"
         );
+        if query.starts_with("topk(") {
+            let mut ranked_points = response["data"]["result"]
+                .as_array()
+                .unwrap_or_else(|| panic!("missing Top-K range result for {query}: {response}"))
+                .iter()
+                .flat_map(|series| {
+                    series["values"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|point| {
+                            (
+                                point[0].as_f64().expect("Top-K timestamp"),
+                                point[1]
+                                    .as_str()
+                                    .expect("Top-K value")
+                                    .parse::<f64>()
+                                    .expect("numeric Top-K value"),
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            ranked_points.sort_by(|left, right| left.0.total_cmp(&right.0));
+            let expected = if query.contains("sum_over_time") {
+                vec![(first_eval, 200.0), (second_eval, 26.0)]
+            } else {
+                vec![(first_eval, 4.0), (second_eval, 4.0)]
+            };
+            assert_eq!(
+                ranked_points, expected,
+                "wrong Top-K windows for {query}: {response}"
+            );
+            continue;
+        }
         let values = response["data"]["result"][0]["values"]
             .as_array()
             .unwrap_or_else(|| panic!("missing range values for {query}: {response}"));
@@ -610,6 +713,11 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         assert_eq!(values[0][0], first_eval);
         assert_eq!(values[1][0], second_eval);
     }
+
+    // Readiness polling may briefly reach the exact fallback before a newly
+    // closed warm window is visible. Every planned query above was required
+    // to converge to a warm answer; isolate the explicit fallback assertions.
+    fallback_calls.lock().await.clear();
 
     let fallback_instant: Value = client
         .get(format!("{backend}/api/v1/query"))
@@ -683,7 +791,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let materializations = status["materializations"]
         .as_array()
         .expect("materialization statuses");
-    assert_eq!(materializations.len(), 3);
+    assert_eq!(materializations.len(), 5);
     assert!(materializations
         .iter()
         .all(|entry| entry["phase"] == "serving"));
@@ -697,7 +805,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         .await
         .expect("metrics body");
     assert!(metrics.contains("asap_remote_write_requests_total 4"));
-    assert!(metrics.contains("asap_remote_write_samples_total 27"));
-    assert!(metrics.contains("asap_remote_write_duplicates_total 24"));
+    assert!(metrics.contains("asap_remote_write_samples_total 32"));
+    assert!(metrics.contains("asap_remote_write_duplicates_total 29"));
     assert!(metrics.contains("asap_remote_write_rejected_requests_total 1"));
 }

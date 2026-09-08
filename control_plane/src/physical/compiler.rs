@@ -187,6 +187,10 @@ pub struct BackendLocalImplementation {
     pub window_implementation_id: String,
     pub state_layout: String,
     pub implementation_cost: ImplementationCostEvidence,
+    /// Certificates keyed by exact registered PromQL; converted to root IDs
+    /// before workload selection so one query cannot borrow another's evidence.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub topk_evidence: HashMap<String, TopKMembershipEvidence>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1582,6 +1586,7 @@ impl BackendLocalPlanningSnapshot {
         }
         let mut queries = Vec::with_capacity(entries.len());
         let mut canonical_roots = Vec::with_capacity(entries.len());
+        let mut topk_evidence_by_id = HashMap::new();
         for (index, entry) in entries.into_iter().enumerate() {
             let evaluation_interval_ms = match entry.recurrence {
                 QueryRecurrence::Repeated(RepeatedDemand::FixedInterval(interval)) => interval.0,
@@ -1634,8 +1639,12 @@ impl BackendLocalPlanningSnapshot {
             cost.workload_fingerprint =
                 canonical_promql(&query_string).map_err(CompileError::QueryPlan)?;
             cost.horizon_seconds = self.implementation.horizon_seconds;
+            let query_id = format!("compat-query-{index}");
+            if let Some(evidence) = self.implementation.topk_evidence.get(&query_string) {
+                topk_evidence_by_id.insert(query_id.clone(), evidence.clone());
+            }
             queries.push(PlanningQuery {
-                query_id: format!("compat-query-{index}"),
+                query_id,
                 query_string,
                 post_asap,
                 source: Source::TimeSeries {
@@ -1656,11 +1665,11 @@ impl BackendLocalPlanningSnapshot {
                 runtime_policy: RuntimeRulePolicy::default(),
             });
         }
-        select_workload_roots(&mut queries, canonical_roots, &HashMap::new())?;
+        select_workload_roots(&mut queries, canonical_roots, &topk_evidence_by_id)?;
         Ok((
             PlanningRequest {
                 queries,
-                evidence: HashMap::new(),
+                evidence: topk_evidence_by_id,
                 planner_revision: PLANNER_REVISION.into(),
             },
             self.environment,
@@ -2508,6 +2517,13 @@ fn physical_aggregation(
         spatial_filter: String::new(),
         grouping: query.group_by.clone(),
         item_label: None,
+        heap_update_mode: selected.parameters.get("weight_mode").and_then(|mode| {
+            match mode.as_str() {
+                Some("count") => Some("count"),
+                Some("value") => Some("value"),
+                _ => None,
+            }
+        }),
         aggregation_input: match target {
             PhysicalDeploymentTarget::DistributedCollectors => AggregationInput::SketchEnvelope,
             PhysicalDeploymentTarget::BackendLocalRemoteWrite => AggregationInput::Raw,
@@ -2589,9 +2605,22 @@ fn collect_selected_materializations(
             }
             SummaryExpr::SummaryAgg {
                 family: SummaryFamilyType::Sketch(kind, _),
+                input,
                 ..
             } => {
                 if let Some(readout) = readout {
+                    let mut parameters = sketch_params_json(kind.params());
+                    if matches!(readout, SketchQuery::TopK { .. }) {
+                        use planner_types::post_asap::SummaryInputExpr;
+                        let mode = match &input.weight {
+                            SummaryInputExpr::Constant(value) if *value == 1.0 => "count",
+                            SummaryInputExpr::Column(
+                                planner_types::pre_asap::ColumnRef::SampleValue,
+                            ) => "value",
+                            _ => return Err("unsupported TopK SummaryUpdate weight".into()),
+                        };
+                        parameters["weight_mode"] = mode.into();
+                    }
                     let metric = summary_agg_metric(node).ok_or_else(|| {
                         "SummaryAgg has no unique time-series source in post-ASAP IR".to_string()
                     })?;
@@ -2605,7 +2634,7 @@ fn collect_selected_materializations(
                         ),
                         readout: Some(readout.clone()),
                         algorithm: format!("{:?}", kind.algorithm()).to_ascii_lowercase(),
-                        parameters: sketch_params_json(kind.params()),
+                        parameters,
                     });
                 }
             }
@@ -2708,6 +2737,32 @@ fn stable_workload_plan_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Count and value rankings must configure different state update contracts.
+    #[test]
+    fn temporal_topk_binds_planner_update_weight() {
+        for (query, mode) in [
+            ("topk(1, sum_over_time(m[1m]))", "value"),
+            ("topk(1, count_over_time(m[1m]))", "count"),
+        ] {
+            let evidence = TopKMembershipEvidence {
+                selected_lower_bound: 101.0,
+                excluded_upper_bound: 100.0,
+                interval_failure_probability: 0.001,
+                observed_at_unix_ms: 9500,
+                source: "unit-fixture".into(),
+            };
+            let request = request_with_evidence("topk", query, Some(evidence)).unwrap();
+            let plan = PhysicalCompiler
+                .compile(request, environment(10000))
+                .unwrap();
+            assert_eq!(plan.precompute_plan.materializations.len(), 1, "{query}");
+            assert_eq!(
+                plan.precompute_plan.materializations[0].parameters["weight_mode"], mode,
+                "{query}"
+            );
+        }
+    }
 
     fn environment(now: u64) -> DeploymentEnvironment {
         DeploymentEnvironment {
@@ -3293,6 +3348,7 @@ mod tests {
                 window_implementation_id: "backend-tumbling-v1".into(),
                 state_layout: "anchored-pane-v1".into(),
                 implementation_cost: template.window_implementations[0].cost.clone(),
+                topk_evidence: HashMap::new(),
             },
             environment,
         };
@@ -3405,13 +3461,15 @@ mod tests {
 
         assert!(plan.collector_plans.is_empty());
         assert!(plan.transmission_plan.rules.is_empty());
-        assert_eq!(plan.query_plan.entries.len(), 4);
-        assert_eq!(plan.precompute_plan.materializations.len(), 3);
+        assert_eq!(plan.query_plan.entries.len(), 6);
+        assert_eq!(plan.precompute_plan.materializations.len(), 5);
         for query in [
             "rate(asap_demo_counter_total[5s])",
             "increase(asap_demo_counter_total[5s])",
             "sum_over_time(asap_demo_gauge[5s])",
             "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
+            "topk(1, sum_over_time(asap_demo_gauge[5s]))",
+            "topk(1, count_over_time(asap_demo_gauge[5s]))",
         ] {
             assert!(plan.query_plan.lookup(query).is_ok(), "missing {query}");
         }

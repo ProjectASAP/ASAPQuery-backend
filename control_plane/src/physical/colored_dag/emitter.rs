@@ -702,6 +702,9 @@ pub struct BackendAggregation {
     /// `parameters["item_label"]` so the data-plane ingest records it on the
     /// CMS sid and can answer per-item `estimate(key)` (FrequencyEstimate).
     pub item_label: Option<String>,
+    /// Runtime accumulator mode derived from SummaryAgg.input.weight, never
+    /// from the TopK readout. None retains the legacy value-update default.
+    pub heap_update_mode: Option<&'static str>,
     /// Phase ε.1 — what shape the backend ingests for this
     /// aggregation. Mode 1 (sketch at edge) / sketch_envelope is the
     /// default (the wire payload is a sketch state already). Mode 2
@@ -899,6 +902,7 @@ impl Emitter for ThreeStageEmitter {
                     });
                     backend_aggregations.push(BackendAggregation {
                         item_label: None,
+                        heap_update_mode: None,
                         aggregation_id,
                         metric_name: edge.source_metric.clone().unwrap_or_default(),
                         family: SummaryFamilyType::Sketch(
@@ -983,6 +987,7 @@ impl Emitter for ThreeStageEmitter {
                     next_agg_index += 1;
                     backend_aggregations.push(BackendAggregation {
                         item_label: None,
+                        heap_update_mode: None,
                         aggregation_id: aid,
                         metric_name: edge.source_metric.clone().unwrap_or_default(),
                         family: SummaryFamilyType::Sketch(

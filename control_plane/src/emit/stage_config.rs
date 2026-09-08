@@ -2986,6 +2986,11 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
             obj.insert("item_label".to_string(), JsonValue::String(label.clone()));
         }
     }
+    if let Some(mode) = agg.heap_update_mode {
+        if let Some(obj) = parameters.as_object_mut() {
+            obj.insert("weight_mode".into(), JsonValue::String(mode.into()));
+        }
+    }
     let aggregation_input = match agg.aggregation_input {
         AggregationInput::SketchEnvelope => "sketch_envelope",
         AggregationInput::Raw => "raw",
@@ -3206,6 +3211,7 @@ mod tests {
             spatial_filter: String::new(),
             grouping: Vec::new(),
             item_label: None,
+            heap_update_mode: None,
             aggregation_input,
         }
     }
