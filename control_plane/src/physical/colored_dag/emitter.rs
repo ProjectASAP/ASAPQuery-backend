@@ -54,6 +54,7 @@ enum NodeKind<'a> {
     SketchAgg {
         sketch_type: &'a SketchAlgorithm,
         params: &'a SketchParams,
+        input: &'a planner_types::post_asap::SummaryUpdate,
     },
     /// An exact accumulator — the old `PhysicalExpr::ExactAgg`. This
     /// emitter has never had a match arm for it (falls through to the
@@ -100,10 +101,12 @@ fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
             } => NodeKind::ExactAgg,
             SummaryExpr::SummaryAgg {
                 family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, _),
+                input,
                 ..
             } => NodeKind::SketchAgg {
                 sketch_type: kind.algorithm(),
                 params: kind.params(),
+                input,
             },
             // `Plain`/`Sample`/`Wavelet`/`StatModel` never occur on a real
             // `SummaryAgg` (never `Plain` by construction; `Sample`/
@@ -156,6 +159,8 @@ pub enum EmitError {
     /// the legacy planner output rather than POST an empty payload.
     #[error("backend has no sketch consumers; nothing to wire")]
     BackendEmpty,
+    #[error("unsupported heap update weight")]
+    UnsupportedHeapUpdate,
 }
 
 /// Generic emitter trait — Phase E ships only [`ThreeStageEmitter`]; future
@@ -886,6 +891,7 @@ impl Emitter for ThreeStageEmitter {
                     NodeKind::SketchAgg {
                         sketch_type,
                         params,
+                        input,
                     },
                     StageId::Edge,
                 ) => {
@@ -902,7 +908,20 @@ impl Emitter for ThreeStageEmitter {
                     });
                     backend_aggregations.push(BackendAggregation {
                         item_label: None,
-                        heap_update_mode: None,
+                        heap_update_mode: if matches!(
+                            sketch_type,
+                            SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap
+                        ) {
+                            use planner_types::post_asap::SummaryInputExpr;
+                            use planner_types::pre_asap::ColumnRef;
+                            Some(match &input.weight {
+                                SummaryInputExpr::Constant(value) if *value == 1.0 => "count",
+                                SummaryInputExpr::Column(ColumnRef::SampleValue) => "value",
+                                _ => return Err(EmitError::UnsupportedHeapUpdate),
+                            })
+                        } else {
+                            None
+                        },
                         aggregation_id,
                         metric_name: edge.source_metric.clone().unwrap_or_default(),
                         family: SummaryFamilyType::Sketch(

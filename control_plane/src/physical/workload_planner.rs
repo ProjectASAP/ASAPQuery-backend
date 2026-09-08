@@ -70,7 +70,18 @@ fn mvp_deployment_policy(
 /// `PhysicalExpr` is then fed into `planner::stage_split::split_typed_three_stage`
 /// + the per-stage emitters in `config::stage_config`.
 pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::physical::post_asap::PhysicalExpr> {
-    bind_workload_typed_with_item_filter(w, None)
+    bind_workload_typed_with_evidence(w, None, None)
+}
+
+/// Bind a legacy workload with an explicit Top-K membership certificate.
+/// Approximate Top-K fails closed through [`bind_workload_typed`] when this
+/// evidence is absent; callers that have validated a fresh certificate use
+/// this entry point instead.
+pub fn bind_workload_typed_with_topk_evidence(
+    w: &QueryWorkload,
+    evidence: &crate::physical::compiler::TopKMembershipEvidence,
+) -> Option<crate::physical::post_asap::PhysicalExpr> {
+    bind_workload_typed_with_evidence(w, None, Some(evidence))
 }
 
 /// Like [`bind_workload_typed`], but for a `Frequency` statistic, `item_filter`
@@ -87,6 +98,14 @@ pub fn bind_workload_typed(w: &QueryWorkload) -> Option<crate::physical::post_as
 pub fn bind_workload_typed_with_item_filter(
     w: &QueryWorkload,
     item_filter: Option<(&str, &str)>,
+) -> Option<crate::physical::post_asap::PhysicalExpr> {
+    bind_workload_typed_with_evidence(w, item_filter, None)
+}
+
+fn bind_workload_typed_with_evidence(
+    w: &QueryWorkload,
+    item_filter: Option<(&str, &str)>,
+    topk_evidence: Option<&crate::physical::compiler::TopKMembershipEvidence>,
 ) -> Option<crate::physical::post_asap::PhysicalExpr> {
     use crate::physical::post_asap::cost_model::ForcedFamilyCostModel;
     use crate::types_v2::AccuracyTarget;
@@ -217,6 +236,12 @@ pub fn bind_workload_typed_with_item_filter(
                     nullable: false,
                     table: None,
                 },
+                Column {
+                    name: "endpoint".into(),
+                    dtype: DataType::Utf8,
+                    nullable: false,
+                    table: None,
+                },
             ],
             0,
             vec![vec![0]],
@@ -226,17 +251,39 @@ pub fn bind_workload_typed_with_item_filter(
         range: w.time_window,
         child: Box::new(scan).into(),
     };
+    // Planner's weighted Top-K contract deliberately accepts only an
+    // additive ranking input.  The legacy workload vocabulary has no TopK
+    // aggregation variant: the `top_endpoint_qps` contract row arrives as
+    // `Frequency`, meaning that each observed series occurrence contributes
+    // one to its rank.  Make that previously implicit update semantics
+    // explicit as an inner Count aggregate.  Besides satisfying the typed
+    // contract, this supplies the PromQL label-set entity identity used as
+    // the heap item.
+    let aggregate_child = if statistic == DeploymentIntent::TopK {
+        QueryExpr::Aggregate {
+            reduction: planner_types::pre_asap::Reduction::by(vec![2]),
+            measures: vec![L3AggIntent::Count {
+                accuracy: accuracy.clone(),
+            }],
+            output_names: Vec::new(),
+            having: None,
+            child: Box::new(windowed).into(),
+        }
+    } else {
+        windowed
+    };
     let aggregate = QueryExpr::Aggregate {
-        // Synthetic probe only -- `boundary::implementation_for` (what
-        // this shape actually drives) keys off `AggIntent`/accuracy alone,
-        // never `Reduction`, so this value doesn't affect the family pick.
-        // `PerEntity` is the representative choice for a windowed shape
-        // with no `by` (ASAPController#163/#165).
-        reduction: planner_types::pre_asap::Reduction::PerEntity,
+        // Top-K is a genuine full reduction over the per-item counts above;
+        // other synthetic probes retain the representative per-entity shape.
+        reduction: if statistic == DeploymentIntent::TopK {
+            planner_types::pre_asap::Reduction::by(vec![])
+        } else {
+            planner_types::pre_asap::Reduction::PerEntity
+        },
         measures: vec![intent],
         output_names: Vec::new(),
         having: None,
-        child: Box::new(windowed).into(),
+        child: Box::new(aggregate_child).into(),
     };
 
     // ── Drive the picked family directly, bypassing selection ─────────
@@ -271,7 +318,35 @@ pub fn bind_workload_typed_with_item_filter(
         other => other,
     };
     let cost_model = ForcedFamilyCostModel::new(accuracy.clone(), forced);
-    let node = crate::planner_selection::select_summary(&aggregate, &cost_model).ok()?;
+    struct Evidence<'a>(Option<&'a crate::physical::compiler::TopKMembershipEvidence>);
+    impl asap_aware_mapping::AccuracyEvidenceProvider for Evidence<'_> {
+        fn propagation_stats(
+            &self,
+            op: &planner_types::post_asap::CompositionOperator,
+            _family: &planner_types::post_asap::SummaryFamilyType,
+            _query: Option<&planner_types::post_asap::SketchQuery>,
+        ) -> asap_aware_mapping::PropagationStats {
+            match (op, self.0) {
+                (planner_types::post_asap::CompositionOperator::TopKSelection, Some(e)) => {
+                    asap_aware_mapping::PropagationStats {
+                        topk_selected_lower_bound: Some(e.selected_lower_bound),
+                        topk_excluded_upper_bound: Some(e.excluded_upper_bound),
+                        topk_interval_failure_probability: Some(e.interval_failure_probability),
+                        ..Default::default()
+                    }
+                }
+                _ => Default::default(),
+            }
+        }
+    }
+    let node = crate::planner_selection::select_summary_with_evidence(
+        &aggregate,
+        &cost_model,
+        &asap_aware_mapping::DefaultAccuracyModel,
+        &asap_aware_mapping::EqualSplitAllocator,
+        &Evidence(topk_evidence),
+    )
+    .ok()?;
     // `implement_tree_with` never *errors* on "nothing bound" — an
     // intent `boundary::implementation_for`/`CostModel::realize_extension`
     // can't realize (e.g. `TopK { accuracy: Exact }`, ASAPController#151,
@@ -662,6 +737,16 @@ mod tests {
         }
     }
 
+    fn topk_evidence() -> crate::physical::compiler::TopKMembershipEvidence {
+        crate::physical::compiler::TopKMembershipEvidence {
+            selected_lower_bound: 101.0,
+            excluded_upper_bound: 100.0,
+            interval_failure_probability: 0.001,
+            observed_at_unix_ms: 1,
+            source: "workload-planner-test".into(),
+        }
+    }
+
     #[test]
     fn typed_binding_http_requests_total_is_raw_passthrough() {
         // Contract: `http_requests_total` → raw passthrough (no sketch).
@@ -715,13 +800,32 @@ mod tests {
     }
 
     #[test]
-    fn typed_binding_top_endpoint_qps_requires_membership_evidence() {
+    fn typed_binding_top_endpoint_qps_picks_count_sketch_with_heap() {
         // Contract: `top_endpoint_qps` → CountSketch (TopK).
         // The metric-name reclassification reroutes from the AggType
         // default (Frequency → CMS) to the contract row (TopK →
         // CountSketch).
         let w = workload_for("top_endpoint_qps", AggType::Frequency);
         assert!(bind_workload_typed(&w).is_none());
+        let bound = bind_workload_typed_with_topk_evidence(&w, &topk_evidence())
+            .expect("evidenced top_endpoint_qps must bind");
+        // Count-ranked producers must not revert to value-weighted runtime defaults.
+        let configs = crate::physical::stage_split::split_typed_three_stage(&bound).unwrap();
+        let backend = configs
+            .get(&crate::physical::colored_dag::StageId::Backend)
+            .unwrap();
+        let crate::physical::colored_dag::StageConfig::Backend(backend) = backend else {
+            panic!("expected backend config");
+        };
+        assert_eq!(backend.aggregations[0].heap_update_mode, Some("count"));
+        assert_eq!(
+            extract_family(&bound),
+            Some(SketchAlgorithm::CountSketchWithHeap),
+        );
+        assert!(matches!(
+            extract_query(&bound),
+            Some(planner_types::post_asap::SketchQuery::TopK { k: 10, .. })
+        ));
     }
 
     #[test]
@@ -811,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_rejects_topk_override_without_membership_evidence() {
+    fn planner_honors_cms_topk_override() {
         // CMS-Heap pattern (Cormode & Muthukrishnan 2005): when a
         // workload's `sketch_family_override` (=
         // `sketch_type_override`) selects CountMinSketch for a TopK
@@ -819,16 +923,23 @@ mod tests {
         // back to the canonical CountSketch default.
         let mut w = workload_for("top_endpoint_qps", AggType::Frequency);
         w.sketch_type_override = Some(SketchType::CountMinSketch);
-        assert!(bind_workload_typed(&w).is_none());
+        let bound = bind_workload_typed_with_topk_evidence(&w, &topk_evidence())
+            .expect("CMS Top-K override must bind with evidence");
+        assert_eq!(extract_family(&bound), Some(SketchAlgorithm::CmsWithHeap));
     }
 
     #[test]
-    fn planner_default_topk_requires_membership_evidence() {
+    fn planner_default_topk_uses_count_sketch_with_heap() {
         // Without any override, the canonical pick for a TopK metric
         // stays CountSketch(-with-heap) — CMS-Heap is opt-in via
         // override only.
         let w = workload_for("top_endpoint_qps", AggType::Frequency);
-        assert!(bind_workload_typed(&w).is_none());
+        let bound = bind_workload_typed_with_topk_evidence(&w, &topk_evidence())
+            .expect("default Top-K must bind with evidence");
+        assert_eq!(
+            extract_family(&bound),
+            Some(SketchAlgorithm::CountSketchWithHeap),
+        );
     }
 
     #[test]
