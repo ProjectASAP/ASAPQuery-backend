@@ -62,3 +62,19 @@ called `first_pass`, not “cold cache”; later traversals are `repeat`. All fa
 and fallback responses remain in the denominator. A completion file means the
 replay finished, **not** that accuracy or benefit acceptance passed. The next
 stacked PR adds matched exact queries and measurement/reporting.
+
+
+## Finite-input completion
+
+After all Remote Write batches are accepted, the runner calls
+`POST /api/v1/precompute/drain` and saves `drain.json`. The receiver seals input
+before worker barriers are queued. Each worker publishes its trailing panes,
+then acknowledges completion; prior processing or sink failures remain failures
+on repeated drains. Queries begin only after a successful completion response.
+Subsequent Remote Write requests return HTTP 409 for that process. Start a new
+backend process for another input generation.
+
+This endpoint is for a finite replay, not a live ingestion watermark. Closing a
+trailing pane does not by itself prove its coverage matches every query window;
+unsupported or incomplete readouts must still follow exact fallback. This change
+adds no local raw-query storage or hybrid operator execution.

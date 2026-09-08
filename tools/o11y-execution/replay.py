@@ -188,7 +188,7 @@ def main():
     parser.add_argument("--data-plane", type=Path, required=True)
     parser.add_argument("--exact-url", required=True, help="dedicated empty Prometheus with Remote Write receiver enabled")
     parser.add_argument("--port", type=int, default=18089)
-    parser.add_argument("--settle-seconds", type=float, default=2)
+    parser.add_argument("--settle-seconds", type=float, default=0, help="deprecated; completion uses explicit finite-input drain")
     parser.add_argument("--repetitions", type=int, default=2)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -205,7 +205,7 @@ def main():
                              for p in [args.metrics, args.queries, args.snapshot, args.compiler, args.data_plane]},
                   "samples": len(samples), "timestamp_min_ms": samples[0][2], "timestamp_max_ms": samples[-1][2],
                   "query_occurrences": len(queries), "configuration": {k: str(v) for k, v in vars(args).items()},
-                  "limitations": ["generator provenance must be supplied separately", "first pass is not a guaranteed cold cache", "ingest acceptance is not materialization completion"]}
+                  "limitations": ["generator provenance must be supplied separately", "first pass is not a guaranteed cold cache", "finite-input drain closes trailing panes and permanently seals Remote Write; no live-ingestion claim"]}
     write_json(args.output / "run.json", provenance)
     with (args.output / "planning.stderr").open("w") as log:
         compiled = subprocess.run([str(args.compiler.resolve()), str(args.snapshot.resolve())], check=True,
@@ -240,7 +240,10 @@ def main():
                        and p["phase"] == "active" for p in installed["response"].get("plans", [])):
                 raise RuntimeError("runtime has not activated the selected plan generation")
             ingest(samples, [args.exact_url, backend], args.output)
-            time.sleep(args.settle_seconds)
+            drained = request(backend + "/api/v1/precompute/drain", b"")
+            write_json(args.output / "drain.json", drained)
+            if drained["http_status"] != 200 or drained["response"].get("complete") is not True:
+                raise RuntimeError("finite-input materialization drain failed; see drain.json")
             results = replay(queries, backend, args.output, args.repetitions)
             write_json(args.output / "store.json", request(backend + "/api/v1/store/metrics"))
             write_json(args.output / "completion.json", {"complete": True,

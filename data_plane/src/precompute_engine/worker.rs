@@ -202,6 +202,7 @@ impl Worker {
     pub async fn run(mut self) {
         info!("Worker {} started", self.id);
 
+        let mut processing_error: Option<String> = None;
         while let Some(msg) = self.receiver.recv().await {
             match msg {
                 WorkerMessage::GroupSamples {
@@ -223,6 +224,7 @@ impl Worker {
                     .entered();
                     if let Err(e) = self.process_group_samples(sid, policy_fp, &group_key, samples)
                     {
+                        processing_error = Some(e.to_string());
                         warn!(
                             "Worker {} error processing sid={} (policy_fp={}, group={}): {}",
                             self.id, sid, policy_fp, group_key, e
@@ -246,6 +248,7 @@ impl Worker {
                     )
                     .entered();
                     if let Err(e) = self.process_samples_raw(&series_key, samples) {
+                        processing_error = Some(e.to_string());
                         warn!("Worker {} raw error for {}: {}", self.id, series_key, e);
                     }
                     debug!(
@@ -278,6 +281,7 @@ impl Worker {
                         timestamp_ms,
                         accumulator,
                     ) {
+                        processing_error = Some(e.to_string());
                         warn!(
                             "Worker {} accumulator input error for sid={} (policy_fp={}, group={}): {}",
                             self.id, sid, policy_fp, group_key, e
@@ -290,6 +294,7 @@ impl Worker {
                 }
                 WorkerMessage::Flush => {
                     if let Err(e) = self.flush_all() {
+                        processing_error = Some(e.to_string());
                         warn!("Worker {} flush error: {}", self.id, e);
                     }
                     // Evict orphaned GroupStates whose agg_id has been
@@ -297,6 +302,13 @@ impl Worker {
                     // data are kept until they drain (flush_all already
                     // closed their windows); empty ones are freed.
                     self.evict_orphaned_groups();
+                }
+                WorkerMessage::Drain(reply) => {
+                    let result = self.force_close_all().map_err(|e| e.to_string());
+                    if let Err(error) = &result {
+                        processing_error = Some(error.clone());
+                    }
+                    let _ = reply.send(processing_error.clone().map_or(Ok(()), Err));
                 }
                 WorkerMessage::Shutdown => {
                     info!("Worker {} shutting down", self.id);
@@ -3258,6 +3270,114 @@ aggregations:
     // store instead of being lost. Covers both the sample (`active_panes`) and
     // sketch (`sketch_panes`) paths.
     // -----------------------------------------------------------------------
+
+    // Acknowledgement proves FIFO input processing and trailing-window publication.
+    #[tokio::test]
+    async fn finite_input_drain_publishes_before_acknowledging() {
+        let config = make_agg_config(
+            1,
+            "cpu",
+            AggregationType::SingleSubpopulation,
+            "Sum",
+            10,
+            0,
+            vec![],
+        );
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker(
+            HashMap::from([(1, config)]),
+            sink.clone(),
+            false,
+            0,
+            LateDataPolicy::Drop,
+        );
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        worker.receiver = rx;
+        let task = tokio::spawn(worker.run());
+        tx.send(WorkerMessage::GroupSamples {
+            sid: 1,
+            policy_fp: PolicyFingerprint(1),
+            group_key: "".into(),
+            samples: group_samples("cpu", vec![(1000, 2.0), (2000, 3.0)]),
+            ingest_received_at: std::time::Instant::now(),
+        })
+        .await
+        .unwrap();
+        let (ack, completed) = tokio::sync::oneshot::channel();
+        tx.send(WorkerMessage::Drain(ack)).await.unwrap();
+        completed.await.unwrap().unwrap();
+        let outputs = sink.drain();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0]
+                .1
+                .as_any()
+                .downcast_ref::<SumAccumulator>()
+                .unwrap()
+                .sum,
+            5.0
+        );
+        let (ack, completed) = tokio::sync::oneshot::channel();
+        tx.send(WorkerMessage::Drain(ack)).await.unwrap();
+        completed.await.unwrap().unwrap();
+        assert_eq!(sink.len(), 0);
+        tx.send(WorkerMessage::Shutdown).await.unwrap();
+        task.await.unwrap();
+    }
+
+    // A sink failure remains visible on repeated barriers after panes were consumed.
+    #[tokio::test]
+    async fn finite_input_drain_does_not_hide_sink_failure_on_retry() {
+        struct FailedSink;
+        impl OutputSink for FailedSink {
+            fn emit_batch(
+                &self,
+                _: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                Err("deliberate sink failure".into())
+            }
+        }
+        let config = make_agg_config(
+            1,
+            "cpu",
+            AggregationType::SingleSubpopulation,
+            "Sum",
+            10,
+            0,
+            vec![],
+        );
+        let mut worker = make_worker(
+            HashMap::from([(1, config)]),
+            Arc::new(CapturingOutputSink::new()),
+            false,
+            0,
+            LateDataPolicy::Drop,
+        );
+        worker.output_sink = Arc::new(FailedSink);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        worker.receiver = rx;
+        let task = tokio::spawn(worker.run());
+        tx.send(WorkerMessage::GroupSamples {
+            sid: 1,
+            policy_fp: PolicyFingerprint(1),
+            group_key: "".into(),
+            samples: group_samples("cpu", vec![(1000, 2.0)]),
+            ingest_received_at: std::time::Instant::now(),
+        })
+        .await
+        .unwrap();
+        for _ in 0..2 {
+            let (ack, completed) = tokio::sync::oneshot::channel();
+            tx.send(WorkerMessage::Drain(ack)).await.unwrap();
+            assert!(completed
+                .await
+                .unwrap()
+                .unwrap_err()
+                .contains("deliberate sink failure"));
+        }
+        tx.send(WorkerMessage::Shutdown).await.unwrap();
+        task.await.unwrap();
+    }
 
     #[test]
     fn shutdown_force_close_emits_trailing_sample_window() {
