@@ -102,6 +102,13 @@ Query serving uses only the installed `QueryPlan` DAG. A query absent from that
 DAG is a capability miss and goes to the exact Prometheus fallback; the backend
 does not search materialization candidates while serving.
 
+Counter `rate` and `increase` queries currently use the exact Prometheus
+fallback in this raw-ingest profile. The backend does not install pooled counter
+state because independent series can reset or arrive at the same timestamp.
+Other supported queries in the workload can still use warm summaries. Previously
+generated artifacts containing raw counter state are rejected; regenerate them
+from their workload snapshots.
+
 Activation and warm readiness are deliberately separate. A newly activated
 generation exposes each materialization as `materializing`; the QueryPlan path
 promotes it through `ready` to `serving` only after its closed-window coverage
