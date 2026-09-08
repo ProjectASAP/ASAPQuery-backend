@@ -13,6 +13,19 @@ def vector(*values):
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_explicit_roundoff_tolerance_preserves_errors_and_structure(self):
+        """Declared floating-point tolerance permits roundoff, never missing series."""
+        actual, expected = vector(("a", 1.0 + 1e-15)), vector(("a", 1.0))
+        self.assertFalse(compare_results(actual, expected)["equal"])
+        result = compare_results(actual, expected, 1e-9, 1e-12)
+        self.assertTrue(result["equal"])
+        self.assertFalse(result["strict_equal"])
+        self.assertGreater(result["max_absolute_error"], 0)
+        self.assertFalse(compare_results(actual, vector(("a", 1.0), ("b", 1.0)), 1e-9, 1e-12)["equal"])
+        self.assertFalse(compare_results(vector(("a", 1.1)), expected, 1e-9, 1e-12)["equal"])
+        with self.assertRaises(ValueError):
+            compare_results(actual, expected, float("nan"), 0)
+
     def test_group_matching_is_not_row_position(self):
         """Permuting a group-by result does not change correctness."""
         result = compare_results(vector(("b", 2), ("a", 1)), vector(("a", 1), ("b", 2)))
@@ -42,6 +55,20 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(report["occurrences"], 1)
         self.assertIsNone(report["matched_query_latency_ratio"])
         self.assertIsNone(report["end_to_end_benefit"])
+
+    def test_backend_cpu_includes_separate_fallback_service(self):
+        """A forwarded query cannot claim CPU savings by omitting Prometheus work."""
+        row = {"execution": "exact_fallback", "elapsed_ns": 10, "response": vector(("a", 1)),
+               "process_resources": {"backend": {"cpu_ns": 2}, "fallback_service": {"cpu_ns": 7},
+                                     "exact_service": {"cpu_ns": 99}},
+               "exact": {"http_status": 200, "elapsed_ns": 10, "response": vector(("a", 1)),
+                         "process_resources": {"exact_service": {"cpu_ns": 8}}}}
+        report = summarize([row])
+        self.assertEqual(report["backend_plus_fallback_cpu_ns"], 9)
+        self.assertEqual(report["baseline_cpu_ns"], 8)
+        del row["process_resources"]["fallback_service"]
+        del row["process_resources"]["exact_service"]
+        self.assertIsNone(summarize([row])["backend_plus_fallback_cpu_ns"])
 
     def test_matrix_requires_the_same_timestamps_and_empty_series(self):
         """Series and time coverage are part of correctness even without numeric samples."""

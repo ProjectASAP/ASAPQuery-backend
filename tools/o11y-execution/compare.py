@@ -31,7 +31,9 @@ def result_samples(response):
     return kind, groups, result
 
 
-def compare_results(actual, expected):
+def compare_results(actual, expected, relative_tolerance=0.0, absolute_tolerance=0.0):
+    if any(not math.isfinite(v) or v < 0 for v in (relative_tolerance, absolute_tolerance)):
+        raise ValueError("comparison tolerances must be finite and nonnegative")
     try:
         ak, ag, a = result_samples(actual)
         ek, eg, e = result_samples(expected)
@@ -39,7 +41,7 @@ def compare_results(actual, expected):
             raise ValueError("different result types")
     except (ValueError, TypeError, KeyError) as error:
         return {"comparable": False, "equal": False, "reason": str(error)}
-    absolute, relative, zero, nonfinite = [], [], 0, 0
+    absolute, relative, zero, nonfinite, outside_tolerance = [], [], 0, 0, 0
     for key in a.keys() & e.keys():
         x, y = a[key], e[key]
         if not math.isfinite(x) or not math.isfinite(y):
@@ -51,6 +53,8 @@ def compare_results(actual, expected):
             nonfinite += 1
             continue
         absolute.append(error)
+        if not math.isclose(x, y, rel_tol=relative_tolerance, abs_tol=absolute_tolerance):
+            outside_tolerance += 1
         if y:
             ratio = error / abs(y)
             if math.isfinite(ratio):
@@ -61,7 +65,10 @@ def compare_results(actual, expected):
             zero += 1
     missing, extra = len(e.keys() - a.keys()), len(a.keys() - e.keys())
     return {"comparable": True,
-            "equal": ag == eg and not (missing or extra or zero or nonfinite or any(absolute)),
+            "equal": ag == eg and not (missing or extra or nonfinite or outside_tolerance),
+            "strict_equal": ag == eg and not (missing or extra or zero or nonfinite or any(absolute)),
+            "relative_tolerance": relative_tolerance, "absolute_tolerance": absolute_tolerance,
+            "samples_outside_tolerance": outside_tolerance,
             "missing_series": len(eg - ag), "extra_series": len(ag - eg),
             "missing_samples": missing, "extra_samples": extra,
             "completeness": (len(a.keys() & e.keys()) / len(e)) if e else (1.0 if not a else 0.0),
@@ -80,14 +87,29 @@ def distribution(values):
 
 
 def summarize(rows):
-    comparisons = [compare_results(row["response"], row.get("exact", {}).get("response", {})) for row in rows]
+    comparisons = [compare_results(row["response"], row.get("exact", {}).get("response", {}),
+                   row.get("comparison", {}).get("relative_tolerance", 0.0),
+                   row.get("comparison", {}).get("absolute_tolerance", 0.0)) for row in rows]
     eligible = bool(rows) and all(
         c["equal"] and r["execution"] in ("warm", "exact_fallback") and r["exact"].get("http_status") == 200
         for r, c in zip(rows, comparisons))
     actual = sum(r["elapsed_ns"] for r in rows)
     exact = sum(r.get("exact", {}).get("elapsed_ns", 0) for r in rows)
-    return {"occurrences": len(rows),
+    def cpu_total(requests, names):
+        values = [request.get("process_resources", {}).get(name) for request in requests for name in names]
+        return sum(v["cpu_ns"] for v in values) if values and all(v is not None for v in values) else None
+    has_fallback_process = any("fallback_service" in r.get("process_resources", {}) for r in rows)
+    backend_names = ["backend", "fallback_service" if has_fallback_process else "exact_service"]
+    backend_cpu = cpu_total(rows, backend_names)
+    exact_cpu = cpu_total([r.get("exact", {}) for r in rows], ["exact_service"])
+    return {"backend_plus_fallback_cpu_ns": backend_cpu,
+            "baseline_cpu_ns": exact_cpu,
+            "baseline_over_backend_cpu_ratio": exact_cpu / backend_cpu if eligible and backend_cpu and exact_cpu is not None else None,
+            "cpu_scope": "request intervals, whole processes including background work; fallback CPU charged to backend; /proc tick granularity",
+            "occurrences": len(rows),
             "execution_counts": {k: sum(r["execution"] == k for r in rows) for k in ("warm", "exact_fallback", "failed")},
+            "execution_detail_counts": {k: sum(r.get("execution_provenance", {}).get("detail") == k for r in rows) for k in ("asap", "hybrid", "local_raw", "external_exact")},
+            "summary_acceleration_scope": "warm excludes every request using raw execution; hybrid is reported separately under exact_fallback",
             "equal_results": sum(c["equal"] for c in comparisons),
             "uncomparable_results": sum(not c["comparable"] for c in comparisons),
             "comparisons": comparisons,
