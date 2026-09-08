@@ -3271,6 +3271,59 @@ aggregations:
     // sketch (`sketch_panes`) paths.
     // -----------------------------------------------------------------------
 
+    // A pooled Sum is correct only for an explicit cross-entity reduction.
+    #[test]
+    fn pooled_sum_does_not_preserve_per_entity_output_rows() {
+        use crate::precompute_engine::operators::SumAccumulator;
+        let config = make_agg_config(
+            1,
+            "gauge",
+            AggregationType::SingleSubpopulation,
+            "Sum",
+            10,
+            0,
+            vec![],
+        );
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker(
+            HashMap::from([(1, config)]),
+            sink.clone(),
+            false,
+            0,
+            LateDataPolicy::Drop,
+        );
+        worker
+            .process_group_samples(
+                1,
+                PolicyFingerprint(1),
+                "",
+                vec![
+                    ("gauge{job=\"api\"}".into(), 1000, 10.0),
+                    ("gauge{job=\"api\"}".into(), 2000, 30.0),
+                    ("gauge{job=\"worker\"}".into(), 1000, 200.0),
+                ],
+            )
+            .unwrap();
+        worker.force_close_all().unwrap();
+        let captured = sink.drain();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0]
+                .1
+                .as_any()
+                .downcast_ref::<SumAccumulator>()
+                .unwrap()
+                .sum,
+            240.0
+        );
+        // sum_over_time must instead emit api=40 and worker=200 separately.
+        assert_ne!(
+            captured.len(),
+            2,
+            "this producer does not retain entity rows"
+        );
+    }
+
     // This single-series updater cannot implement a grouped sum of counter increases.
     // The physical compiler rejects raw counter producers until series state is preserved.
     #[test]

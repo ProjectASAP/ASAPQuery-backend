@@ -19,7 +19,7 @@
         "time_selection": { "scope": "real_time", "lookback": 5000, "as_of": null }
       },
       {
-        "query": "sum_over_time(asap_demo_gauge[5s])",
+        "query": "sum(sum_over_time(asap_demo_gauge[5s]))",
         "demand": { "fixed_interval": 1000 },
         "requirements": { "accuracy": "implicit_exact", "response_latency": "unspecified" },
         "predictability": { "predictable": { "known_at": null } },
