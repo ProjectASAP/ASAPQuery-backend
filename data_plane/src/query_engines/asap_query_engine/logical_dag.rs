@@ -950,7 +950,12 @@ mod tests {
         q.requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
             planner_types::types::AccuracyTarget::Exact,
         );
-        let plan = snapshot.compile().unwrap();
+        // Compile the evidence-collection candidate; v1 unquoted startup keeps
+        // its native compatibility policy, while production v2 prices candidates.
+        let (candidate, environment) = snapshot.planning_request().unwrap();
+        let plan = control_plane::physical::compiler::PhysicalCompiler
+            .compile(candidate, environment)
+            .unwrap();
         let installed = plan.query_plan.lookup(query).unwrap();
         assert!(installed.nodes.values().any(|n| matches!(
             n,
