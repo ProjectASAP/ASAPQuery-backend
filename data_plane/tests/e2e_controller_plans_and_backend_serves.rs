@@ -1674,7 +1674,6 @@ fn extract_w_d_from_streaming_config(streaming_config_json: &JsonValue) -> (u32,
     (w, d)
 }
 
-
 /// OTLP `ExportMetricsServiceRequest` with a single `CountSketch` DP
 /// carrying msgpack-encoded heap-bearing bytes. `encoding=MSGPACK` (3)
 /// triggers `sketch_algorithm_for`'s auto-promotion to
