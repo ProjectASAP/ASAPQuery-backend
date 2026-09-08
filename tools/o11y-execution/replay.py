@@ -420,14 +420,15 @@ def main():
                               "Raw process RSS is not summary state size; store.json retains backend counters",
                               "Service startup before supplied PID attachment and isolated cold-cache runs remain unmeasured",
                               "Query equality on one dataset is not a formal approximation confidence guarantee"]}
+                from summarize import query_cost_comparison, STALE
+                report["query_cost_comparison"] = query_cost_comparison(plan, report, results, provenance, json.loads(args.snapshot.read_text()))
+                if report["query_cost_comparison"]["available"]:
+                    report["limitations"] = [item for item in report["limitations"] if item != STALE]
+                report["limitations"].append("Full lifecycle ratio remains unavailable: residency, retirement and service startup scopes are not aligned")
                 write_json(args.output / "comparison.json", report)
         finally:
-            child.terminate()
-            try:
-                child.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
+            from process_lifecycle import stop
+            write_json(args.output / "backend-lifecycle.json", stop(child, timeout=10))
 
 
 if __name__ == "__main__":
