@@ -396,6 +396,33 @@ impl BackendClient {
         }
     }
 
+    pub async fn discard_staged_physical_plan(
+        &self,
+        plan_id: u64,
+        plan_version: u64,
+    ) -> std::result::Result<(), BackendPostError> {
+        let response = self
+            .http
+            .post(format!(
+                "{}/discard",
+                derive_physical_plan_url(&self.endpoint)
+            ))
+            .json(&serde_json::json!({"plan_id": plan_id, "plan_version": plan_version}))
+            .send()
+            .await
+            .map_err(classify_reqwest_error)?;
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(classify_http_status(
+                status,
+                response.text().await.unwrap_or_default(),
+                "PhysicalPlan discard POST",
+            ))
+        }
+    }
+
     pub async fn activate_physical_plan(
         &self,
         plan_id: u64,

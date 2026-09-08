@@ -309,6 +309,27 @@ impl PhysicalPlanLifecycle {
         Ok(())
     }
 
+    /// Roll back a failed publication without touching active readers or state.
+    pub fn discard_staged(
+        &self,
+        plan_id: u64,
+        plan_version: u64,
+    ) -> Result<(), PhysicalPlanLifecycleError> {
+        let key = (plan_id, plan_version);
+        let mut state = self
+            .state
+            .lock()
+            .expect("physical-plan lifecycle lock poisoned");
+        if state.staged.remove(&key).is_none() {
+            return Err(PhysicalPlanLifecycleError::NotStaged {
+                plan_id,
+                plan_version,
+            });
+        }
+        state.statuses.remove(&key);
+        Ok(())
+    }
+
     pub fn activate(
         &self,
         plan_id: u64,
@@ -979,6 +1000,25 @@ mod tests {
         assert_eq!(statuses[1].phase, PhysicalPlanPhase::Active);
         lifecycle.retire_drained(7, 1);
         assert_eq!(lifecycle.statuses()[0].phase, PhysicalPlanPhase::Retired);
+    }
+
+    // Failed publication releases only its staging slot; active readers remain valid.
+    #[test]
+    fn discard_staged_allows_retry_and_never_discards_active() {
+        let active = HotReloadActivePhysicalPlan::new(physical_plan(7, 1, 100, None));
+        let held_reader = active.snapshot();
+        let lifecycle = PhysicalPlanLifecycle::new(active.clone());
+        lifecycle
+            .stage(physical_plan(7, 2, 200, None), 150)
+            .unwrap();
+        lifecycle.discard_staged(7, 2).unwrap();
+        lifecycle
+            .stage(physical_plan(7, 2, 300, None), 250)
+            .unwrap();
+        lifecycle.activate(7, 2, 300).unwrap();
+        assert!(lifecycle.discard_staged(7, 2).is_err());
+        assert_eq!(active.snapshot().backend_plan.plan_version, 2);
+        assert_eq!(held_reader.backend_plan.plan_version, 1);
     }
 
     #[test]

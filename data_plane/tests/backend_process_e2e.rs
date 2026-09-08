@@ -626,7 +626,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                 failed_body.contains("injected Collector staging failure"),
                 "{failed_body}"
             );
-            let (rejected_plan, _collector_socket) = collector.await.unwrap();
+            let (rejected_plan, collector_socket) = collector.await.unwrap();
             let rejected_frame = client
                 .post(format!("http://{otlp_http}/v1/metrics"))
                 .header("content-type", "application/x-protobuf")
@@ -671,6 +671,107 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                 .await
                 .unwrap();
             assert_eq!(first_scalar(&still_warm), Some(value));
+            // Retry the staged successor while queries are in flight. Each
+            // request must retain a complete active snapshot through cutover.
+            request["activation_unix_ms"] = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 250)
+                .into();
+            let reader_client = client.clone();
+            let reader_base = data_base.clone();
+            let readers = tokio::spawn(async move {
+                for _ in 0..40 {
+                    let response: serde_json::Value = reader_client
+                        .get(format!("{reader_base}/api/v1/query"))
+                        .query(&[
+                            ("query", query.to_string()),
+                            ("time", (window_end_ms as f64 / 1000.0).to_string()),
+                        ])
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        first_scalar(&response),
+                        Some(value),
+                        "torn serving snapshot: {response}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+            let collector = tokio::spawn(respond_next_collector_plan(collector_socket, true));
+            let activated = client
+                .post(format!(
+                    "{control_base}/api/v1/physical-plan/compile-and-publish"
+                ))
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            let status = activated.status();
+            let body = activated.text().await.unwrap();
+            assert!(
+                status.is_success(),
+                "successful successor rejected: {status}: {body}"
+            );
+            let activated: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(activated["plan_version"], 2);
+            let (successor, _collector_socket) = collector.await.unwrap();
+            readers.await.unwrap();
+            let old_frame = client
+                .post(format!("http://{otlp_http}/v1/metrics"))
+                .header("content-type", "application/x-protobuf")
+                .body(ddsketch_export(
+                    "whole_process_e2e_latency_ms",
+                    sample_ns,
+                    &[9999.0],
+                    planned_alpha,
+                    &collector_plan,
+                    2,
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                old_frame.status().as_u16(),
+                422,
+                "retired generation accepted a write"
+            );
+            let new_frame = client
+                .post(format!("http://{otlp_http}/v1/metrics"))
+                .header("content-type", "application/x-protobuf")
+                .body(ddsketch_export(
+                    "whole_process_e2e_latency_ms",
+                    sample_ns + 1_000_000_000,
+                    &[200.0; 101],
+                    planned_alpha,
+                    &successor,
+                    1,
+                ))
+                .send()
+                .await
+                .unwrap();
+            assert!(new_frame.status().is_success());
+            let new_result: serde_json::Value = client
+                .get(format!("{data_base}/api/v1/query"))
+                .query(&[
+                    ("query", query.to_string()),
+                    ("time", ((window_end_ms + 1000) as f64 / 1000.0).to_string()),
+                ])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(
+                (first_scalar(&new_result).unwrap() - 200.0).abs() <= 200.0 * planned_alpha * 1.05,
+                "{new_result}"
+            );
             return;
         }
         last_response = response;
