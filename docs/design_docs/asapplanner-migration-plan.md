@@ -48,7 +48,8 @@ Implementation tracking (PRs are not merged automatically):
 | [Backend #522](https://github.com/ProjectASAP/ASAPQuery-backend/pull/522) | D: provider-priced complete bound-workload selection, strict v2 startup evidence, read-only quote preparation, live publication/reporting and process acceptance |
 
 The backend PRs form a sequential review stack from #513 through #522;
-#515 additionally depends on Planner #356. #516 includes the fail-closed
+#515 uses merged Planner #356 at revision
+`378a7547ede629a64e84c9f7c810226ce196cce9`. #516 includes the fail-closed
 arithmetic regression fix, propagated through its dependent branches.
 The backend-local dashboard and distributed single-partition quantile examples
 have executable acceptance evidence, including complete cost-based selection
@@ -57,9 +58,9 @@ is in the review stack, not yet merged or deployed. Production calibration,
 platform-specific rollout and broader semantic workload replacement are not
 claimed complete by these fixtures.
 
-Local verification of the combined stack: 654 control-plane library tests,
-28 control-plane binary tests, one control-plane integration test, 977
-data-plane library tests and three production-process tests passed. Planner
+Local verification of the original combined migration stack: 654 control-plane
+library tests, 28 control-plane binary tests, one control-plane integration
+test, 977 data-plane library tests and three production-process tests passed. Planner
 #356 passed its 156 type-library tests and GitHub formatting/lint/test checks.
 The backend process tests cover the actual binaries and Collector Rust library,
 not production traffic or every Collector platform adapter. Local passes do
@@ -279,6 +280,26 @@ At the baseline inspection, open PRs
 process-E2E and TopK-related work. Re-check their status and changed files
 before touching overlapping paths. Their presence is not evidence that the
 workload-sharing migration is complete.
+
+Review follow-up (2026-09-08): #505 is now stacked on #522 and uses the merged
+Planner revision above. Typed TopK update weights belong to the selected
+producer, not its readout. Its multi-series fixture distinguishes count ranking
+(`api=4`) from value ranking (`worker=200`). #509 compares complete vectors at
+each range step, including changing winners. #506 tests unregistered-query
+fallback; it is not evidence that registered arithmetic is unsupported.
+
+#515 preserves duplicate algorithm candidates during cost ranking; removing
+them violates Planner's candidate-multiset contract and can panic. #522 quote
+preparation enumerates bindable alternatives without requiring the default
+warm alternative to compile, so missing warm implementations do not hide an
+available exact quote. Publication still requires a selected, validated plan.
+
+#511 retains evidence-aware legacy binding and now preserves count update
+semantics in emitted heap configuration. Its old sketch-envelope TopK serving
+tests remain a separate acceptance gap: the fixture installs StreamingConfig,
+not an active physical QueryPlan, and requests unregistered instantaneous TopK.
+Do not treat binding success or the canonical temporal TopK process test as
+proof that this legacy serving path has migrated.
 
 The [architecture PR #512](https://github.com/ProjectASAP/ASAPQuery-backend/pull/512)
 tracks the design and this delivery plan. Implementation PRs should report the
