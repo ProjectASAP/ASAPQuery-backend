@@ -547,6 +547,10 @@ async fn main() {
     let app = Router::new()
         .route("/api/v1/plan", post(handle_plan))
         .route(
+            "/api/v1/physical-plan/cost-manifests",
+            post(handle_workload_cost_manifests),
+        )
+        .route(
             "/api/v1/physical-plan/compile-and-publish",
             post(handle_compile_and_publish_physical_plan),
         )
@@ -590,6 +594,8 @@ struct PhysicalPlanQueryRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompileAndPublishPhysicalPlanRequest {
+    #[serde(default)]
+    workload_cost_evidence: Option<physical::workload_cost::WorkloadCostEvidence>,
     queries: Vec<PhysicalPlanQueryRequest>,
     collector_ids: Vec<String>,
     capability_snapshot_id: String,
@@ -613,6 +619,7 @@ fn default_physical_plan_timeout_ms() -> u64 {
 
 #[derive(Debug, Serialize)]
 struct CompileAndPublishPhysicalPlanResponse {
+    cost_comparison: Option<physical::workload_cost::WorkloadCostComparison>,
     plan_id: u64,
     plan_version: u64,
     status: &'static str,
@@ -629,7 +636,7 @@ async fn handle_compile_and_publish_physical_plan(
     State(st): State<AppState>,
     Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
 ) -> impl IntoResponse {
-    let (bundle, collector_ids, apply_timeout, adaptation_evidence) =
+    let (bundle, collector_ids, apply_timeout, adaptation_evidence, _) =
         match compile_physical_plan_request(request) {
             Ok(compiled) => compiled,
             Err(response) => return response.into_response(),
@@ -711,6 +718,7 @@ async fn handle_compile_and_publish_physical_plan(
     }
 
     Json(CompileAndPublishPhysicalPlanResponse {
+        cost_comparison: bundle.cost_comparison,
         plan_id: bundle.envelope.plan_id,
         plan_version: bundle.envelope.plan_version,
         status: "active",
@@ -731,6 +739,7 @@ fn compile_physical_plan_request(
         Vec<String>,
         Duration,
         Vec<physical::compiler::RuntimeAdaptationEvidence>,
+        Vec<physical::workload_cost::WorkloadCostManifest>,
     ),
     (StatusCode, String),
 > {
@@ -806,24 +815,38 @@ fn compile_physical_plan_request(
         return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string()));
     }
 
-    let bundle = match physical::compiler::PhysicalCompiler.compile(
-        physical::compiler::PlanningRequest {
-            queries,
-            evidence: request.evidence,
-            planner_revision: request.planner_revision,
-        },
-        physical::compiler::DeploymentEnvironment {
-            target: physical::compiler::PhysicalDeploymentTarget::DistributedCollectors,
-            collector_ids: request.collector_ids.clone(),
-            capability_snapshot_id: request.capability_snapshot_id,
-            observed_at_unix_ms: now,
-            max_evidence_age_ms: request.max_evidence_age_ms,
-            plan_version: request.plan_version,
-            activation_unix_ms: request.activation_unix_ms,
-            expiry_unix_ms: request.expiry_unix_ms,
-            backend_compat: request.backend_compat,
-        },
-    ) {
+    let planning_request = physical::compiler::PlanningRequest {
+        queries,
+        evidence: request.evidence,
+        planner_revision: request.planner_revision,
+    };
+    let environment = physical::compiler::DeploymentEnvironment {
+        target: physical::compiler::PhysicalDeploymentTarget::DistributedCollectors,
+        collector_ids: request.collector_ids.clone(),
+        capability_snapshot_id: request.capability_snapshot_id,
+        observed_at_unix_ms: now,
+        max_evidence_age_ms: request.max_evidence_age_ms,
+        plan_version: request.plan_version,
+        activation_unix_ms: request.activation_unix_ms,
+        expiry_unix_ms: request.expiry_unix_ms,
+        backend_compat: request.backend_compat,
+    };
+    let candidates = physical::workload_cost::with_exact_alternative(planning_request.clone())
+        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?;
+    let manifests = candidates
+        .iter()
+        .filter_map(|candidate| {
+            physical::compiler::PhysicalCompiler
+                .compile(candidate.clone(), environment.clone())
+                .and_then(|plan| physical::workload_cost::manifest(&plan, &candidate.queries))
+                .ok()
+        })
+        .collect();
+    let compiled = match request.workload_cost_evidence {
+        Some(evidence) => physical::workload_cost::select(candidates, environment, &evidence),
+        None => physical::compiler::PhysicalCompiler.compile(planning_request, environment),
+    };
+    let bundle = match compiled {
         Ok(bundle) => bundle,
         Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
     };
@@ -833,7 +856,25 @@ fn compile_physical_plan_request(
         request.collector_ids,
         apply_timeout,
         request.runtime_adaptation_evidence,
+        manifests,
     ))
+}
+
+/// Read-only preparation: no OpAMP, staging, activation or data-plane writes.
+async fn handle_workload_cost_manifests(
+    Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
+) -> impl IntoResponse {
+    if request.workload_cost_evidence.is_some() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "omit quotes when requesting manifests",
+        )
+            .into_response();
+    }
+    match compile_physical_plan_request(request) {
+        Ok((_, _, _, _, manifests)) => Json(manifests).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
