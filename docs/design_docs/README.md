@@ -10,9 +10,8 @@ internals and are subordinate to the shared system contracts.
 
 Proposals for shared-contract review (not duplicate normative specifications):
 
-- [Self-Describing Summary (SDS)](self-describing-summary.md): general summary
-  semantics, Schema / Dictionary / Record, compatibility, guarantees and
-  high-level migration across Planner and downstream runtimes.
+- [Self-Describing Summary (SDS)](self-describing-summary.md): Schema,
+  Dictionary and Record structure definitions.
 
 Backend-specific operating profiles:
 
