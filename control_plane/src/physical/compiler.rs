@@ -1619,25 +1619,7 @@ impl BackendLocalPlanningSnapshot {
                 runtime_policy: RuntimeRulePolicy::default(),
             });
         }
-        // A cohort shares the same end-to-end requirement, not an inferred
-        // weakest common accuracy. Different targets are searched separately.
-        let mut cohorts: Vec<(AccuracyTarget, Vec<(usize, Rc<QueryExpr>)>)> = Vec::new();
-        for (index, root) in canonical_roots.into_iter().enumerate() {
-            let accuracy = &queries[index].accuracy;
-            if let Some((_, roots)) = cohorts.iter_mut().find(|(target, _)| target == accuracy) {
-                roots.push((index, root));
-            } else {
-                cohorts.push((accuracy.clone(), vec![(index, root)]));
-            }
-        }
-        for (accuracy, roots) in cohorts {
-            let model = ControlPlaneCostModel::new(accuracy.clone());
-            let selected = crate::planner_selection::select_workload(roots, accuracy, &model)
-                .map_err(|error| CompileError::Snapshot(error.to_string()))?;
-            for (index, node) in selected {
-                queries[index].post_asap = node;
-            }
-        }
+        select_workload_roots(&mut queries, canonical_roots, &HashMap::new())?;
         PhysicalCompiler.compile(
             PlanningRequest {
                 queries,
@@ -2070,6 +2052,52 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
     (metrics.len() == 1)
         .then(|| metrics.into_iter().next())
         .flatten()
+}
+
+/// Shared selection boundary for canonical startup and compile-and-publish.
+/// Certificate-bearing roots stay isolated: equal certificate values do not
+/// establish that the certificate's source scope covers another query.
+pub fn select_workload_roots(
+    queries: &mut [PlanningQuery],
+    roots: Vec<Rc<QueryExpr>>,
+    evidence: &HashMap<String, TopKMembershipEvidence>,
+) -> Result<(), CompileError> {
+    if roots.len() != queries.len() {
+        return Err(CompileError::Snapshot(
+            "canonical root/query mapping is incomplete".into(),
+        ));
+    }
+    let mut cohorts: Vec<(AccuracyTarget, Option<String>, Vec<(usize, Rc<QueryExpr>)>)> =
+        Vec::new();
+    for (index, root) in roots.into_iter().enumerate() {
+        let accuracy = &queries[index].accuracy;
+        let certificate_scope = evidence
+            .contains_key(&queries[index].query_id)
+            .then(|| queries[index].query_id.clone());
+        if let Some((_, _, roots)) = cohorts
+            .iter_mut()
+            .find(|(target, scope, _)| target == accuracy && scope == &certificate_scope)
+        {
+            roots.push((index, root));
+        } else {
+            cohorts.push((accuracy.clone(), certificate_scope, vec![(index, root)]));
+        }
+    }
+    for (accuracy, scope, roots) in cohorts {
+        let model = ControlPlaneCostModel::new(accuracy.clone());
+        let certificate = scope.as_ref().and_then(|id| evidence.get(id));
+        let selected = crate::planner_selection::select_workload_with_evidence(
+            roots,
+            accuracy,
+            &model,
+            &QueryEvidence(certificate),
+        )
+        .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+        for (index, node) in selected {
+            queries[index].post_asap = node;
+        }
+    }
+    Ok(())
 }
 
 /// Planner-adapter selection step used before physical compilation. Keeping
@@ -2609,6 +2637,51 @@ mod tests {
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    // Both production adapters preserve canonical root identity and select the
+    // whole evidence-free cohort, rather than independently binding roots.
+    #[test]
+    fn shared_selection_adapter_preserves_query_mapping() {
+        let mut workload = request("q90", "quantile_over_time(0.9, m[1m])");
+        workload
+            .queries
+            .extend(request("q99", "quantile_over_time(0.99, m[1m])").queries);
+        let roots = workload
+            .queries
+            .iter()
+            .map(|query| {
+                Rc::new(
+                    crate::query_parser::parse_query_expr_canonical(
+                        &query.query_string,
+                        query.accuracy.clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        select_workload_roots(&mut workload.queries, roots, &workload.evidence).unwrap();
+        let bundle = PhysicalCompiler
+            .compile(workload, environment(10000))
+            .unwrap();
+        assert_eq!(bundle.query_plan.entries.len(), 2);
+        assert_eq!(bundle.collector_plans[0].materializations.len(), 1);
+        assert_eq!(
+            bundle
+                .query_plan
+                .entries
+                .values()
+                .map(|entry| entry.query_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["q90", "q99"])
+        );
+    }
+
+    // A broken input mapping must be rejected, never silently drop a root.
+    #[test]
+    fn shared_selection_rejects_incomplete_root_mapping() {
+        let mut workload = request("q", "quantile_over_time(0.9, m[1m])");
+        assert!(select_workload_roots(&mut workload.queries, vec![], &workload.evidence).is_err());
     }
 
     #[test]
