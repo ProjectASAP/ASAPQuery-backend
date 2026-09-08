@@ -11,8 +11,11 @@ The end-to-end architecture and shared contracts are maintained centrally in
 That documentation owns collection, transmission, backend ingest/storage/query,
 SID, physical plans, workload inputs, and runtime feedback.
 
-This repository keeps only code-owned implementation guidance and user-facing
-backend operation material.
+This repository keeps code-owned implementation guidance, user-facing backend
+operation material, and a scoped
+[ASAPPlanner integration proposal](design_docs/asapplanner-integration.md)
+covering architecture boundaries, workflow, and high-level migration without
+duplicating the canonical cross-component contracts.
 
 ## Getting started
 

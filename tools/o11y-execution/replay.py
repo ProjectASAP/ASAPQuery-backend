@@ -267,7 +267,7 @@ def main():
     parser.add_argument("--cpu-affinity", help="comma-separated permitted CPU IDs; enforced on backend and supplied Prometheus PIDs")
     parser.add_argument("--address-space-bytes", type=int, help="same RLIMIT_AS for backend and supplied Prometheus; virtual memory, not RSS cap")
     parser.add_argument("--port", type=int, default=18089)
-    parser.add_argument("--settle-seconds", type=float, default=0, help="deprecated; readiness uses explicit precompute drain")
+    parser.add_argument("--settle-seconds", type=float, default=0, help="deprecated; completion uses explicit finite-input drain")
     parser.add_argument("--repetitions", type=int, default=2)
     parser.add_argument("--relative-tolerance", type=float, default=0.0)
     parser.add_argument("--absolute-tolerance", type=float, default=0.0)
@@ -286,6 +286,10 @@ def main():
         parser.error("fallback-url must be a separate service")
     if args.fallback_url and (cpus or args.address_space_bytes) and not args.fallback_pid:
         parser.error("resource enforcement also requires --fallback-pid")
+    if args.fallback_url and args.exact_pid is not None and args.exact_pid == args.fallback_pid:
+        parser.error("baseline and fallback must use distinct processes")
+    if args.exact_storage and args.fallback_storage and args.exact_storage.resolve() == args.fallback_storage.resolve():
+        parser.error("baseline and fallback must use distinct storage directories")
     fallback_url = args.fallback_url or args.exact_url
     for pid in [args.exact_pid, args.fallback_pid]:
         if pid is not None:
@@ -305,7 +309,7 @@ def main():
                              for p in [args.metrics, args.queries, args.snapshot, args.compiler, args.data_plane]},
                   "samples": len(samples), "timestamp_min_ms": samples[0][2], "timestamp_max_ms": samples[-1][2],
                   "query_occurrences": len(queries), "configuration": {k: str(v) for k, v in vars(args).items()},
-                  "limitations": ["generator provenance must be supplied separately", "first pass is not a guaranteed cold cache", "finite-input drain closes trailing partial windows; query correctness is checked against Prometheus"]}
+                  "limitations": ["generator provenance must be supplied separately", "first pass is not a guaranteed cold cache", "finite-input drain closes trailing panes and permanently seals Remote Write; no live-ingestion claim"]}
     write_json(args.output / "run.json", provenance)
     planning_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     with (args.output / "planning.stderr").open("w") as log:
@@ -363,7 +367,7 @@ def main():
             if drained["http_status"] != 200 or drained["response"].get("complete") is not True:
                 raise RuntimeError("finite-input materialization drain failed; see drain.json")
             ingest_elapsed = time.perf_counter_ns() - ingest_start
-            phases["after_ingest_and_settle"] = process_snapshots()
+            phases["after_ingest_and_drain"] = process_snapshots()
             write_json(args.output / "store-after-build.json", request(backend + "/api/v1/store/metrics"))
             write_json(args.output / "process-phases.json", phases)
             results = replay(queries, backend, args.output, args.repetitions, args.exact_url if args.compare else None,
@@ -399,8 +403,9 @@ def main():
                           "resource_limits": {"cpu_affinity": sorted(cpus) if cpus else None,
                                               "address_space_bytes": args.address_space_bytes,
                                               "scope": "per process; backend fallback service charged separately"},
-                          "isolated_baseline_service": bool(args.fallback_url),
-                          "measured_ingest_and_settle_wall_ns": ingest_elapsed,
+                          "separate_fallback_endpoint": bool(args.fallback_url),
+                          "isolated_baseline_service": bool(args.fallback_url and args.exact_pid and args.fallback_pid and args.exact_pid != args.fallback_pid),
+                          "measured_ingest_and_drain_wall_ns": ingest_elapsed,
                           "planning_wall_ns": plan["planning_elapsed_ns"],
                           "process_phases": phases,
                           "planning_resources": planning_resources,
@@ -409,8 +414,8 @@ def main():
                                                      for service in PROCESS_IDS}
                                               for name, before, after in [
                                                   ("startup", "startup", "before_ingest"),
-                                                  ("ingest_and_build", "before_ingest", "after_ingest_and_settle"),
-                                                  ("queries", "after_ingest_and_settle", "after_queries")]},
+                                                  ("ingest_and_build", "before_ingest", "after_ingest_and_drain"),
+                                                  ("queries", "after_ingest_and_drain", "after_queries")]},
                           "estimated_vs_measured_cost_ratio": None,
                           "acceptance_complete": False,
                           "limitations": ["No common conversion from provider cost units to measured resource units",

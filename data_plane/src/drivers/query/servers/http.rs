@@ -5754,6 +5754,29 @@ async fn handle_health(State(state): State<AppState>) -> axum::response::Respons
     (StatusCode::OK, "ok").into_response()
 }
 
+/// Explicit end-of-input; this seals Remote Write for the lifetime of the process.
+async fn handle_precompute_drain(State(state): State<AppState>) -> Response {
+    let Some(receiver) = state.remote_write.as_ref() else {
+        return (StatusCode::NOT_FOUND, "Remote Write is disabled").into_response();
+    };
+    match receiver.drain().await {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "status": "success", "input_closed": true, "complete": true
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({
+                "status": "error", "input_closed": true, "complete": false, "error": error
+            })),
+        )
+            .into_response(),
+    }
+}
+
 /// Return list of metrics currently in the store.
 /// Explicit end-of-input; this seals Remote Write for the lifetime of the process.
 async fn handle_precompute_drain(State(state): State<AppState>) -> Response {

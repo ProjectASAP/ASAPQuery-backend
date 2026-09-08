@@ -1,7 +1,7 @@
 //! Black-box acceptance test for the collector-free ASAPQuery profile.
 //!
 //! Starts the production binary from a canonical workload snapshot, ingests
-//! only Prometheus Remote Write v1, exercises every declared warm query family
+//! only Prometheus Remote Write v1, exercises safe warm families and per-series fallback
 //! through instant and range APIs, and verifies exact fallback request parity.
 
 use std::collections::HashMap;
@@ -115,6 +115,266 @@ fn is_warm(response: &Value) -> bool {
                 .is_some_and(|line| line == "data_source: asap_query")
         })
     })
+}
+
+// Both heap implementations must execute registered temporal counts through
+// an installed QueryPlan, retaining all three ranked identities and values.
+#[tokio::test]
+async fn registered_temporal_topk_cms_heap() {
+    registered_temporal_topk(planner_types::post_asap::SketchAlgorithm::CmsWithHeap).await;
+}
+
+#[tokio::test]
+async fn registered_temporal_topk_count_sketch_heap() {
+    registered_temporal_topk(planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap).await;
+}
+
+async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlgorithm) {
+    use control_plane::physical::compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler};
+    use planner_types::post_asap::{CompositionOperator, SketchQuery, SummaryFamilyType};
+    const QUERY: &str = "topk(3, count_over_time(top_endpoint_qps[5s]))";
+    struct Evidence;
+    impl asap_aware_mapping::AccuracyEvidenceProvider for Evidence {
+        fn propagation_stats(
+            &self,
+            op: &CompositionOperator,
+            _: &SummaryFamilyType,
+            _: Option<&SketchQuery>,
+        ) -> asap_aware_mapping::PropagationStats {
+            if matches!(op, CompositionOperator::TopKSelection) {
+                asap_aware_mapping::PropagationStats {
+                    topk_selected_lower_bound: Some(95.0),
+                    topk_excluded_upper_bound: Some(80.0),
+                    topk_interval_failure_probability: Some(0.001),
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            }
+        }
+    }
+    let mut fixture: Value = serde_json::from_str(include_str!(
+        "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+    ))
+    .unwrap();
+    let mut entry = fixture["query_workload"]["repeating_queries"][5].clone();
+    entry["query"] = QUERY.into();
+    entry["requirements"]["accuracy"] =
+        serde_json::json!({"explicit": {"EpsilonDelta": {"epsilon": 0.05, "delta": 0.05}}});
+    fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
+    fixture["implementation"]["topk_evidence"] = serde_json::json!({
+        QUERY: {
+            "selected_lower_bound": 95.0, "excluded_upper_bound": 80.0,
+            "interval_failure_probability": 0.001, "observed_at_unix_ms": 9500,
+            "source": "deterministic-count-ranking-fixture"
+        }
+    });
+    let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture).unwrap();
+    let (mut request, environment) = snapshot.planning_request().unwrap();
+    let query = &mut request.queries[0];
+    let expr =
+        control_plane::query_parser::parse_query_expr_canonical(QUERY, query.accuracy.clone())
+            .unwrap();
+    let model = control_plane::physical::post_asap::cost_model::ForcedFamilyCostModel::new(
+        query.accuracy.clone(),
+        algorithm.clone(),
+    );
+    query.post_asap = control_plane::planner_selection::select_summary_with_evidence(
+        &expr,
+        &model,
+        &asap_aware_mapping::DefaultAccuracyModel,
+        &asap_aware_mapping::EqualSplitAllocator,
+        &Evidence,
+    )
+    .unwrap();
+    let plan = PhysicalCompiler.compile(request, environment).unwrap();
+    assert_eq!(plan.precompute_plan.materializations.len(), 1);
+    use data_plane::storage_engines::types::AggregationType;
+    let expected_type = match algorithm {
+        planner_types::post_asap::SketchAlgorithm::CmsWithHeap => {
+            AggregationType::CountMinSketchWithHeap
+        }
+        planner_types::post_asap::SketchAlgorithm::CountSketchWithHeap => {
+            AggregationType::CountSketchWithHeap
+        }
+        _ => panic!("fixture requires a heap implementation"),
+    };
+    assert_eq!(
+        plan.precompute_plan.materializations[0].aggregation_type,
+        expected_type
+    );
+    assert_eq!(
+        plan.precompute_plan.materializations[0].parameters["weight_mode"],
+        "count"
+    );
+    let artifact = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
+        precompute_plan: plan.precompute_plan,
+        transmission_plan: plan.transmission_plan,
+        backend_plan: plan.backend_plan.encode_to_vec(),
+        query_plan: plan.query_plan,
+        storage_routing: None,
+        adaptation_evidence: vec![],
+    };
+    let output = tempfile::tempdir().unwrap();
+    let mut artifact_file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&mut artifact_file, &artifact).unwrap();
+    let port = unused_port();
+    let fallback = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fallback_url = format!("http://{}", fallback.local_addr().unwrap());
+    let fallback_task = tokio::spawn(async move {
+        axum::serve(fallback, Router::new()
+            .route("/-/healthy", get(|| async { "healthy" }))
+            .route("/api/v1/query", get(|| async { Json(serde_json::json!({
+                "status": "error", "errorType": "execution", "error": "fixture exact backend unavailable"
+            })) }))).await.unwrap();
+    });
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_data_plane"))
+            .args(["--profile", "asapquery", "--physical-plan"])
+            .arg(artifact_file.path())
+            .args([
+                "--forward-unsupported-queries",
+                "--prometheus-server",
+                &fallback_url,
+            ])
+            .args(["--http-port", &port.to_string(), "--output-dir"])
+            .arg(output.path())
+            .args([
+                "--precompute-allowed-lateness-ms",
+                "0",
+                "--precompute-flush-interval-ms",
+                "25",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let client = reqwest::Client::new();
+    let backend = format!("http://127.0.0.1:{port}");
+    wait_until_ready(&client, &format!("{backend}/api/v1/health"), &mut child.0).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let base = now - now.rem_euclid(5000) - 20000;
+    let counts = [
+        ("alpha", 100),
+        ("beta", 50),
+        ("gamma", 200),
+        ("delta", 75),
+        ("epsilon", 10),
+        ("zeta", 150),
+    ];
+    let samples = WriteRequest {
+        timeseries: counts
+            .iter()
+            .map(|(item, count)| {
+                // Non-unit values distinguish count updates from accidental weighted sums.
+                let points = (0..2)
+                    .flat_map(|window| {
+                        (0..*count).map(move |i| (base + window * 5000 + 10 + i * 20, 17.0))
+                    })
+                    .collect::<Vec<_>>();
+                series_with_labels("top_endpoint_qps", &[("endpoint", item)], &points)
+            })
+            .collect(),
+    };
+    assert_eq!(remote_write(&client, &backend, &samples).await, 204);
+    let watermark = WriteRequest {
+        timeseries: vec![series_with_labels(
+            "top_endpoint_qps",
+            &[("endpoint", "gamma")],
+            &[(base + 10500, 17.0)],
+        )],
+    };
+    assert_eq!(remote_write(&client, &backend, &watermark).await, 204);
+    assert_eq!(remote_write(&client, &backend, &samples).await, 204);
+    let timestamp = (base + 5000) as f64 / 1000.0;
+    let instant = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let response: Value = client
+                .get(format!("{backend}/api/v1/query"))
+                .query(&[
+                    ("query", QUERY.to_string()),
+                    ("time", timestamp.to_string()),
+                ])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if response["status"] == "success" && is_warm(&response) {
+                break response;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("registered TopK must become warm within 30s");
+    let expected = [("gamma", 200.0), ("zeta", 150.0), ("alpha", 100.0)];
+    let assert_ranks = |response: &Value, range: bool| {
+        assert_eq!(response["status"], "success", "{response}");
+        assert!(is_warm(response), "{response}");
+        let rows = response["data"]["result"].as_array().unwrap();
+        assert_eq!(rows.len(), 3, "{response}");
+        for (item, count) in expected {
+            let row = rows
+                .iter()
+                .find(|row| {
+                    row["metric"]["item"].as_str()
+                        == Some(format!("top_endpoint_qps{{endpoint=\"{item}\"}}").as_str())
+                })
+                .unwrap_or_else(|| panic!("missing {item}: {response}"));
+            let points = if range {
+                let points = row["values"].as_array().unwrap();
+                assert_eq!(points.len(), 2);
+                points.clone()
+            } else {
+                vec![row["value"].clone()]
+            };
+            for (index, point) in points.iter().enumerate() {
+                assert_eq!(point[0].as_f64(), Some(timestamp + index as f64 * 5.0));
+                assert_eq!(
+                    point[1].as_str().unwrap().parse::<f64>().unwrap(),
+                    count,
+                    "{response}"
+                );
+            }
+        }
+    };
+    assert_ranks(&instant, false);
+    let range: Value = client
+        .get(format!("{backend}/api/v1/query_range"))
+        .query(&[
+            ("query", QUERY.to_string()),
+            ("start", timestamp.to_string()),
+            ("end", (timestamp + 5.0).to_string()),
+            ("step", "5".into()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_ranks(&range, true);
+    let unregistered: Value = client
+        .get(format!("{backend}/api/v1/query"))
+        .query(&[("query", "topk(3, top_endpoint_qps)")])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        unregistered["status"], "error",
+        "unregistered query must not replan: {unregistered}"
+    );
+    assert_eq!(unregistered["error"], "fixture exact backend unavailable");
+    fallback_task.abort();
 }
 
 // Three registered consumers must observe one raw SUM/count producer, including
@@ -491,6 +751,16 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
                 ],
             ),
             series_with_labels(
+                "asap_demo_counter_total",
+                &[("instance", "independent")],
+                &[
+                    (base + 500, 50.0),
+                    (base + 1_700, 60.0),
+                    (base + 2_900, 5.0),
+                    (base + 4_200, 15.0),
+                ],
+            ),
+            series_with_labels(
                 "asap_demo_gauge",
                 &[("job", "api")],
                 &[
@@ -564,34 +834,48 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let first_eval = (base + 5_000) as f64 / 1_000.0;
     let second_eval = (base + 10_000) as f64 / 1_000.0;
     let backend_log = output_dir.path().join("query_engine.log");
-    let rate = wait_for_warm_instant(
-        &client,
-        &backend,
+    // Counter and bare per-series quantile roots retain the complete exact request
+    // until raw producers can preserve the required per-series state.
+    for query in [
         "rate(asap_demo_counter_total[5s])",
-        first_eval,
-        &backend_log,
-    )
-    .await;
-    let increase = wait_for_warm_instant(
-        &client,
-        &backend,
         "increase(asap_demo_counter_total[5s])",
-        first_eval,
-        &backend_log,
-    )
-    .await;
+        "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
+    ] {
+        let instant: Value = client
+            .get(format!("{backend}/api/v1/query"))
+            .query(&[
+                ("query", query.to_string()),
+                ("time", first_eval.to_string()),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(instant["data"]["result"][0]["metric"]["fallback"], "true");
+        assert!(!is_warm(&instant));
+        let range: Value = client
+            .get(format!("{backend}/api/v1/query_range"))
+            .query(&[
+                ("query", query.to_string()),
+                ("start", first_eval.to_string()),
+                ("end", second_eval.to_string()),
+                ("step", "5".into()),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(range["data"]["result"][0]["metric"]["fallback"], "true");
+        assert!(!is_warm(&range));
+    }
     let sum = wait_for_warm_instant(
         &client,
         &backend,
-        "sum_over_time(asap_demo_gauge[5s])",
-        first_eval,
-        &backend_log,
-    )
-    .await;
-    let quantile = wait_for_warm_instant(
-        &client,
-        &backend,
-        "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
+        "sum(sum_over_time(asap_demo_gauge[5s]))",
         first_eval,
         &backend_log,
     )
@@ -635,24 +919,17 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         topk_count["data"]["result"][0]["metric"]["item"],
         "asap_demo_gauge{job=\"api\"}"
     );
-    let rate_value = first_value(&rate, "value").expect("rate value");
-    let increase_value = first_value(&increase, "value").expect("increase value");
-    assert!((rate_value * 5.0 - increase_value).abs() < 1e-9);
     assert!((first_value(&sum, "value").expect("sum value") - 240.0).abs() < 1e-9);
-    let quantile_value = first_value(&quantile, "value").expect("quantile value");
-    assert!(
-        (19.0..=31.0).contains(&quantile_value),
-        "unexpected p50: {quantile_value}; response={quantile}"
-    );
 
     for query in [
-        "rate(asap_demo_counter_total[5s])",
-        "increase(asap_demo_counter_total[5s])",
-        "sum_over_time(asap_demo_gauge[5s])",
-        "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
+        "sum(sum_over_time(asap_demo_gauge[5s]))",
         "topk(1, sum_over_time(asap_demo_gauge[5s]))",
         "topk(1, count_over_time(asap_demo_gauge[5s]))",
     ] {
+        let first_instant =
+            wait_for_warm_instant(&client, &backend, query, first_eval, &backend_log).await;
+        let second_instant =
+            wait_for_warm_instant(&client, &backend, query, second_eval, &backend_log).await;
         let response: Value = client
             .get(format!("{backend}/api/v1/query_range"))
             .query(&[
@@ -672,6 +949,45 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
             is_warm(&response),
             "{query} did not use warm tier: {response}"
         );
+        // Compare the complete vector at each step, including changing Top-K
+        // membership. Sorting labels makes response ordering irrelevant.
+        for (timestamp, instant) in [(first_eval, &first_instant), (second_eval, &second_instant)] {
+            let mut expected = instant["data"]["result"]
+                .as_array()
+                .expect("instant vector")
+                .iter()
+                .map(|series| {
+                    (
+                        serde_json::to_string(&series["metric"]).unwrap(),
+                        series["value"][1].as_str().unwrap().parse::<f64>().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut actual = response["data"]["result"]
+                .as_array()
+                .expect("range matrix")
+                .iter()
+                .flat_map(|series| {
+                    series["values"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(move |point| point[0].as_f64() == Some(timestamp))
+                        .map(move |point| {
+                            (
+                                serde_json::to_string(&series["metric"]).unwrap(),
+                                point[1].as_str().unwrap().parse::<f64>().unwrap(),
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            expected.sort_by(|a, b| a.0.cmp(&b.0));
+            actual.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                actual, expected,
+                "complete range/instant vector differs for {query} at {timestamp}"
+            );
+        }
         if query.starts_with("topk(") {
             let mut ranked_points = response["data"]["result"]
                 .as_array()
@@ -716,7 +1032,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
 
     // Readiness polling may briefly reach the exact fallback before a newly
     // closed warm window is visible. Every planned query above was required
-    // to converge to a warm answer; isolate the explicit fallback assertions.
+    // to converge to its declared warm or exact tier; isolate further fallback assertions.
     fallback_calls.lock().await.clear();
 
     let fallback_instant: Value = client
@@ -760,10 +1076,46 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         "true"
     );
 
+    // These complete expressions are NOT registered in this snapshot.
+    // This tests routing fallback, not absence of operator support: registered
+    // exact arithmetic is covered by shared_exact_dashboard_executes_selected_workload.
+    // Never partially warm an unregistered expression using a registered child.
+    let fallback_matrix = [
+        // ASAPQuery #700; backend #503.
+        "avg_over_time(asap_demo_gauge[5s])",
+        "count(asap_demo_gauge)",
+        "avg(asap_demo_gauge)",
+        // ASAPQuery #629/#700; backend #432.
+        "topk(5, asap_demo_gauge)",
+        // ASAPQuery #256/#572/#577/#644; Planner #343, backend #504.
+        "rate(asap_demo_counter_total[5s]) + rate(asap_demo_counter_total[5s])",
+        "rate(asap_demo_counter_total[5s]) / 2",
+        // ASAPQuery #466/#640; backend #473.
+        "sum_over_time(asap_demo_gauge[10s])",
+    ];
+    for query in fallback_matrix {
+        let response: Value = client
+            .get(format!("{backend}/api/v1/query"))
+            .query(&[
+                ("query", query.to_string()),
+                ("time", first_eval.to_string()),
+            ])
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("fallback request failed for {query}: {error}"))
+            .json()
+            .await
+            .unwrap_or_else(|error| panic!("fallback JSON failed for {query}: {error}"));
+        assert_eq!(
+            response["data"]["result"][0]["metric"]["fallback"], "true",
+            "unregistered matrix row must fall back atomically: {query}: {response}"
+        );
+    }
+
     let calls = fallback_calls.lock().await;
     assert_eq!(
         calls.len(),
-        2,
+        2 + fallback_matrix.len(),
         "planned queries unexpectedly fell back: {calls:?}"
     );
     assert_eq!(calls[0].0, "instant");
@@ -791,10 +1143,83 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let materializations = status["materializations"]
         .as_array()
         .expect("materialization statuses");
-    assert_eq!(materializations.len(), 5);
+    assert_eq!(materializations.len(), 3);
     assert!(materializations
         .iter()
         .all(|entry| entry["phase"] == "serving"));
+
+    // A previously generated raw counter plan must be rejected before staging,
+    // while the current safe generation remains available to readers.
+    let mut snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        serde_json::from_str(include_str!(
+            "../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+    snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+        planner_types::workload::Query("rate(asap_demo_counter_total[1m])".into());
+    let (mut legacy_request, mut environment) = snapshot.planning_request().unwrap();
+    let query = &mut legacy_request.queries[0];
+    let parsed = control_plane::query_parser::parse_query_expr_canonical(
+        &query.query_string,
+        query.accuracy.clone(),
+    )
+    .unwrap();
+    query.post_asap = control_plane::physical::compiler::select_post_asap(
+        &parsed,
+        query.accuracy.clone(),
+        &query.lifecycle,
+        None,
+    )
+    .unwrap();
+    environment.target =
+        control_plane::physical::compiler::PhysicalDeploymentTarget::DistributedCollectors;
+    environment.collector_ids = vec!["legacy-counter-source".into()];
+    environment.plan_version = 2;
+    let mut legacy = control_plane::physical::compiler::PhysicalCompiler
+        .compile(legacy_request, environment)
+        .unwrap();
+    legacy.precompute_plan.ingest.protocol =
+        control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1;
+    legacy.precompute_plan.ingest.endpoint_path = "/api/v1/write".into();
+    legacy.precompute_plan.ingest.timestamp_unit =
+        control_plane::physical::compiler::TimestampUnit::UnixMilliseconds;
+    legacy.precompute_plan.ingest.require_plan_identity = false;
+    legacy
+        .precompute_plan
+        .ingest
+        .require_materialization_identity = false;
+    legacy.precompute_plan.ingest.require_registered_producer = false;
+    legacy.precompute_plan.producers.clear();
+    legacy.transmission_plan.rules.clear();
+    let artifact = serde_json::json!({"precompute_plan": legacy.precompute_plan,
+        "transmission_plan": legacy.transmission_plan, "backend_plan": legacy.backend_plan.encode_to_vec(),
+        "query_plan": legacy.query_plan, "storage_routing": null, "adaptation_evidence": []});
+    let built = data_plane::drivers::query::servers::http::build_active_physical_plan(
+        serde_json::from_value(artifact.clone()).unwrap(),
+        std::sync::Arc::new(data_plane::storage_engines::types::BackendStorageRouting::empty()),
+    );
+    assert!(matches!(built, Err(error) if error.contains("raw counter state")));
+    // HTTP may reject this old generation at the earlier successor authorization
+    // boundary; either way it must leave the installed generation unchanged.
+    let rejected = client
+        .post(format!("{backend}/api/v1/physical-plan"))
+        .json(&artifact)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status().as_u16(), 422);
+    let after: Value = client
+        .get(format!("{backend}/api/v1/physical-plan/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after["plans"], status["plans"],
+        "rejected artifact changed active generation"
+    );
 
     let metrics = client
         .get(format!("{backend}/metrics"))
@@ -805,7 +1230,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         .await
         .expect("metrics body");
     assert!(metrics.contains("asap_remote_write_requests_total 4"));
-    assert!(metrics.contains("asap_remote_write_samples_total 32"));
-    assert!(metrics.contains("asap_remote_write_duplicates_total 29"));
+    assert!(metrics.contains("asap_remote_write_samples_total 36"));
+    assert!(metrics.contains("asap_remote_write_duplicates_total 33"));
     assert!(metrics.contains("asap_remote_write_rejected_requests_total 1"));
 }

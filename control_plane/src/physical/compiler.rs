@@ -1678,6 +1678,7 @@ impl BackendLocalPlanningSnapshot {
             });
         }
         select_workload_roots(&mut queries, canonical_roots, &topk_evidence_by_id)?;
+        // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
             PlanningRequest {
                 local_raw_execution: true,
@@ -1688,6 +1689,99 @@ impl BackendLocalPlanningSnapshot {
             self.environment,
         ))
     }
+}
+
+/// Raw accumulators do not retain arbitrary source labels. Preserve native semantics
+/// unless the selected DAG explicitly authorizes pooling the source entities.
+fn has_unsafe_raw_entity_leaf(
+    node: &Rc<SummaryNode>,
+    selected: &BTreeSet<usize>,
+    pooling: bool,
+) -> bool {
+    use planner_types::post_asap::ExactKind;
+    use planner_types::pre_asap::Reduction;
+    match &node.expr {
+        SummaryExpr::SummaryAgg {
+            child,
+            reduction,
+            family,
+            ..
+        } => {
+            if selected.contains(&(Rc::as_ptr(node) as usize)) {
+                return matches!(reduction, Reduction::PerEntity) && !pooling;
+            }
+            let additive_reduction = matches!(reduction, Reduction::Reduce(_))
+                && matches!(family, SummaryFamilyType::ExactAggregate(ExactKind::Sum, _))
+                && matches!(
+                    &child.expr,
+                    SummaryExpr::SummaryAgg {
+                        family: SummaryFamilyType::ExactAggregate(
+                            ExactKind::Sum | ExactKind::Count,
+                            _
+                        ),
+                        ..
+                    }
+                );
+            has_unsafe_raw_entity_leaf(child, selected, additive_reduction)
+        }
+        SummaryExpr::BinaryOp { lhs, rhs, .. } => {
+            has_unsafe_raw_entity_leaf(lhs, selected, false)
+                || has_unsafe_raw_entity_leaf(rhs, selected, false)
+        }
+        SummaryExpr::SummaryEstimate { summary_input, .. } => {
+            has_unsafe_raw_entity_leaf(summary_input, selected, false)
+        }
+        SummaryExpr::SummaryMerge { children } => children
+            .iter()
+            .any(|child| has_unsafe_raw_entity_leaf(child, selected, false)),
+        _ => false,
+    }
+}
+
+/// Preserve native execution for raw states that cannot preserve source semantics.
+fn preserve_native_unsafe_raw_roots(queries: &mut [PlanningQuery]) -> Result<(), CompileError> {
+    for query in queries {
+        let selected = collect_selected_materializations(&query.post_asap, false).map_err(|reason| {
+            CompileError::Query {
+                query_id: query.query_id.clone(),
+                reason,
+            }
+        })?;
+        let unsafe_entities = has_unsafe_raw_entity_leaf(
+            &query.post_asap,
+            &selected.iter().map(|state| state.node_identity).collect(),
+            false,
+        );
+        if unsafe_entities
+            || selected.iter().any(|state| {
+                matches!(
+                    state.family,
+                    SummaryFamilyType::ExactAggregate(
+                        planner_types::post_asap::ExactKind::Increase
+                            | planner_types::post_asap::ExactKind::Rate,
+                        _
+                    )
+                )
+            })
+        {
+            let parsed = crate::query_parser::parse_query_expr_canonical(
+                &query.query_string,
+                query.accuracy.clone(),
+            )
+            .map_err(|error| CompileError::Query {
+                query_id: query.query_id.clone(),
+                reason: error.to_string(),
+            })?;
+            query.post_asap =
+                crate::planner_selection::keep_pre_asap(&parsed).map_err(|error| {
+                    CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+        }
+    }
+    Ok(())
 }
 
 impl PhysicalCompiler {
@@ -1718,46 +1812,10 @@ impl PhysicalCompiler {
             });
         }
 
-        // Raw counter updates currently pool series inside a grouping bucket.
-        // Keep complete native execution until independent reset/timestamp state
-        // is represented; other workload roots can still use their summaries.
         if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite
             && !request.local_raw_execution
         {
-            for query in &mut request.queries {
-                let selected = collect_selected_materializations(&query.post_asap, false).map_err(
-                    |reason| CompileError::Query {
-                        query_id: query.query_id.clone(),
-                        reason,
-                    },
-                )?;
-                if selected.iter().any(|state| {
-                    matches!(
-                        state.family,
-                        SummaryFamilyType::ExactAggregate(
-                            planner_types::post_asap::ExactKind::Increase
-                                | planner_types::post_asap::ExactKind::Rate,
-                            _
-                        )
-                    )
-                }) {
-                    let parsed = crate::query_parser::parse_query_expr_canonical(
-                        &query.query_string,
-                        query.accuracy.clone(),
-                    )
-                    .map_err(|error| CompileError::Query {
-                        query_id: query.query_id.clone(),
-                        reason: error.to_string(),
-                    })?;
-                    query.post_asap =
-                        crate::planner_selection::keep_pre_asap(&parsed).map_err(|error| {
-                            CompileError::Query {
-                                query_id: query.query_id.clone(),
-                                reason: error.to_string(),
-                            }
-                        })?;
-                }
-            }
+            preserve_native_unsafe_raw_roots(&mut request.queries)?;
         }
 
         let roots = request
@@ -2766,51 +2824,6 @@ fn materialization_consumers(
 /// fallback node and no unused warm state is provisioned.
 /// Raw accumulators do not retain arbitrary source labels. Preserve native semantics
 /// unless the selected DAG explicitly authorizes pooling the source entities.
-fn has_unsafe_raw_entity_leaf(
-    node: &Rc<SummaryNode>,
-    selected: &BTreeSet<usize>,
-    pooling: bool,
-) -> bool {
-    use planner_types::post_asap::ExactKind;
-    use planner_types::pre_asap::Reduction;
-    match &node.expr {
-        SummaryExpr::SummaryAgg {
-            child,
-            reduction,
-            family,
-            ..
-        } => {
-            if selected.contains(&(Rc::as_ptr(node) as usize)) {
-                return matches!(reduction, Reduction::PerEntity) && !pooling;
-            }
-            let additive_reduction = matches!(reduction, Reduction::Reduce(_))
-                && matches!(family, SummaryFamilyType::ExactAggregate(ExactKind::Sum, _))
-                && matches!(
-                    &child.expr,
-                    SummaryExpr::SummaryAgg {
-                        family: SummaryFamilyType::ExactAggregate(
-                            ExactKind::Sum | ExactKind::Count,
-                            _
-                        ),
-                        ..
-                    }
-                );
-            has_unsafe_raw_entity_leaf(child, selected, additive_reduction)
-        }
-        SummaryExpr::BinaryOp { lhs, rhs, .. } => {
-            has_unsafe_raw_entity_leaf(lhs, selected, false)
-                || has_unsafe_raw_entity_leaf(rhs, selected, false)
-        }
-        SummaryExpr::SummaryEstimate { summary_input, .. } => {
-            has_unsafe_raw_entity_leaf(summary_input, selected, false)
-        }
-        SummaryExpr::SummaryMerge { children } => children
-            .iter()
-            .any(|child| has_unsafe_raw_entity_leaf(child, selected, false)),
-        _ => false,
-    }
-}
-
 fn collect_selected_materializations(
     node: &Rc<SummaryNode>,
     composable: bool,
@@ -3055,6 +3068,41 @@ fn stable_workload_plan_id(
 mod tests {
     use super::*;
 
+    #[test]
+    fn raw_per_entity_state_requires_explicit_additive_reduction() {
+        for query in [
+            "sum_over_time(m[1m])",
+            "quantile_over_time(0.99, m[1m])",
+            "sum_over_time(m[1m]) / count_over_time(m[1m])",
+        ] {
+            let mut environment = environment(10_000);
+            environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+            environment.collector_ids.clear();
+            let plan = PhysicalCompiler
+                .compile(request("per-entity", query), environment)
+                .unwrap();
+            assert!(
+                plan.precompute_plan.materializations.is_empty(),
+                "{query} pooled source entities"
+            );
+        }
+        for query in [
+            "sum(sum_over_time(m[1m]))",
+            "sum by (job) (sum_over_time(m[1m]))",
+        ] {
+            let mut environment = environment(10_000);
+            environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+            environment.collector_ids.clear();
+            let plan = PhysicalCompiler
+                .compile(request("reduced", query), environment)
+                .unwrap();
+            assert!(
+                !plan.precompute_plan.materializations.is_empty(),
+                "{query} lost safe additive state"
+            );
+        }
+    }
+
     // A pooled raw counter cannot distinguish same-timestamp series or independent resets.
     #[test]
     fn backend_local_rejects_pooled_counter_materialization() {
@@ -3071,6 +3119,74 @@ mod tests {
             entry.nodes[&entry.root],
             crate::query_plan::QueryPlanNode::ExactFallback { .. }
         )));
+    }
+
+    // Old precompiled raw counter artifacts are rejected before installation too.
+    #[test]
+    fn raw_counter_artifact_is_rejected_while_envelope_counter_remains_valid() {
+        let plan = PhysicalCompiler
+            .compile(request("counter", "rate(m[1m])"), environment(10_000))
+            .unwrap();
+        plan.precompute_plan.validate().unwrap();
+        let mut raw = plan.precompute_plan;
+        raw.ingest.protocol = IngestProtocol::PrometheusRemoteWriteV1;
+        raw.ingest.endpoint_path = "/api/v1/write".into();
+        raw.ingest.timestamp_unit = TimestampUnit::UnixMilliseconds;
+        raw.ingest.require_plan_identity = false;
+        raw.ingest.require_materialization_identity = false;
+        raw.ingest.require_registered_producer = false;
+        raw.producers.clear();
+        assert!(matches!(
+            raw.validate(),
+            Err(PrecomputePlanError::UnsupportedRawCounter(_))
+        ));
+    }
+
+    // Counter fallback does not disable an independent safe summary in the same workload.
+    #[test]
+    fn counter_fallback_preserves_other_workload_summaries() {
+        let mut workload = request("counter", "sum(rate(m[1m]))");
+        workload
+            .queries
+            .extend(request("gauge", "sum(sum_over_time(g[1m]))").queries);
+        let mut environment = environment(10_000);
+        environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        environment.collector_ids.clear();
+        let plan = PhysicalCompiler.compile(workload, environment).unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        assert!(plan
+            .query_plan
+            .lookup("sum(rate(m[1m]))")
+            .unwrap()
+            .materialization_bindings()
+            .is_empty());
+        assert_eq!(
+            plan.query_plan
+                .lookup("sum(sum_over_time(g[1m]))")
+                .unwrap()
+                .materialization_bindings()
+                .len(),
+            1
+        );
+    }
+
+    // Capability normalization precedes candidate enumeration, avoiding duplicate exact quotes.
+    #[test]
+    fn counter_only_snapshot_has_distinct_local_and_native_cost_alternatives() {
+        let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query("rate(m[1m])".into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        let (request, _) = snapshot.planning_request().unwrap();
+        assert_eq!(
+            super::super::workload_cost::with_exact_alternative(request)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     // Count and value rankings must configure different state update contracts.
@@ -3285,10 +3401,16 @@ mod tests {
             PhysicalDeploymentTarget::DistributedCollectors,
             PhysicalDeploymentTarget::BackendLocalRemoteWrite,
         ] {
-            let mut workload = request("q90", "quantile_over_time(0.90, m[1m])");
-            workload
-                .queries
-                .extend(request("q99", "quantile_over_time(0.99, m[1m])").queries);
+            let (first, second) = if target == PhysicalDeploymentTarget::BackendLocalRemoteWrite {
+                ("sum(sum_over_time(m[1m]))", "sum(sum_over_time(m[1m])) * 2")
+            } else {
+                (
+                    "quantile_over_time(0.90, m[1m])",
+                    "quantile_over_time(0.99, m[1m])",
+                )
+            };
+            let mut workload = request("first", first);
+            workload.queries.extend(request("second", second).queries);
             let mut env = environment(10_000);
             env.target = target;
             if target == PhysicalDeploymentTarget::BackendLocalRemoteWrite {
@@ -3906,7 +4028,7 @@ mod tests {
             ),
             (
                 "q-sum",
-                "sum_over_time(m[1m])",
+                "sum(sum_over_time(m[1m]))",
                 crate::query_plan::ExactReadout::Sum,
             ),
         ] {
@@ -3932,7 +4054,7 @@ mod tests {
             assert!(plan.collector_plans.is_empty(), "{promql}");
             let entry = plan.query_plan.entries.values().next().unwrap();
             assert!(matches!(
-                entry.nodes.get(&entry.root),
+                entry.nodes.values().find(|node| matches!(node, crate::query_plan::QueryPlanNode::ExactReadout { .. })),
                 Some(crate::query_plan::QueryPlanNode::ExactReadout { readout, .. })
                     if *readout == expected_readout
             ));
@@ -4010,7 +4132,7 @@ mod tests {
         for query in [
             "rate(asap_demo_counter_total[5s])",
             "increase(asap_demo_counter_total[5s])",
-            "sum_over_time(asap_demo_gauge[5s])",
+            "sum(sum_over_time(asap_demo_gauge[5s]))",
             "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
             "topk(1, sum_over_time(asap_demo_gauge[5s]))",
             "topk(1, count_over_time(asap_demo_gauge[5s]))",
