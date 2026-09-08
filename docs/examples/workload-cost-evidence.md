@@ -49,7 +49,10 @@ This is a flat coverage manifest over the existing physical projection, not
 another semantic DAG. Planner supplies the legal post-ASAP computations; costs
 can change which bound workload is committed, not rewrite its semantics.
 
-- Source ingestion once per source/location over the horizon.
+- Source ingestion once per source/location over the horizon. Exact fallback
+  includes every named input metric, including both sides of binary expressions;
+  repeated references to a metric share one upkeep component. Queries whose
+  sources cannot be fully enumerated are unavailable for complete costing.
 - Each shared state's build, update/merge, residency/spill and retirement once
   per actual location, independent of the number of result consumers.
 - Each Collector transmission rule over the horizon.
