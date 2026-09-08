@@ -13,6 +13,25 @@ Separating these layers lets many materialized instances reuse the same operator
 configuration and data scope. A new time interval creates a new instance without
 copying or redefining either descriptor.
 
+## Proposed ownership
+
+The descriptor vocabulary belongs in shared semantic contracts, suitable for
+Planner's shared types. Planner reasons about operators, fidelity, source and
+population semantics. The backend binds those descriptions to actual series,
+filters and grouping, and owns materialized instance state and its lifecycle.
+
+| Layer | Proposed responsibility |
+| --- | --- |
+| Summary Descriptor | Shared semantic definition used by Planner and backend |
+| Data Descriptor | Shared source/population definition; backend resolves concrete runtime bindings |
+| Summary Instance | Backend owns metadata, state, updates, storage and retirement |
+
+Planner may observe instance availability, covered time ranges and descriptor
+references as planning evidence. It does not need the encoded summary state.
+SDS describes summaries; an installed QueryPlan specifies how to execute a query
+using them. This ownership split is a proposal, not a claim that SDS types or
+interfaces already exist in either repository.
+
 ## 1. Summary Descriptor
 
 A Summary Descriptor defines **how the data is summarized** and **which fidelity
