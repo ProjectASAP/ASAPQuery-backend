@@ -4,7 +4,7 @@
 //! second semantic DAG. Planner supplies legal alternatives; deployment quotes
 //! price every reachable operation, and the backend commits one complete plan.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use asap_aware_mapping::cost_model::Cost;
 use serde::{Deserialize, Serialize};
@@ -198,14 +198,10 @@ pub fn manifest(
                 query.accuracy.clone(),
             )
             .map_err(|error| invalid(error.to_string()))?;
-            let metric = crate::query_parser::qe_to_parsed_query(&parsed).metric_name;
-            if metric.is_empty() {
-                return Err(invalid(
-                    "exact-source pricing requires a unique time-series source in this profile",
-                ));
+            for metric in exact_source_metrics(&parsed)? {
+                let source = json!({"source": planner_types::pre_asap::Source::TimeSeries { metric }, "location": "exact_backend"});
+                add(format!("source:{}", source), source, "horizon", 1.0);
             }
-            let source = json!({"source": planner_types::pre_asap::Source::TimeSeries { metric }, "location": "exact_backend"});
-            add(format!("source:{}", source), source, "horizon", 1.0);
         }
         // Reachability comes from QueryPlan, including materialization reads,
         // arithmetic, reduction and a complete engine-native exact fallback.
@@ -234,6 +230,65 @@ pub fn manifest(
         workload,
         components,
     })
+}
+
+/// Walk the canonical relational tree, preserving every input to binary and
+/// fan-in operators. Unsupported source discovery must not produce a partial quote.
+fn exact_source_metrics(
+    expr: &planner_types::pre_asap::QueryExpr,
+) -> Result<BTreeSet<String>, CompileError> {
+    use planner_types::pre_asap::{QueryExpr, Source};
+    fn visit(expr: &QueryExpr, metrics: &mut BTreeSet<String>) -> Result<(), CompileError> {
+        match expr {
+            QueryExpr::Scan {
+                source: Source::TimeSeries { metric },
+                ..
+            } if !metric.is_empty() => {
+                metrics.insert(metric.clone());
+            }
+            QueryExpr::PromqlScalarBridge(child)
+            | QueryExpr::PromqlVectorFromScalar(child)
+            | QueryExpr::PromqlScalarFromVector(child)
+            | QueryExpr::PromqlRelabel { child, .. }
+            | QueryExpr::PromqlSeriesSample { child, .. }
+            | QueryExpr::Filter { child, .. }
+            | QueryExpr::Project { child, .. }
+            | QueryExpr::Aggregate { child, .. }
+            | QueryExpr::Dedup { child, .. }
+            | QueryExpr::Sort { child, .. }
+            | QueryExpr::Limit { child, .. }
+            | QueryExpr::PromqlSubquery { child, .. }
+            | QueryExpr::TimeRange { child, .. }
+            | QueryExpr::TimeShift { child, .. } => visit(child, metrics)?,
+            QueryExpr::BinaryOp {
+                lhs: left,
+                rhs: right,
+                ..
+            }
+            | QueryExpr::Join { left, right, .. }
+            | QueryExpr::SetOp { left, right, .. } => {
+                visit(left, metrics)?;
+                visit(right, metrics)?;
+            }
+            QueryExpr::Concat { children, .. } => {
+                for child in children {
+                    visit(child, metrics)?;
+                }
+            }
+            QueryExpr::Literal(_) | QueryExpr::EvalTimestamp => {}
+            // In particular, info() has an implicit metadata source that is
+            // not a Scan child, and unnamed selectors require source discovery.
+            _ => {
+                return Err(invalid(
+                    "exact-source pricing cannot enumerate this query's sources",
+                ))
+            }
+        }
+        Ok(())
+    }
+    let mut metrics = BTreeSet::new();
+    visit(expr, &mut metrics)?;
+    Ok(metrics)
 }
 
 impl WorkloadCostEvidence {
@@ -446,6 +501,77 @@ mod tests {
             quotes,
         };
         (candidates, env, evidence)
+    }
+
+    // All input metrics need upkeep quotes; repeated reads share that upkeep.
+    #[test]
+    fn exact_manifest_covers_and_deduplicates_query_sources() {
+        for (query, expected) in [
+            (
+                "sum_over_time(m[1m]) + sum_over_time(n[1m])",
+                vec!["m", "n"],
+            ),
+            ("sum_over_time(m[1m]) + count_over_time(m[1m])", vec!["m"]),
+        ] {
+            let (mut request, env) = fixture().planning_request().unwrap();
+            request.queries[0].query_string = query.into();
+            let exact = with_exact_alternative(request).unwrap().pop().unwrap();
+            let plan = PhysicalCompiler
+                .compile(exact.clone(), env.clone())
+                .unwrap();
+            let manifest = manifest(&plan, &exact.queries).unwrap();
+            let sources: Vec<_> = manifest
+                .components
+                .iter()
+                .filter(|(id, _)| id.starts_with("source:"))
+                .map(|(_, demand)| {
+                    demand.implementation["source"]["TimeSeries"]["metric"]
+                        .as_str()
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(sources, expected, "{query}");
+            let mut evidence = WorkloadCostEvidence {
+                data_snapshot_id: "test-data".into(),
+                model_version: "test-model".into(),
+                observed_at_unix_ms: env.observed_at_unix_ms,
+                valid_for_ms: env.max_evidence_age_ms,
+                quotes: vec![WorkloadQuote {
+                    unit_costs: manifest
+                        .components
+                        .keys()
+                        .map(|id| (id.clone(), 1.0))
+                        .collect(),
+                    manifest,
+                    executable: true,
+                }],
+            };
+            assert!(select(vec![exact.clone()], env.clone(), &evidence).is_ok());
+            let source_id = evidence.quotes[0]
+                .unit_costs
+                .keys()
+                .rfind(|id| id.starts_with("source:"))
+                .unwrap()
+                .clone();
+            evidence.quotes[0].unit_costs.remove(&source_id);
+            assert!(
+                select(vec![exact], env, &evidence).is_err(),
+                "missing input upkeep must fail closed"
+            );
+        }
+    }
+
+    // Hidden or unresolved sources must not yield a partially priced manifest.
+    #[test]
+    fn exact_source_discovery_rejects_unresolved_inputs() {
+        let accuracy = fixture().planning_request().unwrap().0.queries[0]
+            .accuracy
+            .clone();
+        for query in ["info(m)", "{job=\"api\"}"] {
+            let parsed =
+                crate::query_parser::parse_query_expr_canonical(query, accuracy.clone()).unwrap();
+            assert!(exact_source_metrics(&parsed).is_err(), "{query}");
+        }
     }
 
     #[test]

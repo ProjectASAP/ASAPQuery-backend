@@ -128,6 +128,18 @@ pub enum AggKind {
     },
 }
 
+/// Complete resolver identity for a configured materialization. All live and
+/// replay paths must include policy semantics, not just the sketch family.
+pub(crate) fn materialization_kind_for_config(
+    config: &asap_types::aggregation_config::AggregationConfig,
+) -> String {
+    format!(
+        "{}|{}",
+        agg_kind_for_config(config).canonical_string(),
+        config.policy_fingerprint()
+    )
+}
+
 /// Resolve the physical state family produced by a precompute policy. This is
 /// shared by SID minting and store registration so a sketch policy can never
 /// be minted as `ExactAgg` and later registered as `Sketch` (or vice versa).

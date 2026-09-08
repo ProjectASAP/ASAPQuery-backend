@@ -1855,18 +1855,8 @@ impl SketchStore {
         // samples by sid up-front) skip the resolver round-trip by
         // invoking the sid-direct sibling.
         let (attrs_fp, _label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
-        let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg);
-        // Sid mint delegated to the caller's closure — typically
-        // `|m, fp, ak| series_resolver.resolve(m, fp, ak)`. Keeps the
-        // SketchStore free of any layer-inverted dependency on the
-        // resolver type (which lives in `drivers::ingest`). Tests
-        // pass either a real local resolver or a counter-mock
-        // closure.
-        let agg_kind_canonical = format!(
-            "{}|{}",
-            agg_kind.canonical_string(),
-            agg_cfg.policy_fingerprint()
-        );
+        let agg_kind_canonical =
+            crate::storage_engines::sketch_db::data::materialization_kind_for_config(agg_cfg);
         let sid = mint_sid(&agg_cfg.metric, &attrs_fp, &agg_kind_canonical);
         self.ingest_precompute_with_sid(sid, agg_cfg, output, accumulator)
     }
@@ -3925,6 +3915,70 @@ mod tests {
             cov.is_some(),
             "LIVE BUG #2: exact_agg_coverage_bounds blind to disk after evict"
         );
+        drop(p);
+    }
+
+    // Raw sample counts must survive production durable storage.
+    #[test]
+    fn raw_count_survives_disk_eviction() {
+        use crate::storage_engines::types::AggregationType;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let idx = Arc::new(SketchStore::new());
+        // Register an ExactAgg(Sum) sid keyed by `zone`.
+        let mut m = meta(8001);
+        m.metric_name = "http_requests_total".into();
+        m.group_by_keys = ["zone".to_string()].into_iter().collect();
+        m.agg_kind = AggKind::ExactAgg {
+            agg_type: AggregationType::Sum,
+            parameters_canonical: String::new(),
+            spatial_filter_canonical: String::new(),
+        };
+        idx.register(m);
+        let p = idx
+            .start_persistence(durable_cfg(tmp.path().to_path_buf()))
+            .unwrap();
+
+        let lv_zone = |v: &str| {
+            let mut x = BTreeMap::new();
+            x.insert("zone".to_string(), v.to_string());
+            x
+        };
+        for i in 0..10u64 {
+            let s = i * 30_000;
+            idx.append_precompute(
+                8001,
+                lv_zone("z0"),
+                (s, s + 30_000),
+                Box::new({
+                    let mut acc = crate::precompute_engine::operators::SumAccumulator::new();
+                    acc.update((i + 1) as f64);
+                    acc.update(10.0);
+                    acc
+                }),
+            );
+        }
+        assert!(
+            wait_until(
+                || idx.approx_memory_bytes() == 0 && idx.list_sealed_epochs_len() == 0,
+                std::time::Duration::from_secs(5),
+            ),
+            "exact-agg windows never fully evicted"
+        );
+        // Query the EVICTED portion [0, 150_000) — must come back from disk.
+        let series = idx.query_exact_agg_range(8001, 0, 150_000);
+        assert!(
+            !series.is_empty(),
+            "exact-agg query returned no result after flush and eviction"
+        );
+        let (_label, samples) = &series[0];
+        assert!(
+            samples.contains_key(&30_000),
+            "evicted exact-agg window missing from disk"
+        );
+        let stats = samples[&30_000].aux_stats();
+        assert_eq!(stats.count, Some(2));
+        assert_eq!(stats.sum, Some(11.0));
+        assert_eq!(stats.sum.unwrap() / stats.count.unwrap() as f64, 5.5);
         drop(p);
     }
 

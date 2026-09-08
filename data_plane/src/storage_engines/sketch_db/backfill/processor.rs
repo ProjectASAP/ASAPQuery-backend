@@ -72,7 +72,6 @@ use tracing::debug;
 use crate::drivers::ingest::canonical_attrs_fingerprint;
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
-use crate::storage_engines::sketch_db::data::{canonical_parameters, AggKind};
 use crate::storage_engines::types::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::PolicyFingerprint;
@@ -119,12 +118,8 @@ fn build_group_key_label_values(group_key: &str) -> KeyByLabelValues {
 /// embedded in `series_key` (the `metric{k1="v1",k2="v2"}` text shape
 /// `RawSample::labels` holds), so we parse them out first.
 ///
-/// The sid identity tuple is `(metric, attrs_fp, agg_kind_canonical)`
-/// — identical to what the live ingest path computes, so the same
-/// `(metric, grouping-values, agg_kind)` produces the SAME sid no
-/// matter which path (live or backfill) saw the sample first. That
-/// invariant is what lets backfill writes land in the same store
-/// row the live ingest already populated for `[created_at, ∞)`.
+/// Policy and grouping identity must match live ingestion so historical and
+/// live windows occupy the same storage row.
 fn resolve_backfill_bucket_sid(
     resolver: &SeriesIdResolver,
     config: &AggregationConfig,
@@ -138,12 +133,8 @@ fn resolve_backfill_bucket_sid(
         .map(|name| (name.as_str(), *labels.get(name.as_str()).unwrap_or(&"")))
         .collect();
     let attrs_fp = canonical_attrs_fingerprint(&grouping_pairs);
-    let agg_kind = AggKind::ExactAgg {
-        agg_type: config.aggregation_type,
-        parameters_canonical: canonical_parameters(&config.parameters),
-        spatial_filter_canonical: config.spatial_filter_normalized.clone(),
-    };
-    let agg_kind_canonical = agg_kind.canonical_string();
+    let agg_kind_canonical =
+        crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
     resolver.resolve(&config.metric, &attrs_fp, &agg_kind_canonical)
 }
 
@@ -912,19 +903,10 @@ mod tests {
         assert_eq!(written, vec![(fp, (0u64, 100u64))]);
     }
 
-    /// B7.7 invariant: the sid the backfill processor mints for a
-    /// `(config, grouping-values)` tuple is bit-equal to the sid the
-    /// live ingest path's `resolve_bucket_sid_for_agg_config` would
-    /// mint via the SAME `SeriesIdResolver`. Locks the "live and
-    /// backfill share one sid namespace" contract — without it, the
-    /// `[created_at, ∞)` and `[0, created_at)` halves of the agg's
-    /// timeline would live under DIFFERENT sids and the query path
-    /// would only see half the history.
+    /// Replay and the actual live storage sink must resolve the same row.
     #[test]
     fn backfill_sid_matches_live_ingest_sid_for_same_grouping_values() {
-        use crate::drivers::ingest::canonical_attrs_fingerprint;
         use crate::drivers::ingest::series_resolver::SeriesIdResolver;
-        use crate::storage_engines::sketch_db::data::{canonical_parameters, AggKind};
 
         let cfg = sum_config(1, "latency", vec!["svc", "zone"]);
         let resolver = SeriesIdResolver::new();
@@ -933,20 +915,29 @@ mod tests {
         let backfill_sid =
             resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"a\",zone=\"z0\"}");
 
-        // Live side: mirror what `resolve_bucket_sid_for_agg_config`
-        // in drivers/ingest/otel.rs does, manually here so the test
-        // doesn't need to drive the OTLP pipeline.
-        let live_attrs_fp = canonical_attrs_fingerprint(&[("svc", "a"), ("zone", "z0")]);
-        let live_agg_kind = AggKind::ExactAgg {
-            agg_type: cfg.aggregation_type,
-            parameters_canonical: canonical_parameters(&cfg.parameters),
-            spatial_filter_canonical: cfg.spatial_filter_normalized.clone(),
-        };
-        let live_sid = resolver.resolve(
-            &cfg.metric,
-            &live_attrs_fp,
-            &live_agg_kind.canonical_string(),
+        // Exercise the actual live sink instead of duplicating its SID formula.
+        let store = crate::storage_engines::sketch_db::index::SketchStore::new();
+        let output = crate::storage_engines::types::PrecomputedOutput::new(
+            100,
+            200,
+            Some(
+                crate::storage_engines::types::KeyByLabelValues::new_with_labels(vec![
+                    "a".into(),
+                    "z0".into(),
+                ]),
+            ),
+            cfg.policy_fingerprint(),
         );
+        let acc =
+            crate::precompute_engine::operators::sum_accumulator::SumAccumulator::with_sum(1.0);
+        let live_sid = store
+            .ingest_precompute_for_agg_config(
+                |metric, attrs, kind| resolver.resolve(metric, attrs, kind),
+                &cfg,
+                &output,
+                &acc,
+            )
+            .expect("live sink write");
 
         assert_eq!(
             backfill_sid, live_sid,
