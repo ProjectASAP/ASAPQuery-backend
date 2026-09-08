@@ -11,35 +11,53 @@ use asap_types::Statistic;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SumAccumulator {
     pub sum: f64,
+    /// None for scalar-only payloads; a sum does not establish a sample count.
+    #[serde(default)]
+    pub observation_count: Option<u64>,
 }
 
 impl SumAccumulator {
     pub fn new() -> Self {
-        Self { sum: 0.0 }
+        Self {
+            sum: 0.0,
+            observation_count: Some(0),
+        }
     }
 
     pub fn with_sum(sum: f64) -> Self {
-        Self { sum }
+        Self {
+            sum,
+            observation_count: None,
+        }
     }
 
     pub fn update(&mut self, value: f64) {
         self.sum += value;
+        self.observation_count = self
+            .observation_count
+            .and_then(|count| count.checked_add(1));
     }
 
     pub fn deserialize_from_json(data: &Value) -> Result<Self, Box<dyn std::error::Error>> {
         let sum = data["sum"]
             .as_f64()
             .ok_or("Missing or invalid 'sum' field")?;
-        Ok(Self::with_sum(sum))
+        Ok(Self {
+            sum,
+            observation_count: data.get("observation_count").and_then(Value::as_u64),
+        })
     }
 
     pub fn deserialize_from_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
-        if buffer.len() < 4 {
-            return Err("Buffer too short for f32".into());
+        match buffer.len() {
+            // Legacy Python scalar sums carry no sample-count evidence.
+            4 => Ok(Self::with_sum(f32::from_le_bytes(buffer.try_into()?) as f64)),
+            // Counted sums use the same fixed layout as the Collector Sum payload.
+            16 => Self::from_sum_bytes(buffer),
+            len => {
+                Err(format!("Invalid persisted Sum payload length: {len} (want 4 or 16)").into())
+            }
         }
-        // Python uses struct.pack("<f", self.sum) which is 4-byte little-endian float
-        let sum = f32::from_le_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as f64;
-        Ok(Self::with_sum(sum))
     }
 
     /// Decode the fixed Sum payload produced by the first-class Sum
@@ -51,17 +69,18 @@ impl SumAccumulator {
     /// self-contained fixed layout. It decodes into the SAME
     /// `AggregationType::Sum` accumulator as a plain-OTLP Sum, so the SumAgg
     /// envelope and a plain Sum land on one identity (`exact_agg:Sum`) with no
-    /// new SketchAlgorithm. `count` is decoded but not retained
-    /// (SumAccumulator tracks the scalar sum only; Sum is never sample_p-thinned
-    /// so no 1/p rescale is needed).
+    /// new SketchAlgorithm. The supplied observation count is retained for
+    /// exact sample-count readouts; scalar-only legacy payloads leave it unknown.
     pub fn from_sum_bytes(buffer: &[u8]) -> Result<Self, Box<dyn std::error::Error>> {
         if buffer.len() < 16 {
             return Err(format!("Sum payload too short: {} bytes (want 16)", buffer.len()).into());
         }
         let sum = f64::from_le_bytes(buffer[0..8].try_into().unwrap());
-        // count = u64::from_le_bytes(buffer[8..16]) — decoded position documented
-        // but not retained by the scalar-sum accumulator.
-        Ok(Self::with_sum(sum))
+        let count = u64::from_le_bytes(buffer[8..16].try_into().unwrap());
+        Ok(Self {
+            sum,
+            observation_count: Some(count),
+        })
     }
 }
 
@@ -74,13 +93,21 @@ impl Default for SumAccumulator {
 impl SerializableToSink for SumAccumulator {
     fn serialize_to_json(&self) -> Value {
         serde_json::json!({
-            "sum": self.sum
+            "sum": self.sum,
+            "observation_count": self.observation_count
         })
     }
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
-        // Match Python's struct.pack("<f", self.sum) - 4-byte little-endian float
-        (self.sum as f32).to_le_bytes().to_vec()
+        match self.observation_count {
+            Some(count) => {
+                let mut bytes = Vec::with_capacity(16);
+                bytes.extend_from_slice(&self.sum.to_le_bytes());
+                bytes.extend_from_slice(&count.to_le_bytes());
+                bytes
+            }
+            None => (self.sum as f32).to_le_bytes().to_vec(),
+        }
     }
 }
 
@@ -136,10 +163,9 @@ impl AggregateCore for SumAccumulator {
     }
 
     fn aux_stats(&self) -> AuxStats {
-        // SumAccumulator tracks exactly one scalar — the sum.
-        // Count/min/max aren't retained by this type.
         AuxStats {
             sum: Some(self.sum),
+            count: self.observation_count,
             ..AuxStats::empty()
         }
     }
@@ -191,6 +217,7 @@ impl SingleSubpopulationAggregateFactory for SumAccumulatorFactory {
     ) -> Result<Box<dyn SingleSubpopulationAggregate>, Box<dyn std::error::Error + Send + Sync>>
     {
         let mut total_sum = 0.0;
+        let mut observation_count = Some(0u64);
 
         for acc in accumulators {
             if acc.type_name() != "SumAccumulator" {
@@ -198,9 +225,14 @@ impl SingleSubpopulationAggregateFactory for SumAccumulatorFactory {
             }
             let sum_value = acc.query(Statistic::Sum, None)?;
             total_sum += sum_value;
+            observation_count =
+                observation_count.and_then(|total| total.checked_add(acc.aux_stats().count?));
         }
 
-        Ok(Box::new(SumAccumulator::with_sum(total_sum)))
+        Ok(Box::new(SumAccumulator {
+            sum: total_sum,
+            observation_count,
+        }))
     }
 
     fn create_default(&self) -> Box<dyn SingleSubpopulationAggregate> {
@@ -213,13 +245,76 @@ impl MergeableAccumulator<SumAccumulator> for SumAccumulator {
         accumulators: Vec<SumAccumulator>,
     ) -> Result<SumAccumulator, Box<dyn std::error::Error + Send + Sync>> {
         let total_sum = accumulators.iter().map(|acc| acc.sum).sum();
-        Ok(SumAccumulator::with_sum(total_sum))
+        let observation_count = accumulators
+            .iter()
+            .try_fold(0u64, |total, acc| total.checked_add(acc.observation_count?));
+        Ok(SumAccumulator {
+            sum: total_sum,
+            observation_count,
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Sample counts must survive updates and merges independently of the sum.
+    #[test]
+    fn observation_count_survives_merge() {
+        let mut first = SumAccumulator::new();
+        first.update(10.0);
+        first.update(20.0);
+        let mut second = SumAccumulator::new();
+        second.update(100.0);
+        let merged = SumAccumulator::merge_accumulators(vec![first, second]).unwrap();
+        assert_eq!(merged.sum, 130.0);
+        assert_eq!(merged.aux_stats().count, Some(3));
+    }
+
+    // A legacy scalar sum has no evidence of how many observations produced it.
+    #[test]
+    fn legacy_sum_does_not_invent_observation_count() {
+        let mut raw = SumAccumulator::new();
+        raw.update(10.0);
+        let merged =
+            SumAccumulator::merge_accumulators(vec![raw, SumAccumulator::with_sum(20.0)]).unwrap();
+        assert_eq!(merged.aux_stats().count, None);
+    }
+
+    // Persistence retains known counts, including zero and the full u64 range.
+    #[test]
+    fn counted_sum_binary_round_trip() {
+        for count in [0, 3, u64::MAX] {
+            let acc = SumAccumulator {
+                sum: 1.0000000000001,
+                observation_count: Some(count),
+            };
+            let bytes = acc.serialize_to_bytes();
+            assert_eq!(bytes.len(), 16);
+            let restored = SumAccumulator::deserialize_from_bytes(&bytes).unwrap();
+            assert_eq!(restored.sum, acc.sum);
+            assert_eq!(restored.observation_count, Some(count));
+        }
+    }
+
+    // Existing scalar-only files remain readable without inventing counts.
+    #[test]
+    fn legacy_binary_sum_has_unknown_count() {
+        let bytes = 42.5f32.to_le_bytes();
+        let restored = SumAccumulator::deserialize_from_bytes(&bytes).unwrap();
+        assert_eq!(restored.sum, 42.5);
+        assert_eq!(restored.observation_count, None);
+        assert_eq!(restored.serialize_to_bytes(), bytes);
+    }
+
+    // Truncated counted payloads must not silently decode as scalar sums.
+    #[test]
+    fn persisted_sum_rejects_invalid_lengths() {
+        for len in [0, 3, 5, 8, 15, 17] {
+            assert!(SumAccumulator::deserialize_from_bytes(&vec![0; len]).is_err());
+        }
+    }
 
     #[test]
     fn test_sum_accumulator_creation() {
