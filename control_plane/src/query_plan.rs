@@ -395,11 +395,9 @@ where
             SummaryExpr::BinaryOp { .. } => QueryPlanNode::ExactFallback {
                 reason: "summary binary operation is not executable by the warm tier".into(),
             },
-            SummaryExpr::KeepPreAsap(_) => {
-                QueryPlanNode::ExactFallback {
-                    reason: "post-ASAP node requires exact execution".into(),
-                }
-            }
+            SummaryExpr::KeepPreAsap(_) => QueryPlanNode::ExactFallback {
+                reason: "post-ASAP node requires exact execution".into(),
+            },
             SummaryExpr::SummaryAgg {
                 family,
                 reduction,
