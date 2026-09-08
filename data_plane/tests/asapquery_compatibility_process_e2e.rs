@@ -653,6 +653,10 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         "topk(1, sum_over_time(asap_demo_gauge[5s]))",
         "topk(1, count_over_time(asap_demo_gauge[5s]))",
     ] {
+        let first_instant =
+            wait_for_warm_instant(&client, &backend, query, first_eval, &backend_log).await;
+        let second_instant =
+            wait_for_warm_instant(&client, &backend, query, second_eval, &backend_log).await;
         let response: Value = client
             .get(format!("{backend}/api/v1/query_range"))
             .query(&[
@@ -672,6 +676,45 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
             is_warm(&response),
             "{query} did not use warm tier: {response}"
         );
+        // Compare the complete vector at each step, including changing Top-K
+        // membership. Sorting labels makes response ordering irrelevant.
+        for (timestamp, instant) in [(first_eval, &first_instant), (second_eval, &second_instant)] {
+            let mut expected = instant["data"]["result"]
+                .as_array()
+                .expect("instant vector")
+                .iter()
+                .map(|series| {
+                    (
+                        serde_json::to_string(&series["metric"]).unwrap(),
+                        series["value"][1].as_str().unwrap().parse::<f64>().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut actual = response["data"]["result"]
+                .as_array()
+                .expect("range matrix")
+                .iter()
+                .flat_map(|series| {
+                    series["values"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(move |point| point[0].as_f64() == Some(timestamp))
+                        .map(move |point| {
+                            (
+                                serde_json::to_string(&series["metric"]).unwrap(),
+                                point[1].as_str().unwrap().parse::<f64>().unwrap(),
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            expected.sort_by(|a, b| a.0.cmp(&b.0));
+            actual.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                actual, expected,
+                "complete range/instant vector differs for {query} at {timestamp}"
+            );
+        }
         if query.starts_with("topk(") {
             let mut ranked_points = response["data"]["result"]
                 .as_array()
