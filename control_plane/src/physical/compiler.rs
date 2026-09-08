@@ -1751,7 +1751,8 @@ impl PhysicalCompiler {
         // BackendPlan candidates to rediscover this decision.
         let mut node_bindings = HashMap::<usize, asap_types::PolicyFingerprint>::new();
         let consumers = materialization_consumers(&request.queries, environment.target)?;
-        let mut lifecycle_estimates = BTreeMap::new();
+        let mut lifecycle_estimates =
+            BTreeMap::<asap_types::PolicyFingerprint, MaterializationLifecycleEstimate>::new();
 
         for query in &request.queries {
             let evidence = request.evidence.get(&query.query_id);
@@ -1870,14 +1871,27 @@ impl PhysicalCompiler {
                 let materialization =
                     backend_plan::aggregation_config_for_materialization(&aggregation)?
                         .policy_fingerprint();
+                let consumer_query_ids = state_consumers
+                    .iter()
+                    .map(|query| query.query_id.clone())
+                    .collect::<Vec<_>>();
+                // Lifecycle demand was priced before choosing pane width. Two
+                // distinct logical cohorts can now collide on one physical
+                // fingerprint; retaining either quote would omit consumers.
+                if lifecycle_estimates
+                    .get(&materialization)
+                    .is_some_and(|existing| existing.consumer_query_ids != consumer_query_ids)
+                {
+                    return Err(CompileError::Lifecycle {
+                        query_id: query.query_id.clone(),
+                        reason: "selected pane coalesces distinct logical consumer cohorts; joint physical-pane lifecycle evidence is required".into(),
+                    });
+                }
                 lifecycle_estimates
                     .entry(materialization)
                     .or_insert_with(|| MaterializationLifecycleEstimate {
                         materialization,
-                        consumer_query_ids: state_consumers
-                            .iter()
-                            .map(|query| query.query_id.clone())
-                            .collect(),
+                        consumer_query_ids,
                         window_implementation_id: window_implementation.implementation_id.clone(),
                         horizon_seconds: query.lifecycle.horizon_seconds,
                         expected_reads: planner_selection.expected_reads,
@@ -3687,6 +3701,29 @@ mod tests {
                 expected_id
             );
         }
+    }
+
+    // Distinct logical cohorts cannot silently coalesce using only the first quote.
+    #[test]
+    fn selected_panes_reject_unpriced_cross_cohort_coalescing() {
+        let mut workload = request("q20", "sum_over_time(m[20s])");
+        let mut second = request("q40", "sum_over_time(m[40s])").queries.remove(0);
+        workload.queries[0].window_secs = 20;
+        workload.queries[0].window_implementations[0].window_secs = 20;
+        second.window_secs = 40;
+        second.lifecycle.evaluation_interval_ms = 20_000;
+        second.window_implementations[0].window_secs = 40;
+        workload.queries.push(second);
+        for query in &mut workload.queries {
+            query.window_implementations[0].pane_secs = 10;
+            query.window_implementations[0].implementation_id = "shared-ten-second-pane".into();
+        }
+        let mut env = environment(10_000);
+        env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        env.collector_ids.clear();
+        assert!(
+            matches!(PhysicalCompiler.compile(workload, env), Err(CompileError::Lifecycle { reason, .. }) if reason.contains("distinct logical consumer cohorts"))
+        );
     }
 
     // Non-divisor panes cannot reconstruct a lookback from whole states.

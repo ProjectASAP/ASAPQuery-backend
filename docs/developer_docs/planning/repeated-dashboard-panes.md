@@ -15,7 +15,11 @@ Planner's `CompleteSummaryCandidateEstimate`; the compiler installs the ID
 returned by Planner. It does not choose another size after planning. Actual
 pane width enters the state fingerprint, precompute configuration, and query
 binding; the query's 60-second lookback remains unchanged. Shared DAG consumers
-must agree on the physical deployment contract.
+must agree on the physical deployment contract. Distinct logical-window cohorts
+that collide only after selecting a smaller shared pane are rejected until
+joint lifecycle evidence is available for the resulting physical state. The
+compiler never keeps only the first cohort's consumer count or cost quote.
+Sharing within one already-priced logical cohort remains supported.
 
 The original QueryWorkload, including recurrence, time scope, predictability,
 requirements and data evidence, reaches lifecycle planning. Shared consumers'
