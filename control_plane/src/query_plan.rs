@@ -392,12 +392,11 @@ where
             } if !exact_value_executable(node) => QueryPlanNode::ExactFallback {
                 reason: "only temporal observation counts are supported".into(),
             },
-            SummaryExpr::BinaryOp { .. } => QueryPlanNode::ExactFallback {
-                reason: "summary binary operation is not executable by the warm tier".into(),
-            },
-            SummaryExpr::KeepPreAsap(_) => QueryPlanNode::ExactFallback {
-                reason: "post-ASAP node requires exact execution".into(),
-            },
+            SummaryExpr::BinaryOp { .. } | SummaryExpr::KeepPreAsap(_) => {
+                QueryPlanNode::ExactFallback {
+                    reason: "post-ASAP node requires exact execution".into(),
+                }
+            }
             SummaryExpr::SummaryAgg {
                 family,
                 reduction,

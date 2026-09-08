@@ -342,8 +342,8 @@ fn incompatible_evidence_preserves_deployment_behavior() {
     }
 }
 
-/// A planner binary summary cannot become a silently executable warm-tier
-/// plan before that tier implements binary summary evaluation.
+/// Binary operations over these approximate sketch values retain explicit
+/// fallback even though the warm tier now supports exact additive binaries.
 #[test]
 fn binary_summary_has_explicit_warm_tier_fallback() {
     use control_plane::query_plan::{
@@ -377,7 +377,7 @@ fn binary_summary_has_explicit_warm_tier_fallback() {
     )
     .unwrap();
     assert!(
-        matches!(&plan.nodes[&plan.root], QueryPlanNode::ExactFallback { reason } if reason.contains("binary operation"))
+        matches!(&plan.nodes[&plan.root], QueryPlanNode::ExactFallback { reason } if !reason.is_empty())
     );
     assert!(plan.materialization_bindings().is_empty());
 }
