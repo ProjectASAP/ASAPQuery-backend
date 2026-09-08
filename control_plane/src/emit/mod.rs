@@ -321,8 +321,8 @@ fn extract_from_node(node: &Rc<SummaryNode>) -> Option<SketchAlgorithm> {
         SummaryExpr::SummaryMerge { children } => children.iter().find_map(extract_from_node),
         // Not surfaced by any `Bind*` path yet (gated on rules that
         // haven't landed — see `deployment_expr.rs`'s module docs).
-        SummaryExpr::SummaryJoin { .. }
-        | SummaryExpr::BinaryOp { .. }
+        SummaryExpr::BinaryOp { .. }
+        | SummaryExpr::SummaryJoin { .. }
         | SummaryExpr::SummarySubtract { .. }
         | SummaryExpr::SummaryDelete { .. }
         | SummaryExpr::KeepPreAsap(_) => None,

@@ -547,6 +547,10 @@ async fn main() {
     let app = Router::new()
         .route("/api/v1/plan", post(handle_plan))
         .route(
+            "/api/v1/physical-plan/cost-manifests",
+            post(handle_workload_cost_manifests),
+        )
+        .route(
             "/api/v1/physical-plan/compile-and-publish",
             post(handle_compile_and_publish_physical_plan),
         )
@@ -590,6 +594,8 @@ struct PhysicalPlanQueryRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompileAndPublishPhysicalPlanRequest {
+    #[serde(default)]
+    workload_cost_evidence: Option<physical::workload_cost::WorkloadCostEvidence>,
     queries: Vec<PhysicalPlanQueryRequest>,
     collector_ids: Vec<String>,
     capability_snapshot_id: String,
@@ -613,11 +619,13 @@ fn default_physical_plan_timeout_ms() -> u64 {
 
 #[derive(Debug, Serialize)]
 struct CompileAndPublishPhysicalPlanResponse {
+    cost_comparison: Option<physical::workload_cost::WorkloadCostComparison>,
     plan_id: u64,
     plan_version: u64,
     status: &'static str,
     generated_at_unix_ms: u64,
     collector_ids: Vec<String>,
+    lifecycle_estimates: Vec<physical::compiler::MaterializationLifecycleEstimate>,
 }
 
 /// Compile one Planner IR decision into matching Collector, Precompute, and Backend views
@@ -628,9 +636,18 @@ async fn handle_compile_and_publish_physical_plan(
     State(st): State<AppState>,
     Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
 ) -> impl IntoResponse {
-    let (bundle, collector_ids, apply_timeout, adaptation_evidence) =
-        match compile_physical_plan_request(request) {
-            Ok(compiled) => compiled,
+    let (bundle, collector_ids, apply_timeout, adaptation_evidence, _) =
+        match compile_physical_plan_request(request, false) {
+            Ok((Some(bundle), ids, timeout, adaptation, manifests)) => {
+                (bundle, ids, timeout, adaptation, manifests)
+            }
+            Ok((None, ..)) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "publication requires a selected plan",
+                )
+                    .into_response()
+            }
             Err(response) => return response.into_response(),
         };
 
@@ -674,9 +691,12 @@ async fn handle_compile_and_publish_physical_plan(
         .publish_collector_plans(&bundle.collector_plans, apply_timeout)
         .await
     {
+        let cleanup = backend
+            .discard_staged_physical_plan(bundle.envelope.plan_id, bundle.envelope.plan_version)
+            .await;
         return (
             StatusCode::BAD_GATEWAY,
-            format!("collector physical-plan publication failed: {error}"),
+            format!("collector physical-plan publication failed: {error}; staged backend cleanup: {cleanup:?}"),
         )
             .into_response();
     }
@@ -707,11 +727,13 @@ async fn handle_compile_and_publish_physical_plan(
     }
 
     Json(CompileAndPublishPhysicalPlanResponse {
+        cost_comparison: bundle.cost_comparison,
         plan_id: bundle.envelope.plan_id,
         plan_version: bundle.envelope.plan_version,
         status: "active",
         generated_at_unix_ms: bundle.envelope.generated_at_unix_ms,
         collector_ids,
+        lifecycle_estimates: bundle.lifecycle_estimates,
     })
     .into_response()
 }
@@ -720,12 +742,14 @@ async fn handle_compile_and_publish_physical_plan(
 // Only the Send-safe compiled bundle crosses an await point.
 fn compile_physical_plan_request(
     request: CompileAndPublishPhysicalPlanRequest,
+    manifests_only: bool,
 ) -> Result<
     (
-        physical::compiler::PhysicalPlan,
+        Option<physical::compiler::PhysicalPlan>,
         Vec<String>,
         Duration,
         Vec<physical::compiler::RuntimeAdaptationEvidence>,
+        Vec<physical::workload_cost::WorkloadCostManifest>,
     ),
     (StatusCode, String),
 > {
@@ -759,6 +783,7 @@ fn compile_physical_plan_request(
         .unwrap_or_default()
         .as_millis() as u64;
     let mut queries = Vec::with_capacity(request.queries.len());
+    let mut canonical_roots = Vec::with_capacity(request.queries.len());
     for query in request.queries {
         if query.query_id.trim().is_empty()
             || query.metric.trim().is_empty()
@@ -773,15 +798,11 @@ fn compile_physical_plan_request(
             Ok(expr) => expr,
             Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
         };
-        let post_asap = match physical::compiler::select_post_asap(
-            &expr,
-            query.accuracy.clone(),
-            &query.lifecycle,
-            request.evidence.get(&query.query_id),
-        ) {
+        let post_asap = match control_plane::planner_selection::keep_pre_asap(&expr) {
             Ok(plan) => plan,
             Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
         };
+        canonical_roots.push(std::rc::Rc::new(expr));
         queries.push(physical::compiler::PlanningQuery {
             query_id: query.query_id,
             query_string: query.query_string,
@@ -798,34 +819,89 @@ fn compile_physical_plan_request(
         });
     }
 
-    let bundle = match physical::compiler::PhysicalCompiler.compile(
-        physical::compiler::PlanningRequest {
-            queries,
-            evidence: request.evidence,
-            planner_revision: request.planner_revision,
-        },
-        physical::compiler::DeploymentEnvironment {
-            target: physical::compiler::PhysicalDeploymentTarget::DistributedCollectors,
-            collector_ids: request.collector_ids.clone(),
-            capability_snapshot_id: request.capability_snapshot_id,
-            observed_at_unix_ms: now,
-            max_evidence_age_ms: request.max_evidence_age_ms,
-            plan_version: request.plan_version,
-            activation_unix_ms: request.activation_unix_ms,
-            expiry_unix_ms: request.expiry_unix_ms,
-            backend_compat: request.backend_compat,
-        },
-    ) {
+    if let Err(error) =
+        physical::compiler::select_workload_roots(&mut queries, canonical_roots, &request.evidence)
+    {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string()));
+    }
+
+    let planning_request = physical::compiler::PlanningRequest {
+        queries,
+        evidence: request.evidence,
+        planner_revision: request.planner_revision,
+    };
+    let environment = physical::compiler::DeploymentEnvironment {
+        target: physical::compiler::PhysicalDeploymentTarget::DistributedCollectors,
+        collector_ids: request.collector_ids.clone(),
+        capability_snapshot_id: request.capability_snapshot_id,
+        observed_at_unix_ms: now,
+        max_evidence_age_ms: request.max_evidence_age_ms,
+        plan_version: request.plan_version,
+        activation_unix_ms: request.activation_unix_ms,
+        expiry_unix_ms: request.expiry_unix_ms,
+        backend_compat: request.backend_compat,
+    };
+    let candidates = physical::workload_cost::with_exact_alternative(planning_request.clone())
+        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?;
+    let manifests: Vec<_> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            physical::compiler::PhysicalCompiler
+                .compile(candidate.clone(), environment.clone())
+                .and_then(|plan| physical::workload_cost::manifest(&plan, &candidate.queries))
+                .ok()
+        })
+        .collect();
+    let apply_timeout = Duration::from_millis(request.apply_timeout_ms);
+    // Quote preparation enumerates feasible bindings; it does not select the
+    // default warm candidate, which may be unavailable while exact is valid.
+    if manifests_only {
+        if manifests.is_empty() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "no bindable workload cost manifests".into(),
+            ));
+        }
+        return Ok((
+            None,
+            request.collector_ids,
+            apply_timeout,
+            request.runtime_adaptation_evidence,
+            manifests,
+        ));
+    }
+    let compiled = match request.workload_cost_evidence {
+        Some(evidence) => physical::workload_cost::select(candidates, environment, &evidence),
+        None => physical::compiler::PhysicalCompiler.compile(planning_request, environment),
+    };
+    let bundle = match compiled {
         Ok(bundle) => bundle,
         Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
     };
-    let apply_timeout = Duration::from_millis(request.apply_timeout_ms);
     Ok((
-        bundle,
+        Some(bundle),
         request.collector_ids,
         apply_timeout,
         request.runtime_adaptation_evidence,
+        manifests,
     ))
+}
+
+/// Read-only preparation: no OpAMP, staging, activation or data-plane writes.
+async fn handle_workload_cost_manifests(
+    Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
+) -> impl IntoResponse {
+    if request.workload_cost_evidence.is_some() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "omit quotes when requesting manifests",
+        )
+            .into_response();
+    }
+    match compile_physical_plan_request(request, true) {
+        Ok((_, _, _, _, manifests)) => Json(manifests).into_response(),
+        Err(error) => error.into_response(),
+    }
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -2032,6 +2108,39 @@ mod api_tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    // A missing warm implementation must not hide the executable exact quote.
+    #[tokio::test]
+    async fn cost_manifests_survive_unavailable_warm_candidate() {
+        let snapshot: physical::compiler::BackendLocalPlanningSnapshot = serde_json::from_str(
+            include_str!("../../docs/examples/asapquery-planning-snapshot.json"),
+        )
+        .unwrap();
+        let (planning, _) = snapshot.planning_request().unwrap();
+        let query = &planning.queries[0];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let request = serde_json::from_value(serde_json::json!({
+            "queries": [{
+                "query_id": query.query_id, "query_string": query.query_string,
+                "metric": "m", "window_secs": 60, "accuracy": query.accuracy,
+                "lifecycle": query.lifecycle, "window_implementations": []
+            }],
+            "collector_ids": ["test"], "capability_snapshot_id": "test",
+            "planner_revision": physical::compiler::PLANNER_REVISION,
+            "max_evidence_age_ms": 60000, "plan_version": 1,
+            "activation_unix_ms": now, "backend_compat": control_plane::backend_plan::BACKEND_COMPAT
+        }))
+        .unwrap();
+        let response = handle_workload_cost_manifests(Json(request))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let manifests = body_json(response).await;
+        assert_eq!(manifests.as_array().unwrap().len(), 1);
+    }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();

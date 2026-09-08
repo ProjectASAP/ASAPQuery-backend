@@ -680,6 +680,7 @@ impl Replanner {
         Some(BackendStageConfig {
             aggregations: vec![BackendAggregation {
                 item_label: None,
+                heap_update_mode: None,
                 aggregation_id: format!("exact-{}-{}", workload.metric_name, role),
                 metric_name: workload.metric_name.clone(),
                 family: SummaryFamilyType::ExactAggregate(exact_kind, exact_params),
@@ -1310,6 +1311,7 @@ mod tests {
                 BackendStageConfig {
                     aggregations: vec![BackendAggregation {
                         item_label: None,
+                        heap_update_mode: None,
                         aggregation_id: "exact-http_requests_total-sum".to_string(),
                         metric_name: "http_requests_total".to_string(),
                         family: planner_types::post_asap::SummaryFamilyType::ExactAggregate(

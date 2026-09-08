@@ -38,9 +38,9 @@ fn frequency_comparison() -> (
     artifact.records[1].error.as_mut().unwrap().mean = Some(0.001);
     for row in &mut artifact.records {
         row.error.as_mut().unwrap().query = query.clone();
-        row.metrics.build_cpu_ns =
+        row.metrics.resources.cpu.build_cpu_ns =
             serde_json::from_value(json!({"value":1.0,"samples":3,"stddev":0.0})).unwrap();
-        row.metrics.read_cpu_ns = row.metrics.build_cpu_ns.clone();
+        row.metrics.resources.cpu.read_cpu_ns = row.metrics.resources.cpu.build_cpu_ns.clone();
     }
     let bindings: Vec<_> = artifact
         .records
@@ -174,7 +174,14 @@ fn offline_frequency_filters_backend_layout_before_comparison() {
         width: 1500,
         depth: 5,
     };
-    unsupported.metrics.update_cpu_ns.as_mut().unwrap().value = 0.001;
+    unsupported
+        .metrics
+        .resources
+        .cpu
+        .update_cpu_ns
+        .as_mut()
+        .unwrap()
+        .value = 0.001;
     let mut query_binding = evidence.query_bindings[1].clone();
     query_binding.record_id = unsupported.id.clone();
     evidence.query_bindings.push(query_binding);
@@ -335,8 +342,8 @@ fn incompatible_evidence_preserves_deployment_behavior() {
     }
 }
 
-/// A planner binary summary cannot become a silently executable warm-tier
-/// plan before that tier implements binary summary evaluation.
+/// Binary operations over these approximate sketch values retain explicit
+/// fallback even though the warm tier now supports exact additive binaries.
 #[test]
 fn binary_summary_has_explicit_warm_tier_fallback() {
     use control_plane::query_plan::{
@@ -370,7 +377,7 @@ fn binary_summary_has_explicit_warm_tier_fallback() {
     )
     .unwrap();
     assert!(
-        matches!(&plan.nodes[&plan.root], QueryPlanNode::ExactFallback { reason } if reason.contains("binary operation"))
+        matches!(&plan.nodes[&plan.root], QueryPlanNode::ExactFallback { reason } if !reason.is_empty())
     );
     assert!(plan.materialization_bindings().is_empty());
 }

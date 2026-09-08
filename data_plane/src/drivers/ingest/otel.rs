@@ -597,13 +597,9 @@ fn flush_barrier_drops(_state: &IngestState, drops: &HashMap<u64, u64>, driver_t
 /// distinct `(rack, node, pod)` tuple under a `grouping_labels=[zone]`
 /// policy would mint its own sid and never roll up.
 ///
-/// `agg_kind` is `ExactAgg { ... }` for both raw-sample and opaque-
-/// envelope sketch paths so the resolver key matches the signature
-/// `reconcile_from_streaming_config` derives from the same config; the
-/// modified-OTLP first-class sketch path takes a different sid-
-/// resolution route inside `route_modified_otlp_sketches_to_precompute`
-/// because it carries per-DP `(SketchAlgorithm, SketchConfig)` and
-/// must distinguish (e.g.) DDSketch vs Kll over the same series.
+/// Configured ingest shares the policy-aware physical identity used by the
+/// live storage sink and backfill. Unbound modified-OTLP sketches retain
+/// their separate wire-level identity protocol.
 fn resolve_bucket_sid_for_agg_config(
     ingest_state: &Arc<IngestState>,
     config: &asap_types::aggregation_config::AggregationConfig,
@@ -619,14 +615,8 @@ fn resolve_bucket_sid_for_agg_config(
         })
         .collect();
     let fp = crate::drivers::ingest::canonical_attrs_fingerprint(&grouping_pairs);
-    let agg_kind = crate::storage_engines::sketch_db::data::AggKind::ExactAgg {
-        agg_type: config.aggregation_type,
-        parameters_canonical: crate::storage_engines::sketch_db::data::canonical_parameters(
-            &config.parameters,
-        ),
-        spatial_filter_canonical: config.spatial_filter_normalized.clone(),
-    };
-    let agg_kind_canonical = agg_kind.canonical_string();
+    let agg_kind_canonical =
+        crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
     let sid = ingest_state
         .series_resolver
         .resolve(&config.metric, &fp, &agg_kind_canonical);
@@ -4656,14 +4646,8 @@ mod sid_bucketing_tests {
         // regardless of group_key shape — the test pin is on sid
         // assignment, not on group_key content), then verify the
         // sid matches the resolver mint for THAT zone.
-        let agg_kind = crate::storage_engines::sketch_db::data::AggKind::ExactAgg {
-            agg_type: cfg.aggregation_type,
-            parameters_canonical: crate::storage_engines::sketch_db::data::canonical_parameters(
-                &cfg.parameters,
-            ),
-            spatial_filter_canonical: cfg.spatial_filter_normalized.clone(),
-        };
-        let agg_kind_canonical = agg_kind.canonical_string();
+        let agg_kind_canonical =
+            crate::storage_engines::sketch_db::data::materialization_kind_for_config(&cfg);
         for (sid, _, _, samples) in &groups {
             let mut vals: Vec<f64> = samples.iter().map(|(_, _, v)| *v).collect();
             vals.sort_by(|a, b| a.partial_cmp(b).unwrap());

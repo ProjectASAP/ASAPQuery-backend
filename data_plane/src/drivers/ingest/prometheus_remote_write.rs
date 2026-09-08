@@ -461,13 +461,17 @@ fn route_messages(
                 })
                 .collect();
             let attrs_fp = super::canonical_attrs_fingerprint(&grouping_pairs);
-            let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(config);
-            let sid = ingest.series_resolver.resolve(
-                &config.metric,
-                &attrs_fp,
-                &agg_kind.canonical_string(),
-            );
             let policy_fp = asap_types::PolicyFingerprint(config.policy_fp_u64());
+            // A sketch family is not a complete physical identity. Two
+            // materializations may use the same family and grouping while
+            // differing in update semantics (for example count- versus
+            // value-weighted Top-K). Keep those states on distinct SIDs.
+            let materialization_kind =
+                crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
+            let sid =
+                ingest
+                    .series_resolver
+                    .resolve(&config.metric, &attrs_fp, &materialization_kind);
             buckets
                 .entry(sid)
                 .or_insert_with(|| ((sid, policy_fp, group_key), Vec::new()))

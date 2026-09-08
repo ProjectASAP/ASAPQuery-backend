@@ -109,7 +109,10 @@ fn sketch_agg_l4(
                 SketchKind::new(kind, params),
                 GroupingStrategy::default(),
             ),
-            input: planner_types::post_asap::SummaryUpdate::column(ColumnRef::SampleValue),
+            input: planner_types::post_asap::SummaryUpdate {
+                item: None,
+                weight: planner_types::post_asap::SummaryInputExpr::Column(ColumnRef::SampleValue),
+            },
             reduction: Reduction::by(vec![]),
             grouping: GroupingStrategy::default(),
         },
