@@ -85,6 +85,8 @@ pub enum WorkerMessage {
     },
     /// Signal the worker to flush/check idle windows.
     Flush,
+    /// Finite-input barrier: acknowledge only after queued input and trailing panes reach the sink.
+    Drain(tokio::sync::oneshot::Sender<Result<(), String>>),
     /// Graceful shutdown.
     Shutdown,
 }
@@ -126,6 +128,7 @@ impl fmt::Debug for WorkerMessage {
                 .field("accumulator_type", &accumulator.type_name())
                 .finish(),
             Self::Flush => f.write_str("Flush"),
+            Self::Drain(_) => f.write_str("Drain"),
             Self::Shutdown => f.write_str("Shutdown"),
         }
     }
@@ -205,7 +208,7 @@ impl SeriesRouter {
                 WorkerMessage::GroupSamples { sid, .. }
                 | WorkerMessage::AccumulatorInput { sid, .. } => self.worker_for_sid(*sid),
                 WorkerMessage::RawSamples { series_key, .. } => self.worker_for(series_key),
-                WorkerMessage::Flush | WorkerMessage::Shutdown => 0,
+                WorkerMessage::Flush | WorkerMessage::Drain(_) | WorkerMessage::Shutdown => 0,
             };
             let permit = self.senders[worker_idx]
                 .clone()
@@ -240,6 +243,23 @@ impl SeriesRouter {
                 .send(WorkerMessage::Shutdown)
                 .await
                 .map_err(|e| format!("Failed to send shutdown to worker {}: {}", i, e))?;
+        }
+        Ok(())
+    }
+
+    /// Caller must stop new input before invoking this finite-source barrier.
+    pub async fn drain(&self) -> Result<(), String> {
+        let mut replies = Vec::new();
+        for sender in &self.senders {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            sender
+                .send(WorkerMessage::Drain(tx))
+                .await
+                .map_err(|e| e.to_string())?;
+            replies.push(rx);
+        }
+        for reply in replies {
+            reply.await.map_err(|e| e.to_string())??;
         }
         Ok(())
     }
