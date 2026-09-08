@@ -119,6 +119,7 @@ fn node_is_archive(node: &Rc<SummaryNode>) -> bool {
             node_is_archive(left) || node_is_archive(right)
         }
         SummaryExpr::SummaryDelete { summary_input, .. } => node_is_archive(summary_input),
+        SummaryExpr::BinaryOp { lhs, rhs, .. } => node_is_archive(lhs) || node_is_archive(rhs),
     }
 }
 
@@ -774,7 +775,16 @@ fn phase_b_e2e_topk_well_formed() {
     let accuracy = AccuracyTarget::Epsilon(0.05);
     let expr = crate::query_parser::parse_query_expr_canonical(query, accuracy.clone())
         .expect("TopK parses");
-    assert!(bind_query_expr(&expr, accuracy).is_err());
+    let bound = bind_query_expr(&expr, accuracy);
+    assert!(
+        bound.is_err()
+            || matches!(
+                &bound,
+                Ok(PhysicalExpr::Committed(PostAsapPlan::Summary(node)))
+                    if matches!(node.expr, SummaryExpr::KeepPreAsap(_))
+            ),
+        "unevidenced TopK must remain exact or unavailable: {bound:?}"
+    );
 }
 
 /// Archive-only routing through the full L1→L3→L4 pipeline. Asserts the

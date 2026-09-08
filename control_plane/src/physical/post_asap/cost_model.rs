@@ -252,6 +252,7 @@ impl CostModel for ControlPlaneCostModel {
             .min_by(|left, right| left.1 .0.total_cmp(&right.1 .0))
             .map(
                 |(framework, physical_cost)| CompleteSummaryCandidateEstimate {
+                    physical_plan_id: None,
                     cost: Cost(lifecycle_cost + physical_cost.0),
                     window_frameworks: vec![Some(framework.clone()); deployments.len()],
                     window_accuracy_guarantee: Some(

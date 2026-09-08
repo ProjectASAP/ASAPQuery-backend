@@ -331,9 +331,11 @@ where
         self.next_id += 1;
         self.seen.insert(identity, id);
         let physical = match &node.expr {
-            SummaryExpr::KeepPreAsap(_) => QueryPlanNode::ExactFallback {
-                reason: "post-ASAP node requires exact execution".into(),
-            },
+            SummaryExpr::BinaryOp { .. } | SummaryExpr::KeepPreAsap(_) => {
+                QueryPlanNode::ExactFallback {
+                    reason: "post-ASAP node requires exact execution".into(),
+                }
+            }
             SummaryExpr::SummaryAgg {
                 family,
                 reduction,
