@@ -158,16 +158,14 @@ pub fn execute<E: SummaryExecutor>(
             reduction,
             ..
         } => {
-            let planner_types::post_asap::SummaryUpdate {
-                item: None,
-                weight: planner_types::post_asap::SummaryInputExpr::Column(col),
-            } = input
-            else {
-                return Err(ExecError::NotYetSupported(
-                    "keyed or non-column summary update",
-                ));
+            let col = match input.item.as_ref().unwrap_or(&input.weight) {
+                planner_types::post_asap::SummaryInputExpr::Column(col) => col.clone(),
+                planner_types::post_asap::SummaryInputExpr::Constant(value) if *value == 1.0 => {
+                    ColumnRef::SampleValue
+                }
+                _ => return Err(ExecError::NotYetSupported("summary update expression")),
             };
-            let tagged = exec.find_candidates(family, col, reduction, child)?;
+            let tagged = exec.find_candidates(family, &col, reduction, child)?;
             if tagged.is_empty() {
                 return Err(ExecError::NoCandidates);
             }
@@ -242,9 +240,9 @@ pub fn execute<E: SummaryExecutor>(
         }
 
         SummaryExpr::SummaryJoin { .. } => Err(ExecError::NotYetSupported("SummaryJoin")),
+        SummaryExpr::BinaryOp { .. } => Err(ExecError::NotYetSupported("BinaryOp")),
         SummaryExpr::SummarySubtract { .. } => Err(ExecError::NotYetSupported("SummarySubtract")),
         SummaryExpr::SummaryDelete { .. } => Err(ExecError::NotYetSupported("SummaryDelete")),
-        SummaryExpr::BinaryOp { .. } => Err(ExecError::NotYetSupported("BinaryOp")),
     }
 }
 
@@ -335,7 +333,12 @@ mod tests {
             expr: SummaryExpr::SummaryAgg {
                 child,
                 family,
-                input: planner_types::post_asap::SummaryUpdate::column(ColumnRef::SampleValue),
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction,
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },

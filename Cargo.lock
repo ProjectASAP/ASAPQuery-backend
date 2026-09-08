@@ -343,7 +343,7 @@ dependencies = [
 [[package]]
 name = "asap-aware-mapping"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=dfdf6b5c1f7d667394a4ea1f56fb3786af04228d#dfdf6b5c1f7d667394a4ea1f56fb3786af04228d"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=c3410d14865497758d212e4265ad25c782187de1#c3410d14865497758d212e4265ad25c782187de1"
 dependencies = [
  "asap-types",
  "serde",
@@ -354,7 +354,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=dfdf6b5c1f7d667394a4ea1f56fb3786af04228d#dfdf6b5c1f7d667394a4ea1f56fb3786af04228d"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=c3410d14865497758d212e4265ad25c782187de1#c3410d14865497758d212e4265ad25c782187de1"
 dependencies = [
  "asap-types",
  "promql-parser 0.10.0",
@@ -374,7 +374,7 @@ dependencies = [
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=dfdf6b5c1f7d667394a4ea1f56fb3786af04228d#dfdf6b5c1f7d667394a4ea1f56fb3786af04228d"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=c3410d14865497758d212e4265ad25c782187de1#c3410d14865497758d212e4265ad25c782187de1"
 dependencies = [
  "serde",
  "serde_json",

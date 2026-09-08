@@ -1855,14 +1855,8 @@ impl SketchStore {
         // samples by sid up-front) skip the resolver round-trip by
         // invoking the sid-direct sibling.
         let (attrs_fp, _label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
-        let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg);
-        // Sid mint delegated to the caller's closure — typically
-        // `|m, fp, ak| series_resolver.resolve(m, fp, ak)`. Keeps the
-        // SketchStore free of any layer-inverted dependency on the
-        // resolver type (which lives in `drivers::ingest`). Tests
-        // pass either a real local resolver or a counter-mock
-        // closure.
-        let agg_kind_canonical = agg_kind.canonical_string();
+        let agg_kind_canonical =
+            crate::storage_engines::sketch_db::data::materialization_kind_for_config(agg_cfg);
         let sid = mint_sid(&agg_cfg.metric, &attrs_fp, &agg_kind_canonical);
         self.ingest_precompute_with_sid(sid, agg_cfg, output, accumulator)
     }

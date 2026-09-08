@@ -264,6 +264,7 @@ mod tests {
             spatial_filter: String::new(),
             grouping,
             item_label: None,
+            heap_update_mode: None,
             aggregation_input: AggregationInput::SketchEnvelope,
         }
     }
@@ -514,6 +515,7 @@ mod tests {
             spatial_filter: String::new(),
             grouping: vec!["zone".to_string()],
             item_label: None,
+            heap_update_mode: None,
             aggregation_input: AggregationInput::Raw,
         };
         let cfg = BackendStageConfig {

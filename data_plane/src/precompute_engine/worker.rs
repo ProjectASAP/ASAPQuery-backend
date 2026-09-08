@@ -1191,7 +1191,7 @@ pub fn decode_label_value(s: &str) -> std::borrow::Cow<'_, str> {
 /// the key dimension *inside* the sketch (e.g., which bucket in a CMS, which
 /// entry in a MultipleSumAccumulator's HashMap). This matches the Arroyo SQL
 /// pattern: `udf(concat_ws(';', aggregated_labels), value)`.
-fn apply_sample(
+pub(crate) fn apply_sample(
     updater: &mut dyn AccumulatorUpdater,
     series_key: &str,
     val: f64,
@@ -1199,7 +1199,19 @@ fn apply_sample(
     config: &AggregationConfig,
 ) {
     if updater.is_keyed() {
-        let key = extract_aggregated_key_from_series(series_key, config);
+        // Planner's PromQL Top-K item is the series identity. When no
+        // explicit aggregated labels are projected, retain the canonical
+        // series key instead of collapsing every series onto an empty item.
+        let key = if config.aggregated_labels.labels.is_empty()
+            && matches!(
+                config.aggregation_type,
+                crate::storage_engines::types::AggregationType::CountMinSketchWithHeap
+                    | crate::storage_engines::types::AggregationType::CountSketchWithHeap
+            ) {
+            KeyByLabelValues::new_with_labels(vec![series_key.to_string()])
+        } else {
+            extract_aggregated_key_from_series(series_key, config)
+        };
         updater.update_keyed(&key, val, ts);
     } else {
         updater.update_single(val, ts);

@@ -178,10 +178,10 @@ impl ThreeStageWalker {
             // scope map.
             SummaryExpr::KeepPreAsap(qe) => self.colour_logical(qe)?,
             SummaryExpr::BinaryOp { lhs, rhs, .. } => {
-                let (left, _) = self.visit_l4node(lhs)?;
-                let (right, _) = self.visit_l4node(rhs)?;
-                self.dag.edges.push((id, left));
-                self.dag.edges.push((id, right));
+                for child in [lhs, rhs] {
+                    let (cid, _) = self.visit_l4node(child)?;
+                    self.dag.edges.push((id, cid));
+                }
                 StageId::Backend
             }
 
