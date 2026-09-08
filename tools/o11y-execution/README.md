@@ -91,8 +91,19 @@ so forwarded work is visible. Ingestion journal timings and phase snapshots expo
 the construction/update interval, including the declared settle delay. Counters
 include background work and have CPU-tick resolution. RSS/HWM are **whole-process**
 memory, not summary heap; HWM is process-lifetime peak, not isolated phase peak.
-`store.json` preserves the backend's raw state counters. Affinity/cgroup metadata
-is recorded but equal resource budgets are not enforced by this harness.
+`store.json` preserves the backend's raw state counters. `--cpu-affinity` applies
+one CPU set to the backend and supplied Prometheus processes/threads.
+`--address-space-bytes` applies the same RLIMIT_AS, which limits virtual address
+space, not RSS or combined process memory. These controls are optional and their
+presence is recorded; they do not establish a full cgroup resource budget.
+
+Use `--fallback-url` and `--fallback-pid` for a separate fresh Prometheus instance,
+keeping `--exact-url`/`--exact-pid` for the baseline. Identical process IDs and
+storage paths are rejected. Both receive identical input batches. Backend CPU
+includes its fallback service CPU; baseline CPU remains separate. With no
+separate fallback service, the report preserves the shared-cache limitation.
+`--exact-storage` and `--fallback-storage` record logical file sizes separately;
+backend output file sizes include logs and are not retained summary heap sizes.
 
 The provider's estimated costs are preserved next to measured quantities without
 pretending abstract model units are CPU nanoseconds. End-to-end benefit and
@@ -100,5 +111,5 @@ estimated/measured cost ratios remain null until their units, lifecycle scope,
 exact-service startup/storage costs and resource budgets are matched. Separate
 fresh-process/cache-controlled trials, a retained-state measurement, calibration
 provenance and real-corpus execution evidence are still required before declaring
-the five #524 acceptance criteria complete. The shared fallback/baseline service
+the five #524 acceptance criteria complete. A shared fallback/baseline service
 can transfer cache warmth; alternating order does not eliminate this confound.
