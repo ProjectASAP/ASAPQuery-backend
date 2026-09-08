@@ -1,7 +1,7 @@
 //! Black-box acceptance test for the collector-free ASAPQuery profile.
 //!
 //! Starts the production binary from a canonical workload snapshot, ingests
-//! only Prometheus Remote Write v1, exercises safe warm families and counter fallback
+//! only Prometheus Remote Write v1, exercises safe warm families and per-series fallback
 //! through instant and range APIs, and verifies exact fallback request parity.
 
 use std::collections::HashMap;
@@ -834,8 +834,8 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let first_eval = (base + 5_000) as f64 / 1_000.0;
     let second_eval = (base + 10_000) as f64 / 1_000.0;
     let backend_log = output_dir.path().join("query_engine.log");
-    // Counter roots retain the complete exact request until independent series
-    // reset/timestamp state is represented by the backend raw producer.
+    // Counter and bare per-series quantile roots retain the complete exact request
+    // until raw producers can preserve the required per-series state.
     for query in [
         "rate(asap_demo_counter_total[5s])",
         "increase(asap_demo_counter_total[5s])",
@@ -1032,7 +1032,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
 
     // Readiness polling may briefly reach the exact fallback before a newly
     // closed warm window is visible. Every planned query above was required
-    // to converge to a warm answer; isolate the explicit fallback assertions.
+    // to converge to its declared warm or exact tier; isolate further fallback assertions.
     fallback_calls.lock().await.clear();
 
     let fallback_instant: Value = client
