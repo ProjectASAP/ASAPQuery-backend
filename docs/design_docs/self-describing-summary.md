@@ -1,175 +1,152 @@
 # Self-Describing Summary (SDS)
 
-Proposed logical structures; not an implemented serialization format.
+This proposal defines three logical layers for summary producers and consumers.
+It does not change the current runtime or wire format.
 
-## SDS
+| Layer | Describes | Changes when |
+| --- | --- | --- |
+| **Summary Descriptor** | Summary operator and fidelity guarantees | Algorithm, configuration or guarantee contract changes |
+| **Data Descriptor** | Summarized source and population | Source binding or population definition changes |
+| **Summary Instance** | Instance metadata and summary state | A concrete materialization is created or updated |
+
+Separating these layers lets many materialized instances reuse the same operator
+configuration and data scope. A new time interval creates a new instance without
+copying or redefining either descriptor.
+
+## 1. Summary Descriptor
+
+A Summary Descriptor defines **how the data is summarized** and **which fidelity
+claims the summary supports**. It does not identify a source population or a
+particular time interval.
 
 | Field | Type | Definition |
 | --- | --- | --- |
-| `schemas` | `SdsSchema[]` | Immutable summary descriptors |
-| `dictionary` | `SdsIdentity[]` | Reusable population identities |
-| `records` | `SdsRecord[]` | Summary states or readout results |
+| `summary_descriptor_id` | `QualifiedId` | Immutable descriptor identity |
+| `operator` | `SummaryOperator` | Algorithm, semantic version, parameters and supported operations |
+| `fidelity` | `FidelityGuarantee[]` | Exactness or error guarantees, with their scope and conditions |
+| `state_representation` | `StateRepresentation` | State type, codec and codec version |
 
-References are namespace-qualified. Every record's descriptor references must
-resolve within the SDS or a durably retained descriptor context.
+`SummaryOperator` contains an algorithm identifier, versioned semantics,
+type-specific parameters, and supported build/update/merge/readout signatures.
+Parameters and operation arguments depend on the summary type; `item` and
+`weight` are not mandatory common fields.
 
-## SdsSchema
+For example, a KLL operator may specify `k: 200`. The value of `k` is an
+algorithm parameter, **not itself a numerical error guarantee**. Its fidelity
+contract separately identifies the supported rank-error bound or versioned
+bound derivation, probability of failure, readout scope and required conditions.
+If that guarantee is unavailable, fidelity is explicitly `Unknown`.
 
-| Field | Type | Definition |
-| --- | --- | --- |
-| `schema_id` | `QualifiedId` | Immutable descriptor identity |
-| `schema_version` | `Version` | Descriptor format version |
-| `input` | `InputContract` | Summarized input and its interpretation |
-| `grouping` | `GroupingContract` | Population partitioning and group-key types |
-| `summary` | `SummaryTypeContract` | Summary-specific state and operation semantics |
-| `representation` | `RepresentationContract` | Payload layout and encoding |
-| `guarantees` | `GuaranteeContract[]` | Guarantees available for specified operations |
+A `FidelityGuarantee` contains:
 
-### InputContract
+- The applicable operation and error quantity, such as quantile rank error.
+- A category: `Exact`, `DeterministicBound`, `ProbabilisticBound` or `Unknown`.
+- A bound or versioned bound derivation, and a failure probability when applicable.
+- The population/readout/evaluation scope and required assumptions.
 
-| Field | Type | Definition |
-| --- | --- | --- |
-| `source` | `CanonicalSourceBinding` | Versioned source definition; concrete snapshot/partition is identified by record coverage |
-| `fields` | `FieldDefinition[]` | Stable field IDs, data types, nullability and optional units |
-| `projection` | `TypedExpression[]` | Expressions supplying the operation's inputs |
-| `filter` | `Optional<TypedPredicate>` | Input qualification; absent means no additional filter |
-| `observation_semantics` | `VersionedSemanticContract` | Null, NaN, duplicate and ordering interpretation |
+A `StateRepresentation` identifies the logical state type and versioned encoding.
+Compatible bytes alone do not establish that two operators have compatible
+semantics or guarantees.
 
-### GroupingContract
+## 2. Data Descriptor
 
-| Field | Type | Definition |
-| --- | --- | --- |
-| `mode` | `Global \| PerEntity \| ByKeys` | One population, preserved entity populations, or explicit grouping |
-| `keys` | `TypedExpression[]` | Group-key expressions; empty for Global |
-| `key_semantics` | `VersionedSemanticContract` | Equality, canonicalization and absent/null handling |
-
-### SummaryTypeContract
+A Data Descriptor defines **which data is summarized**. It is independent of the
+summary algorithm and of a particular materialized interval.
 
 | Field | Type | Definition |
 | --- | --- | --- |
-| `type_id` | `QualifiedId` | Summary semantic type |
-| `type_version` | `Version` | State and operation semantics version |
-| `parameters` | `TypedParameterRecord` | Parameters validated against this summary type's parameter schema |
-| `state_schema` | `TypeDefinition` | Logical state structure |
-| `operations` | `OperationContract[]` | Supported state construction, modification, combination and readout |
+| `data_descriptor_id` | `QualifiedId` | Immutable data-scope identity |
+| `source` | `SourceBinding` | Metric/series or dataset, including its versioned field definitions |
+| `population` | `PopulationDefinition` | Selection predicate and grouping/entity scope |
+| `observation_semantics` | `SemanticContract` | Value projection, units and handling of missing, duplicate or invalid observations |
 
-`parameters` and operation signatures are type-specific; `item` and `weight`
-are not common SDS fields.
+For example, the source can be the metric `cpu_usage`, and the summarized
+population can be the series satisfying `container_type="login"`.
 
-| Summary type | Type-specific parameter fields | Update input signature |
-| --- | --- | --- |
-| Exact aggregate | Aggregate components, numeric representation and overflow policy | Typed observations with component-specific qualification |
-| DDSketch | Relative accuracy and supported value-domain policy | Numeric observation |
-| KLL | Capacity and compaction configuration | Ordered observation |
-| HLL | Precision, element encoding and hash configuration | Element |
-| CMS | Width, depth, key encoding, hash configuration and increment-domain policy | Key, increment |
-| CountSketch | Width, depth, key encoding, hash configuration and increment-domain policy | Key, increment |
-| Heap-bearing frequency summary | Base frequency contract, candidate policy and heap capacity | Base frequency update input |
+`PopulationDefinition` records both selection and partitioning. It distinguishes
+one summary over all selected observations, independent summaries per series,
+and summaries grouped by specified label keys. Concrete group values belong in
+the instance metadata when one descriptor describes a reusable grouping rule.
 
-### OperationContract
+A population predicate is a typed, resolved data-selection definition. It is not
+an arbitrary executable program attached to a summary.
 
-| Field | Type | Definition |
-| --- | --- | --- |
-| `operation_id` | `QualifiedId` | Versioned operation definition |
-| `kind` | `Build \| Update \| Merge \| Retract \| Subtract \| Readout` | Operation category; only supported operations are listed |
-| `inputs` | `TypeDefinition[]` | Ordered input/state signatures |
-| `arguments` | `ParameterSchema` | Typed operation arguments |
-| `output` | `TypeDefinition` | Output state or result type |
-| `preconditions` | `RuleRef[]` | Compatibility, coverage, ordering and provenance requirements |
-| `guarantee_rules` | `RuleRef[]` | Applicable guarantee derivation/composition rules |
+## 3. Summary Instance
 
-### RepresentationContract
+A Summary Instance combines **instance metadata** with **the actual summary
+state**, referencing one Summary Descriptor and one Data Descriptor.
 
 | Field | Type | Definition |
 | --- | --- | --- |
-| `representation_id` | `QualifiedId` | Concrete state-layout identity |
-| `codec` | `QualifiedId` | Payload codec |
-| `codec_version` | `Version` | Codec version |
-| `layout` | `TypeDefinition` | Encoded payload layout |
-| `payload_kinds` | `Set<FullState \| StateDelta \| ReadoutResult>` | Supported payload forms |
+| `instance_id` | `QualifiedId` | Materialized instance identity |
+| `summary_descriptor_id` | `QualifiedId` | Referenced operator/fidelity descriptor |
+| `data_descriptor_id` | `QualifiedId` | Referenced source/population descriptor |
+| `metadata` | `InstanceMetadata` | Concrete extent, population binding, completeness and provenance |
+| `state` | `SummaryState` | Materialized state encoded according to the Summary Descriptor |
 
-### GuaranteeContract
+`InstanceMetadata` contains the concrete time range or dataset extent, any group
+values needed by the population rule, completeness (`Complete`, `Partial` or
+`Unknown`), producer/generation/sequence provenance and instance-specific fidelity
+evidence. Time ranges specify their clock, units and interval boundaries.
+Completeness is separate from mathematical approximation error.
 
-| Field | Type | Definition |
-| --- | --- | --- |
-| `guarantee_id` | `QualifiedId` | Versioned guarantee definition |
-| `operation` | `QualifiedId` | Operation/readout to which the guarantee applies |
-| `kind` | `Exact \| DeterministicBound \| ProbabilisticBound \| Unknown` | Guarantee category |
-| `error_quantity` | `Optional<TypedErrorDefinition>` | Quantity, units and normalization being bounded |
-| `bound` | `Optional<TypedBound>` | Bound or versioned bound derivation |
-| `failure_probability` | `Optional<Probability>` | Required for a probabilistic bound; not invented for other categories |
-| `scope` | `GuaranteeScope` | Population/readout and evaluation set covered by the claim |
-| `assumptions` | `RuleRef[]` | Required input, algorithm and evidence conditions |
+`SummaryState` is the state itself, not a quantile readout or other query result.
+If a transport carries a delta, it must identify its base instance/version and
+the descriptor's supported apply operation; it cannot be interpreted as a full
+state without that context.
 
-## SdsIdentity
+## Shared-descriptor example
 
-| Field | Type | Definition |
-| --- | --- | --- |
-| `identity_id` | `QualifiedId` | Population identity; may have a compact dictionary alias |
-| `schema_id` | `QualifiedId` | Referenced SDS Schema |
-| `source_identity` | `TypedRecord` | Concrete source identity, including metric name where applicable |
-| `group_values` | `TypedTuple` | Values matching the grouping key/entity schema |
+The following example summarizes `cpu_usage` observations from login containers
+using KLL with `k=200`. All three instances reuse the same Summary Descriptor and
+Data Descriptor; only the instance time range and state change.
 
-## SdsRecord
+```yaml
+summary_descriptor:
+  summary_descriptor_id: example:kll-200-v1
+  operator:
+    algorithm: KLL
+    parameters: {k: 200}
+    semantics: example:kll-semantics-v1
+  fidelity:
+    - operation: quantile
+      error_quantity: rank_error
+      category: Unknown  # No numerical guarantee is inferred from k alone.
+  state_representation: example:kll-state-codec-v1
 
-| Field | Type | Definition |
-| --- | --- | --- |
-| `record_id` | `QualifiedId` | Record identity |
-| `identity_id` | `QualifiedId` | Referenced dictionary identity |
-| `coverage` | `Coverage` | Actual summarized input extent and completeness |
-| `payload` | `SdsPayload` | Exactly one state or result variant |
-| `provenance` | `ProvenanceRef` | Resolvable producer, generation and sequence metadata |
-| `guarantee_evidence` | `GuaranteeEvidence[]` | Instance-specific evidence for applicable guarantees |
+data_descriptor:
+  data_descriptor_id: example:login-cpu-v1
+  source: {metric: cpu_usage}
+  population:
+    predicate: {container_type: {equals: login}}
+    grouping: global
+  observation_semantics: example:cpu-observations-v1
 
-### SdsPayload
+instances:
+  - instance_id: example:login-cpu-0
+    summary_descriptor_id: example:kll-200-v1
+    data_descriptor_id: example:login-cpu-v1
+    metadata: {time_range: "[0,10)", clock: example:seconds}
+    state: S0
+  - instance_id: example:login-cpu-1
+    summary_descriptor_id: example:kll-200-v1
+    data_descriptor_id: example:login-cpu-v1
+    metadata: {time_range: "[10,20)", clock: example:seconds}
+    state: S1
+  - instance_id: example:login-cpu-2
+    summary_descriptor_id: example:kll-200-v1
+    data_descriptor_id: example:login-cpu-v1
+    metadata: {time_range: "[20,30)", clock: example:seconds}
+    state: S2
+```
 
-| Variant | Fields |
-| --- | --- |
-| `FullState` | `state: bytes` |
-| `StateDelta` | `base_record: QualifiedId`, `apply_operation: QualifiedId`, `delta: bytes` |
-| `ReadoutResult` | `operation: QualifiedId`, `arguments: TypedParameterRecord`, `value: TypedValue` |
+`S0`, `S1` and `S2` denote separate encoded KLL states. The example omits concrete
+payload bytes and producer evidence; it makes no completeness or numerical error
+claim. Descriptor references must resolve within the supplied context or a
+durably retained descriptor registry.
 
-State bytes use the referenced representation contract. A readout result uses
-its operation's output type and is not implicitly mergeable state.
-
-### Coverage
-
-| Field | Type | Definition |
-| --- | --- | --- |
-| `extent` | `TimeExtent \| DatasetExtent` | Time interval or dataset snapshot/partition extent |
-| `completeness` | `Complete \| Partial \| Unknown` | Coverage status, separate from mathematical accuracy |
-| `evidence` | `EvidenceRef[]` | Evidence establishing coverage/freshness |
-
-| Extent | Fields |
-| --- | --- |
-| `TimeExtent` | `clock: ClockDefinition`, `start: Timestamp`, `end: Timestamp`, `bounds: IntervalBounds` |
-| `DatasetExtent` | `snapshot: QualifiedId`, `partitions: TypedSet`, `selection: Optional<TypedPredicate>` |
-
-### GuaranteeEvidence
-
-| Field | Type | Definition |
-| --- | --- | --- |
-| `guarantee_id` | `QualifiedId` | Schema guarantee being evaluated |
-| `scope` | `GuaranteeScope` | Concrete population/readout/evaluation scope |
-| `status` | `Established \| Unverified \| Invalid` | Whether the conditions for this instance are established |
-| `evidence` | `EvidenceRef[]` | Resolvable evidence and its validity/provenance |
-
-## Referenced types
-
-| Type | Definition |
-| --- | --- |
-| `QualifiedId` | Namespace plus immutable identifier |
-| `Version` | Version identifier with an explicit compatibility definition |
-| `TypeDefinition` | Resolvable, versioned scalar/tuple/collection/state type |
-| `TypedValue / TypedTuple / TypedRecord / TypedSet` | Values whose types and field identities resolve through a TypeDefinition |
-| `ParameterSchema / TypedParameterRecord` | Versioned parameter definition and values validated against it |
-| `CanonicalSourceBinding` | Resolvable source definition with stable field bindings |
-| `FieldDefinition` | Field ID, name, type, nullability and optional unit |
-| `TypedExpression / TypedPredicate` | Canonical expression with resolved input/output types |
-| `VersionedSemanticContract / RuleRef` | Versioned semantic definition or compatibility rule; not executable code supplied by a record |
-| `TypedErrorDefinition / TypedBound` | Error quantity and bound with defined types, units and interpretation |
-| `Probability` | Finite number in [0, 1] |
-| `GuaranteeScope` | Population selector, operation arguments and covered evaluation set; distinguishes per-row, whole-result and repeated-evaluation claims |
-| `ClockDefinition / Timestamp / IntervalBounds` | Clock/time unit, time value and inclusive/exclusive interval boundaries |
-| `ProvenanceRef` | Reference to existing frame/materialization metadata: producer, epoch, sequence and plan generation |
-| `EvidenceRef` | Immutable evidence reference including issuer, observation time, validity and subject scope |
+Changing `k` creates a new Summary Descriptor. Changing the source or population
+creates a new Data Descriptor. Advancing the time range creates a new Summary
+Instance. Merge compatibility additionally requires the operator's merge rules,
+compatible data scopes and valid instance coverage; sharing descriptors alone
+does not authorize merging overlapping observations.
