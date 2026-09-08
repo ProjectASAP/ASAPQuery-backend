@@ -42,7 +42,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "14a3b53ca9e1436273c3069b0810cb07d5d9287b";
+pub const PLANNER_REVISION: &str = "378a7547ede629a64e84c9f7c810226ce196cce9";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
