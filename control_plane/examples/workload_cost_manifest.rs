@@ -12,13 +12,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (request, environment) = snapshot.planning_request()?;
     let manifests = workload_cost::with_exact_alternative(request)?
         .into_iter()
-        .map(|candidate| {
+        .filter_map(|candidate| {
             let queries = candidate.queries.clone();
             PhysicalCompiler
                 .compile(candidate, environment.clone())
                 .and_then(|plan| workload_cost::manifest(&plan, &queries))
+                .ok()
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Vec<_>>();
+    if manifests.is_empty() {
+        return Err("no bindable workload cost manifests".into());
+    }
     println!("{}", serde_json::to_string_pretty(&manifests)?);
     Ok(())
 }
