@@ -1,7 +1,7 @@
 //! Black-box acceptance test for the collector-free ASAPQuery profile.
 //!
 //! Starts the production binary from a canonical workload snapshot, ingests
-//! only Prometheus Remote Write v1, exercises every declared warm query family
+//! only Prometheus Remote Write v1, exercises safe warm families and counter fallback
 //! through instant and range APIs, and verifies exact fallback request parity.
 
 use std::collections::HashMap;
@@ -491,6 +491,16 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
                 ],
             ),
             series_with_labels(
+                "asap_demo_counter_total",
+                &[("instance", "independent")],
+                &[
+                    (base + 500, 50.0),
+                    (base + 1_700, 60.0),
+                    (base + 2_900, 5.0),
+                    (base + 4_200, 15.0),
+                ],
+            ),
+            series_with_labels(
                 "asap_demo_gauge",
                 &[("job", "api")],
                 &[
@@ -564,22 +574,43 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let first_eval = (base + 5_000) as f64 / 1_000.0;
     let second_eval = (base + 10_000) as f64 / 1_000.0;
     let backend_log = output_dir.path().join("query_engine.log");
-    let rate = wait_for_warm_instant(
-        &client,
-        &backend,
+    // Counter roots retain the complete exact request until independent series
+    // reset/timestamp state is represented by the backend raw producer.
+    for query in [
         "rate(asap_demo_counter_total[5s])",
-        first_eval,
-        &backend_log,
-    )
-    .await;
-    let increase = wait_for_warm_instant(
-        &client,
-        &backend,
         "increase(asap_demo_counter_total[5s])",
-        first_eval,
-        &backend_log,
-    )
-    .await;
+    ] {
+        let instant: Value = client
+            .get(format!("{backend}/api/v1/query"))
+            .query(&[
+                ("query", query.to_string()),
+                ("time", first_eval.to_string()),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(instant["data"]["result"][0]["metric"]["fallback"], "true");
+        assert!(!is_warm(&instant));
+        let range: Value = client
+            .get(format!("{backend}/api/v1/query_range"))
+            .query(&[
+                ("query", query.to_string()),
+                ("start", first_eval.to_string()),
+                ("end", second_eval.to_string()),
+                ("step", "5".into()),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(range["data"]["result"][0]["metric"]["fallback"], "true");
+        assert!(!is_warm(&range));
+    }
     let sum = wait_for_warm_instant(
         &client,
         &backend,
@@ -635,9 +666,6 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         topk_count["data"]["result"][0]["metric"]["item"],
         "asap_demo_gauge{job=\"api\"}"
     );
-    let rate_value = first_value(&rate, "value").expect("rate value");
-    let increase_value = first_value(&increase, "value").expect("increase value");
-    assert!((rate_value * 5.0 - increase_value).abs() < 1e-9);
     assert!((first_value(&sum, "value").expect("sum value") - 240.0).abs() < 1e-9);
     let quantile_value = first_value(&quantile, "value").expect("quantile value");
     assert!(
@@ -646,8 +674,6 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     );
 
     for query in [
-        "rate(asap_demo_counter_total[5s])",
-        "increase(asap_demo_counter_total[5s])",
         "sum_over_time(asap_demo_gauge[5s])",
         "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
         "topk(1, sum_over_time(asap_demo_gauge[5s]))",
@@ -870,10 +896,83 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let materializations = status["materializations"]
         .as_array()
         .expect("materialization statuses");
-    assert_eq!(materializations.len(), 5);
+    assert_eq!(materializations.len(), 4);
     assert!(materializations
         .iter()
         .all(|entry| entry["phase"] == "serving"));
+
+    // A previously generated raw counter plan must be rejected before staging,
+    // while the current safe generation remains available to readers.
+    let mut snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        serde_json::from_str(include_str!(
+            "../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+    snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
+        planner_types::workload::Query("rate(asap_demo_counter_total[1m])".into());
+    let (mut legacy_request, mut environment) = snapshot.planning_request().unwrap();
+    let query = &mut legacy_request.queries[0];
+    let parsed = control_plane::query_parser::parse_query_expr_canonical(
+        &query.query_string,
+        query.accuracy.clone(),
+    )
+    .unwrap();
+    query.post_asap = control_plane::physical::compiler::select_post_asap(
+        &parsed,
+        query.accuracy.clone(),
+        &query.lifecycle,
+        None,
+    )
+    .unwrap();
+    environment.target =
+        control_plane::physical::compiler::PhysicalDeploymentTarget::DistributedCollectors;
+    environment.collector_ids = vec!["legacy-counter-source".into()];
+    environment.plan_version = 2;
+    let mut legacy = control_plane::physical::compiler::PhysicalCompiler
+        .compile(legacy_request, environment)
+        .unwrap();
+    legacy.precompute_plan.ingest.protocol =
+        control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1;
+    legacy.precompute_plan.ingest.endpoint_path = "/api/v1/write".into();
+    legacy.precompute_plan.ingest.timestamp_unit =
+        control_plane::physical::compiler::TimestampUnit::UnixMilliseconds;
+    legacy.precompute_plan.ingest.require_plan_identity = false;
+    legacy
+        .precompute_plan
+        .ingest
+        .require_materialization_identity = false;
+    legacy.precompute_plan.ingest.require_registered_producer = false;
+    legacy.precompute_plan.producers.clear();
+    legacy.transmission_plan.rules.clear();
+    let artifact = serde_json::json!({"precompute_plan": legacy.precompute_plan,
+        "transmission_plan": legacy.transmission_plan, "backend_plan": legacy.backend_plan.encode_to_vec(),
+        "query_plan": legacy.query_plan, "storage_routing": null, "adaptation_evidence": []});
+    let built = data_plane::drivers::query::servers::http::build_active_physical_plan(
+        serde_json::from_value(artifact.clone()).unwrap(),
+        std::sync::Arc::new(data_plane::storage_engines::types::BackendStorageRouting::empty()),
+    );
+    assert!(matches!(built, Err(error) if error.contains("raw counter state")));
+    // HTTP may reject this old generation at the earlier successor authorization
+    // boundary; either way it must leave the installed generation unchanged.
+    let rejected = client
+        .post(format!("{backend}/api/v1/physical-plan"))
+        .json(&artifact)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status().as_u16(), 422);
+    let after: Value = client
+        .get(format!("{backend}/api/v1/physical-plan/status"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        after["plans"], status["plans"],
+        "rejected artifact changed active generation"
+    );
 
     let metrics = client
         .get(format!("{backend}/metrics"))
@@ -884,7 +983,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         .await
         .expect("metrics body");
     assert!(metrics.contains("asap_remote_write_requests_total 4"));
-    assert!(metrics.contains("asap_remote_write_samples_total 32"));
-    assert!(metrics.contains("asap_remote_write_duplicates_total 29"));
+    assert!(metrics.contains("asap_remote_write_samples_total 36"));
+    assert!(metrics.contains("asap_remote_write_duplicates_total 33"));
     assert!(metrics.contains("asap_remote_write_rejected_requests_total 1"));
 }
