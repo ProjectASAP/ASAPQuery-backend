@@ -42,7 +42,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "c3410d14865497758d212e4265ad25c782187de1";
+pub const PLANNER_REVISION: &str = "abb2f20e27091ac0c60715dc42b9b59c75b3447c";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
@@ -126,6 +126,8 @@ pub struct LifecyclePlanningInput {
 
 #[derive(Debug, Clone, Default)]
 pub struct PlanningRequest {
+    /// Original dashboard demand, in the same order as queries. None is legacy input.
+    pub query_workload: Option<QueryWorkload>,
     pub queries: Vec<PlanningQuery>,
     pub evidence: HashMap<String, TopKMembershipEvidence>,
     pub planner_revision: String,
@@ -180,6 +182,9 @@ pub struct BackendLocalPlanningSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct BackendLocalImplementation {
+    /// Provider-priced concrete pane choices keyed by the registered PromQL text.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub window_candidates: HashMap<String, Vec<WindowImplementationCandidate>>,
     pub lifecycle_costs: LifecycleCostEvidence,
     pub evidence_observed_at_unix_ms: u64,
     pub evidence_valid_for_ms: u64,
@@ -1584,6 +1589,13 @@ impl BackendLocalPlanningSnapshot {
                 "QueryWorkload must contain at least one query".into(),
             ));
         }
+        for query in self.implementation.window_candidates.keys() {
+            if !entries.iter().any(|entry| &entry.query.0 == query) {
+                return Err(CompileError::Snapshot(format!(
+                    "window candidates reference unregistered query `{query}`"
+                )));
+            }
+        }
         let mut queries = Vec::with_capacity(entries.len());
         let mut canonical_roots = Vec::with_capacity(entries.len());
         let mut topk_evidence_by_id = HashMap::new();
@@ -1645,7 +1657,7 @@ impl BackendLocalPlanningSnapshot {
             }
             queries.push(PlanningQuery {
                 query_id,
-                query_string,
+                query_string: query_string.clone(),
                 post_asap,
                 source: Source::TimeSeries {
                     metric: metadata.metric_name,
@@ -1654,20 +1666,28 @@ impl BackendLocalPlanningSnapshot {
                 group_by: metadata.group_by_labels,
                 accuracy,
                 lifecycle,
-                window_implementations: vec![WindowImplementationCandidate {
-                    implementation_id: self.implementation.window_implementation_id.clone(),
-                    framework: SummaryWindowFramework::Tumbling,
-                    window_secs: lookback_ms / 1_000,
-                    pane_secs: lookback_ms / 1_000,
-                    state_layout: self.implementation.state_layout.clone(),
-                    cost,
-                }],
+                window_implementations: self
+                    .implementation
+                    .window_candidates
+                    .get(&query_string)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        vec![WindowImplementationCandidate {
+                            implementation_id: self.implementation.window_implementation_id.clone(),
+                            framework: SummaryWindowFramework::Tumbling,
+                            window_secs: lookback_ms / 1_000,
+                            pane_secs: lookback_ms / 1_000,
+                            state_layout: self.implementation.state_layout.clone(),
+                            cost,
+                        }]
+                    }),
                 runtime_policy: RuntimeRulePolicy::default(),
             });
         }
         select_workload_roots(&mut queries, canonical_roots, &topk_evidence_by_id)?;
         Ok((
             PlanningRequest {
+                query_workload: Some(workload),
                 queries,
                 evidence: topk_evidence_by_id,
                 planner_revision: PLANNER_REVISION.into(),
@@ -1696,6 +1716,18 @@ impl PhysicalCompiler {
                 query_id: "deployment-target".into(),
                 reason: "backend-local target cannot declare Collector producers".into(),
             });
+        }
+
+        if let Some(workload) = &request.query_workload {
+            let entries = workload.entries().collect::<Vec<_>>();
+            if entries.len() != request.queries.len()
+                || entries
+                    .iter()
+                    .zip(&request.queries)
+                    .any(|(entry, query)| entry.query.0 != query.query_string)
+            {
+                return Err(CompileError::Snapshot("original workload and planning queries must have identical order and query text".into()));
+            }
         }
 
         let roots = request
@@ -1754,10 +1786,12 @@ impl PhysicalCompiler {
                     SummaryMaintenanceCapabilities {
                         incremental_update: true,
                         merge: true,
-                        delete: false,
+                        // Expired whole panes are excluded when reading a moving scope.
+                        delete: environment.target
+                            == PhysicalDeploymentTarget::BackendLocalRemoteWrite,
                     },
                 )
-                .with_window_framework_costs(window_costs);
+                .with_window_implementation_costs(window_costs);
             if environment.target == PhysicalDeploymentTarget::DistributedCollectors
                 && selected.iter().any(|state| {
                     matches!(
@@ -1797,7 +1831,7 @@ impl PhysicalCompiler {
                     }
                     _ => selected.algorithm.clone(),
                 };
-                let aggregation = physical_aggregation(
+                let mut aggregation = physical_aggregation(
                     query,
                     &selected,
                     aggregation_id.clone(),
@@ -1816,14 +1850,26 @@ impl PhysicalCompiler {
                     &model,
                     &environment,
                     &state_consumers,
+                    request.query_workload.as_ref().map(|workload| {
+                        (
+                            workload,
+                            consumers[&materialization].iter().copied().collect(),
+                        )
+                    }),
                 )?;
                 let window_implementation = query.window_implementations.iter()
-                    .filter(|candidate| candidate.framework == planner_selection.window_framework)
-                    .min_by(|left, right| left.cost.weighted_cost.total_cmp(&right.cost.weighted_cost))
+                    .find(|candidate| candidate.implementation_id == planner_selection.window_implementation_id
+                        && candidate.framework == planner_selection.window_framework)
                     .ok_or_else(|| CompileError::Lifecycle {
                         query_id: query.query_id.clone(),
                         reason: "Planner selected a window framework without a retained concrete implementation".into(),
                     })?;
+                // The logical consumer group is identified above. The installed state
+                // identity includes the actual pane width selected by Planner.
+                aggregation.window_secs = window_implementation.pane_secs;
+                let materialization =
+                    backend_plan::aggregation_config_for_materialization(&aggregation)?
+                        .policy_fingerprint();
                 lifecycle_estimates
                     .entry(materialization)
                     .or_insert_with(|| MaterializationLifecycleEstimate {
@@ -1873,7 +1919,7 @@ impl PhysicalCompiler {
                     algorithm: physical_algorithm,
                     parameters: selected.parameters,
                     group_by: query.group_by.clone(),
-                    window_secs: query.window_secs,
+                    window_secs: window_implementation.pane_secs,
                     abstract_window_framework: planner_selection.window_framework.clone(),
                     window_implementation_id: window_implementation.implementation_id.clone(),
                     pane_secs: window_implementation.pane_secs,
@@ -2037,7 +2083,9 @@ impl PhysicalCompiler {
                             ))
                         })?;
                     if materialization.family != physical_materialization_family(node_family)
-                        || materialization.window.size_ms != query.window_secs.saturating_mul(1_000)
+                        || materialization.window.size_ms == 0
+                        || query.window_secs.saturating_mul(1_000) % materialization.window.size_ms
+                            != 0
                         || materialization.group_by != query.group_by
                     {
                         return Err(crate::query_plan::QueryPlanError::Invalid(format!(
@@ -2050,7 +2098,7 @@ impl PhysicalCompiler {
                         metric: planned_metric,
                         sid_grouping: query.group_by.clone(),
                         output_grouping: PhysicalGrouping::Reduce(query.group_by.clone()),
-                        window_ms: query.window_secs.saturating_mul(1_000),
+                        window_ms: materialization.window.size_ms,
                     })
                 },
             )?;
@@ -2280,9 +2328,9 @@ fn validate_lifecycle_input(
 fn validate_window_implementations(
     query: &PlanningQuery,
     environment: &DeploymentEnvironment,
-) -> Result<Vec<(SummaryWindowFramework, Cost)>, CompileError> {
+) -> Result<Vec<(String, SummaryWindowFramework, Cost)>, CompileError> {
     let mut ids = BTreeSet::new();
-    let mut cheapest = BTreeMap::<SummaryWindowFramework, f64>::new();
+    let mut candidates = Vec::new();
     for candidate in &query.window_implementations {
         let evidence = &candidate.cost;
         let age = environment
@@ -2306,11 +2354,15 @@ fn validate_window_implementations(
             && candidate.pane_secs != 0
             && candidate.pane_secs <= candidate.window_secs
             && candidate.window_secs % candidate.pane_secs == 0
-            // Current Collector runtime contract is the MVP's anchored,
-            // tumbling implementation. Other Planner primitives become
-            // candidates only when an executor advertises full semantics.
             && candidate.framework == SummaryWindowFramework::Tumbling
-            && candidate.pane_secs == candidate.window_secs;
+            && match environment.target {
+                PhysicalDeploymentTarget::DistributedCollectors => {
+                    candidate.pane_secs == candidate.window_secs
+                }
+                // Cadence does not establish phase alignment. Serving checks each
+                // actual interval and falls back when whole panes cannot cover it.
+                PhysicalDeploymentTarget::BackendLocalRemoteWrite => true,
+            };
         if !valid {
             return Err(CompileError::Lifecycle {
                 query_id: query.query_id.clone(),
@@ -2320,24 +2372,23 @@ fn validate_window_implementations(
                 ),
             });
         }
-        cheapest
-            .entry(candidate.framework.clone())
-            .and_modify(|cost| *cost = cost.min(evidence.weighted_cost))
-            .or_insert(evidence.weighted_cost);
+        candidates.push((
+            candidate.implementation_id.clone(),
+            candidate.framework.clone(),
+            Cost(evidence.weighted_cost),
+        ));
     }
-    if cheapest.is_empty() {
+    if candidates.is_empty() {
         return Err(CompileError::Lifecycle {
             query_id: query.query_id.clone(),
             reason: "no complete executor-feasible window implementation evidence".into(),
         });
     }
-    Ok(cheapest
-        .into_iter()
-        .map(|(framework, cost)| (framework, Cost(cost)))
-        .collect())
+    Ok(candidates)
 }
 
 struct PlannerPhysicalSelection {
+    window_implementation_id: String,
     lifecycle: CollectorLifecycle,
     window_framework: SummaryWindowFramework,
     expected_reads: f64,
@@ -2351,6 +2402,7 @@ fn select_lifecycle(
     model: &ControlPlaneCostModel,
     environment: &DeploymentEnvironment,
     consumers: &[&PlanningQuery],
+    original_workload: Option<(&QueryWorkload, Vec<usize>)>,
 ) -> Result<PlannerPhysicalSelection, CompileError> {
     // Current lifecycle evidence is per producer with one unit read cost.
     // Conflicting source/rate/horizon/cost snapshots cannot be averaged into
@@ -2404,9 +2456,11 @@ fn select_lifecycle(
             ..DataWorkload::default()
         }),
     };
+    let (workload, indices) =
+        original_workload.unwrap_or((&workload, (0..consumers.len()).collect()));
     let plan = plan_summary_maintenance_lifecycles(
         Rc::new(node.clone()),
-        WorkloadDemand::new(&workload, &(0..consumers.len()).collect::<Vec<_>>()),
+        WorkloadDemand::new(workload, &indices),
         environment.observed_at_unix_ms,
         Some(Horizon(query.lifecycle.horizon_seconds)),
         SummaryMaintenanceLifecycleCapabilities {
@@ -2438,6 +2492,12 @@ fn select_lifecycle(
             reason: "latest ASAPPlanner selected no window framework from the supplied physical evidence".into(),
         })?;
     Ok(PlannerPhysicalSelection {
+        window_implementation_id: plan.selected_physical_plan_id.clone().ok_or_else(|| {
+            CompileError::Lifecycle {
+                query_id: query.query_id.clone(),
+                reason: "Planner returned no concrete window implementation identity".into(),
+            }
+        })?,
         expected_reads: plan.expected_reads.ok_or_else(|| CompileError::Lifecycle {
             query_id: query.query_id.clone(),
             reason: "missing joint read demand".into(),
@@ -2810,6 +2870,7 @@ mod tests {
             evidence_by_query.insert(query_id.to_string(), evidence);
         }
         Ok(PlanningRequest {
+            query_workload: None,
             queries: vec![PlanningQuery {
                 query_id: query_id.into(),
                 query_string: promql.into(),
@@ -3342,6 +3403,7 @@ mod tests {
             query_workload,
             data_workload,
             implementation: BackendLocalImplementation {
+                window_candidates: HashMap::new(),
                 lifecycle_costs: template.lifecycle.costs,
                 evidence_observed_at_unix_ms: 9_500,
                 evidence_valid_for_ms: 60_000,
@@ -3353,6 +3415,16 @@ mod tests {
             },
             environment,
         };
+        assert_eq!(
+            snapshot
+                .clone()
+                .planning_request()
+                .unwrap()
+                .0
+                .query_workload
+                .as_ref(),
+            Some(&snapshot.query_workload)
+        );
         let first = snapshot
             .clone()
             .compile()
@@ -3578,6 +3650,53 @@ mod tests {
             plan.validate_against_backend(&bundle.backend_plan),
             Err(PrecomputePlanError::InvalidSchema { .. })
         ));
+    }
+
+    // Concrete candidates with the same framework survive selection; changing
+    // their quoted costs changes installed state, not the query's lookback.
+    #[test]
+    fn tumbling_sizes_are_selected_by_cost_and_installed() {
+        for (small_cost, expected_secs, expected_id) in [(0.1, 10, "small"), (10.0, 60, "large")] {
+            let mut request = request("q", "sum_over_time(m[1m])");
+            let query = &mut request.queries[0];
+            let mut small = query.window_implementations[0].clone();
+            small.implementation_id = "small".into();
+            small.pane_secs = 10;
+            small.cost.weighted_cost = small_cost;
+            query.window_implementations[0].implementation_id = "large".into();
+            query.window_implementations.push(small);
+            let mut env = environment(10_000);
+            env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+            env.collector_ids.clear();
+            let bundle = PhysicalCompiler.compile(request, env).unwrap();
+            let materialization = bundle
+                .backend_plan
+                .materializations
+                .values()
+                .next()
+                .unwrap();
+            assert_eq!(materialization.window.size_ms, expected_secs * 1000);
+            let entry = bundle.query_plan.lookup("sum_over_time(m[1m])").unwrap();
+            assert_eq!(entry.instant.lookback_ms, 60_000);
+            assert_eq!(
+                entry.materialization_bindings()[0].window_ms,
+                expected_secs * 1000
+            );
+            assert_eq!(
+                bundle.lifecycle_estimates[0].window_implementation_id,
+                expected_id
+            );
+        }
+    }
+
+    // Non-divisor panes cannot reconstruct a lookback from whole states.
+    #[test]
+    fn tumbling_sizes_reject_non_divisors() {
+        let mut request = request("q", "sum_over_time(m[1m])");
+        request.queries[0].window_implementations[0].pane_secs = 7;
+        let mut env = environment(10_000);
+        env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        assert!(PhysicalCompiler.compile(request, env).is_err());
     }
 
     #[test]

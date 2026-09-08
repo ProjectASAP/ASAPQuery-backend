@@ -491,8 +491,7 @@ mod tests {
         assert_eq!(only(v), 7.0);
     }
 
-    /// Legacy candidate lookup cannot discard keyed items or constant weights
-    /// when adapting the planner's typed update contract.
+    /// Expressions outside the supported column/unit-weight contract fail before lookup.
     #[test]
     fn unsupported_update_semantics_fail_before_candidate_lookup() {
         use planner_types::post_asap::{SummaryInputExpr, SummaryUpdate};
@@ -500,12 +499,12 @@ mod tests {
         exec.register(7.0);
         for input in [
             SummaryUpdate {
-                item: Some(SummaryInputExpr::Column(ColumnRef::Named("key".into()))),
+                item: Some(SummaryInputExpr::Constant(2.0)),
                 weight: SummaryInputExpr::Column(ColumnRef::SampleValue),
             },
             SummaryUpdate {
                 item: None,
-                weight: SummaryInputExpr::Constant(1.0),
+                weight: SummaryInputExpr::Constant(2.0),
             },
         ] {
             let mut tree = agg_node(sum(), logical_node());
@@ -516,9 +515,7 @@ mod tests {
             *update = input;
             assert!(matches!(
                 execute(&tree, &exec),
-                Err(ExecError::NotYetSupported(
-                    "keyed or non-column summary update"
-                ))
+                Err(ExecError::NotYetSupported("summary update expression"))
             ));
         }
     }
