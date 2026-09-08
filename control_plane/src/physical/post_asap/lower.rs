@@ -87,6 +87,18 @@ fn bind_recursive(
     cost_model: &dyn CostModel,
 ) -> Result<PostAsapPlan, BindingError> {
     match expr {
+        // These roots describe exact query semantics, not summary candidate
+        // sites. Preserve the complete expression so archive execution retains
+        // selector labels, ordering, and comparison filtering.
+        QueryExpr::Scan { .. }
+        | QueryExpr::Sort { .. }
+        | QueryExpr::Filter { .. }
+        | QueryExpr::BinaryOp {
+            op: planner_types::pre_asap::BinaryOpKind::Compare(_),
+            ..
+        } => Ok(PostAsapPlan::Summary(
+            crate::planner_selection::keep_pre_asap(expr)?,
+        )),
         // `QueryExpr::LetBinding`/`::Ref` don't exist in the canonical IR
         // anymore (ASAPPlanner#181/#192 -- see
         // control_plane/docs/design-asapplanner-pin-migration.md), so

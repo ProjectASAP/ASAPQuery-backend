@@ -386,7 +386,7 @@ fn query_expr_contains_time_range(qe: &planner_types::pre_asap::QueryExpr) -> bo
         | QueryExpr::PromqlSubquery { child, .. }
         | QueryExpr::TimeShift { child, .. }
         | QueryExpr::SQLWindowFunc { child, .. } => query_expr_contains_time_range(child),
-        QueryExpr::Concat { children } => children.iter().any(query_expr_contains_time_range),
+        QueryExpr::Concat { children, .. } => children.iter().any(query_expr_contains_time_range),
         QueryExpr::Join { left, right, .. }
         | QueryExpr::SetOp { left, right, .. }
         | QueryExpr::BinaryOp {
@@ -415,7 +415,7 @@ fn query_expr_contains_rate(qe: &planner_types::pre_asap::QueryExpr) -> bool {
         | QueryExpr::TimeRange { child, .. }
         | QueryExpr::TimeShift { child, .. }
         | QueryExpr::SQLWindowFunc { child, .. } => query_expr_contains_rate(child),
-        QueryExpr::Concat { children } => children.iter().any(query_expr_contains_rate),
+        QueryExpr::Concat { children, .. } => children.iter().any(query_expr_contains_rate),
         QueryExpr::Join { left, right, .. }
         | QueryExpr::SetOp { left, right, .. }
         | QueryExpr::BinaryOp {
@@ -441,7 +441,7 @@ fn query_expr_has_filter(qe: &planner_types::pre_asap::QueryExpr) -> bool {
         | QueryExpr::TimeRange { child, .. }
         | QueryExpr::TimeShift { child, .. }
         | QueryExpr::SQLWindowFunc { child, .. } => query_expr_has_filter(child),
-        QueryExpr::Concat { children } => children.iter().any(query_expr_has_filter),
+        QueryExpr::Concat { children, .. } => children.iter().any(query_expr_has_filter),
         QueryExpr::Join { left, right, .. }
         | QueryExpr::SetOp { left, right, .. }
         | QueryExpr::BinaryOp {
@@ -472,7 +472,7 @@ fn query_expr_max_time_range_ms(qe: &planner_types::pre_asap::QueryExpr) -> Opti
         | QueryExpr::Limit { child, .. }
         | QueryExpr::TimeShift { child, .. }
         | QueryExpr::SQLWindowFunc { child, .. } => child_max(child),
-        QueryExpr::Concat { children } => children
+        QueryExpr::Concat { children, .. } => children
             .iter()
             .filter_map(query_expr_max_time_range_ms)
             .max(),

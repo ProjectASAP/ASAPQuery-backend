@@ -134,7 +134,7 @@ fn collect_aggregate_roots<'a>(expr: &'a QueryExpr, out: &mut Vec<&'a QueryExpr>
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. }
         | QueryExpr::PromqlSubquery { child, .. } => collect_aggregate_roots(child, out),
-        QueryExpr::Concat { children } => {
+        QueryExpr::Concat { children, .. } => {
             for c in children {
                 collect_aggregate_roots(c, out);
             }

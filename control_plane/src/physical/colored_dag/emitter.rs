@@ -115,7 +115,8 @@ fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
             SummaryExpr::SummaryMerge { .. } => NodeKind::SketchMerge,
             SummaryExpr::SummaryJoin { .. }
             | SummaryExpr::SummarySubtract { .. }
-            | SummaryExpr::SummaryDelete { .. } => NodeKind::Other,
+            | SummaryExpr::SummaryDelete { .. }
+            | SummaryExpr::BinaryOp { .. } => NodeKind::Other,
         },
         PhysicalExpr::Committed(PostAsapPlan::LetBinding { name, .. }) => {
             NodeKind::LetBinding { name }
@@ -1125,7 +1126,7 @@ fn extract_edge_facts(qe: &planner_types::pre_asap::QueryExpr, edge: &mut EdgeSt
         | QE::Sort { child, .. }
         | QE::Limit { child, .. }
         | QE::PromqlSubquery { child, .. } => extract_edge_facts(child, edge),
-        QE::Concat { children } => {
+        QE::Concat { children, .. } => {
             for c in children {
                 extract_edge_facts(c, edge);
             }

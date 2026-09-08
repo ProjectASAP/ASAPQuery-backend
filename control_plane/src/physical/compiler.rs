@@ -1975,7 +1975,12 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 inner: right,
                 ..
             }
-            | SummaryExpr::SummarySubtract { left, right } => {
+            | SummaryExpr::SummarySubtract { left, right }
+            | SummaryExpr::BinaryOp {
+                lhs: left,
+                rhs: right,
+                ..
+            } => {
                 walk(left, metrics);
                 walk(right, metrics);
             }
@@ -2338,6 +2343,7 @@ fn collect_selected_materializations(
                 });
             }
             SummaryExpr::KeepPreAsap(_)
+            | SummaryExpr::BinaryOp { .. }
             | SummaryExpr::SummaryAgg { .. }
             | SummaryExpr::SummaryJoin { .. }
             | SummaryExpr::SummarySubtract { .. }

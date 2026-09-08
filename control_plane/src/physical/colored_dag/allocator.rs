@@ -177,6 +177,13 @@ impl ThreeStageWalker {
             // (scrape locality); `Ref` resolves through the lexical
             // scope map.
             SummaryExpr::KeepPreAsap(qe) => self.colour_logical(qe)?,
+            SummaryExpr::BinaryOp { lhs, rhs, .. } => {
+                let (left, _) = self.visit_l4node(lhs)?;
+                let (right, _) = self.visit_l4node(rhs)?;
+                self.dag.edges.push((id, left));
+                self.dag.edges.push((id, right));
+                StageId::Backend
+            }
 
             // ── SummaryAgg: always edge per design.md §6 batched-queries
             // table — true for both approximate sketches (the old
