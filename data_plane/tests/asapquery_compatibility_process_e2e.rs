@@ -760,10 +760,10 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         "true"
     );
 
-    // PR-derived negative half of the executable matrix. These queries are
-    // accepted by ASAPQuery, but their warm plans are tracked by the linked
-    // backend/Planner issues. Until those land, the production binary must
-    // fall back atomically rather than partially evaluating a warm subtree.
+    // These complete expressions are NOT registered in this snapshot.
+    // This tests routing fallback, not absence of operator support: registered
+    // exact arithmetic is covered by shared_exact_dashboard_executes_selected_workload.
+    // Never partially warm an unregistered expression using a registered child.
     let fallback_matrix = [
         // ASAPQuery #700; backend #503.
         "avg_over_time(asap_demo_gauge[5s])",
@@ -792,7 +792,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
             .unwrap_or_else(|error| panic!("fallback JSON failed for {query}: {error}"));
         assert_eq!(
             response["data"]["result"][0]["metric"]["fallback"], "true",
-            "unsupported matrix row must fall back atomically: {query}: {response}"
+            "unregistered matrix row must fall back atomically: {query}: {response}"
         );
     }
 
