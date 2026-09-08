@@ -294,12 +294,15 @@ preparation enumerates bindable alternatives without requiring the default
 warm alternative to compile, so missing warm implementations do not hide an
 available exact quote. Publication still requires a selected, validated plan.
 
-#511 retains evidence-aware legacy binding and now preserves count update
-semantics in emitted heap configuration. Its old sketch-envelope TopK serving
-tests remain a separate acceptance gap: the fixture installs StreamingConfig,
-not an active physical QueryPlan, and requests unregistered instantaneous TopK.
-Do not treat binding success or the canonical temporal TopK process test as
-proof that this legacy serving path has migrated.
+#511 retains evidence-aware legacy binding and preserves count update semantics
+in emitted heap configuration. Its two heap TopK acceptance tests now use
+registered `topk(3, count_over_time(top_endpoint_qps[5s]))`, a compiled physical
+QueryPlan, and the production backend-local Remote Write path. Both CMS-with-heap
+and CountSketch-with-heap return gamma=200, zeta=150 and alpha=100 over two
+windows, with exact item identities, timestamps and retry deduplication checked.
+Unregistered instantaneous TopK still follows the explicit exact fallback.
+This replaces the two obsolete no-QueryPlan tests; it does not restore that
+serving contract or claim migration of other legacy OTLP fixtures.
 
 The [architecture PR #512](https://github.com/ProjectASAP/ASAPQuery-backend/pull/512)
 tracks the design and this delivery plan. Implementation PRs should report the
