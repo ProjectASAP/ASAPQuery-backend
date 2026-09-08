@@ -42,7 +42,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "378a7547ede629a64e84c9f7c810226ce196cce9";
+pub const PLANNER_REVISION: &str = "c3410d14865497758d212e4265ad25c782187de1";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
@@ -169,6 +169,8 @@ pub enum PhysicalDeploymentTarget {
 #[serde(deny_unknown_fields)]
 pub struct BackendLocalPlanningSnapshot {
     pub snapshot_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_cost_evidence: Option<super::workload_cost::WorkloadCostEvidence>,
     pub query_workload: QueryWorkload,
     pub data_workload: DataWorkload,
     pub implementation: BackendLocalImplementation,
@@ -620,6 +622,7 @@ pub struct PhysicalPlan {
     pub query_plan: QueryPlan,
     /// Lifecycle component only, not a complete physical-plan comparison.
     pub lifecycle_estimates: Vec<MaterializationLifecycleEstimate>,
+    pub cost_comparison: Option<super::workload_cost::WorkloadCostComparison>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1514,7 +1517,28 @@ impl BackendLocalPlanningSnapshot {
     /// one backend-local PhysicalPlan. No CollectorPlan is produced and no
     /// precompiled serving artifact is accepted at this boundary.
     pub fn compile(self) -> Result<PhysicalPlan, CompileError> {
-        if self.snapshot_version != 1 {
+        let evidence = self.workload_cost_evidence.clone();
+        if self.snapshot_version == 2 && evidence.is_none() {
+            return Err(CompileError::Snapshot(
+                "version 2 requires complete workload cost evidence".into(),
+            ));
+        }
+        let (request, environment) = self.planning_request()?;
+        match evidence {
+            Some(evidence) => super::workload_cost::select(
+                super::workload_cost::with_exact_alternative(request)?,
+                environment,
+                &evidence,
+            ),
+            None => PhysicalCompiler.compile(request, environment),
+        }
+    }
+
+    /// Build Planner-authorized candidates for evidence collection without publishing.
+    pub fn planning_request(
+        self,
+    ) -> Result<(PlanningRequest, DeploymentEnvironment), CompileError> {
+        if self.snapshot_version != 1 && self.snapshot_version != 2 {
             return Err(CompileError::Snapshot(format!(
                 "unsupported workload snapshot version {}",
                 self.snapshot_version
@@ -1633,14 +1657,14 @@ impl BackendLocalPlanningSnapshot {
             });
         }
         select_workload_roots(&mut queries, canonical_roots, &HashMap::new())?;
-        PhysicalCompiler.compile(
+        Ok((
             PlanningRequest {
                 queries,
                 evidence: HashMap::new(),
                 planner_revision: PLANNER_REVISION.into(),
             },
             self.environment,
-        )
+        ))
     }
 }
 
@@ -1693,6 +1717,17 @@ impl PhysicalCompiler {
             if let Some(e) = evidence {
                 validate_evidence(&query.query_id, e, &environment)?;
             }
+            let node = query.post_asap.clone();
+            let selected =
+                collect_selected_materializations(&node).map_err(|reason| CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason,
+                })?;
+            // An exact native fallback has no maintained state and must not
+            // depend on evidence for unused window/state implementations.
+            if selected.is_empty() {
+                continue;
+            }
             validate_lifecycle_input(&query.query_id, &query.lifecycle)?;
             let lifecycle_costs = SummaryMaintenanceLifecycleCostInputs {
                 build_cost: Some(Cost(query.lifecycle.costs.build)),
@@ -1714,12 +1749,6 @@ impl PhysicalCompiler {
                     },
                 )
                 .with_window_framework_costs(window_costs);
-            let node = query.post_asap.clone();
-            let selected =
-                collect_selected_materializations(&node).map_err(|reason| CompileError::Query {
-                    query_id: query.query_id.clone(),
-                    reason,
-                })?;
             if environment.target == PhysicalDeploymentTarget::DistributedCollectors
                 && selected.iter().any(|state| {
                     matches!(
@@ -1736,9 +1765,6 @@ impl PhysicalCompiler {
                     reason: "observation-count readout requires the backend-local raw producer"
                         .into(),
                 });
-            }
-            if selected.is_empty() {
-                continue;
             }
             match &query.source {
                 Source::TimeSeries { .. } => {}
@@ -2040,6 +2066,7 @@ impl PhysicalCompiler {
             backend_plan,
             query_plan,
             lifecycle_estimates: lifecycle_estimates.into_values().collect(),
+            cost_comparison: None,
         })
     }
 }
@@ -3255,6 +3282,7 @@ mod tests {
             .remove(0);
         let snapshot = BackendLocalPlanningSnapshot {
             snapshot_version: 1,
+            workload_cost_evidence: None,
             query_workload,
             data_workload,
             implementation: BackendLocalImplementation {

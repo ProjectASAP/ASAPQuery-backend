@@ -338,6 +338,60 @@ async fn respond_next_collector_plan(
     (plan, socket)
 }
 
+async fn quote_workload(
+    client: &reqwest::Client,
+    control_base: &str,
+    request: &mut serde_json::Value,
+) {
+    request
+        .as_object_mut()
+        .unwrap()
+        .remove("workload_cost_evidence");
+    let manifests: Vec<control_plane::physical::workload_cost::WorkloadCostManifest> = client
+        .post(format!(
+            "{control_base}/api/v1/physical-plan/cost-manifests"
+        ))
+        .json(&request)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(manifests.len(), 2);
+    let quotes = manifests
+        .into_iter()
+        .enumerate()
+        .map(|(index, manifest)| {
+            let unit_costs = manifest
+                .components
+                .keys()
+                .map(|key| (key.clone(), 1.0))
+                .collect();
+            control_plane::physical::workload_cost::WorkloadQuote {
+                manifest,
+                executable: index == 0,
+                unit_costs,
+            }
+        })
+        .collect();
+    request["workload_cost_evidence"] = serde_json::to_value(
+        control_plane::physical::workload_cost::WorkloadCostEvidence {
+            data_snapshot_id: "whole-process-fixture-v1".into(),
+            model_version: "test-only-unit-costs".into(),
+            observed_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            valid_for_ms: 60000,
+            quotes,
+        },
+    )
+    .unwrap();
+}
+
 #[tokio::test]
 async fn production_control_plane_to_data_plane_otlp_to_promql() {
     let control_binary = std::env::var("ASAP_E2E_CONTROL_PLANE_BIN")
@@ -468,6 +522,10 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
     second["query_id"] = "whole-process-e2e-median".into();
     second["query_string"] = "quantile_over_time(0.5, whole_process_e2e_latency_ms[1s])".into();
     request["queries"].as_array_mut().unwrap().push(second);
+    // Obtain actual compiler requirements without publishing, then provide
+    // deterministic test-only quotes. The native fallback is unavailable in
+    // this deployment; a cost number alone must not make it executable.
+    quote_workload(&client, &control_base, &mut request).await;
     let publication_response = client
         .post(format!(
             "{control_base}/api/v1/physical-plan/compile-and-publish"
@@ -487,6 +545,14 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
     );
     let publication: serde_json::Value =
         serde_json::from_str(&publication_body).expect("decode publication response");
+    assert_eq!(
+        publication["cost_comparison"]["alternatives"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(publication["cost_comparison"]["alternatives"][1]["unavailable_reason"].is_string());
     let (collector_plan, collector_socket) = collector.await.expect("collector task completed");
     assert_eq!(
         publication["plan_id"],
@@ -610,6 +676,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                 .as_millis() as u64
                 + 1000)
                 .into();
+            quote_workload(&client, &control_base, &mut request).await;
             let collector = tokio::spawn(respond_next_collector_plan(collector_socket, false));
             let failed = client
                 .post(format!(

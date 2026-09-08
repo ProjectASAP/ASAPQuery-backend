@@ -138,9 +138,46 @@ async fn shared_exact_dashboard_executes_selected_workload() {
             })
             .collect(),
     );
-    let typed: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+    let mut typed: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
         serde_json::from_value(snapshot.clone()).unwrap();
+    let (request, environment) = typed.clone().planning_request().unwrap();
+    let candidates =
+        control_plane::physical::workload_cost::with_exact_alternative(request).unwrap();
+    let quotes = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let plan = control_plane::physical::compiler::PhysicalCompiler
+                .compile(candidate.clone(), environment.clone())
+                .unwrap();
+            let manifest =
+                control_plane::physical::workload_cost::manifest(&plan, &candidate.queries)
+                    .unwrap();
+            let unit_costs = manifest
+                .components
+                .keys()
+                .map(|key| (key.clone(), if index == 0 { 1.0 } else { 1000.0 }))
+                .collect();
+            control_plane::physical::workload_cost::WorkloadQuote {
+                manifest,
+                executable: true,
+                unit_costs,
+            }
+        })
+        .collect();
+    typed.snapshot_version = 2;
+    typed.workload_cost_evidence = Some(
+        control_plane::physical::workload_cost::WorkloadCostEvidence {
+            data_snapshot_id: "process-fixture-v1".into(),
+            model_version: "test-only-unit-costs".into(),
+            observed_at_unix_ms: environment.observed_at_unix_ms,
+            valid_for_ms: environment.max_evidence_age_ms,
+            quotes,
+        },
+    );
+    snapshot = serde_json::to_value(&typed).unwrap();
     let plan = typed.compile().unwrap();
+    assert!(plan.cost_comparison.is_some());
     assert_eq!(plan.precompute_plan.materializations.len(), 1);
     assert_eq!(plan.query_plan.entries.len(), 3);
     let snapshot_path = output_dir.path().join("snapshot.json");
