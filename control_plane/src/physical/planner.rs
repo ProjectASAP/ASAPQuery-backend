@@ -351,7 +351,7 @@ fn plan_node(expr: &QueryExpr, config: &PhysicalPlannerConfig) -> PhysicalNode {
         // (`intent_algebra::lower`), so the `HashAggregate { keys }` this
         // arm used to build now comes straight out of the `Aggregate`
         // arm above.
-        QueryExpr::Concat { children } => {
+        QueryExpr::Concat { children, .. } => {
             let children: Vec<PhysicalNode> =
                 children.iter().map(|c| plan_node(c, config)).collect();
             let sketch_type = children
@@ -774,6 +774,7 @@ mod tests {
             having: None,
             child: QueryExpr::Concat {
                 children: vec![windowed_agg(default_frequency(), 60, "requests")],
+                discriminator_unique_key: None,
             }
             .into(),
         };

@@ -263,7 +263,10 @@ impl SketchAllocator {
             }
 
             // ── Merge — Backend ───────────────────────────────────────────
-            QueryExpr::Concat { children: inputs } => {
+            QueryExpr::Concat {
+                children: inputs,
+                discriminator_unique_key,
+            } => {
                 let children: Vec<PlanNode> = inputs
                     .into_iter()
                     .map(|inp| self.alloc_node(inp, budget))
@@ -272,6 +275,7 @@ impl SketchAllocator {
                 PlanNode {
                     expr: QueryExpr::Concat {
                         children: children.iter().map(|c| c.expr.clone()).collect(),
+                        discriminator_unique_key,
                     },
                     stage: PipelineStage::Backend,
                     mode: ExecutionMode::Passthrough,
@@ -952,6 +956,7 @@ mod tests {
     fn merge_goes_to_backend() {
         let expr = QueryExpr::Concat {
             children: vec![scan("a"), scan("b")],
+            discriminator_unique_key: None,
         };
         let node = alloc(unlimited(), expr);
         assert_eq!(node.stage, PipelineStage::Backend);

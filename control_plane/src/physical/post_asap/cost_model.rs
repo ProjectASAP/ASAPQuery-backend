@@ -252,6 +252,7 @@ impl CostModel for ControlPlaneCostModel {
             .min_by(|left, right| left.1 .0.total_cmp(&right.1 .0))
             .map(
                 |(framework, physical_cost)| CompleteSummaryCandidateEstimate {
+                    physical_plan_id: None,
                     cost: Cost(lifecycle_cost + physical_cost.0),
                     window_frameworks: vec![Some(framework.clone()); deployments.len()],
                     window_accuracy_guarantee: Some(
@@ -285,17 +286,15 @@ impl CostModel for ControlPlaneCostModel {
             }
             AggIntent::TopK { .. } => {
                 let preferred = self.topk_family_order(&intent_accuracy(intent));
-                let mut ranked = Vec::with_capacity(candidates.len());
-                for kind in preferred {
-                    if candidates.contains(&kind) && !ranked.contains(&kind) {
-                        ranked.push(kind);
-                    }
-                }
-                for kind in candidates {
-                    if !ranked.contains(kind) {
-                        ranked.push(kind.clone());
-                    }
-                }
+                // Distinct grouping implementations can use the same algorithm.
+                // Ranking must preserve the candidate multiset, not deduplicate it.
+                let mut ranked = candidates.to_vec();
+                ranked.sort_by_key(|kind| {
+                    preferred
+                        .iter()
+                        .position(|candidate| candidate == kind)
+                        .unwrap_or(preferred.len())
+                });
                 ranked
             }
             // Cardinality → Hll, Count → Cms: control_plane only ever
@@ -706,6 +705,26 @@ mod tests {
                 SketchAlgorithm::CmsWithHeap
             ]
         );
+    }
+
+    // Workload search can enumerate multiple layouts for the same algorithm.
+    #[test]
+    fn topk_ranking_preserves_duplicate_candidates() {
+        let model = ControlPlaneCostModel::new(AccuracyTarget::Exact);
+        let intent = AggIntent::TopK {
+            k: 1,
+            accuracy: eps(0.01),
+        };
+        let mut candidates = vec![
+            SketchAlgorithm::CmsWithHeap,
+            SketchAlgorithm::CountSketchWithHeap,
+            SketchAlgorithm::CmsWithHeap,
+            SketchAlgorithm::CountSketchWithHeap,
+        ];
+        let mut ranked = model.rank_candidates(&intent, &candidates);
+        candidates.sort();
+        ranked.sort();
+        assert_eq!(ranked, candidates);
     }
 
     #[test]
