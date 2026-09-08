@@ -3259,6 +3259,54 @@ aggregations:
     // sketch (`sketch_panes`) paths.
     // -----------------------------------------------------------------------
 
+    // This single-series updater cannot implement a grouped sum of counter increases.
+    // The physical compiler rejects raw counter producers until series state is preserved.
+    #[test]
+    fn pooled_counter_samples_lose_independent_same_timestamp_reset() {
+        use crate::precompute_engine::operators::IncreaseAccumulator;
+        let config = make_agg_config(
+            1,
+            "requests_total",
+            AggregationType::SingleSubpopulation,
+            "Increase",
+            10,
+            0,
+            vec![],
+        );
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker(
+            HashMap::from([(1, config)]),
+            sink.clone(),
+            false,
+            0,
+            LateDataPolicy::Drop,
+        );
+        worker
+            .process_group_samples(
+                1,
+                PolicyFingerprint(1),
+                "",
+                vec![
+                    ("requests_total{instance=\"a\"}".into(), 1000, 100.0),
+                    ("requests_total{instance=\"b\"}".into(), 1000, 50.0),
+                    ("requests_total{instance=\"a\"}".into(), 2000, 110.0),
+                    ("requests_total{instance=\"b\"}".into(), 2000, 5.0),
+                ],
+            )
+            .unwrap();
+        worker.force_close_all().unwrap();
+        let captured = sink.drain();
+        let accumulator = captured[0]
+            .1
+            .as_any()
+            .downcast_ref::<IncreaseAccumulator>()
+            .unwrap();
+        assert_eq!(accumulator.total_increase, 10.0);
+        let independent_increases = (110.0 - 100.0) + 5.0;
+        assert_eq!(independent_increases, 15.0);
+        assert_ne!(accumulator.total_increase, independent_increases);
+    }
+
     #[test]
     fn shutdown_force_close_emits_trailing_sample_window() {
         // 10s tumbling window; make_worker uses grace=0, isolating the
