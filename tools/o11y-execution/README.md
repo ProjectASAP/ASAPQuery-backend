@@ -1,8 +1,7 @@
 # Real-workload execution replay
 
-Developer acceptance tooling, stacked on #524 and the deployment/cost-selection
-foundation through #505. This is an executable harness, not a published benefit
-result. It invokes the **control-plane compiler**, which calls the pinned Planner,
+Developer acceptance tooling. A completed run does not establish a benefit.
+It invokes the **control-plane compiler**, which calls the pinned Planner,
 then boots the production data plane with that compiler's atomic install request.
 No family override, candidate index, or benchmark-selected winner is accepted.
 
@@ -25,8 +24,10 @@ No family override, candidate index, or benchmark-selected winner is accepted.
   configured for the input's timestamp range. This process is also the fallback
   service; do not point the runner at a production/shared instance.
 
-The harness does not provision Prometheus or calibrate the cost provider. These
-are required run inputs, not completed end-to-end acceptance evidence.
+The lower-level `replay.py` uses externally managed Prometheus processes.
+`run_comparison.py` provisions fresh baseline and fallback processes for each
+trial. See [CALIBRATION.md](CALIBRATION.md) for measured cost evidence; calibration
+enumerates candidates, while the replay compiler chooses the winner normally.
 
 ## Run
 
@@ -57,7 +58,13 @@ classification. Forwarded responses carry a backend-owned `x-asap-execution`
 header; an unmarked success is not counted as warm or fallback. `ingestion.json`
 records accepted batches; acceptance does not prove worker completion.
 
-The settle interval is recorded, not a completion barrier. The first traversal is
+`execution_provenance` distinguishes summary-only `asap`, `hybrid`, `local_raw`
+and `external_exact`, and records actual raw scans and summary readouts. Both
+hybrid and raw-only execution remain under `exact_fallback`; they are never
+reported as summary-only warm execution. A typed residual DAG can retain selected
+summary siblings, but a particular corpus may still produce no materializations.
+
+The runner waits for the finite-input completion barrier. The first traversal is
 called `first_pass`, not “cold cache”; later traversals are `repeat`. All failures
 and fallback responses remain in the denominator. A completion file means the
 replay finished, **not** that accuracy or benefit acceptance passed.
@@ -78,9 +85,10 @@ failures, first-pass/repeat latency distributions and sequential service rate.
 Duplicate series, failed responses, unsupported response types and warnings make
 a result uncomparable. Matching one dataset is not a formal confidence guarantee.
 
-The latency ratio is emitted only when **all** matched responses are exact-equal
-and successful. Approximate discrepancies are still reported, but no arbitrary
-error threshold is substituted for each query's accuracy contract. Fallbacks
+The latency ratio is emitted only when **all** matched responses pass the recorded
+comparison and succeed. Tolerances default to zero; explicit absolute/relative
+tolerances preserve strict equality and raw errors alongside the decision. These
+numeric tolerances do not establish a sketch's accuracy guarantee. Fallbacks
 remain in the totals. The ratio measures query service time only, never amortized
 end-to-end savings. Raw per-request timings allow other analyses without hiding
 the unsuccessful portion of the workload.
@@ -88,17 +96,64 @@ the unsuccessful portion of the workload.
 Linux process counters are captured around HTTP calls and at startup, ingestion
 and query boundaries. Backend calls also record exact-service CPU when available,
 so forwarded work is visible. Ingestion journal timings and phase snapshots expose
-the construction/update interval, including the declared settle delay. Counters
+the construction/update interval, including the finite-input drain. Counters
 include background work and have CPU-tick resolution. RSS/HWM are **whole-process**
 memory, not summary heap; HWM is process-lifetime peak, not isolated phase peak.
-`store.json` preserves the backend's raw state counters. Affinity/cgroup metadata
-is recorded but equal resource budgets are not enforced by this harness.
+`store.json` preserves the backend's raw state counters. `--cpu-affinity` applies
+one CPU set to the backend and supplied Prometheus processes/threads.
+`--address-space-bytes` applies the same RLIMIT_AS, which limits virtual address
+space, not RSS or combined process memory. These controls are optional and their
+presence is recorded; they do not establish a full cgroup resource budget.
 
-The provider's estimated costs are preserved next to measured quantities without
-pretending abstract model units are CPU nanoseconds. End-to-end benefit and
-estimated/measured cost ratios remain null until their units, lifecycle scope,
-exact-service startup/storage costs and resource budgets are matched. Separate
-fresh-process/cache-controlled trials, a retained-state measurement, calibration
-provenance and real-corpus execution evidence are still required before declaring
-the five #524 acceptance criteria complete. The shared fallback/baseline service
-can transfer cache warmth; alternating order does not eliminate this confound.
+Use `--fallback-url` and `--fallback-pid` for a separate fresh Prometheus instance,
+keeping `--exact-url`/`--exact-pid` for the baseline. Identical process IDs and
+storage paths are rejected. Both receive identical input batches. Backend CPU
+includes its fallback service CPU; baseline CPU remains separate. With no
+separate fallback service, the report preserves the shared-cache limitation.
+`--exact-storage` and `--fallback-storage` record logical file sizes separately;
+backend output file sizes include logs and are not retained summary heap sizes.
+
+`summarize.py` compares estimated and measured query CPU only after verifying the
+CPU model, data hash, selected manifest and priced query multiplicities. It
+excludes lifecycle components from that ratio. Full lifecycle benefit remains
+unavailable until matching setup, update, residency and retirement measurements
+exist. A shared fallback/baseline service can transfer cache warmth; alternating
+order does not eliminate this confound.
+
+## Fresh repeated trials
+
+```sh
+python3 tools/o11y-execution/run_comparison.py \
+  --prometheus /path/prometheus \
+  --metrics /path/metrics.txt --queries /path/queries.json \
+  --snapshot /path/o11y-costed-snapshot.json \
+  --compiler target/release/examples/compile_workload_artifact \
+  --data-plane target/release/data_plane \
+  --cpu-affinity 4,5 --trials 3 --repetitions 20 \
+  --output /path/new-trials
+python3 tools/o11y-execution/summarize.py /path/new-trials/trial-1/replay \
+  --output /path/new-trials/trial-1/summary.json
+```
+
+Each trial uses new empty TSDB directories and three distinct ports. The wrapper
+records commands and Prometheus startup/lifetime resources, then stops its own
+services. `backend-lifecycle.json` records backend lifetime CPU and peak RSS using
+per-PID `wait4`. Process exit is not a summary-retirement measurement. Fresh
+processes do not imply evicted OS caches, fixed memory quotas, or a concurrent
+throughput test. Every repetition preserves the original evaluation timestamps;
+this run does not simulate a live dashboard's advancing query windows.
+
+## Finite-input completion
+
+After all Remote Write batches are accepted, the runner calls
+`POST /api/v1/precompute/drain` and saves `drain.json`. The receiver seals input
+before worker barriers are queued. Each worker publishes its trailing panes,
+then acknowledges completion; prior processing or sink failures remain failures
+on repeated drains. Queries begin only after a successful completion response.
+Subsequent Remote Write requests return HTTP 409 for that process. Start a new
+backend process for another input generation.
+
+This endpoint is for a finite replay, not a live ingestion watermark. Closing a
+trailing pane does not by itself prove its coverage matches every query window;
+unsupported or incomplete readouts must still follow exact fallback. Typed raw
+residual plans prepare their raw index during drain so setup costs remain visible.

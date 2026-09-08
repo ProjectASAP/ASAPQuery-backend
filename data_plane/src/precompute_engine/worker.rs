@@ -407,18 +407,33 @@ impl Worker {
         }
         let state = self.group_states.get_mut(&sid).unwrap();
 
+        // Keep original timestamps inside accumulators (notably rate/increase),
+        // shifting only pane membership and closure watermark for PromQL (a,b].
+        let right_closed = state
+            .config
+            .parameters
+            .get("promql_right_closed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let pane_timestamp = |ts: i64| {
+            if right_closed {
+                ts.saturating_sub(1)
+            } else {
+                ts
+            }
+        };
         // Find the timestamp span in this batch. A first batch may contain
         // several windows (Prometheus commonly sends catch-up samples after
         // startup), so its minimum timestamp is also the initial closure
         // scan boundary.
         let batch_min_ts = samples
             .iter()
-            .map(|(_, ts, _)| *ts)
+            .map(|(_, ts, _)| pane_timestamp(*ts))
             .min()
             .unwrap_or(i64::MIN);
         let batch_max_ts = samples
             .iter()
-            .map(|(_, ts, _)| *ts)
+            .map(|(_, ts, _)| pane_timestamp(*ts))
             .max()
             .unwrap_or(i64::MIN);
         let previous_event_time = state.max_event_time_ms;
@@ -435,8 +450,9 @@ impl Worker {
         // Route each sample to its pane
         for (series_key, ts, val) in &samples {
             let too_late = previous_event_time != i64::MIN
-                && *ts < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
-            let pane_start = state.window_manager.pane_start_for(*ts);
+                && pane_timestamp(*ts)
+                    < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
+            let pane_start = state.window_manager.pane_start_for(pane_timestamp(*ts));
             let pane_end = pane_start + state.window_manager.slide_interval_ms();
             let pane_closed = !state.active_panes.contains_key(&pane_start)
                 && previous_closure_watermark >= pane_start + state.window_manager.window_size_ms();
@@ -3270,6 +3286,59 @@ aggregations:
     // store instead of being lost. Covers both the sample (`active_panes`) and
     // sketch (`sketch_panes`) paths.
     // -----------------------------------------------------------------------
+
+    // A pooled Sum is correct only for an explicit cross-entity reduction.
+    #[test]
+    fn pooled_sum_does_not_preserve_per_entity_output_rows() {
+        use crate::precompute_engine::operators::SumAccumulator;
+        let config = make_agg_config(
+            1,
+            "gauge",
+            AggregationType::SingleSubpopulation,
+            "Sum",
+            10,
+            0,
+            vec![],
+        );
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker(
+            HashMap::from([(1, config)]),
+            sink.clone(),
+            false,
+            0,
+            LateDataPolicy::Drop,
+        );
+        worker
+            .process_group_samples(
+                1,
+                PolicyFingerprint(1),
+                "",
+                vec![
+                    ("gauge{job=\"api\"}".into(), 1000, 10.0),
+                    ("gauge{job=\"api\"}".into(), 2000, 30.0),
+                    ("gauge{job=\"worker\"}".into(), 1000, 200.0),
+                ],
+            )
+            .unwrap();
+        worker.force_close_all().unwrap();
+        let captured = sink.drain();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(
+            captured[0]
+                .1
+                .as_any()
+                .downcast_ref::<SumAccumulator>()
+                .unwrap()
+                .sum,
+            240.0
+        );
+        // sum_over_time must instead emit api=40 and worker=200 separately.
+        assert_ne!(
+            captured.len(),
+            2,
+            "this producer does not retain entity rows"
+        );
+    }
 
     // This single-series updater cannot implement a grouped sum of counter increases.
     // The physical compiler rejects raw counter producers until series state is preserved.

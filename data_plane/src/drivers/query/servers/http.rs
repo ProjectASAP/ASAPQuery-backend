@@ -5754,7 +5754,6 @@ async fn handle_health(State(state): State<AppState>) -> axum::response::Respons
     (StatusCode::OK, "ok").into_response()
 }
 
-/// Return list of metrics currently in the store.
 /// Explicit end-of-input; this seals Remote Write for the lifetime of the process.
 async fn handle_precompute_drain(State(state): State<AppState>) -> Response {
     let Some(receiver) = state.remote_write.as_ref() else {
@@ -5778,6 +5777,7 @@ async fn handle_precompute_drain(State(state): State<AppState>) -> Response {
     }
 }
 
+/// Return list of metrics currently in the store.
 async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::Response {
     use axum::http::StatusCode;
     use axum::response::IntoResponse;

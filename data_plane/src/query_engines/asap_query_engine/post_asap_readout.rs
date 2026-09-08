@@ -110,6 +110,16 @@ pub fn execute_query_plan_instant(
     } else {
         now_ms.saturating_sub(entry.instant.lookback_ms)
     };
+    for binding in entry.materialization_bindings() {
+        if binding.window_ms == 0
+            || t0_ms % binding.window_ms != 0
+            || now_ms % binding.window_ms != 0
+        {
+            return Err(LoweringSkip::MaterializationNotReady(
+                "evaluation interval cuts a materialized pane".into(),
+            ));
+        }
+    }
     let outcome = execute_physical_query_plan(
         index,
         entry,
@@ -898,6 +908,102 @@ mod tests {
         // same semantics as `SummaryValue::coverage()`, reconfirmed for
         // `exact_coverage` by this module's A0 test in `summary_executor.rs`.
         assert_eq!(outcome.coverage, Some((2_000, 2_000)));
+    }
+
+    #[test]
+    fn repeated_multi_pane_reads_exclude_expired_state_and_reject_gaps() {
+        let idx = SketchStore::new();
+        let policy = asap_types::PolicyFingerprint(777);
+        idx.register(SketchInstanceMetadata {
+            sid: 7,
+            metric_name: "requests_total".into(),
+            group_by_keys: std::collections::BTreeSet::new(),
+            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Sum)),
+            agg_kind: AggKind::ExactAgg {
+                agg_type: asap_types::AggregationType::Sum,
+                parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: None,
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: policy,
+        });
+        // Old panes remain stored; each advancing query must select only its lookback.
+        for pane in 0..8 {
+            idx.append_precompute(
+                7,
+                BTreeMap::new(),
+                (pane * 10_000, (pane + 1) * 10_000),
+                Box::new(
+                    crate::precompute_engine::operators::SumAccumulator::with_sum(
+                        (pane + 1) as f64,
+                    ),
+                ),
+            );
+        }
+
+        let entry = control_plane::query_plan::QueryPlanEntry {
+            query_id: "q-rate".into(),
+            canonical_promql: "rate(requests_total[1m])".into(),
+            root: control_plane::query_plan::QueryNodeId(0),
+            nodes: BTreeMap::from([
+                (
+                    control_plane::query_plan::QueryNodeId(0),
+                    QueryPlanNode::ExactReadout {
+                        input: control_plane::query_plan::QueryNodeId(1),
+                        readout: control_plane::query_plan::ExactReadout::Sum,
+                    },
+                ),
+                (
+                    control_plane::query_plan::QueryNodeId(1),
+                    QueryPlanNode::ReadMaterialization {
+                        binding: control_plane::query_plan::MaterializationBinding {
+                            materialization: policy,
+                            metric: "requests_total".into(),
+                            sid_grouping: vec![],
+                            output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
+                            window_ms: 10_000,
+                            readout_lookback_ms: Some(60_000),
+                        },
+                    },
+                ),
+            ]),
+            instant: control_plane::query_plan::InstantExecution {
+                lookback_ms: 60_000,
+                full_history: false,
+                cumulative_readout: true,
+            },
+            fallback: control_plane::query_plan::FallbackPolicy::ExactBackend,
+        };
+        for (now, expected) in [(60_000, 21.0), (70_000, 27.0), (80_000, 33.0)] {
+            let (outcome, _) = execute_query_plan_instant(&idx, &entry, now).unwrap();
+            assert_eq!(outcome.series[0].1[0].1, expected);
+        }
+        assert!(
+            execute_query_plan_instant(&idx, &entry, 70_001).is_err(),
+            "partial pane must fall back"
+        );
+        assert!(
+            execute_query_plan_instant(&idx, &entry, 90_000).is_err(),
+            "open/missing trailing pane must fall back"
+        );
+        // Both endpoints exist, but the missing interior pane is not evidence of zero samples.
+        let gap_idx = SketchStore::new();
+        idx.with_instance(7, |meta| gap_idx.register(meta.clone()));
+        for pane in [0, 1, 3, 4, 5] {
+            gap_idx.append_precompute(
+                7,
+                BTreeMap::new(),
+                (pane * 10_000, (pane + 1) * 10_000),
+                Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(1.0)),
+            );
+        }
+        assert!(
+            execute_query_plan_instant(&gap_idx, &entry, 60_000).is_err(),
+            "interior gap must fall back"
+        );
     }
 
     #[test]
