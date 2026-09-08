@@ -20,6 +20,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SelectionError {
+    #[error("ASAPPlanner workload materialization failed: {0}")]
+    Workload(String),
     #[error("failed to derive the pre-ASAP schema: {0}")]
     Schema(#[from] QueryExprError),
     #[error("ASAPPlanner produced no legal summary candidate for the target")]
@@ -149,6 +151,40 @@ pub fn select_summary_default(expr: &QueryExpr) -> Result<Rc<SummaryNode>, Selec
     select_summary(expr, &asap_aware_mapping::DefaultCostModel)
 }
 
+/// Search a same-requirement workload cohort through Planner's canonical CSE
+/// and replacement inventory. Physical implementation compatibility is checked
+/// later, before publication; this function never assigns runtime identities.
+pub fn select_workload(
+    roots: Vec<(usize, Rc<QueryExpr>)>,
+    accuracy: AccuracyTarget,
+    cost_model: &dyn CostModel,
+) -> Result<Vec<(usize, Rc<SummaryNode>)>, SelectionError> {
+    let strategies = asap_aware_mapping::default_strategies_with(cost_model);
+    let space = asap_aware_mapping::search_workload_with_targets(
+        roots
+            .into_iter()
+            .map(|(id, root)| (id, root, Some(accuracy.clone())))
+            .collect(),
+        &strategies,
+        &asap_aware_mapping::DefaultAccuracyModel,
+    );
+    let selection = space.global_selection(cost_model);
+    let roots = space
+        .roots
+        .iter()
+        .map(|(id, root)| {
+            selection
+                .materialize(root)
+                .map_err(|error| SelectionError::Workload(error.to_string()))?
+                .map(|node| (*id, node))
+                .ok_or_else(|| SelectionError::Workload(format!("missing query root {id}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(planner_types::post_asap::share_common_summary_subtrees(
+        roots,
+    ))
+}
+
 /// Select from Planner's legal candidates with deployment-supplied accuracy
 /// models and typed evidence (for example a TopK membership certificate).
 pub fn select_summary_with_evidence(
@@ -188,5 +224,95 @@ pub fn select_summary_or_keep(
     match select_summary(expr, cost_model) {
         Err(SelectionError::NoLegalCandidate) => keep_pre_asap(expr),
         result => result,
+    }
+}
+
+#[cfg(test)]
+mod workload_tests {
+    use super::*;
+    use crate::physical::post_asap::cost_model::ControlPlaneCostModel;
+
+    fn plan(queries: &[&str], accuracy: AccuracyTarget) -> Vec<(usize, Rc<SummaryNode>)> {
+        let roots = queries
+            .iter()
+            .enumerate()
+            .map(|(index, query)| {
+                (
+                    index,
+                    Rc::new(
+                        crate::query_parser::parse_query_expr_canonical(query, accuracy.clone())
+                            .unwrap(),
+                    ),
+                )
+            })
+            .collect();
+        select_workload(
+            roots,
+            accuracy.clone(),
+            &ControlPlaneCostModel::new(accuracy),
+        )
+        .unwrap()
+    }
+
+    // Distinct quantile roots retain their readouts while sharing one selected sketch.
+    #[test]
+    fn quantile_roots_share_selected_producer() {
+        let roots = plan(
+            &[
+                "quantile_over_time(0.90, m[1m])",
+                "quantile_over_time(0.99, m[1m])",
+            ],
+            AccuracyTarget::EpsilonDelta {
+                epsilon: 0.01,
+                delta: 0.01,
+            },
+        );
+        let SummaryExpr::SummaryEstimate {
+            summary_input: first,
+            query: q1,
+        } = &roots[0].1.expr
+        else {
+            panic!("{:?}", roots[0].1)
+        };
+        let SummaryExpr::SummaryEstimate {
+            summary_input: second,
+            query: q2,
+        } = &roots[1].1.expr
+        else {
+            panic!("{:?}", roots[1].1)
+        };
+        assert!(Rc::ptr_eq(first, second));
+        assert_ne!(q1, q2);
+    }
+
+    // Sharing must not collapse different source or logical-window requirements.
+    #[test]
+    fn distinct_windows_and_sources_do_not_share() {
+        let roots = plan(
+            &[
+                "sum_over_time(m[1m])",
+                "sum_over_time(m[2m])",
+                "sum_over_time(n[1m])",
+            ],
+            AccuracyTarget::Exact,
+        );
+        assert!(!Rc::ptr_eq(&roots[0].1, &roots[1].1));
+        assert!(!Rc::ptr_eq(&roots[0].1, &roots[2].1));
+    }
+
+    // Arithmetic keeps its exact operands visible and reuses the standalone sum.
+    #[test]
+    fn weighted_mean_retains_shared_sum_operand() {
+        let roots = plan(
+            &[
+                "sum_over_time(m[1m])",
+                "sum_over_time(m[1m]) / count_over_time(m[1m])",
+            ],
+            AccuracyTarget::Exact,
+        );
+        let SummaryExpr::BinaryOp { lhs, .. } = &roots[1].1.expr else {
+            panic!("{:?}", roots[1].1)
+        };
+        assert!(Rc::ptr_eq(&roots[0].1, lhs));
     }
 }

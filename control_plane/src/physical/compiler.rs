@@ -42,7 +42,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "d0701dd4d4f0acb267b004c42ba30b2c9547ff7c";
+pub const PLANNER_REVISION: &str = "378a7547ede629a64e84c9f7c810226ce196cce9";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
@@ -1544,6 +1544,7 @@ impl BackendLocalPlanningSnapshot {
             ));
         }
         let mut queries = Vec::with_capacity(entries.len());
+        let mut canonical_roots = Vec::with_capacity(entries.len());
         for (index, entry) in entries.into_iter().enumerate() {
             let evaluation_interval_ms = match entry.recurrence {
                 QueryRecurrence::Repeated(RepeatedDemand::FixedInterval(interval)) => interval.0,
@@ -1589,8 +1590,9 @@ impl BackendLocalPlanningSnapshot {
                 horizon_seconds: self.implementation.horizon_seconds,
                 costs: self.implementation.lifecycle_costs.clone(),
             };
-            let post_asap = select_post_asap(&parsed, accuracy.clone(), &lifecycle, None)
+            let post_asap = crate::planner_selection::keep_pre_asap(&parsed)
                 .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
+            canonical_roots.push(Rc::new(parsed));
             let mut cost = self.implementation.implementation_cost.clone();
             cost.workload_fingerprint =
                 canonical_promql(&query_string).map_err(CompileError::QueryPlan)?;
@@ -1617,6 +1619,25 @@ impl BackendLocalPlanningSnapshot {
                 runtime_policy: RuntimeRulePolicy::default(),
             });
         }
+        // A cohort shares the same end-to-end requirement, not an inferred
+        // weakest common accuracy. Different targets are searched separately.
+        let mut cohorts: Vec<(AccuracyTarget, Vec<(usize, Rc<QueryExpr>)>)> = Vec::new();
+        for (index, root) in canonical_roots.into_iter().enumerate() {
+            let accuracy = &queries[index].accuracy;
+            if let Some((_, roots)) = cohorts.iter_mut().find(|(target, _)| target == accuracy) {
+                roots.push((index, root));
+            } else {
+                cohorts.push((accuracy.clone(), vec![(index, root)]));
+            }
+        }
+        for (accuracy, roots) in cohorts {
+            let model = ControlPlaneCostModel::new(accuracy.clone());
+            let selected = crate::planner_selection::select_workload(roots, accuracy, &model)
+                .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+            for (index, node) in selected {
+                queries[index].post_asap = node;
+            }
+        }
         PhysicalCompiler.compile(
             PlanningRequest {
                 queries,
@@ -1631,7 +1652,7 @@ impl BackendLocalPlanningSnapshot {
 impl PhysicalCompiler {
     pub fn compile(
         &self,
-        request: PlanningRequest,
+        mut request: PlanningRequest,
         environment: DeploymentEnvironment,
     ) -> Result<PhysicalPlan, CompileError> {
         if request.planner_revision != PLANNER_REVISION {
@@ -1649,6 +1670,15 @@ impl PhysicalCompiler {
             });
         }
 
+        let roots = request
+            .queries
+            .iter()
+            .enumerate()
+            .map(|(id, query)| (id, Rc::clone(&query.post_asap)))
+            .collect();
+        for (id, root) in planner_types::post_asap::share_common_summary_subtrees(roots) {
+            request.queries[id].post_asap = root;
+        }
         let mut aggregations = Vec::with_capacity(request.queries.len());
         let mut readouts = Vec::with_capacity(request.queries.len());
         let mut collector_materializations = Vec::with_capacity(request.queries.len());
@@ -1657,9 +1687,9 @@ impl PhysicalCompiler {
         let mut runtime_policies = BTreeMap::new();
         // Binding is established while compiling the physical
         // materializations, then consumed by QueryPlan lowering. The key is
-        // the planner DAG node identity within a query; serving never scans
+        // the planner DAG node identity across the workload; serving never scans
         // BackendPlan candidates to rediscover this decision.
-        let mut node_bindings = HashMap::<(String, usize), asap_types::PolicyFingerprint>::new();
+        let mut node_bindings = HashMap::<usize, asap_types::PolicyFingerprint>::new();
 
         for query in &request.queries {
             let evidence = request.evidence.get(&query.query_id);
@@ -1693,6 +1723,9 @@ impl PhysicalCompiler {
                     query_id: query.query_id.clone(),
                     reason,
                 })?;
+            if selected.is_empty() {
+                continue;
+            }
             let planner_selection = select_lifecycle(query, &node, &model, &environment)?;
             let window_implementation = query
                 .window_implementations
@@ -1743,7 +1776,7 @@ impl PhysicalCompiler {
                 let precompute_materialization =
                     backend_plan::aggregation_config_for_materialization(&aggregation)?;
                 let materialization = precompute_materialization.policy_fingerprint();
-                let binding_key = (query.query_id.clone(), selected.node_identity);
+                let binding_key = selected.node_identity;
                 if let Some(existing) = node_bindings.insert(binding_key, materialization) {
                     if existing != materialization {
                         return Err(CompileError::Query {
@@ -1772,7 +1805,7 @@ impl PhysicalCompiler {
                     });
                 }
                 let collector_materialization = CollectorMaterialization {
-                    query_id: query.query_id.clone(),
+                    query_id: format!("state-{}", materialization.0),
                     materialization,
                     metric: metric.clone(),
                     algorithm: physical_algorithm,
@@ -1810,7 +1843,7 @@ impl PhysicalCompiler {
             }
         }
 
-        let plan_id = stable_plan_id(&plan_materializations);
+        let plan_id = stable_workload_plan_id(&plan_materializations, &request.queries);
         let envelope = PlanEnvelope {
             plan_id,
             plan_version: environment.plan_version,
@@ -1925,7 +1958,7 @@ impl PhysicalCompiler {
                         )
                     })?;
                     let fingerprint = node_bindings
-                        .get(&(query.query_id.clone(), node as *const SummaryNode as usize))
+                        .get(&(node as *const SummaryNode as usize))
                         .copied()
                         .ok_or_else(|| {
                             crate::query_plan::QueryPlanError::Invalid(format!(
@@ -2427,6 +2460,20 @@ fn stable_plan_id(materializations: &[CollectorMaterialization]) -> u64 {
     hasher.finish()
 }
 
+fn stable_workload_plan_id(
+    materializations: &[CollectorMaterialization],
+    queries: &[PlanningQuery],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    stable_plan_id(materializations).hash(&mut hasher);
+    for query in queries {
+        query.query_id.hash(&mut hasher);
+        query.query_string.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2624,6 +2671,32 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn canonical_snapshot_preserves_shared_bindings_after_serialization() {
+        // Two different registered readouts survive publication with one state.
+        let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
+        let mut second = entries[0].clone();
+        second.query = Query("quantile_over_time(0.90, m[1m])".into());
+        entries.push(second);
+        let bundle = snapshot.compile().unwrap();
+        assert_eq!(bundle.query_plan.entries.len(), 2);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+        let query_plan: QueryPlan =
+            serde_json::from_slice(&serde_json::to_vec(&bundle.query_plan).unwrap()).unwrap();
+        let bindings = query_plan
+            .entries
+            .values()
+            .flat_map(|entry| entry.materialization_bindings())
+            .map(|binding| binding.materialization)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(bindings.len(), 1);
+        query_plan.validate(&bindings).unwrap();
     }
 
     #[test]
