@@ -483,6 +483,10 @@ impl HttpServer {
             )
             .route("/api/v1/physical-plan", post(handle_post_physical_plan))
             .route(
+                "/api/v1/physical-plan/discard",
+                post(handle_discard_physical_plan),
+            )
+            .route(
                 "/api/v1/physical-plan/activate",
                 post(handle_activate_physical_plan),
             )
@@ -588,6 +592,10 @@ impl HttpServer {
                 get(handle_get_backend_plan).post(handle_post_backend_plan),
             )
             .route("/api/v1/physical-plan", post(handle_post_physical_plan))
+            .route(
+                "/api/v1/physical-plan/discard",
+                post(handle_discard_physical_plan),
+            )
             .route(
                 "/api/v1/physical-plan/activate",
                 post(handle_activate_physical_plan),
@@ -6074,6 +6082,24 @@ async fn handle_activate_physical_plan(
         })),
     )
         .into_response()
+}
+
+async fn handle_discard_physical_plan(
+    State(state): State<AppState>,
+    axum::Json(request): axum::Json<ActivatePhysicalPlanRequest>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(lifecycle) = state.physical_plan_lifecycle.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "physical-plan lifecycle is not attached",
+        )
+            .into_response();
+    };
+    match lifecycle.discard_staged(request.plan_id, request.plan_version) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
 }
 
 async fn handle_physical_plan_status(State(state): State<AppState>) -> axum::response::Response {

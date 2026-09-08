@@ -675,9 +675,12 @@ async fn handle_compile_and_publish_physical_plan(
         .publish_collector_plans(&bundle.collector_plans, apply_timeout)
         .await
     {
+        let cleanup = backend
+            .discard_staged_physical_plan(bundle.envelope.plan_id, bundle.envelope.plan_version)
+            .await;
         return (
             StatusCode::BAD_GATEWAY,
-            format!("collector physical-plan publication failed: {error}"),
+            format!("collector physical-plan publication failed: {error}; staged backend cleanup: {cleanup:?}"),
         )
             .into_response();
     }
