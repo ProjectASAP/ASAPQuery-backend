@@ -19,7 +19,7 @@ pub enum FallbackResponse {
 
 impl IntoResponse for FallbackResponse {
     fn into_response(self) -> Response {
-        match self {
+        let mut response = match self {
             FallbackResponse::Json(value) => Json(value).into_response(),
             FallbackResponse::Text(text) => {
                 // Return plain text with appropriate content type
@@ -32,7 +32,28 @@ impl IntoResponse for FallbackResponse {
                 )
                     .into_response()
             }
-        }
+        };
+        response.headers_mut().insert(
+            "x-asap-execution",
+            axum::http::HeaderValue::from_static("exact_fallback"),
+        );
+        response
+    }
+}
+
+#[cfg(test)]
+mod execution_attribution_tests {
+    use super::*;
+
+    // An HTTP fallback must be distinguishable from warm execution, even if
+    // its upstream response carries misleading or absent source annotations.
+    #[test]
+    fn forwarded_response_has_backend_owned_execution_marker() {
+        let response = FallbackResponse::Json(serde_json::json!({
+            "status": "success", "infos": ["data_source: asap_query"]
+        }))
+        .into_response();
+        assert_eq!(response.headers()["x-asap-execution"], "exact_fallback");
     }
 }
 

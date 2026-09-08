@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Replay supplied o11ybench inputs through the production backend. No winner overrides."""
+import argparse
+from decimal import Decimal
+import hashlib
+import json
+import math
+from pathlib import Path
+import re
+import socket
+import struct
+import subprocess
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+
+def classify(response, headers=None):
+    if response.get("status") != "success":
+        return "failed"
+    if (headers or {}).get("x-asap-execution") == "exact_fallback":
+        return "exact_fallback"
+    sources = {x for x in response.get("infos", []) if isinstance(x, str) and x.startswith("data_source:")}
+    if sources == {"data_source: asap_query"}:
+        return "warm"
+    if sources == {"data_source: exact_fallback"}:
+        return "exact_fallback"
+    return "failed"
+
+
+def validate_workload(snapshot, corpus):
+    rows = corpus["queries"]
+    if not corpus.get("upstream_revision") or not rows:
+        raise ValueError("a versioned, nonempty upstream query corpus is required")
+    ids = [row["id"] for row in rows]
+    if len(set(ids)) != len(ids):
+        raise ValueError("query occurrence IDs must be unique")
+    for row in rows:
+        if not isinstance(row["eval_timestamp_ms"], int) or row["eval_timestamp_ms"] < 0:
+            raise ValueError("each query needs its original nonnegative evaluation timestamp")
+    workload = snapshot["query_workload"]
+    if workload.get("query_batch"):
+        raise ValueError("this runner currently accepts repeating workload registrations only")
+    registered = {row["query"] for row in workload["repeating_queries"]}
+    if registered != {row["query"] for row in rows}:
+        raise ValueError("snapshot registrations must match the complete unique corpus exactly")
+    return rows
+
+
+_SAMPLE = re.compile(r'([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?\s+(\S+)\s+(\d+(?:\.\d+)?)')
+_LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\[\\"n])*)"')
+
+
+def parse_samples(lines):
+    """Strict OpenMetrics subset: seconds converted losslessly to Remote Write milliseconds."""
+    rows, seen, latest = [], {}, -1
+    for number, line in enumerate(lines, 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _SAMPLE.fullmatch(line)
+        if not match:
+            raise ValueError(f"unsupported sample at line {number}")
+        metric, raw_labels, value, timestamp = match.groups()
+        labels = {"__name__": metric}
+        rest = raw_labels or ""
+        while rest:
+            label = _LABEL.match(rest)
+            if not label or label[1] in labels:
+                raise ValueError(f"invalid or duplicate label at line {number}")
+            labels[label[1]] = re.sub(r'\\([\\"n])', lambda m: '\n' if m[1] == 'n' else m[1], label[2])
+            rest = rest[label.end():]
+            if rest:
+                if not rest.startswith(",") or len(rest) == 1:
+                    raise ValueError(f"invalid label separator at line {number}")
+                rest = rest[1:]
+        millis = Decimal(timestamp) * 1000
+        if millis != millis.to_integral_value():
+            raise ValueError(f"submillisecond timestamp at line {number}")
+        value, timestamp = float(value), int(millis)
+        key = tuple(sorted(labels.items()))
+        if not math.isfinite(value) or timestamp > 2**63 - 1 or timestamp < latest or timestamp <= seen.get(key, -1):
+            raise ValueError(f"nonfinite, duplicate, or out-of-order sample at line {number}")
+        latest, seen[key] = timestamp, timestamp
+        rows.append((labels, value, timestamp))
+    if not rows:
+        raise ValueError("empty dataset")
+    return rows
+
+
+def varint(value):
+    result = bytearray()
+    while value > 127:
+        result.append((value & 127) | 128)
+        value >>= 7
+    result.append(value)
+    return bytes(result)
+
+
+def field(number, payload):
+    return varint(number * 8 + 2) + varint(len(payload)) + payload
+
+
+def encode_write(rows):
+    """Remote Write v1 protobuf in an uncompressed-literal raw Snappy block."""
+    series = {}
+    for labels, value, timestamp in rows:
+        series.setdefault(tuple(sorted(labels.items())), []).append((value, timestamp))
+    wire = bytearray()
+    for labels, samples in series.items():
+        ts = b"".join(field(1, field(1, k.encode()) + field(2, v.encode())) for k, v in labels)
+        ts += b"".join(field(2, b"\x09" + struct.pack("<d", v) + b"\x10" + varint(t)) for v, t in samples)
+        wire.extend(field(1, ts))
+    length = len(wire)
+    if not length:
+        raise ValueError("cannot encode empty batch")
+    n = length - 1
+    if n < 60:
+        literal = bytes([n << 2])
+    else:
+        size = (n.bit_length() + 7) // 8
+        literal = bytes([(59 + size) << 2]) + n.to_bytes(size, "little")
+    return varint(length) + literal + wire
+
+
+def request(url, data=None, headers=None):
+    start = time.perf_counter_ns()
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers or {}), timeout=60) as response:
+            body, status, received = response.read(), response.status, dict(response.headers.items())
+        try:
+            body = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            body = {"raw": body.decode(errors="replace")}
+        return {"http_status": status, "response": body, "headers": {k.lower(): v for k, v in received.items()},
+                "elapsed_ns": time.perf_counter_ns() - start}
+    except (OSError, urllib.error.URLError) as error:
+        return {"http_status": getattr(error, "code", None), "response": {"status": "error", "error": str(error)},
+                "headers": {}, "elapsed_ns": time.perf_counter_ns() - start}
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+
+
+def ingest(rows, endpoints, output):
+    batches = []
+    for offset in range(0, len(rows), 5000):
+        payload = encode_write(rows[offset:offset + 5000])
+        batch = {"offset": offset, "sample_count": len(rows[offset:offset + 5000]),
+                 "payload_sha256": hashlib.sha256(payload).hexdigest(), "endpoints": {}}
+        batches.append(batch)
+        for endpoint in endpoints:
+            # Persist intent first: a timeout can follow partial acceptance. Never retry silently.
+            batch["endpoints"][endpoint] = {"status": "attempting"}
+            write_json(output / "ingestion.json", batches)
+            result = request(endpoint.rstrip("/") + "/api/v1/write", payload, {
+                "Content-Type": "application/x-protobuf", "Content-Encoding": "snappy",
+                "X-Prometheus-Remote-Write-Version": "0.1.0"})
+            batch["endpoints"][endpoint] = result
+            write_json(output / "ingestion.json", batches)
+            if not result["http_status"] or not 200 <= result["http_status"] < 300:
+                raise RuntimeError(f"ingestion failed at batch {offset}; inspect partial acceptance before retry")
+
+
+def replay(queries, backend, output, repetitions):
+    rows = []
+    for repeat in range(repetitions):
+        for query in queries:
+            params = urllib.parse.urlencode({"query": query["query"], "time": f'{query["eval_timestamp_ms"] / 1000:.3f}'})
+            answer = request(backend.rstrip("/") + "/api/v1/query?" + params)
+            route = classify(answer["response"], answer["headers"])
+            if answer["http_status"] != 200:
+                route = "failed"
+            rows.append({**query, "repetition": repeat, "phase": "first_pass" if repeat == 0 else "repeat",
+                         "execution": route, **answer})
+            write_json(output / "queries.json", rows)
+    return rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--metrics", type=Path, required=True)
+    parser.add_argument("--queries", type=Path, required=True)
+    parser.add_argument("--snapshot", type=Path, required=True)
+    parser.add_argument("--compiler", type=Path, required=True)
+    parser.add_argument("--data-plane", type=Path, required=True)
+    parser.add_argument("--exact-url", required=True, help="dedicated empty Prometheus with Remote Write receiver enabled")
+    parser.add_argument("--port", type=int, default=18089)
+    parser.add_argument("--settle-seconds", type=float, default=2)
+    parser.add_argument("--repetitions", type=int, default=2)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    if args.repetitions < 1 or not 0 <= args.settle_seconds <= 60:
+        parser.error("positive repetitions and settle-seconds in [0, 60] required")
+    corpus = json.loads(args.queries.read_text())
+    queries = validate_workload(json.loads(args.snapshot.read_text()), corpus)
+    samples = parse_samples(args.metrics.read_text().splitlines())
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", args.port))
+    args.output.mkdir(parents=True, exist_ok=False)
+    provenance = {"schema_version": 1, "upstream_revision": corpus["upstream_revision"],
+                  "inputs": {str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest()
+                             for p in [args.metrics, args.queries, args.snapshot, args.compiler, args.data_plane]},
+                  "samples": len(samples), "timestamp_min_ms": samples[0][2], "timestamp_max_ms": samples[-1][2],
+                  "query_occurrences": len(queries), "configuration": {k: str(v) for k, v in vars(args).items()},
+                  "limitations": ["generator provenance must be supplied separately", "first pass is not a guaranteed cold cache", "ingest acceptance is not materialization completion"]}
+    write_json(args.output / "run.json", provenance)
+    with (args.output / "planning.stderr").open("w") as log:
+        compiled = subprocess.run([str(args.compiler.resolve()), str(args.snapshot.resolve())], check=True,
+                                  stdout=subprocess.PIPE, stderr=log, text=True)
+    plan = json.loads(compiled.stdout)
+    write_json(args.output / "planning.json", plan)
+    artifact = args.output / "install.json"
+    write_json(artifact, plan["install_request"])
+    backend = f"http://127.0.0.1:{args.port}"
+    command = [str(args.data_plane.resolve()), "--profile", "asapquery", "--physical-plan", str(artifact.resolve()),
+               "--prometheus-server", args.exact_url, "--forward-unsupported-queries", "--http-port", str(args.port),
+               "--output-dir", str((args.output / "backend").resolve()), "--precompute-allowed-lateness-ms", "0",
+               "--precompute-flush-interval-ms", "25"]
+    write_json(args.output / "command.json", command)
+    with (args.output / "backend.log").open("w") as log:
+        child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            for _ in range(120):
+                if child.poll() is not None:
+                    raise RuntimeError("data plane exited; see backend.log")
+                if request(backend + "/api/v1/health")["http_status"] == 200:
+                    break
+                time.sleep(0.25)
+            else:
+                raise RuntimeError("data plane readiness timeout")
+            installed = request(backend + "/api/v1/physical-plan/status")
+            write_json(args.output / "installed.json", installed)
+            if installed["http_status"] != 200:
+                raise RuntimeError("could not read installed plan status")
+            envelope = plan["envelope"]
+            if not any(p["plan_id"] == envelope["plan_id"] and p["plan_version"] == envelope["plan_version"]
+                       and p["phase"] == "active" for p in installed["response"].get("plans", [])):
+                raise RuntimeError("runtime has not activated the selected plan generation")
+            ingest(samples, [args.exact_url, backend], args.output)
+            time.sleep(args.settle_seconds)
+            results = replay(queries, backend, args.output, args.repetitions)
+            write_json(args.output / "store.json", request(backend + "/api/v1/store/metrics"))
+            write_json(args.output / "completion.json", {"complete": True,
+                       "execution_counts": {k: sum(r["execution"] == k for r in results) for k in ["warm", "exact_fallback", "failed"]},
+                       "benefit_claim": None})
+        finally:
+            child.terminate()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+
+
+if __name__ == "__main__":
+    main()

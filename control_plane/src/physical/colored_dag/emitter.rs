@@ -116,8 +116,7 @@ fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
             SummaryExpr::BinaryOp { .. }
             | SummaryExpr::SummaryJoin { .. }
             | SummaryExpr::SummarySubtract { .. }
-            | SummaryExpr::SummaryDelete { .. }
-            | SummaryExpr::BinaryOp { .. } => NodeKind::Other,
+            | SummaryExpr::SummaryDelete { .. } => NodeKind::Other,
         },
         PhysicalExpr::Committed(PostAsapPlan::LetBinding { name, .. }) => {
             NodeKind::LetBinding { name }

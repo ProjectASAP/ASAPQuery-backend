@@ -200,7 +200,10 @@ impl ControlPlaneCostModel {
             .map(|algorithm| {
                 let params = self.size_params(algorithm.clone(), intent, eps, delta);
                 let row = provider.lookup(algorithm, &params).ok()?;
-                Some((algorithm.clone(), row.metrics.update_cpu_ns.as_ref()?.value))
+                Some((
+                    algorithm.clone(),
+                    row.metrics.resources.cpu.update_cpu_ns.as_ref()?.value,
+                ))
             })
             .collect();
         let Some(mut costs) = costs else {

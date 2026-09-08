@@ -38,8 +38,8 @@ fn inspect(
                         Some(json!({
                             "record_id": row.id,
                             "provenance": row.provenance,
-                            "update_cpu_ns": row.metrics.update_cpu_ns,
-                            "retained_bytes": row.metrics.retained_bytes,
+                            "update_cpu_ns": row.metrics.resources.cpu.update_cpu_ns,
+                            "retained_bytes": row.metrics.resources.retained_memory_bytes,
                             "offline_error_observation": row.error,
                             "error_applies_to_current_query": false,
                         })),

@@ -2111,10 +2111,6 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 walk(right, metrics);
             }
             SummaryExpr::SummaryDelete { summary_input, .. } => walk(summary_input, metrics),
-            SummaryExpr::BinaryOp { lhs, rhs, .. } => {
-                walk(lhs, metrics);
-                walk(rhs, metrics);
-            }
         }
     }
     let mut metrics = BTreeSet::new();
