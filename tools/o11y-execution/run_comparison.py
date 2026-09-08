@@ -30,8 +30,8 @@ def main():
     args = parser.parse_args()
     if args.trials < 1 or args.repetitions < 1:
         parser.error("trials and repetitions must be positive")
-    if not 1 <= args.base_port <= 65533:
-        parser.error("base-port must leave room for three valid ports")
+    if args.base_port < 1 or args.base_port + args.trials * 3 - 1 > 65535:
+        parser.error("trial port range must fit TCP ports")
     cpus = {int(value) for value in args.cpu_affinity.split(",")}
     if not cpus or not cpus <= os.sched_getaffinity(0):
         parser.error("requested CPUs are unavailable")
@@ -43,6 +43,8 @@ def main():
                         "CPU affinity is shared, not an aggregate quota or memory cap",
                         "Finite-input replay; repeated queries retain original evaluation times"]})
     for trial in range(1, args.trials + 1):
+        # Separate ports avoid previous trial connections still in TIME_WAIT.
+        base_port = args.base_port + (trial - 1) * 3
         folder = args.output / f"trial-{trial}"
         folder.mkdir()
         config = folder / "prometheus.yml"
@@ -50,7 +52,7 @@ def main():
         children, logs, evidence = {}, [], {}
         try:
             for index, name in enumerate(("baseline", "fallback")):
-                port = args.base_port + index
+                port = base_port + index
                 command = [str(args.prometheus.resolve()), f"--config.file={config.resolve()}",
                            f"--storage.tsdb.path={(folder / name).resolve()}",
                            f"--web.listen-address=127.0.0.1:{port}",
@@ -78,13 +80,13 @@ def main():
             command = [sys.executable, str(Path(__file__).with_name("replay.py"))]
             for name in ("metrics", "queries", "snapshot", "compiler", "data_plane"):
                 command += ["--" + name.replace("_", "-"), str(getattr(args, name).resolve())]
-            command += ["--compare", "--exact-url", f"http://127.0.0.1:{args.base_port}",
-                        "--fallback-url", f"http://127.0.0.1:{args.base_port + 1}",
+            command += ["--compare", "--exact-url", f"http://127.0.0.1:{base_port}",
+                        "--fallback-url", f"http://127.0.0.1:{base_port + 1}",
                         "--exact-pid", str(children["baseline"].pid),
                         "--fallback-pid", str(children["fallback"].pid),
                         "--exact-storage", str((folder / "baseline").resolve()),
                         "--fallback-storage", str((folder / "fallback").resolve()),
-                        "--cpu-affinity", args.cpu_affinity, "--port", str(args.base_port + 2),
+                        "--cpu-affinity", args.cpu_affinity, "--port", str(base_port + 2),
                         "--repetitions", str(args.repetitions), "--relative-tolerance", "1e-9",
                         "--absolute-tolerance", "1e-12", "--output", str((folder / "replay").resolve())]
             save(folder / "command.json", command)
