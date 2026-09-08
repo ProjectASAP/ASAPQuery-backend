@@ -137,6 +137,9 @@ impl QueryPlanEntry {
             )));
         }
         for (id, node) in &self.nodes {
+            if matches!(node, QueryPlanNode::Scalar { value } if !value.is_finite()) {
+                return Err(QueryPlanError::Invalid("non-finite scalar constant".into()));
+            }
             for input in node.inputs() {
                 if !self.nodes.contains_key(input) {
                     return Err(QueryPlanError::Invalid(format!(
@@ -234,6 +237,17 @@ pub enum PhysicalGrouping {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    Scalar {
+        value: f64,
+    },
+    Binary {
+        inputs: [QueryNodeId; 2],
+        operator: planner_types::pre_asap::ArithmeticOpKind,
+    },
+    ReduceSum {
+        input: QueryNodeId,
+        grouping: PhysicalGrouping,
+    },
     ReadMaterialization {
         binding: MaterializationBinding,
     },
@@ -256,10 +270,13 @@ pub enum QueryPlanNode {
 impl QueryPlanNode {
     pub fn inputs(&self) -> &[QueryNodeId] {
         match self {
-            Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => &[],
-            Self::SummaryEstimate { input, .. } | Self::ExactReadout { input, .. } => {
-                std::slice::from_ref(input)
+            Self::Scalar { .. } | Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => {
+                &[]
             }
+            Self::Binary { inputs, .. } => inputs,
+            Self::ReduceSum { input, .. }
+            | Self::SummaryEstimate { input, .. }
+            | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
             Self::SummaryMerge { inputs } => inputs,
         }
     }
@@ -269,6 +286,7 @@ impl QueryPlanNode {
 #[serde(rename_all = "snake_case")]
 pub enum ExactReadout {
     Sum,
+    Count,
     Increase,
     Rate,
 }
@@ -286,17 +304,7 @@ pub enum QueryReadout {
     Cardinality,
     TopK {
         k: usize,
-        #[serde(default)]
-        weight: QueryTopKWeight,
     },
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum QueryTopKWeight {
-    Count,
-    #[default]
-    Value,
 }
 
 impl From<SketchQuery> for QueryReadout {
@@ -305,13 +313,7 @@ impl From<SketchQuery> for QueryReadout {
             SketchQuery::Quantile { q } => Self::Quantile { q },
             SketchQuery::PointCount { key, value } => Self::PointCount { key, value },
             SketchQuery::Cardinality => Self::Cardinality,
-            SketchQuery::TopK { k, weight } => Self::TopK {
-                k,
-                weight: match weight {
-                    planner_types::post_asap::TopKWeight::Count => QueryTopKWeight::Count,
-                    planner_types::post_asap::TopKWeight::Value => QueryTopKWeight::Value,
-                },
-            },
+            SketchQuery::TopK { k } => Self::TopK { k },
         }
     }
 }
@@ -322,13 +324,7 @@ impl From<QueryReadout> for SketchQuery {
             QueryReadout::Quantile { q } => Self::Quantile { q },
             QueryReadout::PointCount { key, value } => Self::PointCount { key, value },
             QueryReadout::Cardinality => Self::Cardinality,
-            QueryReadout::TopK { k, weight } => Self::TopK {
-                k,
-                weight: match weight {
-                    QueryTopKWeight::Count => planner_types::post_asap::TopKWeight::Count,
-                    QueryTopKWeight::Value => planner_types::post_asap::TopKWeight::Value,
-                },
-            },
+            QueryReadout::TopK { k } => Self::TopK { k },
         }
     }
 }
@@ -353,9 +349,54 @@ where
         self.next_id += 1;
         self.seen.insert(identity, id);
         let physical = match &node.expr {
-            SummaryExpr::KeepPreAsap(_) => QueryPlanNode::ExactFallback {
-                reason: "post-ASAP node requires exact execution".into(),
+            SummaryExpr::BinaryOp { lhs, rhs, operator } if exact_value_executable(node) => {
+                let planner_types::pre_asap::BinaryOpKind::Arithmetic(operator) = &operator.kind
+                else {
+                    unreachable!()
+                };
+                QueryPlanNode::Binary {
+                    inputs: [self.lower(lhs)?, self.lower(rhs)?],
+                    operator: operator.clone(),
+                }
+            }
+            SummaryExpr::KeepPreAsap(expr) if scalar_literal(expr).is_some() => {
+                QueryPlanNode::Scalar {
+                    value: scalar_literal(expr).unwrap(),
+                }
+            }
+            SummaryExpr::SummaryAgg {
+                family:
+                    SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _),
+                child,
+                reduction,
+                ..
+            } if !matches!(child.expr, SummaryExpr::KeepPreAsap(_))
+                && exact_value_executable(node) =>
+            {
+                QueryPlanNode::ReduceSum {
+                    input: self.lower(child)?,
+                    grouping: physical_grouping(reduction, child)?,
+                }
+            }
+            SummaryExpr::SummaryAgg { child, .. }
+                if !matches!(child.expr, SummaryExpr::KeepPreAsap(_)) =>
+            {
+                QueryPlanNode::ExactFallback {
+                    reason: "unsupported exact operation over summary output".into(),
+                }
+            }
+            SummaryExpr::SummaryAgg {
+                family:
+                    SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _),
+                ..
+            } if !exact_value_executable(node) => QueryPlanNode::ExactFallback {
+                reason: "only temporal observation counts are supported".into(),
             },
+            SummaryExpr::BinaryOp { .. } | SummaryExpr::KeepPreAsap(_) => {
+                QueryPlanNode::ExactFallback {
+                    reason: "post-ASAP node requires exact execution".into(),
+                }
+            }
             SummaryExpr::SummaryAgg {
                 family,
                 reduction,
@@ -366,10 +407,16 @@ where
                     let mut binding = (self.bind)(node, family)?;
                     binding.output_grouping = physical_grouping(reduction, child)?;
                     if let Some(readout) = exact_readout(family) {
-                        let input = QueryNodeId(self.next_id);
-                        self.next_id += 1;
-                        self.nodes
-                            .insert(input, QueryPlanNode::ReadMaterialization { binding });
+                        let existing = self.nodes.iter().find_map(|(id, node)| {
+                            matches!(node, QueryPlanNode::ReadMaterialization { binding: other } if other == &binding).then_some(*id)
+                        });
+                        let input = existing.unwrap_or_else(|| {
+                            let input = QueryNodeId(self.next_id);
+                            self.next_id += 1;
+                            self.nodes
+                                .insert(input, QueryPlanNode::ReadMaterialization { binding });
+                            input
+                        });
                         QueryPlanNode::ExactReadout { input, readout }
                     } else {
                         QueryPlanNode::ReadMaterialization { binding }
@@ -419,8 +466,107 @@ fn exact_readout(family: &SummaryFamilyType) -> Option<ExactReadout> {
     use planner_types::post_asap::ExactKind;
     match family {
         SummaryFamilyType::ExactAggregate(ExactKind::Sum, _) => Some(ExactReadout::Sum),
+        SummaryFamilyType::ExactAggregate(ExactKind::Count, _) => Some(ExactReadout::Count),
         SummaryFamilyType::ExactAggregate(ExactKind::Increase, _) => Some(ExactReadout::Increase),
         SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => Some(ExactReadout::Rate),
+        _ => None,
+    }
+}
+
+fn scalar_literal(expr: &planner_types::pre_asap::QueryExpr) -> Option<f64> {
+    use planner_types::pre_asap::{QueryExpr, ScalarValue};
+    let value = match expr {
+        QueryExpr::PromqlScalarBridge(child) => return scalar_literal(child),
+        QueryExpr::Literal(ScalarValue::Float64(value)) => *value,
+        QueryExpr::Literal(ScalarValue::Int64(value)) => *value as f64,
+        _ => return None,
+    };
+    value.is_finite().then_some(value)
+}
+
+/// The current exact arithmetic adapter is deliberately narrower than PromQL:
+/// default vector matching, scalar literals and additive temporal readouts.
+/// Unsupported operands make the complete expression fall back.
+pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
+    use planner_types::post_asap::ExactKind;
+    if !node
+        .guarantee
+        .as_ref()
+        .is_some_and(|guarantee| guarantee.is_exact())
+    {
+        return false;
+    }
+    match &node.expr {
+        SummaryExpr::KeepPreAsap(expr) => scalar_literal(expr).is_some(),
+        SummaryExpr::BinaryOp { lhs, rhs, operator } => {
+            matches!(
+                operator.kind,
+                planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
+            ) && operator.vector_match.is_none()
+                && exact_value_executable(lhs)
+                && exact_value_executable(rhs)
+                && value_grouping(node).is_ok()
+                && match (value_source(lhs), value_source(rhs)) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => true,
+                }
+        }
+        SummaryExpr::SummaryAgg {
+            family: SummaryFamilyType::ExactAggregate(kind, _),
+            child,
+            reduction,
+            ..
+        } => {
+            if matches!(child.expr, SummaryExpr::KeepPreAsap(_)) {
+                matches!(&child.expr, SummaryExpr::KeepPreAsap(expr) if matches!(expr.as_ref(), planner_types::pre_asap::QueryExpr::TimeRange { child, .. } if matches!(child.as_ref(), planner_types::pre_asap::QueryExpr::Scan { .. })))
+                    && matches!(reduction, Reduction::PerEntity)
+                    && matches!(
+                        kind,
+                        ExactKind::Sum | ExactKind::Count | ExactKind::Increase | ExactKind::Rate
+                    )
+            } else {
+                // Raw producer grouping may move through additive reductions,
+                // but never through division or other value arithmetic.
+                matches!(kind, ExactKind::Sum)
+                    && matches!(child.expr, SummaryExpr::SummaryAgg { .. })
+                    && exact_value_executable(child)
+            }
+        }
+        _ => false,
+    }
+}
+
+fn value_grouping(node: &SummaryNode) -> Result<Option<PhysicalGrouping>, QueryPlanError> {
+    match &node.expr {
+        SummaryExpr::KeepPreAsap(_) => Ok(None),
+        SummaryExpr::SummaryAgg {
+            reduction, child, ..
+        } => physical_grouping(reduction, child).map(Some),
+        SummaryExpr::BinaryOp { lhs, rhs, .. } => {
+            let left = value_grouping(lhs)?;
+            let right = value_grouping(rhs)?;
+            match (left, right) {
+                (Some(left), Some(right)) if left != right => Err(QueryPlanError::Invalid(
+                    "arithmetic operands require different producer grouping contracts".into(),
+                )),
+                (left, right) => Ok(left.or(right)),
+            }
+        }
+        _ => Err(QueryPlanError::Invalid(
+            "unsupported exact value grouping".into(),
+        )),
+    }
+}
+
+// The MVP QueryPlan evaluates all operands over one interval. Different
+// selectors/windows need per-operand time binding before they can be warm.
+fn value_source(node: &SummaryNode) -> Option<&planner_types::pre_asap::QueryExpr> {
+    match &node.expr {
+        SummaryExpr::SummaryAgg { child, .. } => match &child.expr {
+            SummaryExpr::KeepPreAsap(expr) => Some(expr),
+            _ => value_source(child),
+        },
+        SummaryExpr::BinaryOp { lhs, rhs, .. } => value_source(lhs).or_else(|| value_source(rhs)),
         _ => None,
     }
 }
@@ -474,19 +620,6 @@ mod tests {
         assert_eq!(
             canonical_promql("sum by (service) ( rate(http_requests_total[5m]) )").unwrap(),
             canonical_promql("sum by(service)(rate(http_requests_total[5m]))").unwrap()
-        );
-    }
-
-    #[test]
-    fn legacy_topk_readout_defaults_to_value_weighting() {
-        let readout: QueryReadout =
-            serde_json::from_str(r#"{"kind":"top_k","k":5}"#).expect("legacy TopK readout");
-        assert_eq!(
-            readout,
-            QueryReadout::TopK {
-                k: 5,
-                weight: QueryTopKWeight::Value,
-            }
         );
     }
 

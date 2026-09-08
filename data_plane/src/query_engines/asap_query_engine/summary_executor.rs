@@ -233,6 +233,9 @@ impl GroupState {
             return None;
         };
         let stat = match (readout, agg_type) {
+            (control_plane::query_plan::ExactReadout::Count, AggregationType::Sum) => {
+                asap_types::Statistic::Count
+            }
             (
                 control_plane::query_plan::ExactReadout::Sum,
                 AggregationType::Sum | AggregationType::MultipleSum,
@@ -260,7 +263,11 @@ impl GroupState {
             ("range_start_ms".to_string(), range_start_ms.to_string()),
             ("range_end_ms".to_string(), range_end_ms.to_string()),
         ]);
-        merged?.query_statistic(stat, key, &query_kwargs).ok()
+        let merged = merged?;
+        if readout == control_plane::query_plan::ExactReadout::Count {
+            return merged.aux_stats().count.map(|count| count as f64);
+        }
+        merged.query_statistic(stat, key, &query_kwargs).ok()
     }
 
     /// Coverage analog of `exact_value` — folds `(min_window_end_ms,
@@ -739,7 +746,7 @@ fn readout_cumulative(
         return Err(SummaryExecutorError::NoCandidates);
     };
     let w_end = latest_window_end.unwrap_or(t1_ms);
-    if let SketchQuery::TopK { k, .. } = query {
+    if let SketchQuery::TopK { k } = query {
         Ok(SummaryValue::TopK(
             vec![(w_end, topk_ranked(&merged, *k)?)],
             coverage,
@@ -801,7 +808,7 @@ fn readout_per_window(
     if by_window.is_empty() {
         return Err(SummaryExecutorError::NoCandidates);
     }
-    if let SketchQuery::TopK { k, .. } = query {
+    if let SketchQuery::TopK { k } = query {
         let points = by_window
             .into_iter()
             .map(|(w_end, rs)| topk_ranked(&rs, *k).map(|items| (w_end, items)))
@@ -1142,7 +1149,7 @@ pub(crate) fn find_metric_in_query_expr(qe: &QueryExpr) -> Option<String> {
         | QueryExpr::TimeRange { child, .. }
         | QueryExpr::TimeShift { child, .. }
         | QueryExpr::SQLWindowFunc { child, .. } => find_metric_in_query_expr(child),
-        QueryExpr::Concat { children } => children.iter().find_map(find_metric_in_query_expr),
+        QueryExpr::Concat { children, .. } => children.iter().find_map(find_metric_in_query_expr),
         QueryExpr::Join { left, .. } | QueryExpr::SetOp { left, .. } => {
             find_metric_in_query_expr(left)
         }
@@ -1221,7 +1228,12 @@ mod tests {
                     planner_types::post_asap::SketchAlgorithm::Kll,
                     planner_types::post_asap::SketchParams::Kll { k: 200 },
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction,
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
@@ -1245,7 +1257,12 @@ mod tests {
                     planner_types::post_asap::SketchAlgorithm::Hll,
                     planner_types::post_asap::SketchParams::Hll { precision: 10 },
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction,
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
@@ -1395,7 +1412,12 @@ mod tests {
                         depth: 4,
                     },
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction: Reduction::by(vec![]),
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
@@ -1458,7 +1480,12 @@ mod tests {
                         heap_size: 10,
                     },
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction: Reduction::by(vec![]),
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
@@ -1502,7 +1529,12 @@ mod tests {
                     planner_types::post_asap::ExactKind::Sum,
                     planner_types::post_asap::ExactParams::Sum,
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 // Sum is a genuine PromQL aggregation operator -- an empty
                 // `by` always means "reduce fully," never `PerEntity` (see
                 // `resolve_group_key`'s doc).
@@ -2133,13 +2165,7 @@ mod tests {
             },
         );
         let child = scan_node("requests_total", None);
-        let tree = estimate_node(
-            cms_agg_node(child),
-            SketchQuery::TopK {
-                k: 5,
-                weight: planner_types::post_asap::TopKWeight::Value,
-            },
-        );
+        let tree = estimate_node(cms_agg_node(child), SketchQuery::TopK { k: 5 });
         let exec = ctx(&idx);
         match execute(&tree, &exec) {
             Err(crate::query_engines::asap_query_engine::summary_exec::ExecError::Executor(
@@ -2176,13 +2202,7 @@ mod tests {
         );
 
         let child = scan_node("requests_by_route", None);
-        let tree = estimate_node(
-            cms_with_heap_agg_node(child),
-            SketchQuery::TopK {
-                k: 3,
-                weight: planner_types::post_asap::TopKWeight::Value,
-            },
-        );
+        let tree = estimate_node(cms_with_heap_agg_node(child), SketchQuery::TopK { k: 3 });
 
         let exec = ctx(&idx);
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
@@ -2232,13 +2252,7 @@ mod tests {
         );
 
         let child = scan_node("requests_by_route", None);
-        let tree = estimate_node(
-            cms_with_heap_agg_node(child),
-            SketchQuery::TopK {
-                k: 5,
-                weight: planner_types::post_asap::TopKWeight::Value,
-            },
-        );
+        let tree = estimate_node(cms_with_heap_agg_node(child), SketchQuery::TopK { k: 5 });
 
         let exec = ctx(&idx);
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
@@ -2284,13 +2298,7 @@ mod tests {
         );
 
         let child = scan_node("requests_by_route", None);
-        let tree = estimate_node(
-            cms_with_heap_agg_node(child),
-            SketchQuery::TopK {
-                k: 2,
-                weight: planner_types::post_asap::TopKWeight::Value,
-            },
-        );
+        let tree = estimate_node(cms_with_heap_agg_node(child), SketchQuery::TopK { k: 2 });
 
         let exec = matrix_ctx(&idx);
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
@@ -2351,7 +2359,12 @@ mod tests {
                     planner_types::post_asap::SketchAlgorithm::Kll,
                     planner_types::post_asap::SketchParams::Kll { k: 500 },
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction: Reduction::by(vec![]),
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
@@ -2610,13 +2623,7 @@ mod tests {
         );
 
         let child = scan_node("requests_by_route", None);
-        let tree = estimate_node(
-            cms_with_heap_agg_node(child),
-            SketchQuery::TopK {
-                k: 5,
-                weight: planner_types::post_asap::TopKWeight::Value,
-            },
-        );
+        let tree = estimate_node(cms_with_heap_agg_node(child), SketchQuery::TopK { k: 5 });
 
         let exec = matrix_ctx(&idx);
         let ExecOutcome::Value(v) = execute(&tree, &exec).expect("execute should succeed") else {
@@ -2818,7 +2825,12 @@ mod tests {
                     planner_types::post_asap::ExactKind::MinMax,
                     planner_types::post_asap::ExactParams::MinMax,
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction: Reduction::by(vec![]),
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },

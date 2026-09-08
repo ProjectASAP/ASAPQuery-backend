@@ -484,6 +484,12 @@ async fn main() -> Result<()> {
         let plan = snapshot
             .compile()
             .map_err(|error| format!("startup planning failed for {}: {error}", path.display()))?;
+        if let Some(comparison) = &plan.cost_comparison {
+            info!(
+                "Startup workload cost decision: {}",
+                serde_json::to_string(comparison)?
+            );
+        }
         Some(
             data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
                 precompute_plan: plan.precompute_plan,

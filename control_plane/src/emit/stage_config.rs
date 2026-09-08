@@ -2986,18 +2986,9 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
             obj.insert("item_label".to_string(), JsonValue::String(label.clone()));
         }
     }
-    if let Some(weight) = agg.topk_weight {
+    if let Some(mode) = agg.heap_update_mode {
         if let Some(obj) = parameters.as_object_mut() {
-            obj.insert(
-                "weight_mode".to_string(),
-                JsonValue::String(
-                    match weight {
-                        planner_types::post_asap::TopKWeight::Count => "count",
-                        planner_types::post_asap::TopKWeight::Value => "value",
-                    }
-                    .to_string(),
-                ),
-            );
+            obj.insert("weight_mode".into(), JsonValue::String(mode.into()));
         }
     }
     let aggregation_input = match agg.aggregation_input {
@@ -3056,13 +3047,9 @@ fn build_backend_readout_json(r: &BackendReadout) -> JsonValue {
             "key": column_ref_to_wire_key(key),
             "value": value,
         }),
-        SketchQuery::TopK { k, weight } => json!({
+        SketchQuery::TopK { k } => json!({
             "op": "topk",
             "k": k,
-            "weight_mode": match weight {
-                planner_types::post_asap::TopKWeight::Count => "count",
-                planner_types::post_asap::TopKWeight::Value => "value",
-            },
         }),
     }
 }
@@ -3224,7 +3211,7 @@ mod tests {
             spatial_filter: String::new(),
             grouping: Vec::new(),
             item_label: None,
-            topk_weight: None,
+            heap_update_mode: None,
             aggregation_input,
         }
     }
@@ -3622,10 +3609,7 @@ mod tests {
             readouts: vec![
                 BackendReadout {
                     aggregation_id: "agg0".into(),
-                    op: SketchQuery::TopK {
-                        k: 10,
-                        weight: planner_types::post_asap::TopKWeight::Value,
-                    },
+                    op: SketchQuery::TopK { k: 10 },
                 },
                 BackendReadout {
                     aggregation_id: "agg1".into(),
@@ -3713,10 +3697,7 @@ mod tests {
                         SketchQuery::Quantile { q: 0.99 }
                     }
                     SketchAlgorithm::Hll => SketchQuery::Cardinality,
-                    SketchAlgorithm::CountSketch => SketchQuery::TopK {
-                        k: 10,
-                        weight: planner_types::post_asap::TopKWeight::Value,
-                    },
+                    SketchAlgorithm::CountSketch => SketchQuery::TopK { k: 10 },
                     SketchAlgorithm::Cms => SketchQuery::PointCount {
                         key: ColumnRef::Named("user_42".into()),
                         value: None,

@@ -117,6 +117,222 @@ fn is_warm(response: &Value) -> bool {
     })
 }
 
+// Three registered consumers must observe one raw SUM/count producer, including
+// uneven instance sample counts and Remote Write retries.
+#[tokio::test]
+async fn shared_exact_dashboard_executes_selected_workload() {
+    let fallback_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fallback_address = fallback_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(fallback_listener, Router::new()
+            .route("/-/healthy", get(|| async { "healthy" }))
+            .route("/api/v1/query", get(|| async { Json(serde_json::json!({"status":"success","data":{"resultType":"vector","result":[]}})) })))
+            .await.unwrap();
+    });
+    let output_dir = tempfile::tempdir().unwrap();
+    let mut snapshot: Value = serde_json::from_str(include_str!(
+        "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+    ))
+    .unwrap();
+    let sum = "sum by (service) (sum_over_time(asap_demo_gauge[5s]))";
+    let count = "sum by (service) (count_over_time(asap_demo_gauge[5s]))";
+    let mean = format!("{sum} / {count}");
+    let mut entry = snapshot["query_workload"]["repeating_queries"][2].clone();
+    snapshot["query_workload"]["repeating_queries"] = Value::Array(
+        [sum, count, mean.as_str()]
+            .into_iter()
+            .map(|query| {
+                entry["query"] = query.into();
+                entry.clone()
+            })
+            .collect(),
+    );
+    let mut typed: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        serde_json::from_value(snapshot.clone()).unwrap();
+    let (request, environment) = typed.clone().planning_request().unwrap();
+    let candidates =
+        control_plane::physical::workload_cost::with_exact_alternative(request).unwrap();
+    let quotes = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(index, candidate)| {
+            let plan = control_plane::physical::compiler::PhysicalCompiler
+                .compile(candidate.clone(), environment.clone())
+                .unwrap();
+            let manifest =
+                control_plane::physical::workload_cost::manifest(&plan, &candidate.queries)
+                    .unwrap();
+            let unit_costs = manifest
+                .components
+                .keys()
+                .map(|key| (key.clone(), if index == 0 { 1.0 } else { 1000.0 }))
+                .collect();
+            control_plane::physical::workload_cost::WorkloadQuote {
+                manifest,
+                executable: true,
+                unit_costs,
+            }
+        })
+        .collect();
+    typed.snapshot_version = 2;
+    typed.workload_cost_evidence = Some(
+        control_plane::physical::workload_cost::WorkloadCostEvidence {
+            data_snapshot_id: "process-fixture-v1".into(),
+            model_version: "test-only-unit-costs".into(),
+            observed_at_unix_ms: environment.observed_at_unix_ms,
+            valid_for_ms: environment.max_evidence_age_ms,
+            quotes,
+        },
+    );
+    snapshot = serde_json::to_value(&typed).unwrap();
+    let plan = typed.compile().unwrap();
+    assert!(plan.cost_comparison.is_some());
+    assert_eq!(plan.precompute_plan.materializations.len(), 1);
+    assert_eq!(plan.query_plan.entries.len(), 3);
+    let snapshot_path = output_dir.path().join("snapshot.json");
+    std::fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let port = unused_port();
+    let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
+        .args(["--profile", "asapquery", "--planning-snapshot"])
+        .arg(&snapshot_path)
+        .args([
+            "--forward-unsupported-queries",
+            "--prometheus-server",
+            &format!("http://{fallback_address}"),
+        ])
+        .args(["--http-port", &port.to_string(), "--output-dir"])
+        .arg(output_dir.path())
+        .args([
+            "--precompute-allowed-lateness-ms",
+            "0",
+            "--precompute-flush-interval-ms",
+            "25",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut child = ChildGuard(child);
+    let client = reqwest::Client::new();
+    let backend = format!("http://127.0.0.1:{port}");
+    wait_until_ready(&client, &format!("{backend}/api/v1/health"), &mut child.0).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let base = now - now.rem_euclid(5000) - 20000;
+    let labeled = |service: &str, instance: &str, samples: &[(i64, f64)]| {
+        let mut item = series("asap_demo_gauge", samples);
+        item.labels.extend([
+            Label {
+                name: "service".into(),
+                value: service.into(),
+            },
+            Label {
+                name: "instance".into(),
+                value: instance.into(),
+            },
+        ]);
+        item
+    };
+    let request = WriteRequest {
+        timeseries: vec![
+            labeled("api", "a", &[(base + 500, 10.0)]),
+            labeled(
+                "api",
+                "b",
+                &[(base + 600, 2.0), (base + 1700, 4.0), (base + 2900, 8.0)],
+            ),
+            labeled("worker", "c", &[(base + 700, 9.0), (base + 1900, 15.0)]),
+        ],
+    };
+    assert_eq!(remote_write(&client, &backend, &request).await, 204);
+    assert_eq!(remote_write(&client, &backend, &request).await, 204);
+    let advance = WriteRequest {
+        timeseries: vec![
+            labeled("api", "a", &[(base + 5500, 100.0)]),
+            labeled("api", "b", &[(base + 5500, 100.0)]),
+            labeled("worker", "c", &[(base + 5500, 100.0)]),
+        ],
+    };
+    assert_eq!(remote_write(&client, &backend, &advance).await, 204);
+    let final_advance = WriteRequest {
+        timeseries: vec![
+            labeled("api", "a", &[(base + 10500, 1000.0)]),
+            labeled("api", "b", &[(base + 10500, 1000.0)]),
+            labeled("worker", "c", &[(base + 10500, 1000.0)]),
+        ],
+    };
+    assert_eq!(remote_write(&client, &backend, &final_advance).await, 204);
+    for (query, expected) in [
+        (sum, [24.0, 24.0]),
+        (count, [4.0, 2.0]),
+        (mean.as_str(), [6.0, 12.0]),
+    ] {
+        let result = wait_for_warm_instant(
+            &client,
+            &backend,
+            query,
+            (base + 5000) as f64 / 1000.0,
+            &output_dir.path().join("query_engine.log"),
+        )
+        .await;
+        let rows = result["data"]["result"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{query}: {result}");
+        for row in rows {
+            let service = row["metric"]["service"].as_str().unwrap();
+            assert_eq!(row["metric"].as_object().unwrap().len(), 1);
+            let value: f64 = row["value"][1].as_str().unwrap().parse().unwrap();
+            assert_eq!(
+                value,
+                expected[usize::from(service == "worker")],
+                "{query}: {result}"
+            );
+            assert_eq!(
+                row["value"][0].as_f64().unwrap(),
+                (base + 5000) as f64 / 1000.0
+            );
+        }
+    }
+    let result: Value = client
+        .get(format!("{backend}/api/v1/query_range"))
+        .query(&[
+            ("query", mean.clone()),
+            ("start", ((base + 5000) as f64 / 1000.0).to_string()),
+            ("end", ((base + 10000) as f64 / 1000.0).to_string()),
+            ("step", "5".into()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(is_warm(&result), "{result}");
+    for row in result["data"]["result"].as_array().unwrap() {
+        let values = row["values"].as_array().unwrap();
+        assert_eq!(values.len(), 2, "{result}");
+        assert_eq!(values[1][1], "100", "{result}");
+    }
+    // Unaligned intervals cannot be answered by whole tumbling states.
+    let result: Value = client
+        .get(format!("{backend}/api/v1/query"))
+        .query(&[
+            ("query", mean),
+            ("time", ((base + 5001) as f64 / 1000.0).to_string()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        !is_warm(&result),
+        "partial interval was incorrectly warm: {result}"
+    );
+}
+
 async fn wait_for_warm_instant(
     client: &reqwest::Client,
     base: &str,
