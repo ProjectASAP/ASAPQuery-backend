@@ -676,6 +676,45 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
             is_warm(&response),
             "{query} did not use warm tier: {response}"
         );
+        // Compare the complete vector at each step, including changing Top-K
+        // membership. Sorting labels makes response ordering irrelevant.
+        for (timestamp, instant) in [(first_eval, &first_instant), (second_eval, &second_instant)] {
+            let mut expected = instant["data"]["result"]
+                .as_array()
+                .expect("instant vector")
+                .iter()
+                .map(|series| {
+                    (
+                        serde_json::to_string(&series["metric"]).unwrap(),
+                        series["value"][1].as_str().unwrap().parse::<f64>().unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut actual = response["data"]["result"]
+                .as_array()
+                .expect("range matrix")
+                .iter()
+                .flat_map(|series| {
+                    series["values"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(move |point| point[0].as_f64() == Some(timestamp))
+                        .map(move |point| {
+                            (
+                                serde_json::to_string(&series["metric"]).unwrap(),
+                                point[1].as_str().unwrap().parse::<f64>().unwrap(),
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            expected.sort_by(|a, b| a.0.cmp(&b.0));
+            actual.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                actual, expected,
+                "complete range/instant vector differs for {query} at {timestamp}"
+            );
+        }
         if query.starts_with("topk(") {
             let mut ranked_points = response["data"]["result"]
                 .as_array()
@@ -716,32 +755,6 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         assert_eq!(values.len(), 2, "wrong step count for {query}: {response}");
         assert_eq!(values[0][0], first_eval);
         assert_eq!(values[1][0], second_eval);
-        assert_eq!(
-            response["data"]["result"][0]["metric"], first_instant["data"]["result"][0]["metric"],
-            "range/instant labels differ at first step for {query}"
-        );
-        assert_eq!(
-            response["data"]["result"][0]["metric"], second_instant["data"]["result"][0]["metric"],
-            "range/instant labels differ at second step for {query}"
-        );
-        let range_first = values[0][1]
-            .as_str()
-            .and_then(|value| value.parse::<f64>().ok())
-            .expect("first range value");
-        let range_second = values[1][1]
-            .as_str()
-            .and_then(|value| value.parse::<f64>().ok())
-            .expect("second range value");
-        assert_eq!(
-            range_first,
-            first_value(&first_instant, "value").expect("first instant value"),
-            "range value differs from an independent instant evaluation at first step for {query}"
-        );
-        assert_eq!(
-            range_second,
-            first_value(&second_instant, "value").expect("second instant value"),
-            "range value differs from an independent instant evaluation at second step for {query}"
-        );
     }
 
     // Readiness polling may briefly reach the exact fallback before a newly
