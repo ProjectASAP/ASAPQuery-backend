@@ -5,6 +5,8 @@
 //! node IDs. Serving executes this graph without reconstructing Planner IR or
 //! searching for compatible materializations.
 
+pub mod logical;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
@@ -116,6 +118,41 @@ impl QueryPlanEntry {
             nodes: BTreeMap::new(),
             seen: BTreeMap::new(),
             bind: &mut bind,
+            logical_source: None,
+        };
+        let root = compiler.lower(root)?;
+        Ok(Self {
+            query_id,
+            canonical_promql,
+            root,
+            nodes: compiler.nodes,
+            instant,
+            fallback,
+        })
+    }
+
+    /// Compile selected summary nodes and verified native residuals into one DAG.
+    /// This is a distinct physical alternative; native execution remains available.
+    pub fn compile_bound_composable<F>(
+        query_id: String,
+        canonical_promql: String,
+        root: &Rc<SummaryNode>,
+        instant: InstantExecution,
+        fallback: FallbackPolicy,
+        mut bind: F,
+    ) -> Result<Self, QueryPlanError>
+    where
+        F: FnMut(
+            &SummaryNode,
+            &SummaryFamilyType,
+        ) -> Result<MaterializationBinding, QueryPlanError>,
+    {
+        let mut compiler = DagCompiler {
+            next_id: 0,
+            nodes: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            bind: &mut bind,
+            logical_source: Some(canonical_promql.clone()),
         };
         let root = compiler.lower(root)?;
         Ok(Self {
@@ -137,6 +174,9 @@ impl QueryPlanEntry {
             )));
         }
         for (id, node) in &self.nodes {
+            if let QueryPlanNode::Logical { operator, inputs } = node {
+                operator.validate(inputs.len())?;
+            }
             if matches!(node, QueryPlanNode::Scalar { value } if !value.is_finite()) {
                 return Err(QueryPlanError::Invalid("non-finite scalar constant".into()));
             }
@@ -149,6 +189,11 @@ impl QueryPlanEntry {
                 }
             }
             if let QueryPlanNode::ReadMaterialization { binding } = node {
+                if binding.readout_lookback_ms == Some(0) {
+                    return Err(QueryPlanError::Invalid(
+                        "zero semantic readout lookback".into(),
+                    ));
+                }
                 if !available.contains(&binding.materialization) {
                     return Err(QueryPlanError::Invalid(format!(
                         "query `{}` node {} references absent materialization {}",
@@ -225,6 +270,9 @@ pub struct MaterializationBinding {
     /// Query operator grouping applied while folding those SIDs.
     pub output_grouping: PhysicalGrouping,
     pub window_ms: u64,
+    /// Semantic query lookback, independent of the physical pane duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readout_lookback_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -237,6 +285,10 @@ pub enum PhysicalGrouping {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    Logical {
+        operator: logical::LogicalOperator,
+        inputs: Vec<QueryNodeId>,
+    },
     Scalar {
         value: f64,
     },
@@ -277,7 +329,7 @@ impl QueryPlanNode {
             Self::ReduceSum { input, .. }
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
-            Self::SummaryMerge { inputs } => inputs,
+            Self::SummaryMerge { inputs } | Self::Logical { inputs, .. } => inputs,
         }
     }
 }
@@ -334,12 +386,41 @@ struct DagCompiler<'a, F> {
     nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
     seen: BTreeMap<usize, QueryNodeId>,
     bind: &'a mut F,
+    logical_source: Option<String>,
 }
 
 impl<F> DagCompiler<'_, F>
 where
     F: FnMut(&SummaryNode, &SummaryFamilyType) -> Result<MaterializationBinding, QueryPlanError>,
 {
+    fn graft(
+        &mut self,
+        id: QueryNodeId,
+        root: QueryNodeId,
+        nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
+    ) -> Result<QueryNodeId, QueryPlanError> {
+        let mut remap = BTreeMap::new();
+        for local in nodes.keys() {
+            let global = if *local == root {
+                id
+            } else {
+                let next = QueryNodeId(self.next_id);
+                self.next_id += 1;
+                next
+            };
+            remap.insert(*local, global);
+        }
+        for (local, mut physical) in nodes {
+            if let QueryPlanNode::Logical { inputs, .. } = &mut physical {
+                for input in inputs {
+                    *input = remap[input];
+                }
+            }
+            self.nodes.insert(remap[&local], physical);
+        }
+        return Ok(id);
+    }
+
     fn lower(&mut self, node: &Rc<SummaryNode>) -> Result<QueryNodeId, QueryPlanError> {
         let identity = Rc::as_ptr(node) as usize;
         if let Some(id) = self.seen.get(&identity) {
@@ -348,7 +429,100 @@ where
         let id = QueryNodeId(self.next_id);
         self.next_id += 1;
         self.seen.insert(identity, id);
+        let residual = match (&self.logical_source, &node.expr) {
+            (Some(original), SummaryExpr::KeepPreAsap(expr)) => {
+                Some(logical::residual_nodes(original, expr)?)
+            }
+            (Some(original), SummaryExpr::SummaryAgg { child, .. })
+                if matches!(child.expr, SummaryExpr::KeepPreAsap(_))
+                    && !matches!(
+                        crate::physical::compiler::materialization_leaf_contract(node),
+                        Ok((_, Some(_)))
+                    ) =>
+            {
+                Some(logical::selected_residual_nodes(original, node)?)
+            }
+            _ => None,
+        };
+        if let Some((root, nodes)) = residual {
+            return self.graft(id, root, nodes);
+        }
+
         let physical = match &node.expr {
+            SummaryExpr::BinaryOp { lhs, rhs, operator } if self.logical_source.is_some() => {
+                let operator = logical::binary_operator(operator)?;
+                QueryPlanNode::Logical {
+                    operator,
+                    inputs: vec![self.lower(lhs)?, self.lower(rhs)?],
+                }
+            }
+
+            SummaryExpr::SummaryAgg {
+                family: SummaryFamilyType::ExactAggregate(kind, _),
+                child,
+                reduction,
+                ..
+            } if self.logical_source.is_some()
+                && !matches!(child.expr, SummaryExpr::KeepPreAsap(_)) =>
+            {
+                if !matches!(
+                    kind,
+                    planner_types::post_asap::ExactKind::Sum
+                        | planner_types::post_asap::ExactKind::Count
+                ) {
+                    let operator = logical::selected_aggregate_operator(
+                        self.logical_source.as_deref().unwrap(),
+                        node,
+                    )?;
+                    let input = self.lower(child)?;
+                    self.nodes.insert(
+                        id,
+                        QueryPlanNode::Logical {
+                            operator,
+                            inputs: vec![input],
+                        },
+                    );
+                    return Ok(id);
+                }
+                let operation = match kind {
+                    planner_types::post_asap::ExactKind::Sum => logical::Aggregation::Sum,
+                    planner_types::post_asap::ExactKind::Count => logical::Aggregation::Count,
+                    _ => {
+                        return Err(QueryPlanError::Invalid(
+                            "unsupported aggregation over selected summary values".into(),
+                        ))
+                    }
+                };
+                let keys = reduction.group_keys().ok_or_else(|| {
+                    QueryPlanError::Invalid(
+                        "per-entity summary reduction requires a temporal operator".into(),
+                    )
+                })?;
+                let labels = keys
+                    .keys()
+                    .iter()
+                    .map(|&column| {
+                        child
+                            .schema
+                            .fields
+                            .get(column)
+                            .map(|field| field.name.clone())
+                            .ok_or_else(|| {
+                                QueryPlanError::Invalid("unresolved logical grouping column".into())
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                QueryPlanNode::Logical {
+                    operator: logical::LogicalOperator::Aggregate {
+                        operation,
+                        grouping: logical::Grouping {
+                            labels,
+                            without: keys.is_without(),
+                        },
+                    },
+                    inputs: vec![self.lower(child)?],
+                }
+            }
             SummaryExpr::BinaryOp { lhs, rhs, operator } if exact_value_executable(node) => {
                 let planner_types::pre_asap::BinaryOpKind::Arithmetic(operator) = &operator.kind
                 else {
@@ -392,11 +566,12 @@ where
             } if !exact_value_executable(node) => QueryPlanNode::ExactFallback {
                 reason: "only temporal observation counts are supported".into(),
             },
-            SummaryExpr::BinaryOp { .. } | SummaryExpr::KeepPreAsap(_) => {
-                QueryPlanNode::ExactFallback {
-                    reason: "post-ASAP node requires exact execution".into(),
-                }
-            }
+            SummaryExpr::BinaryOp { .. } => QueryPlanNode::ExactFallback {
+                reason: "summary binary operation is not executable by the warm tier".into(),
+            },
+            SummaryExpr::KeepPreAsap(_) => QueryPlanNode::ExactFallback {
+                reason: "post-ASAP node requires exact execution".into(),
+            },
             SummaryExpr::SummaryAgg {
                 family,
                 reduction,
@@ -404,7 +579,17 @@ where
                 ..
             } => match family {
                 SummaryFamilyType::ExactAggregate(..) | SummaryFamilyType::Sketch(..) => {
-                    let mut binding = (self.bind)(node, family)?;
+                    let mut binding = match (self.bind)(node, family) {
+                        Ok(binding) => binding,
+                        Err(error) => {
+                            if let Some(original) = &self.logical_source {
+                                let (root, nodes) =
+                                    logical::selected_residual_nodes(original, node)?;
+                                return self.graft(id, root, nodes);
+                            }
+                            return Err(error);
+                        }
+                    };
                     binding.output_grouping = physical_grouping(reduction, child)?;
                     if let Some(readout) = exact_readout(family) {
                         let existing = self.nodes.iter().find_map(|(id, node)| {

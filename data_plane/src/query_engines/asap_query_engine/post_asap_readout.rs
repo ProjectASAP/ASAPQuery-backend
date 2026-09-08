@@ -251,6 +251,9 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                     .collect::<Result<Vec<_>, _>>()
                     .map(PhysicalQueryOutput::State)
             }
+            QueryPlanNode::Logical { .. } => Err(PhysicalNodeError::Fallback(
+                "logical node requires installed logical runtime".into(),
+            )),
             QueryPlanNode::ExactFallback { reason } => {
                 Err(PhysicalNodeError::Fallback(reason.clone()))
             }
@@ -793,6 +796,7 @@ mod tests {
                     sid_grouping: vec!["service".into()],
                     output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                     window_ms: 60_000,
+                    readout_lookback_ms: Some(60_000),
                 })
             },
         )
@@ -961,6 +965,7 @@ mod tests {
                             sid_grouping: vec![],
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 10_000,
+                            readout_lookback_ms: Some(60_000),
                         },
                     },
                 ),
@@ -1054,6 +1059,7 @@ mod tests {
                             sid_grouping: vec![],
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 60_000,
+                            readout_lookback_ms: Some(60_000),
                         },
                     },
                 ),
@@ -1069,5 +1075,81 @@ mod tests {
             .expect("execute exact rate DAG");
         let value = outcome.series[0].1[0].1;
         assert!((value - 0.575).abs() < 1e-12, "reset-aware rate={value}");
+
+        // The installed residual combines an actual bound store readout with raw input.
+        use crate::query_engines::asap_query_engine::logical_dag;
+        use crate::query_engines::query_result::{InstantVectorElement, QueryResult};
+        use control_plane::query_plan::{
+            logical::{BinaryOperation, LogicalOperator},
+            QueryNodeId,
+        };
+        let mut hybrid = entry.clone();
+        hybrid.root = QueryNodeId(4);
+        hybrid.nodes.insert(
+            QueryNodeId(3),
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::Scan {
+                    metric: Some("up".into()),
+                    matchers: vec![],
+                    range_ms: None,
+                    offset_ms: 0,
+                },
+                inputs: vec![],
+            },
+        );
+        hybrid.nodes.insert(
+            QueryNodeId(4),
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::Binary {
+                    operation: BinaryOperation::Add,
+                    return_bool: false,
+                },
+                inputs: vec![entry.root, QueryNodeId(3)],
+            },
+        );
+        let samples = logical_dag::PreparedSamples::new(&[
+            crate::drivers::ingest::prometheus_remote_write::CanonicalSample {
+                metric: "up".into(),
+                labels: Default::default(),
+                series_key: "up".into(),
+                timestamp_ms: 60_000,
+                value: Some(2.),
+            },
+        ])
+        .unwrap();
+        let (result, stats) =
+            logical_dag::execute_prepared_with_stats(&hybrid, &samples, 60_000, |root, at| {
+                assert_eq!(root, entry.root);
+                let result = execute_query_plan_readout(&idx, &entry, at - 60_000, at, true)
+                    .map_err(|error| {
+                        crate::query_engines::EngineError::capability_miss(
+                            "test",
+                            format!("{error:?}"),
+                        )
+                    })?;
+                Ok(QueryResult::vector(
+                    result
+                        .series
+                        .into_iter()
+                        .map(|(labels, values)| {
+                            InstantVectorElement::new(
+                                crate::storage_engines::types::KeyByLabelValues::new_with_labels(
+                                    labels.values().cloned().collect(),
+                                ),
+                                values.last().unwrap().1,
+                            )
+                            .with_label_keys_override(labels.into_keys().collect())
+                        })
+                        .collect(),
+                    at,
+                ))
+            })
+            .unwrap();
+        let QueryResult::Vector(result) = result else {
+            panic!("instant vector required")
+        };
+        assert!((result.values[0].value - 2.575).abs() < 1e-12);
+        assert_eq!(stats.raw_scan_evaluations, 1);
+        assert_eq!(stats.summary_readout_evaluations, 1);
     }
 }

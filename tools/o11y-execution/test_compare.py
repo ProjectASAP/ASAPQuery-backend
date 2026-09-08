@@ -13,6 +13,19 @@ def vector(*values):
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_explicit_roundoff_tolerance_preserves_errors_and_structure(self):
+        """Declared floating-point tolerance permits roundoff, never missing series."""
+        actual, expected = vector(("a", 1.0 + 1e-15)), vector(("a", 1.0))
+        self.assertFalse(compare_results(actual, expected)["equal"])
+        result = compare_results(actual, expected, 1e-9, 1e-12)
+        self.assertTrue(result["equal"])
+        self.assertFalse(result["strict_equal"])
+        self.assertGreater(result["max_absolute_error"], 0)
+        self.assertFalse(compare_results(actual, vector(("a", 1.0), ("b", 1.0)), 1e-9, 1e-12)["equal"])
+        self.assertFalse(compare_results(vector(("a", 1.1)), expected, 1e-9, 1e-12)["equal"])
+        with self.assertRaises(ValueError):
+            compare_results(actual, expected, float("nan"), 0)
+
     def test_group_matching_is_not_row_position(self):
         """Permuting a group-by result does not change correctness."""
         result = compare_results(vector(("b", 2), ("a", 1)), vector(("a", 1), ("b", 2)))

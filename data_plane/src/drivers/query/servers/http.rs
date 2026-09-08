@@ -569,6 +569,7 @@ impl HttpServer {
         let range_query_endpoint = adapter.get_range_query_endpoint();
 
         let app = Router::new()
+            .route("/api/v1/precompute/drain", post(handle_precompute_drain))
             .route(query_endpoint, get(handle_instant_query))
             .route(query_endpoint, post(handle_instant_query_post))
             .route(range_query_endpoint, get(handle_range_query))
@@ -1534,6 +1535,74 @@ async fn process_via_router(
     }
 }
 
+fn extract_logical_provenance(
+    value: &mut serde_json::Value,
+) -> Option<Result<(u64, u64, u64), ()>> {
+    let warnings = value.get_mut("warnings")?.as_array_mut()?;
+    let mut route = None;
+    let mut stats = None;
+    let mut found = false;
+    let mut malformed = false;
+    warnings.retain(|warning| {
+        let Some(text) = warning.as_str() else {
+            return true;
+        };
+        if let Some(mode) = text.strip_prefix("asap_execution:") {
+            found = true;
+            if route.replace(mode.to_owned()).is_some() {
+                malformed = true;
+            }
+            return false;
+        }
+        if let Some(text) = text.strip_prefix("asap_logical_stats:") {
+            found = true;
+            let values = text.split(',').collect::<Vec<_>>();
+            let parsed = if values.len() == 3 {
+                values[0]
+                    .strip_prefix("raw=")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .zip(
+                        values[1]
+                            .strip_prefix("summary=")
+                            .and_then(|v| v.parse::<u64>().ok()),
+                    )
+                    .zip(
+                        values[2]
+                            .strip_prefix("memo_hits=")
+                            .and_then(|v| v.parse::<u64>().ok()),
+                    )
+                    .map(|((raw, summary), memo)| (raw, summary, memo))
+            } else {
+                None
+            };
+            if stats.is_some() || parsed.is_none() {
+                malformed = true;
+            }
+            stats = parsed;
+            return false;
+        }
+        true
+    });
+    if !found {
+        return None;
+    }
+    let Some((raw, summary, memo)) = stats else {
+        return Some(Err(()));
+    };
+    let expected = if raw > 0 && summary > 0 {
+        "hybrid"
+    } else if summary == 0 {
+        "raw_dag"
+    } else {
+        "asap"
+    };
+    if malformed || route.as_deref().is_some_and(|mode| mode != expected) {
+        Some(Err(()))
+    } else {
+        Some(Ok((raw, summary, memo)))
+    }
+}
+
 /// Append a `data_source: <id>` info-line to the response JSON's
 /// `infos` array (Prometheus 3.0-style, mirrors the wire-format
 /// extension the `GorillaQueryEngine` documents in §6 of
@@ -1544,7 +1613,7 @@ async fn process_via_router(
 async fn annotate_data_source(response: Response, data_source_id: &'static str) -> Response {
     use axum::body::to_bytes;
 
-    let (parts, body) = response.into_parts();
+    let (mut parts, body) = response.into_parts();
     // Adapter responses are bounded JSON objects; cap at 16 MiB to
     // bracket pathological cases without blowing memory.
     let bytes = match to_bytes(body, 16 * 1024 * 1024).await {
@@ -1563,6 +1632,52 @@ async fn annotate_data_source(response: Response, data_source_id: &'static str) 
             return Response::from_parts(parts, axum::body::Body::from(bytes));
         }
     };
+    if data_source_id == "asap_query" {
+        if let Some(provenance) = extract_logical_provenance(&mut value) {
+            let (route, detail) = match provenance {
+                Ok((raw, summary, memo)) => {
+                    for (name, count) in [
+                        ("x-asap-raw-scan-evaluations", raw),
+                        ("x-asap-summary-readout-evaluations", summary),
+                        ("x-asap-memo-hits", memo),
+                    ] {
+                        parts.headers.insert(
+                            name,
+                            axum::http::HeaderValue::from_str(&count.to_string()).unwrap(),
+                        );
+                    }
+                    if raw > 0 || summary == 0 {
+                        (
+                            "exact_fallback",
+                            if summary > 0 { "hybrid" } else { "local_raw" },
+                        )
+                    } else {
+                        ("warm", "asap")
+                    }
+                }
+                Err(()) => ("failed", "invalid_provenance"),
+            };
+            parts.headers.insert(
+                "x-asap-execution",
+                axum::http::HeaderValue::from_static(route),
+            );
+            parts.headers.insert(
+                "x-asap-execution-detail",
+                axum::http::HeaderValue::from_static(detail),
+            );
+            if let Some(map) = value.as_object_mut() {
+                if let Some(infos) = map
+                    .entry("infos")
+                    .or_insert_with(|| serde_json::json!([]))
+                    .as_array_mut()
+                {
+                    infos.push(serde_json::json!(format!("execution: {detail}")));
+                }
+            }
+        }
+    }
+    // The body changed; an adapter's original Content-Length is no longer valid.
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     if let serde_json::Value::Object(map) = &mut value {
         let infos_entry = map
             .entry("infos".to_string())
@@ -5673,6 +5788,9 @@ async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::
     let body = serde_json::json!({
         "status": "success",
         "sid_count": timestamps.len(),
+        "approx_resident_bytes": state.sketch_index.approx_resident_bytes(),
+        "raw_store_estimated_bytes": state.remote_write.as_ref().map(|receiver| receiver.raw_store().estimated_bytes()).unwrap_or(0),
+        "raw_store_samples": state.remote_write.as_ref().map(|receiver| receiver.raw_store().sample_count()).unwrap_or(0),
         "earliest_timestamps_per_sid": timestamps});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
@@ -6787,4 +6905,45 @@ async fn handle_delete_backfill_job(
         "status": "success",
         "job_id": job_id});
     (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod logical_provenance_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn hybrid_execution_is_fallback_with_measured_branch_counts() {
+        // A successful mixed graph must never inherit the pure-ASAP route from its engine name.
+        let response = Json(serde_json::json!({"status":"success", "warnings":[
+            "asap_execution:hybrid", "asap_logical_stats:raw=2,summary=1,memo_hits=3"
+        ], "data":{"resultType":"vector", "result":[]}}))
+        .into_response();
+        let response = annotate_data_source(response, "asap_query").await;
+        assert_eq!(response.headers()["x-asap-execution"], "exact_fallback");
+        assert_eq!(response.headers()["x-asap-execution-detail"], "hybrid");
+        assert_eq!(
+            response.headers()["x-asap-summary-readout-evaluations"],
+            "1"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value["warnings"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn partial_result_warning_survives_internal_metadata_extraction() {
+        // Only internal metadata is removed; incomplete-result warnings still invalidate comparison.
+        let mut value = serde_json::json!({"warnings":["partial data", "asap_execution:raw_dag", "asap_logical_stats:raw=1,summary=0,memo_hits=0"]});
+        assert_eq!(extract_logical_provenance(&mut value), Some(Ok((1, 0, 0))));
+        assert_eq!(value["warnings"], serde_json::json!(["partial data"]));
+    }
+
+    #[test]
+    fn contradictory_provenance_is_not_warm() {
+        // Claimed route cannot override the observed raw branch count.
+        let mut value = serde_json::json!({"warnings":["asap_execution:asap", "asap_logical_stats:raw=1,summary=1,memo_hits=0"]});
+        assert_eq!(extract_logical_provenance(&mut value), Some(Err(())));
+    }
 }

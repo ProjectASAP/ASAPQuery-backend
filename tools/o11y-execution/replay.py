@@ -37,14 +37,35 @@ def constrain_process(pid, cpus, address_space_bytes=None):
 def classify(response, headers=None):
     if response.get("status") != "success":
         return "failed"
-    if (headers or {}).get("x-asap-execution") == "exact_fallback":
+    declared = (headers or {}).get("x-asap-execution")
+    if declared in ("exact_fallback", "failed"):
+        return declared
+    detail = (headers or {}).get("x-asap-execution-detail")
+    if detail in ("hybrid", "local_raw"):
         return "exact_fallback"
+    if detail == "invalid_provenance":
+        return "failed"
     sources = {x for x in response.get("infos", []) if isinstance(x, str) and x.startswith("data_source:")}
     if sources == {"data_source: asap_query"}:
         return "warm"
     if sources == {"data_source: exact_fallback"}:
         return "exact_fallback"
     return "failed"
+
+
+def execution_provenance(response, headers=None):
+    headers = headers or {}
+    route = classify(response, headers)
+    detail = headers.get("x-asap-execution-detail")
+    if detail is None:
+        detail = "asap" if route == "warm" else "external_exact" if route == "exact_fallback" else "failed"
+    counts = {}
+    for name, header in (("raw_scan_evaluations", "x-asap-raw-scan-evaluations"),
+                         ("summary_readout_evaluations", "x-asap-summary-readout-evaluations"),
+                         ("memo_hits", "x-asap-memo-hits")):
+        value = headers.get(header)
+        counts[name] = int(value) if value is not None and value.isdigit() else None
+    return {"detail": detail, **counts}
 
 
 def validate_workload(snapshot, corpus):
@@ -203,7 +224,7 @@ def ingest(rows, endpoints, output):
                 raise RuntimeError(f"ingestion failed at batch {offset}; inspect partial acceptance before retry")
 
 
-def replay(queries, backend, output, repetitions, exact_url=None):
+def replay(queries, backend, output, repetitions, exact_url=None, relative_tolerance=0.0, absolute_tolerance=0.0):
     rows = []
     for repeat in range(repetitions):
         for query_index, query in enumerate(queries):
@@ -220,10 +241,10 @@ def replay(queries, backend, output, repetitions, exact_url=None):
             if answer["http_status"] != 200:
                 route = "failed"
             rows.append({**query, "repetition": repeat, "phase": "first_pass" if repeat == 0 else "repeat",
-                         "execution": route, **answer})
+                         "execution": route, "execution_provenance": execution_provenance(answer["response"], answer["headers"]), **answer})
             if exact is not None:
                 rows[-1]["exact"] = exact
-                rows[-1]["comparison"] = compare_results(answer["response"], exact["response"])
+                rows[-1]["comparison"] = compare_results(answer["response"], exact["response"], relative_tolerance, absolute_tolerance)
                 rows[-1]["pair_order"] = "exact_first" if exact_first else "backend_first"
             write_json(output / "queries.json", rows)
     return rows
@@ -248,6 +269,8 @@ def main():
     parser.add_argument("--port", type=int, default=18089)
     parser.add_argument("--settle-seconds", type=float, default=0, help="deprecated; completion uses explicit finite-input drain")
     parser.add_argument("--repetitions", type=int, default=2)
+    parser.add_argument("--relative-tolerance", type=float, default=0.0)
+    parser.add_argument("--absolute-tolerance", type=float, default=0.0)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.repetitions < 1 or not 0 <= args.settle_seconds <= 60:
@@ -347,7 +370,8 @@ def main():
             phases["after_ingest_and_drain"] = process_snapshots()
             write_json(args.output / "store-after-build.json", request(backend + "/api/v1/store/metrics"))
             write_json(args.output / "process-phases.json", phases)
-            results = replay(queries, backend, args.output, args.repetitions, args.exact_url if args.compare else None)
+            results = replay(queries, backend, args.output, args.repetitions, args.exact_url if args.compare else None,
+                             args.relative_tolerance, args.absolute_tolerance)
             phases["after_queries"] = process_snapshots()
             write_json(args.output / "process-phases.json", phases)
             store = request(backend + "/api/v1/store/metrics")
@@ -362,6 +386,7 @@ def main():
             write_json(args.output / "storage.json", storage)
             write_json(args.output / "completion.json", {"complete": True,
                        "execution_counts": {k: sum(r["execution"] == k for r in results) for k in ["warm", "exact_fallback", "failed"]},
+                       "execution_detail_counts": {k: sum(r["execution_provenance"]["detail"] == k for r in results) for k in ["asap", "hybrid", "local_raw", "external_exact", "failed", "invalid_provenance"]},
                        "benefit_claim": None})
             if args.compare:
                 report = {"schema_version": 1, "all_requests": summarize(results),
@@ -371,6 +396,8 @@ def main():
                                                   for query in queries},
                           "by_execution": {route: summarize([r for r in results if r["execution"] == route])
                                            for route in ["warm", "exact_fallback", "failed"]},
+                          "by_execution_detail": {detail: summarize([r for r in results if r["execution_provenance"]["detail"] == detail])
+                                                  for detail in ["asap", "hybrid", "local_raw", "external_exact"]},
                           "estimated_cost": plan["cost_comparison"],
                           "measurement_units": {"latency": "nanoseconds", "cpu": "process CPU nanoseconds", "memory": "bytes"},
                           "resource_limits": {"cpu_affinity": sorted(cpus) if cpus else None,
@@ -398,14 +425,15 @@ def main():
                               "Raw process RSS is not summary state size; store.json retains backend counters",
                               "Service startup before supplied PID attachment and isolated cold-cache runs remain unmeasured",
                               "Query equality on one dataset is not a formal approximation confidence guarantee"]}
+                from summarize import query_cost_comparison, STALE
+                report["query_cost_comparison"] = query_cost_comparison(plan, report, results, provenance, json.loads(args.snapshot.read_text()))
+                if report["query_cost_comparison"]["available"]:
+                    report["limitations"] = [item for item in report["limitations"] if item != STALE]
+                report["limitations"].append("Full lifecycle ratio remains unavailable: residency, retirement and service startup scopes are not aligned")
                 write_json(args.output / "comparison.json", report)
         finally:
-            child.terminate()
-            try:
-                child.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.wait()
+            from process_lifecycle import stop
+            write_json(args.output / "backend-lifecycle.json", stop(child, timeout=10))
 
 
 if __name__ == "__main__":

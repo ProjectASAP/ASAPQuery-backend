@@ -490,6 +490,7 @@ mod tests {
                             sid_grouping: vec![],
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 1_000,
+                            readout_lookback_ms: Some(1_000),
                         },
                     },
                 ),

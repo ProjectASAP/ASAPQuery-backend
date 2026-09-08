@@ -4,7 +4,7 @@ from unittest.mock import patch
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
-from replay import classify, validate_workload, encode_write, parse_samples, replay
+from replay import execution_provenance, classify, validate_workload, encode_write, parse_samples, replay
 
 
 class ReplayTests(unittest.TestCase):
@@ -19,6 +19,14 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual(classify(response), "failed")
         self.assertEqual(classify({"status": "success", "infos": ["data_source: asap_query"]},
                                   {"x-asap-execution": "exact_fallback"}), "exact_fallback")
+
+    def test_hybrid_is_not_counted_as_pure_summary_acceleration(self):
+        response = {"status": "success", "infos": ["data_source: asap_query"]}
+        headers = {"x-asap-execution": "exact_fallback", "x-asap-execution-detail": "hybrid",
+                   "x-asap-raw-scan-evaluations": "2", "x-asap-summary-readout-evaluations": "1"}
+        self.assertEqual(classify(response, headers), "exact_fallback")
+        self.assertEqual(execution_provenance(response, headers)["summary_readout_evaluations"], 1)
+        self.assertEqual(classify(response, {"x-asap-execution": "failed"}), "failed")
 
     def test_corpus_occurrences_preserved_but_all_unique_queries_registered(self):
         """The harness cannot quietly replace or omit upstream queries."""

@@ -119,6 +119,7 @@ pub struct ASAPQueryEngine {
     /// Generation-consistent physical snapshot used by the production query
     /// path. QueryPlan and BackendPlan must never be sampled separately.
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
+    raw_store: Option<Arc<crate::query_engines::raw_store::RawSampleStore>>,
 }
 
 impl ASAPQueryEngine {
@@ -150,7 +151,196 @@ impl ASAPQueryEngine {
             sketch_index: None,
             archive_engine: None,
             active_physical_plan: None,
+            raw_store: None,
         }
+    }
+
+    pub fn with_raw_store(
+        mut self,
+        store: Arc<crate::query_engines::raw_store::RawSampleStore>,
+    ) -> Self {
+        self.raw_store = Some(store);
+        self
+    }
+
+    fn execute_logical_entry(
+        &self,
+        physical: &crate::storage_engines::types::ActivePhysicalPlan,
+        entry: &control_plane::query_plan::QueryPlanEntry,
+        samples: &super::logical_dag::PreparedSamples,
+        at: u64,
+    ) -> Result<
+        (
+            crate::query_engines::query_result::QueryResult,
+            super::logical_dag::ExecutionStats,
+        ),
+        crate::query_engines::EngineError,
+    > {
+        use crate::query_engines::EngineError;
+        super::logical_dag::execute_prepared_with_stats(
+            entry,
+            samples,
+            at,
+            |root, evaluation_ms| {
+                let mut subtree = entry.clone();
+                subtree.root = root;
+                let reachable = subtree.topological_order().map_err(|e| {
+                    EngineError::capability_miss("installed_logical_dag", e.to_string())
+                })?;
+                subtree.nodes.retain(|id, _| reachable.contains(id));
+                let bindings = subtree.materialization_bindings();
+                let windows: std::collections::BTreeSet<Option<u64>> =
+                    bindings.iter().map(|b| b.readout_lookback_ms).collect();
+                if windows.len() != 1 || windows.contains(&None) || windows.contains(&Some(0)) {
+                    return Err(EngineError::capability_miss(
+                        "installed_logical_dag",
+                        "bound subtree requires one explicit positive window",
+                    ));
+                }
+                subtree.instant.lookback_ms = windows
+                    .first()
+                    .copied()
+                    .flatten()
+                    .expect("explicit semantic lookback checked");
+                subtree.instant.full_history = false;
+                subtree.instant.cumulative_readout = true;
+                let requirement = readiness_requirement(&subtree);
+                let index = self.sketch_index.as_ref().ok_or_else(|| {
+                    EngineError::capability_miss(
+                        "installed_logical_dag",
+                        "summary store unavailable",
+                    )
+                })?;
+                let (result, t0) = super::live_serve::serve_instant_from_query_plan(
+                    index,
+                    &subtree,
+                    evaluation_ms,
+                )
+                .map_err(|e| {
+                    EngineError::capability_miss(
+                        "installed_logical_dag",
+                        format!("bound readout failed: {e:?}"),
+                    )
+                })?;
+                let active = self.active_physical_plan.as_ref().ok_or_else(|| {
+                    EngineError::capability_miss(
+                        "installed_logical_dag",
+                        "readiness registry unavailable",
+                    )
+                })?;
+                let plan_id = physical.backend_plan.plan_id;
+                let version = physical.backend_plan.plan_version;
+                if !complete_window_coverage(
+                    result.coverage,
+                    t0,
+                    evaluation_ms,
+                    requirement.max_window_ms,
+                ) {
+                    active.mark_materializing(
+                        plan_id,
+                        version,
+                        &requirement.materializations,
+                        result.coverage,
+                    );
+                    return Err(EngineError::capability_miss(
+                        "installed_logical_dag",
+                        format!("bound readout incomplete at {evaluation_ms}"),
+                    ));
+                }
+                let coverage = result.coverage.expect("coverage checked");
+                if !active.mark_ready(plan_id, version, &requirement.materializations, coverage)
+                    || !active.mark_serving(
+                        plan_id,
+                        version,
+                        &requirement.materializations,
+                        coverage,
+                    )
+                {
+                    return Err(EngineError::capability_miss(
+                        "installed_logical_dag",
+                        "physical generation changed during bound readout",
+                    ));
+                }
+                Ok(asap_tier_result_to_query_result(
+                    result,
+                    evaluation_ms,
+                    false,
+                ))
+            },
+        )
+    }
+
+    fn execute_logical_range(
+        &self,
+        physical: &crate::storage_engines::types::ActivePhysicalPlan,
+        entry: &control_plane::query_plan::QueryPlanEntry,
+        start: u64,
+        end: u64,
+        step: u64,
+    ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
+    {
+        use crate::query_engines::{
+            query_result::{QueryResult, RangeVectorElement},
+            EngineError,
+        };
+        if step == 0 || start > end || (end - start) / step >= 11_000 {
+            return Err(EngineError::capability_miss(
+                "installed_logical_dag",
+                "invalid range or more than 11000 evaluations",
+            ));
+        }
+        let store = self.raw_store.as_ref().ok_or_else(|| {
+            EngineError::capability_miss("installed_logical_dag", "raw store unavailable")
+        })?;
+        let samples = store.snapshot(
+            physical.backend_plan.plan_id,
+            physical.backend_plan.plan_version,
+        )?;
+        let mut series =
+            std::collections::BTreeMap::<Vec<(String, String)>, RangeVectorElement>::new();
+        let mut total = super::logical_dag::ExecutionStats::default();
+        let mut at = start;
+        loop {
+            let (result, stats) = self.execute_logical_entry(physical, entry, &samples, at)?;
+            total.raw_scan_evaluations += stats.raw_scan_evaluations;
+            total.summary_readout_evaluations += stats.summary_readout_evaluations;
+            total.memo_hits += stats.memo_hits;
+            let QueryResult::Vector(result) = result else {
+                return Err(EngineError::capability_miss(
+                    "installed_logical_dag",
+                    "range step requires vector",
+                ));
+            };
+            for point in result.values {
+                let keys = point.label_keys_override.ok_or_else(|| {
+                    EngineError::capability_miss(
+                        "installed_logical_dag",
+                        "missing range label identity",
+                    )
+                })?;
+                let identity = keys
+                    .iter()
+                    .cloned()
+                    .zip(point.labels.labels.iter().cloned())
+                    .collect();
+                series
+                    .entry(identity)
+                    .or_insert_with(|| {
+                        RangeVectorElement::new(point.labels).with_label_keys_override(keys)
+                    })
+                    .add_sample(at, point.value);
+            }
+            let Some(next) = at.checked_add(step) else {
+                break;
+            };
+            if next > end {
+                break;
+            }
+            at = next;
+        }
+        let mut result = QueryResult::matrix(series.into_values().collect());
+        annotate_logical_execution(&mut result, &total);
+        Ok(result)
     }
 
     pub fn with_active_physical_plan(
@@ -351,6 +541,18 @@ impl ASAPQueryEngine {
         step_ms: u64,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
+        if let Some(physical) = self.physical_plan_snapshot() {
+            if let Ok(entry) = physical.query_plan.lookup(query) {
+                if entry.nodes.values().any(|node| {
+                    matches!(
+                        node,
+                        control_plane::query_plan::QueryPlanNode::Logical { .. }
+                    )
+                }) {
+                    return self.execute_logical_range(&physical, entry, start_ms, end_ms, step_ms);
+                }
+            }
+        }
         let Some(idx) = self.sketch_index.as_ref() else {
             return Err(crate::query_engines::EngineError::capability_miss(
                 crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
@@ -569,6 +771,31 @@ fn stitch_warm_and_archive(
     QueryResult::matrix(elements)
 }
 
+fn annotate_logical_execution(
+    result: &mut crate::query_engines::query_result::QueryResult,
+    stats: &super::logical_dag::ExecutionStats,
+) {
+    use crate::query_engines::query_result::QueryResult;
+    let warnings = match result {
+        QueryResult::Vector(v) => &mut v.warnings,
+        QueryResult::Matrix(m) => &mut m.warnings,
+    };
+    if stats.raw_scan_evaluations > 0 || stats.summary_readout_evaluations == 0 {
+        warnings.push(
+            if stats.summary_readout_evaluations > 0 {
+                "asap_execution:hybrid"
+            } else {
+                "asap_execution:raw_dag"
+            }
+            .into(),
+        );
+    }
+    warnings.push(format!(
+        "asap_logical_stats:raw={},summary={},memo_hits={}",
+        stats.raw_scan_evaluations, stats.summary_readout_evaluations, stats.memo_hits
+    ));
+}
+
 fn asap_tier_result_to_query_result(
     result: crate::storage_engines::sketch_db::query::ASAPTierResult,
     now_ms: u64,
@@ -660,6 +887,31 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
         now_ms: u64,
     ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
     {
+        if let Some(physical) = self.physical_plan_snapshot() {
+            if let Ok(entry) = physical.query_plan.lookup(query) {
+                if entry.nodes.values().any(|node| {
+                    matches!(
+                        node,
+                        control_plane::query_plan::QueryPlanNode::Logical { .. }
+                    )
+                }) {
+                    let store = self.raw_store.as_ref().ok_or_else(|| {
+                        crate::query_engines::EngineError::capability_miss(
+                            "installed_logical_dag",
+                            "raw store unavailable",
+                        )
+                    })?;
+                    let samples = store.snapshot(
+                        physical.backend_plan.plan_id,
+                        physical.backend_plan.plan_version,
+                    )?;
+                    let (mut result, stats) =
+                        self.execute_logical_entry(&physical, entry, &samples, now_ms)?;
+                    annotate_logical_execution(&mut result, &stats);
+                    return Ok(result);
+                }
+            }
+        }
         // One authoritative warm path: ASAPPlanner post-ASAP DAG →
         // BackendPlan/materialization resolver → SID lookup → DAG executor.
         // A typed resolver/executor error becomes CapabilityMiss, which lets
