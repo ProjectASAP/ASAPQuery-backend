@@ -233,6 +233,9 @@ impl GroupState {
             return None;
         };
         let stat = match (readout, agg_type) {
+            (control_plane::query_plan::ExactReadout::Count, AggregationType::Sum) => {
+                asap_types::Statistic::Count
+            }
             (
                 control_plane::query_plan::ExactReadout::Sum,
                 AggregationType::Sum | AggregationType::MultipleSum,
@@ -260,7 +263,11 @@ impl GroupState {
             ("range_start_ms".to_string(), range_start_ms.to_string()),
             ("range_end_ms".to_string(), range_end_ms.to_string()),
         ]);
-        merged?.query_statistic(stat, key, &query_kwargs).ok()
+        let merged = merged?;
+        if readout == control_plane::query_plan::ExactReadout::Count {
+            return merged.aux_stats().count.map(|count| count as f64);
+        }
+        merged.query_statistic(stat, key, &query_kwargs).ok()
     }
 
     /// Coverage analog of `exact_value` — folds `(min_window_end_ms,
@@ -1142,7 +1149,7 @@ pub(crate) fn find_metric_in_query_expr(qe: &QueryExpr) -> Option<String> {
         | QueryExpr::TimeRange { child, .. }
         | QueryExpr::TimeShift { child, .. }
         | QueryExpr::SQLWindowFunc { child, .. } => find_metric_in_query_expr(child),
-        QueryExpr::Concat { children } => children.iter().find_map(find_metric_in_query_expr),
+        QueryExpr::Concat { children, .. } => children.iter().find_map(find_metric_in_query_expr),
         QueryExpr::Join { left, .. } | QueryExpr::SetOp { left, .. } => {
             find_metric_in_query_expr(left)
         }
@@ -1221,7 +1228,12 @@ mod tests {
                     planner_types::post_asap::SketchAlgorithm::Kll,
                     planner_types::post_asap::SketchParams::Kll { k: 200 },
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction,
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
@@ -1245,7 +1257,12 @@ mod tests {
                     planner_types::post_asap::SketchAlgorithm::Hll,
                     planner_types::post_asap::SketchParams::Hll { precision: 10 },
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction,
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
@@ -1395,7 +1412,12 @@ mod tests {
                         depth: 4,
                     },
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction: Reduction::by(vec![]),
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
@@ -1458,7 +1480,12 @@ mod tests {
                         heap_size: 10,
                     },
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction: Reduction::by(vec![]),
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
@@ -1502,7 +1529,12 @@ mod tests {
                     planner_types::post_asap::ExactKind::Sum,
                     planner_types::post_asap::ExactParams::Sum,
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 // Sum is a genuine PromQL aggregation operator -- an empty
                 // `by` always means "reduce fully," never `PerEntity` (see
                 // `resolve_group_key`'s doc).
@@ -2327,7 +2359,12 @@ mod tests {
                     planner_types::post_asap::SketchAlgorithm::Kll,
                     planner_types::post_asap::SketchParams::Kll { k: 500 },
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction: Reduction::by(vec![]),
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },
@@ -2788,7 +2825,12 @@ mod tests {
                     planner_types::post_asap::ExactKind::MinMax,
                     planner_types::post_asap::ExactParams::MinMax,
                 ),
-                col: ColumnRef::SampleValue,
+                input: planner_types::post_asap::SummaryUpdate {
+                    item: None,
+                    weight: planner_types::post_asap::SummaryInputExpr::Column(
+                        ColumnRef::SampleValue,
+                    ),
+                },
                 reduction: Reduction::by(vec![]),
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
             },

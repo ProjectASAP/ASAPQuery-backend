@@ -618,6 +618,7 @@ struct CompileAndPublishPhysicalPlanResponse {
     status: &'static str,
     generated_at_unix_ms: u64,
     collector_ids: Vec<String>,
+    lifecycle_estimates: Vec<physical::compiler::MaterializationLifecycleEstimate>,
 }
 
 /// Compile one Planner IR decision into matching Collector, Precompute, and Backend views
@@ -674,9 +675,12 @@ async fn handle_compile_and_publish_physical_plan(
         .publish_collector_plans(&bundle.collector_plans, apply_timeout)
         .await
     {
+        let cleanup = backend
+            .discard_staged_physical_plan(bundle.envelope.plan_id, bundle.envelope.plan_version)
+            .await;
         return (
             StatusCode::BAD_GATEWAY,
-            format!("collector physical-plan publication failed: {error}"),
+            format!("collector physical-plan publication failed: {error}; staged backend cleanup: {cleanup:?}"),
         )
             .into_response();
     }
@@ -712,6 +716,7 @@ async fn handle_compile_and_publish_physical_plan(
         status: "active",
         generated_at_unix_ms: bundle.envelope.generated_at_unix_ms,
         collector_ids,
+        lifecycle_estimates: bundle.lifecycle_estimates,
     })
     .into_response()
 }
@@ -759,6 +764,7 @@ fn compile_physical_plan_request(
         .unwrap_or_default()
         .as_millis() as u64;
     let mut queries = Vec::with_capacity(request.queries.len());
+    let mut canonical_roots = Vec::with_capacity(request.queries.len());
     for query in request.queries {
         if query.query_id.trim().is_empty()
             || query.metric.trim().is_empty()
@@ -773,15 +779,11 @@ fn compile_physical_plan_request(
             Ok(expr) => expr,
             Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
         };
-        let post_asap = match physical::compiler::select_post_asap(
-            &expr,
-            query.accuracy.clone(),
-            &query.lifecycle,
-            request.evidence.get(&query.query_id),
-        ) {
+        let post_asap = match control_plane::planner_selection::keep_pre_asap(&expr) {
             Ok(plan) => plan,
             Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
         };
+        canonical_roots.push(std::rc::Rc::new(expr));
         queries.push(physical::compiler::PlanningQuery {
             query_id: query.query_id,
             query_string: query.query_string,
@@ -796,6 +798,12 @@ fn compile_physical_plan_request(
             window_implementations: query.window_implementations,
             runtime_policy: query.runtime_policy,
         });
+    }
+
+    if let Err(error) =
+        physical::compiler::select_workload_roots(&mut queries, canonical_roots, &request.evidence)
+    {
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string()));
     }
 
     let bundle = match physical::compiler::PhysicalCompiler.compile(

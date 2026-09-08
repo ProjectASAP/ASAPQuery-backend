@@ -194,7 +194,7 @@ fn collect_agg_intents(expr: &planner_types::pre_asap::QueryExpr, out: &mut Vec<
         | QueryExpr::TimeRange { child, .. }
         | QueryExpr::TimeShift { child, .. }
         | QueryExpr::SQLWindowFunc { child, .. } => collect_agg_intents(child, out),
-        QueryExpr::Concat { children } => {
+        QueryExpr::Concat { children, .. } => {
             for child in children {
                 collect_agg_intents(child, out);
             }
