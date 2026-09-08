@@ -839,6 +839,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     for query in [
         "rate(asap_demo_counter_total[5s])",
         "increase(asap_demo_counter_total[5s])",
+        "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
     ] {
         let instant: Value = client
             .get(format!("{backend}/api/v1/query"))
@@ -874,15 +875,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let sum = wait_for_warm_instant(
         &client,
         &backend,
-        "sum_over_time(asap_demo_gauge[5s])",
-        first_eval,
-        &backend_log,
-    )
-    .await;
-    let quantile = wait_for_warm_instant(
-        &client,
-        &backend,
-        "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
+        "sum(sum_over_time(asap_demo_gauge[5s]))",
         first_eval,
         &backend_log,
     )
@@ -927,15 +920,9 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         "asap_demo_gauge{job=\"api\"}"
     );
     assert!((first_value(&sum, "value").expect("sum value") - 240.0).abs() < 1e-9);
-    let quantile_value = first_value(&quantile, "value").expect("quantile value");
-    assert!(
-        (19.0..=31.0).contains(&quantile_value),
-        "unexpected p50: {quantile_value}; response={quantile}"
-    );
 
     for query in [
-        "sum_over_time(asap_demo_gauge[5s])",
-        "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
+        "sum(sum_over_time(asap_demo_gauge[5s]))",
         "topk(1, sum_over_time(asap_demo_gauge[5s]))",
         "topk(1, count_over_time(asap_demo_gauge[5s]))",
     ] {
@@ -1156,7 +1143,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let materializations = status["materializations"]
         .as_array()
         .expect("materialization statuses");
-    assert_eq!(materializations.len(), 4);
+    assert_eq!(materializations.len(), 3);
     assert!(materializations
         .iter()
         .all(|entry| entry["phase"] == "serving"));
