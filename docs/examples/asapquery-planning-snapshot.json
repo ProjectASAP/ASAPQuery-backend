@@ -1,7 +1,7 @@
 {
   "snapshot_version": 1,
   "query_workload": {
-    "language": "prom_q_l",
+    "language": "promql",
     "query_batch": null,
     "repeating_queries": [
       {

@@ -147,7 +147,7 @@ fn root_scan_schema(qe: &QueryExpr) -> Option<&planner_types::pre_asap::Schema> 
         | QueryExpr::Sort { child, .. }
         | QueryExpr::Limit { child, .. }
         | QueryExpr::PromqlSubquery { child, .. } => root_scan_schema(child),
-        QueryExpr::Concat { children } => children.iter().find_map(root_scan_schema),
+        QueryExpr::Concat { children, .. } => children.iter().find_map(root_scan_schema),
         QueryExpr::Join { left, right, .. }
         | QueryExpr::SetOp { left, right, .. }
         | QueryExpr::BinaryOp {
@@ -257,7 +257,7 @@ impl QeCollector {
                 self.visit(child, schema);
             }
             QueryExpr::Dedup { child, .. } => self.visit(child, schema),
-            QueryExpr::Concat { children } => {
+            QueryExpr::Concat { children, .. } => {
                 for c in children {
                     self.visit(c, schema);
                 }

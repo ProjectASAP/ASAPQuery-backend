@@ -42,7 +42,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "5daccfede6fe75dbe638be8e5eed5382b5b91693";
+pub const PLANNER_REVISION: &str = "378a7547ede629a64e84c9f7c810226ce196cce9";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
@@ -169,6 +169,8 @@ pub enum PhysicalDeploymentTarget {
 #[serde(deny_unknown_fields)]
 pub struct BackendLocalPlanningSnapshot {
     pub snapshot_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_cost_evidence: Option<super::workload_cost::WorkloadCostEvidence>,
     pub query_workload: QueryWorkload,
     pub data_workload: DataWorkload,
     pub implementation: BackendLocalImplementation,
@@ -185,8 +187,8 @@ pub struct BackendLocalImplementation {
     pub window_implementation_id: String,
     pub state_layout: String,
     pub implementation_cost: ImplementationCostEvidence,
-    /// Optional per-query membership certificates for approximate TopK.
-    /// Keys are the exact PromQL strings in `query_workload`.
+    /// Certificates keyed by exact registered PromQL; converted to root IDs
+    /// before workload selection so one query cannot borrow another's evidence.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub topk_evidence: HashMap<String, TopKMembershipEvidence>,
 }
@@ -622,6 +624,20 @@ pub struct PhysicalPlan {
     pub transmission_plan: TransmissionPlan,
     pub backend_plan: BackendPlan,
     pub query_plan: QueryPlan,
+    /// Lifecycle component only, not a complete physical-plan comparison.
+    pub lifecycle_estimates: Vec<MaterializationLifecycleEstimate>,
+    pub cost_comparison: Option<super::workload_cost::WorkloadCostComparison>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MaterializationLifecycleEstimate {
+    pub materialization: asap_types::PolicyFingerprint,
+    pub consumer_query_ids: Vec<String>,
+    pub window_implementation_id: String,
+    pub horizon_seconds: f64,
+    pub expected_reads: f64,
+    pub expected_updates: f64,
+    pub lifecycle_cost: f64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1505,7 +1521,28 @@ impl BackendLocalPlanningSnapshot {
     /// one backend-local PhysicalPlan. No CollectorPlan is produced and no
     /// precompiled serving artifact is accepted at this boundary.
     pub fn compile(self) -> Result<PhysicalPlan, CompileError> {
-        if self.snapshot_version != 1 {
+        let evidence = self.workload_cost_evidence.clone();
+        if self.snapshot_version == 2 && evidence.is_none() {
+            return Err(CompileError::Snapshot(
+                "version 2 requires complete workload cost evidence".into(),
+            ));
+        }
+        let (request, environment) = self.planning_request()?;
+        match evidence {
+            Some(evidence) => super::workload_cost::select(
+                super::workload_cost::with_exact_alternative(request)?,
+                environment,
+                &evidence,
+            ),
+            None => PhysicalCompiler.compile(request, environment),
+        }
+    }
+
+    /// Build Planner-authorized candidates for evidence collection without publishing.
+    pub fn planning_request(
+        self,
+    ) -> Result<(PlanningRequest, DeploymentEnvironment), CompileError> {
+        if self.snapshot_version != 1 && self.snapshot_version != 2 {
             return Err(CompileError::Snapshot(format!(
                 "unsupported workload snapshot version {}",
                 self.snapshot_version
@@ -1548,6 +1585,7 @@ impl BackendLocalPlanningSnapshot {
             ));
         }
         let mut queries = Vec::with_capacity(entries.len());
+        let mut canonical_roots = Vec::with_capacity(entries.len());
         let mut topk_evidence_by_id = HashMap::new();
         for (index, entry) in entries.into_iter().enumerate() {
             let evaluation_interval_ms = match entry.recurrence {
@@ -1594,15 +1632,15 @@ impl BackendLocalPlanningSnapshot {
                 horizon_seconds: self.implementation.horizon_seconds,
                 costs: self.implementation.lifecycle_costs.clone(),
             };
-            let topk_evidence = self.implementation.topk_evidence.get(&query_string);
-            let post_asap = select_post_asap(&parsed, accuracy.clone(), &lifecycle, topk_evidence)
+            let post_asap = crate::planner_selection::keep_pre_asap(&parsed)
                 .map_err(|error| CompileError::Snapshot(format!("query {index}: {error}")))?;
+            canonical_roots.push(Rc::new(parsed));
             let mut cost = self.implementation.implementation_cost.clone();
             cost.workload_fingerprint =
                 canonical_promql(&query_string).map_err(CompileError::QueryPlan)?;
             cost.horizon_seconds = self.implementation.horizon_seconds;
             let query_id = format!("compat-query-{index}");
-            if let Some(evidence) = topk_evidence {
+            if let Some(evidence) = self.implementation.topk_evidence.get(&query_string) {
                 topk_evidence_by_id.insert(query_id.clone(), evidence.clone());
             }
             queries.push(PlanningQuery {
@@ -1627,21 +1665,22 @@ impl BackendLocalPlanningSnapshot {
                 runtime_policy: RuntimeRulePolicy::default(),
             });
         }
-        PhysicalCompiler.compile(
+        select_workload_roots(&mut queries, canonical_roots, &topk_evidence_by_id)?;
+        Ok((
             PlanningRequest {
                 queries,
                 evidence: topk_evidence_by_id,
                 planner_revision: PLANNER_REVISION.into(),
             },
             self.environment,
-        )
+        ))
     }
 }
 
 impl PhysicalCompiler {
     pub fn compile(
         &self,
-        request: PlanningRequest,
+        mut request: PlanningRequest,
         environment: DeploymentEnvironment,
     ) -> Result<PhysicalPlan, CompileError> {
         if request.planner_revision != PLANNER_REVISION {
@@ -1659,20 +1698,44 @@ impl PhysicalCompiler {
             });
         }
 
+        let roots = request
+            .queries
+            .iter()
+            .enumerate()
+            .map(|(id, query)| (id, Rc::clone(&query.post_asap)))
+            .collect();
+        for (id, root) in planner_types::post_asap::share_common_summary_subtrees(roots) {
+            request.queries[id].post_asap = root;
+        }
         let mut aggregations = Vec::with_capacity(request.queries.len());
         let mut readouts = Vec::with_capacity(request.queries.len());
         let mut collector_materializations = Vec::with_capacity(request.queries.len());
+        let mut plan_materializations = Vec::with_capacity(request.queries.len());
+        let mut shared_materializations = BTreeMap::new();
         let mut runtime_policies = BTreeMap::new();
         // Binding is established while compiling the physical
         // materializations, then consumed by QueryPlan lowering. The key is
-        // the planner DAG node identity within a query; serving never scans
+        // the planner DAG node identity across the workload; serving never scans
         // BackendPlan candidates to rediscover this decision.
-        let mut node_bindings = HashMap::<(String, usize), asap_types::PolicyFingerprint>::new();
+        let mut node_bindings = HashMap::<usize, asap_types::PolicyFingerprint>::new();
+        let consumers = materialization_consumers(&request.queries, environment.target)?;
+        let mut lifecycle_estimates = BTreeMap::new();
 
         for query in &request.queries {
             let evidence = request.evidence.get(&query.query_id);
             if let Some(e) = evidence {
                 validate_evidence(&query.query_id, e, &environment)?;
+            }
+            let node = query.post_asap.clone();
+            let selected =
+                collect_selected_materializations(&node).map_err(|reason| CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason,
+                })?;
+            // An exact native fallback has no maintained state and must not
+            // depend on evidence for unused window/state implementations.
+            if selected.is_empty() {
+                continue;
             }
             validate_lifecycle_input(&query.query_id, &query.lifecycle)?;
             let lifecycle_costs = SummaryMaintenanceLifecycleCostInputs {
@@ -1695,22 +1758,23 @@ impl PhysicalCompiler {
                     },
                 )
                 .with_window_framework_costs(window_costs);
-            let node = query.post_asap.clone();
-            let selected =
-                collect_selected_materializations(&node).map_err(|reason| CompileError::Query {
+            if environment.target == PhysicalDeploymentTarget::DistributedCollectors
+                && selected.iter().any(|state| {
+                    matches!(
+                        state.family,
+                        SummaryFamilyType::ExactAggregate(
+                            planner_types::post_asap::ExactKind::Count,
+                            _
+                        )
+                    )
+                })
+            {
+                return Err(CompileError::Query {
                     query_id: query.query_id.clone(),
-                    reason,
-                })?;
-            let planner_selection = select_lifecycle(query, &node, &model, &environment)?;
-            let window_implementation = query
-                .window_implementations
-                .iter()
-                .filter(|candidate| candidate.framework == planner_selection.window_framework)
-                .min_by(|left, right| left.cost.weighted_cost.total_cmp(&right.cost.weighted_cost))
-                .ok_or_else(|| CompileError::Lifecycle {
-                    query_id: query.query_id.clone(),
-                    reason: "Planner selected a window framework without a retained concrete implementation".into(),
-                })?;
+                    reason: "observation-count readout requires the backend-local raw producer"
+                        .into(),
+                });
+            }
             match &query.source {
                 Source::TimeSeries { .. } => {}
                 Source::Table { .. } => {
@@ -1727,29 +1791,54 @@ impl PhysicalCompiler {
                 // as Increase. Keep that semantic distinction in QueryPlan,
                 // while the physical store binds both to Increase state.
                 let physical_family = physical_materialization_family(&selected.family);
-                let aggregation = BackendAggregation {
-                    aggregation_id: aggregation_id.clone(),
-                    metric_name: metric.clone(),
-                    family: physical_family,
-                    window_secs: query.window_secs,
-                    spatial_filter: String::new(),
-                    grouping: query.group_by.clone(),
-                    item_label: None,
-                    topk_weight: selected.readout.as_ref().and_then(|readout| match readout {
-                        SketchQuery::TopK { weight, .. } => Some(*weight),
-                        _ => None,
-                    }),
-                    aggregation_input: match environment.target {
-                        PhysicalDeploymentTarget::DistributedCollectors => {
-                            AggregationInput::SketchEnvelope
-                        }
-                        PhysicalDeploymentTarget::BackendLocalRemoteWrite => AggregationInput::Raw,
-                    },
+                let physical_algorithm = match &physical_family {
+                    SummaryFamilyType::ExactAggregate(kind, _) => {
+                        format!("{kind:?}").to_ascii_lowercase()
+                    }
+                    _ => selected.algorithm.clone(),
                 };
+                let aggregation = physical_aggregation(
+                    query,
+                    &selected,
+                    aggregation_id.clone(),
+                    environment.target,
+                );
                 let precompute_materialization =
                     backend_plan::aggregation_config_for_materialization(&aggregation)?;
                 let materialization = precompute_materialization.policy_fingerprint();
-                let binding_key = (query.query_id.clone(), selected.node_identity);
+                let state_consumers = consumers[&materialization]
+                    .iter()
+                    .map(|index| &request.queries[*index])
+                    .collect::<Vec<_>>();
+                let planner_selection = select_lifecycle(
+                    query,
+                    &selected.node,
+                    &model,
+                    &environment,
+                    &state_consumers,
+                )?;
+                let window_implementation = query.window_implementations.iter()
+                    .filter(|candidate| candidate.framework == planner_selection.window_framework)
+                    .min_by(|left, right| left.cost.weighted_cost.total_cmp(&right.cost.weighted_cost))
+                    .ok_or_else(|| CompileError::Lifecycle {
+                        query_id: query.query_id.clone(),
+                        reason: "Planner selected a window framework without a retained concrete implementation".into(),
+                    })?;
+                lifecycle_estimates
+                    .entry(materialization)
+                    .or_insert_with(|| MaterializationLifecycleEstimate {
+                        materialization,
+                        consumer_query_ids: state_consumers
+                            .iter()
+                            .map(|query| query.query_id.clone())
+                            .collect(),
+                        window_implementation_id: window_implementation.implementation_id.clone(),
+                        horizon_seconds: query.lifecycle.horizon_seconds,
+                        expected_reads: planner_selection.expected_reads,
+                        expected_updates: planner_selection.expected_updates,
+                        lifecycle_cost: planner_selection.lifecycle_cost,
+                    });
+                let binding_key = selected.node_identity;
                 if let Some(existing) = node_bindings.insert(binding_key, materialization) {
                     if existing != materialization {
                         return Err(CompileError::Query {
@@ -1777,11 +1866,11 @@ impl PhysicalCompiler {
                         op: readout,
                     });
                 }
-                collector_materializations.push(CollectorMaterialization {
-                    query_id: query.query_id.clone(),
+                let collector_materialization = CollectorMaterialization {
+                    query_id: format!("state-{}", materialization.0),
                     materialization,
                     metric: metric.clone(),
-                    algorithm: selected.algorithm,
+                    algorithm: physical_algorithm,
                     parameters: selected.parameters,
                     group_by: query.group_by.clone(),
                     window_secs: query.window_secs,
@@ -1791,11 +1880,32 @@ impl PhysicalCompiler {
                     state_layout: window_implementation.state_layout.clone(),
                     evidence_source: evidence.map(|e| e.source.clone()),
                     lifecycle: planner_selection.lifecycle.clone(),
-                });
+                };
+                // The store fingerprint identifies state, not its concrete
+                // deployment. Consumers may share it only when their selected
+                // implementations agree; otherwise publication would install
+                // conflicting producers for the same state identity.
+                let mut shared_contract = collector_materialization.clone();
+                // Keep every consumer in the existing plan identity even
+                // though the executable producer declaration is deduplicated.
+                plan_materializations.push(collector_materialization.clone());
+                shared_contract.query_id.clear();
+                if let Some(existing) = shared_materializations.get(&materialization) {
+                    if existing != &shared_contract {
+                        return Err(CompileError::Query {
+                            query_id: query.query_id.clone(),
+                            reason: "queries sharing one materialization specify conflicting deployment contracts"
+                                .into(),
+                        });
+                    }
+                } else {
+                    shared_materializations.insert(materialization, shared_contract);
+                    collector_materializations.push(collector_materialization);
+                }
             }
         }
 
-        let plan_id = stable_plan_id(&collector_materializations);
+        let plan_id = stable_workload_plan_id(&plan_materializations, &request.queries);
         let envelope = PlanEnvelope {
             plan_id,
             plan_version: environment.plan_version,
@@ -1910,7 +2020,7 @@ impl PhysicalCompiler {
                         )
                     })?;
                     let fingerprint = node_bindings
-                        .get(&(query.query_id.clone(), node as *const SummaryNode as usize))
+                        .get(&(node as *const SummaryNode as usize))
                         .copied()
                         .ok_or_else(|| {
                             crate::query_plan::QueryPlanError::Invalid(format!(
@@ -1964,6 +2074,8 @@ impl PhysicalCompiler {
             transmission_plan,
             backend_plan,
             query_plan,
+            lifecycle_estimates: lifecycle_estimates.into_values().collect(),
+            cost_comparison: None,
         })
     }
 }
@@ -1994,6 +2106,10 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 walk(right, metrics);
             }
             SummaryExpr::SummaryDelete { summary_input, .. } => walk(summary_input, metrics),
+            SummaryExpr::BinaryOp { lhs, rhs, .. } => {
+                walk(lhs, metrics);
+                walk(rhs, metrics);
+            }
         }
     }
     let mut metrics = BTreeSet::new();
@@ -2001,6 +2117,52 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
     (metrics.len() == 1)
         .then(|| metrics.into_iter().next())
         .flatten()
+}
+
+/// Shared selection boundary for canonical startup and compile-and-publish.
+/// Certificate-bearing roots stay isolated: equal certificate values do not
+/// establish that the certificate's source scope covers another query.
+pub fn select_workload_roots(
+    queries: &mut [PlanningQuery],
+    roots: Vec<Rc<QueryExpr>>,
+    evidence: &HashMap<String, TopKMembershipEvidence>,
+) -> Result<(), CompileError> {
+    if roots.len() != queries.len() {
+        return Err(CompileError::Snapshot(
+            "canonical root/query mapping is incomplete".into(),
+        ));
+    }
+    let mut cohorts: Vec<(AccuracyTarget, Option<String>, Vec<(usize, Rc<QueryExpr>)>)> =
+        Vec::new();
+    for (index, root) in roots.into_iter().enumerate() {
+        let accuracy = &queries[index].accuracy;
+        let certificate_scope = evidence
+            .contains_key(&queries[index].query_id)
+            .then(|| queries[index].query_id.clone());
+        if let Some((_, _, roots)) = cohorts
+            .iter_mut()
+            .find(|(target, scope, _)| target == accuracy && scope == &certificate_scope)
+        {
+            roots.push((index, root));
+        } else {
+            cohorts.push((accuracy.clone(), certificate_scope, vec![(index, root)]));
+        }
+    }
+    for (accuracy, scope, roots) in cohorts {
+        let model = ControlPlaneCostModel::new(accuracy.clone());
+        let certificate = scope.as_ref().and_then(|id| evidence.get(id));
+        let selected = crate::planner_selection::select_workload_with_evidence(
+            roots,
+            accuracy,
+            &model,
+            &QueryEvidence(certificate),
+        )
+        .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+        for (index, node) in selected {
+            queries[index].post_asap = node;
+        }
+    }
+    Ok(())
 }
 
 /// Planner-adapter selection step used before physical compilation. Keeping
@@ -2177,6 +2339,9 @@ fn validate_window_implementations(
 struct PlannerPhysicalSelection {
     lifecycle: CollectorLifecycle,
     window_framework: SummaryWindowFramework,
+    expected_reads: f64,
+    expected_updates: f64,
+    lifecycle_cost: f64,
 }
 
 fn select_lifecycle(
@@ -2184,28 +2349,49 @@ fn select_lifecycle(
     node: &SummaryNode,
     model: &ControlPlaneCostModel,
     environment: &DeploymentEnvironment,
+    consumers: &[&PlanningQuery],
 ) -> Result<PlannerPhysicalSelection, CompileError> {
+    // Current lifecycle evidence is per producer with one unit read cost.
+    // Conflicting source/rate/horizon/cost snapshots cannot be averaged into
+    // invented evidence. Only recurrence may differ between consumers.
+    let mut common = query.lifecycle.clone();
+    common.evaluation_interval_ms = 0;
+    for consumer in consumers {
+        let mut input = consumer.lifecycle.clone();
+        input.evaluation_interval_ms = 0;
+        if input != common {
+            return Err(CompileError::Lifecycle {
+                query_id: consumer.query_id.clone(),
+                reason: "shared producer consumers have conflicting lifecycle evidence".into(),
+            });
+        }
+    }
     let workload = QueryWorkload {
         language: QueryLanguage::PromQL,
         query_batch: None,
-        repeating_queries: Some(vec![RepeatingEntry {
-            query: Query(query.query_id.clone()),
-            demand: RepeatedDemand::FixedInterval(RepetitionInterval(
-                query.lifecycle.evaluation_interval_ms,
-            )),
-            requirements: QueryRequirements {
-                accuracy: AccuracyRequirement::Explicit(query.accuracy.clone()),
-                ..QueryRequirements::default()
-            },
-            predictability: Predictability::Predictable { known_at: None },
-            time_selection: TimeSelection {
-                // Collector windows are retired as whole states. They do not
-                // claim deletion support for moving-window retractions.
-                scope: QueryTimeScope::Unknown,
-                lookback: Some(DurationMs(query.window_secs.saturating_mul(1_000))),
-                as_of: None,
-            },
-        }]),
+        repeating_queries: Some(
+            consumers
+                .iter()
+                .map(|query| RepeatingEntry {
+                    query: Query(query.query_id.clone()),
+                    demand: RepeatedDemand::FixedInterval(RepetitionInterval(
+                        query.lifecycle.evaluation_interval_ms,
+                    )),
+                    requirements: QueryRequirements {
+                        accuracy: AccuracyRequirement::Explicit(query.accuracy.clone()),
+                        ..QueryRequirements::default()
+                    },
+                    predictability: Predictability::Predictable { known_at: None },
+                    time_selection: TimeSelection {
+                        // Collector windows are retired as whole states. They do not
+                        // claim deletion support for moving-window retractions.
+                        scope: QueryTimeScope::Unknown,
+                        lookback: Some(DurationMs(query.window_secs.saturating_mul(1_000))),
+                        as_of: None,
+                    },
+                })
+                .collect(),
+        ),
         data_workload: Some(DataWorkload {
             arrival: DataArrival::ContinuouslyIngesting,
             ingestion_rate: Evidence {
@@ -2219,7 +2405,7 @@ fn select_lifecycle(
     };
     let plan = plan_summary_maintenance_lifecycles(
         Rc::new(node.clone()),
-        WorkloadDemand::new(&workload, &[0]),
+        WorkloadDemand::new(&workload, &(0..consumers.len()).collect::<Vec<_>>()),
         environment.observed_at_unix_ms,
         Some(Horizon(query.lifecycle.horizon_seconds)),
         SummaryMaintenanceLifecycleCapabilities {
@@ -2251,6 +2437,32 @@ fn select_lifecycle(
             reason: "latest ASAPPlanner selected no window framework from the supplied physical evidence".into(),
         })?;
     Ok(PlannerPhysicalSelection {
+        expected_reads: plan.expected_reads.ok_or_else(|| CompileError::Lifecycle {
+            query_id: query.query_id.clone(),
+            reason: "missing joint read demand".into(),
+        })?,
+        expected_updates: plan
+            .update_rate
+            .ok_or_else(|| CompileError::Lifecycle {
+                query_id: query.query_id.clone(),
+                reason: "missing source update demand".into(),
+            })?
+            .0
+            * query.lifecycle.horizon_seconds,
+        lifecycle_cost: plan.deployments[0]
+            .alternatives
+            .iter()
+            .find(|alternative| {
+                alternative.rejection.is_none()
+                    && alternative.summary_maintenance_lifecycle
+                        == guarantee.summary_maintenance_lifecycle
+            })
+            .and_then(|alternative| alternative.total_cost)
+            .ok_or_else(|| CompileError::Lifecycle {
+                query_id: query.query_id.clone(),
+                reason: "missing selected lifecycle cost".into(),
+            })?
+            .0,
         lifecycle: CollectorLifecycle {
             kind: match guarantee.summary_maintenance_lifecycle {
                 SummaryMaintenanceLifecycle::Ephemeral => "ephemeral",
@@ -2282,12 +2494,66 @@ fn select_lifecycle(
 }
 
 struct SelectedMaterialization {
+    node: Rc<SummaryNode>,
     node_identity: usize,
     metric: String,
     family: SummaryFamilyType,
     readout: Option<SketchQuery>,
     algorithm: String,
     parameters: Value,
+}
+
+fn physical_aggregation(
+    query: &PlanningQuery,
+    selected: &SelectedMaterialization,
+    aggregation_id: String,
+    target: PhysicalDeploymentTarget,
+) -> BackendAggregation {
+    BackendAggregation {
+        aggregation_id,
+        metric_name: selected.metric.clone(),
+        family: physical_materialization_family(&selected.family),
+        window_secs: query.window_secs,
+        spatial_filter: String::new(),
+        grouping: query.group_by.clone(),
+        item_label: None,
+        heap_update_mode: selected.parameters.get("weight_mode").and_then(|mode| {
+            match mode.as_str() {
+                Some("count") => Some("count"),
+                Some("value") => Some("value"),
+                _ => None,
+            }
+        }),
+        aggregation_input: match target {
+            PhysicalDeploymentTarget::DistributedCollectors => AggregationInput::SketchEnvelope,
+            PhysicalDeploymentTarget::BackendLocalRemoteWrite => AggregationInput::Raw,
+        },
+    }
+}
+
+fn materialization_consumers(
+    queries: &[PlanningQuery],
+    target: PhysicalDeploymentTarget,
+) -> Result<BTreeMap<asap_types::PolicyFingerprint, BTreeSet<usize>>, CompileError> {
+    let mut consumers = BTreeMap::<_, BTreeSet<_>>::new();
+    for (index, query) in queries.iter().enumerate() {
+        let states = collect_selected_materializations(&query.post_asap).map_err(|reason| {
+            CompileError::Query {
+                query_id: query.query_id.clone(),
+                reason,
+            }
+        })?;
+        for state in states {
+            let config = backend_plan::aggregation_config_for_materialization(
+                &physical_aggregation(query, &state, query.query_id.clone(), target),
+            )?;
+            consumers
+                .entry(config.policy_fingerprint())
+                .or_default()
+                .insert(index);
+        }
+    }
+    Ok(consumers)
 }
 
 /// Collect every executable materialization leaf in the selected post-ASAP
@@ -2305,6 +2571,29 @@ fn collect_selected_materializations(
         selected: &mut Vec<SelectedMaterialization>,
     ) -> Result<(), String> {
         match &node.expr {
+            SummaryExpr::BinaryOp { lhs, rhs, .. }
+                if crate::query_plan::exact_value_executable(node) =>
+            {
+                walk(lhs, readout, selected)?;
+                walk(rhs, readout, selected)?;
+            }
+            SummaryExpr::SummaryAgg {
+                child,
+                family:
+                    SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _),
+                ..
+            } if !matches!(child.expr, SummaryExpr::KeepPreAsap(_))
+                && crate::query_plan::exact_value_executable(node) =>
+            {
+                walk(child, readout, selected)?;
+            }
+            SummaryExpr::SummaryAgg { child, .. }
+                if !matches!(child.expr, SummaryExpr::KeepPreAsap(_)) => {}
+            SummaryExpr::SummaryAgg {
+                family:
+                    SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _),
+                ..
+            } if !crate::query_plan::exact_value_executable(node) => {}
             SummaryExpr::SummaryEstimate {
                 summary_input,
                 query,
@@ -2316,13 +2605,27 @@ fn collect_selected_materializations(
             }
             SummaryExpr::SummaryAgg {
                 family: SummaryFamilyType::Sketch(kind, _),
+                input,
                 ..
             } => {
                 if let Some(readout) = readout {
+                    let mut parameters = sketch_params_json(kind.params());
+                    if matches!(readout, SketchQuery::TopK { .. }) {
+                        use planner_types::post_asap::SummaryInputExpr;
+                        let mode = match &input.weight {
+                            SummaryInputExpr::Constant(value) if *value == 1.0 => "count",
+                            SummaryInputExpr::Column(
+                                planner_types::pre_asap::ColumnRef::SampleValue,
+                            ) => "value",
+                            _ => return Err("unsupported TopK SummaryUpdate weight".into()),
+                        };
+                        parameters["weight_mode"] = mode.into();
+                    }
                     let metric = summary_agg_metric(node).ok_or_else(|| {
                         "SummaryAgg has no unique time-series source in post-ASAP IR".to_string()
                     })?;
                     selected.push(SelectedMaterialization {
+                        node: Rc::clone(node),
                         node_identity: Rc::as_ptr(node) as usize,
                         metric,
                         family: SummaryFamilyType::Sketch(
@@ -2331,7 +2634,7 @@ fn collect_selected_materializations(
                         ),
                         readout: Some(readout.clone()),
                         algorithm: format!("{:?}", kind.algorithm()).to_ascii_lowercase(),
-                        parameters: sketch_params_json(kind.params()),
+                        parameters,
                     });
                 }
             }
@@ -2343,6 +2646,7 @@ fn collect_selected_materializations(
                     "SummaryAgg has no unique time-series source in post-ASAP IR".to_string()
                 })?;
                 selected.push(SelectedMaterialization {
+                    node: Rc::clone(node),
                     node_identity: Rc::as_ptr(node) as usize,
                     metric,
                     family: SummaryFamilyType::ExactAggregate(kind.clone(), params.clone()),
@@ -2351,7 +2655,8 @@ fn collect_selected_materializations(
                     parameters: Value::Object(Default::default()),
                 });
             }
-            SummaryExpr::KeepPreAsap(_)
+            SummaryExpr::BinaryOp { .. }
+            | SummaryExpr::KeepPreAsap(_)
             | SummaryExpr::SummaryAgg { .. }
             | SummaryExpr::SummaryJoin { .. }
             | SummaryExpr::SummarySubtract { .. }
@@ -2367,6 +2672,14 @@ fn collect_selected_materializations(
 
 fn physical_materialization_family(family: &SummaryFamilyType) -> SummaryFamilyType {
     match family {
+        SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _) => {
+            // The local raw Sum updater retains the observation count alongside
+            // its sum. Both logical states can use this one concrete producer.
+            SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Sum,
+                planner_types::post_asap::ExactParams::Sum,
+            )
+        }
         SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Rate, _) => {
             SummaryFamilyType::ExactAggregate(
                 planner_types::post_asap::ExactKind::Increase,
@@ -2407,9 +2720,49 @@ fn stable_plan_id(materializations: &[CollectorMaterialization]) -> u64 {
     hasher.finish()
 }
 
+fn stable_workload_plan_id(
+    materializations: &[CollectorMaterialization],
+    queries: &[PlanningQuery],
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    stable_plan_id(materializations).hash(&mut hasher);
+    for query in queries {
+        query.query_id.hash(&mut hasher);
+        query.query_string.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Count and value rankings must configure different state update contracts.
+    #[test]
+    fn temporal_topk_binds_planner_update_weight() {
+        for (query, mode) in [
+            ("topk(1, sum_over_time(m[1m]))", "value"),
+            ("topk(1, count_over_time(m[1m]))", "count"),
+        ] {
+            let evidence = TopKMembershipEvidence {
+                selected_lower_bound: 101.0,
+                excluded_upper_bound: 100.0,
+                interval_failure_probability: 0.001,
+                observed_at_unix_ms: 9500,
+                source: "unit-fixture".into(),
+            };
+            let request = request_with_evidence("topk", query, Some(evidence)).unwrap();
+            let plan = PhysicalCompiler
+                .compile(request, environment(10000))
+                .unwrap();
+            assert_eq!(plan.precompute_plan.materializations.len(), 1, "{query}");
+            assert_eq!(
+                plan.precompute_plan.materializations[0].parameters["weight_mode"], mode,
+                "{query}"
+            );
+        }
+    }
 
     fn environment(now: u64) -> DeploymentEnvironment {
         DeploymentEnvironment {
@@ -2494,6 +2847,298 @@ mod tests {
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    // Both production adapters preserve canonical root identity and select the
+    // whole evidence-free cohort, rather than independently binding roots.
+    #[test]
+    fn shared_selection_adapter_preserves_query_mapping() {
+        let mut workload = request("q90", "quantile_over_time(0.9, m[1m])");
+        workload
+            .queries
+            .extend(request("q99", "quantile_over_time(0.99, m[1m])").queries);
+        let roots = workload
+            .queries
+            .iter()
+            .map(|query| {
+                Rc::new(
+                    crate::query_parser::parse_query_expr_canonical(
+                        &query.query_string,
+                        query.accuracy.clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        select_workload_roots(&mut workload.queries, roots, &workload.evidence).unwrap();
+        let bundle = PhysicalCompiler
+            .compile(workload, environment(10000))
+            .unwrap();
+        assert_eq!(bundle.query_plan.entries.len(), 2);
+        assert_eq!(bundle.collector_plans[0].materializations.len(), 1);
+        assert_eq!(
+            bundle
+                .query_plan
+                .entries
+                .values()
+                .map(|entry| entry.query_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["q90", "q99"])
+        );
+    }
+
+    // A broken input mapping must be rejected, never silently drop a root.
+    #[test]
+    fn shared_selection_rejects_incomplete_root_mapping() {
+        let mut workload = request("q", "quantile_over_time(0.9, m[1m])");
+        assert!(select_workload_roots(&mut workload.queries, vec![], &workload.evidence).is_err());
+    }
+
+    // Adding another readout adds recurring reads, not another update stream.
+    #[test]
+    fn joint_lifecycle_charges_shared_updates_once() {
+        let baseline = PhysicalCompiler
+            .compile(
+                request("q90", "quantile_over_time(0.9, m[1m])"),
+                environment(10000),
+            )
+            .unwrap();
+        let mut workload = request("q90", "quantile_over_time(0.9, m[1m])");
+        let mut second = request("q99", "quantile_over_time(0.99, m[1m])")
+            .queries
+            .remove(0);
+        second.lifecycle.evaluation_interval_ms = 20000;
+        workload.queries.push(second);
+        let shared = PhysicalCompiler
+            .compile(workload, environment(10000))
+            .unwrap();
+        assert_eq!(shared.lifecycle_estimates.len(), 1);
+        let estimate = &shared.lifecycle_estimates[0];
+        assert_eq!(estimate.consumer_query_ids, vec!["q90", "q99"]);
+        assert_eq!(estimate.expected_reads, 45.0);
+        assert_eq!(estimate.expected_updates, 30000.0);
+        assert!((estimate.lifecycle_cost - 45.8).abs() < 1e-9);
+        assert_eq!(
+            estimate.expected_updates,
+            baseline.lifecycle_estimates[0].expected_updates
+        );
+        assert!(
+            (estimate.lifecycle_cost - baseline.lifecycle_estimates[0].lifecycle_cost - 1.5).abs()
+                < 1e-9
+        );
+    }
+
+    // Unknown joint provenance cannot be replaced by whichever root came first.
+    #[test]
+    fn shared_lifecycle_rejects_conflicting_source_evidence() {
+        let mut workload = request("q90", "quantile_over_time(0.9, m[1m])");
+        let mut second = request("q99", "quantile_over_time(0.99, m[1m])")
+            .queries
+            .remove(0);
+        second.lifecycle.ingestion_rate_per_second = 200.0;
+        workload.queries.push(second);
+        assert!(matches!(
+            PhysicalCompiler.compile(workload, environment(10000)),
+            Err(CompileError::Lifecycle { .. })
+        ));
+    }
+
+    #[test]
+    fn shared_materialization_is_emitted_once_for_every_runtime() {
+        for target in [
+            PhysicalDeploymentTarget::DistributedCollectors,
+            PhysicalDeploymentTarget::BackendLocalRemoteWrite,
+        ] {
+            let mut workload = request("q90", "quantile_over_time(0.90, m[1m])");
+            workload
+                .queries
+                .extend(request("q99", "quantile_over_time(0.99, m[1m])").queries);
+            let mut env = environment(10_000);
+            env.target = target;
+            if target == PhysicalDeploymentTarget::BackendLocalRemoteWrite {
+                env.collector_ids.clear();
+            }
+            let bundle = PhysicalCompiler
+                .compile(workload, env)
+                .expect("shared compile");
+            assert_eq!(bundle.query_plan.entries.len(), 2);
+            assert_eq!(bundle.backend_plan.materializations.len(), 1);
+            assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+            assert_eq!(bundle.precompute_plan.schemas.len(), 1);
+            let bindings = bundle
+                .query_plan
+                .entries
+                .values()
+                .map(|entry| entry.materialization_bindings()[0].materialization)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(bindings.len(), 1);
+            for collector in &bundle.collector_plans {
+                assert_eq!(collector.materializations.len(), 1);
+                assert!(bindings.contains(&collector.materializations[0].materialization));
+            }
+        }
+    }
+
+    #[test]
+    fn adding_shared_consumer_changes_plan_identity() {
+        let workload = request("q90", "quantile_over_time(0.90, m[1m])");
+        let one = PhysicalCompiler
+            .compile(workload, environment(10_000))
+            .unwrap();
+        let mut workload = request("q90", "quantile_over_time(0.90, m[1m])");
+        workload
+            .queries
+            .extend(request("q99", "quantile_over_time(0.99, m[1m])").queries);
+        let two = PhysicalCompiler
+            .compile(workload, environment(10_000))
+            .unwrap();
+        assert_ne!(one.envelope.plan_id, two.envelope.plan_id);
+        assert_eq!(two.collector_plans[0].materializations.len(), 1);
+    }
+
+    #[test]
+    fn different_sources_do_not_share_materializations() {
+        let mut workload = request("qm", "quantile_over_time(0.90, m[1m])");
+        let mut other = request("qn", "quantile_over_time(0.90, n[1m])");
+        other.queries[0].source = Source::TimeSeries { metric: "n".into() };
+        workload.queries.extend(other.queries);
+        let bundle = PhysicalCompiler
+            .compile(workload, environment(10_000))
+            .unwrap();
+        assert_eq!(bundle.backend_plan.materializations.len(), 2);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 2);
+        for collector in &bundle.collector_plans {
+            assert_eq!(collector.materializations.len(), 2);
+        }
+    }
+
+    #[test]
+    fn rate_and_increase_share_physical_counter_state() {
+        let mut workload = request("rate", "rate(m[1m])");
+        workload
+            .queries
+            .extend(request("increase", "increase(m[1m])").queries);
+        let bundle = PhysicalCompiler
+            .compile(workload, environment(10_000))
+            .unwrap();
+        assert_eq!(bundle.query_plan.entries.len(), 2);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+        for collector in &bundle.collector_plans {
+            assert_eq!(collector.materializations.len(), 1);
+            assert_eq!(collector.materializations[0].algorithm, "increase");
+        }
+    }
+
+    #[test]
+    fn shared_materialization_rejects_conflicting_deployment_contracts() {
+        for field in ["implementation", "layout"] {
+            let mut workload = request("q90", "quantile_over_time(0.90, m[1m])");
+            let mut other = request("q99", "quantile_over_time(0.99, m[1m])");
+            let implementation = &mut other.queries[0].window_implementations[0];
+            if field == "implementation" {
+                implementation.implementation_id = "another-implementation".into();
+            } else {
+                implementation.state_layout = "another-layout".into();
+            }
+            workload.queries.extend(other.queries);
+            let error = PhysicalCompiler
+                .compile(workload, environment(10_000))
+                .expect_err("conflicting shared state must fail before publication");
+            assert!(
+                error
+                    .to_string()
+                    .contains("conflicting deployment contracts"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_dashboard_binds_sum_and_count_to_one_local_producer() {
+        // Both dashboard roots use one packed raw accumulator, with explicit readouts.
+        let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
+        entries[0].query = Query("sum by (service) (sum_over_time(m[1m]))".into());
+        entries[0].requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        let mut mean = entries[0].clone();
+        mean.query = Query(
+            "sum by (service) (sum_over_time(m[1m])) / sum by (service) (count_over_time(m[1m]))"
+                .into(),
+        );
+        entries.push(mean);
+        let bundle = snapshot.compile().unwrap();
+        assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+        assert_eq!(bundle.query_plan.entries.len(), 2);
+        for entry in bundle.query_plan.entries.values() {
+            assert!(
+                !entry.nodes.values().any(|node| matches!(
+                    node,
+                    crate::query_plan::QueryPlanNode::ExactFallback { .. }
+                )),
+                "{entry:?}"
+            );
+            assert_eq!(entry.materialization_bindings().len(), 1);
+        }
+        assert!(bundle.query_plan.entries.values().any(|entry| entry
+            .nodes
+            .values()
+            .any(|node| matches!(node, crate::query_plan::QueryPlanNode::Binary { .. }))));
+    }
+
+    // Grouping must not move through non-additive arithmetic during physical
+    // packing: SUM(instance SUM / instance COUNT) is not pooled SUM / COUNT.
+    #[test]
+    fn non_additive_entity_reduction_does_not_bind_pooled_state() {
+        for query in [
+            "sum by (service) (sum_over_time(m[1m]) / count_over_time(m[1m]))",
+            "sum by (service) (sum_over_time(m[1m])) / sum by (region) (count_over_time(m[1m]))",
+            "sum(m) / sum_over_time(m[1m])",
+            "sum_over_time(m[1m]) / count_over_time(m[5m])",
+            "sum_over_time(m[1m] offset 1h) / count_over_time(m[1m] offset 1h)",
+        ] {
+            let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+                "../../../docs/examples/asapquery-planning-snapshot.json"
+            ))
+            .unwrap();
+            let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
+            entries[0].query = Query(query.into());
+            entries[0].requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+            let bundle = snapshot.compile().unwrap();
+            assert!(bundle.precompute_plan.materializations.is_empty());
+            assert!(bundle.query_plan.entries.values().all(|entry| matches!(
+                entry.nodes[&entry.root],
+                crate::query_plan::QueryPlanNode::ExactFallback { .. }
+            )));
+        }
+    }
+
+    #[test]
+    fn canonical_snapshot_preserves_shared_bindings_after_serialization() {
+        // Two different registered readouts survive publication with one state.
+        let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
+        let mut second = entries[0].clone();
+        second.query = Query("quantile_over_time(0.90, m[1m])".into());
+        entries.push(second);
+        let bundle = snapshot.compile().unwrap();
+        assert_eq!(bundle.query_plan.entries.len(), 2);
+        assert_eq!(bundle.precompute_plan.materializations.len(), 1);
+        let query_plan: QueryPlan =
+            serde_json::from_slice(&serde_json::to_vec(&bundle.query_plan).unwrap()).unwrap();
+        let bindings = query_plan
+            .entries
+            .values()
+            .flat_map(|entry| entry.materialization_bindings())
+            .map(|binding| binding.materialization)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(bindings.len(), 1);
+        query_plan.validate(&bindings).unwrap();
     }
 
     #[test]
@@ -2692,6 +3337,7 @@ mod tests {
             .remove(0);
         let snapshot = BackendLocalPlanningSnapshot {
             snapshot_version: 1,
+            workload_cost_evidence: None,
             query_workload,
             data_workload,
             implementation: BackendLocalImplementation {
@@ -2822,8 +3468,8 @@ mod tests {
             "increase(asap_demo_counter_total[5s])",
             "sum_over_time(asap_demo_gauge[5s])",
             "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
-            "topk(5, sum_over_time(asap_demo_gauge[5s]))",
-            "topk by (job) (5, count_over_time(asap_demo_gauge[5s]))",
+            "topk(1, sum_over_time(asap_demo_gauge[5s]))",
+            "topk(1, count_over_time(asap_demo_gauge[5s]))",
         ] {
             assert!(plan.query_plan.lookup(query).is_ok(), "missing {query}");
         }
@@ -3069,40 +3715,6 @@ mod tests {
                 .as_deref(),
             Some("runtime-margin-monitor")
         );
-    }
-
-    #[test]
-    fn asapquery_706_topk_over_temporal_shapes_compile_with_explicit_weights() {
-        let evidence = || TopKMembershipEvidence {
-            selected_lower_bound: 101.0,
-            excluded_upper_bound: 100.0,
-            interval_failure_probability: 0.005,
-            observed_at_unix_ms: 9_500,
-            source: "runtime-margin-monitor".into(),
-        };
-        for (query, expected_weight) in [
-            ("topk(5, sum_over_time(m[1m]))", "value"),
-            ("topk by (job) (5, count_over_time(m[1m]))", "count"),
-        ] {
-            let request = request_with_evidence("q-topk-temporal", query, Some(evidence()))
-                .unwrap_or_else(|error| panic!("{query} must select: {error}"));
-            let bundle = PhysicalCompiler
-                .compile(request, environment(10_000))
-                .unwrap_or_else(|error| panic!("{query} must compile: {error}"));
-            let materialization = bundle
-                .precompute_plan
-                .materializations
-                .first()
-                .expect("TopK materialization");
-            assert_eq!(
-                materialization
-                    .parameters
-                    .get("weight_mode")
-                    .and_then(Value::as_str),
-                Some(expected_weight),
-                "{query} must configure the matching heap update mode"
-            );
-        }
     }
 
     #[test]
