@@ -57,7 +57,7 @@ classification. Forwarded responses carry a backend-owned `x-asap-execution`
 header; an unmarked success is not counted as warm or fallback. `ingestion.json`
 records accepted batches; acceptance does not prove worker completion.
 
-The settle interval is recorded, not a completion barrier. The first traversal is
+The runner waits for the finite-input completion barrier. The first traversal is
 called `first_pass`, not “cold cache”; later traversals are `repeat`. All failures
 and fallback responses remain in the denominator. A completion file means the
 replay finished, **not** that accuracy or benefit acceptance passed.
@@ -88,11 +88,22 @@ the unsuccessful portion of the workload.
 Linux process counters are captured around HTTP calls and at startup, ingestion
 and query boundaries. Backend calls also record exact-service CPU when available,
 so forwarded work is visible. Ingestion journal timings and phase snapshots expose
-the construction/update interval, including the declared settle delay. Counters
+the construction/update interval, including the finite-input drain. Counters
 include background work and have CPU-tick resolution. RSS/HWM are **whole-process**
 memory, not summary heap; HWM is process-lifetime peak, not isolated phase peak.
-`store.json` preserves the backend's raw state counters. Affinity/cgroup metadata
-is recorded but equal resource budgets are not enforced by this harness.
+`store.json` preserves the backend's raw state counters. `--cpu-affinity` applies
+one CPU set to the backend and supplied Prometheus processes/threads.
+`--address-space-bytes` applies the same RLIMIT_AS, which limits virtual address
+space, not RSS or combined process memory. These controls are optional and their
+presence is recorded; they do not establish a full cgroup resource budget.
+
+Use `--fallback-url` and `--fallback-pid` for a separate fresh Prometheus instance,
+keeping `--exact-url`/`--exact-pid` for the baseline. Identical process IDs and
+storage paths are rejected. Both receive identical input batches. Backend CPU
+includes its fallback service CPU; baseline CPU remains separate. With no
+separate fallback service, the report preserves the shared-cache limitation.
+`--exact-storage` and `--fallback-storage` record logical file sizes separately;
+backend output file sizes include logs and are not retained summary heap sizes.
 
 The provider's estimated costs are preserved next to measured quantities without
 pretending abstract model units are CPU nanoseconds. End-to-end benefit and
@@ -100,5 +111,20 @@ estimated/measured cost ratios remain null until their units, lifecycle scope,
 exact-service startup/storage costs and resource budgets are matched. Separate
 fresh-process/cache-controlled trials, a retained-state measurement, calibration
 provenance and real-corpus execution evidence are still required before declaring
-the five #524 acceptance criteria complete. The shared fallback/baseline service
+the five #524 acceptance criteria complete. A shared fallback/baseline service
 can transfer cache warmth; alternating order does not eliminate this confound.
+
+## Finite-input completion
+
+After all Remote Write batches are accepted, the runner calls
+`POST /api/v1/precompute/drain` and saves `drain.json`. The receiver seals input
+before worker barriers are queued. Each worker publishes its trailing panes,
+then acknowledges completion; prior processing or sink failures remain failures
+on repeated drains. Queries begin only after a successful completion response.
+Subsequent Remote Write requests return HTTP 409 for that process. Start a new
+backend process for another input generation.
+
+This endpoint is for a finite replay, not a live ingestion watermark. Closing a
+trailing pane does not by itself prove its coverage matches every query window;
+unsupported or incomplete readouts must still follow exact fallback. This change
+adds no local raw-query storage or hybrid operator execution.

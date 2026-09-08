@@ -86,7 +86,18 @@ def summarize(rows):
         for r, c in zip(rows, comparisons))
     actual = sum(r["elapsed_ns"] for r in rows)
     exact = sum(r.get("exact", {}).get("elapsed_ns", 0) for r in rows)
-    return {"occurrences": len(rows),
+    def cpu_total(requests, names):
+        values = [request.get("process_resources", {}).get(name) for request in requests for name in names]
+        return sum(v["cpu_ns"] for v in values) if values and all(v is not None for v in values) else None
+    has_fallback_process = any("fallback_service" in r.get("process_resources", {}) for r in rows)
+    backend_names = ["backend", "fallback_service" if has_fallback_process else "exact_service"]
+    backend_cpu = cpu_total(rows, backend_names)
+    exact_cpu = cpu_total([r.get("exact", {}) for r in rows], ["exact_service"])
+    return {"backend_plus_fallback_cpu_ns": backend_cpu,
+            "baseline_cpu_ns": exact_cpu,
+            "baseline_over_backend_cpu_ratio": exact_cpu / backend_cpu if eligible and backend_cpu and exact_cpu is not None else None,
+            "cpu_scope": "request intervals, whole processes including background work; fallback CPU charged to backend; /proc tick granularity",
+            "occurrences": len(rows),
             "execution_counts": {k: sum(r["execution"] == k for r in rows) for k in ("warm", "exact_fallback", "failed")},
             "equal_results": sum(c["equal"] for c in comparisons),
             "uncomparable_results": sum(not c["comparable"] for c in comparisons),
