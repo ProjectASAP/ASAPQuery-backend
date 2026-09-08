@@ -637,8 +637,17 @@ async fn handle_compile_and_publish_physical_plan(
     Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
 ) -> impl IntoResponse {
     let (bundle, collector_ids, apply_timeout, adaptation_evidence, _) =
-        match compile_physical_plan_request(request) {
-            Ok(compiled) => compiled,
+        match compile_physical_plan_request(request, false) {
+            Ok((Some(bundle), ids, timeout, adaptation, manifests)) => {
+                (bundle, ids, timeout, adaptation, manifests)
+            }
+            Ok((None, ..)) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "publication requires a selected plan",
+                )
+                    .into_response()
+            }
             Err(response) => return response.into_response(),
         };
 
@@ -733,9 +742,10 @@ async fn handle_compile_and_publish_physical_plan(
 // Only the Send-safe compiled bundle crosses an await point.
 fn compile_physical_plan_request(
     request: CompileAndPublishPhysicalPlanRequest,
+    manifests_only: bool,
 ) -> Result<
     (
-        physical::compiler::PhysicalPlan,
+        Option<physical::compiler::PhysicalPlan>,
         Vec<String>,
         Duration,
         Vec<physical::compiler::RuntimeAdaptationEvidence>,
@@ -833,7 +843,7 @@ fn compile_physical_plan_request(
     };
     let candidates = physical::workload_cost::with_exact_alternative(planning_request.clone())
         .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?;
-    let manifests = candidates
+    let manifests: Vec<_> = candidates
         .iter()
         .filter_map(|candidate| {
             physical::compiler::PhysicalCompiler
@@ -842,6 +852,24 @@ fn compile_physical_plan_request(
                 .ok()
         })
         .collect();
+    let apply_timeout = Duration::from_millis(request.apply_timeout_ms);
+    // Quote preparation enumerates feasible bindings; it does not select the
+    // default warm candidate, which may be unavailable while exact is valid.
+    if manifests_only {
+        if manifests.is_empty() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "no bindable workload cost manifests".into(),
+            ));
+        }
+        return Ok((
+            None,
+            request.collector_ids,
+            apply_timeout,
+            request.runtime_adaptation_evidence,
+            manifests,
+        ));
+    }
     let compiled = match request.workload_cost_evidence {
         Some(evidence) => physical::workload_cost::select(candidates, environment, &evidence),
         None => physical::compiler::PhysicalCompiler.compile(planning_request, environment),
@@ -850,9 +878,8 @@ fn compile_physical_plan_request(
         Ok(bundle) => bundle,
         Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
     };
-    let apply_timeout = Duration::from_millis(request.apply_timeout_ms);
     Ok((
-        bundle,
+        Some(bundle),
         request.collector_ids,
         apply_timeout,
         request.runtime_adaptation_evidence,
@@ -871,7 +898,7 @@ async fn handle_workload_cost_manifests(
         )
             .into_response();
     }
-    match compile_physical_plan_request(request) {
+    match compile_physical_plan_request(request, true) {
         Ok((_, _, _, _, manifests)) => Json(manifests).into_response(),
         Err(error) => error.into_response(),
     }
@@ -2081,6 +2108,39 @@ mod api_tests {
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
+
+    // A missing warm implementation must not hide the executable exact quote.
+    #[tokio::test]
+    async fn cost_manifests_survive_unavailable_warm_candidate() {
+        let snapshot: physical::compiler::BackendLocalPlanningSnapshot = serde_json::from_str(
+            include_str!("../../docs/examples/asapquery-planning-snapshot.json"),
+        )
+        .unwrap();
+        let (planning, _) = snapshot.planning_request().unwrap();
+        let query = &planning.queries[0];
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let request = serde_json::from_value(serde_json::json!({
+            "queries": [{
+                "query_id": query.query_id, "query_string": query.query_string,
+                "metric": "m", "window_secs": 60, "accuracy": query.accuracy,
+                "lifecycle": query.lifecycle, "window_implementations": []
+            }],
+            "collector_ids": ["test"], "capability_snapshot_id": "test",
+            "planner_revision": physical::compiler::PLANNER_REVISION,
+            "max_evidence_age_ms": 60000, "plan_version": 1,
+            "activation_unix_ms": now, "backend_compat": control_plane::backend_plan::BACKEND_COMPAT
+        }))
+        .unwrap();
+        let response = handle_workload_cost_manifests(Json(request))
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let manifests = body_json(response).await;
+        assert_eq!(manifests.as_array().unwrap().len(), 1);
+    }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
