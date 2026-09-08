@@ -100,11 +100,9 @@ impl SketchStoreSink {
         }
     }
 
-    /// Best-effort write to `SketchStore` for one PrecomputedOutput.
-    /// Logs and skips on missing agg_config or other transient
-    /// inconsistencies — a SketchStore miss is recoverable in
-    /// practice because the control plane will re-emit the agg_config
-    /// on its next reconcile pass.
+    /// Write one PrecomputedOutput; false reports a rejected output to the caller.
+    /// Missing configuration or incompatible state must surface as failure:
+    /// a finite-input completion barrier cannot acknowledge dropped outputs.
     ///
     /// PR-6 follow-up: resolves the source `AggregationConfig` via
     /// `PolicyRegistry::get(output.policy_fp)`. The legacy
@@ -160,8 +158,18 @@ impl OutputSink for SketchStoreSink {
             return Ok(());
         }
         let _span = debug_span!("sketch_index_insert", batch_size = outputs.len()).entered();
+        let mut failed = 0;
         for (output, accumulator) in &outputs {
-            self.append_to_index(output, accumulator.as_ref());
+            if !self.append_to_index(output, accumulator.as_ref()) {
+                failed += 1;
+            }
+        }
+        if failed > 0 {
+            return Err(format!(
+                "SketchStore rejected {failed} of {} completed outputs",
+                outputs.len()
+            )
+            .into());
         }
         Ok(())
     }
@@ -375,9 +383,9 @@ mod tests {
     }
 
     #[test]
-    fn sketch_index_sink_skips_unknown_agg_id_gracefully() {
+    fn sketch_index_sink_reports_unknown_policy_as_failure() {
         // Streaming config does NOT contain agg_id=99 — the sink
-        // skips it (warn log) rather than panicking.
+        // reports a recoverable error rather than acknowledging a lost write.
         let streaming = StreamingConfig::new(HashMap::new());
         let hot_reload = HotReloadStreamingConfig::new(streaming.clone());
         let sketch_index = Arc::new(SketchStore::new());
@@ -389,12 +397,13 @@ mod tests {
 
         let output = PrecomputedOutput::new(1000, 2000, None, asap_types::PolicyFingerprint(99));
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
-        sink.emit_batch(vec![(output, acc)]).expect("emit ok");
+        sink.emit_batch(vec![(output, acc)])
+            .expect_err("unpersisted output must not be acknowledged");
         assert_eq!(sketch_index.instance_count(), 0);
     }
 
     /// CQ-6 — a registry-miss (policy_fp not in the running streaming
-    /// config) is a silent write-skip; with an `IngestObservability`
+    /// config) reports a failed write; with an `IngestObservability`
     /// handle wired in, the `dropped_policy_miss` counter must tick.
     #[test]
     fn sink_increments_policy_miss_counter_on_registry_miss() {
@@ -412,7 +421,8 @@ mod tests {
         // policy_fp=42 is absent from the empty registry → registry miss.
         let output = PrecomputedOutput::new(1000, 2000, None, asap_types::PolicyFingerprint(42));
         let acc: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
-        sink.emit_batch(vec![(output, acc)]).expect("emit ok");
+        sink.emit_batch(vec![(output, acc)])
+            .expect_err("unpersisted output must not be acknowledged");
 
         assert_eq!(
             sketch_index.instance_count(),
@@ -430,7 +440,8 @@ mod tests {
         // miss — it must not bump the counter.
         let unset = PrecomputedOutput::new(1000, 2000, None, asap_types::PolicyFingerprint::UNSET);
         let acc2: Box<dyn AggregateCore> = Box::new(SumAccumulator::with_sum(1.0));
-        sink.emit_batch(vec![(unset, acc2)]).expect("emit ok");
+        sink.emit_batch(vec![(unset, acc2)])
+            .expect_err("unpersisted output must not be acknowledged");
         assert_eq!(
             obs.dropped_policy_miss
                 .load(std::sync::atomic::Ordering::Relaxed),

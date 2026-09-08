@@ -42,7 +42,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "c3410d14865497758d212e4265ad25c782187de1";
+pub const PLANNER_REVISION: &str = "abb2f20e27091ac0c60715dc42b9b59c75b3447c";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
@@ -372,6 +372,8 @@ pub struct ProducerContract {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PrecomputePlanError {
+    #[error("raw counter state {0} cannot preserve independent series resets/timestamps")]
+    UnsupportedRawCounter(u64),
     #[error("PrecomputePlan envelope does not match BackendPlan identity/lifecycle")]
     PlanIdentityMismatch,
     #[error("unsupported precompute ingest protocol/endpoint/identity contract")]
@@ -520,6 +522,20 @@ impl PrecomputePlan {
         }
         let mut materializations = BTreeSet::new();
         for materialization in &self.materializations {
+            if self.ingest.protocol == IngestProtocol::PrometheusRemoteWriteV1
+                && (matches!(
+                    materialization.aggregation_type,
+                    asap_types::AggregationType::Increase
+                ) || (materialization.aggregation_type
+                    == asap_types::AggregationType::SingleSubpopulation
+                    && materialization
+                        .aggregation_sub_type
+                        .eq_ignore_ascii_case("increase")))
+            {
+                return Err(PrecomputePlanError::UnsupportedRawCounter(
+                    materialization.policy_fp_u64(),
+                ));
+            }
             if !materializations.insert(materialization.policy_fingerprint()) {
                 return Err(PrecomputePlanError::DuplicateMaterialization(
                     materialization.policy_fp_u64(),
@@ -1666,6 +1682,7 @@ impl BackendLocalPlanningSnapshot {
             });
         }
         select_workload_roots(&mut queries, canonical_roots, &topk_evidence_by_id)?;
+        preserve_native_raw_counters(&mut queries)?;
         Ok((
             PlanningRequest {
                 queries,
@@ -1675,6 +1692,45 @@ impl BackendLocalPlanningSnapshot {
             self.environment,
         ))
     }
+}
+
+/// Preserve native execution for counters until raw producers retain series identity.
+fn preserve_native_raw_counters(queries: &mut [PlanningQuery]) -> Result<(), CompileError> {
+    for query in queries {
+        let selected = collect_selected_materializations(&query.post_asap).map_err(|reason| {
+            CompileError::Query {
+                query_id: query.query_id.clone(),
+                reason,
+            }
+        })?;
+        if selected.iter().any(|state| {
+            matches!(
+                state.family,
+                SummaryFamilyType::ExactAggregate(
+                    planner_types::post_asap::ExactKind::Increase
+                        | planner_types::post_asap::ExactKind::Rate,
+                    _
+                )
+            )
+        }) {
+            let parsed = crate::query_parser::parse_query_expr_canonical(
+                &query.query_string,
+                query.accuracy.clone(),
+            )
+            .map_err(|error| CompileError::Query {
+                query_id: query.query_id.clone(),
+                reason: error.to_string(),
+            })?;
+            query.post_asap =
+                crate::planner_selection::keep_pre_asap(&parsed).map_err(|error| {
+                    CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+        }
+    }
+    Ok(())
 }
 
 impl PhysicalCompiler {
@@ -1696,6 +1752,10 @@ impl PhysicalCompiler {
                 query_id: "deployment-target".into(),
                 reason: "backend-local target cannot declare Collector producers".into(),
             });
+        }
+
+        if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite {
+            preserve_native_raw_counters(&mut request.queries)?;
         }
 
         let roots = request
@@ -2739,6 +2799,92 @@ fn stable_workload_plan_id(
 mod tests {
     use super::*;
 
+    // A pooled raw counter cannot distinguish same-timestamp series or independent resets.
+    #[test]
+    fn backend_local_rejects_pooled_counter_materialization() {
+        let request = request("counter", "sum(rate(m[1m]))");
+        let mut environment = environment(10_000);
+        environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        environment.collector_ids.clear();
+        let plan = PhysicalCompiler.compile(request, environment).unwrap();
+        assert!(
+            plan.precompute_plan.materializations.is_empty(),
+            "unsafe pooled raw counter was installed"
+        );
+        assert!(plan.query_plan.entries.values().all(|entry| matches!(
+            entry.nodes[&entry.root],
+            crate::query_plan::QueryPlanNode::ExactFallback { .. }
+        )));
+    }
+
+    // Old precompiled raw counter artifacts are rejected before installation too.
+    #[test]
+    fn raw_counter_artifact_is_rejected_while_envelope_counter_remains_valid() {
+        let plan = PhysicalCompiler
+            .compile(request("counter", "rate(m[1m])"), environment(10_000))
+            .unwrap();
+        plan.precompute_plan.validate().unwrap();
+        let mut raw = plan.precompute_plan;
+        raw.ingest.protocol = IngestProtocol::PrometheusRemoteWriteV1;
+        raw.ingest.endpoint_path = "/api/v1/write".into();
+        raw.ingest.timestamp_unit = TimestampUnit::UnixMilliseconds;
+        raw.ingest.require_plan_identity = false;
+        raw.ingest.require_materialization_identity = false;
+        raw.ingest.require_registered_producer = false;
+        raw.producers.clear();
+        assert!(matches!(
+            raw.validate(),
+            Err(PrecomputePlanError::UnsupportedRawCounter(_))
+        ));
+    }
+
+    // Counter fallback does not disable an independent safe summary in the same workload.
+    #[test]
+    fn counter_fallback_preserves_other_workload_summaries() {
+        let mut workload = request("counter", "sum(rate(m[1m]))");
+        workload
+            .queries
+            .extend(request("gauge", "sum_over_time(g[1m])").queries);
+        let mut environment = environment(10_000);
+        environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        environment.collector_ids.clear();
+        let plan = PhysicalCompiler.compile(workload, environment).unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        assert!(plan
+            .query_plan
+            .lookup("sum(rate(m[1m]))")
+            .unwrap()
+            .materialization_bindings()
+            .is_empty());
+        assert_eq!(
+            plan.query_plan
+                .lookup("sum_over_time(g[1m])")
+                .unwrap()
+                .materialization_bindings()
+                .len(),
+            1
+        );
+    }
+
+    // Capability normalization precedes candidate enumeration, avoiding duplicate exact quotes.
+    #[test]
+    fn counter_only_snapshot_has_one_exact_cost_alternative() {
+        let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query("rate(m[1m])".into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        let (request, _) = snapshot.planning_request().unwrap();
+        assert_eq!(
+            super::super::workload_cost::with_exact_alternative(request)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
     // Count and value rankings must configure different state update contracts.
     #[test]
     fn temporal_topk_binds_planner_update_weight() {
@@ -3408,9 +3554,20 @@ mod tests {
             let mut deployment = environment(10_000);
             deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
             deployment.collector_ids.clear();
-            let plan = PhysicalCompiler
-                .compile(request(query_id, promql), deployment)
-                .unwrap_or_else(|error| panic!("{promql} must compile: {error}"));
+            let compiled = PhysicalCompiler.compile(request(query_id, promql), deployment);
+            if matches!(
+                expected_readout,
+                crate::query_plan::ExactReadout::Rate | crate::query_plan::ExactReadout::Increase
+            ) {
+                let plan = compiled.unwrap();
+                assert!(plan.precompute_plan.materializations.is_empty());
+                assert!(plan.query_plan.entries.values().all(|entry| matches!(
+                    entry.nodes[&entry.root],
+                    crate::query_plan::QueryPlanNode::ExactFallback { .. }
+                )));
+                continue;
+            }
+            let plan = compiled.unwrap_or_else(|error| panic!("{promql} must compile: {error}"));
             assert_eq!(plan.backend_plan.materializations.len(), 1, "{promql}");
             assert_eq!(plan.query_plan.entries.len(), 1, "{promql}");
             assert!(plan.collector_plans.is_empty(), "{promql}");
@@ -3463,7 +3620,7 @@ mod tests {
         assert!(plan.collector_plans.is_empty());
         assert!(plan.transmission_plan.rules.is_empty());
         assert_eq!(plan.query_plan.entries.len(), 6);
-        assert_eq!(plan.precompute_plan.materializations.len(), 5);
+        assert_eq!(plan.precompute_plan.materializations.len(), 4);
         for query in [
             "rate(asap_demo_counter_total[5s])",
             "increase(asap_demo_counter_total[5s])",

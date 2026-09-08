@@ -100,6 +100,7 @@ struct ReceiverInner {
 
 #[derive(Default)]
 struct DedupState {
+    input_closed: bool,
     values: HashMap<(u64, u64, String, i64), DedupValue>,
     expiry: VecDeque<(Instant, u64, u64, String, i64)>,
 }
@@ -112,6 +113,8 @@ enum DedupValue {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteWriteError {
+    #[error("finite input has been closed by the drain barrier")]
+    InputClosed,
     #[error("compressed request exceeds {0} bytes")]
     CompressedTooLarge(usize),
     #[error("decompressed request exceeds {0} bytes")]
@@ -169,6 +172,15 @@ impl PrometheusRemoteWriteReceiver {
 
     pub fn stats(&self) -> Arc<RemoteWriteStats> {
         self.inner.stats.clone()
+    }
+
+    /// Permanently seal this finite source before queuing worker barriers.
+    pub async fn drain(&self) -> Result<(), String> {
+        {
+            let mut state = self.inner.dedup.lock().map_err(|e| e.to_string())?;
+            state.input_closed = true;
+        }
+        self.inner.ingest.router.drain().await
     }
 
     /// Decode, validate, deduplicate, and enqueue one whole v1 request.
@@ -235,6 +247,9 @@ impl PrometheusRemoteWriteReceiver {
             .dedup
             .lock()
             .expect("remote write dedup poisoned");
+        if dedup.input_closed {
+            return Err(RemoteWriteError::InputClosed);
+        }
         dedup.evict_before(now.checked_sub(config.dedup_horizon).unwrap_or(now));
 
         // Validate conflicts both against committed history and inside this
@@ -662,6 +677,28 @@ mod tests {
                 histograms: Vec::new(),
             }],
         })
+    }
+
+    // Closing finite input prevents writes racing behind the completion barrier.
+    #[tokio::test]
+    async fn finite_input_drain_seals_receiver_and_propagates_worker_failure() {
+        let (receiver, mut worker) = configured_receiver();
+        receiver.accept(&one_sample(1.0)).unwrap();
+        let handle = receiver.clone();
+        let drain = tokio::spawn(async move { handle.drain().await });
+        assert!(matches!(
+            worker.recv().await.unwrap(),
+            WorkerMessage::GroupSamples { .. }
+        ));
+        let WorkerMessage::Drain(reply) = worker.recv().await.unwrap() else {
+            panic!("expected barrier")
+        };
+        assert!(matches!(
+            receiver.accept(&one_sample(1.0)),
+            Err(RemoteWriteError::InputClosed)
+        ));
+        reply.send(Err("sink write failed".into())).unwrap();
+        assert_eq!(drain.await.unwrap().unwrap_err(), "sink write failed");
     }
 
     #[test]
