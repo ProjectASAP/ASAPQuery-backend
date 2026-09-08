@@ -15,6 +15,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from compare import compare_results, process_snapshot, process_delta, summarize
+
+PROCESS_IDS = {}
+
 
 def classify(response, headers=None):
     if response.get("status") != "success":
@@ -124,7 +128,7 @@ def encode_write(rows):
     return varint(length) + literal + wire
 
 
-def request(url, data=None, headers=None):
+def _http_request(url, data=None, headers=None):
     start = time.perf_counter_ns()
     try:
         with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers or {}), timeout=60) as response:
@@ -138,6 +142,18 @@ def request(url, data=None, headers=None):
     except (OSError, urllib.error.URLError) as error:
         return {"http_status": getattr(error, "code", None), "response": {"status": "error", "error": str(error)},
                 "headers": {}, "elapsed_ns": time.perf_counter_ns() - start}
+
+
+def process_snapshots():
+    return {name: process_snapshot(pid) for name, pid in PROCESS_IDS.items()}
+
+
+def request(url, data=None, headers=None):
+    before = process_snapshots()
+    result = _http_request(url, data, headers)
+    after = process_snapshots()
+    result["process_resources"] = {name: process_delta(before.get(name), after.get(name)) for name in PROCESS_IDS}
+    return result
 
 
 def write_json(path, value):
@@ -164,17 +180,27 @@ def ingest(rows, endpoints, output):
                 raise RuntimeError(f"ingestion failed at batch {offset}; inspect partial acceptance before retry")
 
 
-def replay(queries, backend, output, repetitions):
+def replay(queries, backend, output, repetitions, exact_url=None):
     rows = []
     for repeat in range(repetitions):
         for query in queries:
             params = urllib.parse.urlencode({"query": query["query"], "time": f'{query["eval_timestamp_ms"] / 1000:.3f}'})
+            # Alternate paired order to expose, rather than always favor, cache/order effects.
+            exact = None
+            if exact_url and (repeat + len(rows)) % 2 == 0:
+                exact = request(exact_url.rstrip("/") + "/api/v1/query?" + params)
             answer = request(backend.rstrip("/") + "/api/v1/query?" + params)
+            if exact_url and exact is None:
+                exact = request(exact_url.rstrip("/") + "/api/v1/query?" + params)
             route = classify(answer["response"], answer["headers"])
             if answer["http_status"] != 200:
                 route = "failed"
             rows.append({**query, "repetition": repeat, "phase": "first_pass" if repeat == 0 else "repeat",
                          "execution": route, **answer})
+            if exact is not None:
+                rows[-1]["exact"] = exact
+                rows[-1]["comparison"] = compare_results(answer["response"], exact["response"])
+                rows[-1]["pair_order"] = "exact_first" if (repeat + len(rows) - 1) % 2 == 0 else "backend_first"
             write_json(output / "queries.json", rows)
     return rows
 
@@ -187,6 +213,8 @@ def main():
     parser.add_argument("--compiler", type=Path, required=True)
     parser.add_argument("--data-plane", type=Path, required=True)
     parser.add_argument("--exact-url", required=True, help="dedicated empty Prometheus with Remote Write receiver enabled")
+    parser.add_argument("--compare", action="store_true", help="execute a matched exact request for every corpus occurrence")
+    parser.add_argument("--exact-pid", type=int, help="local Prometheus PID for Linux CPU/RSS evidence; never stopped by this runner")
     parser.add_argument("--port", type=int, default=18089)
     parser.add_argument("--settle-seconds", type=float, default=2)
     parser.add_argument("--repetitions", type=int, default=2)
@@ -197,6 +225,8 @@ def main():
     corpus = json.loads(args.queries.read_text())
     queries = validate_workload(json.loads(args.snapshot.read_text()), corpus)
     samples = parse_samples(args.metrics.read_text().splitlines())
+    if args.exact_pid is not None and process_snapshot(args.exact_pid) is None:
+        parser.error("exact-pid must name a readable live local process")
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", args.port))
     args.output.mkdir(parents=True, exist_ok=False)
@@ -222,6 +252,10 @@ def main():
     write_json(args.output / "command.json", command)
     with (args.output / "backend.log").open("w") as log:
         child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
+        PROCESS_IDS["backend"] = child.pid
+        if args.exact_pid is not None:
+            PROCESS_IDS["exact_service"] = args.exact_pid
+        phases = {"startup": process_snapshots()}
         try:
             for _ in range(120):
                 if child.poll() is not None:
@@ -239,13 +273,37 @@ def main():
             if not any(p["plan_id"] == envelope["plan_id"] and p["plan_version"] == envelope["plan_version"]
                        and p["phase"] == "active" for p in installed["response"].get("plans", [])):
                 raise RuntimeError("runtime has not activated the selected plan generation")
+            phases["before_ingest"] = process_snapshots()
+            ingest_start = time.perf_counter_ns()
             ingest(samples, [args.exact_url, backend], args.output)
             time.sleep(args.settle_seconds)
-            results = replay(queries, backend, args.output, args.repetitions)
+            ingest_elapsed = time.perf_counter_ns() - ingest_start
+            phases["after_ingest_and_settle"] = process_snapshots()
+            write_json(args.output / "process-phases.json", phases)
+            results = replay(queries, backend, args.output, args.repetitions, args.exact_url if args.compare else None)
+            phases["after_queries"] = process_snapshots()
+            write_json(args.output / "process-phases.json", phases)
             write_json(args.output / "store.json", request(backend + "/api/v1/store/metrics"))
             write_json(args.output / "completion.json", {"complete": True,
                        "execution_counts": {k: sum(r["execution"] == k for r in results) for k in ["warm", "exact_fallback", "failed"]},
                        "benefit_claim": None})
+            if args.compare:
+                report = {"schema_version": 1, "all_requests": summarize(results),
+                          "by_phase": {phase: summarize([r for r in results if r["phase"] == phase])
+                                       for phase in ["first_pass", "repeat"]},
+                          "estimated_cost": plan["cost_comparison"],
+                          "measured_ingest_and_settle_wall_ns": ingest_elapsed,
+                          "planning_wall_ns": plan["planning_elapsed_ns"],
+                          "process_phases": phases,
+                          "estimated_vs_measured_cost_ratio": None,
+                          "acceptance_complete": False,
+                          "limitations": ["No common conversion from provider cost units to measured resource units",
+                              "Exact service is shared with fallback; paired order alternates but caches are not isolated",
+                              "Resource budgets must be independently matched; affinity/cgroup recorded, not enforced",
+                              "Raw process RSS is not summary state size; store.json retains backend counters",
+                              "Planning CPU, exact-service construction/storage and isolated cold-start runs remain unmeasured",
+                              "Query equality on one dataset is not a formal approximation confidence guarantee"]}
+                write_json(args.output / "comparison.json", report)
         finally:
             child.terminate()
             try:
