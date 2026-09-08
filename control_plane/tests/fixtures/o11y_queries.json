@@ -1,0 +1,296 @@
+{
+  "upstream_revision": "3b9567319296366c6a73640d21826fc2fb26bc7e",
+  "eval_timestamp_ms": 1788891296000,
+  "source_files": [
+    {
+      "path": "tasks-spec/prometheus_query/check-service-health.yaml",
+      "sha256": "387dff16abf294107f92cb81384c4ca3964206f1ba47d773671fd6ac7aed785c"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-burn-rate-assessment.yaml",
+      "sha256": "6b3aee1e2adfc3c5b6004f29abfe374edc7294b86a55792d669f03fd122e878b"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-cache-lag-vs-user-latency.yaml",
+      "sha256": "606e0dd923a013bc8475a0efbaafc72afa1ee6035e2f48d1c4bd5e23f164cec3"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-cache-refresh-lag-peak.yaml",
+      "sha256": "6a88045045cab7ac6aba1c84968ecf8e7474cdd77315f2b4db1f2c89869243b3"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-capacity-analysis.yaml",
+      "sha256": "0760992a9f1ad15bfcf91fe14ccab3d130232773cd4a9feaadb96ffeec2982fd"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-discover-http-metric.yaml",
+      "sha256": "5a70c6fb1d575ec794252085afcef88e70b66214cf89aae3bfed8cc6600c78f9"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-error-rate.yaml",
+      "sha256": "7756d896deddf03a8c3ebafc8b677d4d0caf953a55837d63b93c914f0dbb9d0a"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-highest-backend-error-ratio.yaml",
+      "sha256": "39748917439d0201c5eca505f37b48f37d0fa39200c12d3ccd1fc2ce5f20183f"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-label-matchers-service-errors.yaml",
+      "sha256": "db72f53039fba07ebc0b77eb16cdfa10a7cd57b06384c6a8540d95d7d6a94a2b"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-offset-traffic-compare.yaml",
+      "sha256": "dca456d4948de758427725139c5123194d6e6de151815365eb12b5b801194f62"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-order-latency-vs-traffic.yaml",
+      "sha256": "ee1df5d3d7727358c60236091e4f6c24bba77499f3928ae2a337983ad94e4018"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-retry-backlog-triage.yaml",
+      "sha256": "3b11a1d3afb871558908b53a19d79bd38a659f890f244320b34eea8450cfef25"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-subquery-peak-error-rate.yaml",
+      "sha256": "fbc6d1ea4386784ce9c6f1830f33640aa9f517c808d0909209d26d1d829bbee7"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/promql-topk-5xx-share.yaml",
+      "sha256": "d19c40a904b4d09560ad6782adf61dccf8ce0aa060a18da6c835fc81cdf3779e"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/query-cpu-metrics.yaml",
+      "sha256": "51058f02c2bd8616cdde085519e9139668b2eb5b5915afbabe40952062f8459c"
+    },
+    {
+      "path": "tasks-spec/prometheus_query/query-memory-usage.yaml",
+      "sha256": "7ebf61f36fa97d5398cb64ba6543737349d087b91a8719ee62e3568ca23436b9"
+    }
+  ],
+  "queries": [
+    {
+      "id": "check-service-health:rubric:0",
+      "task_id": "check-service-health",
+      "source_path": "tasks-spec/prometheus_query/check-service-health.yaml",
+      "rubric_index": 0,
+      "query": "sum(up)",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "check-service-health:rubric:1",
+      "task_id": "check-service-health",
+      "source_path": "tasks-spec/prometheus_query/check-service-health.yaml",
+      "rubric_index": 1,
+      "query": "max((sum by (job) (rate(http_requests_total{status=~\"5..\",job=~\"user-service|order-service|payment-service\"}[6h]))) / (sum by (job) (rate(http_requests_total{job=~\"user-service|order-service|payment-service\"}[6h]))))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-burn-rate-assessment:rubric:0",
+      "task_id": "promql-burn-rate-assessment",
+      "source_path": "tasks-spec/prometheus_query/promql-burn-rate-assessment.yaml",
+      "rubric_index": 0,
+      "query": "sum(increase(http_requests_total{job=\"payment-service\",status=~\"5..\"}[1h])) / sum(increase(http_requests_total{job=\"payment-service\"}[1h]))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-burn-rate-assessment:rubric:1",
+      "task_id": "promql-burn-rate-assessment",
+      "source_path": "tasks-spec/prometheus_query/promql-burn-rate-assessment.yaml",
+      "rubric_index": 1,
+      "query": "sum(increase(http_requests_total{job=\"payment-service\",status=~\"5..\"}[1h] offset 6h)) / sum(increase(http_requests_total{job=\"payment-service\"}[1h] offset 6h))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-cache-lag-vs-user-latency:rubric:0",
+      "task_id": "promql-cache-lag-vs-user-latency",
+      "source_path": "tasks-spec/prometheus_query/promql-cache-lag-vs-user-latency.yaml",
+      "rubric_index": 0,
+      "query": "max_over_time(service_cache_refresh_lag_seconds{job=\"user-service\"}[12h])",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-cache-lag-vs-user-latency:rubric:1",
+      "task_id": "promql-cache-lag-vs-user-latency",
+      "source_path": "tasks-spec/prometheus_query/promql-cache-lag-vs-user-latency.yaml",
+      "rubric_index": 1,
+      "query": "max_over_time(histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=\"user-service\"}[5m])) by (le))[12h:1m])",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-cache-lag-vs-user-latency:rubric:2",
+      "task_id": "promql-cache-lag-vs-user-latency",
+      "source_path": "tasks-spec/prometheus_query/promql-cache-lag-vs-user-latency.yaml",
+      "rubric_index": 2,
+      "query": "service_cache_refresh_lag_seconds{job=\"user-service\"}",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-cache-refresh-lag-peak:rubric:0",
+      "task_id": "promql-cache-refresh-lag-peak",
+      "source_path": "tasks-spec/prometheus_query/promql-cache-refresh-lag-peak.yaml",
+      "rubric_index": 0,
+      "query": "max_over_time(service_cache_refresh_lag_seconds{job=\"user-service\"}[12h])",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-cache-refresh-lag-peak:rubric:1",
+      "task_id": "promql-cache-refresh-lag-peak",
+      "source_path": "tasks-spec/prometheus_query/promql-cache-refresh-lag-peak.yaml",
+      "rubric_index": 1,
+      "query": "service_cache_refresh_lag_seconds{job=\"user-service\"}",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-capacity-analysis:rubric:0",
+      "task_id": "promql-capacity-analysis",
+      "source_path": "tasks-spec/prometheus_query/promql-capacity-analysis.yaml",
+      "rubric_index": 0,
+      "query": "sum(rate(process_cpu_seconds_total[1h]))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-capacity-analysis:rubric:1",
+      "task_id": "promql-capacity-analysis",
+      "source_path": "tasks-spec/prometheus_query/promql-capacity-analysis.yaml",
+      "rubric_index": 1,
+      "query": "sum(process_resident_memory_bytes)",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-capacity-analysis:rubric:2",
+      "task_id": "promql-capacity-analysis",
+      "source_path": "tasks-spec/prometheus_query/promql-capacity-analysis.yaml",
+      "rubric_index": 2,
+      "query": "max_over_time(sum(process_resident_memory_bytes)[6h:1m])",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-discover-http-metric:rubric:0",
+      "task_id": "promql-discover-http-metric",
+      "source_path": "tasks-spec/prometheus_query/promql-discover-http-metric.yaml",
+      "rubric_index": 0,
+      "query": "sum(rate(http_requests_total{job=~\"user-service|order-service|payment-service\"}[5m]))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-error-rate:rubric:0",
+      "task_id": "promql-error-rate",
+      "source_path": "tasks-spec/prometheus_query/promql-error-rate.yaml",
+      "rubric_index": 0,
+      "query": "sum(rate(http_requests_total{status=~\"5..\",job=~\"user-service|order-service|payment-service\"}[1h])) / sum(rate(http_requests_total{job=~\"user-service|order-service|payment-service\"}[1h]))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-highest-backend-error-ratio:rubric:2",
+      "task_id": "promql-highest-backend-error-ratio",
+      "source_path": "tasks-spec/prometheus_query/promql-highest-backend-error-ratio.yaml",
+      "rubric_index": 2,
+      "query": "(sum by (job) (increase(http_requests_total{status=~\"5..\",job=~\"user-service|order-service|payment-service\"}[6h]))) / (sum by (job) (increase(http_requests_total{job=~\"user-service|order-service|payment-service\"}[6h])))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-highest-backend-error-ratio:rubric:3",
+      "task_id": "promql-highest-backend-error-ratio",
+      "source_path": "tasks-spec/prometheus_query/promql-highest-backend-error-ratio.yaml",
+      "rubric_index": 3,
+      "query": "(sum by (job) (increase(http_requests_total{status=~\"5..\",job=~\"user-service|order-service|payment-service\"}[6h]))) / (sum by (job) (increase(http_requests_total{job=~\"user-service|order-service|payment-service\"}[6h])))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-label-matchers-service-errors:rubric:0",
+      "task_id": "promql-label-matchers-service-errors",
+      "source_path": "tasks-spec/prometheus_query/promql-label-matchers-service-errors.yaml",
+      "rubric_index": 0,
+      "query": "sum by (job) (increase(http_requests_total{status=~\"5..\",job=~\".+-service\"}[24h])) > 0",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-offset-traffic-compare:rubric:0",
+      "task_id": "promql-offset-traffic-compare",
+      "source_path": "tasks-spec/prometheus_query/promql-offset-traffic-compare.yaml",
+      "rubric_index": 0,
+      "query": "sum(rate(http_requests_total{job=\"order-service\"}[5m]))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-offset-traffic-compare:rubric:1",
+      "task_id": "promql-offset-traffic-compare",
+      "source_path": "tasks-spec/prometheus_query/promql-offset-traffic-compare.yaml",
+      "rubric_index": 1,
+      "query": "sum(rate(http_requests_total{job=\"order-service\"}[5m] offset 1h))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-order-latency-vs-traffic:rubric:0",
+      "task_id": "promql-order-latency-vs-traffic",
+      "source_path": "tasks-spec/prometheus_query/promql-order-latency-vs-traffic.yaml",
+      "rubric_index": 0,
+      "query": "sum(rate(http_requests_total{job=\"order-service\"}[5m]))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-order-latency-vs-traffic:rubric:1",
+      "task_id": "promql-order-latency-vs-traffic",
+      "source_path": "tasks-spec/prometheus_query/promql-order-latency-vs-traffic.yaml",
+      "rubric_index": 1,
+      "query": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{job=\"order-service\"}[5m])) by (le))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-retry-backlog-triage:rubric:0",
+      "task_id": "promql-retry-backlog-triage",
+      "source_path": "tasks-spec/prometheus_query/promql-retry-backlog-triage.yaml",
+      "rubric_index": 0,
+      "query": "max_over_time(service_retry_queue_depth{job=~\".+\"}[6h])",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-retry-backlog-triage:rubric:1",
+      "task_id": "promql-retry-backlog-triage",
+      "source_path": "tasks-spec/prometheus_query/promql-retry-backlog-triage.yaml",
+      "rubric_index": 1,
+      "query": "max_over_time(service_retry_queue_depth{job=\"order-service\"}[6h])",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-subquery-peak-error-rate:rubric:0",
+      "task_id": "promql-subquery-peak-error-rate",
+      "source_path": "tasks-spec/prometheus_query/promql-subquery-peak-error-rate.yaml",
+      "rubric_index": 0,
+      "query": "max_over_time((sum(rate(http_requests_total{job=\"order-service\",status=~\"5..\"}[5m])) / sum(rate(http_requests_total{job=\"order-service\"}[5m])))[6h:1m])",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "promql-topk-5xx-share:rubric:0",
+      "task_id": "promql-topk-5xx-share",
+      "source_path": "tasks-spec/prometheus_query/promql-topk-5xx-share.yaml",
+      "rubric_index": 0,
+      "query": "sum(increase(http_requests_total{job=\"order-service\",status=~\"5..\"}[24h])) / sum(increase(http_requests_total{status=~\"5..\"}[24h]))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "query-cpu-metrics:rubric:0",
+      "task_id": "query-cpu-metrics",
+      "source_path": "tasks-spec/prometheus_query/query-cpu-metrics.yaml",
+      "rubric_index": 0,
+      "query": "sum by (job) (rate(process_cpu_seconds_total{job=~\".+\"}[6h]))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "query-cpu-metrics:rubric:2",
+      "task_id": "query-cpu-metrics",
+      "source_path": "tasks-spec/prometheus_query/query-cpu-metrics.yaml",
+      "rubric_index": 2,
+      "query": "sort_desc(sum by (job) (rate(process_cpu_seconds_total{job=~\".+\"}[6h])))",
+      "eval_timestamp_ms": 1788891296000
+    },
+    {
+      "id": "query-memory-usage:rubric:0",
+      "task_id": "query-memory-usage",
+      "source_path": "tasks-spec/prometheus_query/query-memory-usage.yaml",
+      "rubric_index": 0,
+      "query": "sum(avg_over_time(process_resident_memory_bytes{job=~\".+\"}[6h]))",
+      "eval_timestamp_ms": 1788891296000
+    }
+  ]
+}

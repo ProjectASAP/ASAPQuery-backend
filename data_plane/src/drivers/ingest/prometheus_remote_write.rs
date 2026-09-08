@@ -96,10 +96,12 @@ struct ReceiverInner {
     ingest: Arc<IngestState>,
     dedup: Mutex<DedupState>,
     stats: Arc<RemoteWriteStats>,
+    raw_store: Arc<crate::query_engines::raw_store::RawSampleStore>,
 }
 
 #[derive(Default)]
 struct DedupState {
+    input_closed: bool,
     values: HashMap<(u64, u64, String, i64), DedupValue>,
     expiry: VecDeque<(Instant, u64, u64, String, i64)>,
 }
@@ -112,6 +114,8 @@ enum DedupValue {
 
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteWriteError {
+    #[error("finite input has been closed by the drain barrier")]
+    InputClosed,
     #[error("compressed request exceeds {0} bytes")]
     CompressedTooLarge(usize),
     #[error("decompressed request exceeds {0} bytes")]
@@ -153,14 +157,27 @@ pub struct CanonicalSample {
 
 impl PrometheusRemoteWriteReceiver {
     pub fn new(config: PrometheusRemoteWriteConfig, ingest: Arc<IngestState>) -> Self {
+        Self::new_with_raw_store(config, ingest, Arc::new(Default::default()))
+    }
+
+    pub fn new_with_raw_store(
+        config: PrometheusRemoteWriteConfig,
+        ingest: Arc<IngestState>,
+        raw_store: Arc<crate::query_engines::raw_store::RawSampleStore>,
+    ) -> Self {
         Self {
             inner: Arc::new(ReceiverInner {
                 config,
                 ingest,
                 dedup: Mutex::new(DedupState::default()),
                 stats: Arc::new(RemoteWriteStats::default()),
+                raw_store,
             }),
         }
+    }
+
+    pub fn raw_store(&self) -> Arc<crate::query_engines::raw_store::RawSampleStore> {
+        self.inner.raw_store.clone()
     }
 
     pub fn config(&self) -> &PrometheusRemoteWriteConfig {
@@ -169,6 +186,32 @@ impl PrometheusRemoteWriteReceiver {
 
     pub fn stats(&self) -> Arc<RemoteWriteStats> {
         self.inner.stats.clone()
+    }
+
+    /// Permanently seal this finite source before queuing worker barriers.
+    pub async fn drain(&self) -> Result<(), String> {
+        {
+            let mut state = self.inner.dedup.lock().map_err(|e| e.to_string())?;
+            state.input_closed = true;
+        }
+        self.inner.ingest.router.drain().await?;
+        // Finite-input preparation includes the residual index, so its build
+        // cost is not silently amortized into the first query's read cost.
+        if self.inner.raw_store.sample_count() > 0 {
+            let plan = self
+                .inner
+                .ingest
+                .physical_plan_snapshot()
+                .ok_or_else(|| "active plan disappeared during input drain".to_string())?;
+            self.inner
+                .raw_store
+                .snapshot(
+                    plan.precompute_plan.envelope.plan_id,
+                    plan.precompute_plan.envelope.plan_version,
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
     }
 
     /// Decode, validate, deduplicate, and enqueue one whole v1 request.
@@ -235,6 +278,9 @@ impl PrometheusRemoteWriteReceiver {
             .dedup
             .lock()
             .expect("remote write dedup poisoned");
+        if dedup.input_closed {
+            return Err(RemoteWriteError::InputClosed);
+        }
         dedup.evict_before(now.checked_sub(config.dedup_horizon).unwrap_or(now));
 
         // Validate conflicts both against committed history and inside this
@@ -279,6 +325,32 @@ impl PrometheusRemoteWriteReceiver {
             .ingest
             .router
             .try_route_group_batch_atomic(messages)?;
+
+        let mut raw_metrics = std::collections::BTreeSet::new();
+        let mut all_metrics = false;
+        for entry in physical_plan.query_plan.entries.values() {
+            for node in entry.nodes.values() {
+                if let control_plane::query_plan::QueryPlanNode::Logical {
+                    operator:
+                        control_plane::query_plan::logical::LogicalOperator::Scan { metric, .. },
+                    ..
+                } = node
+                {
+                    if let Some(metric) = metric {
+                        raw_metrics.insert(metric.clone());
+                    } else {
+                        all_metrics = true;
+                    }
+                }
+            }
+        }
+        self.inner.raw_store.append_admitted(
+            plan_identity.0,
+            plan_identity.1,
+            &new_samples,
+            &raw_metrics,
+            all_metrics,
+        );
 
         for ((plan_id, plan_version, series, timestamp), value) in batch_values {
             dedup
@@ -537,6 +609,12 @@ mod tests {
     }
 
     fn physical_config(streaming: StreamingConfig) -> HotReloadStreamingConfig {
+        physical_config_with_raw(streaming, false)
+    }
+    fn physical_config_with_raw(
+        streaming: StreamingConfig,
+        retain_raw: bool,
+    ) -> HotReloadStreamingConfig {
         use control_plane::physical::compiler::{
             FrameIdentityContract, IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan,
             SequenceScope, TimestampUnit, TransmissionPlan, PLANNER_REVISION,
@@ -551,7 +629,7 @@ mod tests {
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
-        let active = ActivePhysicalPlan {
+        let mut active = ActivePhysicalPlan {
             precompute_plan: PrecomputePlan {
                 envelope: envelope.clone(),
                 ingest: IngestContract {
@@ -581,6 +659,38 @@ mod tests {
             query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(BackendStorageRouting::empty()),
         };
+        if retain_raw {
+            use control_plane::query_plan::{
+                FallbackPolicy, InstantExecution, QueryNodeId, QueryPlanEntry, QueryPlanNode,
+            };
+            let id = QueryNodeId(0);
+            let query = QueryPlanEntry {
+                query_id: "raw".into(),
+                canonical_promql: "requests_total".into(),
+                root: id,
+                nodes: std::collections::BTreeMap::from([(
+                    id,
+                    QueryPlanNode::Logical {
+                        operator: control_plane::query_plan::logical::LogicalOperator::Scan {
+                            metric: Some("requests_total".into()),
+                            matchers: vec![],
+                            range_ms: None,
+                            offset_ms: 0,
+                        },
+                        inputs: vec![],
+                    },
+                )]),
+                instant: InstantExecution {
+                    lookback_ms: 300_000,
+                    full_history: false,
+                    cumulative_readout: true,
+                },
+                fallback: FallbackPolicy::ExactBackend,
+            };
+            let mut plan = control_plane::query_plan::QueryPlan::empty();
+            plan.entries.insert("requests_total".into(), query);
+            active.query_plan = Arc::new(plan);
+        }
         HotReloadStreamingConfig::from_active(HotReloadActivePhysicalPlan::new(active))
     }
 
@@ -601,6 +711,11 @@ mod tests {
     }
 
     fn configured_receiver() -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
+        configured_receiver_with_raw(false)
+    }
+    fn configured_receiver_with_raw(
+        retain_raw: bool,
+    ) -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
         use asap_types::enums::WindowKind;
         use asap_types::{AggregationConfig, AggregationType, KeyByLabelNames};
         let aggregation = AggregationConfig {
@@ -628,7 +743,7 @@ mod tests {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: physical_config(streaming),
+            hot_reload_config: physical_config_with_raw(streaming, retain_raw),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
@@ -662,6 +777,61 @@ mod tests {
                 histograms: Vec::new(),
             }],
         })
+    }
+
+    // A rejected or duplicate Remote Write request never changes retained raw input.
+    #[test]
+    fn retained_raw_samples_follow_atomic_admission_and_deduplication() {
+        let (receiver, _worker) = configured_receiver_with_raw(true);
+        receiver.accept(&one_sample(1.0)).unwrap();
+        receiver.accept(&one_sample(1.0)).unwrap();
+        assert_eq!(receiver.raw_store().sample_count(), 1);
+        assert!(receiver.accept(&one_sample(2.0)).is_err());
+        assert_eq!(receiver.raw_store().sample_count(), 1);
+        for timestamp in 101..108 {
+            let bytes = snap::raw::Decoder::new()
+                .decompress_vec(&one_sample(1.0))
+                .unwrap();
+            let mut write = WriteRequest::decode(bytes.as_slice()).unwrap();
+            write.timeseries[0].samples[0].timestamp = timestamp;
+            receiver.accept(&compressed(write)).unwrap();
+        }
+        assert_eq!(receiver.raw_store().sample_count(), 8);
+        let bytes = snap::raw::Decoder::new()
+            .decompress_vec(&one_sample(1.0))
+            .unwrap();
+        let mut write = WriteRequest::decode(bytes.as_slice()).unwrap();
+        write.timeseries[0].samples[0].timestamp = 108;
+        assert!(matches!(
+            receiver.accept(&compressed(write)),
+            Err(RemoteWriteError::Backpressure(_))
+        ));
+        assert_eq!(receiver.raw_store().sample_count(), 8);
+        let (native, _worker) = configured_receiver();
+        native.accept(&one_sample(1.0)).unwrap();
+        assert_eq!(native.raw_store().sample_count(), 0);
+    }
+
+    // Closing finite input prevents writes racing behind the completion barrier.
+    #[tokio::test]
+    async fn finite_input_drain_seals_receiver_and_propagates_worker_failure() {
+        let (receiver, mut worker) = configured_receiver();
+        receiver.accept(&one_sample(1.0)).unwrap();
+        let handle = receiver.clone();
+        let drain = tokio::spawn(async move { handle.drain().await });
+        assert!(matches!(
+            worker.recv().await.unwrap(),
+            WorkerMessage::GroupSamples { .. }
+        ));
+        let WorkerMessage::Drain(reply) = worker.recv().await.unwrap() else {
+            panic!("expected barrier")
+        };
+        assert!(matches!(
+            receiver.accept(&one_sample(1.0)),
+            Err(RemoteWriteError::InputClosed)
+        ));
+        reply.send(Err("sink write failed".into())).unwrap();
+        assert_eq!(drain.await.unwrap().unwrap_err(), "sink write failed");
     }
 
     #[test]

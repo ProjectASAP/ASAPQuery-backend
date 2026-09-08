@@ -203,6 +203,29 @@ pub fn manifest(
                 add(format!("source:{}", source), source, "horizon", 1.0);
             }
         }
+        // Typed local scans require retained input and ingest/update work even
+        // when no precomputed summary is installed. Deduplicate by source.
+        for node in entry.nodes.values() {
+            if let crate::query_plan::QueryPlanNode::Logical {
+                operator: crate::query_plan::logical::LogicalOperator::Scan { metric, .. },
+                ..
+            } = node
+            {
+                let metric = metric
+                    .as_ref()
+                    .ok_or_else(|| invalid("local raw scan requires named-source pricing"))?;
+                let source = json!({"source": planner_types::pre_asap::Source::TimeSeries { metric: metric.clone() }, "location": "backend", "ingest": plan.precompute_plan.ingest});
+                add(format!("source:{}", source), source.clone(), "horizon", 1.0);
+                for operation in ["build", "update", "residency", "retire"] {
+                    add(
+                        format!("raw-state:{metric}:{operation}"),
+                        json!({"operation": operation, "source": source}),
+                        "horizon",
+                        1.0,
+                    );
+                }
+            }
+        }
         // Reachability comes from QueryPlan, including materialization reads,
         // arithmetic, reduction and a complete engine-native exact fallback.
         for node_id in entry.topological_order()? {
@@ -234,7 +257,7 @@ pub fn manifest(
 
 /// Walk the canonical relational tree, preserving every input to binary and
 /// fan-in operators. Unsupported source discovery must not produce a partial quote.
-fn exact_source_metrics(
+pub(crate) fn exact_source_metrics(
     expr: &planner_types::pre_asap::QueryExpr,
 ) -> Result<BTreeSet<String>, CompileError> {
     use planner_types::pre_asap::{QueryExpr, Source};
@@ -434,6 +457,7 @@ pub fn with_exact_alternative(
     request: PlanningRequest,
 ) -> Result<Vec<PlanningRequest>, CompileError> {
     let mut exact = request.clone();
+    exact.local_raw_execution = false;
     for query in &mut exact.queries {
         let parsed = crate::query_parser::parse_query_expr_canonical(
             &query.query_string,
@@ -443,11 +467,12 @@ pub fn with_exact_alternative(
         query.post_asap = crate::planner_selection::keep_pre_asap(&parsed)
             .map_err(|error| invalid(error.to_string()))?;
     }
-    if request
-        .queries
-        .iter()
-        .zip(&exact.queries)
-        .all(|(a, b)| a.post_asap == b.post_asap)
+    if !request.local_raw_execution
+        && request
+            .queries
+            .iter()
+            .zip(&exact.queries)
+            .all(|(a, b)| a.post_asap == b.post_asap)
     {
         Ok(vec![request])
     } else {
@@ -501,6 +526,50 @@ mod tests {
             quotes,
         };
         (candidates, env, evidence)
+    }
+
+    // Retained local input is priced once per metric, separate from the native service.
+    #[test]
+    fn local_raw_manifest_prices_shared_storage_and_distinct_native_alternative() {
+        use planner_types::workload::{AccuracyRequirement, Query};
+        let mut snapshot = fixture();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query = Query("sum(rate(a{job=\"x\"}[1m])) / sum(rate(a{job!=\"x\"}[5m]))".into());
+        entry.requirements.accuracy =
+            AccuracyRequirement::Explicit(crate::types_v2::AccuracyTarget::Exact);
+        let (request, environment) = snapshot.planning_request().unwrap();
+        let candidates = with_exact_alternative(request).unwrap();
+        assert_eq!(candidates.len(), 2);
+        let local = PhysicalCompiler
+            .compile(candidates[0].clone(), environment.clone())
+            .unwrap();
+        let native = PhysicalCompiler
+            .compile(candidates[1].clone(), environment)
+            .unwrap();
+        assert_ne!(local.envelope.plan_id, native.envelope.plan_id);
+        let manifest = manifest(&local, &candidates[0].queries).unwrap();
+        assert_eq!(
+            manifest
+                .components
+                .keys()
+                .filter(|key| key.starts_with("raw-state:a:"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            manifest
+                .components
+                .values()
+                .filter(|demand| demand.implementation.get("location")
+                    == Some(&serde_json::json!("backend")))
+                .count(),
+            1
+        );
+        assert!(!manifest
+            .components
+            .values()
+            .any(|demand| demand.implementation.get("location")
+                == Some(&serde_json::json!("exact_backend"))));
     }
 
     // All input metrics need upkeep quotes; repeated reads share that upkeep.

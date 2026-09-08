@@ -20,6 +20,7 @@
 pub mod asap_query_engine;
 pub mod no_data_archive;
 pub mod query_result;
+pub mod raw_store;
 pub mod routing;
 pub mod thanos_query_engine;
 
