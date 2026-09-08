@@ -5789,6 +5789,7 @@ async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::
         "status": "success",
         "sid_count": timestamps.len(),
         "approx_resident_bytes": state.sketch_index.approx_resident_bytes(),
+        "exact_range_max_index_bytes": state.remote_write.as_ref().map(|receiver| receiver.raw_store().range_max_index_bytes()).unwrap_or(0),
         "raw_store_estimated_bytes": state.remote_write.as_ref().map(|receiver| receiver.raw_store().estimated_bytes()).unwrap_or(0),
         "raw_store_samples": state.remote_write.as_ref().map(|receiver| receiver.raw_store().sample_count()).unwrap_or(0),
         "earliest_timestamps_per_sid": timestamps});

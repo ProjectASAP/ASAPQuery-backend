@@ -12,6 +12,13 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LogicalOperator {
+    /// Planner-selected exact per-series MinMax state, queried as max over an
+    /// exact event-time interval. This is an installed index, not a raw scan.
+    ReadRangeMaxIndex {
+        metric: String,
+        matchers: Vec<LabelMatcher>,
+        range_ms: u64,
+    },
     Scan {
         metric: Option<String>,
         matchers: Vec<LabelMatcher>,
@@ -117,7 +124,7 @@ fn offset(value: &Option<Offset>) -> Result<i64, QueryPlanError> {
 impl LogicalOperator {
     pub fn validate(&self, inputs: usize) -> Result<(), QueryPlanError> {
         let expected = match self {
-            Self::Scan { .. } => 0,
+            Self::Scan { .. } | Self::ReadRangeMaxIndex { .. } => 0,
             Self::Binary { .. } | Self::HistogramQuantile => 2,
             _ => 1,
         };
@@ -132,6 +139,14 @@ impl LogicalOperator {
             }
         ) {
             return Err(invalid("zero range"));
+        }
+        if let Self::ReadRangeMaxIndex {
+            metric, range_ms, ..
+        } = self
+        {
+            if metric.is_empty() || *range_ms == 0 || *range_ms > i64::MAX as u64 {
+                return Err(invalid("invalid exact range-max index contract"));
+            }
         }
         if let Self::Subquery {
             range_ms, step_ms, ..
@@ -788,6 +803,116 @@ mod planner_workload_tests {
                     ..
                 }
             ));
+        }
+    }
+}
+
+/// Preserve the exact original operator direction because MinMax family alone
+/// does not distinguish min from max. The full Planner-node witness is required.
+pub(super) fn selected_range_max_index(
+    original: &str,
+    node: &planner_types::post_asap::SummaryNode,
+) -> Result<Option<LogicalOperator>, QueryPlanError> {
+    use planner_types::post_asap::{ExactKind, SummaryExpr, SummaryFamilyType};
+    if !matches!(
+        &node.expr,
+        SummaryExpr::SummaryAgg {
+            family: SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _),
+            reduction: planner_types::pre_asap::Reduction::PerEntity,
+            ..
+        }
+    ) {
+        return Ok(None);
+    }
+    let (root, nodes) = selected_residual_nodes(original, node)?;
+    let Some(QueryPlanNode::Logical {
+        operator:
+            LogicalOperator::Temporal {
+                operation: TemporalOperation::Max,
+            },
+        inputs,
+    }) = nodes.get(&root)
+    else {
+        return Ok(None);
+    };
+    if inputs.len() != 1 || nodes.len() != 2 {
+        return Ok(None);
+    }
+    let Some(QueryPlanNode::Logical {
+        operator:
+            LogicalOperator::Scan {
+                metric: Some(metric),
+                matchers,
+                range_ms: Some(range_ms),
+                offset_ms: 0,
+            },
+        ..
+    }) = nodes.get(&inputs[0])
+    else {
+        return Ok(None);
+    };
+    Ok(Some(LogicalOperator::ReadRangeMaxIndex {
+        metric: metric.clone(),
+        matchers: matchers.clone(),
+        range_ms: *range_ms,
+    }))
+}
+
+#[cfg(test)]
+mod range_max_index_tests {
+    use super::*;
+    #[test]
+    fn real_gauge_queries_have_planner_authorized_exact_indexes() {
+        for (query, metric, range_ms) in [
+            (
+                r#"max_over_time(service_cache_refresh_lag_seconds{job="user-service"}[12h])"#,
+                "service_cache_refresh_lag_seconds",
+                43_200_000,
+            ),
+            (
+                r#"max_over_time(service_retry_queue_depth{job=~".+"}[6h])"#,
+                "service_retry_queue_depth",
+                21_600_000,
+            ),
+            (
+                r#"max_over_time(service_retry_queue_depth{job="order-service"}[6h])"#,
+                "service_retry_queue_depth",
+                21_600_000,
+            ),
+        ] {
+            let original = crate::query_parser::parse_query_expr_canonical(
+                query,
+                planner_types::types::AccuracyTarget::Exact,
+            )
+            .unwrap();
+            let selected = crate::planner_selection::select_summary_default(&original).unwrap();
+            let index = selected_range_max_index(query, &selected).unwrap().unwrap();
+            assert!(
+                matches!(index, LogicalOperator::ReadRangeMaxIndex { metric: ref actual, range_ms: actual_range, .. } if actual == metric && actual_range == range_ms)
+            );
+            index.validate(0).unwrap();
+            assert!(index.validate(1).is_err());
+        }
+    }
+    #[test]
+    fn min_and_shifted_or_nested_windows_do_not_become_max_indexes() {
+        for query in [
+            "min_over_time(m[1m])",
+            "max_over_time(m[1m] offset 1m)",
+            "max_over_time((m + m)[1m:1s])",
+        ] {
+            let original = crate::query_parser::parse_query_expr_canonical(
+                query,
+                planner_types::types::AccuracyTarget::Exact,
+            )
+            .unwrap();
+            let selected = crate::planner_selection::select_summary_default(&original).unwrap();
+            assert!(
+                selected_range_max_index(query, &selected)
+                    .unwrap()
+                    .is_none(),
+                "{query}"
+            );
         }
     }
 }

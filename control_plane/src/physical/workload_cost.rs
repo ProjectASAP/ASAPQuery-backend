@@ -207,13 +207,37 @@ pub fn manifest(
         // when no precomputed summary is installed. Deduplicate by source.
         for node in entry.nodes.values() {
             if let crate::query_plan::QueryPlanNode::Logical {
-                operator: crate::query_plan::logical::LogicalOperator::Scan { metric, .. },
+                operator:
+                    operator @ (crate::query_plan::logical::LogicalOperator::Scan { .. }
+                    | crate::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
+                        ..
+                    }),
                 ..
             } = node
             {
-                let metric = metric
-                    .as_ref()
-                    .ok_or_else(|| invalid("local raw scan requires named-source pricing"))?;
+                let metric = match operator {
+                    crate::query_plan::logical::LogicalOperator::Scan { metric, .. } => metric
+                        .as_ref()
+                        .ok_or_else(|| invalid("local raw scan requires named-source pricing"))?,
+                    crate::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
+                        metric,
+                        ..
+                    } => metric,
+                    _ => unreachable!(),
+                };
+                if matches!(
+                    operator,
+                    crate::query_plan::logical::LogicalOperator::ReadRangeMaxIndex { .. }
+                ) {
+                    for operation in ["build", "update", "residency", "retire"] {
+                        add(
+                            format!("range-max-index:{metric}:{operation}"),
+                            json!({"operation": operation, "metric": metric, "index": "exact_per_series_range_max_v1"}),
+                            "horizon",
+                            1.0,
+                        );
+                    }
+                }
                 let source = json!({"source": planner_types::pre_asap::Source::TimeSeries { metric: metric.clone() }, "location": "backend", "ingest": plan.precompute_plan.ingest});
                 add(format!("source:{}", source), source.clone(), "horizon", 1.0);
                 for operation in ["build", "update", "residency", "retire"] {
@@ -493,6 +517,52 @@ mod tests {
         snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
             planner_types::workload::Query("sum(sum_over_time(m[1m]))".into());
         snapshot
+    }
+
+    #[test]
+    fn range_max_index_costs_share_state_across_filters_and_charge_retained_input() {
+        let mut snapshot = fixture();
+        let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
+        entries[0].query = planner_types::workload::Query(
+            "max_over_time(service_retry_queue_depth{job=~\".+\"}[6h])".into(),
+        );
+        entries[0].requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
+            planner_types::types::AccuracyTarget::Exact,
+        );
+        let mut second = entries[0].clone();
+        second.query = planner_types::workload::Query(
+            "max_over_time(service_retry_queue_depth{job=\"order-service\"}[6h])".into(),
+        );
+        entries.push(second);
+        let (request, env) = snapshot.planning_request().unwrap();
+        let plan = PhysicalCompiler.compile(request.clone(), env).unwrap();
+        let costs = manifest(&plan, &request.queries).unwrap();
+        assert_eq!(
+            costs
+                .components
+                .keys()
+                .filter(|id| id.starts_with("range-max-index:"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            costs
+                .components
+                .keys()
+                .filter(|id| id.starts_with("raw-state:"))
+                .count(),
+            4
+        );
+        for operation in ["build", "update", "residency", "retire"] {
+            assert_eq!(
+                costs.components[&format!("range-max-index:service_retry_queue_depth:{operation}")]
+                    .multiplicity,
+                1.0
+            );
+        }
+        assert_eq!(plan.query_plan.entries.values().flat_map(|entry| entry.nodes.values()).filter(|node|
+            matches!(node, crate::query_plan::QueryPlanNode::Logical { operator:
+                crate::query_plan::logical::LogicalOperator::ReadRangeMaxIndex { .. }, .. })).count(), 2);
     }
 
     fn quoted() -> (
