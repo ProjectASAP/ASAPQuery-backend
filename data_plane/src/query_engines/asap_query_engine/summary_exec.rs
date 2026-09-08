@@ -158,12 +158,16 @@ pub fn execute<E: SummaryExecutor>(
             reduction,
             ..
         } => {
-            let col = match input.item.as_ref().unwrap_or(&input.weight) {
-                planner_types::post_asap::SummaryInputExpr::Column(col) => col.clone(),
-                planner_types::post_asap::SummaryInputExpr::Constant(value) if *value == 1.0 => {
-                    ColumnRef::SampleValue
+            // This legacy adapter forwards one value column, not a complete
+            // keyed item/weight contract. Do not silently treat a unit-weight
+            // count as a sample-value sum or drop the weight of a keyed update.
+            let col = match (&input.item, &input.weight) {
+                (None, planner_types::post_asap::SummaryInputExpr::Column(col)) => col.clone(),
+                _ => {
+                    return Err(ExecError::NotYetSupported(
+                        "keyed or non-column summary update",
+                    ))
                 }
-                _ => return Err(ExecError::NotYetSupported("summary update expression")),
             };
             let tagged = exec.find_candidates(family, &col, reduction, child)?;
             if tagged.is_empty() {
@@ -499,12 +503,12 @@ mod tests {
         exec.register(7.0);
         for input in [
             SummaryUpdate {
-                item: Some(SummaryInputExpr::Constant(2.0)),
+                item: Some(SummaryInputExpr::Column(ColumnRef::Named("key".into()))),
                 weight: SummaryInputExpr::Column(ColumnRef::SampleValue),
             },
             SummaryUpdate {
                 item: None,
-                weight: SummaryInputExpr::Constant(2.0),
+                weight: SummaryInputExpr::Constant(1.0),
             },
         ] {
             let mut tree = agg_node(sum(), logical_node());
@@ -515,7 +519,9 @@ mod tests {
             *update = input;
             assert!(matches!(
                 execute(&tree, &exec),
-                Err(ExecError::NotYetSupported("summary update expression"))
+                Err(ExecError::NotYetSupported(
+                    "keyed or non-column summary update"
+                ))
             ));
         }
     }
