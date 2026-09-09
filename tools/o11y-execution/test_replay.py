@@ -4,7 +4,7 @@ from unittest.mock import patch
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
-from replay import execution_provenance, classify, validate_workload, encode_write, parse_samples, replay
+from replay import execution_provenance, classify, validate_workload, encode_write, parse_samples, replay, validate_sample_file, ingest_sample_file
 
 
 class ReplayTests(unittest.TestCase):
@@ -70,6 +70,23 @@ class ReplayTests(unittest.TestCase):
             self.assertEqual(http.call_count, 6)
             self.assertEqual(probes.call_count, 3)
             self.assertTrue((Path(directory) / "query-batch-resources.json").exists())
+
+    def test_file_validation_and_ingestion_stream_without_read_text(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            metrics = root / "metrics.prom"
+            metrics.write_text("x{job=\"a\"} 1 1\nx{job=\"a\"} 2 2\n")
+            self.assertEqual(validate_sample_file(metrics), 2)
+            captured = []
+            def consume(rows, endpoints, output):
+                self.assertNotIsInstance(rows, list)
+                captured.extend(rows)
+            with patch("replay.ingest", side_effect=consume):
+                ingest_sample_file(metrics, ["http://example"], root)
+                self.assertEqual(captured, [
+                    ({"__name__": "x", "job": "a"}, 1.0, 1000),
+                    ({"__name__": "x", "job": "a"}, 2.0, 2000),
+                ])
 
     def test_bad_input_fails_before_any_ingest(self):
         """No silent sample drops, duplicate samples, or time reordering."""
