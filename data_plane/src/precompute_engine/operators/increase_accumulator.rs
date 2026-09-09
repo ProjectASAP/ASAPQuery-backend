@@ -348,8 +348,26 @@ impl AggregateCore for IncreaseAccumulator {
             .downcast_ref::<IncreaseAccumulator>()
             .ok_or("Failed to downcast to IncreaseAccumulator")?;
 
-        // Use the existing merge_accumulators method
-        let merged = Self::merge_accumulators(vec![self.clone(), other_increase.clone()])?;
+        let (first, second) = if self.starting_timestamp <= other_increase.starting_timestamp {
+            (self, other_increase)
+        } else {
+            (other_increase, self)
+        };
+        let mut merged = first.clone();
+        if second.starting_timestamp > merged.last_seen_timestamp {
+            merged.total_increase +=
+                if second.starting_measurement.value >= merged.last_seen_measurement.value {
+                    second.starting_measurement.value - merged.last_seen_measurement.value
+                } else {
+                    second.starting_measurement.value
+                };
+        }
+        merged.total_increase += second.total_increase;
+        merged.sample_count = merged.sample_count.saturating_add(second.sample_count);
+        if second.last_seen_timestamp > merged.last_seen_timestamp {
+            merged.last_seen_measurement = second.last_seen_measurement.clone();
+            merged.last_seen_timestamp = second.last_seen_timestamp;
+        }
 
         Ok(Box::new(merged))
     }

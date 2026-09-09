@@ -178,8 +178,11 @@ impl AggregateCore for MinMaxAccumulator {
             .downcast_ref::<MinMaxAccumulator>()
             .ok_or("Failed to downcast to MinMaxAccumulator")?;
 
-        // Use the existing merge_accumulators method
-        let merged = Self::merge_accumulators(vec![self.clone(), other_minmax.clone()])?;
+        if self.sub_type != other_minmax.sub_type {
+            return Err("Cannot merge MinMaxAccumulators with different sub_types".into());
+        }
+        let mut merged = self.clone();
+        merged.update(other_minmax.value);
 
         Ok(Box::new(merged))
     }

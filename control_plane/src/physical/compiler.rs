@@ -135,6 +135,9 @@ pub struct PlanningRequest {
     pub queries: Vec<PlanningQuery>,
     pub evidence: HashMap<String, TopKMembershipEvidence>,
     pub planner_revision: String,
+    /// Observed cadence of source samples. Exact temporal panes must divide
+    /// both this cadence and the repeated-query evaluation interval.
+    pub source_sample_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -196,6 +199,8 @@ pub struct BackendLocalImplementation {
     pub window_implementation_id: String,
     pub state_layout: String,
     pub implementation_cost: ImplementationCostEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sample_interval_ms: Option<u64>,
     /// Certificates keyed by exact registered PromQL; converted to root IDs
     /// before workload selection so one query cannot borrow another's evidence.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -1699,6 +1704,7 @@ impl BackendLocalPlanningSnapshot {
                 queries,
                 evidence: topk_evidence_by_id,
                 planner_revision: PLANNER_REVISION.into(),
+                source_sample_interval_ms: self.implementation.source_sample_interval_ms,
             },
             self.environment,
         ))
@@ -2055,7 +2061,11 @@ impl PhysicalCompiler {
                     // smallest supported pane and let the data plane anchor it
                     // to the first event-time sample; common scrape/repetition
                     // cadences then preserve exact boundaries without raw data.
-                    crate::emit::stage_config::MIN_WINDOW_SECS
+                    exact_temporal_pane_secs(
+                        window_implementation.pane_secs,
+                        query.lifecycle.evaluation_interval_ms,
+                        request.source_sample_interval_ms,
+                    )
                 } else {
                     window_implementation.pane_secs
                 };
@@ -2651,6 +2661,32 @@ fn validate_window_implementations(
         });
     }
     Ok(candidates)
+}
+
+fn exact_temporal_pane_secs(
+    candidate_pane_secs: u64,
+    evaluation_interval_ms: u32,
+    source_sample_interval_ms: Option<u64>,
+) -> u64 {
+    fn gcd(mut left: u64, mut right: u64) -> u64 {
+        while right != 0 {
+            (left, right) = (right, left % right);
+        }
+        left
+    }
+
+    let minimum = crate::emit::stage_config::MIN_WINDOW_SECS;
+    let Some(source_ms) = source_sample_interval_ms else {
+        return minimum;
+    };
+    if source_ms % 1_000 != 0 || u64::from(evaluation_interval_ms) % 1_000 != 0 {
+        return minimum;
+    }
+    let aligned = gcd(
+        candidate_pane_secs,
+        gcd(source_ms / 1_000, u64::from(evaluation_interval_ms) / 1_000),
+    );
+    aligned.max(minimum)
 }
 
 struct PlannerPhysicalSelection {
@@ -3461,11 +3497,19 @@ mod tests {
             }],
             evidence: evidence_by_query,
             planner_revision: PLANNER_REVISION.into(),
+            source_sample_interval_ms: None,
         })
     }
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    #[test]
+    fn exact_temporal_pane_uses_observed_source_and_query_cadence() {
+        assert_eq!(exact_temporal_pane_secs(86_400, 60_000, Some(30_000)), 30);
+        assert_eq!(exact_temporal_pane_secs(43_200, 60_000, Some(30_000)), 30);
+        assert_eq!(exact_temporal_pane_secs(21_600, 60_000, None), 5);
     }
 
     // Both production adapters preserve canonical root identity and select the
@@ -4169,6 +4213,7 @@ mod tests {
                 window_implementation_id: "backend-tumbling-v1".into(),
                 state_layout: "anchored-pane-v1".into(),
                 implementation_cost: template.window_implementations[0].cost.clone(),
+                source_sample_interval_ms: None,
                 topk_evidence: HashMap::new(),
             },
             environment,

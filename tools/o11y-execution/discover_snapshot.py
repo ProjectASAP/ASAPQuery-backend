@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import re
 import time
+import math
 from replay import parse_samples
 
 
@@ -63,6 +64,20 @@ def main():
     snapshot["snapshot_version"] = 2
     snapshot.pop("workload_cost_evidence", None)
     implementation = snapshot["implementation"]
+    by_series = {}
+    for labels, _, timestamp in rows:
+        by_series.setdefault(tuple(sorted(labels.items())), []).append(timestamp)
+    deltas = [right - left for timestamps in by_series.values()
+              for left, right in zip(timestamps, timestamps[1:]) if right > left]
+    source_sample_interval_ms = None
+    for delta_ms in deltas:
+        source_sample_interval_ms = (
+            delta_ms
+            if source_sample_interval_ms is None
+            else math.gcd(source_sample_interval_ms, delta_ms)
+        )
+    if source_sample_interval_ms:
+        implementation["source_sample_interval_ms"] = source_sample_interval_ms
     implementation.update(evidence_observed_at_unix_ms=now, evidence_valid_for_ms=86400000, horizon_seconds=horizon)
     implementation["lifecycle_costs"] = dict.fromkeys(("build", "maintenance_per_update", "read", "retention_per_second", "retirement"), 1.0)
     implementation["implementation_cost"].update(model_version="UNCALIBRATED-enumeration-only", observed_at_unix_ms=now,

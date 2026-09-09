@@ -70,12 +70,16 @@ use planner_types::post_asap::{
 };
 use planner_types::pre_asap::{ColumnId, ColumnRef, QueryExpr, Reduction, Source};
 
+use crate::precompute_engine::operators::increase_accumulator::IncreaseAccumulator;
+use crate::precompute_engine::operators::min_max_accumulator::MinMaxAccumulator;
 use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig, SketchTimeSeries};
 use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
 use crate::storage_engines::sketch_db::query::delta_apply::{
     cumulative_summary_state, per_window_summary_states, DeltaSketchKind, SummaryState,
 };
-use crate::storage_engines::types::{AggregateCore, AggregationType, KeyByLabelValues};
+use crate::storage_engines::types::{
+    AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
+};
 
 /// Per-query, per-call execution context — constructed fresh for each
 /// incoming query (never shared across concurrent queries, never
@@ -254,6 +258,46 @@ impl GroupState {
             ) => asap_types::Statistic::Max,
             _ => return None,
         };
+
+        // Temporal exact summaries are the hot path for long-window
+        // dashboards. Merge their concrete, fixed-size states in one batch
+        // instead of allocating a boxed trait object for every pane.
+        if matches!(
+            agg_type,
+            AggregationType::Increase | AggregationType::MultipleIncrease
+        ) {
+            let accumulators = entries
+                .iter()
+                .flat_map(|windows| windows.values())
+                .map(|acc| acc.as_any().downcast_ref::<IncreaseAccumulator>().cloned())
+                .collect::<Option<Vec<_>>>()?;
+            let merged = <IncreaseAccumulator as MergeableAccumulator<
+                IncreaseAccumulator,
+            >>::merge_accumulators(accumulators)
+            .ok()?;
+            let query_kwargs = std::collections::HashMap::from([
+                ("range_start_ms".to_string(), range_start_ms.to_string()),
+                ("range_end_ms".to_string(), range_end_ms.to_string()),
+            ]);
+            return merged.query_statistic(stat, key, &query_kwargs).ok();
+        }
+        if matches!(
+            agg_type,
+            AggregationType::MinMax | AggregationType::MultipleMinMax
+        ) && readout == control_plane::query_plan::ExactReadout::Max
+        {
+            return entries
+                .iter()
+                .flat_map(|windows| windows.values())
+                .map(|acc| {
+                    acc.as_any()
+                        .downcast_ref::<MinMaxAccumulator>()
+                        .map(|a| a.value)
+                })
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .reduce(f64::max);
+        }
         let mut merged: Option<Box<dyn AggregateCore>> = None;
         for windows in entries {
             for acc in windows.values() {

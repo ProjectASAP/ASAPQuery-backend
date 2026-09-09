@@ -468,9 +468,9 @@ pub enum AggPayload {
     /// Opaque sketch state — see [`SketchSampleState`].
     Sketch(SketchSampleState),
     /// Exact-aggregation state — Sum / Count / Avg / Rate / MinMax.
-    /// Cloned via the `Clone` impl on `Box<dyn AggregateCore>` (which
-    /// dispatches through `clone_boxed_core`).
-    ExactAgg(Box<dyn crate::storage_engines::types::AggregateCore>),
+    /// Shared by range readers so querying thousands of panes does not clone
+    /// every accumulator while holding the store lock.
+    ExactAgg(std::sync::Arc<dyn crate::storage_engines::types::AggregateCore>),
 }
 
 impl std::fmt::Debug for AggPayload {
@@ -502,6 +502,15 @@ impl AggPayload {
     pub fn as_exact_agg(&self) -> Option<&dyn crate::storage_engines::types::AggregateCore> {
         match self {
             AggPayload::ExactAgg(p) => Some(p.as_ref()),
+            AggPayload::Sketch(_) => None,
+        }
+    }
+
+    pub fn as_exact_agg_arc(
+        &self,
+    ) -> Option<&std::sync::Arc<dyn crate::storage_engines::types::AggregateCore>> {
+        match self {
+            AggPayload::ExactAgg(payload) => Some(payload),
             AggPayload::Sketch(_) => None,
         }
     }

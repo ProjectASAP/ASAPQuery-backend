@@ -613,7 +613,11 @@ impl SketchStore {
             .or_insert_with(|| Arc::new(RwLock::new(self.fresh_sid_store())))
             .clone();
         let mut guard = store.write().unwrap();
-        guard.insert(window, series_label_values, AggPayload::ExactAgg(payload));
+        guard.insert(
+            window,
+            series_label_values,
+            AggPayload::ExactAgg(Arc::from(payload)),
+        );
         guard.last_write_unix_ms = now_ms();
     }
 
@@ -1097,11 +1101,11 @@ impl SketchStore {
                 .current_epoch
                 .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
             for (win, label_id, payload) in &buf {
-                if let Some(p) = payload.as_exact_agg() {
+                if let Some(p) = payload.as_exact_agg_arc() {
                     by_label_id
                         .entry(*label_id)
                         .or_default()
-                        .insert(win.1 as i64, Arc::from(p.clone_boxed_core()));
+                        .insert(win.1 as i64, Arc::clone(p));
                 }
             }
             buf.clear();
@@ -1109,11 +1113,11 @@ impl SketchStore {
             for sealed in guard.sealed_epochs.values() {
                 sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
                 for (win, label_id, payload) in &buf {
-                    if let Some(p) = payload.as_exact_agg() {
+                    if let Some(p) = payload.as_exact_agg_arc() {
                         by_label_id
                             .entry(*label_id)
                             .or_default()
-                            .insert(win.1 as i64, Arc::from(p.clone_boxed_core()));
+                            .insert(win.1 as i64, Arc::clone(p));
                     }
                 }
                 buf.clear();
@@ -3084,7 +3088,7 @@ mod tests {
         assert!(sketch.as_exact_agg().is_none());
 
         use crate::precompute_engine::operators::SumAccumulator;
-        let exact_agg = AggPayload::ExactAgg(Box::new(SumAccumulator::with_sum(1.0)));
+        let exact_agg = AggPayload::ExactAgg(Arc::new(SumAccumulator::with_sum(1.0)));
         assert!(exact_agg.as_sketch().is_none());
         assert!(exact_agg.as_exact_agg().is_some());
     }
