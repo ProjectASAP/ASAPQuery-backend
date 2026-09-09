@@ -333,6 +333,185 @@ mod tests {
         );
         server.abort();
     }
+
+    #[tokio::test]
+    async fn five_minute_error_ratio_combines_prometheus_cut_with_summary_store() {
+        use crate::precompute_engine::operators::IncreaseAccumulator;
+        use crate::query_engines::query_result::{InstantVectorElement, QueryResult};
+        use crate::storage_engines::sketch_db::{
+            data::AggKind,
+            index::{Capability, SketchInstanceMetadata},
+        };
+        use crate::storage_engines::types::{KeyByLabelValues, Measurement};
+        use control_plane::query_plan::{
+            logical::BinaryOperation, ExactReadout, MaterializationBinding, PhysicalGrouping,
+        };
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        const AT: u64 = 300_000;
+        const MATERIALIZATION: asap_types::PolicyFingerprint =
+            asap_types::PolicyFingerprint(9001);
+        let store = crate::storage_engines::sketch_db::index::SketchStore::new();
+        store.register(SketchInstanceMetadata {
+            sid: 41,
+            metric_name: "http_requests_total".into(),
+            group_by_keys: std::collections::BTreeSet::from(["job".into()]),
+            capability: Some(Capability::ExactAgg(asap_types::AggregationType::Increase)),
+            agg_kind: AggKind::ExactAgg {
+                agg_type: asap_types::AggregationType::Increase,
+                parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: None,
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: MATERIALIZATION,
+        });
+        let mut denominator = IncreaseAccumulator::new(
+            Measurement::new(100.0),
+            0,
+            Measurement::new(100.0),
+            0,
+        );
+        denominator.update(Measurement::new(400.0), AT as i64);
+        store.append_precompute(
+            41,
+            BTreeMap::from([("job".into(), "user-service".into())]),
+            (0, AT),
+            Box::new(denominator),
+        );
+
+        let exact_query =
+            "sum by (job) (rate(http_requests_total{status=~\"5..\",job=\"user-service\"}[5m]))";
+        let entry = entry(BTreeMap::from([
+            (
+                QueryNodeId(0),
+                QueryPlanNode::Logical {
+                    operator: LogicalOperator::Binary {
+                        operation: BinaryOperation::Div,
+                        return_bool: false,
+                    },
+                    inputs: vec![QueryNodeId(1), QueryNodeId(2)],
+                },
+            ),
+            (
+                QueryNodeId(1),
+                QueryPlanNode::Logical {
+                    operator: LogicalOperator::ExactSubquery {
+                        query: exact_query.into(),
+                    },
+                    inputs: vec![],
+                },
+            ),
+            (
+                QueryNodeId(2),
+                QueryPlanNode::ExactReadout {
+                    input: QueryNodeId(3),
+                    readout: ExactReadout::Rate,
+                },
+            ),
+            (
+                QueryNodeId(3),
+                QueryPlanNode::ReadMaterialization {
+                    binding: MaterializationBinding {
+                        materialization: MATERIALIZATION.into(),
+                        metric: "http_requests_total".into(),
+                        sid_grouping: vec!["job".into()],
+                        output_grouping: PhysicalGrouping::Reduce(vec!["job".into()]),
+                        window_ms: AT,
+                        readout_lookback_ms: Some(AT),
+                    },
+                },
+            ),
+        ]));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed_calls = calls.clone();
+        let app = axum::Router::new().route(
+            "/api/v1/query",
+            axum::routing::get(
+                move |axum::extract::Query(params): axum::extract::Query<
+                    BTreeMap<String, String>,
+                >| {
+                    let observed_calls = observed_calls.clone();
+                    async move {
+                        observed_calls.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(params["query"], exact_query);
+                        assert_eq!(params["time"], "300.000");
+                        axum::Json(serde_json::json!({
+                            "status": "success",
+                            "data": {"resultType": "vector", "result": [{
+                                "metric": {"job": "user-service"},
+                                "value": [300, "0.1"]
+                            }]}
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let prepared = prepare(
+            &entry,
+            &[AT],
+            Some(&format!("http://{address}")),
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        let (result, stats) = super::super::logical_dag::execute_installed(
+            &entry,
+            &prepared,
+            AT,
+            |root, at| {
+                assert_eq!(root, QueryNodeId(2));
+                let mut summary = entry.clone();
+                summary.root = root;
+                summary.nodes.retain(|id, _| matches!(id.0, 2 | 3));
+                let (outcome, _) = super::super::post_asap_readout::execute_query_plan_instant(
+                    &store, &summary, at,
+                )
+                .map_err(|error| miss(format!("summary readout failed: {error:?}")))?;
+                let rows = outcome
+                    .series
+                    .into_iter()
+                    .map(|(labels, samples)| {
+                        let (keys, values): (Vec<_>, Vec<_>) = labels.into_iter().unzip();
+                        Ok(InstantVectorElement::new(
+                            KeyByLabelValues::new_with_labels(values),
+                            samples
+                                .last()
+                                .ok_or_else(|| miss("summary returned no point"))?
+                                .1,
+                        )
+                        .with_label_keys_override(keys))
+                    })
+                    .collect::<Result<Vec<_>, EngineError>>()?;
+                Ok(QueryResult::vector(rows, at))
+            },
+        )
+        .unwrap();
+        let QueryResult::Vector(result) = result else {
+            panic!("instant vector expected")
+        };
+        assert_eq!(result.timestamp, AT);
+        assert_eq!(result.values.len(), 1);
+        assert_eq!(result.values[0].label_keys_override.as_deref(), Some(&["job".into()][..]));
+        assert_eq!(result.values[0].labels.labels, vec!["user-service"]);
+        assert!((result.values[0].value - 0.1).abs() < 1e-12);
+        assert_eq!(stats.raw_scan_evaluations, 0);
+        assert_eq!(stats.remote_evaluations, 1);
+        assert_eq!(stats.remote_rpcs, 1);
+        assert_eq!(stats.summary_readout_evaluations, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
     #[test]
     fn deployed_raw_scan_is_rejected_before_execution() {
         let entry = entry(BTreeMap::from([(
