@@ -829,11 +829,12 @@ mod tests {
             capability_snapshot_id: "test".into(),
         };
         ActivePhysicalPlan {
+            envelope: envelope.clone(),
             summary_catalog: None,
             precompute_plan: control_plane::physical::compiler::PrecomputePlan {
                 summary_catalog: None,
                 materialization_contracts: Default::default(),
-                envelope,
+                envelope: envelope.clone(),
                 ingest: control_plane::physical::compiler::IngestContract {
                     protocol:
                         control_plane::physical::compiler::IngestProtocol::ModifiedOtlpMetricsV1,
@@ -869,15 +870,6 @@ mod tests {
                 rules: Vec::new(),
             },
             runtime_config: Arc::new(StreamingConfig::new(HashMap::new())),
-            backend_plan: Arc::new(control_plane::backend_plan::BackendPlan {
-                plan_id,
-                plan_version,
-                generated_at_unix_ms: activation_unix_ms,
-                activation_unix_ms,
-                expiry_unix_ms,
-                backend_compat: "asap-query-backend.v1".into(),
-                ..Default::default()
-            }),
             query_plan: Arc::new(control_plane::query_plan::QueryPlan {
                 plan_id,
                 plan_version,

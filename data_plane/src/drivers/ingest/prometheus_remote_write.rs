@@ -773,6 +773,7 @@ mod tests {
             capability_snapshot_id: "test".into(),
         };
         let active = ActivePhysicalPlan {
+            envelope: envelope.clone(),
             summary_catalog: None,
             precompute_plan: PrecomputePlan {
                 summary_catalog: None,
@@ -802,7 +803,6 @@ mod tests {
                 rules: Vec::new(),
             },
             runtime_config: Arc::new(streaming),
-            backend_plan: Arc::new(control_plane::backend_plan::BackendPlan::default()),
             query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(BackendStorageRouting::empty()),
         };

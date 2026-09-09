@@ -244,8 +244,8 @@ impl ASAPQueryEngine {
                     "readiness registry unavailable",
                 )
             })?;
-            let plan_id = physical.backend_plan.plan_id;
-            let version = physical.backend_plan.plan_version;
+            let plan_id = physical.plan_id();
+            let version = physical.plan_version();
             // Exact range accumulators preserve their actual first/last sample
             // timestamps. Sparse counter series may legitimately begin after
             // the range boundary; Prometheus evaluates the samples that exist.
@@ -387,7 +387,7 @@ impl ASAPQueryEngine {
         self.active_physical_plan
             .as_ref()
             .map(|handle| handle.snapshot())
-            .filter(|plan| plan.backend_plan.plan_id != 0)
+            .filter(|plan| plan.plan_id() != 0)
     }
 
     /// Phase-5 hybrid-stitch builder — attach an archive engine the
@@ -602,8 +602,8 @@ impl ASAPQueryEngine {
                         physical_plan.query_plan.plan_id, physical_plan.query_plan.plan_version,
                     )?;
                     readiness = Some((
-                        physical_plan.backend_plan.plan_id,
-                        physical_plan.backend_plan.plan_version,
+                        physical_plan.plan_id(),
+                        physical_plan.plan_version(),
                         readiness_requirement(query_entry),
                     ));
                     crate::query_engines::asap_query_engine::live_serve::serve_range_steps_from_query_plan(
@@ -961,8 +961,8 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 Some(physical_plan) => match physical_plan.query_plan.lookup(query) {
                     Ok(query_entry) => {
                         readiness = Some((
-                            physical_plan.backend_plan.plan_id,
-                            physical_plan.backend_plan.plan_version,
+                            physical_plan.plan_id(),
+                            physical_plan.plan_version(),
                             readiness_requirement(query_entry),
                         ));
                         crate::query_engines::asap_query_engine::live_serve::serve_instant_from_query_plan(

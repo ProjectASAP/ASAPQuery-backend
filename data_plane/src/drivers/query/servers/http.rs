@@ -2522,6 +2522,7 @@ mod tests {
         };
         let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(
             crate::storage_engines::types::ActivePhysicalPlan {
+                envelope: envelope.clone(),
                 summary_catalog: None,
                 precompute_plan: PrecomputePlan {
                     summary_catalog: None,
@@ -2551,13 +2552,6 @@ mod tests {
                     rules: Vec::new(),
                 },
                 runtime_config: streaming_config.clone(),
-                backend_plan: Arc::new(control_plane::backend_plan::BackendPlan {
-                    plan_id: 7,
-                    plan_version: 1,
-                    activation_unix_ms: 1,
-                    backend_compat: control_plane::backend_plan::BACKEND_COMPAT.into(),
-                    ..Default::default()
-                }),
                 query_plan: Arc::new(control_plane::query_plan::QueryPlan {
                     plan_id: 7,
                     plan_version: 1,
@@ -5776,12 +5770,9 @@ async fn handle_health(State(state): State<AppState>) -> axum::response::Respons
             return (StatusCode::SERVICE_UNAVAILABLE, "no active PhysicalPlan").into_response();
         };
         let now = unix_time_ms();
-        let lifecycle_ready = active.backend_plan.plan_id != 0
-            && active.backend_plan.activation_unix_ms <= now
-            && active
-                .backend_plan
-                .expiry_unix_ms
-                .is_none_or(|expiry| now < expiry);
+        let lifecycle_ready = active.plan_id() != 0
+            && active.activation_unix_ms() <= now
+            && active.expiry_unix_ms().is_none_or(|expiry| now < expiry);
         let ingest_ready = matches!(
             active.precompute_plan.ingest.protocol,
             control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
@@ -6136,11 +6127,11 @@ pub fn build_active_physical_plan(
         None => default_routing,
     };
     Ok(crate::storage_engines::types::ActivePhysicalPlan {
+        envelope: envelope.clone(),
         summary_catalog: Some(Arc::new(request.summary_catalog)),
         precompute_plan: request.precompute_plan,
         transmission_plan: request.transmission_plan,
         runtime_config: Arc::new(runtime_config),
-        backend_plan: Arc::new(backend_plan),
         query_plan: Arc::new(request.query_plan),
         storage_routing,
     })
@@ -6202,7 +6193,7 @@ async fn handle_post_physical_plan(
         }
     };
     if state.remote_write.is_some()
-        && (active.backend_plan.plan_id == 0
+        && (active.plan_id() == 0
             || !matches!(
                 active.precompute_plan.ingest.protocol,
                 control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
@@ -6218,9 +6209,9 @@ async fn handle_post_physical_plan(
         )
             .into_response();
     }
-    let plan_id = active.backend_plan.plan_id;
+    let plan_id = active.plan_id();
     let materialization_count = active.precompute_plan.materializations.len();
-    let plan_version = active.backend_plan.plan_version;
+    let plan_version = active.plan_version();
     let now = unix_time_ms();
     if let Err(error) = lifecycle.stage(active, now) {
         return (
@@ -6276,9 +6267,9 @@ async fn handle_activate_physical_plan(
                 .into_response()
         }
     };
-    if old.backend_plan.plan_id != 0 {
-        let draining_id = old.backend_plan.plan_id;
-        let draining_version = old.backend_plan.plan_version;
+    if old.plan_id() != 0 {
+        let draining_id = old.plan_id();
+        let draining_version = old.plan_version();
         let lifecycle = lifecycle.clone();
         tokio::spawn(async move {
             loop {
