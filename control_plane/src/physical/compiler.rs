@@ -2448,7 +2448,7 @@ impl PhysicalCompiler {
                     }
                     Ok(MaterializationBinding {
                         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1_000)),
-                        materialization: fingerprint,
+                        materialization: fingerprint.into(),
                         metric: planned_metric,
                         sid_grouping: materialization.group_by.clone(),
                         output_grouping: PhysicalGrouping::Reduce(materialization.group_by.clone()),
@@ -2503,7 +2503,7 @@ impl PhysicalCompiler {
                 .entries
                 .values()
                 .flat_map(QueryPlanEntry::materialization_bindings)
-                .filter(|binding| binding.materialization == fingerprint)
+                .filter(|binding| binding.materialization.fingerprint() == fingerprint)
                 .filter_map(|binding| binding.readout_lookback_ms)
                 .max();
             if let Some(lookback_ms) = max_lookback_ms {
@@ -2545,6 +2545,7 @@ impl PhysicalCompiler {
                     reason: error.to_string(),
                 })?;
         }
+        query_plan.validate_against_catalog(&summary_catalog)?;
         Ok(PhysicalPlan {
             envelope,
             summary_catalog,
@@ -3819,7 +3820,7 @@ mod tests {
             assert_eq!(bindings.len(), 1);
             for collector in &bundle.collector_plans {
                 assert_eq!(collector.materializations.len(), 1);
-                assert!(bindings.contains(&collector.materializations[0].materialization));
+                assert!(bindings.contains(&collector.materializations[0].materialization.into()));
             }
         }
     }
@@ -4230,7 +4231,7 @@ mod tests {
             .entries
             .values()
             .flat_map(|entry| entry.materialization_bindings())
-            .map(|binding| binding.materialization)
+            .map(|binding| binding.materialization.fingerprint())
             .collect::<BTreeSet<_>>();
         assert_eq!(bindings.len(), 1);
         query_plan.validate(&bindings).unwrap();
@@ -4323,7 +4324,7 @@ mod tests {
                 .summary_catalog
                 .materializations
                 .keys()
-                .copied()
+                .map(|id| id.fingerprint())
                 .collect::<BTreeSet<_>>(),
             bundle
                 .backend_plan

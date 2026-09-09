@@ -454,7 +454,9 @@ impl QueryExecutionContext<'_> {
             Ok(())
         };
         let required_keys: BTreeSet<_> = binding.sid_grouping.iter().cloned().collect();
-        let mut sids = self.index.sids_for_policy(binding.materialization);
+        let mut sids = self
+            .index
+            .sids_for_policy(binding.materialization.fingerprint());
         sids.sort_unstable();
         sids.dedup();
         let mut matched_metadata = 0usize;
@@ -464,7 +466,7 @@ impl QueryExecutionContext<'_> {
             let candidate = self
                 .index
                 .with_instance(sid, |meta| {
-                    if meta.policy_fp != binding.materialization
+                    if meta.policy_fp != binding.materialization.fingerprint()
                         || meta.metric_name != binding.metric
                         || meta.group_by_keys != required_keys
                     {
@@ -567,7 +569,7 @@ impl QueryExecutionContext<'_> {
         if by_group.is_empty() {
             tracing::debug!(
                 metric = %binding.metric,
-                materialization = %binding.materialization,
+                materialization = %binding.materialization.as_u64(),
                 ?sids,
                 matched_metadata,
                 t0_ms = self.t0_ms,

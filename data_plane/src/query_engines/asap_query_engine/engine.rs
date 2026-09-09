@@ -16,7 +16,7 @@ fn readiness_requirement(
     let bindings = entry.materialization_bindings();
     let mut materializations = bindings
         .iter()
-        .map(|binding| binding.materialization)
+        .map(|binding| binding.materialization.fingerprint())
         .collect::<Vec<_>>();
     materializations.sort_unstable();
     materializations.dedup();
@@ -250,7 +250,7 @@ impl ASAPQueryEngine {
                     physical
                         .backend_plan
                         .materializations
-                        .get(&binding.materialization)
+                        .get(&binding.materialization.fingerprint())
                         .map(|materialization| &materialization.family),
                     Some(planner_types::post_asap::SummaryFamilyType::ExactAggregate(
                         ..
