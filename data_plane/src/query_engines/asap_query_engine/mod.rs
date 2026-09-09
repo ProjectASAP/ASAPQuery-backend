@@ -10,6 +10,7 @@
 //! the JSONL leg has been deleted).
 
 pub mod engine;
+mod exact_subqueries;
 pub mod live_serve;
 pub mod logical_dag;
 pub mod physical_dag;
@@ -27,4 +28,6 @@ pub mod tests;
 
 pub use engine::ASAPQueryEngine;
 
-mod range_max_index;
+pub(crate) mod range_max_index;
+
+pub(crate) mod range_counter_index;

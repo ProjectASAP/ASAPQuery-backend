@@ -16,7 +16,7 @@ type Labels = BTreeMap<String, String>;
 type Vector = Vec<(Labels, f64)>;
 type Matrix = Vec<(Labels, Vec<(i64, f64)>)>;
 #[derive(Clone)]
-enum Value {
+pub(crate) enum Value {
     Scalar(f64),
     Vector(Vector),
     Matrix(Matrix, i64, i64),
@@ -39,6 +39,10 @@ pub struct ExecutionStats {
     pub raw_scan_evaluations: usize,
     pub summary_readout_evaluations: usize,
     pub memo_hits: usize,
+    pub remote_evaluations: usize,
+    pub remote_rpcs: usize,
+    pub remote_branch_evaluations: usize,
+    pub index_reads: usize,
 }
 impl PreparedSamples {
     pub fn new(samples: &[CanonicalSample]) -> Result<Self, EngineError> {
@@ -152,7 +156,7 @@ fn vector(value: Value) -> Result<Vector, EngineError> {
     }
     Ok(values)
 }
-fn from_result(result: QueryResult) -> Result<Value, EngineError> {
+pub(crate) fn from_result(result: QueryResult) -> Result<Value, EngineError> {
     let QueryResult::Vector(value) = result else {
         return Err(miss("bound readout must return instant vector"));
     };
@@ -223,9 +227,44 @@ pub fn execute_prepared_with_stats<F>(
 where
     F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>,
 {
+    execute_values(entry, &samples.series, None, at, callback)
+}
+
+pub(crate) struct PreparedLeaf {
+    pub value: Value,
+    pub remote: bool,
+    pub remote_evaluations: usize,
+    pub remote_rpcs: usize,
+    pub index_reads: usize,
+}
+pub(crate) type PreparedLeaves = BTreeMap<(QueryNodeId, i64), PreparedLeaf>;
+
+pub(crate) fn execute_installed<F>(
+    entry: &QueryPlanEntry,
+    leaves: &PreparedLeaves,
+    at: u64,
+    callback: F,
+) -> Result<(QueryResult, ExecutionStats), EngineError>
+where
+    F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>,
+{
+    execute_values(entry, &[], Some(leaves), at, callback)
+}
+
+fn execute_values<F>(
+    entry: &QueryPlanEntry,
+    series: &[Series],
+    leaves: Option<&PreparedLeaves>,
+    at: u64,
+    callback: F,
+) -> Result<(QueryResult, ExecutionStats), EngineError>
+where
+    F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>,
+{
     let mut evaluator = Evaluator {
         entry,
-        series: &samples.series,
+        series,
+        leaves,
         callback,
         stats: ExecutionStats::default(),
         memo: BTreeMap::new(),
@@ -233,7 +272,14 @@ where
         regexes: BTreeMap::new(),
     };
     let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
-    let result = vector(evaluator.eval(entry.root, at_signed)?)?;
+    let evaluated = evaluator.eval(entry.root, at_signed)?;
+    if leaves.is_some() && matches!(evaluated, Value::Scalar(_)) {
+        // QueryResult currently models vectors/matrices only. Preserve a scalar
+        // root's HTTP type by routing it to native, while scalar intermediates
+        // remain typed inside vector composition.
+        return Err(miss("scalar root requires native response adapter"));
+    }
+    let result = vector(evaluated)?;
     Ok((
         QueryResult::vector(
             result
@@ -255,6 +301,7 @@ where
 struct Evaluator<'a, F> {
     entry: &'a QueryPlanEntry,
     series: &'a [Series],
+    leaves: Option<&'a PreparedLeaves>,
     stats: ExecutionStats,
     callback: F,
     memo: BTreeMap<(QueryNodeId, i64), Value>,
@@ -266,6 +313,19 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
         if let Some(value) = self.memo.get(&(id, at)) {
             self.stats.memo_hits += 1;
             return Ok(value.clone());
+        }
+        if let Some(leaf) = self.leaves.and_then(|leaves| leaves.get(&(id, at))) {
+            if leaf.remote {
+                self.stats.remote_branch_evaluations += 1;
+                self.stats.remote_evaluations += leaf.remote_evaluations;
+                self.stats.remote_rpcs += leaf.remote_rpcs;
+            } else {
+                self.stats.summary_readout_evaluations += 1;
+            }
+            self.stats.index_reads += leaf.index_reads;
+            let value = leaf.value.clone();
+            self.memo.insert((id, at), value.clone());
+            return Ok(value);
         }
         if self.active.len() >= 256 || !self.active.insert((id, at)) {
             return Err(miss("cyclic or excessively deep installed DAG"));
@@ -281,7 +341,22 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             .clone();
         let value = match node {
             QueryPlanNode::Scalar { value } => Value::Scalar(value),
-            QueryPlanNode::Logical { operator, inputs } => self.logical(operator, &inputs, at)?,
+            QueryPlanNode::Logical { operator, inputs } => {
+                if self.leaves.is_some()
+                    && matches!(
+                        operator,
+                        LogicalOperator::Scan { .. }
+                            | LogicalOperator::ReadRangeMaxIndex { .. }
+                            | LogicalOperator::ReadRangeCounterIndex { .. }
+                            | LogicalOperator::ExactSubquery { .. }
+                    )
+                {
+                    return Err(miss(
+                        "installed leaf was not prepared; local raw execution is forbidden",
+                    ));
+                }
+                self.logical(operator, &inputs, at)?
+            }
             _ => {
                 self.stats.summary_readout_evaluations += 1;
                 from_result((self.callback)(
@@ -307,10 +382,15 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 .ok_or_else(|| miss("missing logical input"))
         };
         match operator {
+            LogicalOperator::ExactSubquery { .. }
+            | LogicalOperator::ReadRangeCounterIndex { .. } => Err(miss(
+                "remote/index leaf requires prepared installed execution",
+            )),
             LogicalOperator::ReadRangeMaxIndex {
                 metric,
                 matchers,
                 range_ms,
+                ..
             } => self.range_max_index(&metric, &matchers, range_ms, at),
             LogicalOperator::Scan {
                 metric,
@@ -904,6 +984,7 @@ mod tests {
                         metric: metric.clone(),
                         matchers: matchers.clone(),
                         range_ms: *range_ms,
+                        retention_ms: *range_ms,
                     }),
                     _ => None,
                 })
@@ -934,94 +1015,6 @@ mod tests {
         }
         let bytes = prepared.range_max_index_bytes();
         assert!(bytes > 0 && bytes < prepared.estimated_bytes());
-    }
-
-    #[test]
-    fn real_planner_max_index_matches_exact_at_56_seconds_and_rebuilds_after_input() {
-        use crate::query_engines::raw_store::RawSampleStore;
-        use control_plane::physical::compiler::BackendLocalPlanningSnapshot;
-        let query = r#"max_over_time(service_cache_refresh_lag_seconds{job="user-service"}[12h])"#;
-        let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
-            "../../../../docs/examples/asapquery-planning-snapshot.json"
-        ))
-        .unwrap();
-        let q = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
-        q.query = planner_types::workload::Query(query.into());
-        q.requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
-            planner_types::types::AccuracyTarget::Exact,
-        );
-        // Compile the evidence-collection candidate; v1 unquoted startup keeps
-        // its native compatibility policy, while production v2 prices candidates.
-        let (candidate, environment) = snapshot.planning_request().unwrap();
-        let plan = control_plane::physical::compiler::PhysicalCompiler
-            .compile(candidate, environment)
-            .unwrap();
-        let installed = plan.query_plan.lookup(query).unwrap();
-        assert!(installed.nodes.values().any(|n| matches!(
-            n,
-            QueryPlanNode::Logical {
-                operator: LogicalOperator::ReadRangeMaxIndex { .. },
-                ..
-            }
-        )));
-        let at = 1_788_891_296_000_i64;
-        let start = at - 43_200_000;
-        let metric = "service_cache_refresh_lag_seconds";
-        let samples = [
-            sample(metric, "user-service", start, Some(999.)),
-            sample(metric, "user-service", start + 1, Some(4.)),
-            sample(metric, "user-service", at, Some(8.)),
-            sample(metric, "order-service", at, Some(500.)),
-        ];
-        let metrics = BTreeSet::from([metric.into()]);
-        let store = RawSampleStore::default();
-        store.append_admitted(1, 1, &samples, &metrics, false);
-        let first = store.snapshot(1, 1).unwrap();
-        first.prepare_range_max_indexes(&metrics);
-        let bytes = store.range_max_index_bytes();
-        assert!(bytes > 0);
-        let execute_index = |data: &PreparedSamples| {
-            execute_prepared_with_stats(installed, data, at as u64, |_, _| unreachable!()).unwrap()
-        };
-        let (actual, stats) = execute_index(&first);
-        let expected = execute(&entry(query), &samples, at as u64).unwrap();
-        assert_eq!(
-            serde_json::to_value(actual).unwrap(),
-            serde_json::to_value(expected).unwrap()
-        );
-        assert_eq!(stats.raw_scan_evaluations, 0);
-        assert_eq!(stats.summary_readout_evaluations, 1);
-        assert_eq!(
-            store.range_max_index_bytes(),
-            bytes,
-            "query must reuse eager state"
-        );
-        store.append_admitted(
-            1,
-            1,
-            &[sample(metric, "user-service", at - 1, Some(20.))],
-            &metrics,
-            false,
-        );
-        assert_eq!(
-            store.range_max_index_bytes(),
-            0,
-            "admission must invalidate prior index"
-        );
-        let next = store.snapshot(1, 1).unwrap();
-        assert!(!std::sync::Arc::ptr_eq(&first, &next));
-        next.prepare_range_max_indexes(&metrics);
-        let (QueryResult::Vector(updated), _) = execute_index(&next) else {
-            panic!()
-        };
-        assert_eq!(updated.values[0].value, 20.);
-        let (QueryResult::Vector(old), _) = execute_index(&first) else {
-            panic!()
-        };
-        assert_eq!(
-            old.values[0].value, 8.,
-            "in-flight snapshot remains coherent"
-        );
     }
 
     // Regex alternation remains fully anchored and missing labels compare as empty.

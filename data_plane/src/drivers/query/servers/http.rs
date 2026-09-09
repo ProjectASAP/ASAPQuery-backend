@@ -1537,7 +1537,7 @@ async fn process_via_router(
 
 fn extract_logical_provenance(
     value: &mut serde_json::Value,
-) -> Option<Result<(u64, u64, u64), ()>> {
+) -> Option<Result<(u64, u64, u64, u64, u64, u64, u64), ()>> {
     let warnings = value.get_mut("warnings")?.as_array_mut()?;
     let mut route = None;
     let mut stats = None;
@@ -1557,21 +1557,39 @@ fn extract_logical_provenance(
         if let Some(text) = text.strip_prefix("asap_logical_stats:") {
             found = true;
             let values = text.split(',').collect::<Vec<_>>();
-            let parsed = if values.len() == 3 {
-                values[0]
-                    .strip_prefix("raw=")
+            let parse = |index: usize, prefix: &str| {
+                values
+                    .get(index)
+                    .and_then(|v| v.strip_prefix(prefix))
                     .and_then(|v| v.parse::<u64>().ok())
-                    .zip(
-                        values[1]
-                            .strip_prefix("summary=")
-                            .and_then(|v| v.parse::<u64>().ok()),
-                    )
-                    .zip(
-                        values[2]
-                            .strip_prefix("memo_hits=")
-                            .and_then(|v| v.parse::<u64>().ok()),
-                    )
-                    .map(|((raw, summary), memo)| (raw, summary, memo))
+            };
+            let parsed = if values.len() == 3 || values.len() == 5 || values.len() == 7 {
+                parse(0, "raw=")
+                    .zip(parse(1, "summary="))
+                    .zip(parse(2, "memo_hits="))
+                    .zip(if values.len() >= 5 {
+                        parse(3, "remote=")
+                    } else {
+                        Some(0)
+                    })
+                    .zip(if values.len() >= 5 {
+                        parse(4, "index_reads=")
+                    } else {
+                        Some(0)
+                    })
+                    .and_then(|((((raw, summary), memo), remote), indexes)| {
+                        let rpcs = if values.len() == 7 {
+                            parse(5, "remote_rpcs=")?
+                        } else {
+                            remote
+                        };
+                        let branches = if values.len() == 7 {
+                            parse(6, "remote_branches=")?
+                        } else {
+                            remote
+                        };
+                        Some((raw, summary, memo, remote, indexes, rpcs, branches))
+                    })
             } else {
                 None
             };
@@ -1586,10 +1604,10 @@ fn extract_logical_provenance(
     if !found {
         return None;
     }
-    let Some((raw, summary, memo)) = stats else {
+    let Some((raw, summary, memo, remote, indexes, rpcs, branches)) = stats else {
         return Some(Err(()));
     };
-    let expected = if raw > 0 && summary > 0 {
+    let expected = if (raw > 0 || remote > 0) && summary > 0 {
         "hybrid"
     } else if summary == 0 {
         "raw_dag"
@@ -1599,7 +1617,7 @@ fn extract_logical_provenance(
     if malformed || route.as_deref().is_some_and(|mode| mode != expected) {
         Some(Err(()))
     } else {
-        Some(Ok((raw, summary, memo)))
+        Some(Ok((raw, summary, memo, remote, indexes, rpcs, branches)))
     }
 }
 
@@ -1635,21 +1653,31 @@ async fn annotate_data_source(response: Response, data_source_id: &'static str) 
     if data_source_id == "asap_query" {
         if let Some(provenance) = extract_logical_provenance(&mut value) {
             let (route, detail) = match provenance {
-                Ok((raw, summary, memo)) => {
+                Ok((raw, summary, memo, remote, indexes, rpcs, branches)) => {
                     for (name, count) in [
                         ("x-asap-raw-scan-evaluations", raw),
                         ("x-asap-summary-readout-evaluations", summary),
                         ("x-asap-memo-hits", memo),
+                        ("x-asap-exact-subquery-evaluations", remote),
+                        ("x-asap-index-series-reads", indexes),
+                        ("x-asap-exact-subquery-rpcs", rpcs),
+                        ("x-asap-exact-branch-evaluations", branches),
                     ] {
                         parts.headers.insert(
                             name,
                             axum::http::HeaderValue::from_str(&count.to_string()).unwrap(),
                         );
                     }
-                    if raw > 0 || summary == 0 {
+                    if raw > 0 || remote > 0 || summary == 0 {
                         (
                             "exact_fallback",
-                            if summary > 0 { "hybrid" } else { "local_raw" },
+                            if summary > 0 {
+                                "hybrid"
+                            } else if remote > 0 {
+                                "external_exact"
+                            } else {
+                                "local_raw"
+                            },
                         )
                     } else {
                         ("warm", "asap")
@@ -5789,9 +5817,10 @@ async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::
         "status": "success",
         "sid_count": timestamps.len(),
         "approx_resident_bytes": state.sketch_index.approx_resident_bytes(),
-        "exact_range_max_index_bytes": state.remote_write.as_ref().map(|receiver| receiver.raw_store().range_max_index_bytes()).unwrap_or(0),
-        "raw_store_estimated_bytes": state.remote_write.as_ref().map(|receiver| receiver.raw_store().estimated_bytes()).unwrap_or(0),
-        "raw_store_samples": state.remote_write.as_ref().map(|receiver| receiver.raw_store().sample_count()).unwrap_or(0),
+        "exact_range_counter_index_bytes": state.remote_write.as_ref().map(|receiver| receiver.index_store().range_counter_index_bytes()).unwrap_or(0),
+        "exact_range_max_index_bytes": state.remote_write.as_ref().map(|receiver| receiver.index_store().range_max_index_bytes()).unwrap_or(0),
+        "index_store_estimated_bytes": state.remote_write.as_ref().map(|receiver| receiver.index_store().estimated_bytes()).unwrap_or(0),
+        "index_state_points": state.remote_write.as_ref().map(|receiver| receiver.index_store().sample_count()).unwrap_or(0),
         "earliest_timestamps_per_sid": timestamps});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
@@ -6933,11 +6962,26 @@ mod logical_provenance_tests {
         assert!(value["warnings"].as_array().unwrap().is_empty());
     }
 
+    #[tokio::test]
+    async fn prometheus_exact_branch_is_hybrid_without_any_local_raw_scan() {
+        let response = Json(serde_json::json!({"status":"success", "warnings":[
+            "asap_execution:hybrid", "asap_logical_stats:raw=0,summary=1,memo_hits=0,remote=1,index_reads=4"
+        ], "data":{"resultType":"vector", "result":[]}})).into_response();
+        let response = annotate_data_source(response, "asap_query").await;
+        assert_eq!(response.headers()["x-asap-execution-detail"], "hybrid");
+        assert_eq!(response.headers()["x-asap-raw-scan-evaluations"], "0");
+        assert_eq!(response.headers()["x-asap-exact-subquery-evaluations"], "1");
+        assert_eq!(response.headers()["x-asap-index-series-reads"], "4");
+    }
+
     #[test]
     fn partial_result_warning_survives_internal_metadata_extraction() {
         // Only internal metadata is removed; incomplete-result warnings still invalidate comparison.
         let mut value = serde_json::json!({"warnings":["partial data", "asap_execution:raw_dag", "asap_logical_stats:raw=1,summary=0,memo_hits=0"]});
-        assert_eq!(extract_logical_provenance(&mut value), Some(Ok((1, 0, 0))));
+        assert_eq!(
+            extract_logical_provenance(&mut value),
+            Some(Ok((1, 0, 0, 0, 0, 0, 0)))
+        );
         assert_eq!(value["warnings"], serde_json::json!(["partial data"]));
     }
 

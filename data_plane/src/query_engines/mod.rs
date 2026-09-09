@@ -18,9 +18,9 @@
 //!   `crate::query_engines::routing::QueryEngine` impl returns.
 
 pub mod asap_query_engine;
+pub mod index_store;
 pub mod no_data_archive;
 pub mod query_result;
-pub mod raw_store;
 pub mod routing;
 pub mod thanos_query_engine;
 

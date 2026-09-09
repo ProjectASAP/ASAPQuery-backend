@@ -128,6 +128,8 @@ pub struct LifecyclePlanningInput {
 pub struct PlanningRequest {
     /// Enable installed typed raw residuals for this backend-local candidate.
     pub local_raw_execution: bool,
+    /// Allowed serialized index leaf contracts; None enables every eligible leaf.
+    pub index_policy: Option<BTreeSet<String>>,
     /// Original dashboard demand, in the same order as queries. None is legacy input.
     pub query_workload: Option<QueryWorkload>,
     pub queries: Vec<PlanningQuery>,
@@ -1708,6 +1710,7 @@ impl BackendLocalPlanningSnapshot {
         Ok((
             PlanningRequest {
                 local_raw_execution: true,
+                index_policy: None,
                 query_workload: Some(workload),
                 queries,
                 evidence: topk_evidence_by_id,
@@ -2139,7 +2142,8 @@ impl PhysicalCompiler {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             stable_workload_plan_id(&plan_materializations, &request.queries).hash(&mut hash);
-            "typed-local-residual-v2-range-max-index".hash(&mut hash);
+            "typed-local-residual-v3-counter-index".hash(&mut hash);
+            request.index_policy.hash(&mut hash);
             for query in &request.queries {
                 format!("{:?}", query.post_asap).hash(&mut hash);
             }
@@ -2293,7 +2297,7 @@ impl PhysicalCompiler {
                 full_history: false,
                 cumulative_readout: true,
             };
-            let entry = if request.local_raw_execution {
+            let mut entry = if request.local_raw_execution {
                 QueryPlanEntry::compile_bound_composable(
                     query.query_id.clone(),
                     canonical.clone(),
@@ -2312,6 +2316,12 @@ impl PhysicalCompiler {
                     binding,
                 )
             }?;
+            if request.local_raw_execution {
+                crate::query_plan::logical::apply_index_policy(
+                    &mut entry,
+                    request.index_policy.as_ref(),
+                )?;
+            }
             if query_entries.insert(canonical.clone(), entry).is_some() {
                 return Err(CompileError::Query {
                     query_id: query.query_id.clone(),
@@ -3263,7 +3273,7 @@ mod tests {
             super::super::workload_cost::with_exact_alternative(request)
                 .unwrap()
                 .len(),
-            2
+            3
         );
     }
 
@@ -3339,6 +3349,7 @@ mod tests {
         }
         Ok(PlanningRequest {
             local_raw_execution: false,
+            index_policy: None,
             query_workload: None,
             queries: vec![PlanningQuery {
                 query_id: query_id.into(),
@@ -3688,7 +3699,7 @@ mod tests {
     }
 
     #[test]
-    fn composable_per_entity_window_uses_raw_rows_instead_of_pooled_state() {
+    fn composable_per_entity_window_delegates_exact_subtree_to_prometheus() {
         use crate::query_plan::{logical::LogicalOperator, QueryPlanNode};
         let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
@@ -3704,13 +3715,18 @@ mod tests {
         assert!(entry.nodes.values().any(|node| matches!(
             node,
             QueryPlanNode::Logical {
-                operator: LogicalOperator::Scan { .. },
+                operator: LogicalOperator::ExactSubquery { query },
                 ..
-            }
+            } if query == "sum_over_time(m[1m])"
         )));
         assert!(entry.nodes.values().all(|node| !matches!(
             node,
-            QueryPlanNode::ReadMaterialization { .. } | QueryPlanNode::ExactFallback { .. }
+            QueryPlanNode::ReadMaterialization { .. }
+                | QueryPlanNode::ExactFallback { .. }
+                | QueryPlanNode::Logical {
+                    operator: LogicalOperator::Scan { .. },
+                    ..
+                }
         )));
     }
 
@@ -3749,11 +3765,8 @@ mod tests {
 
     // A filtered denominator is a typed residual while its summary sibling remains installed.
     #[test]
-    fn composable_binary_retains_summary_sibling_of_filtered_raw_branch() {
-        use crate::query_plan::{
-            logical::{LabelMatch, LogicalOperator},
-            QueryPlanNode,
-        };
+    fn composable_binary_retains_summary_sibling_of_prometheus_filtered_subtree() {
+        use crate::query_plan::{logical::LogicalOperator, QueryPlanNode};
         let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -3773,8 +3786,15 @@ mod tests {
             .values()
             .any(|node| matches!(node, QueryPlanNode::ExactFallback { .. })));
         assert!(query.nodes.values().any(|node| matches!(node,
-            QueryPlanNode::Logical { operator: LogicalOperator::Scan { metric: Some(metric), range_ms: Some(300_000), matchers, .. }, .. }
-            if metric == "b" && matchers.iter().any(|matcher| matcher.name == "job" && matcher.value == "x" && matcher.operation == LabelMatch::NotEqual))));
+            QueryPlanNode::Logical { operator: LogicalOperator::ExactSubquery { query }, .. }
+            if query == "sum_over_time(b{job!=\"x\"}[5m])" || query == "sum(sum_over_time(b{job!=\"x\"}[5m]))")));
+        assert!(!query.nodes.values().any(|node| matches!(
+            node,
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::Scan { .. },
+                ..
+            }
+        )));
         assert_eq!(plan.precompute_plan.materializations.len(), 1);
     }
 

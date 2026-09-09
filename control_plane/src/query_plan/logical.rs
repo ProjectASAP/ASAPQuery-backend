@@ -12,12 +12,26 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LogicalOperator {
+    /// A maximal exact scalar/vector subtree evaluated by Prometheus.
+    ExactSubquery {
+        query: String,
+    },
+    /// Exact reset-aware per-series counter state, with independent branch time binding.
+    ReadRangeCounterIndex {
+        metric: String,
+        matchers: Vec<LabelMatcher>,
+        range_ms: u64,
+        offset_ms: i64,
+        operation: TemporalOperation,
+        retention_ms: u64,
+    },
     /// Planner-selected exact per-series MinMax state, queried as max over an
     /// exact event-time interval. This is an installed index, not a raw scan.
     ReadRangeMaxIndex {
         metric: String,
         matchers: Vec<LabelMatcher>,
         range_ms: u64,
+        retention_ms: u64,
     },
     Scan {
         metric: Option<String>,
@@ -124,7 +138,10 @@ fn offset(value: &Option<Offset>) -> Result<i64, QueryPlanError> {
 impl LogicalOperator {
     pub fn validate(&self, inputs: usize) -> Result<(), QueryPlanError> {
         let expected = match self {
-            Self::Scan { .. } | Self::ReadRangeMaxIndex { .. } => 0,
+            Self::Scan { .. }
+            | Self::ReadRangeMaxIndex { .. }
+            | Self::ReadRangeCounterIndex { .. }
+            | Self::ExactSubquery { .. } => 0,
             Self::Binary { .. } | Self::HistogramQuantile => 2,
             _ => 1,
         };
@@ -141,11 +158,46 @@ impl LogicalOperator {
             return Err(invalid("zero range"));
         }
         if let Self::ReadRangeMaxIndex {
-            metric, range_ms, ..
+            metric,
+            range_ms,
+            retention_ms,
+            ..
         } = self
         {
-            if metric.is_empty() || *range_ms == 0 || *range_ms > i64::MAX as u64 {
+            if metric.is_empty()
+                || *range_ms == 0
+                || *range_ms > i64::MAX as u64
+                || retention_ms < range_ms
+            {
                 return Err(invalid("invalid exact range-max index contract"));
+            }
+        }
+        if let Self::ReadRangeCounterIndex {
+            metric,
+            range_ms,
+            operation,
+            retention_ms,
+            ..
+        } = self
+        {
+            if metric.is_empty()
+                || *range_ms == 0
+                || *range_ms > i64::MAX as u64
+                || retention_ms < range_ms
+                || !matches!(
+                    operation,
+                    TemporalOperation::Rate | TemporalOperation::Increase
+                )
+            {
+                return Err(invalid("invalid exact range-counter index contract"));
+            }
+        }
+        if let Self::ExactSubquery { query } = self {
+            let parsed = parser::parse(query).map_err(|e| invalid(e.to_string()))?;
+            if matches!(parsed, Expr::MatrixSelector(_) | Expr::Subquery(_)) {
+                return Err(invalid(
+                    "exact subtree boundary must return scalar or instant vector",
+                ));
             }
         }
         if let Self::Subquery {
@@ -670,7 +722,14 @@ mod hybrid_tests {
         )
         .unwrap();
         assert_eq!(entry.materialization_bindings().len(), 1);
-        assert!(entry.nodes.values().any(|node| matches!(node, QueryPlanNode::Logical { operator: LogicalOperator::Scan { matchers, .. }, .. } if matchers.iter().any(|m| m.name == "job" && m.value == "api"))));
+        assert!(entry.nodes.values().any(|node| matches!(node, QueryPlanNode::Logical { operator: LogicalOperator::ExactSubquery { query }, .. } if query == "sum_over_time(m{job=\"api\"}[5m])")));
+        assert!(!entry.nodes.values().any(|node| matches!(
+            node,
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::Scan { .. },
+                ..
+            }
+        )));
         assert!(matches!(
             entry.nodes[&entry.root],
             QueryPlanNode::Logical {
@@ -855,6 +914,7 @@ pub(super) fn selected_range_max_index(
         metric: metric.clone(),
         matchers: matchers.clone(),
         range_ms: *range_ms,
+        retention_ms: *range_ms,
     }))
 }
 
@@ -913,6 +973,542 @@ mod range_max_index_tests {
                     .is_none(),
                 "{query}"
             );
+        }
+    }
+}
+
+/// Stable contract identity used by priced physical alternatives, independent of node IDs.
+pub fn index_key(operator: &LogicalOperator) -> Result<String, QueryPlanError> {
+    let mut value = serde_json::to_value(operator).map_err(|e| invalid(e.to_string()))?;
+    if let Some(object) = value.as_object_mut() {
+        // Retention is a consumer lifetime requirement, not the index read's
+        // semantics. Equivalent matcher conjunctions must share policy keys.
+        object.remove("retention_ms");
+        if let Some(matchers) = object.get_mut("matchers").and_then(|v| v.as_array_mut()) {
+            matchers.sort_by_cached_key(|m| m.to_string());
+        }
+    }
+    serde_json::to_string(&value).map_err(|e| invalid(e.to_string()))
+}
+
+fn counter_contract(
+    root: QueryNodeId,
+    nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
+) -> Option<LogicalOperator> {
+    let QueryPlanNode::Logical {
+        operator: LogicalOperator::Temporal { operation },
+        inputs,
+    } = nodes.get(&root)?
+    else {
+        return None;
+    };
+    if !matches!(
+        operation,
+        TemporalOperation::Rate | TemporalOperation::Increase
+    ) || inputs.len() != 1
+    {
+        return None;
+    }
+    let QueryPlanNode::Logical {
+        operator:
+            LogicalOperator::Scan {
+                metric: Some(metric),
+                matchers,
+                range_ms: Some(range_ms),
+                offset_ms,
+            },
+        ..
+    } = nodes.get(&inputs[0])?
+    else {
+        return None;
+    };
+    Some(LogicalOperator::ReadRangeCounterIndex {
+        metric: metric.clone(),
+        matchers: matchers.clone(),
+        range_ms: *range_ms,
+        offset_ms: *offset_ms,
+        operation: *operation,
+        retention_ms: range_ms.saturating_add((*offset_ms).max(0) as u64),
+    })
+}
+
+pub(super) fn selected_counter_index(
+    original: &str,
+    node: &planner_types::post_asap::SummaryNode,
+) -> Result<Option<LogicalOperator>, QueryPlanError> {
+    use planner_types::post_asap::{ExactKind, SummaryExpr, SummaryFamilyType};
+    if !matches!(
+        &node.expr,
+        SummaryExpr::SummaryAgg {
+            family: SummaryFamilyType::ExactAggregate(ExactKind::Rate | ExactKind::Increase, _),
+            reduction: planner_types::pre_asap::Reduction::PerEntity,
+            ..
+        }
+    ) {
+        return Ok(None);
+    }
+    let (root, nodes) = selected_residual_nodes(original, node)?;
+    Ok(counter_contract(root, &nodes))
+}
+
+/// A kept logical subtree may contain rate operations. Prove each physical index
+/// implementation with Planner at compile time, then match the retained typed
+/// operator exactly. The installed parent DAG and its result combination stay intact.
+pub(super) fn promote_counter_indexes(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
+    fn visit(expr: &Expr, calls: &mut Vec<String>) {
+        match expr {
+            Expr::Call(e) => {
+                if matches!(e.func.name, "rate" | "increase") {
+                    calls.push(expr.to_string());
+                }
+                for arg in &e.args.args {
+                    visit(arg, calls);
+                }
+            }
+            Expr::Paren(e) => visit(&e.expr, calls),
+            Expr::Unary(e) => visit(&e.expr, calls),
+            Expr::Subquery(e) => visit(&e.expr, calls),
+            Expr::Aggregate(e) => visit(&e.expr, calls),
+            Expr::Binary(e) => {
+                visit(&e.lhs, calls);
+                visit(&e.rhs, calls);
+            }
+            _ => {}
+        }
+    }
+    let expression = parser::parse(&entry.canonical_promql).map_err(|e| invalid(e.to_string()))?;
+    let mut calls = Vec::new();
+    visit(&expression, &mut calls);
+    let mut proven = std::collections::BTreeSet::new();
+    for call in calls {
+        let parsed = crate::query_parser::parse_query_expr_canonical(
+            &call,
+            planner_types::types::AccuracyTarget::Exact,
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        let selected = crate::planner_selection::select_summary_default(&parsed)
+            .map_err(|e| invalid(e.to_string()))?;
+        if let Some(operator) = selected_counter_index(&call, &selected)? {
+            proven.insert(index_key(&operator)?);
+        }
+    }
+    let mut changes = Vec::new();
+    for id in entry.nodes.keys() {
+        if let Some(operator) = counter_contract(*id, &entry.nodes) {
+            if proven.contains(&index_key(&operator)?) {
+                changes.push((*id, operator));
+            }
+        }
+    }
+    for (id, operator) in changes {
+        entry.nodes.insert(
+            id,
+            QueryPlanNode::Logical {
+                operator,
+                inputs: vec![],
+            },
+        );
+    }
+    prune(entry);
+    Ok(())
+}
+
+fn prune(entry: &mut QueryPlanEntry) {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut pending = vec![entry.root];
+    while let Some(id) = pending.pop() {
+        if seen.insert(id) {
+            if let Some(node) = entry.nodes.get(&id) {
+                pending.extend(node.inputs());
+            }
+        }
+    }
+    entry.nodes.retain(|id, _| seen.contains(id));
+}
+
+/// Disabling one index leaf restores its exact raw operator, not the whole query.
+pub fn apply_index_policy(
+    entry: &mut QueryPlanEntry,
+    policy: Option<&std::collections::BTreeSet<String>>,
+) -> Result<(), QueryPlanError> {
+    if let Some(policy) = policy {
+        for node in entry.nodes.values_mut() {
+            let QueryPlanNode::Logical { operator, inputs } = node else {
+                continue;
+            };
+            if let Some(query) = operator.exact_promql()? {
+                if !policy.contains(&index_key(operator)?) {
+                    *operator = LogicalOperator::ExactSubquery { query };
+                    inputs.clear();
+                }
+            }
+        }
+    }
+    externalize_residuals(entry)?;
+    assign_retention(entry)?;
+    Ok(())
+}
+
+pub fn index_candidate_keys(
+    original: &str,
+    selected: &std::rc::Rc<planner_types::post_asap::SummaryNode>,
+) -> Result<std::collections::BTreeSet<String>, QueryPlanError> {
+    let entry = QueryPlanEntry::compile_bound_composable(
+        "inventory".into(),
+        original.into(),
+        selected,
+        InstantExecution {
+            lookback_ms: 300_000,
+            full_history: false,
+            cumulative_readout: true,
+        },
+        FallbackPolicy::ExactBackend,
+        |_, _| Err(invalid("inventory has no bound physical summary")),
+    )?;
+    entry
+        .nodes
+        .values()
+        .filter_map(|node| match node {
+            QueryPlanNode::Logical {
+                operator:
+                    operator @ (LogicalOperator::ReadRangeCounterIndex { .. }
+                    | LogicalOperator::ReadRangeMaxIndex { .. }),
+                ..
+            } => Some(index_key(operator)),
+            _ => None,
+        })
+        .collect()
+}
+
+impl LogicalOperator {
+    /// Exact fallback expression belongs to the installed contract, never reparsed from user input at serving time.
+    pub fn exact_promql(&self) -> Result<Option<String>, QueryPlanError> {
+        let (metric, matchers, range, shift, function) = match self {
+            Self::ReadRangeCounterIndex {
+                metric,
+                matchers,
+                range_ms,
+                offset_ms,
+                operation,
+                ..
+            } => (
+                metric,
+                matchers,
+                range_ms,
+                *offset_ms,
+                match operation {
+                    TemporalOperation::Rate => "rate",
+                    TemporalOperation::Increase => "increase",
+                    _ => return Err(invalid("invalid counter operation")),
+                },
+            ),
+            Self::ReadRangeMaxIndex {
+                metric,
+                matchers,
+                range_ms,
+                ..
+            } => (metric, matchers, range_ms, 0, "max_over_time"),
+            _ => return Ok(None),
+        };
+        let labels = matchers
+            .iter()
+            .map(|m| {
+                let op = match m.operation {
+                    LabelMatch::Equal => "=",
+                    LabelMatch::NotEqual => "!=",
+                    LabelMatch::Regex => "=~",
+                    LabelMatch::NotRegex => "!~",
+                };
+                Ok(format!(
+                    "{}{op}{}",
+                    m.name,
+                    serde_json::to_string(&m.value).map_err(|e| invalid(e.to_string()))?
+                ))
+            })
+            .collect::<Result<Vec<_>, QueryPlanError>>()?
+            .join(",");
+        let shifted = if shift == 0 {
+            String::new()
+        } else {
+            format!(
+                " offset {}{}ms",
+                if shift < 0 { "-" } else { "" },
+                shift.unsigned_abs()
+            )
+        };
+        let query = format!("{function}({metric}{{{labels}}}[{range}ms]{shifted})");
+        let parsed = parser::parse(&query).map_err(|e| invalid(e.to_string()))?;
+        Ok(Some(parsed.to_string()))
+    }
+}
+
+fn expression_shape(
+    id: QueryNodeId,
+    nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
+) -> Result<String, QueryPlanError> {
+    let node = nodes
+        .get(&id)
+        .ok_or_else(|| invalid("missing expression node"))?;
+    if let QueryPlanNode::Logical {
+        operator: LogicalOperator::ExactSubquery { query },
+        ..
+    } = node
+    {
+        let mut lower = Lower {
+            nodes: BTreeMap::new(),
+            seen: BTreeMap::new(),
+        };
+        let expr = parser::parse(query).map_err(|e| invalid(e.to_string()))?;
+        let root = lower.lower(&expr)?;
+        return expression_shape(root, &lower.nodes);
+    }
+    let value = match node {
+        QueryPlanNode::Logical { operator, .. } => {
+            serde_json::to_string(operator).map_err(|e| invalid(e.to_string()))?
+        }
+        QueryPlanNode::Scalar { value } => format!("scalar:{:x}", value.to_bits()),
+        _ => return Err(invalid("summary node has no raw expression shape")),
+    };
+    let children = node
+        .inputs()
+        .iter()
+        .map(|child| expression_shape(*child, nodes))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(format!("{value}({})", children.join(";")))
+}
+
+/// Collapse only maximal raw residual subtrees whose full typed expression is
+/// witnessed in the original query. Matrix boundaries remain inside Prometheus.
+pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
+    fn gather(expr: &Expr, out: &mut Vec<Expr>) {
+        if !matches!(expr, Expr::MatrixSelector(_) | Expr::Subquery(_)) {
+            out.push(expr.clone());
+        }
+        match expr {
+            Expr::Paren(e) => gather(&e.expr, out),
+            Expr::Unary(e) => gather(&e.expr, out),
+            Expr::Subquery(e) => gather(&e.expr, out),
+            Expr::Aggregate(e) => gather(&e.expr, out),
+            Expr::Binary(e) => {
+                gather(&e.lhs, out);
+                gather(&e.rhs, out);
+            }
+            Expr::Call(e) => {
+                for arg in &e.args.args {
+                    gather(arg, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let expr = parser::parse(&entry.canonical_promql).map_err(|e| invalid(e.to_string()))?;
+    let mut expressions = Vec::new();
+    gather(&expr, &mut expressions);
+    let mut witnesses = BTreeMap::new();
+    for expression in expressions {
+        let mut lower = Lower {
+            nodes: BTreeMap::new(),
+            seen: BTreeMap::new(),
+        };
+        if let Ok(root) = lower.lower(&expression) {
+            witnesses.insert(
+                expression_shape(root, &lower.nodes)?,
+                expression.to_string(),
+            );
+        }
+    }
+    fn flags(id: QueryNodeId, nodes: &BTreeMap<QueryNodeId, QueryPlanNode>) -> (bool, bool) {
+        let Some(node) = nodes.get(&id) else {
+            return (true, false);
+        };
+        let mut indexed = !matches!(
+            node,
+            QueryPlanNode::Logical { .. } | QueryPlanNode::Scalar { .. }
+        );
+        let mut exact = false;
+        if let QueryPlanNode::Logical { operator, .. } = node {
+            indexed |= matches!(
+                operator,
+                LogicalOperator::ReadRangeMaxIndex { .. }
+                    | LogicalOperator::ReadRangeCounterIndex { .. }
+            );
+            exact = matches!(
+                operator,
+                LogicalOperator::Scan { .. } | LogicalOperator::ExactSubquery { .. }
+            );
+        }
+        for child in node.inputs() {
+            let (a, b) = flags(*child, nodes);
+            indexed |= a;
+            exact |= b;
+        }
+        (indexed, exact)
+    }
+    let mut pending = vec![entry.root];
+    while let Some(id) = pending.pop() {
+        let (indexed, exact) = flags(id, &entry.nodes);
+        if !indexed && exact {
+            if let Ok(shape) = expression_shape(id, &entry.nodes) {
+                if let Some(query) = witnesses.get(&shape) {
+                    entry.nodes.insert(
+                        id,
+                        QueryPlanNode::Logical {
+                            operator: LogicalOperator::ExactSubquery {
+                                query: query.clone(),
+                            },
+                            inputs: vec![],
+                        },
+                    );
+                    continue;
+                }
+            }
+        }
+        pending.extend(entry.nodes[&id].inputs());
+    }
+    prune(entry);
+    if entry.nodes.values().any(|node| {
+        matches!(
+            node,
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::Scan { .. },
+                ..
+            }
+        )
+    }) {
+        return Err(invalid(
+            "local Scan is not deployable; exact subtree requires a complete Prometheus boundary",
+        ));
+    }
+    Ok(())
+}
+
+fn assign_retention(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
+    let mut pending = vec![(entry.root, 0u64)];
+    let mut depths = BTreeMap::new();
+    while let Some((id, depth)) = pending.pop() {
+        if depths.get(&id).is_some_and(|prior| *prior >= depth) {
+            continue;
+        }
+        depths.insert(id, depth);
+        let node = entry
+            .nodes
+            .get_mut(&id)
+            .ok_or_else(|| invalid("missing index ancestor"))?;
+        let mut child_depth = depth;
+        if let QueryPlanNode::Logical { operator, .. } = node {
+            match operator {
+                LogicalOperator::Subquery {
+                    range_ms,
+                    offset_ms,
+                    ..
+                } => {
+                    child_depth = depth
+                        .checked_add(*range_ms)
+                        .and_then(|v| v.checked_add((*offset_ms).max(0) as u64))
+                        .ok_or_else(|| invalid("retention overflow"))?;
+                }
+                LogicalOperator::ReadRangeCounterIndex {
+                    range_ms,
+                    offset_ms,
+                    retention_ms,
+                    ..
+                } => {
+                    *retention_ms = depth
+                        .checked_add(*range_ms)
+                        .and_then(|v| v.checked_add((*offset_ms).max(0) as u64))
+                        .ok_or_else(|| invalid("retention overflow"))?;
+                }
+                LogicalOperator::ReadRangeMaxIndex {
+                    range_ms,
+                    retention_ms,
+                    ..
+                } => {
+                    *retention_ms = depth
+                        .checked_add(*range_ms)
+                        .ok_or_else(|| invalid("retention overflow"))?;
+                }
+                _ => {}
+            }
+        }
+        pending.extend(node.inputs().iter().map(|child| (*child, child_depth)));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod remote_boundary_regressions {
+    use super::*;
+    // Population conjunction order and consumer retention cannot create ghost mask keys.
+    #[test]
+    fn policy_identity_is_independent_of_matcher_order_and_retention() {
+        let first = LabelMatcher {
+            name: "job".into(),
+            value: "orders".into(),
+            operation: LabelMatch::Equal,
+        };
+        let second = LabelMatcher {
+            name: "status".into(),
+            value: "5..".into(),
+            operation: LabelMatch::Regex,
+        };
+        let a = LogicalOperator::ReadRangeCounterIndex {
+            metric: "requests".into(),
+            matchers: vec![first.clone(), second.clone()],
+            range_ms: 300_000,
+            offset_ms: 0,
+            operation: TemporalOperation::Rate,
+            retention_ms: 300_000,
+        };
+        let b = LogicalOperator::ReadRangeCounterIndex {
+            metric: "requests".into(),
+            matchers: vec![second, first],
+            range_ms: 300_000,
+            offset_ms: 0,
+            operation: TemporalOperation::Rate,
+            retention_ms: 3_600_000,
+        };
+        assert_eq!(index_key(&a).unwrap(), index_key(&b).unwrap());
+    }
+    // Both policies retain the original ratio but delegate only the disabled operand to Prometheus.
+    #[test]
+    fn real_error_ratio_has_remote_subtree_without_any_local_scan() {
+        let query = "sum(rate(http_requests_total{job=\"order-service\",status=~\"5..\"}[5m])) / sum(rate(http_requests_total{job=\"order-service\"}[5m]))";
+        let parsed = crate::query_parser::parse_query_expr_canonical(
+            query,
+            planner_types::types::AccuracyTarget::Exact,
+        )
+        .unwrap();
+        let selected = crate::planner_selection::select_summary_default(&parsed).unwrap();
+        let keys = index_candidate_keys(query, &selected).unwrap();
+        assert_eq!(keys.len(), 2);
+        for key in keys {
+            let mut entry = QueryPlanEntry::compile_bound_composable(
+                "ratio".into(),
+                query.into(),
+                &selected,
+                InstantExecution {
+                    lookback_ms: 300_000,
+                    full_history: false,
+                    cumulative_readout: true,
+                },
+                FallbackPolicy::ExactBackend,
+                |_, _| Err(invalid("no pooled producer")),
+            )
+            .unwrap();
+            apply_index_policy(&mut entry, Some(&[key].into_iter().collect())).unwrap();
+            let count = |predicate: fn(&LogicalOperator) -> bool| {
+                entry.nodes.values().filter(|node| matches!(node, QueryPlanNode::Logical { operator, .. } if predicate(operator))).count()
+            };
+            assert_eq!(
+                count(|op| matches!(op, LogicalOperator::ReadRangeCounterIndex { .. })),
+                1
+            );
+            assert_eq!(
+                count(|op| matches!(op, LogicalOperator::ExactSubquery { .. })),
+                1
+            );
+            assert_eq!(count(|op| matches!(op, LogicalOperator::Scan { .. })), 0);
+            entry.validate(&Default::default()).unwrap();
         }
     }
 }

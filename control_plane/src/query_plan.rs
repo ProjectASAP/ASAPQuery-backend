@@ -155,14 +155,17 @@ impl QueryPlanEntry {
             logical_source: Some(canonical_promql.clone()),
         };
         let root = compiler.lower(root)?;
-        Ok(Self {
+        let mut entry = Self {
             query_id,
             canonical_promql,
             root,
             nodes: compiler.nodes,
             instant,
             fallback,
-        })
+        };
+        logical::promote_counter_indexes(&mut entry)?;
+        logical::apply_index_policy(&mut entry, None)?;
+        Ok(entry)
     }
 
     /// Validate references, bindings, reachability, and cycles before activation.
@@ -430,7 +433,9 @@ where
         self.next_id += 1;
         self.seen.insert(identity, id);
         if let Some(original) = &self.logical_source {
-            if let Some(operator) = logical::selected_range_max_index(original, node)? {
+            if let Some(operator) = logical::selected_counter_index(original, node)?
+                .or(logical::selected_range_max_index(original, node)?)
+            {
                 self.nodes.insert(
                     id,
                     QueryPlanNode::Logical {

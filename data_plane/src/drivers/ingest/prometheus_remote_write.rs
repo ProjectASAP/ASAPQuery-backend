@@ -96,7 +96,7 @@ struct ReceiverInner {
     ingest: Arc<IngestState>,
     dedup: Mutex<DedupState>,
     stats: Arc<RemoteWriteStats>,
-    raw_store: Arc<crate::query_engines::raw_store::RawSampleStore>,
+    index_store: Arc<crate::query_engines::index_store::IndexStore>,
 }
 
 #[derive(Default)]
@@ -157,13 +157,13 @@ pub struct CanonicalSample {
 
 impl PrometheusRemoteWriteReceiver {
     pub fn new(config: PrometheusRemoteWriteConfig, ingest: Arc<IngestState>) -> Self {
-        Self::new_with_raw_store(config, ingest, Arc::new(Default::default()))
+        Self::new_with_index_store(config, ingest, Arc::new(Default::default()))
     }
 
-    pub fn new_with_raw_store(
+    pub fn new_with_index_store(
         config: PrometheusRemoteWriteConfig,
         ingest: Arc<IngestState>,
-        raw_store: Arc<crate::query_engines::raw_store::RawSampleStore>,
+        index_store: Arc<crate::query_engines::index_store::IndexStore>,
     ) -> Self {
         Self {
             inner: Arc::new(ReceiverInner {
@@ -171,13 +171,13 @@ impl PrometheusRemoteWriteReceiver {
                 ingest,
                 dedup: Mutex::new(DedupState::default()),
                 stats: Arc::new(RemoteWriteStats::default()),
-                raw_store,
+                index_store,
             }),
         }
     }
 
-    pub fn raw_store(&self) -> Arc<crate::query_engines::raw_store::RawSampleStore> {
-        self.inner.raw_store.clone()
+    pub fn index_store(&self) -> Arc<crate::query_engines::index_store::IndexStore> {
+        self.inner.index_store.clone()
     }
 
     pub fn config(&self) -> &PrometheusRemoteWriteConfig {
@@ -197,7 +197,7 @@ impl PrometheusRemoteWriteReceiver {
         self.inner.ingest.router.drain().await?;
         // Finite-input preparation includes the residual index, so its build
         // cost is not silently amortized into the first query's read cost.
-        if self.inner.raw_store.sample_count() > 0 {
+        if self.inner.index_store.sample_count() > 0 {
             let plan = self
                 .inner
                 .ingest
@@ -205,30 +205,13 @@ impl PrometheusRemoteWriteReceiver {
                 .ok_or_else(|| "active plan disappeared during input drain".to_string())?;
             let prepared = self
                 .inner
-                .raw_store
+                .index_store
                 .snapshot(
                     plan.precompute_plan.envelope.plan_id,
                     plan.precompute_plan.envelope.plan_version,
                 )
                 .map_err(|error| error.to_string())?;
-            let metrics = plan
-                .query_plan
-                .entries
-                .values()
-                .flat_map(|entry| entry.nodes.values())
-                .filter_map(|node| match node {
-                    control_plane::query_plan::QueryPlanNode::Logical {
-                        operator:
-                            control_plane::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
-                                metric,
-                                ..
-                            },
-                        ..
-                    } => Some(metric.clone()),
-                    _ => None,
-                })
-                .collect();
-            prepared.prepare_range_max_indexes(&metrics);
+            prepared.prepare();
         }
         Ok(())
     }
@@ -345,40 +328,47 @@ impl PrometheusRemoteWriteReceiver {
             .router
             .try_route_group_batch_atomic(messages)?;
 
-        let mut raw_metrics = std::collections::BTreeSet::new();
-        let mut all_metrics = false;
-        for entry in physical_plan.query_plan.entries.values() {
-            for node in entry.nodes.values() {
-                if let control_plane::query_plan::QueryPlanNode::Logical {
-                    operator:
-                        control_plane::query_plan::logical::LogicalOperator::Scan { metric, .. },
-                    ..
-                } = node
-                {
-                    if let Some(metric) = metric {
-                        raw_metrics.insert(metric.clone());
-                    } else {
-                        all_metrics = true;
-                    }
-                } else if let control_plane::query_plan::QueryPlanNode::Logical {
-                    operator:
-                        control_plane::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
-                            metric,
-                            ..
-                        },
-                    ..
-                } = node
-                {
-                    raw_metrics.insert(metric.clone());
+        let mut specs = std::collections::BTreeMap::<
+            String,
+            crate::query_engines::index_store::IndexSpec,
+        >::new();
+        for node in physical_plan
+            .query_plan
+            .entries
+            .values()
+            .flat_map(|entry| entry.nodes.values())
+        {
+            if let control_plane::query_plan::QueryPlanNode::Logical { operator, .. } = node {
+                use control_plane::query_plan::logical::LogicalOperator;
+                let (metric, retention_ms, counter, matchers) = match operator {
+                    LogicalOperator::ReadRangeCounterIndex {
+                        metric,
+                        retention_ms,
+                        matchers,
+                        ..
+                    } => (metric, *retention_ms, true, matchers),
+                    LogicalOperator::ReadRangeMaxIndex {
+                        metric,
+                        retention_ms,
+                        matchers,
+                        ..
+                    } => (metric, *retention_ms, false, matchers),
+                    _ => continue,
+                };
+                let spec = specs.entry(metric.clone()).or_default();
+                spec.retention_ms = spec.retention_ms.max(retention_ms);
+                spec.counter |= counter;
+                spec.max |= !counter;
+                if !spec.populations.contains(matchers) {
+                    spec.populations.push(matchers.clone());
                 }
             }
         }
-        self.inner.raw_store.append_admitted(
+        self.inner.index_store.append_admitted(
             plan_identity.0,
             plan_identity.1,
             &new_samples,
-            &raw_metrics,
-            all_metrics,
+            &specs,
         );
 
         for ((plan_id, plan_version, series, timestamp), value) in batch_values {
@@ -704,6 +694,7 @@ mod tests {
                         operator: if indexed {
                             control_plane::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
                                 metric: "requests_total".into(),
+                                retention_ms: 60_000,
                                 matchers: vec![],
                                 range_ms: 60_000,
                             }
@@ -754,7 +745,7 @@ mod tests {
     fn configured_receiver_with_raw(
         retain_raw: bool,
     ) -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
-        configured_receiver_with_index(retain_raw, false)
+        configured_receiver_with_index(retain_raw, retain_raw)
     }
     fn configured_receiver_with_index(
         retain_raw: bool,
@@ -829,9 +820,9 @@ mod tests {
         let (receiver, _worker) = configured_receiver_with_raw(true);
         receiver.accept(&one_sample(1.0)).unwrap();
         receiver.accept(&one_sample(1.0)).unwrap();
-        assert_eq!(receiver.raw_store().sample_count(), 1);
+        assert_eq!(receiver.index_store().sample_count(), 1);
         assert!(receiver.accept(&one_sample(2.0)).is_err());
-        assert_eq!(receiver.raw_store().sample_count(), 1);
+        assert_eq!(receiver.index_store().sample_count(), 1);
         for timestamp in 101..108 {
             let bytes = snap::raw::Decoder::new()
                 .decompress_vec(&one_sample(1.0))
@@ -840,7 +831,7 @@ mod tests {
             write.timeseries[0].samples[0].timestamp = timestamp;
             receiver.accept(&compressed(write)).unwrap();
         }
-        assert_eq!(receiver.raw_store().sample_count(), 8);
+        assert_eq!(receiver.index_store().sample_count(), 8);
         let bytes = snap::raw::Decoder::new()
             .decompress_vec(&one_sample(1.0))
             .unwrap();
@@ -850,10 +841,10 @@ mod tests {
             receiver.accept(&compressed(write)),
             Err(RemoteWriteError::Backpressure(_))
         ));
-        assert_eq!(receiver.raw_store().sample_count(), 8);
+        assert_eq!(receiver.index_store().sample_count(), 8);
         let (native, _worker) = configured_receiver();
         native.accept(&one_sample(1.0)).unwrap();
-        assert_eq!(native.raw_store().sample_count(), 0);
+        assert_eq!(native.index_store().sample_count(), 0);
     }
 
     #[tokio::test]
@@ -861,11 +852,11 @@ mod tests {
         let (receiver, mut worker) = configured_receiver_with_index(true, true);
         receiver.accept(&one_sample(3.0)).unwrap();
         assert_eq!(
-            receiver.raw_store().sample_count(),
+            receiver.index_store().sample_count(),
             1,
             "index-only plan must retain admitted input"
         );
-        assert_eq!(receiver.raw_store().range_max_index_bytes(), 0);
+        assert_eq!(receiver.index_store().range_max_index_bytes(), 0);
         let handle = receiver.clone();
         let drain = tokio::spawn(async move { handle.drain().await });
         assert!(matches!(
@@ -878,7 +869,7 @@ mod tests {
         reply.send(Ok(())).unwrap();
         drain.await.unwrap().unwrap();
         assert!(
-            receiver.raw_store().range_max_index_bytes() > 0,
+            receiver.index_store().range_max_index_bytes() > 0,
             "complete must include index construction before query calibration"
         );
     }
