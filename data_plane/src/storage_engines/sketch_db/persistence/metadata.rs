@@ -402,15 +402,29 @@ impl SdsSidecar {
         sidecar
     }
 
-    fn into_records(self) -> Vec<SidMetaRecord> {
+    fn into_records(self) -> PersistResult<Vec<SidMetaRecord>> {
         self.bindings
             .into_values()
-            .filter_map(|binding| {
+            .map(|binding| {
                 let operator = self
                     .summary_descriptors
-                    .get(&binding.summary_descriptor_id)?;
-                let data = self.data_descriptors.get(&binding.data_descriptor_id)?;
-                Some(SidMetaRecord {
+                    .get(&binding.summary_descriptor_id)
+                    .ok_or_else(|| {
+                        PersistError::Format(format!(
+                            "SID {} references missing summary descriptor {}",
+                            binding.sid, binding.summary_descriptor_id
+                        ))
+                    })?;
+                let data = self
+                    .data_descriptors
+                    .get(&binding.data_descriptor_id)
+                    .ok_or_else(|| {
+                        PersistError::Format(format!(
+                            "SID {} references missing data descriptor {}",
+                            binding.sid, binding.data_descriptor_id
+                        ))
+                    })?;
+                Ok(SidMetaRecord {
                     sid: binding.sid,
                     metric_name: data.metric_name.clone(),
                     group_by_keys: data.group_by_keys.clone(),
@@ -482,7 +496,17 @@ impl SidMetadataStore {
                     return Ok(Vec::new());
                 }
             };
-            return Ok(sidecar.into_records());
+            return match sidecar.into_records() {
+                Ok(records) => Ok(records),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        %error,
+                        "SDS metadata sidecar has broken descriptor references; ignoring"
+                    );
+                    Ok(Vec::new())
+                }
+            };
         }
         // Version 1 was a flat SID map. Read it and normalize on the next write.
         let map: HashMap<String, SidMetaRecord> = match serde_json::from_value(value) {
@@ -631,6 +655,27 @@ mod tests {
         assert_eq!(persisted["data_descriptors"].as_object().unwrap().len(), 1);
         assert_eq!(persisted["bindings"].as_object().unwrap().len(), 2);
         assert_eq!(store.load().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn broken_descriptor_reference_does_not_partially_recover() {
+        let tmp = TempDir::new().unwrap();
+        let store = SidMetadataStore::new(tmp.path());
+        store.upsert_all(&[sketch_meta(1), exact_meta(2)]).unwrap();
+
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+        let missing_id = persisted["bindings"]["1"]["summary_descriptor_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        persisted["summary_descriptors"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&missing_id);
+        std::fs::write(store.path(), serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        assert!(store.load().unwrap().is_empty());
     }
 
     #[test]
