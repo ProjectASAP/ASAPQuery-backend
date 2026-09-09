@@ -138,6 +138,10 @@ pub struct PlanningRequest {
     /// Observed cadence of source samples. Exact temporal panes must divide
     /// both this cadence and the repeated-query evaluation interval.
     pub source_sample_interval_ms: Option<u64>,
+    /// How far behind the newest ingested sample an admitted query may be
+    /// evaluated. This extends physical retention only; it never changes the
+    /// PromQL range selector used for readout.
+    pub query_staleness_margin_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -201,10 +205,16 @@ pub struct BackendLocalImplementation {
     pub implementation_cost: ImplementationCostEvidence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_sample_interval_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub query_staleness_margin_ms: u64,
     /// Certificates keyed by exact registered PromQL; converted to root IDs
     /// before workload selection so one query cannot borrow another's evidence.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub topk_evidence: HashMap<String, TopKMembershipEvidence>,
+}
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1705,6 +1715,7 @@ impl BackendLocalPlanningSnapshot {
                 evidence: topk_evidence_by_id,
                 planner_revision: PLANNER_REVISION.into(),
                 source_sample_interval_ms: self.implementation.source_sample_interval_ms,
+                query_staleness_margin_ms: self.implementation.query_staleness_margin_ms,
             },
             self.environment,
         ))
@@ -2386,8 +2397,11 @@ impl PhysicalCompiler {
                 .max();
             if let Some(lookback_ms) = max_lookback_ms {
                 let pane_ms = materialization.slide_interval.saturating_mul(1_000).max(1);
-                materialization.num_aggregates_to_retain =
-                    Some(lookback_ms.div_ceil(pane_ms).saturating_add(1));
+                materialization.num_aggregates_to_retain = Some(retained_window_count(
+                    lookback_ms,
+                    request.query_staleness_margin_ms,
+                    pane_ms,
+                ));
             }
         }
         query_plan.validate(&materialization_fingerprints)?;
@@ -2687,6 +2701,13 @@ fn exact_temporal_pane_secs(
         gcd(source_ms / 1_000, u64::from(evaluation_interval_ms) / 1_000),
     );
     aligned.max(minimum)
+}
+
+fn retained_window_count(lookback_ms: u64, staleness_margin_ms: u64, pane_ms: u64) -> u64 {
+    lookback_ms
+        .saturating_add(staleness_margin_ms)
+        .div_ceil(pane_ms.max(1))
+        .saturating_add(1)
 }
 
 struct PlannerPhysicalSelection {
@@ -3498,6 +3519,7 @@ mod tests {
             evidence: evidence_by_query,
             planner_revision: PLANNER_REVISION.into(),
             source_sample_interval_ms: None,
+            query_staleness_margin_ms: 0,
         })
     }
 
@@ -3510,6 +3532,15 @@ mod tests {
         assert_eq!(exact_temporal_pane_secs(86_400, 60_000, Some(30_000)), 30);
         assert_eq!(exact_temporal_pane_secs(43_200, 60_000, Some(30_000)), 30);
         assert_eq!(exact_temporal_pane_secs(21_600, 60_000, None), 5);
+    }
+
+    #[test]
+    fn query_staleness_extends_retention_without_changing_readout_lookback() {
+        assert_eq!(
+            retained_window_count(6 * 60 * 60_000, 19 * 60_000, 30_000),
+            759
+        );
+        assert_eq!(retained_window_count(6 * 60 * 60_000, 0, 30_000), 721);
     }
 
     // Both production adapters preserve canonical root identity and select the
@@ -4214,6 +4245,7 @@ mod tests {
                 state_layout: "anchored-pane-v1".into(),
                 implementation_cost: template.window_implementations[0].cost.clone(),
                 source_sample_interval_ms: None,
+                query_staleness_margin_ms: 0,
                 topk_evidence: HashMap::new(),
             },
             environment,

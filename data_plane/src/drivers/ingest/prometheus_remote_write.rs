@@ -7,7 +7,7 @@
 use crate::precompute_engine::ingest_handler::IngestState;
 use crate::precompute_engine::series_router::{TryRouteError, WorkerMessage};
 use prost::Message;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -102,7 +102,8 @@ struct ReceiverInner {
 struct DedupState {
     input_closed: bool,
     values: HashMap<(u64, u64, String, i64), DedupValue>,
-    expiry: VecDeque<(Instant, u64, u64, String, i64)>,
+    expiry_by_event_time: BTreeMap<i64, Vec<(u64, u64, String)>>,
+    max_event_timestamp_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -242,7 +243,6 @@ impl PrometheusRemoteWriteReceiver {
             physical_plan.precompute_plan.envelope.plan_version,
         );
 
-        let now = Instant::now();
         let mut dedup = self
             .inner
             .dedup
@@ -251,7 +251,15 @@ impl PrometheusRemoteWriteReceiver {
         if dedup.input_closed {
             return Err(RemoteWriteError::InputClosed);
         }
-        dedup.evict_before(now.checked_sub(config.dedup_horizon).unwrap_or(now));
+        let batch_max_timestamp_ms = samples.iter().map(|sample| sample.timestamp_ms).max();
+        let max_event_timestamp_ms = match (dedup.max_event_timestamp_ms, batch_max_timestamp_ms) {
+            (Some(current), Some(batch)) => Some(current.max(batch)),
+            (current, batch) => current.or(batch),
+        };
+        let horizon_ms = i64::try_from(config.dedup_horizon.as_millis()).unwrap_or(i64::MAX);
+        let retention_cutoff_ms = max_event_timestamp_ms
+            .map(|timestamp| timestamp.saturating_sub(horizon_ms))
+            .unwrap_or(i64::MIN);
 
         // Validate conflicts both against committed history and inside this
         // request before reserving any worker capacity.
@@ -269,7 +277,11 @@ impl PrometheusRemoteWriteReceiver {
                 .value
                 .map(|v| DedupValue::Number(v.to_bits()))
                 .unwrap_or(DedupValue::Stale);
-            let prior = batch_values.get(&key).or_else(|| dedup.values.get(&key));
+            let prior = batch_values.get(&key).or_else(|| {
+                (sample.timestamp_ms >= retention_cutoff_ms)
+                    .then(|| dedup.values.get(&key))
+                    .flatten()
+            });
             match prior {
                 Some(previous) if *previous == value => {
                     duplicates += 1;
@@ -286,7 +298,16 @@ impl PrometheusRemoteWriteReceiver {
                 }
             }
         }
-        if dedup.values.len().saturating_add(batch_values.len()) > config.max_dedup_entries {
+        let retained_existing = dedup
+            .values
+            .keys()
+            .filter(|key| key.3 >= retention_cutoff_ms)
+            .count();
+        let retained_batch = batch_values
+            .keys()
+            .filter(|key| key.3 >= retention_cutoff_ms)
+            .count();
+        if retained_existing.saturating_add(retained_batch) > config.max_dedup_entries {
             return Err(RemoteWriteError::DedupCapacity(config.max_dedup_entries));
         }
 
@@ -296,13 +317,23 @@ impl PrometheusRemoteWriteReceiver {
             .router
             .try_route_group_batch_atomic(messages)?;
 
+        // Commit dedup mutation only after the entire routed batch was
+        // reserved successfully. A rejected/backpressured request must not
+        // advance event time or erase retry history.
+        dedup.max_event_timestamp_ms = max_event_timestamp_ms;
+        dedup.evict_event_times_before(retention_cutoff_ms);
         for ((plan_id, plan_version, series, timestamp), value) in batch_values {
+            if timestamp < retention_cutoff_ms {
+                continue;
+            }
             dedup
                 .values
                 .insert((plan_id, plan_version, series.clone(), timestamp), value);
             dedup
-                .expiry
-                .push_back((now, plan_id, plan_version, series, timestamp));
+                .expiry_by_event_time
+                .entry(timestamp)
+                .or_default()
+                .push((plan_id, plan_version, series));
         }
         let stale_count = new_samples
             .iter()
@@ -329,15 +360,18 @@ impl PrometheusRemoteWriteReceiver {
 }
 
 impl DedupState {
-    fn evict_before(&mut self, cutoff: Instant) {
-        while self
-            .expiry
-            .front()
-            .is_some_and(|(accepted_at, _, _, _, _)| *accepted_at < cutoff)
-        {
-            if let Some((_, plan_id, plan_version, series, timestamp)) = self.expiry.pop_front() {
-                self.values
-                    .remove(&(plan_id, plan_version, series, timestamp));
+    fn evict_event_times_before(&mut self, cutoff_ms: i64) {
+        let expired_timestamps = self
+            .expiry_by_event_time
+            .range(..cutoff_ms)
+            .map(|(timestamp, _)| *timestamp)
+            .collect::<Vec<_>>();
+        for timestamp in expired_timestamps {
+            if let Some(entries) = self.expiry_by_event_time.remove(&timestamp) {
+                for (plan_id, plan_version, series) in entries {
+                    self.values
+                        .remove(&(plan_id, plan_version, series, timestamp));
+                }
             }
         }
     }
@@ -1049,6 +1083,25 @@ mod tests {
             receiver.stats().rejected_requests.load(Ordering::Relaxed),
             1
         );
+    }
+
+    #[test]
+    fn dedup_history_is_evicted_by_event_time_during_fast_replay() {
+        let mut state = DedupState::default();
+        for timestamp in [0, 60_000, 600_000, 660_000] {
+            let series = format!("series-{timestamp}");
+            state
+                .values
+                .insert((7, 3, series.clone(), timestamp), DedupValue::Number(1));
+            state
+                .expiry_by_event_time
+                .entry(timestamp)
+                .or_default()
+                .push((7, 3, series));
+        }
+        state.evict_event_times_before(600_000);
+        assert_eq!(state.values.len(), 2);
+        assert!(state.values.keys().all(|key| key.3 >= 600_000));
     }
 
     #[test]

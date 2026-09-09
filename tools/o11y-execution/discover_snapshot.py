@@ -78,6 +78,10 @@ def main():
         )
     if source_sample_interval_ms:
         implementation["source_sample_interval_ms"] = source_sample_interval_ms
+    # Finite replay evaluates the oldest repetition first after loading the
+    # complete input. Preserve that admitted historical-query span separately
+    # from each query's PromQL range selector.
+    implementation["query_staleness_margin_ms"] = max(0, (args.repetitions - 1) * args.interval_ms)
     implementation.update(evidence_observed_at_unix_ms=now, evidence_valid_for_ms=86400000, horizon_seconds=horizon)
     implementation["lifecycle_costs"] = dict.fromkeys(("build", "maintenance_per_update", "read", "retention_per_second", "retirement"), 1.0)
     implementation["implementation_cost"].update(model_version="UNCALIBRATED-enumeration-only", observed_at_unix_ms=now,

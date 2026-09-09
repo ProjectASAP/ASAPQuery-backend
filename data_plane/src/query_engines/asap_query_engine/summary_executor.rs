@@ -504,6 +504,34 @@ impl QueryExecutionContext<'_> {
                     });
                 }
                 Candidate::ExactAgg(agg_type) => {
+                    if matches!(
+                        agg_type,
+                        AggregationType::MinMax | AggregationType::MultipleMinMax
+                    ) {
+                        if let Some(series) = self
+                            .index
+                            .query_exact_max_rollup_range(sid, self.t0_ms, self.t1_ms)
+                        {
+                            for (labels, value) in series {
+                                let key = match &binding.output_grouping {
+                                    PhysicalGrouping::PerEntity => labels,
+                                    PhysicalGrouping::Reduce(keys) => {
+                                        project_group_key(keys, &labels)
+                                    }
+                                };
+                                let accumulator =
+                                    MinMaxAccumulator::with_value(value, "max".to_string());
+                                by_group.entry(key).or_default().push(GroupState::ExactAgg {
+                                    entries: vec![Rc::new(BTreeMap::from([(
+                                        self.t1_ms as i64,
+                                        Arc::new(accumulator) as Arc<dyn AggregateCore>,
+                                    )]))],
+                                    agg_type,
+                                });
+                            }
+                            continue;
+                        }
+                    }
                     let Some((labels, windows)) = self
                         .index
                         .query_exact_agg_range(sid, self.t0_ms, self.t1_ms)

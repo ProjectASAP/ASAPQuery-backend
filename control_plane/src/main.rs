@@ -833,6 +833,7 @@ fn compile_physical_plan_request(
         evidence: request.evidence,
         planner_revision: request.planner_revision,
         source_sample_interval_ms: None,
+        query_staleness_margin_ms: 0,
     };
     let environment = physical::compiler::DeploymentEnvironment {
         target: physical::compiler::PhysicalDeploymentTarget::DistributedCollectors,
