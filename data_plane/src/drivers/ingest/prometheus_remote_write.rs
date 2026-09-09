@@ -773,6 +773,7 @@ mod tests {
             capability_snapshot_id: "test".into(),
         };
         let active = ActivePhysicalPlan {
+            summary_catalog: None,
             precompute_plan: PrecomputePlan {
                 summary_catalog: None,
                 materialization_contracts: Default::default(),

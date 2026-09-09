@@ -492,6 +492,8 @@ async fn main() -> Result<()> {
         }
         Some(
             data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
+                summary_catalog: plan.summary_catalog,
+                collector_plans: plan.collector_plans,
                 precompute_plan: plan.precompute_plan,
                 transmission_plan: plan.transmission_plan,
                 backend_plan: plan.backend_plan.encode_to_vec(),
@@ -674,8 +676,8 @@ async fn main() -> Result<()> {
     // sharing contract as `hot_reload_config`.
     let initial_backend_plan = control_plane::backend_plan::BackendPlan::default();
     let initial_precompute_plan = control_plane::physical::compiler::PrecomputePlan {
-                summary_catalog: None,
-                materialization_contracts: Default::default(),
+        summary_catalog: None,
+        materialization_contracts: Default::default(),
         envelope: control_plane::physical::compiler::PlanEnvelope {
             plan_id: 0,
             plan_version: 0,
@@ -716,6 +718,7 @@ async fn main() -> Result<()> {
     };
     let initial_active_plan = startup_physical_plan.unwrap_or_else(|| {
         data_plane::storage_engines::types::ActivePhysicalPlan {
+            summary_catalog: None,
             precompute_plan: initial_precompute_plan,
             transmission_plan: initial_transmission_plan,
             runtime_config: streaming_config.clone(),
@@ -1109,6 +1112,7 @@ async fn main() -> Result<()> {
     if active_physical_plan.snapshot().backend_plan.plan_id == 0 {
         let current = active_physical_plan.snapshot();
         active_physical_plan.swap(data_plane::storage_engines::types::ActivePhysicalPlan {
+            summary_catalog: current.summary_catalog.clone(),
             precompute_plan: current.precompute_plan.clone(),
             transmission_plan: current.transmission_plan.clone(),
             runtime_config: current.runtime_config.clone(),
