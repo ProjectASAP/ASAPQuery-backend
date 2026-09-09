@@ -45,23 +45,15 @@ pub enum LogicalOperator {
     },
 }
 
-/// Compile-time identity for a Planner-authorized SummaryStore materialization.
-/// It is never serialized into an installed QueryPlan.
+/// Stable identity of a Planner-authorized materializable DAG leaf. This is a
+/// workload-selection key, not another physical materialization definition.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum MaterializationContract {
-    Counter {
-        metric: String,
-        matchers: Vec<LabelMatcher>,
-        range_ms: u64,
-        offset_ms: i64,
-        operation: TemporalOperation,
-    },
-    RangeMax {
-        metric: String,
-        matchers: Vec<LabelMatcher>,
-        range_ms: u64,
-    },
+struct MaterializationCandidateIdentity {
+    metric: String,
+    matchers: Vec<LabelMatcher>,
+    range_ms: u64,
+    offset_ms: i64,
+    operation: TemporalOperation,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -852,7 +844,7 @@ mod planner_workload_tests {
 pub(crate) fn selected_range_max_materialization(
     original: &str,
     node: &planner_types::post_asap::SummaryNode,
-) -> Result<Option<MaterializationContract>, QueryPlanError> {
+) -> Result<Option<String>, QueryPlanError> {
     use planner_types::post_asap::{ExactKind, SummaryExpr, SummaryFamilyType};
     if !matches!(
         &node.expr,
@@ -891,11 +883,15 @@ pub(crate) fn selected_range_max_materialization(
     else {
         return Ok(None);
     };
-    Ok(Some(MaterializationContract::RangeMax {
-        metric: metric.clone(),
-        matchers: matchers.clone(),
-        range_ms: *range_ms,
-    }))
+    Ok(Some(materialization_candidate_key(
+        MaterializationCandidateIdentity {
+            metric: metric.clone(),
+            matchers: matchers.clone(),
+            range_ms: *range_ms,
+            offset_ms: 0,
+            operation: TemporalOperation::Max,
+        },
+    )?))
 }
 
 #[cfg(test)]
@@ -926,12 +922,11 @@ mod range_max_materialization_tests {
             )
             .unwrap();
             let selected = crate::planner_selection::select_summary_default(&original).unwrap();
-            let index = selected_range_max_materialization(query, &selected)
+            let key = selected_range_max_materialization(query, &selected)
                 .unwrap()
                 .unwrap();
-            assert!(
-                matches!(index, MaterializationContract::RangeMax { metric: ref actual, range_ms: actual_range, .. } if actual == metric && actual_range == range_ms)
-            );
+            assert!(key.contains(metric));
+            assert!(key.contains(&range_ms.to_string()));
         }
     }
     #[test]
@@ -958,8 +953,10 @@ mod range_max_materialization_tests {
 }
 
 /// Stable contract identity used by priced physical alternatives, independent of node IDs.
-pub fn materialization_key(operator: &MaterializationContract) -> Result<String, QueryPlanError> {
-    let mut value = serde_json::to_value(operator).map_err(|e| invalid(e.to_string()))?;
+fn materialization_candidate_key(
+    candidate: MaterializationCandidateIdentity,
+) -> Result<String, QueryPlanError> {
+    let mut value = serde_json::to_value(candidate).map_err(|e| invalid(e.to_string()))?;
     if let Some(object) = value.as_object_mut() {
         // Retention is a consumer lifetime requirement, not the materialization read's
         // semantics. Equivalent matcher conjunctions must share policy keys.
@@ -974,7 +971,7 @@ pub fn materialization_key(operator: &MaterializationContract) -> Result<String,
 fn counter_contract(
     root: QueryNodeId,
     nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
-) -> Option<MaterializationContract> {
+) -> Option<MaterializationCandidateIdentity> {
     let QueryPlanNode::Logical {
         operator: LogicalOperator::Temporal { operation },
         inputs,
@@ -1002,7 +999,7 @@ fn counter_contract(
     else {
         return None;
     };
-    Some(MaterializationContract::Counter {
+    Some(MaterializationCandidateIdentity {
         metric: metric.clone(),
         matchers: matchers.clone(),
         range_ms: *range_ms,
@@ -1014,7 +1011,7 @@ fn counter_contract(
 pub(crate) fn selected_counter_materialization(
     original: &str,
     node: &planner_types::post_asap::SummaryNode,
-) -> Result<Option<MaterializationContract>, QueryPlanError> {
+) -> Result<Option<String>, QueryPlanError> {
     use planner_types::post_asap::{ExactKind, SummaryExpr, SummaryFamilyType};
     if !matches!(
         &node.expr,
@@ -1027,7 +1024,9 @@ pub(crate) fn selected_counter_materialization(
         return Ok(None);
     }
     let (root, nodes) = selected_residual_nodes(original, node)?;
-    Ok(counter_contract(root, &nodes))
+    counter_contract(root, &nodes)
+        .map(materialization_candidate_key)
+        .transpose()
 }
 
 fn prune(entry: &mut QueryPlanEntry) {
@@ -1059,10 +1058,10 @@ pub fn materialization_candidate_keys(
         node: &std::rc::Rc<planner_types::post_asap::SummaryNode>,
         keys: &mut std::collections::BTreeSet<String>,
     ) -> Result<(), QueryPlanError> {
-        if let Some(operator) = selected_counter_materialization(original, node)?
+        if let Some(key) = selected_counter_materialization(original, node)?
             .or(selected_range_max_materialization(original, node)?)
         {
-            keys.insert(materialization_key(&operator)?);
+            keys.insert(key);
         }
         match &node.expr {
             SummaryExpr::BinaryOp { lhs, rhs, .. } => {
@@ -1280,14 +1279,14 @@ mod remote_boundary_regressions {
             value: "5..".into(),
             operation: LabelMatch::Regex,
         };
-        let a = MaterializationContract::Counter {
+        let a = MaterializationCandidateIdentity {
             metric: "requests".into(),
             matchers: vec![first.clone(), second.clone()],
             range_ms: 300_000,
             offset_ms: 0,
             operation: TemporalOperation::Rate,
         };
-        let b = MaterializationContract::Counter {
+        let b = MaterializationCandidateIdentity {
             metric: "requests".into(),
             matchers: vec![second, first],
             range_ms: 300_000,
@@ -1295,8 +1294,8 @@ mod remote_boundary_regressions {
             operation: TemporalOperation::Rate,
         };
         assert_eq!(
-            materialization_key(&a).unwrap(),
-            materialization_key(&b).unwrap()
+            materialization_candidate_key(a).unwrap(),
+            materialization_candidate_key(b).unwrap()
         );
     }
 

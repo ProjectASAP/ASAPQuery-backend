@@ -1923,7 +1923,7 @@ impl PhysicalCompiler {
                         .flatten()
                         .is_some())
                         && request.materialization_policy.as_ref().is_none_or(|policy| {
-                            let operator = crate::query_plan::logical::selected_counter_materialization(
+                            let key = crate::query_plan::logical::selected_counter_materialization(
                                 &query.query_string,
                                 &state.node,
                             )
@@ -1937,11 +1937,7 @@ impl PhysicalCompiler {
                                 .ok()
                                 .flatten()
                             });
-                            operator
-                                .and_then(|operator| {
-                                    crate::query_plan::logical::materialization_key(&operator).ok()
-                                })
-                                .is_some_and(|key| policy.contains(&key))
+                            key.is_some_and(|key| policy.contains(&key))
                         })
                 })
                 .collect::<Vec<_>>();
