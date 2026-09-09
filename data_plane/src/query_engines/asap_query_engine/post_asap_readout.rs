@@ -1074,5 +1074,13 @@ mod tests {
             .expect("execute exact rate DAG");
         let value = outcome.series[0].1[0].1;
         assert!((value - 0.575).abs() < 1e-12, "reset-aware rate={value}");
+        assert!(
+            execute_query_plan_readout(&idx, &entry, 1, 60_000, true).is_err(),
+            "a partial leading counter pane needs Prometheus boundary samples"
+        );
+        assert!(
+            execute_query_plan_readout(&idx, &entry, 0, 59_999, true).is_err(),
+            "a partial trailing counter pane needs Prometheus boundary samples"
+        );
     }
 }

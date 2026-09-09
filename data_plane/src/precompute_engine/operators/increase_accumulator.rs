@@ -630,6 +630,47 @@ mod tests {
     }
 
     #[test]
+    fn pane_merge_preserves_resets_and_prometheus_extrapolation() {
+        let mut left = IncreaseAccumulator::new(
+            Measurement::new(10.0),
+            10_000,
+            Measurement::new(10.0),
+            10_000,
+        );
+        left.update(Measurement::new(20.0), 20_000);
+        let mut right =
+            IncreaseAccumulator::new(Measurement::new(3.0), 30_000, Measurement::new(3.0), 30_000);
+        right.update(Measurement::new(13.0), 50_000);
+        let merged = IncreaseAccumulator::merge_accumulators(vec![right, left]).unwrap();
+        assert_eq!(merged.total_increase, 23.0);
+        assert_eq!(merged.sample_count, 4);
+        let kwargs = HashMap::from([
+            ("range_start_ms".into(), "0".into()),
+            ("range_end_ms".into(), "60000".into()),
+        ]);
+        assert_eq!(
+            crate::SingleSubpopulationAggregate::query(&merged, Statistic::Increase, Some(&kwargs))
+                .unwrap(),
+            34.5
+        );
+    }
+
+    #[test]
+    fn counter_sds_state_is_constant_size_per_pane() {
+        let mut acc = IncreaseAccumulator::new(Measurement::new(0.0), 0, Measurement::new(0.0), 0);
+        let initial = acc.serialize_to_bytes().len();
+        for second in 1..=86_400 {
+            acc.update(Measurement::new(second as f64), second * 1_000);
+        }
+        assert_eq!(acc.serialize_to_bytes().len(), initial);
+        assert_eq!(acc.sample_count, 86_401);
+        assert_eq!(
+            acc.approx_memory_bytes(),
+            std::mem::size_of::<IncreaseAccumulator>()
+        );
+    }
+
+    #[test]
     fn test_increase_accumulator_sum_is_latest_cumulative_value() {
         // Instant `sum (<counter>)` semantics: the per-series summand is
         // the latest cumulative counter value. Two series with latest

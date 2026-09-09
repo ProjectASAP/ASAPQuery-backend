@@ -81,6 +81,14 @@ pub enum SummaryOperator {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FidelityGuarantee {
     Exact,
+    /// Exact PromQL counter readout from fixed-size pane summaries. Each pane
+    /// stores only `(first value/time, last value/time, reset-corrected delta,
+    /// sample count)`. A query is eligible only when the selected panes fully
+    /// cover its range; partial boundary panes must fall back to Prometheus.
+    ExactCounter {
+        model: String,
+        full_pane_coverage_required: bool,
+    },
     KllRankError {
         k: u32,
         model: String,
@@ -125,6 +133,14 @@ impl FidelityGuarantee {
             };
         }
         match config.accumulator_spec().map(|s| s.family) {
+            Ok(SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Increase
+                | planner_types::post_asap::ExactKind::Rate,
+                _,
+            )) => Self::ExactCounter {
+                model: "prometheus.extrapolated-rate.v1".into(),
+                full_pane_coverage_required: true,
+            },
             Ok(SummaryFamilyType::ExactAggregate(..)) => Self::Exact,
             Ok(SummaryFamilyType::Sketch(kind, _)) => match kind.params() {
                 SketchParams::Kll { k } => Self::KllRankError {
@@ -167,6 +183,10 @@ impl FidelityGuarantee {
     fn validate(&self) -> Result<(), SdsError> {
         let valid = match self {
             Self::Exact => true,
+            Self::ExactCounter {
+                model,
+                full_pane_coverage_required,
+            } => !model.is_empty() && *full_pane_coverage_required,
             Self::KllRankError { k, model } => *k > 0 && !model.is_empty(),
             Self::DdSketchRelativeError { alpha } => {
                 alpha.is_finite() && *alpha > 0.0 && *alpha < 1.0
@@ -265,6 +285,11 @@ impl SummaryDescriptor {
     /// they cannot attest heap, Hydra, or aggregation-subtype semantics they lost.
     pub fn from_config(config: &PrecomputeMaterialization) -> Result<Self, SdsError> {
         let fidelity = FidelityGuarantee::from_config(config);
+        let state_schema_version = if matches!(fidelity, FidelityGuarantee::ExactCounter { .. }) {
+            2
+        } else {
+            1
+        };
         Self::new(
             SummaryOperator::Configured {
                 aggregation_type: config.aggregation_type,
@@ -276,7 +301,7 @@ impl SummaryDescriptor {
                     .collect(),
             },
             fidelity,
-            1,
+            state_schema_version,
         )
     }
 }
@@ -513,6 +538,23 @@ mod tests {
         );
     }
     #[test]
+    fn increase_config_declares_prometheus_counter_fidelity() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            "aggregationType: Increase\naggregationSubType: ''\nmetric: requests_total\nlabels:\n  grouping: []\n  rollup: []\n  aggregated: []\nparameters: {}\nwindowSize: 60\nwindowType: tumbling\nspatialFilter: ''\n",
+        )
+        .unwrap();
+        let config =
+            PrecomputeMaterialization::from_yaml_data(&yaml, None, crate::QueryLanguage::promql)
+                .unwrap();
+        assert!(matches!(
+            SummaryDescriptor::from_config(&config).unwrap().fidelity,
+            FidelityGuarantee::ExactCounter {
+                ref model,
+                full_pane_coverage_required: true
+            } if model == "prometheus.extrapolated-rate.v1"
+        ));
+    }
+    #[test]
     fn canonical_nested_parameters_and_model_versions_are_identity() {
         let a = SummaryOperator::Configured {
             aggregation_type: AggregationType::Sum,
@@ -559,8 +601,10 @@ mod tests {
         assert_eq!(id.fingerprint(), fingerprint);
         assert_eq!(id.as_u64(), 42);
         assert_eq!(crate::PolicyFingerprint::from(id), fingerprint);
-        assert_eq!(serde_json::to_value(id).unwrap(), serde_json::to_value(fingerprint).unwrap());
+        assert_eq!(
+            serde_json::to_value(id).unwrap(),
+            serde_json::to_value(fingerprint).unwrap()
+        );
         assert_eq!(serde_json::from_str::<MaterializationId>("42").unwrap(), id);
     }
-
 }
