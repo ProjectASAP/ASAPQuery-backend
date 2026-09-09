@@ -4072,6 +4072,7 @@ mod tests {
                 .materializations
                 .keys()
                 .copied()
+                .map(asap_types::sds::MaterializationId::from)
                 .collect::<BTreeSet<_>>()
         );
         assert_eq!(bundle.precompute_plan.envelope, bundle.envelope);
