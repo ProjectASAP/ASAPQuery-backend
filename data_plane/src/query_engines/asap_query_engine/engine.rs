@@ -624,7 +624,6 @@ impl ASAPQueryEngine {
                 end_ms,
                 false,
                 control_plane::types_v2::AccuracyTarget::Epsilon(0.01),
-                None,
             ),
             #[cfg(not(test))]
             None => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(
@@ -973,7 +972,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 },
                 #[cfg(test)]
                 None => crate::query_engines::asap_query_engine::live_serve::serve_instant_from_summary_executor(
-                    idx, query, now_ms, None,
+                    idx, query, now_ms,
                 ),
                 #[cfg(not(test))]
                 None => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(

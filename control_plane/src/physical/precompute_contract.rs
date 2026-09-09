@@ -25,8 +25,6 @@ pub struct PrecomputeMaterializationContract {
     pub schema_id: String,
     pub update: PrecomputeUpdate,
     pub placement: PrecomputePlacement,
-    pub activation_unix_ms: u64,
-    pub expiry_unix_ms: Option<u64>,
     pub retained_windows: Option<u64>,
 }
 fn invalid(reason: impl Into<String>) -> PrecomputePlanError {
@@ -55,8 +53,6 @@ impl PrecomputePlan {
                     schema_id: schema.schema_id.clone(),
                     update,
                     placement,
-                    activation_unix_ms: self.envelope.activation_unix_ms,
-                    expiry_unix_ms: self.envelope.expiry_unix_ms,
                     retained_windows: config.num_aggregates_to_retain,
                 },
             );
@@ -230,9 +226,7 @@ impl PrecomputePlan {
                     "update/placement does not match ingress and producer bindings",
                 ));
             }
-            if contract.activation_unix_ms != self.envelope.activation_unix_ms
-                || contract.expiry_unix_ms != self.envelope.expiry_unix_ms
-                || contract.retained_windows != config.num_aggregates_to_retain
+            if contract.retained_windows != config.num_aggregates_to_retain
                 || contract.retained_windows == Some(0)
             {
                 return Err(invalid("materialization lifecycle/retention mismatch"));

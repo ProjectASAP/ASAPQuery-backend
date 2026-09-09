@@ -10,7 +10,7 @@ use control_plane::types_v2::AccuracyTarget;
 
 use crate::query_engines::asap_query_engine::physical_dag::{self, QueryNodeRuntime};
 use crate::query_engines::asap_query_engine::post_asap_planner::{
-    execution_hints, plan_promql_to_post_asap, resolve_materializations_for_post_asap, LoweringSkip,
+    execution_hints, plan_promql_to_post_asap, LoweringSkip,
 };
 use crate::query_engines::asap_query_engine::summary_executor::{
     GroupState, QueryExecutionContext, SummaryExecutorError, SummaryValue,
@@ -72,19 +72,9 @@ pub fn execute_post_asap_readout(
     t1_ms: u64,
     is_cumulative: bool,
     accuracy: AccuracyTarget,
-    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    let node = plan_promql_to_post_asap(index, query, accuracy.clone(), backend_plan)?;
-    execute_planned_post_asap(
-        index,
-        &node,
-        query,
-        accuracy,
-        t0_ms,
-        t1_ms,
-        is_cumulative,
-        backend_plan,
-    )
+    let node = plan_promql_to_post_asap(index, query, accuracy.clone())?;
+    execute_planned_post_asap(index, &node, query, accuracy, t0_ms, t1_ms, is_cumulative)
 }
 
 /// Execute an already-bound QueryPlan entry.  This is the production serving
@@ -455,10 +445,9 @@ pub fn execute_post_asap_instant(
     query: &str,
     now_ms: u64,
     accuracy: AccuracyTarget,
-    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<(PostAsapReadoutOutcome, u64), LoweringSkip> {
     const DEFAULT_LOOKBACK_MS: u64 = 5 * 60 * 1000;
-    let node = plan_promql_to_post_asap(index, query, accuracy.clone(), backend_plan)?;
+    let node = plan_promql_to_post_asap(index, query, accuracy.clone())?;
     let hints = execution_hints(&node);
     let t0_ms = if hints.full_history {
         0
@@ -473,7 +462,6 @@ pub fn execute_post_asap_instant(
         t0_ms,
         now_ms,
         hints.cumulative_readout,
-        backend_plan,
     )?;
     Ok((outcome, t0_ms))
 }
@@ -486,14 +474,9 @@ fn execute_planned_post_asap(
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
-    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    let allowed_materializations = match backend_plan {
-        Some(plan) => Some(resolve_materializations_for_post_asap(
-            plan, node, query, accuracy,
-        )?),
-        None => None,
-    };
+    let _ = (query, accuracy);
+    let allowed_materializations = None;
     let ctx = QueryExecutionContext {
         index,
         t0_ms,
@@ -775,7 +758,7 @@ mod tests {
         let idx = SketchStore::new();
         register_hll(&idx, 1, "api", &["a", "b"]);
         register_hll(&idx, 2, "worker", &["b", "c"]);
-        let node = plan_promql_to_post_asap(&idx, "count(unique_users)", accuracy(), None)
+        let node = plan_promql_to_post_asap(&idx, "count(unique_users)", accuracy())
             .expect("compile-stage fixture");
         let canonical = control_plane::query_plan::canonical_promql("count(unique_users)").unwrap();
         let entry = control_plane::query_plan::QueryPlanEntry::compile_bound(
@@ -815,7 +798,6 @@ mod tests {
             2_000,
             true,
             accuracy(),
-            None,
         )
         .expect("should execute");
         assert_eq!(outcome.series.len(), 1);
@@ -839,16 +821,9 @@ mod tests {
         let idx = SketchStore::new();
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
-        let outcome = execute_post_asap_readout(
-            &idx,
-            "count(unique_users)",
-            1_000,
-            2_000,
-            true,
-            accuracy(),
-            None,
-        )
-        .expect("should execute");
+        let outcome =
+            execute_post_asap_readout(&idx, "count(unique_users)", 1_000, 2_000, true, accuracy())
+                .expect("should execute");
         assert_eq!(
             outcome.series.len(),
             1,
@@ -892,16 +867,9 @@ mod tests {
             (1_000, 2_000),
             Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(42.0)),
         );
-        let outcome = execute_post_asap_readout(
-            &idx,
-            "sum(bytes_total)",
-            1_000,
-            2_000,
-            true,
-            accuracy(),
-            None,
-        )
-        .expect("should execute");
+        let outcome =
+            execute_post_asap_readout(&idx, "sum(bytes_total)", 1_000, 2_000, true, accuracy())
+                .expect("should execute");
         // Window-end-only coverage: a single window (1_000, 2_000) is
         // keyed by its end (2_000) alone, so both bounds equal 2_000 --
         // same semantics as `SummaryValue::coverage()`, reconfirmed for

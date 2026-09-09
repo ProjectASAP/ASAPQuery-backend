@@ -4277,13 +4277,6 @@ mod tests {
             .values_mut()
             .next()
             .unwrap()
-            .activation_unix_ms += 1;
-        reject(bad);
-        let mut bad = original.clone();
-        bad.materialization_contracts
-            .values_mut()
-            .next()
-            .unwrap()
             .retained_windows = Some(0);
         reject(bad);
         let mut bad = original.clone();
