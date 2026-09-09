@@ -414,8 +414,6 @@ mod tests {
                 QueryPlanNode::ReadMaterialization {
                     binding: MaterializationBinding {
                         materialization: MATERIALIZATION.into(),
-                        metric: "http_requests_total".into(),
-                        sid_grouping: vec!["job".into()],
                         output_grouping: PhysicalGrouping::Reduce(vec!["job".into()]),
                         window_ms: AT,
                         readout_lookback_ms: Some(AT),

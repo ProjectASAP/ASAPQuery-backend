@@ -30,13 +30,17 @@ impl PhysicalPlanPublication {
         self.query_plan
             .validate_against_catalog(catalog)
             .map_err(|e| e.to_string())?;
+        let materializations = self
+            .precompute_plan
+            .materializations
+            .iter()
+            .map(|config| (config.policy_fingerprint(), config))
+            .collect::<std::collections::BTreeMap<_, _>>();
         for entry in self.query_plan.entries.values() {
             for binding in entry.materialization_bindings() {
-                let config = self
-                    .precompute_plan
-                    .materializations
-                    .iter()
-                    .find(|m| m.policy_fingerprint() == binding.materialization.fingerprint())
+                let config = materializations
+                    .get(&binding.materialization.fingerprint())
+                    .copied()
                     .ok_or("query binding has no precompute materialization")?;
                 if config.slide_interval.checked_mul(1000) != Some(binding.window_ms) {
                     return Err("query pane differs from precompute emission interval".into());

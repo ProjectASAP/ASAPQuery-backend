@@ -777,7 +777,6 @@ mod tests {
             summary_catalog: None,
             precompute_plan: PrecomputePlan {
                 summary_catalog: None,
-                materialization_contracts: Default::default(),
                 envelope: envelope.clone(),
                 ingest: IngestContract {
                     protocol: IngestProtocol::PrometheusRemoteWriteV1,

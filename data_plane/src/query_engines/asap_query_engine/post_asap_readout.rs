@@ -774,8 +774,6 @@ mod tests {
             |_node, _family| {
                 Ok(control_plane::query_plan::MaterializationBinding {
                     materialization: asap_types::PolicyFingerprint(123).into(),
-                    metric: "unique_users".into(),
-                    sid_grouping: vec!["service".into()],
                     output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                     window_ms: 60_000,
                     readout_lookback_ms: Some(60_000),
@@ -928,8 +926,6 @@ mod tests {
                     QueryPlanNode::ReadMaterialization {
                         binding: control_plane::query_plan::MaterializationBinding {
                             materialization: policy.into(),
-                            metric: "requests_total".into(),
-                            sid_grouping: vec![],
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 10_000,
                             readout_lookback_ms: Some(60_000),
@@ -1022,8 +1018,6 @@ mod tests {
                     QueryPlanNode::ReadMaterialization {
                         binding: control_plane::query_plan::MaterializationBinding {
                             materialization: policy.into(),
-                            metric: "requests_total".into(),
-                            sid_grouping: vec![],
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 60_000,
                             readout_lookback_ms: Some(60_000),

@@ -71,13 +71,7 @@ impl QueryPlan {
                             "query binding references absent catalog materialization".into(),
                         )
                     })?;
-                let data = &catalog.data_descriptors[&identity.data_descriptor_id];
-                let grouping: BTreeSet<_> = binding.sid_grouping.iter().cloned().collect();
-                if binding.metric != data.metric_name || grouping != data.group_by_keys {
-                    return Err(QueryPlanError::Invalid(
-                        "query binding source/grouping differs from catalog data descriptor".into(),
-                    ));
-                }
+                let _data = &catalog.data_descriptors[&identity.data_descriptor_id];
                 if binding.window_ms == 0 {
                     return Err(QueryPlanError::Invalid(
                         "zero physical pane duration".into(),
@@ -342,9 +336,6 @@ pub enum FallbackPolicy {
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
     pub materialization: MaterializationId,
-    pub metric: String,
-    /// Exact label-key layout of the stored materialization.
-    pub sid_grouping: Vec<String>,
     /// Query operator grouping applied while folding those SIDs.
     pub output_grouping: PhysicalGrouping,
     pub window_ms: u64,
@@ -951,8 +942,6 @@ mod catalog_binding_tests {
                 QueryPlanNode::ReadMaterialization {
                     binding: MaterializationBinding {
                         materialization: config.policy_fingerprint().into(),
-                        metric: "m".into(),
-                        sid_grouping: vec!["job".into()],
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 10_000,
                         readout_lookback_ms: Some(60_000),
@@ -1002,16 +991,10 @@ mod catalog_binding_tests {
         assert_eq!(binding(&mut decoded).readout_lookback_ms, Some(60_000));
     }
 
-    // A valid fingerprint alone cannot attest a different source or grouping.
+    // The catalog owns source and grouping; the binding owns only its stable ID.
     #[test]
     fn catalog_binding_rejects_source_grouping_and_identity_drift() {
         let (plan, catalog) = fixture();
-        let mut broken = plan.clone();
-        binding(&mut broken).metric = "other".into();
-        assert!(broken.validate_against_catalog(&catalog).is_err());
-        let mut broken = plan.clone();
-        binding(&mut broken).sid_grouping.clear();
-        assert!(broken.validate_against_catalog(&catalog).is_err());
         let mut broken = plan.clone();
         binding(&mut broken).materialization = PolicyFingerprint(123).into();
         assert!(broken.validate_against_catalog(&catalog).is_err());

@@ -275,11 +275,6 @@ pub struct CollectorPlan {
 pub struct PrecomputePlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary_catalog: Option<super::summary_catalog::SummaryCatalogReference>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub materialization_contracts: BTreeMap<
-        asap_types::sds::MaterializationId,
-        super::precompute_contract::PrecomputeMaterializationContract,
-    >,
     pub envelope: PlanEnvelope,
     pub ingest: IngestContract,
     pub schemas: Vec<StateSchemaContract>,
@@ -481,7 +476,6 @@ impl PrecomputePlan {
             .collect();
         let plan = Self {
             summary_catalog: None,
-            materialization_contracts: BTreeMap::new(),
             envelope,
             ingest: IngestContract {
                 protocol: IngestProtocol::ModifiedOtlpMetricsV1,
@@ -620,7 +614,7 @@ impl PrecomputePlan {
                 return Err(PrecomputePlanError::MissingProducer(missing.0));
             }
         }
-        self.validate_catalog_contract()
+        Ok(())
     }
 
     pub fn validate_against_backend(
@@ -1096,18 +1090,8 @@ impl TransmissionPlan {
                 }
             })
             .collect();
-        let catalog = super::summary_catalog::SummaryCatalog::from_materializations(
-            envelope.plan_id,
-            envelope.plan_version,
-            &precompute.materializations,
-        )
-        .map_err(|error| TransmissionPlanError::Catalog(error.to_string()))?;
         let plan = Self {
-            summary_catalog: Some(
-                catalog
-                    .reference()
-                    .map_err(|error| TransmissionPlanError::Catalog(error.to_string()))?,
-            ),
+            summary_catalog: precompute.summary_catalog.clone(),
             envelope,
             frame_identity: FrameIdentityContract {
                 identity_version: 1,
@@ -1122,14 +1106,10 @@ impl TransmissionPlan {
     }
 
     pub fn validate(&self, precompute: &PrecomputePlan) -> Result<(), TransmissionPlanError> {
-        if self.summary_catalog.is_some() {
-            let catalog = super::summary_catalog::SummaryCatalog::from_materializations(
-                precompute.envelope.plan_id,
-                precompute.envelope.plan_version,
-                &precompute.materializations,
-            )
-            .map_err(|error| TransmissionPlanError::Catalog(error.to_string()))?;
-            self.validate_against_catalog(&catalog)?;
+        if self.summary_catalog != precompute.summary_catalog {
+            return Err(TransmissionPlanError::Catalog(
+                "transmission and precompute plans reference different catalog snapshots".into(),
+            ));
         }
         if self.envelope != precompute.envelope {
             return Err(TransmissionPlanError::EnvelopeMismatch);
@@ -2375,13 +2355,13 @@ impl PhysicalCompiler {
             query_id: "precompute-plan".into(),
             reason: error.to_string(),
         })?;
-        let transmission_plan =
+        let mut transmission_plan =
             TransmissionPlan::build(envelope.clone(), &precompute_plan, &runtime_policies)
                 .map_err(|error| CompileError::Query {
                     query_id: "transmission-plan".into(),
                     reason: error.to_string(),
                 })?;
-        let collector_plans = producer_ids
+        let mut collector_plans = producer_ids
             .into_iter()
             .map(|collector_id| CollectorPlan {
                 summary_catalog: transmission_plan.summary_catalog.clone(),
@@ -2402,7 +2382,7 @@ impl PhysicalCompiler {
         for query in &request.queries {
             let canonical = canonical_promql(&query.query_string)?;
             let binding = |node: &SummaryNode, node_family: &SummaryFamilyType| -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
-                    let planned_metric = summary_agg_metric(node).ok_or_else(|| {
+                    summary_agg_metric(node).ok_or_else(|| {
                         crate::query_plan::QueryPlanError::Invalid(
                             "materialized node has no unique time-series source".into(),
                         )
@@ -2450,8 +2430,6 @@ impl PhysicalCompiler {
                     Ok(MaterializationBinding {
                         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1_000)),
                         materialization: fingerprint.into(),
-                        metric: planned_metric,
-                        sid_grouping: materialization.group_by.clone(),
                         output_grouping: PhysicalGrouping::Reduce(materialization.group_by.clone()),
                         window_ms: pane_ms,
                     })
@@ -2532,6 +2510,10 @@ impl PhysicalCompiler {
                 query_id: "precompute-catalog".into(),
                 reason: error.to_string(),
             })?;
+        transmission_plan.summary_catalog = precompute_plan.summary_catalog.clone();
+        for collector in &mut collector_plans {
+            collector.summary_catalog = precompute_plan.summary_catalog.clone();
+        }
         transmission_plan
             .validate_against_catalog(&summary_catalog)
             .map_err(|error| CompileError::Query {
@@ -4063,8 +4045,10 @@ mod tests {
         let actual = bindings
             .iter()
             .map(|binding| {
+                let identity = &plan.summary_catalog.materializations[&binding.materialization];
+                let data = &plan.summary_catalog.data_descriptors[&identity.data_descriptor_id];
                 (
-                    binding.metric.as_str(),
+                    data.metric_name.as_str(),
                     binding.window_ms,
                     binding.readout_lookback_ms,
                 )
@@ -4094,7 +4078,12 @@ mod tests {
         let query = plan.query_plan.entries.values().next().unwrap();
         let bindings = query.materialization_bindings();
         assert_eq!(bindings.len(), 1);
-        assert_eq!((&*bindings[0].metric, bindings[0].window_ms), ("a", 60_000));
+        let identity = &plan.summary_catalog.materializations[&bindings[0].materialization];
+        let data = &plan.summary_catalog.data_descriptors[&identity.data_descriptor_id];
+        assert_eq!(
+            (data.metric_name.as_str(), bindings[0].window_ms),
+            ("a", 60_000)
+        );
         assert!(!query
             .nodes
             .values()
@@ -4273,18 +4262,7 @@ mod tests {
         bad.schemas[0].window.size_ms += 1;
         reject(bad);
         let mut bad = original.clone();
-        bad.materialization_contracts
-            .values_mut()
-            .next()
-            .unwrap()
-            .retained_windows = Some(0);
-        reject(bad);
-        let mut bad = original.clone();
-        bad.materialization_contracts
-            .values_mut()
-            .next()
-            .unwrap()
-            .update = super::super::precompute_contract::PrecomputeUpdate::RawSamples;
+        bad.materializations[0].num_aggregates_to_retain = Some(0);
         reject(bad);
         let mut bad = original.clone();
         bad.summary_catalog
@@ -4298,7 +4276,6 @@ mod tests {
         assert!(original.validate_against_catalog(&corrupt_catalog).is_err());
         let mut legacy = original.clone();
         legacy.summary_catalog = None;
-        legacy.materialization_contracts.clear();
         legacy.validate().unwrap();
         assert!(legacy.validate_against_catalog(catalog).is_err());
     }
@@ -4812,9 +4789,14 @@ mod tests {
             .nodes
             .values()
             .filter_map(|node| match node {
-                crate::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
-                    Some(binding.metric.as_str())
-                }
+                crate::query_plan::QueryPlanNode::ReadMaterialization { binding } => Some(
+                    bundle.summary_catalog.data_descriptors[&bundle
+                        .summary_catalog
+                        .materializations[&binding.materialization]
+                        .data_descriptor_id]
+                        .metric_name
+                        .as_str(),
+                ),
                 _ => None,
             })
             .collect::<BTreeSet<_>>();

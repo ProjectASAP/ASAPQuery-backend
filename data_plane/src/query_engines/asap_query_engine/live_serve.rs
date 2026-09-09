@@ -464,8 +464,6 @@ mod tests {
                     control_plane::query_plan::QueryPlanNode::ReadMaterialization {
                         binding: control_plane::query_plan::MaterializationBinding {
                             materialization: policy.into(),
-                            metric: "bytes".into(),
-                            sid_grouping: vec![],
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 1_000,
                             readout_lookback_ms: Some(1_000),

@@ -665,7 +665,6 @@ async fn main() -> Result<()> {
     // Bootstrap projections share one immutable physical-plan envelope.
     let initial_precompute_plan = control_plane::physical::compiler::PrecomputePlan {
         summary_catalog: None,
-        materialization_contracts: Default::default(),
         envelope: control_plane::physical::compiler::PlanEnvelope {
             plan_id: 0,
             plan_version: 0,

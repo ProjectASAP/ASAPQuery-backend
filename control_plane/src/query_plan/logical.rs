@@ -809,8 +809,6 @@ mod hybrid_tests {
                             if spatial_filter.is_empty() { 7 } else { 8 },
                         )
                         .into(),
-                        metric: "m".into(),
-                        sid_grouping: vec![],
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 300_000,
                         readout_lookback_ms: Some(300_000),

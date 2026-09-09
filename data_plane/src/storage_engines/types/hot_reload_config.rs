@@ -116,10 +116,9 @@ impl ActivePhysicalPlan {
         &self,
     ) -> impl Iterator<Item = asap_types::PolicyFingerprint> + '_ {
         self.precompute_plan
-            .materialization_contracts
-            .keys()
-            .copied()
-            .map(Into::into)
+            .materializations
+            .iter()
+            .map(asap_types::PrecomputeMaterialization::policy_fingerprint)
     }
 }
 
@@ -652,7 +651,6 @@ mod tests {
             summary_catalog: None,
             precompute_plan: control_plane::physical::compiler::PrecomputePlan {
                 summary_catalog: None,
-                materialization_contracts: Default::default(),
                 envelope: envelope.clone(),
                 ingest: control_plane::physical::compiler::IngestContract {
                     protocol:
