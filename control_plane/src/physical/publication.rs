@@ -1,5 +1,4 @@
-//! Canonical publication document. Legacy BackendPlan is not an authority in
-//! this contract; adapters may attach it for old installation endpoints.
+//! Canonical publication document for one catalog generation.
 use super::compiler::{CollectorPlan, PhysicalPlan, PrecomputePlan, TransmissionPlan};
 use super::summary_catalog::SummaryCatalog;
 use crate::query_plan::QueryPlan;
@@ -15,7 +14,7 @@ pub struct PhysicalPlanPublication {
     pub query_plan: QueryPlan,
 }
 impl PhysicalPlanPublication {
-    /// Validate the complete generation without decoding a BackendPlan.
+    /// Validate every plan against the shared catalog snapshot.
     pub fn validate(&self) -> Result<(), String> {
         let catalog = &self.summary_catalog;
         self.precompute_plan

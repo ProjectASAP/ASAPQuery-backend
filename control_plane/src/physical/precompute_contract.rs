@@ -1,5 +1,5 @@
 //! Self-contained precompute execution contracts over a SummaryCatalog snapshot.
-//! BackendPlan remains a compatibility projection, not a validation authority.
+//! The authoritative descriptor definitions live in SummaryCatalog.
 use super::compiler::*;
 use super::summary_catalog::{MaterializationIdentity, SummaryCatalog};
 use asap_types::sds::{MaterializationId, SummaryDescriptor};

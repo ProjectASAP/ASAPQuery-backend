@@ -768,7 +768,7 @@ fn compile_physical_plan_request(
     }
     if request.plan_version == 0
         || request.activation_unix_ms == 0
-        || request.backend_compat != control_plane::backend_plan::BACKEND_COMPAT
+        || request.backend_compat != control_plane::physical::compiler::BACKEND_COMPAT
         || request
             .expiry_unix_ms
             .is_some_and(|expiry| expiry <= request.activation_unix_ms)
@@ -2137,7 +2137,7 @@ mod api_tests {
             "collector_ids": ["test"], "capability_snapshot_id": "test",
             "planner_revision": physical::compiler::PLANNER_REVISION,
             "max_evidence_age_ms": 60000, "plan_version": 1,
-            "activation_unix_ms": now, "backend_compat": control_plane::backend_plan::BACKEND_COMPAT
+            "activation_unix_ms": now, "backend_compat": control_plane::physical::compiler::BACKEND_COMPAT
         }))
         .unwrap();
         let response = handle_workload_cost_manifests(Json(request))

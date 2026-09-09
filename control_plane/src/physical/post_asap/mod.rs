@@ -2,7 +2,7 @@
 //!
 //! ASAPPlanner owns summary selection and the post-ASAP `SummaryNode` tree.
 //! This module adds only backend-specific concerns required to compile that
-//! tree into a [`crate::backend_plan::BackendPlan`]: deployment cost input,
+//! tree into catalog-backed executable plans: deployment cost input,
 //! named sharing/placement wrappers, and runtime family matching. It belongs
 //! under `physical`; it is not another logical or sketch-algebra layer.
 

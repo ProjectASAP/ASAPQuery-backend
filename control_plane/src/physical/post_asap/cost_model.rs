@@ -703,11 +703,11 @@ impl CostModel for ForcedFamilyCostModel {
 ///
 /// **Fallback status (design-backend-plan-wire-format.md §5):**
 /// `post_asap_planner.rs` prefers reading planning's decision directly off an
-/// installed `BackendPlan`'s materializations (no reconstruction needed
+/// installed SummaryCatalog materializations (no reconstruction needed
 /// there — `Materialization.kind`/`.params` already ARE the pair
 /// `observed` needs). This type's caller
 /// (`observed_family_for_metric`, the `SketchStore`-metadata
-/// reconstruction) is the fallback for deploys with no `BackendPlan`
+/// reconstruction) is the fallback for deployments without a catalog snapshot
 /// installed yet, or for metrics a partial/stale plan doesn't cover.
 pub struct ObservedFamilyCostModel {
     inner: ControlPlaneCostModel,
