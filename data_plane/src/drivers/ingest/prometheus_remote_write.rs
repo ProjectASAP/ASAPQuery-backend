@@ -180,8 +180,16 @@ impl PrometheusRemoteWriteReceiver {
         {
             let mut state = self.inner.dedup.lock().map_err(|e| e.to_string())?;
             state.input_closed = true;
+            // No write or retry is admissible after the finite-input barrier,
+            // so retry identities have no remaining correctness role during
+            // the query phase. Release them before waiting for materialization.
+            state.values.clear();
+            state.values.shrink_to_fit();
+            state.expiry_by_event_time.clear();
+            state.max_event_timestamp_ms = None;
         }
         self.inner.ingest.router.drain().await?;
+        trim_process_allocator();
         Ok(())
     }
 
@@ -358,6 +366,22 @@ impl PrometheusRemoteWriteReceiver {
         Ok(())
     }
 }
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_process_allocator() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // The input barrier has drained all worker-owned batches and permanently
+    // rejects future writes, so pages released by the dedup map and ingest
+    // buffers are no longer reachable by application code.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_process_allocator() {}
 
 impl DedupState {
     fn evict_event_times_before(&mut self, cutoff_ms: i64) {
