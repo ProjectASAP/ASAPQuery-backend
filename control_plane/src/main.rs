@@ -829,7 +829,7 @@ fn compile_physical_plan_request(
         query_workload: None,
         queries,
         local_raw_execution: false,
-        index_policy: None,
+        materialization_policy: None,
         evidence: request.evidence,
         planner_revision: request.planner_revision,
         source_sample_interval_ms: None,

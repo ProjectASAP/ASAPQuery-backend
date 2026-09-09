@@ -128,8 +128,8 @@ pub struct LifecyclePlanningInput {
 pub struct PlanningRequest {
     /// Enable installed typed raw residuals for this backend-local candidate.
     pub local_raw_execution: bool,
-    /// Allowed serialized index leaf contracts; None enables every eligible leaf.
-    pub index_policy: Option<BTreeSet<String>>,
+    /// Allowed materialization leaf contracts; None enables every eligible leaf.
+    pub materialization_policy: Option<BTreeSet<String>>,
     /// Original dashboard demand, in the same order as queries. None is legacy input.
     pub query_workload: Option<QueryWorkload>,
     pub queries: Vec<PlanningQuery>,
@@ -1709,7 +1709,7 @@ impl BackendLocalPlanningSnapshot {
         Ok((
             PlanningRequest {
                 local_raw_execution: true,
-                index_policy: None,
+                materialization_policy: None,
                 query_workload: Some(workload),
                 queries,
                 evidence: topk_evidence_by_id,
@@ -1915,22 +1915,22 @@ impl PhysicalCompiler {
                                 planner_types::post_asap::ExactKind::MinMax,
                                 _
                             )
-                        ) || crate::query_plan::logical::selected_range_max_index(
+                        ) || crate::query_plan::logical::selected_range_max_materialization(
                             &query.query_string,
                             &state.node,
                         )
                         .ok()
                         .flatten()
                         .is_some())
-                        && request.index_policy.as_ref().is_none_or(|policy| {
-                            let operator = crate::query_plan::logical::selected_counter_index(
+                        && request.materialization_policy.as_ref().is_none_or(|policy| {
+                            let operator = crate::query_plan::logical::selected_counter_materialization(
                                 &query.query_string,
                                 &state.node,
                             )
                             .ok()
                             .flatten()
                             .or_else(|| {
-                                crate::query_plan::logical::selected_range_max_index(
+                                crate::query_plan::logical::selected_range_max_materialization(
                                     &query.query_string,
                                     &state.node,
                                 )
@@ -1939,7 +1939,7 @@ impl PhysicalCompiler {
                             });
                             operator
                                 .and_then(|operator| {
-                                    crate::query_plan::logical::index_key(&operator).ok()
+                                    crate::query_plan::logical::materialization_key(&operator).ok()
                                 })
                                 .is_some_and(|key| policy.contains(&key))
                         })
@@ -2184,7 +2184,7 @@ impl PhysicalCompiler {
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             stable_workload_plan_id(&plan_materializations, &request.queries).hash(&mut hash);
             "typed-local-residual-v3-counter-index".hash(&mut hash);
-            request.index_policy.hash(&mut hash);
+            request.materialization_policy.hash(&mut hash);
             for query in &request.queries {
                 format!("{:?}", query.post_asap).hash(&mut hash);
             }
@@ -2372,7 +2372,10 @@ impl PhysicalCompiler {
                 // Any Planner-selected leaf without a physical summary binding
                 // is an exact subtree boundary. Deployed plans never retain a
                 // backend-local range index leaf.
-                crate::query_plan::logical::apply_index_policy(&mut entry, Some(&BTreeSet::new()))?;
+                crate::query_plan::logical::apply_materialization_policy(
+                    &mut entry,
+                    Some(&BTreeSet::new()),
+                )?;
             }
             if query_entries.insert(canonical.clone(), entry).is_some() {
                 return Err(CompileError::Query {
@@ -3483,7 +3486,7 @@ mod tests {
         }
         Ok(PlanningRequest {
             local_raw_execution: false,
-            index_policy: None,
+            materialization_policy: None,
             query_workload: None,
             queries: vec![PlanningQuery {
                 query_id: query_id.into(),

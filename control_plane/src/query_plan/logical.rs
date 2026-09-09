@@ -885,7 +885,7 @@ mod planner_workload_tests {
 
 /// Preserve the exact original operator direction because MinMax family alone
 /// does not distinguish min from max. The full Planner-node witness is required.
-pub(crate) fn selected_range_max_index(
+pub(crate) fn selected_range_max_materialization(
     original: &str,
     node: &planner_types::post_asap::SummaryNode,
 ) -> Result<Option<LogicalOperator>, QueryPlanError> {
@@ -963,7 +963,9 @@ mod range_max_index_tests {
             )
             .unwrap();
             let selected = crate::planner_selection::select_summary_default(&original).unwrap();
-            let index = selected_range_max_index(query, &selected).unwrap().unwrap();
+            let index = selected_range_max_materialization(query, &selected)
+                .unwrap()
+                .unwrap();
             assert!(
                 matches!(index, LogicalOperator::ReadRangeMaxIndex { metric: ref actual, range_ms: actual_range, .. } if actual == metric && actual_range == range_ms)
             );
@@ -985,7 +987,7 @@ mod range_max_index_tests {
             .unwrap();
             let selected = crate::planner_selection::select_summary_default(&original).unwrap();
             assert!(
-                selected_range_max_index(query, &selected)
+                selected_range_max_materialization(query, &selected)
                     .unwrap()
                     .is_none(),
                 "{query}"
@@ -995,10 +997,10 @@ mod range_max_index_tests {
 }
 
 /// Stable contract identity used by priced physical alternatives, independent of node IDs.
-pub fn index_key(operator: &LogicalOperator) -> Result<String, QueryPlanError> {
+pub fn materialization_key(operator: &LogicalOperator) -> Result<String, QueryPlanError> {
     let mut value = serde_json::to_value(operator).map_err(|e| invalid(e.to_string()))?;
     if let Some(object) = value.as_object_mut() {
-        // Retention is a consumer lifetime requirement, not the index read's
+        // Retention is a consumer lifetime requirement, not the materialization read's
         // semantics. Equivalent matcher conjunctions must share policy keys.
         object.remove("retention_ms");
         if let Some(matchers) = object.get_mut("matchers").and_then(|v| v.as_array_mut()) {
@@ -1049,7 +1051,7 @@ fn counter_contract(
     })
 }
 
-pub(crate) fn selected_counter_index(
+pub(crate) fn selected_counter_materialization(
     original: &str,
     node: &planner_types::post_asap::SummaryNode,
 ) -> Result<Option<LogicalOperator>, QueryPlanError> {
@@ -1105,14 +1107,14 @@ pub(super) fn promote_counter_indexes(entry: &mut QueryPlanEntry) -> Result<(), 
         .map_err(|e| invalid(e.to_string()))?;
         let selected = crate::planner_selection::select_summary_default(&parsed)
             .map_err(|e| invalid(e.to_string()))?;
-        if let Some(operator) = selected_counter_index(&call, &selected)? {
-            proven.insert(index_key(&operator)?);
+        if let Some(operator) = selected_counter_materialization(&call, &selected)? {
+            proven.insert(materialization_key(&operator)?);
         }
     }
     let mut changes = Vec::new();
     for id in entry.nodes.keys() {
         if let Some(operator) = counter_contract(*id, &entry.nodes) {
-            if proven.contains(&index_key(&operator)?) {
+            if proven.contains(&materialization_key(&operator)?) {
                 changes.push((*id, operator));
             }
         }
@@ -1143,8 +1145,8 @@ fn prune(entry: &mut QueryPlanEntry) {
     entry.nodes.retain(|id, _| seen.contains(id));
 }
 
-/// Disabling one index leaf restores its exact raw operator, not the whole query.
-pub fn apply_index_policy(
+/// Disabling one materialization leaf restores its Prometheus exact subtree, not the whole query.
+pub fn apply_materialization_policy(
     entry: &mut QueryPlanEntry,
     policy: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<(), QueryPlanError> {
@@ -1154,7 +1156,7 @@ pub fn apply_index_policy(
                 continue;
             };
             if let Some(query) = operator.exact_promql()? {
-                if !policy.contains(&index_key(operator)?) {
+                if !policy.contains(&materialization_key(operator)?) {
                     *operator = LogicalOperator::ExactSubquery { query };
                     inputs.clear();
                 }
@@ -1166,7 +1168,7 @@ pub fn apply_index_policy(
     Ok(())
 }
 
-pub fn index_candidate_keys(
+pub fn materialization_candidate_keys(
     original: &str,
     selected: &std::rc::Rc<planner_types::post_asap::SummaryNode>,
 ) -> Result<std::collections::BTreeSet<String>, QueryPlanError> {
@@ -1176,10 +1178,10 @@ pub fn index_candidate_keys(
         node: &std::rc::Rc<planner_types::post_asap::SummaryNode>,
         keys: &mut std::collections::BTreeSet<String>,
     ) -> Result<(), QueryPlanError> {
-        if let Some(operator) =
-            selected_counter_index(original, node)?.or(selected_range_max_index(original, node)?)
+        if let Some(operator) = selected_counter_materialization(original, node)?
+            .or(selected_range_max_materialization(original, node)?)
         {
-            keys.insert(index_key(&operator)?);
+            keys.insert(materialization_key(&operator)?);
         }
         match &node.expr {
             SummaryExpr::BinaryOp { lhs, rhs, .. } => {
@@ -1500,7 +1502,10 @@ mod remote_boundary_regressions {
             operation: TemporalOperation::Rate,
             retention_ms: 3_600_000,
         };
-        assert_eq!(index_key(&a).unwrap(), index_key(&b).unwrap());
+        assert_eq!(
+            materialization_key(&a).unwrap(),
+            materialization_key(&b).unwrap()
+        );
     }
     // Both policies retain the original ratio but delegate only the disabled operand to Prometheus.
     #[test]
@@ -1512,7 +1517,7 @@ mod remote_boundary_regressions {
         )
         .unwrap();
         let selected = crate::planner_selection::select_summary_default(&parsed).unwrap();
-        let keys = index_candidate_keys(query, &selected).unwrap();
+        let keys = materialization_candidate_keys(query, &selected).unwrap();
         assert_eq!(keys.len(), 2);
         for key in keys {
             let mut entry = QueryPlanEntry::compile_bound_composable(
@@ -1528,7 +1533,7 @@ mod remote_boundary_regressions {
                 |_, _| Err(invalid("no pooled producer")),
             )
             .unwrap();
-            apply_index_policy(&mut entry, Some(&[key].into_iter().collect())).unwrap();
+            apply_materialization_policy(&mut entry, Some(&[key].into_iter().collect())).unwrap();
             let count = |predicate: fn(&LogicalOperator) -> bool| {
                 entry.nodes.values().filter(|node| matches!(node, QueryPlanNode::Logical { operator, .. } if predicate(operator))).count()
             };

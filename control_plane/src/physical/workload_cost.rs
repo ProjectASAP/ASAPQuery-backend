@@ -4,7 +4,7 @@
 //! second semantic DAG. Planner supplies legal alternatives; deployment quotes
 //! price every reachable operation, and the backend commits one complete plan.
 
-mod index_candidates;
+mod materialization_candidates;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -73,7 +73,7 @@ pub struct AlternativeCost {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct IndexSearchCoverage {
+pub struct MaterializationSearchCoverage {
     pub eligible_leaves: usize,
     pub enumerated_local_masks: usize,
     pub exhaustive: bool,
@@ -82,8 +82,8 @@ pub struct IndexSearchCoverage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkloadCostComparison {
-    #[serde(default)]
-    pub index_search_coverage: Option<IndexSearchCoverage>,
+    #[serde(default, alias = "index_search_coverage")]
+    pub materialization_search_coverage: Option<MaterializationSearchCoverage>,
     pub data_snapshot_id: String,
     pub model_version: String,
     pub selected_plan_id: u64,
@@ -464,14 +464,14 @@ pub fn select(
     let policies: BTreeSet<_> = candidates
         .iter()
         .filter(|c| c.local_raw_execution)
-        .filter_map(|c| c.index_policy.clone())
+        .filter_map(|c| c.materialization_policy.clone())
         .collect();
     let leaves: BTreeSet<_> = policies.iter().flat_map(|p| p.iter().cloned()).collect();
-    let index_search_coverage = (!policies.is_empty()).then(|| IndexSearchCoverage {
+    let materialization_search_coverage = (!policies.is_empty()).then(|| MaterializationSearchCoverage {
         eligible_leaves: leaves.len(),
         enumerated_local_masks: policies.len(),
         exhaustive: leaves.len() < usize::BITS as usize && policies.len() == (1usize << leaves.len()),
-        scope: "Physical index versus Prometheus exact-subquery implementation masks over Planner-authorized leaves; native alternative separate; bounded inventory does not claim an unenumerated optimum".into(),
+        scope: "Backend materialization versus Prometheus exact-subquery masks over Planner-authorized leaves; native alternative separate; bounded inventory does not claim an unenumerated optimum".into(),
     });
     let mut comparison_workload = None;
     let mut alternatives = Vec::new();
@@ -536,7 +536,7 @@ pub fn select(
     let (_, mut plan, selected_manifest, component_costs) =
         best.ok_or_else(|| invalid("no feasible completely costed alternative"))?;
     plan.cost_comparison = Some(WorkloadCostComparison {
-        index_search_coverage,
+        materialization_search_coverage,
         data_snapshot_id: evidence.data_snapshot_id.clone(),
         model_version: evidence.model_version.clone(),
         selected_plan_id: plan.envelope.plan_id,
@@ -554,7 +554,7 @@ pub fn with_exact_alternative(
 ) -> Result<Vec<PlanningRequest>, CompileError> {
     let mut exact = request.clone();
     exact.local_raw_execution = false;
-    exact.index_policy = None;
+    exact.materialization_policy = None;
     for query in &mut exact.queries {
         let parsed = crate::query_parser::parse_query_expr_canonical(
             &query.query_string,
@@ -573,12 +573,12 @@ pub fn with_exact_alternative(
     {
         Ok(vec![request])
     } else {
-        if !request.local_raw_execution || request.index_policy.is_some() {
+        if !request.local_raw_execution || request.materialization_policy.is_some() {
             return Ok(vec![request, exact]);
         }
         let mut keys = BTreeSet::new();
         for query in &request.queries {
-            match crate::query_plan::logical::index_candidate_keys(
+            match crate::query_plan::logical::materialization_candidate_keys(
                 &query.query_string,
                 &query.post_asap,
             ) {
@@ -591,14 +591,14 @@ pub fn with_exact_alternative(
         if keys.is_empty() {
             return Ok(vec![request, exact]);
         }
-        let inventory = index_candidates::enumerate(keys);
+        let inventory = materialization_candidates::enumerate(keys);
         debug_assert_eq!(inventory.exhaustive, inventory.eligible_leaves <= 4);
         let mut alternatives: Vec<_> = inventory
             .masks
             .into_iter()
             .map(|mask| {
                 let mut candidate = request.clone();
-                candidate.index_policy = Some(mask);
+                candidate.materialization_policy = Some(mask);
                 candidate
             })
             .collect();
@@ -672,7 +672,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_index_masks_price_index_state_and_prometheus_subquery_sources() {
+    fn mixed_materialization_masks_price_state_and_prometheus_subquery_sources() {
         let mut snapshot = fixture();
         let q = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
         q.query =
@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(candidates.len(), 5, "four legal masks plus native");
         let mut identities = BTreeSet::new();
         for candidate in &candidates[..4] {
-            let enabled = candidate.index_policy.as_ref().unwrap().len();
+            let enabled = candidate.materialization_policy.as_ref().unwrap().len();
             let plan = PhysicalCompiler
                 .compile(candidate.clone(), environment.clone())
                 .unwrap();

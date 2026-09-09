@@ -99,13 +99,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enumerate()
     {
         let queries = candidate.queries.clone();
-        let index_policy = candidate.index_policy.clone();
+        let materialization_policy = candidate.materialization_policy.clone();
         let planner_selected_queries = planner_forest(&queries);
         let plan = match PhysicalCompiler.compile(candidate, environment.clone()) {
             Ok(plan) => plan,
             Err(error) => {
                 results.push(
-                    json!({"candidate_index": index, "index_policy": index_policy, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
+                    json!({"candidate_index": index, "materialization_policy": materialization_policy, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
                 );
                 continue;
             }
@@ -114,14 +114,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(manifest) => manifest,
             Err(error) => {
                 results.push(
-                    json!({"candidate_index": index, "index_policy": index_policy, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
+                    json!({"candidate_index": index, "materialization_policy": materialization_policy, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
                 );
                 continue;
             }
         };
         results.push(json!({
             "candidate_index": index,
-            "index_policy": index_policy,
+            "materialization_policy": materialization_policy,
             "planner_selected_queries": planner_selected_queries,
             "manifest": manifest,
             "lifecycle_estimates": plan.lifecycle_estimates,

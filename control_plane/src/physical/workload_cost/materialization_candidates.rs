@@ -3,17 +3,17 @@
 use std::collections::BTreeSet;
 
 #[derive(Debug)]
-pub(super) struct IndexMasks {
+pub(super) struct MaterializationMasks {
     pub masks: Vec<BTreeSet<String>>,
     pub exhaustive: bool,
     pub eligible_leaves: usize,
 }
 
-/// Enumerate every mask for up to four leaves. Larger forests retain all-index,
-/// all-raw, then singleton/complement pairs in stable key order. The caller must
+/// Enumerate every mask for up to four leaves. Larger forests retain all-materialized,
+/// all-exact, then singleton/complement pairs in stable key order. The caller must
 /// disclose bounded coverage; no unenumerated optimum is claimed. Reserve one
 /// of the selector's 64 candidate slots for native execution.
-pub(super) fn enumerate(keys: BTreeSet<String>) -> IndexMasks {
+pub(super) fn enumerate(keys: BTreeSet<String>) -> MaterializationMasks {
     let eligible_leaves = keys.len();
     let ordered: Vec<_> = keys.iter().cloned().collect();
     let exhaustive = eligible_leaves <= 4;
@@ -46,7 +46,7 @@ pub(super) fn enumerate(keys: BTreeSet<String>) -> IndexMasks {
             }
         }
     }
-    IndexMasks {
+    MaterializationMasks {
         masks,
         exhaustive,
         eligible_leaves,
@@ -77,7 +77,7 @@ mod tests {
         assert_eq!(result.masks.iter().collect::<BTreeSet<_>>().len(), 63);
     }
     #[test]
-    fn no_index_has_one_local_implementation() {
+    fn no_materialization_has_one_exact_implementation() {
         assert_eq!(enumerate(BTreeSet::new()).masks, vec![BTreeSet::new()]);
     }
 }
