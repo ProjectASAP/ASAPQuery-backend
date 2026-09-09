@@ -69,7 +69,7 @@ query language/expression, logical evaluation range, requested accuracy,
 result labels/timestamps/type, source, guarantee, and coverage.
 
 Why these interfaces exist: transport/protocol extensions cannot bypass
-BackendPlan routing or directly access summary storage, and fallback backends
+catalog-backed QueryPlan routing or directly access summary storage, and fallback backends
 cannot silently reinterpret a request.
 
 ## 3. Adding and verifying functionality

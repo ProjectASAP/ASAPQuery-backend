@@ -25,7 +25,7 @@ change process environment or still use fixed loopback ports. It covers:
    durably writes its TSDB block, and returns the exact chunk over Thanos
    StoreAPI, plus its compaction, recovery, and shipping suites; and
 6. the final production-process path: typed physical-plan compilation,
-   BackendPlan/precompute installation, collector capability and applied ACK
+   catalog and execution-plan installation, collector capability and applied ACK
    over OpAMP, modified-OTLP ingest, SketchStore policy routing, and PromQL
    query readout of that same plan.
 

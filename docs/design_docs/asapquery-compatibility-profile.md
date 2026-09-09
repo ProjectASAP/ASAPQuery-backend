@@ -98,15 +98,15 @@ configured QueryWorkload + DataWorkload
       backend-only physical compiler
         │          │          │
         ▼          ▼          ▼
- PrecomputePlan BackendPlan QueryPlan DAG
+ PrecomputePlan SummaryCatalog QueryPlan DAG
         │          │          │
         ▼          ▼          ▼
    precompute    catalog   SID-bound executor
 ```
 
 The plan has no collector projection. One compile produces an atomic
-`PhysicalPlan` containing sibling backend-local `PrecomputePlan`, `BackendPlan`,
-and `QueryPlan` sections from the same selected Post-ASAP candidate.
+`PhysicalPlan` containing one `SummaryCatalog` plus sibling backend-local
+`PrecomputePlan` and `QueryPlan` sections from the same selected Post-ASAP candidate.
 `PrecomputePlan` directly is the runtime precompute contract; there is no second
 streaming-config semantic model or lossy conversion step. All sections share
 plan and materialization identities.
@@ -139,8 +139,8 @@ For the first MVP, operators provide immutable `QueryWorkload` and
    `DataWorkload`;
 3. enumerates only backend-local implementations for Planner candidates;
 4. returns implementation-cost evidence needed for selection;
-5. compiles the selected candidate into matching PrecomputePlan, BackendPlan,
-   and QueryPlan views; and
+5. compiles the selected candidate into a matching SummaryCatalog, PrecomputePlan,
+   and QueryPlan; and
 6. stages and atomically activates those views.
 
 It does not enumerate SDK or Collector placements in this profile. A Planner
@@ -247,7 +247,7 @@ require byte-for-byte reproduction of the incoming HTTP request. Routing has two
 successful outcomes:
 
 1. execute the active QueryPlan DAG, whose materialization bindings were
-   resolved from BackendPlan, when compatible summary state has
+   resolved through SummaryCatalog, when compatible summary state has
    complete and fresh coverage; or
 2. forward a semantically equivalent request to the configured Prometheus
    endpoint.
@@ -274,7 +274,7 @@ start backend
   -> verify Prometheus fallback health
   -> load configured QueryWorkload and DataWorkload snapshots
   -> run Planner candidate search and selection
-  -> compile one PhysicalPlan (PrecomputePlan + BackendPlan + QueryPlan)
+  -> compile one PhysicalPlan (SummaryCatalog + PrecomputePlan + QueryPlan)
   -> atomically install precompute + catalog + inactive routes under one version
   -> accept Remote Write and forward every query to Prometheus
   -> enter Materializing state
@@ -299,7 +299,7 @@ same atomic cutover and warmup rules.
 | --- | --- | --- |
 | Ingest source | Prometheus Remote Write raw samples | Collector materializations over modified OTLP and other explicit profiles |
 | Summary construction | Backend-local only | Collector or backend placement |
-| Physical outputs | PrecomputePlan + BackendPlan + QueryPlan | CollectorPlan/PrecomputePlan/TransmissionPlan/BackendPlan/QueryPlan views as applicable |
+| Physical outputs | SummaryCatalog + PrecomputePlan + QueryPlan | SummaryCatalog/CollectorPlan/PrecomputePlan/TransmissionPlan/QueryPlan views as applicable |
 | Query protocol | Prometheus HTTP / PromQL | Additional protocols may be supported |
 | Exact fallback | Upstream Prometheus | Prometheus or another compiled storage/query route |
 | Storage required for MVP | In-process warm summary state | Warm, durable, archive, and remote tiers |
@@ -319,7 +319,7 @@ stronger activation and retry contracts.
 | Area | Implemented contract | Executable evidence |
 | --- | --- | --- |
 | Startup/profile | Collector-free startup, excluded-component validation, fallback health gate | `data_plane` profile tests and production-process E2E |
-| Physical planning | Canonical workload snapshot to one atomic PrecomputePlan/BackendPlan/QueryPlan bundle | `compatibility_demo_snapshot_compiles_the_complete_query_matrix` |
+| Physical planning | Canonical workload snapshot to one atomic SummaryCatalog/PrecomputePlan/QueryPlan bundle | `compatibility_demo_snapshot_compiles_the_complete_query_matrix` |
 | Remote Write | Strict v1 decoding, stale handling, limits, retry-safe deduplication and backpressure | receiver unit tests plus process E2E replay/corrupt-batch assertions |
 | Precompute/store | Raw samples use the planned family; first catch-up batches close all complete windows; sketch and exact payloads share canonical SID semantics | worker/store tests and four-family process matrix |
 | Query execution | QueryPlan-only serving-time lookup, node-level materialization binding, generic DAG traversal, exact fallback | instant/range process matrix and fallback request capture |
@@ -354,11 +354,11 @@ overloaded requests cannot leave untracked mutations while returning success.
 
 Load the configured query and data workload snapshots, call the pinned
 ASAPPlanner, enumerate backend-local implementations, and compile one atomic
-PhysicalPlan with PrecomputePlan, BackendPlan, and QueryPlan. Do not create or
+PhysicalPlan with SummaryCatalog, PrecomputePlan, and QueryPlan. Do not create or
 wait for CollectorPlan.
 
 Acceptance: captured Planner input, selected Post-ASAP candidate,
-PrecomputePlan, BackendPlan, and QueryPlan are deterministic golden artifacts
+SummaryCatalog, PrecomputePlan, and QueryPlan are deterministic golden artifacts
 with matching plan/materialization/window/family/parameter identities.
 
 ### Phase D: atomic activation and warmup
@@ -422,7 +422,7 @@ only proves that the endpoint returns HTTP success does not satisfy this matrix.
 
 The first query extension should be a SQL endpoint because ASAPQuery exposed SQL
 as an additional query surface. It must translate SQL into canonical Planner
-query semantics and reuse the same BackendPlan readiness, summary store, and
+query semantics and reuse the same catalog-backed QueryPlan readiness, summary store, and
 exact-fallback rules; it must not introduce a second planner or separately
 configured materializations. Its supported SQL subset and fallback target need
 their own versioned compatibility contract and conformance cases.

@@ -1,7 +1,7 @@
 # Developing OTLP summary ingestion
 
 > Interface status: target public API. OTLP decoding, SID resolution, and
-> summary handling exist; complete BackendPlan-gated validation is partial.
+> summary handling exist; complete catalog and execution-plan validation is partial.
 
 ## 1. Code architecture
 
@@ -87,7 +87,9 @@ pub trait SummaryValidator {
     fn validate(
         &self,
         received: ReceivedSummary,
-        plan: &BackendPlanSnapshot,
+        catalog: &SummaryCatalog,
+        precompute: &PrecomputePlan,
+        transmission: &TransmissionPlan,
         series: ResolvedSeries,
     ) -> Result<ValidatedSummary, Self::Error>;
 }
@@ -148,7 +150,8 @@ queryable state, and `IngestResult` gives the MVP harness unambiguous evidence.
 
 1. Extend public `SummaryEnvelope` encoding/version definitions.
 2. Implement `SummaryDecoder` without applying state.
-3. Add compatibility validation against BackendPlan/capabilities.
+3. Add compatibility validation against SummaryCatalog, PrecomputePlan,
+   TransmissionPlan, and producer capabilities.
 4. Implement full/delta application through `SummaryStateApplier`.
 5. Verify corrupt bytes return an error and do not change storage.
 

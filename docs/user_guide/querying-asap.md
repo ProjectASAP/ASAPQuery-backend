@@ -41,7 +41,7 @@ sum by (region) (rate(http_requests_total[5m]))
 
 These examples do not promise that every deployment accelerates each query.
 The submitted workload, selected Planner result, available summaries, and
-active BackendPlan determine the route.
+active SummaryCatalog and QueryPlan together determine the route.
 
 ## Accuracy
 

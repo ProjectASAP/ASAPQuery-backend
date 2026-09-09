@@ -85,7 +85,7 @@ or exact fallback are available.
 | Build cannot resolve a path dependency | Verify the three sibling repository names and locations |
 | Data plane exits immediately | Supply `--streaming-config` and check YAML errors and port conflicts |
 | OTLP connection is refused | Start with `--enable-otel-ingest` and verify ports 4317/4318 |
-| Query returns no compatible summary | Inspect streaming config, BackendPlan, storage routing, metric labels, and window |
+| Query returns no compatible summary | Inspect the SummaryCatalog, PrecomputePlan, QueryPlan, storage routing, metric labels, and window |
 | Unsupported query fails | Configure an exact backend or use a supported planned query |
 | Result comes from an unexpected tier | Inspect `infos` provenance and the installed storage routing table |
 | Results are stale | Check collector export, OTLP ingest, active-window state, and source timestamps |

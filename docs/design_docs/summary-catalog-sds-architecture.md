@@ -125,8 +125,13 @@ or create persistent desired state by itself.
              pane instances, completeness and lineage
 ```
 
-All four execution plans reference catalog IDs instead of copying operator,
-source, filter, grouping, fidelity, or state-schema definitions.
+All four execution plans carry catalog references and use catalog materialization
+IDs for cross-plan identity. During the compatibility migration, producer and
+precompute DTOs still repeat fields needed by existing runtimes, including
+operator parameters, source/filter/grouping, window, and state schema. Install
+validation requires those fields to agree exactly with the catalog; they are not
+independent semantic definitions. New interfaces should resolve them from the
+catalog, allowing the copied fields to be removed as consumers migrate.
 
 | Component | Responsibility |
 | --- | --- |
@@ -184,10 +189,11 @@ An ingest record is never an SDS instance. Raw samples can be transient inputs t
 the precompute engine, but the backend does not retain them as a second exact
 query store. Exact residual subtrees run in Prometheus.
 
-The target model requires these invariants. The current implementation enforces
-descriptor binding and non-overlapping pane selection; the remaining structured
-schema and instance contracts must be completed before claiming full SDS
-conformance:
+The SDS metadata and inventory types represent the following invariants. The
+current runtime enforces descriptor binding and non-overlapping pane selection.
+Full runtime conformance still requires applying and durably persisting every
+reconciliation action, including recovery, promotion, lease expiry, retirement,
+and garbage collection:
 
 1. An instance references exactly one immutable Summary Descriptor and one
    immutable Data Descriptor.

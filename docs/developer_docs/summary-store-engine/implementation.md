@@ -132,7 +132,8 @@ pub trait SummaryStore: Send + Sync {
 }
 
 pub struct CoverageRequest {
-    pub plan: BackendPlanSnapshot,
+    pub catalog: SummaryCatalog,
+    pub query_plan: QueryPlan,
     pub materialization_ids: Vec<String>,
     pub range: EvaluationRange,
 }
