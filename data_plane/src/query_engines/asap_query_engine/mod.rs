@@ -29,5 +29,3 @@ pub mod tests;
 pub use engine::ASAPQueryEngine;
 
 pub(crate) mod range_max_index;
-
-pub(crate) mod range_counter_index;

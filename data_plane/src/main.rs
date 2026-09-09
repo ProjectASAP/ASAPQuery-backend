@@ -740,7 +740,6 @@ async fn main() -> Result<()> {
     // (PR E phase 2). Without sharing the handle, ASAPQueryEngine
     // would take a one-time snapshot at construction and ignore
     // subsequent swaps.
-    let index_store = Arc::new(data_plane::query_engines::index_store::IndexStore::default());
     let engine = {
         let mut engine = ASAPQueryEngine::new_with_hot_reload(
             hot_reload_config.clone(),
@@ -753,7 +752,6 @@ async fn main() -> Result<()> {
         // / ghost / unknown.
         .with_sketch_index(sketch_index.clone())
         .with_active_physical_plan(active_physical_plan.clone())
-        .with_index_store(index_store.clone())
         .with_exact_subquery_endpoint(args.prometheus_server.clone());
         if let Some(control_plane_endpoint) = args.control_plane_endpoint.as_ref() {
             info!(
@@ -1048,7 +1046,7 @@ async fn main() -> Result<()> {
     }
 
     if args.enable_remote_write || args.profile == RuntimeProfile::Asapquery {
-        let receiver = PrometheusRemoteWriteReceiver::new_with_index_store(
+        let receiver = PrometheusRemoteWriteReceiver::new(
             PrometheusRemoteWriteConfig {
                 max_compressed_bytes: args.remote_write_max_compressed_bytes,
                 max_decompressed_bytes: args.remote_write_max_decompressed_bytes,
@@ -1060,7 +1058,6 @@ async fn main() -> Result<()> {
             precompute_ingest_state
                 .clone()
                 .expect("precompute ingest state is always constructed"),
-            index_store.clone(),
         );
         info!("Prometheus Remote Write v1 enabled at POST /api/v1/write");
         server = server.with_remote_write(receiver);

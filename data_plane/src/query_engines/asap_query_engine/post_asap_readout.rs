@@ -110,15 +110,14 @@ pub fn execute_query_plan_instant(
     } else {
         now_ms.saturating_sub(entry.instant.lookback_ms)
     };
-    for binding in entry.materialization_bindings() {
-        if binding.window_ms == 0
-            || t0_ms % binding.window_ms != 0
-            || now_ms % binding.window_ms != 0
-        {
-            return Err(LoweringSkip::MaterializationNotReady(
-                "evaluation interval cuts a materialized pane".into(),
-            ));
-        }
+    if entry
+        .materialization_bindings()
+        .iter()
+        .any(|binding| binding.window_ms == 0)
+    {
+        return Err(LoweringSkip::MaterializationNotReady(
+            "materialized pane width is zero".into(),
+        ));
     }
     let outcome = execute_physical_query_plan(
         index,
@@ -983,7 +982,7 @@ mod tests {
         }
         assert!(
             execute_query_plan_instant(&idx, &entry, 70_001).is_err(),
-            "partial pane must fall back"
+            "partial additive pane must fall back"
         );
         assert!(
             execute_query_plan_instant(&idx, &entry, 90_000).is_err(),

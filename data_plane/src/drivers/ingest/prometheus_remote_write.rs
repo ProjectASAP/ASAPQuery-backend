@@ -96,7 +96,6 @@ struct ReceiverInner {
     ingest: Arc<IngestState>,
     dedup: Mutex<DedupState>,
     stats: Arc<RemoteWriteStats>,
-    index_store: Arc<crate::query_engines::index_store::IndexStore>,
 }
 
 #[derive(Default)]
@@ -157,27 +156,14 @@ pub struct CanonicalSample {
 
 impl PrometheusRemoteWriteReceiver {
     pub fn new(config: PrometheusRemoteWriteConfig, ingest: Arc<IngestState>) -> Self {
-        Self::new_with_index_store(config, ingest, Arc::new(Default::default()))
-    }
-
-    pub fn new_with_index_store(
-        config: PrometheusRemoteWriteConfig,
-        ingest: Arc<IngestState>,
-        index_store: Arc<crate::query_engines::index_store::IndexStore>,
-    ) -> Self {
         Self {
             inner: Arc::new(ReceiverInner {
                 config,
                 ingest,
                 dedup: Mutex::new(DedupState::default()),
                 stats: Arc::new(RemoteWriteStats::default()),
-                index_store,
             }),
         }
-    }
-
-    pub fn index_store(&self) -> Arc<crate::query_engines::index_store::IndexStore> {
-        self.inner.index_store.clone()
     }
 
     pub fn config(&self) -> &PrometheusRemoteWriteConfig {
@@ -195,24 +181,6 @@ impl PrometheusRemoteWriteReceiver {
             state.input_closed = true;
         }
         self.inner.ingest.router.drain().await?;
-        // Finite-input preparation includes the residual index, so its build
-        // cost is not silently amortized into the first query's read cost.
-        if self.inner.index_store.sample_count() > 0 {
-            let plan = self
-                .inner
-                .ingest
-                .physical_plan_snapshot()
-                .ok_or_else(|| "active plan disappeared during input drain".to_string())?;
-            let prepared = self
-                .inner
-                .index_store
-                .snapshot(
-                    plan.precompute_plan.envelope.plan_id,
-                    plan.precompute_plan.envelope.plan_version,
-                )
-                .map_err(|error| error.to_string())?;
-            prepared.prepare();
-        }
         Ok(())
     }
 
@@ -327,49 +295,6 @@ impl PrometheusRemoteWriteReceiver {
             .ingest
             .router
             .try_route_group_batch_atomic(messages)?;
-
-        let mut specs = std::collections::BTreeMap::<
-            String,
-            crate::query_engines::index_store::IndexSpec,
-        >::new();
-        for node in physical_plan
-            .query_plan
-            .entries
-            .values()
-            .flat_map(|entry| entry.nodes.values())
-        {
-            if let control_plane::query_plan::QueryPlanNode::Logical { operator, .. } = node {
-                use control_plane::query_plan::logical::LogicalOperator;
-                let (metric, retention_ms, counter, matchers) = match operator {
-                    LogicalOperator::ReadRangeCounterIndex {
-                        metric,
-                        retention_ms,
-                        matchers,
-                        ..
-                    } => (metric, *retention_ms, true, matchers),
-                    LogicalOperator::ReadRangeMaxIndex {
-                        metric,
-                        retention_ms,
-                        matchers,
-                        ..
-                    } => (metric, *retention_ms, false, matchers),
-                    _ => continue,
-                };
-                let spec = specs.entry(metric.clone()).or_default();
-                spec.retention_ms = spec.retention_ms.max(retention_ms);
-                spec.counter |= counter;
-                spec.max |= !counter;
-                if !spec.populations.contains(matchers) {
-                    spec.populations.push(matchers.clone());
-                }
-            }
-        }
-        self.inner.index_store.append_admitted(
-            plan_identity.0,
-            plan_identity.1,
-            &new_samples,
-            &specs,
-        );
 
         for ((plan_id, plan_version, series, timestamp), value) in batch_values {
             dedup
@@ -526,31 +451,71 @@ fn route_messages(
         &snapshot,
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     );
+    let configs = snapshot
+        .get_all_aggregation_configs()
+        .values()
+        .filter_map(|config| {
+            compile_spatial_filter(&config.spatial_filter_normalized)
+                .ok()
+                .map(|filter| (config, filter))
+        })
+        .collect::<Vec<_>>();
     let mut buckets: HashMap<u64, (Bucket, Vec<RoutedSample>)> = HashMap::new();
     for sample in samples {
         let Some(value) = sample.value else {
             // Staleness is a lifecycle signal, never an accumulator input.
             continue;
         };
-        for config in snapshot.get_all_aggregation_configs().values() {
-            if config.metric != sample.metric
-                && config.spatial_filter_normalized != sample.metric
-                && config.spatial_filter != sample.metric
-            {
+        for (config, filter) in &configs {
+            if config.metric != sample.metric || !filter.matches(&sample.labels) {
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&sample.series_key, config);
-            let grouping_pairs: Vec<(&str, &str)> = config
-                .grouping_labels
-                .labels
-                .iter()
-                .map(|name| {
-                    (
-                        name.as_str(),
-                        sample.labels.get(name).map(String::as_str).unwrap_or(""),
-                    )
-                })
-                .collect();
+            // Reset-aware counters and temporal min/max must keep one
+            // accumulator per source series. Their emitted label values still
+            // follow the physical grouping, so query-time Reduce nodes can
+            // combine those independent SDS instances safely.
+            let series_scoped = matches!(
+                config.aggregation_type,
+                asap_types::AggregationType::Increase
+                    | asap_types::AggregationType::MultipleIncrease
+                    | asap_types::AggregationType::MinMax
+                    | asap_types::AggregationType::MultipleMinMax
+            );
+            let grouping_pairs: Vec<(&str, &str)> = if series_scoped {
+                let mut labels = sample
+                    .labels
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str()))
+                    .collect::<Vec<_>>();
+                labels.sort_unstable();
+                labels
+            } else {
+                config
+                    .grouping_labels
+                    .labels
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.as_str(),
+                            sample.labels.get(name).map(String::as_str).unwrap_or(""),
+                        )
+                    })
+                    .collect()
+            };
+            let group_key = if series_scoped {
+                let labels = sample
+                    .labels
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                format!(
+                    "__asap_population__{}",
+                    serde_json::to_string(&labels).expect("label map serialization")
+                )
+            } else {
+                group_key
+            };
             let attrs_fp = super::canonical_attrs_fingerprint(&grouping_pairs);
             let policy_fp = asap_types::PolicyFingerprint(config.policy_fp_u64());
             // A sketch family is not a complete physical identity. Two
@@ -583,6 +548,98 @@ fn route_messages(
             },
         )
         .collect()
+}
+
+#[derive(Debug)]
+enum CompiledLabelMatcher {
+    Equal(String, String),
+    NotEqual(String, String),
+    Regex(String, regex::Regex),
+    NotRegex(String, regex::Regex),
+}
+
+#[derive(Debug, Default)]
+struct CompiledSpatialFilter(Vec<CompiledLabelMatcher>);
+
+impl CompiledSpatialFilter {
+    fn matches(&self, labels: &HashMap<String, String>) -> bool {
+        self.0.iter().all(|matcher| {
+            let (name, expected, negate) = match matcher {
+                CompiledLabelMatcher::Equal(name, value) => {
+                    return labels.get(name).map(String::as_str).unwrap_or("") == value
+                }
+                CompiledLabelMatcher::NotEqual(name, value) => {
+                    return labels.get(name).map(String::as_str).unwrap_or("") != value
+                }
+                CompiledLabelMatcher::Regex(name, regex) => (name, regex, false),
+                CompiledLabelMatcher::NotRegex(name, regex) => (name, regex, true),
+            };
+            let matched = expected.is_match(labels.get(name).map(String::as_str).unwrap_or(""));
+            matched != negate
+        })
+    }
+}
+
+fn compile_spatial_filter(filter: &str) -> Result<CompiledSpatialFilter, String> {
+    let body = filter.trim().trim_start_matches('{').trim_end_matches('}');
+    if body.trim().is_empty() {
+        return Ok(CompiledSpatialFilter::default());
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in body.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && quoted {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if ch == ',' && !quoted {
+            parts.push(body[start..index].trim());
+            start = index + 1;
+        }
+    }
+    if quoted {
+        return Err("unterminated spatial-filter string".into());
+    }
+    parts.push(body[start..].trim());
+    let mut compiled = Vec::with_capacity(parts.len());
+    for part in parts {
+        let (name, operator, raw_value) = ["!~", "=~", "!=", "="]
+            .into_iter()
+            .find_map(|operator| {
+                part.find(operator).map(|at| {
+                    (
+                        part[..at].trim(),
+                        operator,
+                        part[at + operator.len()..].trim(),
+                    )
+                })
+            })
+            .ok_or_else(|| format!("invalid spatial matcher {part:?}"))?;
+        if name.is_empty() {
+            return Err("spatial matcher has an empty label name".into());
+        }
+        let value: String = serde_json::from_str(raw_value)
+            .map_err(|error| format!("invalid spatial matcher value: {error}"))?;
+        compiled.push(match operator {
+            "=" => CompiledLabelMatcher::Equal(name.into(), value),
+            "!=" => CompiledLabelMatcher::NotEqual(name.into(), value),
+            "=~" | "!~" => {
+                let regex = regex::Regex::new(&format!("^(?:{value})$"))
+                    .map_err(|error| format!("invalid spatial matcher regex: {error}"))?;
+                if operator == "=~" {
+                    CompiledLabelMatcher::Regex(name.into(), regex)
+                } else {
+                    CompiledLabelMatcher::NotRegex(name.into(), regex)
+                }
+            }
+            _ => unreachable!(),
+        });
+    }
+    Ok(CompiledSpatialFilter(compiled))
 }
 
 fn valid_label_name(name: &str) -> bool {
@@ -814,64 +871,26 @@ mod tests {
         })
     }
 
-    // A rejected or duplicate Remote Write request never changes retained raw input.
     #[test]
-    fn retained_raw_samples_follow_atomic_admission_and_deduplication() {
-        let (receiver, _worker) = configured_receiver_with_raw(true);
-        receiver.accept(&one_sample(1.0)).unwrap();
-        receiver.accept(&one_sample(1.0)).unwrap();
-        assert_eq!(receiver.index_store().sample_count(), 1);
-        assert!(receiver.accept(&one_sample(2.0)).is_err());
-        assert_eq!(receiver.index_store().sample_count(), 1);
-        for timestamp in 101..108 {
-            let bytes = snap::raw::Decoder::new()
-                .decompress_vec(&one_sample(1.0))
-                .unwrap();
-            let mut write = WriteRequest::decode(bytes.as_slice()).unwrap();
-            write.timeseries[0].samples[0].timestamp = timestamp;
-            receiver.accept(&compressed(write)).unwrap();
-        }
-        assert_eq!(receiver.index_store().sample_count(), 8);
-        let bytes = snap::raw::Decoder::new()
-            .decompress_vec(&one_sample(1.0))
-            .unwrap();
-        let mut write = WriteRequest::decode(bytes.as_slice()).unwrap();
-        write.timeseries[0].samples[0].timestamp = 108;
-        assert!(matches!(
-            receiver.accept(&compressed(write)),
-            Err(RemoteWriteError::Backpressure(_))
-        ));
-        assert_eq!(receiver.index_store().sample_count(), 8);
-        let (native, _worker) = configured_receiver();
-        native.accept(&one_sample(1.0)).unwrap();
-        assert_eq!(native.index_store().sample_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn finite_drain_eagerly_builds_installed_range_max_index() {
-        let (receiver, mut worker) = configured_receiver_with_index(true, true);
-        receiver.accept(&one_sample(3.0)).unwrap();
-        assert_eq!(
-            receiver.index_store().sample_count(),
-            1,
-            "index-only plan must retain admitted input"
-        );
-        assert_eq!(receiver.index_store().range_max_index_bytes(), 0);
-        let handle = receiver.clone();
-        let drain = tokio::spawn(async move { handle.drain().await });
-        assert!(matches!(
-            worker.recv().await.unwrap(),
-            WorkerMessage::GroupSamples { .. }
-        ));
-        let WorkerMessage::Drain(reply) = worker.recv().await.unwrap() else {
-            panic!()
-        };
-        reply.send(Ok(())).unwrap();
-        drain.await.unwrap().unwrap();
+    fn spatial_filter_matches_prometheus_label_semantics() {
+        let labels = HashMap::from([
+            ("job".to_string(), "order-service".to_string()),
+            ("status".to_string(), "503".to_string()),
+        ]);
         assert!(
-            receiver.index_store().range_max_index_bytes() > 0,
-            "complete must include index construction before query calibration"
+            compile_spatial_filter(r#"{job="order-service",status=~"5.."}"#)
+                .unwrap()
+                .matches(&labels)
         );
+        assert!(!compile_spatial_filter(r#"{job!="order-service"}"#)
+            .unwrap()
+            .matches(&labels));
+        assert!(compile_spatial_filter(r#"{missing!="present"}"#)
+            .unwrap()
+            .matches(&labels));
+        assert!(!compile_spatial_filter(r#"{status!~"5.."}"#)
+            .unwrap()
+            .matches(&labels));
     }
 
     // Closing finite input prevents writes racing behind the completion barrier.

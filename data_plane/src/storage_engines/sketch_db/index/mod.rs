@@ -135,6 +135,13 @@ fn build_attrs_fp_and_label_map(
     agg_cfg: &asap_types::aggregation_config::AggregationConfig,
     output: &crate::storage_engines::types::PrecomputedOutput,
 ) -> (String, BTreeMap<String, String>) {
+    if let Some(labels) = &output.population_labels {
+        let attrs_fp = labels
+            .iter()
+            .map(|(name, value)| format!("{name}={value};"))
+            .collect();
+        return (attrs_fp, labels.clone());
+    }
     let label_values_vec = output
         .key
         .as_ref()
@@ -1920,6 +1927,26 @@ impl SketchStore {
                 return None;
             }
             Some(_) => {}
+        }
+
+        if let Some(retained_windows) = agg_cfg.num_aggregates_to_retain {
+            let required_horizon_ms = retained_windows
+                .saturating_mul(agg_cfg.slide_interval)
+                .saturating_mul(1_000);
+            let store = self
+                .series
+                .entry(sid)
+                .or_insert_with(|| Arc::new(RwLock::new(self.fresh_sid_store())))
+                .clone();
+            let mut store = store.write().unwrap();
+            if !store.persistence_enabled {
+                store.retention_horizon_ms = Some(
+                    store
+                        .retention_horizon_ms
+                        .unwrap_or(0)
+                        .max(required_horizon_ms),
+                );
+            }
         }
 
         let window = (output.start_timestamp, output.end_timestamp);

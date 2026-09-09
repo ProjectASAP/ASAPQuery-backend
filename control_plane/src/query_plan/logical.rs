@@ -689,7 +689,7 @@ mod hybrid_tests {
     use crate::query_plan::{MaterializationBinding, PhysicalGrouping};
     #[test]
     fn selected_summary_and_filtered_residual_share_installed_binary() {
-        // An unsupported filtered leaf must not discard its supported sibling's selected materialization.
+        // Both filtered and unfiltered leaves bind independently.
         let query = "sum_over_time(m[5m]) + sum_over_time(m{job=\"api\"}[5m])";
         let canonical = crate::query_parser::parse_query_expr_canonical(
             query,
@@ -697,32 +697,42 @@ mod hybrid_tests {
         )
         .unwrap();
         let selected = crate::planner_selection::select_summary_default(&canonical).unwrap();
-        let entry = QueryPlanEntry::compile_bound_composable(
-            "hybrid".into(),
-            query.into(),
-            &selected,
-            InstantExecution {
-                lookback_ms: 300_000,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            FallbackPolicy::Reject,
-            |node, _| {
-                crate::physical::compiler::materialization_leaf_contract(node)
-                    .map_err(QueryPlanError::Invalid)?;
-                Ok(MaterializationBinding {
-                    materialization: asap_types::PolicyFingerprint(7),
-                    metric: "m".into(),
-                    sid_grouping: vec![],
-                    output_grouping: PhysicalGrouping::PerEntity,
-                    window_ms: 300_000,
-                    readout_lookback_ms: Some(300_000),
-                })
-            },
-        )
-        .unwrap();
-        assert_eq!(entry.materialization_bindings().len(), 1);
-        assert!(entry.nodes.values().any(|node| matches!(node, QueryPlanNode::Logical { operator: LogicalOperator::ExactSubquery { query }, .. } if query == "sum_over_time(m{job=\"api\"}[5m])")));
+        let entry =
+            QueryPlanEntry::compile_bound_composable(
+                "hybrid".into(),
+                query.into(),
+                &selected,
+                InstantExecution {
+                    lookback_ms: 300_000,
+                    full_history: false,
+                    cumulative_readout: false,
+                },
+                FallbackPolicy::Reject,
+                |node, _| {
+                    let (_, _, spatial_filter) =
+                        crate::physical::compiler::materialization_leaf_contract(node)
+                            .map_err(QueryPlanError::Invalid)?;
+                    Ok(MaterializationBinding {
+                        materialization: asap_types::PolicyFingerprint(
+                            if spatial_filter.is_empty() { 7 } else { 8 },
+                        ),
+                        metric: "m".into(),
+                        sid_grouping: vec![],
+                        output_grouping: PhysicalGrouping::PerEntity,
+                        window_ms: 300_000,
+                        readout_lookback_ms: Some(300_000),
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(entry.materialization_bindings().len(), 2);
+        assert!(!entry.nodes.values().any(|node| matches!(
+            node,
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::ExactSubquery { .. },
+                ..
+            }
+        )));
         assert!(!entry.nodes.values().any(|node| matches!(
             node,
             QueryPlanNode::Logical {
@@ -738,7 +748,14 @@ mod hybrid_tests {
             }
         ));
         entry
-            .validate(&[asap_types::PolicyFingerprint(7)].into_iter().collect())
+            .validate(
+                &[
+                    asap_types::PolicyFingerprint(7),
+                    asap_types::PolicyFingerprint(8),
+                ]
+                .into_iter()
+                .collect(),
+            )
             .unwrap();
     }
 
@@ -868,7 +885,7 @@ mod planner_workload_tests {
 
 /// Preserve the exact original operator direction because MinMax family alone
 /// does not distinguish min from max. The full Planner-node witness is required.
-pub(super) fn selected_range_max_index(
+pub(crate) fn selected_range_max_index(
     original: &str,
     node: &planner_types::post_asap::SummaryNode,
 ) -> Result<Option<LogicalOperator>, QueryPlanError> {
@@ -1032,7 +1049,7 @@ fn counter_contract(
     })
 }
 
-pub(super) fn selected_counter_index(
+pub(crate) fn selected_counter_index(
     original: &str,
     node: &planner_types::post_asap::SummaryNode,
 ) -> Result<Option<LogicalOperator>, QueryPlanError> {
@@ -1153,31 +1170,47 @@ pub fn index_candidate_keys(
     original: &str,
     selected: &std::rc::Rc<planner_types::post_asap::SummaryNode>,
 ) -> Result<std::collections::BTreeSet<String>, QueryPlanError> {
-    let entry = QueryPlanEntry::compile_bound_composable(
-        "inventory".into(),
-        original.into(),
-        selected,
-        InstantExecution {
-            lookback_ms: 300_000,
-            full_history: false,
-            cumulative_readout: true,
-        },
-        FallbackPolicy::ExactBackend,
-        |_, _| Err(invalid("inventory has no bound physical summary")),
-    )?;
-    entry
-        .nodes
-        .values()
-        .filter_map(|node| match node {
-            QueryPlanNode::Logical {
-                operator:
-                    operator @ (LogicalOperator::ReadRangeCounterIndex { .. }
-                    | LogicalOperator::ReadRangeMaxIndex { .. }),
-                ..
-            } => Some(index_key(operator)),
-            _ => None,
-        })
-        .collect()
+    use planner_types::post_asap::SummaryExpr;
+    fn visit(
+        original: &str,
+        node: &std::rc::Rc<planner_types::post_asap::SummaryNode>,
+        keys: &mut std::collections::BTreeSet<String>,
+    ) -> Result<(), QueryPlanError> {
+        if let Some(operator) =
+            selected_counter_index(original, node)?.or(selected_range_max_index(original, node)?)
+        {
+            keys.insert(index_key(&operator)?);
+        }
+        match &node.expr {
+            SummaryExpr::BinaryOp { lhs, rhs, .. } => {
+                visit(original, lhs, keys)?;
+                visit(original, rhs, keys)?;
+            }
+            SummaryExpr::SummaryAgg { child, .. } => visit(original, child, keys)?,
+            SummaryExpr::SummaryEstimate { summary_input, .. }
+            | SummaryExpr::SummaryDelete { summary_input, .. } => {
+                visit(original, summary_input, keys)?
+            }
+            SummaryExpr::SummaryMerge { children } => {
+                for child in children {
+                    visit(original, child, keys)?;
+                }
+            }
+            SummaryExpr::SummaryJoin { outer, inner, .. } => {
+                visit(original, outer, keys)?;
+                visit(original, inner, keys)?;
+            }
+            SummaryExpr::SummarySubtract { left, right } => {
+                visit(original, left, keys)?;
+                visit(original, right, keys)?;
+            }
+            SummaryExpr::KeepPreAsap(_) => {}
+        }
+        Ok(())
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    visit(original, selected, &mut keys)?;
+    Ok(keys)
 }
 
 impl LogicalOperator {

@@ -119,7 +119,6 @@ pub struct ASAPQueryEngine {
     /// Generation-consistent physical snapshot used by the production query
     /// path. QueryPlan and BackendPlan must never be sampled separately.
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
-    index_store: Option<Arc<crate::query_engines::index_store::IndexStore>>,
     exact_subquery_endpoint: Option<String>,
     exact_subquery_client: reqwest::Client,
 }
@@ -153,7 +152,6 @@ impl ASAPQueryEngine {
             sketch_index: None,
             archive_engine: None,
             active_physical_plan: None,
-            index_store: None,
             exact_subquery_endpoint: None,
             exact_subquery_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
@@ -162,35 +160,19 @@ impl ASAPQueryEngine {
         }
     }
 
-    pub fn with_index_store(
-        mut self,
-        store: Arc<crate::query_engines::index_store::IndexStore>,
-    ) -> Self {
-        self.index_store = Some(store);
-        self
-    }
     pub fn with_exact_subquery_endpoint(mut self, endpoint: String) -> Self {
         self.exact_subquery_endpoint = Some(endpoint);
         self
     }
     async fn prepare_logical(
         &self,
-        physical: &crate::storage_engines::types::ActivePhysicalPlan,
+        _physical: &crate::storage_engines::types::ActivePhysicalPlan,
         entry: &control_plane::query_plan::QueryPlanEntry,
         times: &[u64],
     ) -> Result<super::logical_dag::PreparedLeaves, crate::query_engines::EngineError> {
-        let indexes = self.index_store.as_ref().and_then(|store| {
-            store
-                .snapshot(
-                    physical.backend_plan.plan_id,
-                    physical.backend_plan.plan_version,
-                )
-                .ok()
-        });
         super::exact_subqueries::prepare(
             entry,
             times,
-            indexes.as_deref(),
             self.exact_subquery_endpoint.as_deref(),
             &self.exact_subquery_client,
         )
@@ -218,7 +200,11 @@ impl ASAPQueryEngine {
                 EngineError::capability_miss("installed_logical_dag", e.to_string())
             })?;
             subtree.nodes.retain(|id, _| reachable.contains(id));
-            let bindings = subtree.materialization_bindings();
+            let bindings: Vec<_> = subtree
+                .materialization_bindings()
+                .into_iter()
+                .cloned()
+                .collect();
             let windows: std::collections::BTreeSet<Option<u64>> =
                 bindings.iter().map(|b| b.readout_lookback_ms).collect();
             if windows.len() != 1 || windows.contains(&None) || windows.contains(&Some(0)) {
@@ -254,12 +240,35 @@ impl ASAPQueryEngine {
             })?;
             let plan_id = physical.backend_plan.plan_id;
             let version = physical.backend_plan.plan_version;
-            if !complete_window_coverage(
-                result.coverage,
-                t0,
-                evaluation_ms,
-                requirement.max_window_ms,
-            ) {
+            // Exact range accumulators preserve their actual first/last sample
+            // timestamps. Sparse counter series may legitimately begin after
+            // the range boundary; Prometheus evaluates the samples that exist.
+            // The physical plan's retention bound guarantees stored panes were
+            // not evicted, so requiring a sample at t0 would reject valid data.
+            let exact_accumulator_bindings = bindings.iter().all(|binding| {
+                matches!(
+                    physical
+                        .backend_plan
+                        .materializations
+                        .get(&binding.materialization)
+                        .map(|materialization| &materialization.family),
+                    Some(planner_types::post_asap::SummaryFamilyType::ExactAggregate(
+                        ..
+                    ))
+                )
+            });
+            let sparse_exact_coverage = exact_accumulator_bindings
+                && result
+                    .coverage
+                    .is_some_and(|(_, coverage_end)| coverage_end >= evaluation_ms);
+            if !sparse_exact_coverage
+                && !complete_window_coverage(
+                    result.coverage,
+                    t0,
+                    evaluation_ms,
+                    requirement.max_window_ms,
+                )
+            {
                 active.mark_materializing(
                     plan_id,
                     version,
@@ -922,22 +931,25 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
     {
         if let Some(physical) = self.physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
-                if entry.nodes.values().any(|node| {
-                    matches!(
-                        node,
-                        control_plane::query_plan::QueryPlanNode::Logical { .. }
-                    )
-                }) {
-                    let leaves = self.prepare_logical(&physical, entry, &[now_ms]).await?;
-                    let (mut result, mut stats) =
-                        self.execute_logical_entry(&physical, entry, &leaves, now_ms)?;
-                    stats.remote_evaluations =
-                        leaves.values().map(|leaf| leaf.remote_evaluations).sum();
-                    stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
-                    stats.index_reads = leaves.values().map(|leaf| leaf.index_reads).sum();
-                    annotate_logical_execution(&mut result, &stats);
-                    return Ok(result);
-                }
+                let leaves = self
+                    .prepare_logical(&physical, entry, &[now_ms])
+                    .await
+                    .map_err(|error| {
+                        tracing::warn!(query, error = %error, "installed query DAG preparation failed");
+                        error
+                    })?;
+                let (mut result, mut stats) = self
+                    .execute_logical_entry(&physical, entry, &leaves, now_ms)
+                    .map_err(|error| {
+                        tracing::warn!(query, error = %error, "installed query DAG execution failed");
+                        error
+                    })?;
+                stats.remote_evaluations =
+                    leaves.values().map(|leaf| leaf.remote_evaluations).sum();
+                stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
+                stats.index_reads = leaves.values().map(|leaf| leaf.index_reads).sum();
+                annotate_logical_execution(&mut result, &stats);
+                return Ok(result);
             }
         }
         // One authoritative warm path: ASAPPlanner post-ASAP DAG →

@@ -1,5 +1,6 @@
 use asap_types::PolicyFingerprint;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::storage_engines::types::KeyByLabelValues;
 
@@ -46,6 +47,10 @@ pub struct PrecomputedOutput {
     pub start_timestamp: u64,
     pub end_timestamp: u64,
     pub key: Option<KeyByLabelValues>,
+    /// Full source-series population identity for per-entity SDS instances.
+    /// Grouping-only summaries leave this absent and use `key`.
+    #[serde(default)]
+    pub population_labels: Option<BTreeMap<String, String>>,
     /// Provenance tag. `#[serde(default)]` on read means records
     /// without the field deserialise as `Native`, preserving
     /// forward-compat with older on-disk payloads.
@@ -79,9 +84,15 @@ impl PrecomputedOutput {
             start_timestamp,
             end_timestamp,
             key,
+            population_labels: None,
             origin: Origin::Native,
             policy_fp,
         }
+    }
+
+    pub fn with_population_labels(mut self, labels: Option<BTreeMap<String, String>>) -> Self {
+        self.population_labels = labels;
+        self
     }
 
     /// Construct a `Backfilled { job_id }` precompute. Called by
@@ -99,6 +110,7 @@ impl PrecomputedOutput {
             start_timestamp,
             end_timestamp,
             key,
+            population_labels: None,
             origin: Origin::Backfilled { job_id },
             policy_fp,
         }

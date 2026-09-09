@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn range_max_index_costs_share_owned_state_across_filters() {
+    fn filtered_max_materializations_have_distinct_sds_populations() {
         let mut snapshot = fixture();
         let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
         entries[0].query = planner_types::workload::Query(
@@ -632,6 +632,7 @@ mod tests {
         entries[0].requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
             planner_types::types::AccuracyTarget::Exact,
         );
+        entries[0].time_selection.lookback = Some(planner_types::workload::DurationMs(21_600_000));
         let mut second = entries[0].clone();
         second.query = planner_types::workload::Query(
             "max_over_time(service_retry_queue_depth{job=\"order-service\"}[6h])".into(),
@@ -644,9 +645,9 @@ mod tests {
             costs
                 .components
                 .keys()
-                .filter(|id| id.starts_with("range-max-index:"))
+                .filter(|id| id.starts_with("state:"))
                 .count(),
-            4
+            8
         );
         assert_eq!(
             costs
@@ -656,16 +657,18 @@ mod tests {
                 .count(),
             0
         );
-        for operation in ["build", "update", "residency", "retire"] {
-            assert_eq!(
-                costs.components[&format!("range-max-index:service_retry_queue_depth:{operation}")]
-                    .multiplicity,
-                1.0
-            );
-        }
-        assert_eq!(plan.query_plan.entries.values().flat_map(|entry| entry.nodes.values()).filter(|node|
-            matches!(node, crate::query_plan::QueryPlanNode::Logical { operator:
-                crate::query_plan::logical::LogicalOperator::ReadRangeMaxIndex { .. }, .. })).count(), 2);
+        assert_eq!(
+            plan.query_plan
+                .entries
+                .values()
+                .flat_map(|entry| entry.nodes.values())
+                .filter(|node| matches!(
+                    node,
+                    crate::query_plan::QueryPlanNode::ReadMaterialization { .. }
+                ))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -691,7 +694,7 @@ mod tests {
             assert_eq!(
                 cost.components
                     .keys()
-                    .filter(|k| k.starts_with("range-max-index:"))
+                    .filter(|k| k.starts_with("state:backend:"))
                     .count(),
                 enabled * 4
             );
@@ -709,7 +712,7 @@ mod tests {
                         && v.implementation.get("location").and_then(Value::as_str)
                             == Some("exact_backend"))
                     .count(),
-                2
+                2 - enabled
             );
             assert!(!plan
                 .query_plan

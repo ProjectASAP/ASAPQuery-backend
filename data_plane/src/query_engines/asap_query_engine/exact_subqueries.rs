@@ -1,6 +1,6 @@
 //! Fetch installed exact cuts from Prometheus before composing them with ASAP state.
-use super::logical_dag::{from_result, PreparedLeaf, PreparedLeaves, Value};
-use crate::query_engines::{index_store::IndexedSamples, EngineError};
+use super::logical_dag::{PreparedLeaf, PreparedLeaves, Value};
+use crate::query_engines::EngineError;
 use control_plane::query_plan::{
     logical::LogicalOperator, QueryNodeId, QueryPlanEntry, QueryPlanNode,
 };
@@ -40,9 +40,7 @@ fn leaves(
                 LogicalOperator::Scan { .. } => {
                     return Err(miss("local raw Scan is forbidden in deployed plans"))
                 }
-                LogicalOperator::ExactSubquery { .. }
-                | LogicalOperator::ReadRangeCounterIndex { .. }
-                | LogicalOperator::ReadRangeMaxIndex { .. } => {
+                LogicalOperator::ExactSubquery { .. } => {
                     result.insert((id, at), operator.clone());
                 }
                 LogicalOperator::Subquery {
@@ -152,7 +150,6 @@ fn parse_result(body: &serde_json::Value, at: i64) -> Result<Value, EngineError>
 pub(super) async fn prepare(
     entry: &QueryPlanEntry,
     times: &[u64],
-    indexes: Option<&IndexedSamples>,
     endpoint: Option<&str>,
     client: &reqwest::Client,
 ) -> Result<PreparedLeaves, EngineError> {
@@ -160,51 +157,10 @@ pub(super) async fn prepare(
     // Equivalent exact cuts at the same time share one actual remote request.
     let mut remote_cache = BTreeMap::<(String, i64), Value>::new();
     for ((id, at), operator) in leaves(entry, times)? {
-        let instant = u64::try_from(at).map_err(|_| miss("subquery predates epoch"))?;
-        let indexed = match (&operator, indexes) {
-            (
-                LogicalOperator::ReadRangeCounterIndex {
-                    metric,
-                    matchers,
-                    range_ms,
-                    offset_ms,
-                    operation,
-                    ..
-                },
-                Some(indexes),
-            ) => Some(
-                indexes.read_counter(metric, matchers, *range_ms, *offset_ms, instant, *operation),
-            ),
-            (
-                LogicalOperator::ReadRangeMaxIndex {
-                    metric,
-                    matchers,
-                    range_ms,
-                    ..
-                },
-                Some(indexes),
-            ) => Some(indexes.read_max(metric, matchers, *range_ms, instant)),
-            _ => None,
-        };
-        if let Some(Ok((value, count))) = indexed {
-            prepared.insert(
-                (id, at),
-                PreparedLeaf {
-                    value: from_result(value)?,
-                    remote: false,
-                    remote_evaluations: 0,
-                    remote_rpcs: 0,
-                    index_reads: count,
-                },
-            );
-            continue;
-        }
+        u64::try_from(at).map_err(|_| miss("subquery predates epoch"))?;
         let query = match &operator {
             LogicalOperator::ExactSubquery { query } => query.clone(),
-            _ => operator
-                .exact_promql()
-                .map_err(|e| miss(e.to_string()))?
-                .ok_or_else(|| miss("indexed leaf has no exact fallback query"))?,
+            _ => return Err(miss("prepared leaf is not an exact subtree")),
         };
         let key = (query.clone(), at);
         let cached = remote_cache.contains_key(&key);
@@ -315,7 +271,6 @@ mod tests {
         let leaves = prepare(
             &entry,
             &[1000],
-            None,
             Some(&format!("http://{address}")),
             &reqwest::Client::new(),
         )
@@ -357,7 +312,6 @@ mod tests {
         let prepared = prepare(
             &repeated,
             &[1000],
-            None,
             Some(&format!("http://{address}")),
             &reqwest::Client::new(),
         )

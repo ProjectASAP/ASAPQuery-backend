@@ -248,6 +248,10 @@ impl GroupState {
                 control_plane::query_plan::ExactReadout::Rate,
                 AggregationType::Increase | AggregationType::MultipleIncrease,
             ) => asap_types::Statistic::Rate,
+            (
+                control_plane::query_plan::ExactReadout::Max,
+                AggregationType::MinMax | AggregationType::MultipleMinMax,
+            ) => asap_types::Statistic::Max,
             _ => return None,
         };
         let mut merged: Option<Box<dyn AggregateCore>> = None;
@@ -383,9 +387,6 @@ impl QueryExecutionContext<'_> {
             if self.t1_ms.saturating_sub(self.t0_ms) <= width {
                 return Ok(());
             }
-            if self.t0_ms % width != 0 || self.t1_ms % width != 0 {
-                return Err(SummaryExecutorError::Unsupported("partial pane interval"));
-            }
             let mut expected = self.t0_ms.checked_add(width);
             for end in ends {
                 let Ok(end) = u64::try_from(end) else {
@@ -465,10 +466,19 @@ impl QueryExecutionContext<'_> {
                         .into_iter()
                         .next()
                     else {
-                        check_panes(Vec::new())?;
                         continue;
                     };
-                    check_panes(windows.keys().copied().collect())?;
+                    // Exact accumulators carry their own first/last event
+                    // timestamps. Empty panes need no stored identity and
+                    // gaps between sampled panes are therefore valid for
+                    // counter and extrema state. Additive pane summaries must
+                    // remain contiguous because a missing pane is not zero.
+                    if matches!(
+                        agg_type,
+                        AggregationType::Sum | AggregationType::MultipleSum
+                    ) {
+                        check_panes(windows.keys().copied().collect())?;
+                    }
                     let key = match &binding.output_grouping {
                         PhysicalGrouping::PerEntity => labels,
                         PhysicalGrouping::Reduce(keys) => project_group_key(keys, &labels),
@@ -1003,18 +1013,10 @@ fn summary_family_matches_sketch(
 /// -> ExactKind::Increase` — confirmed against that module's own
 /// dispatch table rather than invented here).
 ///
-/// `ExactKind::MinMax` is deliberately NOT matched: `AggregationType`
-/// carries no min-vs-max DIRECTION (that lives in the write-side
-/// `AggregationConfig::aggregation_sub_type` string, which this sid's
-/// `AggKind::ExactAgg` metadata doesn't retain), so there's no honest way
-/// for `GroupState::exact_value` to know which statistic to compute --
-/// matching it here would force a later caller to silently guess a
-/// direction. `ExactKind::Count`/`Rate` are ALSO not matched: no
-/// `AggregationType` variant resolves to either today (mirrors
-/// `sketch_reducer.rs::evaluate_exact_agg`'s own `stat` mapping, which
-/// only handles `Sum`/`Increase` for the same reason); `Rate` in
-/// particular is "outer-agg-fold" territory the user has explicitly
-/// deferred pending a design conversation with ASAPController.
+/// `ExactKind::Count`/`Rate`/`MinMax` are not matched by this legacy
+/// family-discovery path because their final operation is ambiguous from the
+/// stored accumulator alone. Installed QueryPlans carry an explicit
+/// `ExactReadout`, and `read_bound_materialization` serves those forms safely.
 fn summary_family_matches_exact(family: &SummaryFamilyType, agg_type: AggregationType) -> bool {
     matches!(
         (family, agg_type),
