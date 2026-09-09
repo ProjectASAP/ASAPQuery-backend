@@ -1611,12 +1611,18 @@ fn extract_logical_provenance(
     let Some((raw, summary, memo, remote, indexes, rpcs, branches)) = stats else {
         return Some(Err(()));
     };
-    let expected = if (raw > 0 || remote > 0) && summary > 0 {
+    let expected = if raw > 0 {
+        // Retain the field only to reject provenance from obsolete local-raw
+        // executors. Installed plans cannot execute such a branch.
+        "invalid"
+    } else if remote > 0 && summary > 0 {
         "hybrid"
-    } else if summary == 0 {
-        "raw_dag"
-    } else {
+    } else if remote > 0 {
+        "exact_dag"
+    } else if summary > 0 {
         "asap"
+    } else {
+        "invalid"
     };
     if malformed || route.as_deref().is_some_and(|mode| mode != expected) {
         Some(Err(()))
@@ -1671,7 +1677,9 @@ async fn annotate_data_source(response: Response, data_source_id: &'static str) 
                             axum::http::HeaderValue::from_str(&count.to_string()).unwrap(),
                         );
                     }
-                    if raw > 0 || remote > 0 || summary == 0 {
+                    if raw > 0 {
+                        ("failed", "invalid_provenance")
+                    } else if remote > 0 || summary == 0 {
                         (
                             "exact_fallback",
                             if summary > 0 {
@@ -1679,7 +1687,7 @@ async fn annotate_data_source(response: Response, data_source_id: &'static str) 
                             } else if remote > 0 {
                                 "external_exact"
                             } else {
-                                "local_raw"
+                                "invalid_provenance"
                             },
                         )
                     } else {
@@ -6944,7 +6952,7 @@ mod logical_provenance_tests {
     async fn hybrid_execution_is_fallback_with_measured_branch_counts() {
         // A successful mixed graph must never inherit the pure-ASAP route from its engine name.
         let response = Json(serde_json::json!({"status":"success", "warnings":[
-            "asap_execution:hybrid", "asap_logical_stats:raw=2,summary=1,memo_hits=3"
+            "asap_execution:hybrid", "asap_logical_stats:raw=0,summary=1,memo_hits=3,remote=2,remote_rpcs=1,remote_branches=2"
         ], "data":{"resultType":"vector", "result":[]}}))
         .into_response();
         let response = annotate_data_source(response, "asap_query").await;
@@ -6962,7 +6970,7 @@ mod logical_provenance_tests {
     }
 
     #[tokio::test]
-    async fn prometheus_exact_branch_is_hybrid_without_any_local_raw_scan() {
+    async fn prometheus_exact_branch_is_hybrid_without_backend_scan() {
         let response = Json(serde_json::json!({"status":"success", "warnings":[
             "asap_execution:hybrid", "asap_logical_stats:raw=0,summary=1,memo_hits=0,remote=1,remote_rpcs=1,remote_branches=1"
         ], "data":{"resultType":"vector", "result":[]}})).into_response();
@@ -6972,20 +6980,33 @@ mod logical_provenance_tests {
         assert_eq!(response.headers()["x-asap-exact-subquery-evaluations"], "1");
     }
 
+    #[tokio::test]
+    async fn prometheus_only_dag_is_external_exact() {
+        let response = Json(serde_json::json!({"status":"success", "warnings":[
+            "asap_execution:exact_dag", "asap_logical_stats:raw=0,summary=0,memo_hits=0,remote=1,remote_rpcs=1,remote_branches=1"
+        ], "data":{"resultType":"vector", "result":[]}})).into_response();
+        let response = annotate_data_source(response, "asap_query").await;
+        assert_eq!(response.headers()["x-asap-execution"], "exact_fallback");
+        assert_eq!(
+            response.headers()["x-asap-execution-detail"],
+            "external_exact"
+        );
+    }
+
     #[test]
     fn partial_result_warning_survives_internal_metadata_extraction() {
         // Only internal metadata is removed; incomplete-result warnings still invalidate comparison.
-        let mut value = serde_json::json!({"warnings":["partial data", "asap_execution:raw_dag", "asap_logical_stats:raw=1,summary=0,memo_hits=0"]});
+        let mut value = serde_json::json!({"warnings":["partial data", "asap_execution:exact_dag", "asap_logical_stats:raw=0,summary=0,memo_hits=0,remote=1,remote_rpcs=1,remote_branches=1"]});
         assert_eq!(
             extract_logical_provenance(&mut value),
-            Some(Ok((1, 0, 0, 0, 0, 0, 0)))
+            Some(Ok((0, 0, 0, 1, 0, 1, 1)))
         );
         assert_eq!(value["warnings"], serde_json::json!(["partial data"]));
     }
 
     #[test]
     fn contradictory_provenance_is_not_warm() {
-        // Claimed route cannot override the observed raw branch count.
+        // Any observed local raw branch invalidates a deployed plan.
         let mut value = serde_json::json!({"warnings":["asap_execution:asap", "asap_logical_stats:raw=1,summary=1,memo_hits=0"]});
         assert_eq!(extract_logical_provenance(&mut value), Some(Err(())));
     }

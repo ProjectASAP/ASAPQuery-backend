@@ -42,7 +42,7 @@ def classify(response, headers=None):
     if declared in ("exact_fallback", "failed"):
         return declared
     detail = (headers or {}).get("x-asap-execution-detail")
-    if detail in ("hybrid", "local_raw"):
+    if detail == "hybrid":
         return "exact_fallback"
     if detail == "invalid_provenance":
         return "failed"
@@ -443,7 +443,7 @@ def main():
             write_json(args.output / "storage.json", storage)
             write_json(args.output / "completion.json", {"complete": True,
                        "execution_counts": {k: sum(r["execution"] == k for r in results) for k in ["warm", "exact_fallback", "failed"]},
-                       "execution_detail_counts": {k: sum(r["execution_provenance"]["detail"] == k for r in results) for k in ["asap", "hybrid", "local_raw", "external_exact", "failed", "invalid_provenance"]},
+                       "execution_detail_counts": {k: sum(r["execution_provenance"]["detail"] == k for r in results) for k in ["asap", "hybrid", "external_exact", "failed", "invalid_provenance"]},
                        "benefit_claim": None})
             if args.compare:
                 report = {"schema_version": 1, "all_requests": summarize(results),
@@ -454,7 +454,7 @@ def main():
                           "by_execution": {route: summarize([r for r in results if r["execution"] == route])
                                            for route in ["warm", "exact_fallback", "failed"]},
                           "by_execution_detail": {detail: summarize([r for r in results if r["execution_provenance"]["detail"] == detail])
-                                                  for detail in ["asap", "hybrid", "local_raw", "external_exact"]},
+                                                  for detail in ["asap", "hybrid", "external_exact"]},
                           "estimated_cost": plan["cost_comparison"],
                           "measurement_units": {"latency": "nanoseconds", "cpu": "process CPU nanoseconds", "memory": "bytes"},
                           "resource_limits": {"cpu_affinity": sorted(cpus) if cpus else None,

@@ -811,15 +811,12 @@ fn annotate_logical_execution(
         QueryResult::Vector(v) => &mut v.warnings,
         QueryResult::Matrix(m) => &mut m.warnings,
     };
-    if stats.raw_scan_evaluations > 0
-        || stats.remote_evaluations > 0
-        || stats.summary_readout_evaluations == 0
-    {
+    if stats.remote_evaluations > 0 {
         warnings.push(
             if stats.summary_readout_evaluations > 0 {
                 "asap_execution:hybrid"
             } else {
-                "asap_execution:raw_dag"
+                "asap_execution:exact_dag"
             }
             .into(),
         );

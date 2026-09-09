@@ -58,11 +58,11 @@ classification. Forwarded responses carry a backend-owned `x-asap-execution`
 header; an unmarked success is not counted as warm or fallback. `ingestion.json`
 records accepted batches; acceptance does not prove worker completion.
 
-`execution_provenance` distinguishes summary-only `asap`, `hybrid`, `local_raw`
-and `external_exact`, and records actual raw scans and summary readouts. Both
-hybrid and raw-only execution remain under `exact_fallback`; they are never
-reported as summary-only warm execution. A typed residual DAG can retain selected
-summary siblings, but a particular corpus may still produce no materializations.
+`execution_provenance` distinguishes summary-only `asap`, `hybrid`, and
+`external_exact`, and records summary readouts and Prometheus exact-subquery
+requests. Hybrid execution remains under `exact_fallback`; it is never reported
+as summary-only warm execution. A typed residual DAG can retain selected summary
+siblings, but a particular corpus may still produce no materializations.
 
 The runner waits for the finite-input completion barrier. The first traversal is
 called `first_pass`, not “cold cache”; later traversals are `repeat`. All failures

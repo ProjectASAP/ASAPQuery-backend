@@ -2883,7 +2883,7 @@ fn select_lifecycle(
     })
 }
 
-/// A warm producer may consume only a source whose semantics its raw updater
+/// A warm producer may consume only a source whose semantics its precompute accumulator
 /// implements. Predicates and shifted ranges remain executable residual nodes.
 pub(crate) fn materialization_leaf_contract(
     node: &SummaryNode,
@@ -3221,8 +3221,8 @@ fn collect_selected_materializations(
 fn physical_materialization_family(family: &SummaryFamilyType) -> SummaryFamilyType {
     match family {
         SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _) => {
-            // The local raw Sum updater retains the observation count alongside
-            // its sum. Both logical states can use this one concrete producer.
+            // The SummaryStore Sum accumulator retains the observation count
+            // alongside its sum. Both logical states can share this producer.
             SummaryFamilyType::ExactAggregate(
                 planner_types::post_asap::ExactKind::Sum,
                 planner_types::post_asap::ExactParams::Sum,

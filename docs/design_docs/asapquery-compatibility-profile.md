@@ -144,8 +144,9 @@ For the first MVP, operators provide immutable `QueryWorkload` and
 6. stages and atomically activates those views.
 
 It does not enumerate SDK or Collector placements in this profile. A Planner
-candidate that has no backend-local raw-sample implementation is unavailable;
-the control plane must not assign it an optimistic zero cost.
+candidate that has no backend-local SummaryStore materialization and readout
+implementation is unavailable; the control plane must not assign it an
+optimistic zero cost.
 
 Online query observation, data-workload estimation from Remote Write, and
 replanning may be added later. If enabled, the data-plane query endpoint emits
