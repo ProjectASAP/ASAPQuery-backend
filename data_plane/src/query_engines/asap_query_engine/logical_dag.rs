@@ -231,12 +231,24 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 )),
                 _ => Err(miss("cannot negate range vector")),
             },
+            LogicalOperator::VectorToScalar => {
+                let values = vector(self.eval(input(0)?, at)?)?;
+                Ok(Value::Scalar(if values.len() == 1 {
+                    values[0].1
+                } else {
+                    f64::NAN
+                }))
+            }
             LogicalOperator::Aggregate {
                 operation,
                 grouping,
             } => {
                 let values = vector(self.eval(input(0)?, at)?)?;
                 Ok(Value::Vector(aggregate(operation, &grouping, values)))
+            }
+            LogicalOperator::TopKSelection { k, grouping } => {
+                let values = vector(self.eval(input(0)?, at)?)?;
+                Ok(Value::Vector(topk_selection(k, &grouping, values)))
             }
             LogicalOperator::Binary {
                 operation,
@@ -394,6 +406,50 @@ fn aggregate(operation: Aggregation, grouping: &Grouping, values: Vector) -> Vec
                 }
             };
             (labels, value)
+        })
+        .collect()
+}
+
+fn grouping_key(labels: &Labels, grouping: &Grouping) -> Labels {
+    labels
+        .iter()
+        .filter(|(key, _)| {
+            if grouping.without {
+                key.as_str() != "__name__" && !grouping.labels.contains(key)
+            } else {
+                grouping.labels.contains(key)
+            }
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// Select by the child sample value while retaining every selected series'
+/// labels. NaN ranks below every numeric value, matching Prometheus' TOPK heap.
+/// Stable sorting also leaves equal-valued series in the child's order.
+fn topk_selection(k: u64, grouping: &Grouping, values: Vector) -> Vector {
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut groups: BTreeMap<Labels, Vector> = BTreeMap::new();
+    for (labels, value) in values {
+        groups
+            .entry(grouping_key(&labels, grouping))
+            .or_default()
+            .push((labels, value));
+    }
+    let limit = usize::try_from(k).unwrap_or(usize::MAX);
+    groups
+        .into_values()
+        .flat_map(|mut group| {
+            group.sort_by(|a, b| match (a.1.is_nan(), b.1.is_nan()) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                (false, false) => b.1.total_cmp(&a.1),
+            });
+            group.truncate(limit);
+            group
         })
         .collect()
 }
@@ -588,4 +644,146 @@ fn bucket_quantile(q: f64, mut b: Vec<(f64, f64)>) -> f64 {
     let (start, base) = if idx == 0 { (0., 0.) } else { buckets[idx - 1] };
     let (end, upper) = buckets[idx];
     start + (end - start) * (rank - base) / (upper - base)
+}
+
+#[cfg(test)]
+mod topk_tests {
+    use super::*;
+    use control_plane::query_plan::{FallbackPolicy, InstantExecution};
+
+    fn labels(items: &[(&str, &str)]) -> Labels {
+        items
+            .iter()
+            .map(|(key, value)| ((*key).into(), (*value).into()))
+            .collect()
+    }
+
+    #[test]
+    fn topk_selects_by_sample_value_and_preserves_series_labels() {
+        let values = vec![
+            (
+                labels(&[("__name__", "cpu"), ("job", "api"), ("pod", "a")]),
+                4.0,
+            ),
+            (
+                labels(&[("__name__", "cpu"), ("job", "api"), ("pod", "b")]),
+                9.0,
+            ),
+            (
+                labels(&[("__name__", "cpu"), ("job", "db"), ("pod", "c")]),
+                7.0,
+            ),
+            (
+                labels(&[("__name__", "cpu"), ("job", "db"), ("pod", "d")]),
+                2.0,
+            ),
+        ];
+        let selected = topk_selection(
+            1,
+            &Grouping {
+                labels: vec!["job".into()],
+                without: false,
+            },
+            values,
+        );
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0].0["pod"], "b");
+        assert_eq!(selected[0].1, 9.0);
+        assert_eq!(selected[1].0["pod"], "c");
+        assert_eq!(selected[1].1, 7.0);
+        assert!(selected
+            .iter()
+            .all(|(labels, _)| labels.contains_key("__name__")));
+    }
+
+    #[test]
+    fn topk_ranks_nan_below_numbers_and_keeps_exact_child_values() {
+        let selected = topk_selection(
+            2,
+            &Grouping {
+                labels: vec![],
+                without: false,
+            },
+            vec![
+                (labels(&[("series", "nan")]), f64::NAN),
+                (labels(&[("series", "low")]), -1.0),
+                (labels(&[("series", "high")]), 3.0),
+            ],
+        );
+        assert_eq!(
+            selected
+                .iter()
+                .map(|row| row.0["series"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["high", "low"]
+        );
+        assert_eq!(
+            selected.iter().map(|row| row.1).collect::<Vec<_>>(),
+            vec![3.0, -1.0]
+        );
+    }
+
+    #[test]
+    fn installed_topk_combines_with_prometheus_exact_child() {
+        let mut entry = QueryPlanEntry::compile_logical(
+            "hybrid-topk".into(),
+            "topk(2, m)".into(),
+            InstantExecution {
+                lookback_ms: 300_000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            FallbackPolicy::ExactBackend,
+        )
+        .unwrap();
+        control_plane::query_plan::logical::finalize_residuals(&mut entry).unwrap();
+        let leaf = entry
+            .nodes
+            .iter()
+            .find_map(|(id, node)| {
+                matches!(
+                    node,
+                    QueryPlanNode::Logical {
+                        operator: LogicalOperator::ExactSubquery { .. },
+                        ..
+                    }
+                )
+                .then_some(*id)
+            })
+            .unwrap();
+        let at = 1_000_u64;
+        let leaves = [(
+            (leaf, at as i64),
+            PreparedLeaf {
+                value: Value::Vector(vec![
+                    (labels(&[("pod", "a")]), 1.0),
+                    (labels(&[("pod", "b")]), 8.0),
+                    (labels(&[("pod", "c")]), 5.0),
+                ]),
+                remote: true,
+                remote_evaluations: 1,
+                remote_rpcs: 1,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let (result, stats) = execute_installed(&entry, &leaves, at, |_, _| {
+            panic!("summary callback must not run for an exact-child topk")
+        })
+        .unwrap();
+        let QueryResult::Vector(result) = result else {
+            panic!("instant vector expected")
+        };
+        assert_eq!(
+            result
+                .values
+                .iter()
+                .map(|point| point.value)
+                .collect::<Vec<_>>(),
+            vec![8.0, 5.0]
+        );
+        assert_eq!(stats.remote_branch_evaluations, 1);
+        assert_eq!(stats.remote_rpcs, 1);
+        assert_eq!(stats.raw_scan_evaluations, 0);
+    }
 }

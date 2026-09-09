@@ -23,8 +23,16 @@ pub enum LogicalOperator {
         offset_ms: i64,
     },
     UnaryNegate,
+    VectorToScalar,
     Aggregate {
         operation: Aggregation,
+        grouping: Grouping,
+    },
+    /// PromQL `topk(k, vector)` selection over values produced by the child.
+    /// This is distinct from a frequency-sketch TopK readout: any exact or
+    /// summary-backed instant-vector child may feed this query-time operator.
+    TopKSelection {
+        k: u64,
         grouping: Grouping,
     },
     Binary {
@@ -244,9 +252,13 @@ impl Lower {
                 self.operation(
                     LogicalOperator::Subquery {
                         range_ms: millis(s.range)?,
+                        // Prometheus uses its configured default evaluation
+                        // interval when `[range:]` omits the resolution. The
+                        // backend-local deployment uses the Prometheus default
+                        // of one minute; unsupported subquery operands are
+                        // externalized as one exact subtree before execution.
                         step_ms: millis(
-                            s.step
-                                .ok_or_else(|| invalid("explicit subquery step required"))?,
+                            s.step.unwrap_or_else(|| std::time::Duration::from_secs(60)),
                         )?,
                         offset_ms: offset(&s.offset)?,
                     },
@@ -254,17 +266,6 @@ impl Lower {
                 )
             }
             Expr::Aggregate(a) => {
-                if a.param.is_some() {
-                    return Err(invalid("parameterized aggregate unsupported"));
-                }
-                let operation = match a.op.to_string().as_str() {
-                    "sum" => Aggregation::Sum,
-                    "max" => Aggregation::Max,
-                    "min" => Aggregation::Min,
-                    "avg" => Aggregation::Avg,
-                    "count" => Aggregation::Count,
-                    other => return Err(invalid(format!("unsupported logical aggregate {other}"))),
-                };
                 let grouping = match &a.modifier {
                     None => Grouping {
                         labels: vec![],
@@ -279,6 +280,54 @@ impl Lower {
                         without: true,
                     },
                 };
+                if a.op.to_string() == "topk" {
+                    let Some(Expr::NumberLiteral(parameter)) = a.param.as_deref() else {
+                        return Err(invalid("topk requires a literal scalar parameter"));
+                    };
+                    if !parameter.val.is_finite() {
+                        return Err(invalid("topk requires a finite scalar parameter"));
+                    }
+                    // Prometheus converts the scalar parameter to int64 before
+                    // selection. Values below one produce an empty vector.
+                    let k = parameter.val as i64;
+                    // Keep the selection node local even when its operand has
+                    // unsupported syntax (for example a subquery with an
+                    // implicit resolution). Prometheus evaluates that maximal
+                    // instant-vector child; the backend still performs topk.
+                    let nodes_before = self.nodes.clone();
+                    let seen_before = self.seen.clone();
+                    let input = match self.lower(&a.expr) {
+                        Ok(input) => input,
+                        Err(_) => {
+                            self.nodes = nodes_before;
+                            self.seen = seen_before;
+                            self.operation(
+                                LogicalOperator::ExactSubquery {
+                                    query: a.expr.to_string(),
+                                },
+                                vec![],
+                            )?
+                        }
+                    };
+                    return self.operation(
+                        LogicalOperator::TopKSelection {
+                            k: u64::try_from(k).unwrap_or(0),
+                            grouping,
+                        },
+                        vec![input],
+                    );
+                }
+                if a.param.is_some() {
+                    return Err(invalid("unsupported parameterized aggregate"));
+                }
+                let operation = match a.op.to_string().as_str() {
+                    "sum" => Aggregation::Sum,
+                    "max" => Aggregation::Max,
+                    "min" => Aggregation::Min,
+                    "avg" => Aggregation::Avg,
+                    "count" => Aggregation::Count,
+                    other => return Err(invalid(format!("unsupported logical aggregate {other}"))),
+                };
                 let input = self.lower(&a.expr)?;
                 self.operation(
                     LogicalOperator::Aggregate {
@@ -290,6 +339,7 @@ impl Lower {
             }
             Expr::Call(c) => {
                 let operator = match c.func.name {
+                    "scalar" => LogicalOperator::VectorToScalar,
                     "histogram_quantile" => LogicalOperator::HistogramQuantile,
                     "sort" => LogicalOperator::Sort { descending: false },
                     "sort_desc" => LogicalOperator::Sort { descending: true },
@@ -552,6 +602,92 @@ mod tests {
         .validate(1)
         .is_err());
     }
+
+    #[test]
+    fn real_topk_queries_lower_to_value_selection() {
+        for (query, k) in [
+            (
+                "topk(2, sum by (job) (rate(backend_process_cpu_seconds_total[1h])))",
+                2,
+            ),
+            (
+                "topk(2, sum by (job) (backend_process_resident_memory_bytes))",
+                2,
+            ),
+            ("topk(2, max_over_time(backend_retry_backlog_depth[6h]))", 2),
+            (
+                "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+                1,
+            ),
+            (
+                "topk(3, avg_over_time((sum by (job) (backend_process_resident_memory_bytes))[6h:]))",
+                3,
+            ),
+        ] {
+            let entry = QueryPlanEntry::compile_logical(
+                "topk".into(),
+                query.into(),
+                instant(),
+                FallbackPolicy::Reject,
+            )
+            .unwrap_or_else(|error| panic!("{query}: {error}"));
+            assert!(matches!(
+                entry.nodes[&entry.root],
+                QueryPlanNode::Logical {
+                    operator: LogicalOperator::TopKSelection { k: actual, .. },
+                    ..
+                } if actual == k
+            ));
+        }
+    }
+
+    #[test]
+    fn topk_keeps_unsupported_child_as_exact_leaf() {
+        let entry = QueryPlanEntry::compile_logical(
+            "topk-subquery".into(),
+            "topk(3, label_replace(memory_bytes, \"dst\", \"$1\", \"src\", \"(.*)\"))".into(),
+            instant(),
+            FallbackPolicy::Reject,
+        )
+        .unwrap();
+        assert!(matches!(
+            entry.nodes[&entry.root],
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::TopKSelection { k: 3, .. },
+                ..
+            }
+        ));
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::ExactSubquery { .. },
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn topk_preserves_by_and_without_partitioning() {
+        for (query, labels, without) in [
+            ("topk by (cluster) (2, m)", vec!["cluster"], false),
+            ("topk without (pod) (2, m)", vec!["pod"], true),
+        ] {
+            let entry = QueryPlanEntry::compile_logical(
+                "topk-group".into(),
+                query.into(),
+                instant(),
+                FallbackPolicy::Reject,
+            )
+            .unwrap();
+            assert!(matches!(
+                &entry.nodes[&entry.root],
+                QueryPlanNode::Logical {
+                    operator: LogicalOperator::TopKSelection { grouping, .. },
+                    ..
+                } if grouping.labels == labels && grouping.without == without
+            ));
+        }
+    }
 }
 
 /// Prove a physical-native substitute represents exactly the selected summary leaf.
@@ -746,6 +882,48 @@ mod planner_workload_tests {
             Expr::Binary(e) => lookback(&e.lhs).max(lookback(&e.rhs)),
             Expr::Call(e) => e.args.args.iter().map(|e| lookback(e)).max().unwrap_or(0),
             _ => 0,
+        }
+    }
+
+    fn compile_one(query: &str) -> crate::physical::compiler::PhysicalPlan {
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let mut entry = fixture["query_workload"]["repeating_queries"][0].clone();
+        entry["query"] = query.into();
+        entry["requirements"]["accuracy"] = serde_json::json!({"explicit":"Exact"});
+        let window = lookback(&parser::parse(query).unwrap());
+        entry["time_selection"]["lookback"] = (if window == 0 { 300_000 } else { window }).into();
+        fixture["query_workload"]["repeating_queries"] = vec![entry].into();
+        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture).unwrap();
+        let (request, environment) = snapshot.planning_request().unwrap();
+        PhysicalCompiler
+            .compile(request, environment)
+            .unwrap_or_else(|error| panic!("{query}: {error}"))
+    }
+
+    #[test]
+    fn evaluation_topk_queries_retain_a_local_selection_root() {
+        for query in [
+            "topk(2, sum by (job) (rate(backend_process_cpu_seconds_total[1h])))",
+            "topk(2, sum by (job) (backend_process_resident_memory_bytes))",
+            "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+            "topk(2, max_over_time(backend_retry_backlog_depth[6h]))",
+            "topk(1, sum by (job) (increase(backend_http_5xx_total[24h])) / scalar(sum(increase(backend_http_5xx_total[24h]))))",
+            "topk(1, sum by (job) (rate(backend_process_cpu_seconds_total[6h])))",
+            "topk(3, avg_over_time((sum by (job) (backend_process_resident_memory_bytes))[6h:]))",
+        ] {
+            let plan = compile_one(query);
+            let entry = plan.query_plan.entries.values().next().unwrap();
+            assert!(matches!(
+                entry.nodes[&entry.root],
+                QueryPlanNode::Logical {
+                    operator: LogicalOperator::TopKSelection { .. },
+                    ..
+                }
+            ), "{query}: {:?}", entry.nodes[&entry.root]);
+            assert!(!entry.nodes.values().any(|node| matches!(node, QueryPlanNode::ExactFallback { .. })), "{query}");
         }
     }
 
@@ -1178,6 +1356,12 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         let mut indexed = !matches!(
             node,
             QueryPlanNode::Logical { .. } | QueryPlanNode::Scalar { .. }
+        ) || matches!(
+            node,
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::TopKSelection { .. },
+                ..
+            }
         );
         let mut exact = false;
         if let QueryPlanNode::Logical { operator, .. } = node {
@@ -1195,6 +1379,15 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
     }
     let mut pending = vec![entry.root];
     while let Some(id) = pending.pop() {
+        if matches!(
+            entry.nodes.get(&id),
+            Some(QueryPlanNode::Logical {
+                operator: LogicalOperator::ExactSubquery { .. },
+                ..
+            })
+        ) {
+            continue;
+        }
         let (indexed, exact) = flags(id, &entry.nodes);
         if !indexed && exact {
             if let Ok(shape) = expression_shape(id, &entry.nodes) {
