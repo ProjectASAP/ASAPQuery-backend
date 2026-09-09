@@ -143,7 +143,9 @@ pub fn select_summary(
         .ok_or(SelectionError::NoLegalCandidate)?;
     match candidate.replacement {
         Replacement::Summary(node) => Ok(node),
-        Replacement::Rewrite(_) => Err(SelectionError::UnexpectedRewrite),
+        Replacement::Rewrite(_) | Replacement::ExactComposition(_) => {
+            Err(SelectionError::UnexpectedRewrite)
+        }
     }
 }
 
@@ -184,6 +186,9 @@ pub fn select_workload_with_evidence(
             &asap_aware_mapping::DefaultAccuracyModel,
             &asap_aware_mapping::EqualSplitAllocator,
             evidence,
+        )),
+        Box::new(asap_aware_mapping::ExactCompositionStrategy::new(
+            cost_model,
         )),
         Box::new(asap_aware_mapping::SemanticEquivalentRewriteStrategy),
     ];
@@ -235,7 +240,9 @@ pub fn select_summary_with_evidence(
         .ok_or(SelectionError::NoLegalCandidate)?;
     match candidate.replacement {
         Replacement::Summary(node) => Ok(node),
-        Replacement::Rewrite(_) => Err(SelectionError::UnexpectedRewrite),
+        Replacement::Rewrite(_) | Replacement::ExactComposition(_) => {
+            Err(SelectionError::UnexpectedRewrite)
+        }
     }
 }
 
@@ -340,6 +347,14 @@ mod workload_tests {
         let SummaryExpr::BinaryOp { lhs, .. } = &roots[1].1.expr else {
             panic!("{:?}", roots[1].1)
         };
-        assert!(Rc::ptr_eq(&roots[0].1, lhs));
+        let shared = match &lhs.expr {
+            SummaryExpr::ValueOperation {
+                child,
+                operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+                ..
+            } => child,
+            _ => lhs,
+        };
+        assert!(Rc::ptr_eq(&roots[0].1, shared));
     }
 }

@@ -602,6 +602,9 @@ struct CompileAndPublishPhysicalPlanRequest {
     #[serde(default)]
     evidence: HashMap<String, physical::compiler::TopKMembershipEvidence>,
     #[serde(default)]
+    exact_composition_costs:
+        HashMap<String, Vec<physical::post_asap::cost_model::ExactCompositionCostEvidence>>,
+    #[serde(default)]
     runtime_adaptation_evidence: Vec<physical::compiler::RuntimeAdaptationEvidence>,
     planner_revision: String,
     max_evidence_age_ms: u64,
@@ -628,10 +631,8 @@ struct CompileAndPublishPhysicalPlanResponse {
     lifecycle_estimates: Vec<physical::compiler::MaterializationLifecycleEstimate>,
 }
 
-/// Compile one Planner IR decision into matching Collector, Precompute, and Backend views
-/// and install them in dependency order. Unlike the legacy planning endpoint,
-/// this MVP boundary is fail-closed: the Collector plan is never published
-/// unless the backend accepted the exact matching BackendPlan first.
+/// Compile one Planner IR decision into one catalog-backed physical plan and
+/// install it atomically before publishing collector projections.
 async fn handle_compile_and_publish_physical_plan(
     State(st): State<AppState>,
     Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
@@ -669,15 +670,18 @@ async fn handle_compile_and_publish_physical_plan(
         )
             .into_response();
     }
+    let publication = match bundle.publication() {
+        Ok(publication) => publication,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid catalog publication: {error}"),
+            )
+                .into_response()
+        }
+    };
     if let Err(error) = backend
-        .post_physical_plan_typed(
-            &bundle.precompute_plan,
-            &bundle.transmission_plan,
-            bundle.backend_plan.encode_to_vec(),
-            &bundle.query_plan,
-            None,
-            &adaptation_evidence,
-        )
+        .post_catalog_plan_typed(&publication, None, &adaptation_evidence)
         .await
     {
         return (
@@ -767,7 +771,7 @@ fn compile_physical_plan_request(
     }
     if request.plan_version == 0
         || request.activation_unix_ms == 0
-        || request.backend_compat != control_plane::backend_plan::BACKEND_COMPAT
+        || request.backend_compat != control_plane::physical::compiler::BACKEND_COMPAT
         || request
             .expiry_unix_ms
             .is_some_and(|expiry| expiry <= request.activation_unix_ms)
@@ -819,9 +823,12 @@ fn compile_physical_plan_request(
         });
     }
 
-    if let Err(error) =
-        physical::compiler::select_workload_roots(&mut queries, canonical_roots, &request.evidence)
-    {
+    if let Err(error) = physical::compiler::select_workload_roots(
+        &mut queries,
+        canonical_roots,
+        &request.evidence,
+        &request.exact_composition_costs,
+    ) {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string()));
     }
 
@@ -831,6 +838,7 @@ fn compile_physical_plan_request(
         hybrid_execution: false,
         materialization_policy: None,
         evidence: request.evidence,
+        exact_composition_costs: request.exact_composition_costs,
         planner_revision: request.planner_revision,
         source_sample_interval_ms: None,
         query_staleness_margin_ms: 0,
@@ -2136,7 +2144,7 @@ mod api_tests {
             "collector_ids": ["test"], "capability_snapshot_id": "test",
             "planner_revision": physical::compiler::PLANNER_REVISION,
             "max_evidence_age_ms": 60000, "plan_version": 1,
-            "activation_unix_ms": now, "backend_compat": control_plane::backend_plan::BACKEND_COMPAT
+            "activation_unix_ms": now, "backend_compat": control_plane::physical::compiler::BACKEND_COMPAT
         }))
         .unwrap();
         let response = handle_workload_cost_manifests(Json(request))
@@ -3543,14 +3551,12 @@ mod api_tests {
             .route("/api/v1/plan", axum::routing::post(handle_plan))
             .with_state(state.clone());
 
-        // The four evidence-safe sketched contract metrics. Each gets a
+        // The two quantile-compatible sketched contract metrics. Each gets a
         // separate POST /api/v1/plan, mirroring the demo's
         // per-workload plan-emit cycle.
         let sketched = [
             "http_requests_total_latency_ms", // DDSketch
             "request_size_bytes",             // KLL
-            "unique_users_per_min",           // HLL
-            "endpoint_request_freq",          // CountMinSketch
         ];
 
         for m in &sketched {
@@ -3569,8 +3575,15 @@ mod api_tests {
             );
         }
 
-        // Drain the mock sink: every plan-emit must have produced
-        // exactly one body.
+        // Publication is dispatched asynchronously; wait for every accepted
+        // plan instead of racing the background HTTP tasks.
+        for _ in 0..100 {
+            if sink.lock().unwrap().len() == sketched.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Drain the mock sink: every plan-emit must have produced exactly one body.
         let bodies = sink.lock().unwrap().clone();
         assert_eq!(
             bodies.len(),
@@ -3693,21 +3706,14 @@ mod api_tests {
             .route("/api/v1/plan", axum::routing::post(handle_plan))
             .with_state(state.clone());
 
-        // The evidence-safe sketched contract metrics — the same
+        // The quantile-compatible sketched contract metrics — the same
         // set the sibling `storage_routing_cumulative_push_...` test
-        // exercises. Each gets a separate `POST /api/v1/plan` with
-        // the metric-name → classified sketch family from
-        // `classify_demo_metric`. Pre-fix the metric-only cache
+        // exercises. Each gets a separate `POST /api/v1/plan`. Pre-fix the metric-only cache
         // would have collapsed sequential same-metric POSTs onto one
         // slot; this test uses 5 distinct metrics so the assertion
         // surfaces the cumulative-merge gap (every metric's row must
         // survive every other metric's swap).
-        let sketched = [
-            "http_requests_total_latency_ms",
-            "request_size_bytes",
-            "unique_users_per_min",
-            "endpoint_request_freq",
-        ];
+        let sketched = ["http_requests_total_latency_ms", "request_size_bytes"];
 
         for m in &sketched {
             let app = app.clone();
@@ -3725,8 +3731,15 @@ mod api_tests {
             );
         }
 
-        // Drain the mock sink: every plan-emit must have produced
-        // exactly one streaming-config body.
+        // Publication is dispatched asynchronously; wait for every accepted
+        // plan instead of racing the background HTTP tasks.
+        for _ in 0..100 {
+            if sink.lock().unwrap().len() == sketched.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Drain the mock sink: every plan-emit must have produced exactly one body.
         let bodies = sink.lock().unwrap().clone();
         assert_eq!(
             bodies.len(),

@@ -492,9 +492,10 @@ async fn main() -> Result<()> {
         }
         Some(
             data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
+                summary_catalog: plan.summary_catalog,
+                collector_plans: plan.collector_plans,
                 precompute_plan: plan.precompute_plan,
                 transmission_plan: plan.transmission_plan,
-                backend_plan: plan.backend_plan.encode_to_vec(),
                 query_plan: plan.query_plan,
                 storage_routing: None,
                 adaptation_evidence: Vec::new(),
@@ -518,7 +519,7 @@ async fn main() -> Result<()> {
         )
         .map_err(|error| format!("invalid startup PhysicalPlan: {error}"))?;
         if args.profile == RuntimeProfile::Asapquery
-            && (active.backend_plan.plan_id == 0
+            && (active.plan_id() == 0
                 || !matches!(
                     active.precompute_plan.ingest.protocol,
                     control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
@@ -528,18 +529,14 @@ async fn main() -> Result<()> {
             return Err("the asapquery profile requires a non-bootstrap physical plan declaring prometheus_remote_write_v1 at /api/v1/write".into());
         }
         let now = unix_time_ms();
-        if active.backend_plan.activation_unix_ms > now {
+        if active.activation_unix_ms() > now {
             return Err(format!(
                 "physical plan activation {} is later than startup time {now}",
-                active.backend_plan.activation_unix_ms
+                active.activation_unix_ms()
             )
             .into());
         }
-        if active
-            .backend_plan
-            .expiry_unix_ms
-            .is_some_and(|expiry| expiry <= now)
-        {
+        if active.expiry_unix_ms().is_some_and(|expiry| expiry <= now) {
             return Err("physical plan artifact is expired".into());
         }
         Some(active)
@@ -664,18 +661,9 @@ async fn main() -> Result<()> {
         None
     };
 
-    // BackendPlan wire format (design-backend-plan-wire-format.md):
-    // install an empty hot-reload handle so `GET/POST
-    // /api/v1/backend-plan` don't 503 before the control plane's first
-    // push lands — same "install empty, let the first push fill it in"
-    // pattern as `bootstrap_routing` below. Shared with both the query
-    // engine (serving-time cutover, Phase 4) and the HTTP server (the
-    // push target) so a POST is observable by the next query, same
-    // sharing contract as `hot_reload_config`.
-    let initial_backend_plan = control_plane::backend_plan::BackendPlan::default();
+    // Bootstrap projections share one immutable physical-plan envelope.
     let initial_precompute_plan = control_plane::physical::compiler::PrecomputePlan {
         summary_catalog: None,
-        materialization_contracts: Default::default(),
         envelope: control_plane::physical::compiler::PlanEnvelope {
             plan_id: 0,
             plan_version: 0,
@@ -716,10 +704,11 @@ async fn main() -> Result<()> {
     };
     let initial_active_plan = startup_physical_plan.unwrap_or_else(|| {
         data_plane::storage_engines::types::ActivePhysicalPlan {
+            envelope: initial_precompute_plan.envelope.clone(),
+            summary_catalog: None,
             precompute_plan: initial_precompute_plan,
             transmission_plan: initial_transmission_plan,
             runtime_config: streaming_config.clone(),
-            backend_plan: Arc::new(initial_backend_plan),
             query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(
                 data_plane::storage_engines::types::BackendStorageRouting::empty(),
@@ -730,10 +719,6 @@ async fn main() -> Result<()> {
         data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(initial_active_plan);
     let hot_reload_config =
         data_plane::storage_engines::types::HotReloadStreamingConfig::from_active(
-            active_physical_plan.clone(),
-        );
-    let hot_reload_backend_plan =
-        data_plane::storage_engines::types::HotReloadBackendPlan::from_active(
             active_physical_plan.clone(),
         );
 
@@ -1043,9 +1028,7 @@ async fn main() -> Result<()> {
         // Legacy partial-document endpoints remain available to distributed
         // deployments. The compatibility profile deliberately exposes only
         // the atomic PhysicalPlan stage/activate lifecycle.
-        server = server
-            .with_hot_reload_config(hot_reload_config.clone())
-            .with_hot_reload_backend_plan(hot_reload_backend_plan.clone());
+        server = server.with_hot_reload_config(hot_reload_config.clone());
     }
 
     if args.enable_remote_write || args.profile == RuntimeProfile::Asapquery {
@@ -1106,13 +1089,14 @@ async fn main() -> Result<()> {
         );
         data_plane::storage_engines::types::BackendStorageRouting::empty()
     };
-    if active_physical_plan.snapshot().backend_plan.plan_id == 0 {
+    if active_physical_plan.snapshot().plan_id() == 0 {
         let current = active_physical_plan.snapshot();
         active_physical_plan.swap(data_plane::storage_engines::types::ActivePhysicalPlan {
+            envelope: current.envelope.clone(),
+            summary_catalog: current.summary_catalog.clone(),
             precompute_plan: current.precompute_plan.clone(),
             transmission_plan: current.transmission_plan.clone(),
             runtime_config: current.runtime_config.clone(),
-            backend_plan: current.backend_plan.clone(),
             query_plan: current.query_plan.clone(),
             storage_routing: Arc::new(bootstrap_routing),
         });

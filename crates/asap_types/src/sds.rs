@@ -1,5 +1,5 @@
-//! Shared SDS descriptor contracts. Instances, state bytes, and registry lifetimes
-//! remain backend-owned. Canonical IDs describe content, never SID or policy IDs.
+//! Shared SDS metadata contracts. Summary payload bytes remain storage-engine
+//! owned; catalogs and inventories contain identities and state references only.
 use crate::{AggregationType, PrecomputeMaterialization};
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryFamilyType};
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,187 @@ impl From<MaterializationId> for crate::PolicyFingerprint {
 descriptor_id!(SummaryDescriptorId);
 descriptor_id!(DataDescriptorId);
 
+descriptor_id!(SummaryInstanceId);
+
+impl SummaryInstanceId {
+    pub fn new(value: impl Into<String>) -> Result<Self, SdsError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(SdsError("summary instance ID must not be empty".into()));
+        }
+        Ok(Self(value))
+    }
+}
+
+/// Immutable identity of the desired catalog generation used to create state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogGeneration {
+    pub schema_version: u32,
+    pub plan_id: u64,
+    pub plan_version: u64,
+    pub snapshot_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HalfOpenTimeRange {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstanceCompleteness {
+    Complete,
+    Partial,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryInstanceStatus {
+    Building,
+    Ready,
+    Retiring,
+    Failed,
+    MissingPayload,
+}
+
+/// Logical producer and physical state location. Placement changes do not
+/// change descriptor or materialization identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryPlacement {
+    pub producer_id: String,
+    pub storage_node_id: String,
+}
+
+/// Opaque storage-engine locator. `key` identifies payload stored elsewhere;
+/// encoded summary state must never be placed in this metadata contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryStateReference {
+    pub store: String,
+    pub key: String,
+    pub state_schema_version: u32,
+    pub generation: u64,
+    pub sequence: u64,
+    pub checksum: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EphemeralLease {
+    pub lease_id: String,
+    pub owner_id: String,
+    pub issued_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstanceLifecycle {
+    Persistent,
+    Ephemeral { lease: EphemeralLease },
+}
+
+/// Observed metadata for one concrete SDS instance. Payload remains in the
+/// storage engine and is reached only through `state_reference`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryInstance {
+    pub instance_id: SummaryInstanceId,
+    pub materialization_id: MaterializationId,
+    pub summary_descriptor_id: SummaryDescriptorId,
+    pub data_descriptor_id: DataDescriptorId,
+    pub time_range: HalfOpenTimeRange,
+    pub group_values: BTreeMap<String, String>,
+    pub catalog_generation: CatalogGeneration,
+    pub placement: SummaryPlacement,
+    pub state_reference: SummaryStateReference,
+    pub status: SummaryInstanceStatus,
+    pub completeness: InstanceCompleteness,
+    pub lifecycle: InstanceLifecycle,
+    pub observed_at_ms: i64,
+}
+
+impl SummaryInstance {
+    pub fn validate(&self) -> Result<(), SdsError> {
+        if self.time_range.start_ms >= self.time_range.end_ms {
+            return Err(SdsError(
+                "summary instance time range must be non-empty".into(),
+            ));
+        }
+        if self.catalog_generation.schema_version == 0
+            || self.catalog_generation.snapshot_digest.is_empty()
+        {
+            return Err(SdsError(
+                "summary instance has invalid catalog generation".into(),
+            ));
+        }
+        if self.placement.producer_id.is_empty() || self.placement.storage_node_id.is_empty() {
+            return Err(SdsError(
+                "summary instance placement must be resolved".into(),
+            ));
+        }
+        if self.state_reference.store.is_empty()
+            || self.state_reference.key.is_empty()
+            || self.state_reference.state_schema_version == 0
+        {
+            return Err(SdsError(
+                "summary instance has invalid state reference".into(),
+            ));
+        }
+        if let InstanceLifecycle::Ephemeral { lease } = &self.lifecycle {
+            if lease.lease_id.is_empty()
+                || lease.owner_id.is_empty()
+                || lease.issued_at_ms >= lease.expires_at_ms
+            {
+                return Err(SdsError(
+                    "summary instance has invalid ephemeral lease".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Data-plane report of what is actually stored. This is observed state and is
+/// deliberately separate from the control-plane desired SummaryCatalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedSummaryInventory {
+    pub schema_version: u32,
+    pub reporter_id: String,
+    pub inventory_version: u64,
+    pub observed_at_ms: i64,
+    pub instances: BTreeMap<SummaryInstanceId, SummaryInstance>,
+}
+
+impl ObservedSummaryInventory {
+    pub fn validate(&self) -> Result<(), SdsError> {
+        if self.schema_version != 1 {
+            return Err(SdsError("unsupported observed inventory schema".into()));
+        }
+        if self.reporter_id.is_empty() {
+            return Err(SdsError("inventory reporter ID must not be empty".into()));
+        }
+        for (id, instance) in &self.instances {
+            instance.validate()?;
+            if id != &instance.instance_id {
+                return Err(SdsError("inventory key differs from instance ID".into()));
+            }
+            if instance.observed_at_ms > self.observed_at_ms {
+                return Err(SdsError(
+                    "instance observation is newer than inventory".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SummaryOperator {
@@ -81,6 +262,14 @@ pub enum SummaryOperator {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FidelityGuarantee {
     Exact,
+    /// Exact PromQL counter readout from fixed-size pane summaries. Each pane
+    /// stores only `(first value/time, last value/time, reset-corrected delta,
+    /// sample count)`. A query is eligible only when the selected panes fully
+    /// cover its range; partial boundary panes must fall back to Prometheus.
+    ExactCounter {
+        model: String,
+        full_pane_coverage_required: bool,
+    },
     KllRankError {
         k: u32,
         model: String,
@@ -125,6 +314,15 @@ impl FidelityGuarantee {
             };
         }
         match config.accumulator_spec().map(|s| s.family) {
+            Ok(SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Increase
+                | planner_types::post_asap::ExactKind::Rate
+                | planner_types::post_asap::ExactKind::IRate,
+                _,
+            )) => Self::ExactCounter {
+                model: "prometheus.extrapolated-rate.v1".into(),
+                full_pane_coverage_required: true,
+            },
             Ok(SummaryFamilyType::ExactAggregate(..)) => Self::Exact,
             Ok(SummaryFamilyType::Sketch(kind, _)) => match kind.params() {
                 SketchParams::Kll { k } => Self::KllRankError {
@@ -167,6 +365,10 @@ impl FidelityGuarantee {
     fn validate(&self) -> Result<(), SdsError> {
         let valid = match self {
             Self::Exact => true,
+            Self::ExactCounter {
+                model,
+                full_pane_coverage_required,
+            } => !model.is_empty() && *full_pane_coverage_required,
             Self::KllRankError { k, model } => *k > 0 && !model.is_empty(),
             Self::DdSketchRelativeError { alpha } => {
                 alpha.is_finite() && *alpha > 0.0 && *alpha < 1.0
@@ -235,6 +437,11 @@ impl SummaryDescriptor {
             return Err(SdsError("state schema version must be positive".into()));
         }
         fidelity.validate()?;
+        if !fidelity.is_compatible_with(&operator) {
+            return Err(SdsError(
+                "summary operator and fidelity guarantee are incompatible".into(),
+            ));
+        }
         let content = json!({"operator":operator,"fidelity":fidelity,"state_schema_version":state_schema_version});
         let id = SummaryDescriptorId(format!("summary:v2:{}", canonical(&content)));
         Ok(Self {
@@ -265,6 +472,11 @@ impl SummaryDescriptor {
     /// they cannot attest heap, Hydra, or aggregation-subtype semantics they lost.
     pub fn from_config(config: &PrecomputeMaterialization) -> Result<Self, SdsError> {
         let fidelity = FidelityGuarantee::from_config(config);
+        let state_schema_version = if matches!(fidelity, FidelityGuarantee::ExactCounter { .. }) {
+            2
+        } else {
+            1
+        };
         Self::new(
             SummaryOperator::Configured {
                 aggregation_type: config.aggregation_type,
@@ -276,8 +488,82 @@ impl SummaryDescriptor {
                     .collect(),
             },
             fidelity,
-            1,
+            state_schema_version,
         )
+    }
+}
+
+impl FidelityGuarantee {
+    /// Reject a descriptor that advertises an error model belonging to a
+    /// different state family. This is part of the shared wire contract, so a
+    /// consumer must not need to trust the process that produced the catalog.
+    pub fn is_compatible_with(&self, operator: &SummaryOperator) -> bool {
+        use AggregationType as A;
+        use FidelityGuarantee::*;
+        use SketchAlgorithm as S;
+
+        let configured = |aggregation_type| match (aggregation_type, self) {
+            (A::Sum | A::MultipleSum | A::MinMax | A::MultipleMinMax, Exact) => true,
+            (A::Increase | A::MultipleIncrease, ExactCounter { .. }) => true,
+            (A::DatasketchesKLL | A::HydraKLL, KllRankError { .. }) => true,
+            (A::DDSketch, DdSketchRelativeError { .. }) => true,
+            (A::HLL, HllCardinalityError { .. }) => true,
+            (A::CountMinSketch | A::CountMinSketchWithHeap, CmsFrequencyError { .. }) => true,
+            (A::CountSketch | A::CountSketchWithHeap, CountSketchFrequencyError { .. }) => true,
+            (A::SingleSubpopulation | A::MultipleSubpopulation, Unknown { .. }) => true,
+            _ => false,
+        };
+
+        match operator {
+            SummaryOperator::LegacyPartial { .. } => matches!(self, Unknown { .. }),
+            SummaryOperator::ExactAgg { agg_type, .. } => configured(*agg_type),
+            SummaryOperator::Configured {
+                aggregation_type,
+                parameters,
+                ..
+            } => configured(*aggregation_type) && self.matches_parameters(parameters),
+            SummaryOperator::Sketch {
+                algorithm,
+                parameters,
+            } => {
+                matches!(
+                    (algorithm, self),
+                    (S::Kll, KllRankError { .. })
+                        | (S::DDSketch, DdSketchRelativeError { .. })
+                        | (S::Hll, HllCardinalityError { .. })
+                        | (S::Cms | S::CmsWithHeap, CmsFrequencyError { .. })
+                        | (
+                            S::CountSketch | S::CountSketchWithHeap,
+                            CountSketchFrequencyError { .. }
+                        )
+                        | (S::Kmv | S::Theta, Unknown { .. })
+                ) && self.matches_parameters(parameters)
+            }
+        }
+    }
+
+    fn matches_parameters(&self, parameters: &BTreeMap<String, Value>) -> bool {
+        let u32_parameter = |names: &[&str], expected: u32| {
+            names
+                .iter()
+                .find_map(|name| parameters.get(*name))
+                .is_none_or(|value| value.as_u64() == Some(u64::from(expected)))
+        };
+        match self {
+            Self::KllRankError { k, .. } => u32_parameter(&["k", "K"], *k),
+            Self::HllCardinalityError { precision, .. } => {
+                u32_parameter(&["precision", "p"], *precision)
+            }
+            Self::CmsFrequencyError { width, depth, .. }
+            | Self::CountSketchFrequencyError { width, depth, .. } => {
+                u32_parameter(&["width"], *width) && u32_parameter(&["depth"], *depth)
+            }
+            Self::DdSketchRelativeError { alpha } => parameters
+                .get("alpha")
+                .or_else(|| parameters.get("relative_accuracy"))
+                .is_none_or(|value| value.as_f64() == Some(*alpha)),
+            _ => true,
+        }
     }
 }
 
@@ -373,6 +659,88 @@ fn data_descriptor_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn observed_instance(lifecycle: InstanceLifecycle) -> SummaryInstance {
+        SummaryInstance {
+            instance_id: SummaryInstanceId::new("instance-1").unwrap(),
+            materialization_id: MaterializationId(crate::PolicyFingerprint(7)),
+            summary_descriptor_id: descriptor(
+                200,
+                FidelityGuarantee::KllRankError {
+                    k: 200,
+                    model: "rank.v1".into(),
+                },
+                1,
+            )
+            .id,
+            data_descriptor_id: DataDescriptor::new("cpu", "", []).id,
+            time_range: HalfOpenTimeRange {
+                start_ms: 0,
+                end_ms: 10,
+            },
+            group_values: BTreeMap::new(),
+            catalog_generation: CatalogGeneration {
+                schema_version: 1,
+                plan_id: 1,
+                plan_version: 2,
+                snapshot_digest: "abc".into(),
+            },
+            placement: SummaryPlacement {
+                producer_id: "producer".into(),
+                storage_node_id: "store".into(),
+            },
+            state_reference: SummaryStateReference {
+                store: "summary-store".into(),
+                key: "state/1".into(),
+                state_schema_version: 1,
+                generation: 1,
+                sequence: 3,
+                checksum: None,
+            },
+            status: SummaryInstanceStatus::Ready,
+            completeness: InstanceCompleteness::Complete,
+            lifecycle,
+            observed_at_ms: 10,
+        }
+    }
+
+    #[test]
+    fn instance_inventory_has_metadata_reference_without_payload() {
+        let instance = observed_instance(InstanceLifecycle::Persistent);
+        instance.validate().unwrap();
+        let encoded = serde_json::to_value(&instance).unwrap();
+        assert!(encoded.get("state_reference").is_some());
+        assert!(encoded.get("state").is_none());
+        assert!(encoded.get("payload").is_none());
+        let inventory = ObservedSummaryInventory {
+            schema_version: 1,
+            reporter_id: "store".into(),
+            inventory_version: 4,
+            observed_at_ms: 10,
+            instances: BTreeMap::from([(instance.instance_id.clone(), instance)]),
+        };
+        inventory.validate().unwrap();
+    }
+
+    #[test]
+    fn invalid_range_and_lease_are_rejected() {
+        let mut instance = observed_instance(InstanceLifecycle::Ephemeral {
+            lease: EphemeralLease {
+                lease_id: "lease".into(),
+                owner_id: "fast-path".into(),
+                issued_at_ms: 10,
+                expires_at_ms: 20,
+            },
+        });
+        instance.validate().unwrap();
+        instance.time_range.end_ms = instance.time_range.start_ms;
+        assert!(instance.validate().is_err());
+        instance.time_range.end_ms = 10;
+        if let InstanceLifecycle::Ephemeral { lease } = &mut instance.lifecycle {
+            lease.expires_at_ms = lease.issued_at_ms;
+        }
+        assert!(instance.validate().is_err());
+    }
     fn descriptor(k: u32, fidelity: FidelityGuarantee, version: u32) -> SummaryDescriptor {
         SummaryDescriptor::new(
             SummaryOperator::Sketch {
@@ -388,8 +756,9 @@ mod tests {
     fn identity_includes_configuration_fidelity_and_state_schema() {
         let base = descriptor(
             200,
-            FidelityGuarantee::Unknown {
-                reason: "not supplied".into(),
+            FidelityGuarantee::KllRankError {
+                k: 200,
+                model: "rank.v1".into(),
             },
             1,
         );
@@ -397,20 +766,30 @@ mod tests {
             base.id,
             descriptor(
                 201,
-                FidelityGuarantee::Unknown {
-                    reason: "not supplied".into()
+                FidelityGuarantee::KllRankError {
+                    k: 201,
+                    model: "rank.v1".into()
                 },
                 1
             )
             .id
         );
-        assert_ne!(base.id, descriptor(200, FidelityGuarantee::Exact, 1).id);
+        assert!(SummaryDescriptor::new(
+            SummaryOperator::Sketch {
+                algorithm: SketchAlgorithm::Kll,
+                parameters: BTreeMap::from([("k".into(), json!(200))]),
+            },
+            FidelityGuarantee::Exact,
+            1,
+        )
+        .is_err());
         assert_ne!(
             base.id,
             descriptor(
                 200,
-                FidelityGuarantee::Unknown {
-                    reason: "not supplied".into()
+                FidelityGuarantee::KllRankError {
+                    k: 200,
+                    model: "rank.v1".into()
                 },
                 2
             )
@@ -449,8 +828,9 @@ mod tests {
     fn wire_roundtrip_and_tampered_id_validation() {
         let original = descriptor(
             200,
-            FidelityGuarantee::Unknown {
-                reason: "not supplied".into(),
+            FidelityGuarantee::KllRankError {
+                k: 200,
+                model: "rank.v1".into(),
             },
             1,
         );
@@ -473,6 +853,31 @@ mod tests {
             },
             FidelityGuarantee::DdSketchRelativeError { alpha: f64::NAN },
             1
+        )
+        .is_err());
+        assert!(SummaryDescriptor::new(
+            SummaryOperator::Configured {
+                aggregation_type: AggregationType::Sum,
+                aggregation_sub_type: String::new(),
+                parameters: BTreeMap::new(),
+            },
+            FidelityGuarantee::KllRankError {
+                k: 200,
+                model: "rank.v1".into(),
+            },
+            1,
+        )
+        .is_err());
+        assert!(SummaryDescriptor::new(
+            SummaryOperator::Sketch {
+                algorithm: SketchAlgorithm::Kll,
+                parameters: BTreeMap::from([("k".into(), json!(100))]),
+            },
+            FidelityGuarantee::KllRankError {
+                k: 200,
+                model: "rank.v1".into(),
+            },
+            1,
         )
         .is_err());
     }
@@ -513,6 +918,23 @@ mod tests {
         );
     }
     #[test]
+    fn increase_config_declares_prometheus_counter_fidelity() {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(
+            "aggregationType: Increase\naggregationSubType: ''\nmetric: requests_total\nlabels:\n  grouping: []\n  rollup: []\n  aggregated: []\nparameters: {}\nwindowSize: 60\nwindowType: tumbling\nspatialFilter: ''\n",
+        )
+        .unwrap();
+        let config =
+            PrecomputeMaterialization::from_yaml_data(&yaml, None, crate::QueryLanguage::promql)
+                .unwrap();
+        assert!(matches!(
+            SummaryDescriptor::from_config(&config).unwrap().fidelity,
+            FidelityGuarantee::ExactCounter {
+                ref model,
+                full_pane_coverage_required: true
+            } if model == "prometheus.extrapolated-rate.v1"
+        ));
+    }
+    #[test]
     fn canonical_nested_parameters_and_model_versions_are_identity() {
         let a = SummaryOperator::Configured {
             aggregation_type: AggregationType::Sum,
@@ -532,8 +954,12 @@ mod tests {
                 .unwrap()
                 .id
         );
+        let kll = SummaryOperator::Sketch {
+            algorithm: SketchAlgorithm::Kll,
+            parameters: BTreeMap::from([("k".into(), json!(200))]),
+        };
         let first = SummaryDescriptor::new(
-            a.clone(),
+            kll.clone(),
             FidelityGuarantee::KllRankError {
                 k: 200,
                 model: "rank.v1".into(),
@@ -542,7 +968,7 @@ mod tests {
         )
         .unwrap();
         let second = SummaryDescriptor::new(
-            a,
+            kll,
             FidelityGuarantee::KllRankError {
                 k: 200,
                 model: "rank.v2".into(),
@@ -559,8 +985,10 @@ mod tests {
         assert_eq!(id.fingerprint(), fingerprint);
         assert_eq!(id.as_u64(), 42);
         assert_eq!(crate::PolicyFingerprint::from(id), fingerprint);
-        assert_eq!(serde_json::to_value(id).unwrap(), serde_json::to_value(fingerprint).unwrap());
+        assert_eq!(
+            serde_json::to_value(id).unwrap(),
+            serde_json::to_value(fingerprint).unwrap()
+        );
         assert_eq!(serde_json::from_str::<MaterializationId>("42").unwrap(), id);
     }
-
 }

@@ -15,7 +15,7 @@ use planner_types::pre_asap::Reduction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use asap_types::PolicyFingerprint;
+use asap_types::{sds::MaterializationId, PolicyFingerprint};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +39,74 @@ impl QueryPlan {
         self.entries
             .get(&identity)
             .ok_or(QueryPlanError::QueryNotPlanned(identity))
+    }
+
+    /// Validate semantic bindings against the authoritative snapshot before use.
+    pub fn validate_against_catalog(
+        &self,
+        catalog: &crate::physical::summary_catalog::SummaryCatalog,
+    ) -> Result<(), QueryPlanError> {
+        catalog
+            .validate()
+            .map_err(|error| QueryPlanError::Invalid(error.to_string()))?;
+        if self.plan_id != catalog.plan_id || self.plan_version != catalog.plan_version {
+            return Err(QueryPlanError::Invalid(
+                "QueryPlan and SummaryCatalog have different plan identity/version".into(),
+            ));
+        }
+        let available = catalog
+            .materializations
+            .keys()
+            .copied()
+            .map(Into::into)
+            .collect();
+        self.validate(&available)?;
+        for entry in self.entries.values() {
+            for binding in entry.materialization_bindings() {
+                let identity = catalog
+                    .materializations
+                    .get(&binding.materialization)
+                    .ok_or_else(|| {
+                        QueryPlanError::Invalid(
+                            "query binding references absent catalog materialization".into(),
+                        )
+                    })?;
+                let _data = &catalog.data_descriptors[&identity.data_descriptor_id];
+                if binding.window_ms == 0 {
+                    return Err(QueryPlanError::Invalid(
+                        "zero physical pane duration".into(),
+                    ));
+                }
+            }
+            for node in entry.nodes.values() {
+                let QueryPlanNode::ExactReadout { input, readout } = node else {
+                    continue;
+                };
+                if !matches!(readout, ExactReadout::Increase | ExactReadout::Rate) {
+                    continue;
+                }
+                let Some(QueryPlanNode::ReadMaterialization { binding }) = entry.nodes.get(input)
+                else {
+                    return Err(QueryPlanError::Invalid(
+                        "counter readout must directly consume one catalog materialization".into(),
+                    ));
+                };
+                let identity = &catalog.materializations[&binding.materialization];
+                let descriptor = &catalog.summary_descriptors[&identity.summary_descriptor_id];
+                if !matches!(
+                    descriptor.fidelity,
+                    asap_types::sds::FidelityGuarantee::ExactCounter {
+                        full_pane_coverage_required: true,
+                        ..
+                    }
+                ) {
+                    return Err(QueryPlanError::Invalid(
+                        "rate/increase binding does not reference an exact counter SDS".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn validate(&self, available: &BTreeSet<PolicyFingerprint>) -> Result<(), QueryPlanError> {
@@ -196,10 +264,12 @@ impl QueryPlanEntry {
                         "zero semantic readout lookback".into(),
                     ));
                 }
-                if !available.contains(&binding.materialization) {
+                if !available.contains(&binding.materialization.fingerprint()) {
                     return Err(QueryPlanError::Invalid(format!(
                         "query `{}` node {} references absent materialization {}",
-                        self.query_id, id.0, binding.materialization.0
+                        self.query_id,
+                        id.0,
+                        binding.materialization.as_u64()
                     )));
                 }
             }
@@ -265,10 +335,7 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
-    pub materialization: PolicyFingerprint,
-    pub metric: String,
-    /// Exact label-key layout of the stored materialization.
-    pub sid_grouping: Vec<String>,
+    pub materialization: MaterializationId,
     /// Query operator grouping applied while folding those SIDs.
     pub output_grouping: PhysicalGrouping,
     pub window_ms: u64,
@@ -429,6 +496,19 @@ where
         if let Some(id) = self.seen.get(&identity) {
             return Ok(*id);
         }
+        if let SummaryExpr::ValueOperation {
+            child,
+            operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+            timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+        } = &node.expr
+        {
+            // SummaryAgg lowering already emits the family-specific ExactReadout.
+            // Preserve the Planner's explicit state boundary without adding a
+            // second runtime readout node.
+            let child_id = self.lower(child)?;
+            self.seen.insert(identity, child_id);
+            return Ok(child_id);
+        }
         let id = QueryNodeId(self.next_id);
         self.next_id += 1;
         self.seen.insert(identity, id);
@@ -452,6 +532,143 @@ where
         }
 
         let physical = match &node.expr {
+            SummaryExpr::ValueOperation {
+                child,
+                operation:
+                    planner_types::post_asap::ValueOperation::Exact(
+                        planner_types::post_asap::ExactOperation::Aggregate {
+                            reduction,
+                            measures,
+                            having: None,
+                            ..
+                        },
+                    ),
+                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+            } if measures.len() == 1 => {
+                use planner_types::pre_asap::AggIntent;
+                let operation = match &measures[0] {
+                    AggIntent::Sum { .. } => logical::Aggregation::Sum,
+                    AggIntent::Count { .. } => logical::Aggregation::Count,
+                    AggIntent::Min { .. } => logical::Aggregation::Min,
+                    AggIntent::Max { .. } => logical::Aggregation::Max,
+                    AggIntent::Avg { .. } => logical::Aggregation::Avg,
+                    _ => {
+                        return Err(QueryPlanError::Invalid(
+                            "unsupported exact value aggregation".into(),
+                        ))
+                    }
+                };
+                let keys = reduction.group_keys().ok_or_else(|| {
+                    QueryPlanError::Invalid(
+                        "per-entity exact value aggregation has no grouping".into(),
+                    )
+                })?;
+                let labels = keys
+                    .keys()
+                    .iter()
+                    .map(|&column| {
+                        child
+                            .schema
+                            .fields
+                            .get(column)
+                            .map(|field| field.name.clone())
+                            .ok_or_else(|| {
+                                QueryPlanError::Invalid(
+                                    "unresolved exact aggregation column".into(),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                QueryPlanNode::Logical {
+                    operator: logical::LogicalOperator::Aggregate {
+                        operation,
+                        grouping: logical::Grouping {
+                            labels,
+                            without: keys.is_without(),
+                        },
+                    },
+                    inputs: vec![self.lower(child)?],
+                }
+            }
+            SummaryExpr::ValueOperation {
+                child: sort,
+                operation: planner_types::post_asap::ValueOperation::Limit { n, offset: 0 },
+                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+            } => {
+                let SummaryExpr::ValueOperation {
+                    child,
+                    operation: planner_types::post_asap::ValueOperation::Sort { keys, partition_by },
+                    timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                } = &sort.expr
+                else {
+                    return Err(QueryPlanError::Invalid(
+                        "query-time Limit must consume a query-time Sort".into(),
+                    ));
+                };
+                if keys.len() != 1 || keys[0].ascending {
+                    return Err(QueryPlanError::Invalid(
+                        "only descending value-ranked TopK is executable".into(),
+                    ));
+                }
+                let planner_types::pre_asap::QueryExpr::Column(sort_column) = &keys[0].expr else {
+                    return Err(QueryPlanError::Invalid(
+                        "TopK sort key must reference the child value column".into(),
+                    ));
+                };
+                if !matches!(
+                    child
+                        .schema
+                        .fields
+                        .get(*sort_column)
+                        .map(|field| &field.dtype),
+                    Some(SummaryFamilyType::Plain(
+                        planner_types::pre_asap::DataType::Float64
+                    )) | Some(SummaryFamilyType::ExactAggregate(..))
+                ) {
+                    return Err(QueryPlanError::Invalid(
+                        "TopK sort key must produce a numeric value".into(),
+                    ));
+                }
+                let labels = partition_by
+                    .keys()
+                    .iter()
+                    .map(|&column| {
+                        child
+                            .schema
+                            .fields
+                            .get(column)
+                            .map(|field| field.name.clone())
+                            .ok_or_else(|| {
+                                QueryPlanError::Invalid("unresolved TopK partition column".into())
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                QueryPlanNode::Logical {
+                    operator: logical::LogicalOperator::TopKSelection {
+                        k: u64::try_from(*n).map_err(|_| {
+                            QueryPlanError::Invalid("TopK limit exceeds u64".into())
+                        })?,
+                        grouping: logical::Grouping {
+                            labels,
+                            without: partition_by.is_without(),
+                        },
+                    },
+                    inputs: vec![self.lower(child)?],
+                }
+            }
+            SummaryExpr::ValueOperation {
+                child,
+                operation: planner_types::post_asap::ValueOperation::Sort { keys, .. },
+                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+            } if keys.len() == 1 => QueryPlanNode::Logical {
+                operator: logical::LogicalOperator::Sort {
+                    descending: !keys[0].ascending,
+                },
+                inputs: vec![self.lower(child)?],
+            },
+            SummaryExpr::ValueOperation { .. } => QueryPlanNode::ExactFallback {
+                reason: "unsupported post-ASAP value operation".into(),
+            },
             SummaryExpr::BinaryOp { lhs, rhs, operator } if self.logical_source.is_some() => {
                 let operator = logical::binary_operator(operator)?;
                 QueryPlanNode::Logical {
@@ -838,5 +1055,162 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cycle"));
+    }
+}
+
+#[cfg(test)]
+mod catalog_binding_tests {
+    use super::*;
+    use crate::physical::summary_catalog::SummaryCatalog;
+    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+
+    fn fixture() -> (QueryPlan, SummaryCatalog) {
+        let config = PrecomputeMaterialization::new(
+            AggregationType::Sum,
+            String::new(),
+            Default::default(),
+            KeyByLabelNames::new(vec!["job".into()]),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            10,
+            10,
+            WindowKind::Tumbling,
+            String::new(),
+            "m".into(),
+            None,
+            None,
+            None,
+        );
+        let catalog = SummaryCatalog::from_materializations(7, 2, &[config.clone()]).unwrap();
+        let entry = QueryPlanEntry {
+            query_id: "q".into(),
+            canonical_promql: "sum_over_time(m[1m])".into(),
+            root: QueryNodeId(1),
+            nodes: BTreeMap::from([(
+                QueryNodeId(1),
+                QueryPlanNode::ReadMaterialization {
+                    binding: MaterializationBinding {
+                        materialization: config.policy_fingerprint().into(),
+                        output_grouping: PhysicalGrouping::PerEntity,
+                        window_ms: 10_000,
+                        readout_lookback_ms: Some(60_000),
+                    },
+                },
+            )]),
+            instant: InstantExecution {
+                lookback_ms: 60_000,
+                full_history: false,
+                cumulative_readout: true,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        (
+            QueryPlan {
+                plan_id: 7,
+                plan_version: 2,
+                entries: BTreeMap::from([(entry.canonical_promql.clone(), entry)]),
+            },
+            catalog,
+        )
+    }
+    fn binding(plan: &mut QueryPlan) -> &mut MaterializationBinding {
+        let QueryPlanNode::ReadMaterialization { binding } = plan
+            .entries
+            .values_mut()
+            .next()
+            .unwrap()
+            .nodes
+            .values_mut()
+            .next()
+            .unwrap()
+        else {
+            panic!("fixture")
+        };
+        binding
+    }
+
+    // One pane ID is compatible with a longer semantic readout window.
+    #[test]
+    fn catalog_binding_round_trip_preserves_pane_and_readout_windows() {
+        let (plan, catalog) = fixture();
+        let mut decoded: QueryPlan =
+            serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+        decoded.validate_against_catalog(&catalog).unwrap();
+        assert_eq!(binding(&mut decoded).window_ms, 10_000);
+        assert_eq!(binding(&mut decoded).readout_lookback_ms, Some(60_000));
+    }
+
+    // The catalog owns source and grouping; the binding owns only its stable ID.
+    #[test]
+    fn catalog_binding_rejects_source_grouping_and_identity_drift() {
+        let (plan, catalog) = fixture();
+        let mut broken = plan.clone();
+        binding(&mut broken).materialization = PolicyFingerprint(123).into();
+        assert!(broken.validate_against_catalog(&catalog).is_err());
+        let mut broken = plan.clone();
+        broken.plan_version += 1;
+        assert!(broken.validate_against_catalog(&catalog).is_err());
+        let mut broken = plan;
+        binding(&mut broken).window_ms = 0;
+        assert!(broken.validate_against_catalog(&catalog).is_err());
+    }
+
+    // Catalog descriptor corruption must fail even if the materialization exists.
+    #[test]
+    fn catalog_binding_rejects_broken_descriptor_reference() {
+        let (plan, mut catalog) = fixture();
+        catalog.summary_descriptors.clear();
+        assert!(plan.validate_against_catalog(&catalog).is_err());
+    }
+
+    #[test]
+    fn counter_readout_requires_counter_sds_fidelity() {
+        fn as_rate_plan(mut plan: QueryPlan) -> QueryPlan {
+            let entry = plan.entries.values_mut().next().unwrap();
+            let read = entry.root;
+            let root = QueryNodeId(2);
+            entry.root = root;
+            entry.nodes.insert(
+                root,
+                QueryPlanNode::ExactReadout {
+                    input: read,
+                    readout: ExactReadout::Rate,
+                },
+            );
+            plan
+        }
+
+        let (sum_plan, sum_catalog) = fixture();
+        assert!(as_rate_plan(sum_plan)
+            .validate_against_catalog(&sum_catalog)
+            .unwrap_err()
+            .to_string()
+            .contains("exact counter SDS"));
+
+        let counter = PrecomputeMaterialization::new(
+            AggregationType::Increase,
+            String::new(),
+            Default::default(),
+            KeyByLabelNames::new(vec!["job".into()]),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            10,
+            10,
+            WindowKind::Tumbling,
+            String::new(),
+            "m".into(),
+            None,
+            None,
+            None,
+        );
+        let counter_catalog =
+            SummaryCatalog::from_materializations(7, 2, &[counter.clone()]).unwrap();
+        let (mut counter_plan, _) = fixture();
+        binding(&mut counter_plan).materialization = counter.policy_fingerprint().into();
+        as_rate_plan(counter_plan)
+            .validate_against_catalog(&counter_catalog)
+            .unwrap();
     }
 }

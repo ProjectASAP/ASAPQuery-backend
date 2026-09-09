@@ -871,7 +871,7 @@ async fn route_modified_otlp_sketches_to_precompute(
         .as_ref()
         .map(|plan| plan.runtime_config.clone())
         .unwrap_or_else(|| ingest_state.config_snapshot());
-    let active_physical_plan = physical_plan_snapshot.filter(|plan| plan.backend_plan.plan_id != 0);
+    let active_physical_plan = physical_plan_snapshot.filter(|plan| plan.plan_id() != 0);
     let lineage_batch_guard = active_physical_plan
         .as_ref()
         .map(|_| ingest_state.observability.frame_lineage.lock_batch());

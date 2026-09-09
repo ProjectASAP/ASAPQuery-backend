@@ -208,9 +208,10 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
         "count"
     );
     let artifact = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
+        summary_catalog: plan.summary_catalog,
+        collector_plans: plan.collector_plans,
         precompute_plan: plan.precompute_plan,
         transmission_plan: plan.transmission_plan,
-        backend_plan: plan.backend_plan.encode_to_vec(),
         query_plan: plan.query_plan,
         storage_routing: None,
         adaptation_evidence: vec![],
@@ -1293,8 +1294,9 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     legacy.precompute_plan.ingest.require_registered_producer = false;
     legacy.precompute_plan.producers.clear();
     legacy.transmission_plan.rules.clear();
-    let artifact = serde_json::json!({"precompute_plan": legacy.precompute_plan,
-        "transmission_plan": legacy.transmission_plan, "backend_plan": legacy.backend_plan.encode_to_vec(),
+    let artifact = serde_json::json!({"summary_catalog": legacy.summary_catalog,
+        "collector_plans": legacy.collector_plans, "precompute_plan": legacy.precompute_plan,
+        "transmission_plan": legacy.transmission_plan,
         "query_plan": legacy.query_plan, "storage_routing": null, "adaptation_evidence": []});
     let built = data_plane::drivers::query::servers::http::build_active_physical_plan(
         serde_json::from_value(artifact.clone()).unwrap(),

@@ -209,7 +209,8 @@ fn planned_capability(
                 planner_types::post_asap::ExactKind::Sum
                 | planner_types::post_asap::ExactKind::Count => asap_types::AggregationType::Sum,
                 planner_types::post_asap::ExactKind::Increase
-                | planner_types::post_asap::ExactKind::Rate => {
+                | planner_types::post_asap::ExactKind::Rate
+                | planner_types::post_asap::ExactKind::IRate => {
                     asap_types::AggregationType::Increase
                 }
                 planner_types::post_asap::ExactKind::MinMax => asap_types::AggregationType::MinMax,

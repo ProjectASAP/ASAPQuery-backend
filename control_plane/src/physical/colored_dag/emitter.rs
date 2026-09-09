@@ -117,6 +117,7 @@ fn classify(expr: &PhysicalExpr) -> NodeKind<'_> {
             SummaryExpr::SummaryEstimate { query, .. } => NodeKind::SketchEstimate { query },
             SummaryExpr::SummaryMerge { .. } => NodeKind::SketchMerge,
             SummaryExpr::BinaryOp { .. }
+            | SummaryExpr::ValueOperation { .. }
             | SummaryExpr::SummaryJoin { .. }
             | SummaryExpr::SummarySubtract { .. }
             | SummaryExpr::SummaryDelete { .. } => NodeKind::Other,

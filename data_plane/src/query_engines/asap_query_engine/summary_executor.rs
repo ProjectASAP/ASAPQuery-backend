@@ -98,8 +98,8 @@ pub struct QueryExecutionContext<'a> {
     /// `readout_cumulative`); `false` for a per-window matrix (one merged
     /// answer per window, via `readout_per_window`).
     pub is_cumulative: bool,
-    /// Materializations authorized by the active BackendPlan's warm routes.
-    /// `None` is the explicit legacy/no-plan mode; `Some` fails closed and
+    /// Materializations authorized by the installed QueryPlan bindings.
+    /// `None` is the explicit dynamic-test mode; `Some` fails closed and
     /// excludes stale or unrelated SIDs even when their metric/family match.
     pub allowed_materializations: Option<BTreeSet<asap_types::PolicyFingerprint>>,
 }
@@ -453,8 +453,9 @@ impl QueryExecutionContext<'_> {
             }
             Ok(())
         };
-        let required_keys: BTreeSet<_> = binding.sid_grouping.iter().cloned().collect();
-        let mut sids = self.index.sids_for_policy(binding.materialization);
+        let mut sids = self
+            .index
+            .sids_for_policy(binding.materialization.fingerprint());
         sids.sort_unstable();
         sids.dedup();
         let mut matched_metadata = 0usize;
@@ -464,10 +465,7 @@ impl QueryExecutionContext<'_> {
             let candidate = self
                 .index
                 .with_instance(sid, |meta| {
-                    if meta.policy_fp != binding.materialization
-                        || meta.metric_name != binding.metric
-                        || meta.group_by_keys != required_keys
-                    {
+                    if meta.policy_fp != binding.materialization.fingerprint() {
                         return None;
                     }
                     match &meta.agg_kind {
@@ -504,6 +502,24 @@ impl QueryExecutionContext<'_> {
                     });
                 }
                 Candidate::ExactAgg(agg_type) => {
+                    if matches!(
+                        agg_type,
+                        AggregationType::Increase | AggregationType::MultipleIncrease
+                    ) {
+                        // Counter pane statistics are sufficient for Prometheus
+                        // extrapolatedRate only when no query boundary cuts a
+                        // pane. A partial pane would require its first/last
+                        // in-range raw sample, which this SDS intentionally
+                        // does not retain. Fail closed to the exact subtree.
+                        let coverage = self
+                            .index
+                            .exact_agg_coverage_bounds(sid, self.t0_ms, self.t1_ms);
+                        if coverage != Some((self.t0_ms, self.t1_ms)) {
+                            return Err(SummaryExecutorError::Unsupported(
+                                "counter SDS requires full-pane query coverage",
+                            ));
+                        }
+                    }
                     if matches!(
                         agg_type,
                         AggregationType::MinMax | AggregationType::MultipleMinMax
@@ -566,8 +582,7 @@ impl QueryExecutionContext<'_> {
         }
         if by_group.is_empty() {
             tracing::debug!(
-                metric = %binding.metric,
-                materialization = %binding.materialization,
+                materialization = %binding.materialization.as_u64(),
                 ?sids,
                 matched_metadata,
                 t0_ms = self.t0_ms,
@@ -1240,10 +1255,6 @@ fn find_metric(node: &SummaryNode) -> Option<String> {
     }
 }
 
-pub(crate) fn find_metric_in_query_expr_from_summary(node: &SummaryNode) -> Option<String> {
-    find_metric(node)
-}
-
 /// Walk a canonical `QueryExpr` down to its first `Scan {
 /// source: Source::TimeSeries { metric }, .. }` to recover the target
 /// metric name. Shared with `post_asap_planner.rs`'s observed-family lookup
@@ -1689,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_plan_materialization_filter_excludes_stale_sid() {
+    fn query_plan_materialization_filter_excludes_stale_sid() {
         let idx = SketchStore::new();
         let mut stale = kll_meta(1, "latency_ms", &[]);
         stale.policy_fp = asap_types::PolicyFingerprint(10);

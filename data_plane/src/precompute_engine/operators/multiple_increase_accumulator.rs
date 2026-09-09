@@ -16,14 +16,6 @@ pub struct MultipleIncreaseAccumulator {
     pub increases: HashMap<KeyByLabelValues, IncreaseAccumulator>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct MeasurementData {
-    starting_measurement: f64,
-    starting_timestamp: i64,
-    last_seen_measurement: f64,
-    last_seen_timestamp: i64,
-}
-
 impl MultipleIncreaseAccumulator {
     pub fn new() -> Self {
         Self {

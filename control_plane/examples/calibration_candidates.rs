@@ -32,6 +32,15 @@ fn planner_forest(queries: &[control_plane::physical::compiler::PlanningQuery]) 
                 vec![lhs, rhs],
                 json!({"operator_debug":format!("{operator:?}")}),
             ),
+            SummaryExpr::ValueOperation {
+                child,
+                operation,
+                timing,
+            } => (
+                "ValueOperation",
+                vec![child],
+                json!({"operation_debug":format!("{operation:?}"),"timing_debug":format!("{timing:?}")}),
+            ),
             SummaryExpr::SummaryAgg {
                 child,
                 family,
@@ -126,9 +135,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "manifest": manifest,
             "lifecycle_estimates": plan.lifecycle_estimates,
             "install_request": {
+                "summary_catalog": plan.summary_catalog,
+                "collector_plans": plan.collector_plans,
                 "precompute_plan": plan.precompute_plan,
                 "transmission_plan": plan.transmission_plan,
-                "backend_plan": plan.backend_plan.encode_to_vec(),
                 "query_plan": plan.query_plan,
                 "storage_routing": null,
                 "adaptation_evidence": []

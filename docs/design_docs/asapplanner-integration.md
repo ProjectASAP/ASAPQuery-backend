@@ -135,7 +135,7 @@ One selected DAG can produce several execution projections:
 - PrecomputePlan: how the selected state is built and maintained.
 - TransmissionPlan and optional CollectorPlan: how distributed producers
   implement and deliver that state.
-- BackendPlan: compatible storage, catalog and routing bindings.
+- SummaryCatalog: canonical summary/data descriptors and stable materialization identities.
 - QueryPlan: executable reads, merges, readouts and remaining exact operations.
 
 These projections may expand one semantic node into several physical tasks.
@@ -302,6 +302,6 @@ backend's scoped consolidation through steps 1–6.
 
 - [Physical compiler](../developer_docs/control-plane/physical-compiler.md)
 - [Plan publication](../developer_docs/control-plane/plan-publication.md)
-- [Backend plan runtime](../developer_docs/query-engine/backend-plan-runtime.md)
+- [Catalog-backed physical-plan runtime](../developer_docs/query-engine/backend-plan-runtime.md)
 - [ASAPQuery compatibility profile](asapquery-compatibility-profile.md)
 - [Runtime accuracy feedback](../developer_docs/control-plane/runtime-accuracy-feedback.md)

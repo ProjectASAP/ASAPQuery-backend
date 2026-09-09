@@ -1,10 +1,7 @@
 //! `RoutingIndex` — a metric-bucketed structural index over a
-//! [`PolicyRegistry`], per `control_plane/docs/design-backend-plan-wire-format.md`
-//! §4's Tier-1/Tier-2 design (currently sourced from `PolicyRegistry` — the
-//! content-addressed view over `StreamingConfig`'s `AggregationConfig`s,
-//! which is genuinely "what control_plane planned" today, not a
-//! reconstruction from ingest-side-effects — pending that doc's `BackendPlan`
-//! wire format actually existing).
+//! [`PolicyRegistry`]. It is sourced from the content-addressed view over a
+//! `StreamingConfig`'s `AggregationConfig`s, so it represents planned policy
+//! rather than a reconstruction from ingest side effects.
 //!
 //! **Tier 1** (exact `PolicyFingerprint` → config) is [`PolicyRegistry::get`]
 //! itself — already O(1), nothing to add here.

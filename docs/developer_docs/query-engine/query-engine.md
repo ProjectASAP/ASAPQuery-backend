@@ -1,14 +1,14 @@
 # Developing query routing and summary readout
 
 > Interface status: target public API. Summary execution and fallback exist;
-> BackendPlan is still replacing legacy routing and local query-shape logic.
+> catalog-backed QueryPlan routing is replacing legacy local query-shape logic.
 
 ## 1. Code architecture
 
 ```text
 protocol request -> QueryAdapter -> QueryService
                                       |
-                           BackendPlanSnapshot
+                    SummaryCatalog + QueryPlan
                               /              \
                          SummaryReader    ExactQueryClient
                               \              /
@@ -50,7 +50,8 @@ pub trait SummaryReader {
         &self,
         request: &QueryRequest,
         route: &SummaryRoute,
-        plan: &BackendPlanSnapshot,
+        catalog: &SummaryCatalog,
+        plan: &QueryPlan,
     ) -> Result<SummaryReadout, Self::Error>;
 }
 
@@ -111,7 +112,7 @@ coverage and guarantee.
 ### Add a readout/operator
 
 1. Add the logical semantics and guarantee to ASAPPlanner.
-2. Extend public backend readout capability and BackendPlan route types.
+2. Extend public backend readout capability and QueryPlan node and catalog-binding types.
 3. Implement it through `SummaryReader`; do not parse and choose a family again.
 4. Return labels/timestamps/result type through `PrometheusResult`.
 5. Compare with the exact backend over identical series and logical range.

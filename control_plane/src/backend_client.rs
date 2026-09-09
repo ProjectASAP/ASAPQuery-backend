@@ -325,38 +325,43 @@ impl BackendClient {
         }
     }
 
-    /// POST an encoded `BackendPlan` (protobuf bytes) to the backend's
-    /// `POST /api/v1/backend-plan` endpoint (see
-    /// `control_plane/docs/design-backend-plan-wire-format.md`), sent
-    /// alongside the streaming-config/storage-routing push, not in place
-    /// of it (see `emit::backend_push`'s call site). Same
-    /// transient/permanent classification as the other typed POST
-    /// methods.
-    pub async fn post_backend_plan_typed(
+    /// Publish one authoritative catalog generation and all plans that reference it.
+    pub async fn post_catalog_plan_typed(
         &self,
-        bytes: Vec<u8>,
+        publication: &crate::physical::publication::PhysicalPlanPublication,
+        storage_routing: Option<serde_json::Value>,
+        adaptation_evidence: &[crate::physical::compiler::RuntimeAdaptationEvidence],
     ) -> std::result::Result<(), BackendPostError> {
-        let url = derive_backend_plan_url(&self.endpoint);
-        debug!(
-            endpoint = %url,
-            plan_bytes = bytes.len(),
-            "posting BackendPlan to ASAPQuery-backend (typed)"
+        publication
+            .validate()
+            .map_err(|error| BackendPostError::Permanent(anyhow::anyhow!(error)))?;
+        let mut body = serde_json::to_value(publication)
+            .map_err(|error| BackendPostError::Permanent(error.into()))?;
+        let fields = body
+            .as_object_mut()
+            .expect("publication serializes as object");
+        fields.insert("storage_routing".into(), serde_json::json!(storage_routing));
+        fields.insert(
+            "adaptation_evidence".into(),
+            serde_json::json!(adaptation_evidence),
         );
-        let resp = self
+        let response = self
             .http
-            .post(&url)
-            .header("content-type", "application/x-protobuf")
-            .body(bytes)
+            .post(derive_physical_plan_url(&self.endpoint))
+            .json(&body)
             .send()
             .await
             .map_err(classify_reqwest_error)?;
-
-        let status = resp.status();
+        let status = response.status();
         if status.is_success() {
             Ok(())
         } else {
-            let body = resp.text().await.unwrap_or_default();
-            Err(classify_http_status(status, body, "BackendPlan POST"))
+            let body = response.text().await.unwrap_or_default();
+            Err(classify_http_status(
+                status,
+                body,
+                "catalog physical-plan POST",
+            ))
         }
     }
 
@@ -367,19 +372,40 @@ impl BackendClient {
         &self,
         precompute_plan: &crate::physical::compiler::PrecomputePlan,
         transmission_plan: &crate::physical::compiler::TransmissionPlan,
-        backend_plan: Vec<u8>,
         query_plan: &crate::query_plan::QueryPlan,
         storage_routing: Option<serde_json::Value>,
         adaptation_evidence: &[crate::physical::compiler::RuntimeAdaptationEvidence],
     ) -> std::result::Result<(), BackendPostError> {
+        // Compatibility replanner has no Planner-selected query/collector DAG.
+        // Still publish the actual catalog and bind every provided projection.
+        let catalog = crate::physical::summary_catalog::SummaryCatalog::from_materializations(
+            precompute_plan.envelope.plan_id,
+            precompute_plan.envelope.plan_version,
+            &precompute_plan.materializations,
+        )
+        .map_err(|error| BackendPostError::Permanent(error.into()))?;
+        let mut precompute_plan = precompute_plan.clone();
+        precompute_plan
+            .bind_catalog(&catalog)
+            .map_err(|error| BackendPostError::Permanent(error.into()))?;
+        let mut transmission_plan = transmission_plan.clone();
+        transmission_plan.summary_catalog = Some(
+            catalog
+                .reference()
+                .map_err(|error| BackendPostError::Permanent(error.into()))?,
+        );
+        query_plan
+            .validate_against_catalog(&catalog)
+            .map_err(|error| BackendPostError::Permanent(error.into()))?;
         let url = derive_physical_plan_url(&self.endpoint);
         let response = self
             .http
             .post(&url)
             .json(&serde_json::json!({
+            "summary_catalog": catalog,
+            "collector_plans": [],
             "precompute_plan": precompute_plan,
             "transmission_plan": transmission_plan,
-            "backend_plan": backend_plan,
             "query_plan": query_plan,
             "storage_routing": storage_routing,
             "adaptation_evidence": adaptation_evidence,
@@ -478,21 +504,6 @@ fn derive_storage_routing_url(endpoint: &str) -> String {
     }
     if let Some(stripped) = endpoint.strip_suffix(STREAMING_PATH_UNDERSCORE) {
         return format!("{stripped}{ROUTING_PATH}");
-    }
-    endpoint.to_string()
-}
-
-/// Map a streaming-config endpoint URL to the sibling `backend-plan`
-/// endpoint, same rewrite convention as [`derive_storage_routing_url`].
-fn derive_backend_plan_url(endpoint: &str) -> String {
-    const STREAMING_PATH_DASH: &str = "/api/v1/streaming-config";
-    const STREAMING_PATH_UNDERSCORE: &str = "/api/v1/streaming_config";
-    const PLAN_PATH: &str = "/api/v1/backend-plan";
-    if let Some(stripped) = endpoint.strip_suffix(STREAMING_PATH_DASH) {
-        return format!("{stripped}{PLAN_PATH}");
-    }
-    if let Some(stripped) = endpoint.strip_suffix(STREAMING_PATH_UNDERSCORE) {
-        return format!("{stripped}{PLAN_PATH}");
     }
     endpoint.to_string()
 }
@@ -650,70 +661,48 @@ mod tests {
         assert_eq!(derive_storage_routing_url("http://x/foo"), "http://x/foo");
     }
 
-    #[test]
-    fn backend_plan_url_rewrites_streaming_path() {
-        assert_eq!(
-            derive_backend_plan_url("http://backend:8088/api/v1/streaming-config"),
-            "http://backend:8088/api/v1/backend-plan"
-        );
-        assert_eq!(
-            derive_backend_plan_url("http://backend:8088/api/v1/streaming_config"),
-            "http://backend:8088/api/v1/backend-plan"
-        );
-    }
-
-    #[test]
-    fn backend_plan_url_preserves_unknown_paths_for_tests() {
-        assert_eq!(
-            derive_backend_plan_url("http://127.0.0.1:1/api/v1/backend-plan"),
-            "http://127.0.0.1:1/api/v1/backend-plan"
-        );
-        assert_eq!(derive_backend_plan_url("http://x/foo"), "http://x/foo");
-    }
-
     #[tokio::test]
-    async fn backend_plan_post_round_trips_bytes_via_url_rewrite() {
-        let hits: StdArc<Mutex<Vec<Vec<u8>>>> = StdArc::new(Mutex::new(Vec::new()));
-        let hits_for_route = hits.clone();
+    async fn catalog_publication_posts_canonical_document_without_legacy_bytes() {
+        let snapshot: crate::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../docs/examples/asapquery-planning-snapshot.json"
+            ))
+            .unwrap();
+        let publication = snapshot.compile().unwrap().publication().unwrap();
+        let hits: StdArc<Mutex<Vec<serde_json::Value>>> = StdArc::new(Mutex::new(Vec::new()));
+        let route_hits = hits.clone();
         let app = Router::new().route(
-            "/api/v1/backend-plan",
-            post(move |body: axum::body::Bytes| {
-                let hits = hits_for_route.clone();
+            "/api/v1/physical-plan",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let hits = route_hits.clone();
                 async move {
-                    hits.lock().unwrap().push(body.to_vec());
+                    hits.lock().unwrap().push(body);
                     axum::http::StatusCode::OK
                 }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
         let client = BackendClient::new(format!("http://{addr}/api/v1/streaming-config"));
-        let bytes = vec![1u8, 2, 3, 4];
         client
-            .post_backend_plan_typed(bytes.clone())
+            .post_catalog_plan_typed(&publication, None, &[])
             .await
-            .expect("backend-plan post ok");
-
-        let received = hits.lock().unwrap();
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0], bytes);
-    }
-
-    #[tokio::test]
-    async fn backend_plan_post_404_is_transient() {
-        let sink = SharedSink(StdArc::new(Mutex::new(Vec::new())));
-        let url = start_mock_backend(sink.clone(), axum::http::StatusCode::NOT_FOUND).await;
-        let client = BackendClient::new(url);
-        let err = client
-            .post_backend_plan_typed(vec![1, 2, 3])
-            .await
-            .expect_err("404 should surface as Err");
-        assert!(err.is_transient(), "404 must classify as transient: {err}");
+            .unwrap();
+        let bodies = hits.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        for field in [
+            "summary_catalog",
+            "precompute_plan",
+            "collector_plans",
+            "transmission_plan",
+            "query_plan",
+        ] {
+            assert!(bodies[0].get(field).is_some(), "missing {field}");
+        }
+        server.abort();
     }
 
     /// Phase α: full happy path. A mock backend hosts the storage

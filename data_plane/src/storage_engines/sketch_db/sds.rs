@@ -4,7 +4,7 @@
 //! Descriptors are content-interned and shared by every materialized instance;
 //! pane-local state remains in `SketchStore`.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock, Weak};
 
 use super::data::{AggKind, SketchConfig};
@@ -101,48 +101,90 @@ pub struct SummaryDescriptorRegistry {
     // registry must not turn retired materializations into a permanent leak.
     summaries: RwLock<HashMap<SummaryDescriptorId, Weak<SummaryDescriptor>>>,
     data: RwLock<HashMap<DataDescriptorId, Weak<DataDescriptor>>>,
+    authoritative_catalog: RwLock<Option<Arc<asap_types::summary_catalog::SummaryCatalog>>>,
 }
 
 impl SummaryDescriptorRegistry {
-    pub fn bind(&self, metadata: SketchInstanceMetadata) -> SdsBinding {
-        let summary_id = summary_descriptor_id(&metadata.agg_kind);
+    pub fn install_catalog(
+        &self,
+        catalog: Arc<asap_types::summary_catalog::SummaryCatalog>,
+    ) -> Result<(), asap_types::summary_catalog::SummaryCatalogError> {
+        catalog.validate()?;
+        *self.authoritative_catalog.write().unwrap() = Some(catalog);
+        Ok(())
+    }
+
+    pub fn authoritative_catalog(
+        &self,
+    ) -> Option<Arc<asap_types::summary_catalog::SummaryCatalog>> {
+        self.authoritative_catalog.read().unwrap().clone()
+    }
+
+    pub fn bind(&self, metadata: SketchInstanceMetadata) -> Result<SdsBinding, String> {
+        let authoritative = self.authoritative_catalog.read().unwrap().clone();
+        let configured = if let Some(catalog) = authoritative.as_ref() {
+            if metadata.policy_fp.is_unset() {
+                return Err(
+                    "materialization identity is required by the installed SummaryCatalog".into(),
+                );
+            }
+            let materialization = asap_types::sds::MaterializationId::from(metadata.policy_fp);
+            let identity = catalog
+                .materializations
+                .get(&materialization)
+                .ok_or_else(|| {
+                    format!(
+                        "materialization {} is absent from the installed SummaryCatalog",
+                        materialization.as_u64()
+                    )
+                })?;
+            Some((
+                catalog.summary_descriptors[&identity.summary_descriptor_id].clone(),
+                catalog.data_descriptors[&identity.data_descriptor_id].clone(),
+            ))
+        } else {
+            None
+        };
+        let summary = configured
+            .as_ref()
+            .map(|(summary, _)| summary.clone())
+            .unwrap_or_else(|| legacy_summary(&metadata.agg_kind));
+        let summary_id = summary.id().clone();
         let summary_descriptor = {
             let mut summaries = self.summaries.write().unwrap();
             if let Some(existing) = summaries.get(&summary_id).and_then(Weak::upgrade) {
                 existing
             } else {
-                let descriptor = Arc::new(legacy_summary(&metadata.agg_kind));
+                let descriptor = Arc::new(summary);
                 summaries.insert(summary_id, Arc::downgrade(&descriptor));
                 descriptor
             }
         };
 
-        let filter = metadata.agg_kind.spatial_filter_canonical();
-        let data_id = data_descriptor_id(
-            &metadata.metric_name,
-            filter,
-            metadata.group_by_keys.iter().map(String::as_str),
-        );
+        let data_descriptor_value = configured.map(|(_, data)| data).unwrap_or_else(|| {
+            DataDescriptor::new(
+                metadata.metric_name.clone(),
+                metadata.agg_kind.spatial_filter_canonical(),
+                metadata.group_by_keys.iter().cloned(),
+            )
+        });
+        let data_id = data_descriptor_value.id().clone();
         let data_descriptor = {
-            let mut data = self.data.write().unwrap();
-            if let Some(existing) = data.get(&data_id).and_then(Weak::upgrade) {
+            let mut data_registry = self.data.write().unwrap();
+            if let Some(existing) = data_registry.get(&data_id).and_then(Weak::upgrade) {
                 existing
             } else {
-                let descriptor = Arc::new(DataDescriptor::new(
-                    metadata.metric_name.clone(),
-                    filter,
-                    metadata.group_by_keys.iter().cloned(),
-                ));
-                data.insert(descriptor.id.clone(), Arc::downgrade(&descriptor));
+                let descriptor = Arc::new(data_descriptor_value);
+                data_registry.insert(descriptor.id.clone(), Arc::downgrade(&descriptor));
                 descriptor
             }
         };
 
-        SdsBinding {
+        Ok(SdsBinding {
             metadata: Arc::new(metadata),
             summary_descriptor,
             data_descriptor,
-        }
+        })
     }
 
     pub fn summary_count(&self) -> usize {
@@ -219,6 +261,7 @@ pub(crate) fn data_descriptor_id<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn metadata(
         sid: u64,
@@ -248,8 +291,12 @@ mod tests {
     #[test]
     fn equivalent_materializations_share_both_descriptors() {
         let registry = SummaryDescriptorRegistry::default();
-        let a = registry.bind(metadata(1, "cpu", r#"{zone="a"}"#, AggregationType::Sum, 7));
-        let b = registry.bind(metadata(2, "cpu", r#"{zone="a"}"#, AggregationType::Sum, 8));
+        let a = registry
+            .bind(metadata(1, "cpu", r#"{zone="a"}"#, AggregationType::Sum, 7))
+            .unwrap();
+        let b = registry
+            .bind(metadata(2, "cpu", r#"{zone="a"}"#, AggregationType::Sum, 8))
+            .unwrap();
 
         assert!(Arc::ptr_eq(&a.summary_descriptor, &b.summary_descriptor));
         assert!(Arc::ptr_eq(&a.data_descriptor, &b.data_descriptor));
@@ -259,8 +306,12 @@ mod tests {
     #[test]
     fn population_changes_only_the_data_descriptor() {
         let registry = SummaryDescriptorRegistry::default();
-        let a = registry.bind(metadata(1, "cpu", r#"{zone="a"}"#, AggregationType::Sum, 7));
-        let b = registry.bind(metadata(2, "cpu", r#"{zone="b"}"#, AggregationType::Sum, 7));
+        let a = registry
+            .bind(metadata(1, "cpu", r#"{zone="a"}"#, AggregationType::Sum, 7))
+            .unwrap();
+        let b = registry
+            .bind(metadata(2, "cpu", r#"{zone="b"}"#, AggregationType::Sum, 7))
+            .unwrap();
 
         assert!(Arc::ptr_eq(&a.summary_descriptor, &b.summary_descriptor));
         assert!(!Arc::ptr_eq(&a.data_descriptor, &b.data_descriptor));
@@ -270,8 +321,12 @@ mod tests {
     #[test]
     fn operator_changes_only_the_summary_descriptor() {
         let registry = SummaryDescriptorRegistry::default();
-        let a = registry.bind(metadata(1, "cpu", "", AggregationType::Sum, 7));
-        let b = registry.bind(metadata(2, "cpu", "", AggregationType::MinMax, 7));
+        let a = registry
+            .bind(metadata(1, "cpu", "", AggregationType::Sum, 7))
+            .unwrap();
+        let b = registry
+            .bind(metadata(2, "cpu", "", AggregationType::MinMax, 7))
+            .unwrap();
 
         assert!(!Arc::ptr_eq(&a.summary_descriptor, &b.summary_descriptor));
         assert!(Arc::ptr_eq(&a.data_descriptor, &b.data_descriptor));
@@ -281,11 +336,59 @@ mod tests {
     #[test]
     fn registry_does_not_retain_descriptors_after_bindings_are_dropped() {
         let registry = SummaryDescriptorRegistry::default();
-        let binding = registry.bind(metadata(1, "cpu", "", AggregationType::Sum, 7));
+        let binding = registry
+            .bind(metadata(1, "cpu", "", AggregationType::Sum, 7))
+            .unwrap();
         assert_eq!((registry.summary_count(), registry.data_count()), (1, 1));
 
         drop(binding);
         registry.prune();
         assert_eq!((registry.summary_count(), registry.data_count()), (0, 0));
+    }
+
+    #[test]
+    fn configured_materializations_bind_only_to_authoritative_catalog_descriptors() {
+        use asap_types::summary_catalog::SummaryCatalog;
+
+        let summary = SummaryDescriptor::new(
+            SummaryOperator::ExactAgg {
+                agg_type: AggregationType::Sum,
+                parameters_canonical: "authoritative=true".into(),
+            },
+            FidelityGuarantee::Exact,
+            1,
+        )
+        .unwrap();
+        let data = DataDescriptor::new("cpu", r#"{zone="a"}"#, ["job".into()]);
+        let catalog = SummaryCatalog::build(
+            7,
+            1,
+            [(
+                asap_types::PolicyFingerprint(7),
+                summary.clone(),
+                data.clone(),
+            )],
+        )
+        .unwrap();
+        let registry = SummaryDescriptorRegistry::default();
+        registry.install_catalog(Arc::new(catalog)).unwrap();
+
+        let binding = registry
+            .bind(metadata(
+                1,
+                "wrong-local-copy",
+                "",
+                AggregationType::MinMax,
+                7,
+            ))
+            .unwrap();
+        assert_eq!(binding.summary_descriptor.as_ref(), &summary);
+        assert_eq!(binding.data_descriptor.as_ref(), &data);
+        assert!(registry
+            .bind(metadata(2, "cpu", "", AggregationType::Sum, 8))
+            .is_err());
+        assert!(registry
+            .bind(metadata(3, "cpu", "", AggregationType::Sum, 0))
+            .is_err());
     }
 }

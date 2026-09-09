@@ -27,9 +27,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "cost_comparison": comparison,
             "lifecycle_estimates": plan.lifecycle_estimates,
             "install_request": {
+                "summary_catalog": plan.summary_catalog,
+                "collector_plans": plan.collector_plans,
                 "precompute_plan": plan.precompute_plan,
                 "transmission_plan": plan.transmission_plan,
-                "backend_plan": plan.backend_plan.encode_to_vec(),
                 "query_plan": plan.query_plan,
                 "storage_routing": null,
                 "adaptation_evidence": []

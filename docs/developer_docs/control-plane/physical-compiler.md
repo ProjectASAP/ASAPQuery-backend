@@ -8,8 +8,9 @@
 The compiler consumes ASAPPlanner types pinned to the revision exposed as
 `physical::compiler::PLANNER_REVISION`, selects
 from Planner's legal candidate space with backend-owned cost and evidence
-inputs, and emits one `PhysicalPlan`. The plan contains CollectorPlan,
-PrecomputePlan, BackendPlan, and QueryPlan projections compiled from the same decision
+inputs, and emits one `PhysicalPlan`. The plan contains one SummaryCatalog plus
+CollectorPlan, PrecomputePlan, TransmissionPlan, and QueryPlan projections
+compiled from the same decision
 for every target collector. Legacy
 `StageAllocator`/`ThreeStageEmitter` paths remain for older publication flows;
 they are not a second semantic planner.
@@ -47,8 +48,8 @@ PhysicalCompiler -------> PhysicalPlan
 - **Physical compiler** enumerates concrete window/pane/state-layout,
   placement, transport, and runtime implementations without changing the
   Planner-owned abstract framework.
-- **PhysicalPlan** is the only output passed to publication. Its CollectorPlan,
-  PrecomputePlan, BackendPlan, and QueryPlan projections are created together and share identities.
+- **PhysicalPlan** is the only output passed to publication. Its SummaryCatalog,
+  CollectorPlan, PrecomputePlan, TransmissionPlan, and QueryPlan are created together and share identities.
 
 Logical query parsing, summary alternatives, guarantees, and candidate search
 remain public ASAPPlanner interfaces. Runtime publication is documented in
@@ -128,10 +129,10 @@ pub struct DeploymentEnvironment {
 
 pub struct PhysicalPlan {
     pub envelope: PlanEnvelope,
+    pub summary_catalog: SummaryCatalog,
     pub collector_plans: Vec<CollectorPlan>, // complete per-target projections
     pub precompute_plan: PrecomputePlan,      // backend streaming materializations
     pub transmission_plan: TransmissionPlan,  // producer/frame wire contract
-    pub backend_plan: BackendPlan,
     pub query_plan: QueryPlan,                // node-ID physical serving DAG
 }
 ```
@@ -145,7 +146,7 @@ Supporting public types:
 | `CollectorPlan` | Serializable execution projection consumed by ASAPCollector. |
 | `PrecomputePlan` | Authoritative materialization, ingest, state-schema, and producer contract consumed directly by the backend runtime. |
 | `TransmissionPlan` | Exact per-producer mode, encoding, cadence, destination, checkpoint policy, and frame identity contract. |
-| `BackendPlan` | Versioned public data-plane materialization/routing contract defined in this repository. |
+| `SummaryCatalog` | Authoritative immutable descriptor and materialization-identity snapshot. |
 | `QueryPlan` | Canonical-query keyed executable DAG with exact materialization bindings and fallback policy. |
 
 Current MVP limits are explicit: time-series sources and supported summary
@@ -177,7 +178,7 @@ Output definitions:
 | `collector_plans` | One plan per targeted collector, following ASAPCollector's public CollectorPlan schema. |
 | `precompute_plan` | Materializations plus `/v1/metrics` ingest semantics, typed state schemas/encodings, and allowed producers; it is installed directly and contains no query-string jobs. |
 | `transmission_plan` | One rule per producer/materialization/schema binding plus the mandatory frame identity and sequencing scope. |
-| `backend_plan` | Matching data-plane materialization and routing contract. |
+| `summary_catalog` | Canonical descriptors and stable materialization identities shared by every execution plan. |
 | `query_plan` | Canonical query identity, explicit fallback policy, node-ID DAG, and exact per-node materialization bindings. |
 
 ### QueryPlan execution boundary
@@ -254,20 +255,17 @@ The materialization `id` above identifies the maintained summary definition.
 It is not the SID. During collection and ingest, each concrete canonical label
 set under that definition resolves to its own SID.
 
-### What the compiler puts in BackendPlan
+### Catalog and query-serving output
 
-The matching BackendPlan is the consumer and query-serving projection of the
-same decision:
+SummaryCatalog contains the canonical descriptor bindings. QueryPlan contains
+the consumer and query-serving projection of the same decision:
 
-| BackendPlan section | Required content | Consuming ASAPQuery-backend component |
+| Output section | Required content | Consuming ASAPQuery-backend component |
 | --- | --- | --- |
-| envelope | The same plan ID/version, activation/expiry, compatibility identity and Planner revision | Backend plan manager |
-| materialization descriptor | Same materialization fingerprint, canonical metric, retained grouping keys, capability, aggregation kind/parameters, accuracy, policy fingerprint and lifecycle | SID resolver and instance-metadata registry |
-| producers/ingest | Expected Collector/producer IDs, input payload kind, state schema, full/delta lineage and optional backend-precompute placement | OTLP ingest engine and precompute engine |
-| window/coverage | Pane/window compatibility, lateness, expected coverage and merge rules | Ingest validation and summary store |
-| storage | Warm/archive/remote route, retention, retirement and expiry | Summary store engine and archive adapter |
-| query routes | Query IDs or canonical capability match, materialization reference, readout/operator, grouping/window composition and remaining backend operators | Query classifier, router and readout engine |
-| guarantee/fallback | Selected guarantee and explicit exact/archive fallback behavior | Query engine and response metadata |
+| SummaryCatalog | Canonical Summary and Data Descriptors plus stable materialization bindings | Catalog resolver and SummaryStore registry |
+| PrecomputePlan | Backend ingest/update placement, schemas, producers, windows, retention, and lifecycle | Ingest and precompute engines |
+| TransmissionPlan | Producer encoding, cadence, identity, sequencing, delta, and checkpoint rules | Collector transport and ingest validation |
+| QueryPlan | Materialization IDs, readout/operator DAG, grouping/window composition, guarantees, and explicit exact fallback | Query router and DAG executor |
 
 The backend declaration does not contain a pre-enumerated SID for every label
 value. It installs immutable metadata for the materialization; the ingest/SID
@@ -284,7 +282,7 @@ CollectorPlan
   -> full/delta encoder + SID dictionary
   -> exporter
 
-BackendPlan
+SummaryCatalog + QueryPlan
   -> plan installer
   -> ingest validator / optional backend precompute
   -> SID resolver + instance metadata
@@ -294,8 +292,8 @@ BackendPlan
 
 Cross-plan validation proves that every Collector-produced materialization has
 one compatible backend ingest/storage declaration and that every planned query
-route references a declared materialization. A Backend-only precompute has a
-BackendPlan producer but no Collector materialization; a raw pass-through has
+route references a declared materialization. A backend-only precompute has a
+PrecomputePlan producer but no Collector materialization; a raw pass-through has
 matching raw transmission and ingest/archive declarations.
 
 ### Summary frame identity
@@ -337,7 +335,7 @@ identity.
 2. Teach `PhysicalCompiler::compile` how selected operators can be placed on it.
 3. Reject plans requiring an unavailable stage/capability.
 4. Verify the output contains one complete CollectorPlan for every producer and
-   one BackendPlan referencing all produced materializations.
+   one SummaryCatalog and matching QueryPlan referencing all produced materializations.
 
 Interpretation: a successful bundle means both runtime views are complete and
 cross-consistent; it does not mean they have been activated.

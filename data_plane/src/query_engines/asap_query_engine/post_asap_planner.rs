@@ -110,9 +110,9 @@ pub enum LoweringSkip {
     /// outcome, just detected one step earlier so the caller can skip
     /// without even constructing a `QueryExecutionContext`.
     NotRealized,
-    /// ASAPPlanner produced a maintained-summary plan, but the installed
-    /// BackendPlan has no warm route to a materialization with the exact
-    /// source, family and parameters required by that post-ASAP tree.
+    /// ASAPPlanner produced a maintained-summary plan, but no installed
+    /// QueryPlan binding has a ready materialization with the required
+    /// source, family and parameters.
     NoWarmRoute(String),
     /// The tree lowered successfully, but `crate::query_engines::asap_query_engine::summary_exec::execute()`
     /// itself returned `Err` (`NoCandidates`, `MergeKindParamsMismatch`,
@@ -224,155 +224,6 @@ fn observed_family_for_metric(
     None
 }
 
-/// Look up what family/params `plan` says is materialized for `metric` —
-/// the `BackendPlan`-sourced sibling of [`observed_family_for_metric`].
-/// Unlike that function, no reconstruction is needed:
-/// `Materialization.family` already carries the canonical `SketchKind` this
-/// needs, straight off the wire the control plane pushed. Returns the first
-/// matching materialization found (mirrors
-/// `observed_family_for_metric`'s "first sketch-typed one found"
-/// semantics); `None` when the plan has no materialization for this
-/// metric.
-fn observed_families_for_metric_from_plan(
-    plan: &control_plane::backend_plan::BackendPlan,
-    metric: &str,
-) -> Vec<(SketchAlgorithm, SketchParams)> {
-    let mut warm_fingerprints: Vec<_> = plan
-        .routing
-        .iter()
-        .filter(|route| {
-            route.storage_backend == control_plane::backend_plan::StorageBackend::SketchStore
-        })
-        .map(|route| route.materialization)
-        .collect();
-    warm_fingerprints.sort_by_key(|fp| fp.0);
-    warm_fingerprints.dedup();
-    warm_fingerprints.into_iter().filter_map(|fingerprint| {
-        let m = plan.materializations.get(&fingerprint)?;
-        if !matches!(&m.source, planner_types::pre_asap::Source::TimeSeries { metric: mm } if mm == metric)
-        {
-            return None;
-        }
-        match &m.family {
-            planner_types::post_asap::SummaryFamilyType::Sketch(kind, _) => {
-                Some((kind.algorithm().clone(), kind.params().clone()))
-            }
-            _ => None,
-        }
-    }).collect()
-}
-
-pub fn resolve_materializations_for_post_asap(
-    plan: &control_plane::backend_plan::BackendPlan,
-    node: &SummaryNode,
-    query: &str,
-    accuracy: AccuracyTarget,
-) -> Result<std::collections::BTreeSet<asap_types::PolicyFingerprint>, LoweringSkip> {
-    let parsed = control_plane::query_parser::parse_query(query, accuracy)
-        .map_err(|e| LoweringSkip::ParseFailed(e.to_string()))?;
-    let spatial_filter = if parsed.label_filters.is_empty() {
-        String::new()
-    } else {
-        let rendered = parsed
-            .label_filters
-            .iter()
-            .map(|(key, value)| format!("{key}=\"{value}\""))
-            .collect::<Vec<_>>()
-            .join(",");
-        asap_types::utils::normalize_spatial_filter(&rendered)
-    };
-    let required_groups: std::collections::BTreeSet<_> =
-        parsed.group_by_labels.into_iter().collect();
-    let query_window_ms = parsed.time_window.as_millis() as u64;
-
-    fn visit(
-        plan: &control_plane::backend_plan::BackendPlan,
-        node: &SummaryNode,
-        spatial_filter: &str,
-        required_groups: &std::collections::BTreeSet<String>,
-        query_window_ms: u64,
-        resolved: &mut std::collections::BTreeSet<asap_types::PolicyFingerprint>,
-    ) -> Result<(), LoweringSkip> {
-        match &node.expr {
-            SummaryExpr::SummaryAgg { child, family, .. } => {
-                let metric = super::summary_executor::find_metric_in_query_expr_from_summary(child)
-                    .ok_or_else(|| {
-                        LoweringSkip::NoWarmRoute("summary has no time-series source".into())
-                    })?;
-                if !matches!(
-                    family,
-                    planner_types::post_asap::SummaryFamilyType::ExactAggregate(..)
-                        | planner_types::post_asap::SummaryFamilyType::Sketch(..)
-                ) {
-                    return Err(LoweringSkip::NoWarmRoute(format!(
-                        "unsupported maintained family for metric `{metric}`"
-                    )));
-                }
-                let matches: Vec<_> = plan.routing.iter().filter_map(|route| {
-                    (route.storage_backend == control_plane::backend_plan::StorageBackend::SketchStore
-                        && plan.materializations.get(&route.materialization).is_some_and(|m| {
-                            matches!(&m.source, planner_types::pre_asap::Source::TimeSeries { metric: mm } if mm == &metric)
-                                && &m.family == family
-                                && m.spatial_filter == spatial_filter
-                                && required_groups.iter().all(|key| m.group_by.contains(key))
-                                && m.window.size_ms <= query_window_ms
-                        }))
-                    .then_some(route.materialization)
-                }).collect();
-                if matches.is_empty() {
-                    return Err(LoweringSkip::NoWarmRoute(format!(
-                        "no warm BackendPlan route for metric `{metric}` and family `{family:?}`"
-                    )));
-                }
-                resolved.extend(matches);
-                visit(
-                    plan,
-                    child,
-                    spatial_filter,
-                    required_groups,
-                    query_window_ms,
-                    resolved,
-                )
-            }
-            SummaryExpr::SummaryEstimate { summary_input, .. } => visit(
-                plan,
-                summary_input,
-                spatial_filter,
-                required_groups,
-                query_window_ms,
-                resolved,
-            ),
-            SummaryExpr::SummaryMerge { children } => {
-                for child in children {
-                    visit(
-                        plan,
-                        child,
-                        spatial_filter,
-                        required_groups,
-                        query_window_ms,
-                        resolved,
-                    )?;
-                }
-                Ok(())
-            }
-            SummaryExpr::KeepPreAsap(_) => Ok(()),
-            _ => Err(LoweringSkip::NoWarmRoute(
-                "post-ASAP operator is not executable by the warm runtime".into(),
-            )),
-        }
-    }
-    let mut resolved = std::collections::BTreeSet::new();
-    visit(
-        plan,
-        node,
-        &spatial_filter,
-        &required_groups,
-        query_window_ms,
-        &mut resolved,
-    )?;
-    Ok(resolved)
-}
-
 fn query_expr_contains_time_range(qe: &planner_types::pre_asap::QueryExpr) -> bool {
     use planner_types::pre_asap::QueryExpr;
     match qe {
@@ -404,7 +255,10 @@ fn query_expr_contains_rate(qe: &planner_types::pre_asap::QueryExpr) -> bool {
         QueryExpr::Aggregate {
             measures, child, ..
         } => {
-            measures.iter().any(|m| matches!(m, AggIntent::Rate)) || query_expr_contains_rate(child)
+            measures
+                .iter()
+                .any(|m| matches!(m, AggIntent::Rate | AggIntent::IRate))
+                || query_expr_contains_rate(child)
         }
         QueryExpr::Filter { child, .. }
         | QueryExpr::Project { child, .. }
@@ -574,7 +428,7 @@ fn ensure_warm_runtime_support(
     match &node.expr {
         SummaryExpr::SummaryAgg { child, family, .. } => {
             match family {
-                SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => {
+                SummaryFamilyType::ExactAggregate(ExactKind::Rate | ExactKind::IRate, _) => {
                     return Err(LoweringSkip::RateShape)
                 }
                 SummaryFamilyType::ExactAggregate(ExactKind::Sum, _)
@@ -646,7 +500,6 @@ pub fn plan_promql_to_post_asap(
     index: &SketchStore,
     query: &str,
     accuracy: AccuracyTarget,
-    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<Rc<SummaryNode>, LoweringSkip> {
     let qe = control_plane::query_parser::parse_query_expr_canonical(query, accuracy.clone())
         .map_err(|e| LoweringSkip::ParseFailed(e.to_string()))?;
@@ -655,37 +508,19 @@ pub fn plan_promql_to_post_asap(
     }
     let source_has_filter = query_expr_has_filter(&qe);
 
-    // Serving time must reproduce the REAL planning decision, not
-    // independently re-derive one -- see this module's docs. Prefer
-    // reading it straight off an installed `BackendPlan`'s
-    // materializations when one covers this metric --
-    // `Materialization.family` already carries the canonical `SketchKind`, no
-    // `AggregationConfig` reconstruction required (design-backend-plan-wire-format.md
-    // §5). Otherwise fall back to the `SketchStore`-reconstruction path
-    // (`observed_family_for_metric`), which is `None` when this metric
-    // has nothing registered (or only an `ExactAgg` sid, which bypasses
-    // `CostModel` entirely) -- `ObservedFamilyCostModel` then falls back
-    // further to the accuracy-driven default.
+    // This dynamic lowering path is retained for isolated executor tests.
+    // Production serving executes the installed QueryPlan and resolves its
+    // MaterializationId bindings through SummaryCatalog.
     let metric = find_metric_in_query_expr(&qe);
-    let mut observed = metric
+    let mut observed = Vec::new();
+    if let Some(family) = metric
         .as_deref()
-        .and_then(|metric| {
-            backend_plan.map(|plan| observed_families_for_metric_from_plan(plan, metric))
-        })
-        .unwrap_or_default();
-    if observed.is_empty() {
-        if let Some(family) = metric
-            .as_deref()
-            .and_then(|metric| observed_family_for_metric(index, metric))
-        {
-            observed.push(family);
-        }
+        .and_then(|metric| observed_family_for_metric(index, metric))
+    {
+        observed.push(family);
     }
-    // No installed family means the planner may use its accuracy-driven
-    // default. With a BackendPlan, try every family materialized for the
-    // metric: a fingerprint does not uniquely identify query semantics,
-    // and choosing the first family could incorrectly fall back while a
-    // later materialization is an exact match.
+    // No observed family means the test-only planner may use its
+    // accuracy-driven default.
     let candidates: Vec<_> = if observed.is_empty() {
         vec![None]
     } else {
@@ -726,20 +561,6 @@ pub fn plan_promql_to_post_asap(
                         last_skip = skip;
                         continue;
                     }
-                    if let Some(plan) = backend_plan {
-                        match resolve_materializations_for_post_asap(
-                            plan,
-                            &node,
-                            query,
-                            accuracy.clone(),
-                        ) {
-                            Ok(_) => return Ok(node),
-                            Err(skip) => {
-                                last_skip = skip;
-                                continue;
-                            }
-                        }
-                    }
                     return Ok(node);
                 }
             }
@@ -769,8 +590,7 @@ mod tests {
     #[test]
     fn rate_query_is_skipped_before_binding() {
         let idx = empty_index();
-        let result =
-            plan_promql_to_post_asap(&idx, "rate(http_requests_total[5m])", accuracy(), None);
+        let result = plan_promql_to_post_asap(&idx, "rate(http_requests_total[5m])", accuracy());
         assert!(
             matches!(result, Err(LoweringSkip::RateShape)),
             "expected RateShape, got {result:?}"
@@ -780,8 +600,7 @@ mod tests {
     #[test]
     fn irate_query_is_skipped_before_binding() {
         let idx = empty_index();
-        let result =
-            plan_promql_to_post_asap(&idx, "irate(http_requests_total[5m])", accuracy(), None);
+        let result = plan_promql_to_post_asap(&idx, "irate(http_requests_total[5m])", accuracy());
         assert!(
             matches!(result, Err(LoweringSkip::RateShape)),
             "expected RateShape, got {result:?}"
@@ -791,7 +610,7 @@ mod tests {
     #[test]
     fn unparseable_query_is_skipped() {
         let idx = empty_index();
-        let result = plan_promql_to_post_asap(&idx, "this is not promql (((", accuracy(), None);
+        let result = plan_promql_to_post_asap(&idx, "this is not promql (((", accuracy());
         assert!(
             matches!(result, Err(LoweringSkip::ParseFailed(_))),
             "expected ParseFailed, got {result:?}"
@@ -811,7 +630,7 @@ mod tests {
         // expression stays one opaque `Logical` blob, which this module
         // surfaces as `NotRealized`.
         let idx = empty_index();
-        let result = plan_promql_to_post_asap(&idx, "http_requests_total", accuracy(), None);
+        let result = plan_promql_to_post_asap(&idx, "http_requests_total", accuracy());
         assert!(
             matches!(result, Err(LoweringSkip::NotRealized)),
             "expected NotRealized, got {result:?}"
@@ -832,13 +651,9 @@ mod tests {
         // falls back to the accuracy-driven default -- same outcome as
         // before this module started consulting the `SketchStore`.
         let idx = empty_index();
-        let node = plan_promql_to_post_asap(
-            &idx,
-            "count_over_time(http_requests_total[5m])",
-            accuracy(),
-            None,
-        )
-        .expect("Frequency intent must realize via bind_query_expr/ControlPlaneCostModel");
+        let node =
+            plan_promql_to_post_asap(&idx, "count_over_time(http_requests_total[5m])", accuracy())
+                .expect("Frequency intent must realize via bind_query_expr/ControlPlaneCostModel");
         assert!(
             !matches!(node.expr, SummaryExpr::KeepPreAsap(_)),
             "expected a real SummaryAgg/SummaryEstimate binding, got Logical (the gap \
@@ -850,13 +665,9 @@ mod tests {
     #[test]
     fn execution_hints_come_from_post_asap_dag() {
         let idx = empty_index();
-        let ranged = plan_promql_to_post_asap(
-            &idx,
-            "quantile_over_time(0.99, latency[5m])",
-            accuracy(),
-            None,
-        )
-        .expect("quantile plan");
+        let ranged =
+            plan_promql_to_post_asap(&idx, "quantile_over_time(0.99, latency[5m])", accuracy())
+                .expect("quantile plan");
         assert_eq!(
             execution_hints(&ranged),
             PostAsapExecutionHints {
@@ -867,7 +678,7 @@ mod tests {
         );
 
         let plain_sum =
-            plan_promql_to_post_asap(&idx, "sum(requests)", accuracy(), None).expect("sum plan");
+            plan_promql_to_post_asap(&idx, "sum(requests)", accuracy()).expect("sum plan");
         assert_eq!(
             execution_hints(&plain_sum),
             PostAsapExecutionHints {
@@ -889,168 +700,10 @@ mod tests {
             &idx,
             "topk(5, sum by (host) (rate(http_requests_total[5m])))",
             accuracy(),
-            None,
         );
         assert!(
             matches!(result, Err(LoweringSkip::NotRealized) | Err(LoweringSkip::RateShape)),
             "expected NotRealized or RateShape (both are valid skips for this shape), got {result:?}"
         );
-    }
-
-    // ── BackendPlan-sourced family lookup (design-backend-plan-wire-format.md §5) ────
-
-    mod backend_plan_cutover {
-        use super::*;
-        use crate::storage_engines::sketch_db::index::{
-            AccuracyBound, Capability, SketchAlgorithm, SketchInstanceMetadata,
-        };
-        use asap_types::enums::WindowKind;
-        use control_plane::backend_plan::{
-            BackendPlan, Materialization, RoutingEntry, StorageBackend, WindowSpec,
-        };
-        use planner_types::pre_asap::{ColumnRef, Source};
-        use std::collections::HashMap;
-
-        fn register_kll(idx: &SketchStore, metric: &str) {
-            let cfg = SketchConfig::Kll { k: 269 };
-            idx.register(SketchInstanceMetadata {
-                sid: 1,
-                metric_name: metric.to_string(),
-                group_by_keys: Default::default(),
-                capability: Some(Capability::QuantileApprox(Some(SketchAlgorithm::Kll))),
-                agg_kind: AggKind::Sketch {
-                    algorithm: SketchAlgorithm::Kll,
-                    config: cfg.clone(),
-                    spatial_filter_canonical: String::new(),
-                },
-                accuracy: Some(AccuracyBound::from_config(&cfg)),
-                first_seen_unix_ms: 0,
-                retired_at_ms: None,
-                expires_at_ms: None,
-                policy_fp: asap_types::PolicyFingerprint::UNSET,
-            });
-        }
-
-        fn plan_with_ddsketch_materialization(metric: &str) -> BackendPlan {
-            let fingerprint = asap_types::PolicyFingerprint(42);
-            let mut materializations = HashMap::new();
-            materializations.insert(
-                fingerprint,
-                Materialization {
-                    fingerprint,
-                    source: Source::TimeSeries {
-                        metric: metric.to_string(),
-                    },
-                    window: WindowSpec {
-                        kind: WindowKind::Tumbling,
-                        size_ms: 60_000,
-                        slide_ms: None,
-                    },
-                    group_by: Vec::new(),
-                    rollup: Vec::new(),
-                    spatial_filter: String::new(),
-                    // `Materialization.family` is Planner's canonical
-                    // `SummaryFamilyType`; its sketch branch carries a
-                    // validated `SketchKind` (category + algorithm + params).
-                    family: planner_types::post_asap::SummaryFamilyType::Sketch(
-                        planner_types::post_asap::SketchKind::new(
-                            SketchAlgorithm::DDSketch,
-                            SketchParams::DDSketch { alpha: 0.01 },
-                        ),
-                        planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
-                    ),
-                    col: ColumnRef::SampleValue,
-                    retention: None,
-                    lifecycle: None,
-                },
-            );
-            BackendPlan {
-                plan_id: 1,
-                generated_at_unix_ms: 0,
-                plan_version: 1,
-                activation_unix_ms: 1,
-                expiry_unix_ms: None,
-                backend_compat: "asap-query-backend.v1".into(),
-                materializations,
-                routing: vec![RoutingEntry {
-                    satisfies: Capability::QuantileApprox(Some(SketchAlgorithm::DDSketch)),
-                    materialization: fingerprint,
-                    storage_backend: StorageBackend::SketchStore,
-                }],
-                monitors: Vec::new(),
-            }
-        }
-
-        /// Extract the bound `(SketchAlgorithm, SketchParams)` from the
-        /// `SummaryEstimate { summary_input: SummaryNode { expr: SummaryAgg {
-        /// summary, params, .. }, .. }, .. }` shape a bare
-        /// `quantile_over_time` query lowers to (confirmed by inspecting
-        /// the tree directly).
-        fn bound_family(node: &SummaryNode) -> (SketchAlgorithm, SketchParams) {
-            match &node.expr {
-                SummaryExpr::SummaryEstimate { summary_input, .. } => match &summary_input.expr {
-                    SummaryExpr::SummaryAgg {
-                        family: planner_types::post_asap::SummaryFamilyType::Sketch(kind, _),
-                        ..
-                    } => (kind.algorithm().clone(), kind.params().clone()),
-                    other => panic!("expected a Sketch SummaryAgg, got {other:?}"),
-                },
-                other => panic!("expected SummaryEstimate, got {other:?}"),
-            }
-        }
-
-        #[test]
-        fn without_a_plan_sketchstore_reconstruction_wins() {
-            // Baseline: no `BackendPlan` -- `observed_family_for_metric`'s
-            // SketchStore reconstruction is the only source.
-            let idx = SketchStore::new();
-            register_kll(&idx, "m");
-            let node =
-                plan_promql_to_post_asap(&idx, "quantile_over_time(0.99, m[1m])", accuracy(), None)
-                    .expect("should lower");
-            assert_eq!(bound_family(&node).0, SketchAlgorithm::Kll);
-        }
-
-        #[test]
-        fn a_plan_materialization_wins_over_sketchstore_reconstruction() {
-            // `SketchStore` has Kll registered for `m` (what
-            // reconstruction alone would find), but the installed
-            // `BackendPlan` says DDSketch for
-            // the SAME metric. The plan must win -- serving time reads
-            // planning's real (plan-sourced) decision, not whatever
-            // `SketchStore` metadata happens to reconstruct to.
-            let idx = SketchStore::new();
-            register_kll(&idx, "m");
-            let plan = plan_with_ddsketch_materialization("m");
-            let node = plan_promql_to_post_asap(
-                &idx,
-                "quantile_over_time(0.99, m[1m])",
-                accuracy(),
-                Some(&plan),
-            )
-            .expect("should lower");
-            assert_eq!(
-                bound_family(&node).0,
-                SketchAlgorithm::DDSketch,
-                "BackendPlan's materialization must take priority over SketchStore reconstruction"
-            );
-        }
-
-        #[test]
-        fn installed_plan_without_metric_route_fails_closed() {
-            // Once a BackendPlan is installed it is authoritative. Store
-            // contents that are absent from the plan must not make a query
-            // warm-eligible, even when a matching legacy SID still exists.
-            let idx = SketchStore::new();
-            register_kll(&idx, "m");
-            let plan = plan_with_ddsketch_materialization("some_other_metric");
-            let result = plan_promql_to_post_asap(
-                &idx,
-                "quantile_over_time(0.99, m[1m])",
-                accuracy(),
-                Some(&plan),
-            );
-            assert!(matches!(result, Err(LoweringSkip::NoWarmRoute(_))));
-        }
     }
 }

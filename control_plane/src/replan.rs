@@ -671,6 +671,9 @@ impl Replanner {
             planner_types::post_asap::ExactKind::Rate => {
                 planner_types::post_asap::ExactParams::Rate
             }
+            planner_types::post_asap::ExactKind::IRate => {
+                planner_types::post_asap::ExactParams::IRate
+            }
         };
         use crate::physical::colored_dag::emitter::{
             AggregationInput, BackendAggregation, BackendStageConfig,
