@@ -360,7 +360,12 @@ impl MaxRollupSeries {
         if let Some(horizon) = retention_horizon_ms {
             let cutoff = window.1.saturating_sub(horizon);
             for nodes in &mut self.levels {
-                nodes.retain(|_, node| node.end_ms >= cutoff);
+                while nodes
+                    .first_key_value()
+                    .is_some_and(|(_, node)| node.end_ms < cutoff)
+                {
+                    nodes.pop_first();
+                }
             }
         }
     }
@@ -397,6 +402,95 @@ impl MaxRollupSeries {
         self.levels
             .iter()
             .map(|nodes| nodes.len() * std::mem::size_of::<(u64, MaxRollupNode)>())
+            .sum()
+    }
+}
+
+/// Readout categories supported by the derived rollup tier. New categories
+/// belong here rather than as additional top-level `SketchStore` fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollupCategory {
+    ExactMax,
+}
+
+type ExactMaxRollups =
+    DashMap<u64, Arc<RwLock<HashMap<BTreeMap<String, String>, MaxRollupSeries>>>>;
+
+/// Rebuildable indexes over canonical SummaryStore panes. This owns derived
+/// query accelerators only; base summary instances remain the source of truth.
+#[derive(Default)]
+struct Rollups {
+    exact_max: ExactMaxRollups,
+}
+
+impl Rollups {
+    fn append_exact_max(
+        &self,
+        sid: u64,
+        labels: BTreeMap<String, String>,
+        window: TimestampRange,
+        value: f64,
+        retention_horizon_ms: Option<u64>,
+    ) {
+        self.exact_max
+            .entry(sid)
+            .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
+            .write()
+            .unwrap()
+            .entry(labels)
+            .or_default()
+            .append(window, value, retention_horizon_ms);
+    }
+
+    fn query(
+        &self,
+        category: RollupCategory,
+        sid: u64,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+    ) -> Option<Vec<(BTreeMap<String, String>, f64)>> {
+        match category {
+            RollupCategory::ExactMax => {
+                let rollups = self.exact_max.get(&sid)?.clone();
+                let guard = rollups.read().unwrap();
+                let values = guard
+                    .iter()
+                    .map(|(labels, series)| {
+                        series
+                            .query(start_unix_ms, end_unix_ms)
+                            .map(|value| (labels.clone(), value))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                (!values.is_empty()).then_some(values)
+            }
+        }
+    }
+
+    fn remove_sid(&self, sid: u64) {
+        self.exact_max.remove(&sid);
+    }
+
+    fn clear(&self) {
+        self.exact_max.clear();
+    }
+
+    fn approx_bytes(&self) -> usize {
+        self.exact_max
+            .iter()
+            .filter_map(|entry| {
+                entry.value().read().ok().map(|series| {
+                    series
+                        .iter()
+                        .map(|(labels, rollup)| {
+                            labels
+                                .iter()
+                                .map(|(key, value)| key.len() + value.len())
+                                .sum::<usize>()
+                                + rollup.approx_bytes()
+                        })
+                        .sum::<usize>()
+                })
+            })
             .sum()
     }
 }
@@ -451,10 +545,8 @@ pub struct SketchStore {
     /// key) for ghost sids — query path detects this and falls through
     /// to Thanos archive.
     series: DashMap<u64, SidStore>,
-    /// In-SummaryStore binary rollups for exact max. Base panes remain the
-    /// source of truth and persistence format; this derived index reduces a
-    /// long aligned range to O(log N) nodes and is rebuilt naturally by ingest.
-    max_rollups: DashMap<u64, Arc<RwLock<HashMap<BTreeMap<String, String>, MaxRollupSeries>>>>,
+    /// Derived rollup categories over canonical SummaryStore panes.
+    rollups: Rollups,
     /// Receiver-observed delta gaps. Query reads overlapping an incomplete
     /// lineage fail closed to the exact tier until a recovery full checkpoint
     /// for that exact producer/window lineage is accepted.
@@ -750,25 +842,22 @@ impl SketchStore {
         let retention_horizon_ms = guard.retention_horizon_ms;
         drop(guard);
         if let Some(value) = max_value.filter(|_| self.persistence_read.read().unwrap().is_none()) {
-            let rollups = self
-                .max_rollups
-                .entry(sid)
-                .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
-                .clone();
-            rollups
-                .write()
-                .unwrap()
-                .entry(series_label_values)
-                .or_default()
-                .append(window, value, retention_horizon_ms);
+            self.rollups.append_exact_max(
+                sid,
+                series_label_values,
+                window,
+                value,
+                retention_horizon_ms,
+            );
         }
     }
 
-    /// Read exact max through the derived in-memory rollup. Returns `None`
+    /// Read a category through the derived in-memory rollup. Returns `None`
     /// when persistence/recovery is active or no complete rollup exists, so
     /// callers can fall back to the canonical exact-agg range path.
-    pub fn query_exact_max_rollup_range(
+    pub fn query_rollup_range(
         &self,
+        category: RollupCategory,
         sid: u64,
         start_unix_ms: u64,
         end_unix_ms: u64,
@@ -776,17 +865,8 @@ impl SketchStore {
         if self.persistence_read.read().unwrap().is_some() {
             return None;
         }
-        let rollups = self.max_rollups.get(&sid)?.clone();
-        let guard = rollups.read().unwrap();
-        let values = guard
-            .iter()
-            .map(|(labels, series)| {
-                series
-                    .query(start_unix_ms, end_unix_ms)
-                    .map(|value| (labels.clone(), value))
-            })
-            .collect::<Option<Vec<_>>>()?;
-        (!values.is_empty()).then_some(values)
+        self.rollups
+            .query(category, sid, start_unix_ms, end_unix_ms)
     }
 
     /// Range-query the ASAP-tier state for one sid. Window-end-keyed
@@ -1744,7 +1824,7 @@ impl SketchStore {
                     .unwrap_or(false)
             });
             if removed.is_some() {
-                self.max_rollups.remove(&sid);
+                self.rollups.remove_sid(sid);
                 evicted += 1;
             }
         }
@@ -1804,20 +1884,7 @@ impl SketchStore {
         // 3. Derived exact-max rollups. They are deliberately reported in
         // resident memory even though they are not part of the durable
         // payload/flush accounting.
-        for entry in self.max_rollups.iter() {
-            if let Ok(series) = entry.value().read() {
-                total += series
-                    .iter()
-                    .map(|(labels, rollup)| {
-                        labels
-                            .iter()
-                            .map(|(key, value)| key.len() + value.len())
-                            .sum::<usize>()
-                            + rollup.approx_bytes()
-                    })
-                    .sum::<usize>();
-            }
-        }
+        total += self.rollups.approx_bytes();
 
         total
     }
@@ -1977,7 +2044,7 @@ impl SketchStore {
         };
         if removed.is_some() {
             self.series.remove(&sid);
-            self.max_rollups.remove(&sid);
+            self.rollups.remove_sid(sid);
             self.incomplete_summary_lineages.remove(&sid);
         }
         removed
@@ -2377,7 +2444,7 @@ impl SketchStore {
     ) {
         use std::sync::atomic::Ordering;
         *self.persistence_read.write().unwrap() = Some(read_handle);
-        self.max_rollups.clear();
+        self.rollups.clear();
         self.seal_window_count
             .store(seal_window_count, Ordering::Relaxed);
         if seal_window_count > 0 {

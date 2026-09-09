@@ -508,10 +508,12 @@ impl QueryExecutionContext<'_> {
                         agg_type,
                         AggregationType::MinMax | AggregationType::MultipleMinMax
                     ) {
-                        if let Some(series) = self
-                            .index
-                            .query_exact_max_rollup_range(sid, self.t0_ms, self.t1_ms)
-                        {
+                        if let Some(series) = self.index.query_rollup_range(
+                            crate::storage_engines::sketch_db::index::RollupCategory::ExactMax,
+                            sid,
+                            self.t0_ms,
+                            self.t1_ms,
+                        ) {
                             for (labels, value) in series {
                                 let key = match &binding.output_grouping {
                                     PhysicalGrouping::PerEntity => labels,

@@ -101,8 +101,8 @@ struct ReceiverInner {
 #[derive(Default)]
 struct DedupState {
     input_closed: bool,
-    values: HashMap<(u64, u64, String, i64), DedupValue>,
-    expiry_by_event_time: BTreeMap<i64, Vec<(u64, u64, String)>>,
+    values: HashMap<(u64, u64, Arc<str>, i64), DedupValue>,
+    expiry_by_event_time: BTreeMap<i64, Vec<(u64, u64, Arc<str>)>>,
     max_event_timestamp_ms: Option<i64>,
 }
 
@@ -148,9 +148,11 @@ pub enum RemoteWriteError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CanonicalSample {
-    pub metric: String,
-    pub labels: HashMap<String, String>,
-    pub series_key: String,
+    pub metric: Arc<str>,
+    pub labels: Arc<HashMap<String, String>>,
+    pub series_key: Arc<str>,
+    population_key: Arc<str>,
+    all_attrs_fingerprint: Arc<str>,
     pub timestamp_ms: i64,
     pub value: Option<f64>,
 }
@@ -271,7 +273,7 @@ impl PrometheusRemoteWriteReceiver {
 
         // Validate conflicts both against committed history and inside this
         // request before reserving any worker capacity.
-        let mut batch_values: HashMap<(u64, u64, String, i64), DedupValue> = HashMap::new();
+        let mut batch_values: HashMap<(u64, u64, Arc<str>, i64), DedupValue> = HashMap::new();
         let mut new_samples = Vec::with_capacity(samples.len());
         let mut duplicates = 0u64;
         for sample in samples {
@@ -296,7 +298,7 @@ impl PrometheusRemoteWriteReceiver {
                 }
                 Some(_) => {
                     return Err(RemoteWriteError::Conflict {
-                        series: sample.series_key,
+                        series: sample.series_key.to_string(),
                         timestamp: sample.timestamp_ms,
                     });
                 }
@@ -422,12 +424,31 @@ fn canonicalize_request(
             return Err(RemoteWriteError::TooManySamples(config.max_samples));
         }
         let (metric, labels, series_key) = canonicalize_labels(&timeseries.labels)?;
+        let metric: Arc<str> = metric.into();
+        let labels = Arc::new(labels);
+        let series_key: Arc<str> = series_key.into();
+        let mut sorted_attrs = labels
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        sorted_attrs.sort_unstable();
+        let all_attrs_fingerprint: Arc<str> =
+            super::canonical_attrs_fingerprint(&sorted_attrs).into();
+        let population_labels = sorted_attrs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let population_key: Arc<str> = format!(
+            "__asap_population__{}",
+            serde_json::to_string(&population_labels).expect("label map serialization")
+        )
+        .into();
         for sample in &timeseries.samples {
             let value = if sample.value.to_bits() == STALE_NAN_BITS {
                 None
             } else if !sample.value.is_finite() {
                 return Err(RemoteWriteError::InvalidSample {
-                    series: series_key.clone(),
+                    series: series_key.to_string(),
                     timestamp: sample.timestamp,
                     reason: "only finite values or the Prometheus stale marker are accepted".into(),
                 });
@@ -438,6 +459,8 @@ fn canonicalize_request(
                 metric: metric.clone(),
                 labels: labels.clone(),
                 series_key: series_key.clone(),
+                population_key: population_key.clone(),
+                all_attrs_fingerprint: all_attrs_fingerprint.clone(),
                 timestamp_ms: sample.timestamp,
                 value,
             });
@@ -525,7 +548,7 @@ fn route_messages(
             continue;
         };
         for (config, filter) in &configs {
-            if config.metric != sample.metric || !filter.matches(&sample.labels) {
+            if config.metric.as_str() != sample.metric.as_ref() || !filter.matches(&sample.labels) {
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&sample.series_key, config);
@@ -541,13 +564,7 @@ fn route_messages(
                     | asap_types::AggregationType::MultipleMinMax
             );
             let grouping_pairs: Vec<(&str, &str)> = if series_scoped {
-                let mut labels = sample
-                    .labels
-                    .iter()
-                    .map(|(name, value)| (name.as_str(), value.as_str()))
-                    .collect::<Vec<_>>();
-                labels.sort_unstable();
-                labels
+                Vec::new()
             } else {
                 config
                     .grouping_labels
@@ -562,19 +579,17 @@ fn route_messages(
                     .collect()
             };
             let group_key = if series_scoped {
-                let labels = sample
-                    .labels
-                    .iter()
-                    .map(|(name, value)| (name.clone(), value.clone()))
-                    .collect::<std::collections::BTreeMap<_, _>>();
-                format!(
-                    "__asap_population__{}",
-                    serde_json::to_string(&labels).expect("label map serialization")
-                )
+                sample.population_key.to_string()
             } else {
                 group_key
             };
-            let attrs_fp = super::canonical_attrs_fingerprint(&grouping_pairs);
+            let computed_attrs_fp;
+            let attrs_fp = if series_scoped {
+                sample.all_attrs_fingerprint.as_ref()
+            } else {
+                computed_attrs_fp = super::canonical_attrs_fingerprint(&grouping_pairs);
+                &computed_attrs_fp
+            };
             let policy_fp = asap_types::PolicyFingerprint(config.policy_fp_u64());
             // A sketch family is not a complete physical identity. Two
             // materializations may use the same family and grouping while
@@ -585,12 +600,12 @@ fn route_messages(
             let sid =
                 ingest
                     .series_resolver
-                    .resolve(&config.metric, &attrs_fp, &materialization_kind);
+                    .resolve(&config.metric, attrs_fp, &materialization_kind);
             buckets
                 .entry(sid)
                 .or_insert_with(|| ((sid, policy_fp, group_key), Vec::new()))
                 .1
-                .push((sample.series_key.clone(), sample.timestamp_ms, value));
+                .push((sample.series_key.to_string(), sample.timestamp_ms, value));
         }
     }
     let received_at = Instant::now();
@@ -974,11 +989,17 @@ mod tests {
         let samples =
             canonicalize_request(&request, &PrometheusRemoteWriteConfig::default()).unwrap();
         assert_eq!(
-            samples[0].series_key,
+            samples[0].series_key.as_ref(),
             "http_requests_total{job=\"api\",zone=\"a\\n\\\"b\"}"
         );
         assert_eq!(samples[0].value, Some(3.0));
         assert_eq!(samples[1].value, None);
+        assert!(Arc::ptr_eq(&samples[0].metric, &samples[1].metric));
+        assert!(Arc::ptr_eq(&samples[0].labels, &samples[1].labels));
+        assert!(Arc::ptr_eq(
+            &samples[0].series_key,
+            &samples[1].series_key
+        ));
     }
 
     #[test]
@@ -1054,7 +1075,7 @@ mod tests {
     fn dedup_history_is_evicted_by_event_time_during_fast_replay() {
         let mut state = DedupState::default();
         for timestamp in [0, 60_000, 600_000, 660_000] {
-            let series = format!("series-{timestamp}");
+            let series: Arc<str> = format!("series-{timestamp}").into();
             state
                 .values
                 .insert((7, 3, series.clone(), timestamp), DedupValue::Number(1));

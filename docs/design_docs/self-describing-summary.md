@@ -1,7 +1,6 @@
 # Self-Describing Summary (SDS)
 
-This proposal defines three logical layers for summary producers and consumers.
-It does not change the current runtime or wire format.
+This design defines three logical layers for summary producers and consumers.
 
 | Layer | Describes | Changes when |
 | --- | --- | --- |
@@ -20,7 +19,7 @@ Planner's shared types. Planner reasons about operators, fidelity, source and
 population semantics. The backend binds those descriptions to actual series,
 filters and grouping, and owns materialized instance state and its lifecycle.
 
-| Layer | Proposed responsibility |
+| Layer | Responsibility |
 | --- | --- |
 | Summary Descriptor | Shared semantic definition used by Planner and backend |
 | Data Descriptor | Shared source/population definition; backend resolves concrete runtime bindings |
@@ -29,8 +28,71 @@ filters and grouping, and owns materialized instance state and its lifecycle.
 Planner may observe instance availability, covered time ranges and descriptor
 references as planning evidence. It does not need the encoded summary state.
 SDS describes summaries; an installed QueryPlan specifies how to execute a query
-using them. This ownership split is a proposal, not a claim that SDS types or
-interfaces already exist in either repository.
+using them. The current backend fields are an incremental implementation of this
+model. They must converge on the identities and invariants below rather than add
+operator-specific stores beside `SketchStore`.
+
+## Concrete backend model
+
+The durable model has descriptor registries plus pane instances. IDs are hashes
+of canonical semantic content; display names and runtime SIDs are not identities.
+
+```rust
+struct SummaryDescriptor {
+    id: SummaryDescriptorId,
+    operator: SummaryOperator,
+    fidelity: Vec<FidelityGuarantee>,
+    state_schema: StateSchema,
+}
+
+struct DataDescriptor {
+    id: DataDescriptorId,
+    source: MetricSource,
+    population: PopulationDefinition,
+    observation_semantics: ObservationSemantics,
+}
+
+struct SummaryInstance {
+    id: SummaryInstanceId,
+    summary_descriptor_id: SummaryDescriptorId,
+    data_descriptor_id: DataDescriptorId,
+    interval: HalfOpenInterval,
+    group_values: BTreeMap<String, String>,
+    completeness: Completeness,
+    lineage: Lineage,
+    state: AggPayload,
+}
+```
+
+The backend maps this model onto its execution components as follows:
+
+| Component | SDS responsibility |
+| --- | --- |
+| Physical-plan compiler | Canonicalize descriptor content, assign descriptor references and declare build/readout operations |
+| Precompute engine | Route matching observations and update the instance for one descriptor pair, group and pane |
+| SummaryStore (`SketchStore` today) | Store descriptor registries, instance metadata, state, completeness and lineage |
+| Query engine | Resolve plan references, select complete instances, merge/read out their state and combine exact Prometheus subquery results |
+| `rollups` | Hold typed, rebuildable indexes derived from canonical instances |
+
+An ingest record is never an SDS instance. Raw samples can be transient inputs to
+the precompute engine, but the backend does not retain them as a second exact
+query store. Exact residual subtrees run in Prometheus.
+
+The store enforces these invariants:
+
+1. An instance references exactly one immutable Summary Descriptor and one
+   immutable Data Descriptor.
+2. `[start, end)` plus concrete group values identifies the summarized extent;
+   different panes are different instances.
+3. State may be merged only when the Summary Descriptor permits the operation,
+   Data Descriptors are compatible, and interval coverage does not double-count.
+4. Completeness and approximation fidelity are independent. An exact operator
+   over a partial interval is still incomplete.
+5. State bytes always carry a state schema version. A codec match alone does not
+   imply semantic compatibility.
+6. Rollups never become authoritative state. `RollupCategory::ExactMax` and
+   future categories live below one `rollups` collection and can be discarded
+   and rebuilt from instances.
 
 ## 1. Summary Descriptor
 
