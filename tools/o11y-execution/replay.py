@@ -136,6 +136,18 @@ def parse_samples(lines):
     return list(iter_samples(lines))
 
 
+def validate_sample_file(path):
+    """Validate a dataset in one bounded-memory pass and return its sample count."""
+    with Path(path).open() as lines:
+        return sum(1 for _ in iter_samples(lines))
+
+
+def ingest_sample_file(path, endpoints, output):
+    """Validate and encode a dataset lazily; callers must run validation first."""
+    with Path(path).open() as lines:
+        ingest(iter_samples(lines), endpoints, output)
+
+
 def varint(value):
     result = bytearray()
     while value > 127:

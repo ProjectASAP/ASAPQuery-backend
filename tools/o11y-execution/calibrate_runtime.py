@@ -46,7 +46,7 @@ def file_bytes(root):
     return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
 
 
-def measure(args, artifact, samples, corpus, snapshot, folder):
+def measure(args, artifact, corpus, snapshot, folder):
     folder.mkdir()
     manifest = artifact["manifest"]
     row = {"plan_id": manifest["plan_id"], "manifest": manifest, "executable": False,
@@ -89,7 +89,7 @@ def measure(args, artifact, samples, corpus, snapshot, folder):
         before, start = after, time.perf_counter_ns()
         runner.PROCESS_IDS.clear()
         runner.PROCESS_IDS.update({"backend": dp.pid, "fallback_service": prom.pid})
-        runner.ingest(samples, [fallback, backend], folder)
+        runner.ingest_sample_file(args.metrics, [fallback, backend], folder)
         drained = runner.request(backend + "/api/v1/precompute/drain", b"")
         runner.write_json(folder / "drain.json", drained)
         if drained["http_status"] != 200 or drained["response"].get("complete") is not True:
@@ -192,15 +192,15 @@ def main():
     if args.repetitions < 1 or args.max_repetitions < args.repetitions or args.minimum_query_cpu_ns <= 0 or args.residency_seconds < 0:
         parser.error("positive repetitions and nonnegative residency required")
     args.output.mkdir(parents=True, exist_ok=False)
-    samples = runner.parse_samples(args.metrics.read_text().splitlines())
+    sample_count = runner.validate_sample_file(args.metrics)
     corpus, snapshot = json.loads(args.queries.read_text()), json.loads(args.snapshot.read_text())
     runner.validate_workload(snapshot, corpus)
     result = {"units": "cpu_ns", "data_snapshot_id": "sha256:" + hashlib.sha256(args.metrics.read_bytes()).hexdigest(),
-              "scope": "accelerated finite-input calibration; measured wall residency is not full logical-horizon residency", "candidates": []}
+              "scope": "accelerated finite-input calibration; measured wall residency is not full logical-horizon residency", "validated_sample_count": sample_count, "candidates": []}
     for index, candidate in enumerate(json.loads(args.candidates.read_text())["candidates"]):
         if "manifest" not in candidate or "install_request" not in candidate:
             continue
-        result["candidates"].append(measure(args, candidate, samples, corpus, snapshot, args.output / f"candidate-{index}"))
+        result["candidates"].append(measure(args, candidate, corpus, snapshot, args.output / f"candidate-{index}"))
         runner.write_json(args.output / "measurements.json", result)
 
 
