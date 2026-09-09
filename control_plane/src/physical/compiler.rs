@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "661154b6d6e8b6b76102fb9d8cdcc440b298418f";
+pub const PLANNER_REVISION: &str = "2270f1f8f98b64e2cc8aa5b7602a570aa0e95f1e";
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 
 #[derive(Debug, Clone)]

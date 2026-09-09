@@ -32,4 +32,4 @@ sha2 = "0.10"
 # exactly (`control_plane/Cargo.toml`) -- two different revs of the same
 # git dependency in one workspace resolve to two distinct Rust types that
 # won't unify.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "661154b6d6e8b6b76102fb9d8cdcc440b298418f" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "2270f1f8f98b64e2cc8aa5b7602a570aa0e95f1e" }
