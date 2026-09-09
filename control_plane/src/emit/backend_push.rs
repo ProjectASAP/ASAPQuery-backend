@@ -230,7 +230,6 @@ async fn push_documents_coupled(
     client: &Arc<BackendClient>,
     precompute_plan: &PrecomputePlan,
     routing_body: String,
-    plan_bytes: Vec<u8>,
 ) -> (bool, bool, u32) {
     let start = Instant::now();
     let routing: serde_json::Value = match serde_json::from_str(&routing_body) {
@@ -244,12 +243,8 @@ async fn push_documents_coupled(
     // may still install producer/storage state, but publishes an empty
     // QueryPlan so every serving request fails closed to the exact tier.
     let query_plan = crate::query_plan::QueryPlan {
-        plan_id: crate::backend_plan::BackendPlan::decode(&plan_bytes)
-            .map(|plan| plan.plan_id)
-            .unwrap_or_default(),
-        plan_version: crate::backend_plan::BackendPlan::decode(&plan_bytes)
-            .map(|plan| plan.plan_version)
-            .unwrap_or_default(),
+        plan_id: precompute_plan.envelope.plan_id,
+        plan_version: precompute_plan.envelope.plan_version,
         entries: Default::default(),
     };
     let transmission_plan = match crate::physical::compiler::TransmissionPlan::build(
@@ -269,7 +264,6 @@ async fn push_documents_coupled(
             .post_physical_plan_typed(
                 precompute_plan,
                 &transmission_plan,
-                plan_bytes.clone(),
                 &query_plan,
                 Some(routing.clone()),
                 &[],
@@ -467,7 +461,6 @@ async fn push_cumulative_entries(
             return PushOutcome::EmitFailed;
         }
     };
-    let plan_bytes = backend_plan.encode_to_vec();
     let precompute_envelope = PlanEnvelope {
         plan_id,
         plan_version: 1,
@@ -561,7 +554,7 @@ async fn push_cumulative_entries(
     };
 
     let (streaming_ok, routing_ok, attempts) =
-        push_documents_coupled(client, &precompute_plan, routing_body, plan_bytes).await;
+        push_documents_coupled(client, &precompute_plan, routing_body).await;
     let plan_ok = streaming_ok;
 
     if streaming_ok && routing_ok && plan_ok {
