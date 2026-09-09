@@ -643,6 +643,7 @@ impl PrecomputePlan {
 #[derive(Debug, Clone)]
 pub struct PhysicalPlan {
     pub envelope: PlanEnvelope,
+    pub summary_catalog: super::summary_catalog::SummaryCatalog,
     pub collector_plans: Vec<CollectorPlan>,
     pub precompute_plan: PrecomputePlan,
     pub transmission_plan: TransmissionPlan,
@@ -2401,8 +2402,18 @@ impl PhysicalCompiler {
             }
         }
         query_plan.validate(&materialization_fingerprints)?;
+        let summary_catalog = super::summary_catalog::SummaryCatalog::from_materializations(
+            envelope.plan_id,
+            envelope.plan_version,
+            &precompute_plan.materializations,
+        )
+        .map_err(|error| CompileError::Query {
+            query_id: "summary-catalog".into(),
+            reason: error.to_string(),
+        })?;
         Ok(PhysicalPlan {
             envelope,
+            summary_catalog,
             collector_plans,
             precompute_plan,
             transmission_plan,
@@ -4043,6 +4054,26 @@ mod tests {
             )
             .expect("compile");
         assert_eq!(bundle.collector_plans.len(), 2);
+        bundle.summary_catalog.validate().expect("catalog contract");
+        assert_eq!(bundle.summary_catalog.plan_id, bundle.envelope.plan_id);
+        assert_eq!(
+            bundle.summary_catalog.plan_version,
+            bundle.envelope.plan_version
+        );
+        assert_eq!(
+            bundle
+                .summary_catalog
+                .materializations
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            bundle
+                .backend_plan
+                .materializations
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        );
         assert_eq!(bundle.precompute_plan.envelope, bundle.envelope);
         assert_eq!(bundle.precompute_plan.materializations.len(), 1);
         assert_eq!(bundle.precompute_plan.schemas.len(), 1);

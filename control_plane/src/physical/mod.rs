@@ -32,6 +32,7 @@ pub mod post_asap;
 pub mod runtime_capability;
 pub mod sketch_catalog;
 pub mod stage_split;
+pub mod summary_catalog;
 pub mod topology;
 pub mod window_fusion;
 pub mod workload_cost;
