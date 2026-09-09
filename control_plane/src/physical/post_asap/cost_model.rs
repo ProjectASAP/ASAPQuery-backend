@@ -42,8 +42,10 @@ use asap_aware_mapping::empirical_comparison::{
 };
 use asap_aware_mapping::empirical_cost::EmpiricalEvidenceProvider;
 use asap_aware_mapping::{
-    CompleteSummaryCandidateEstimate, CostModel, Horizon, Implementation,
-    SummaryMaintenanceCapabilities, SummaryMaintenanceLifecycleCostInputs,
+    CompleteSummaryCandidateEstimate, CostModel, CostProvenance, EvaluationRate,
+    ExactCompositionCostInputs, ExactCompositionCostRequest, Horizon, Implementation,
+    OperationPlacement, SummaryMaintenanceCapabilities, SummaryMaintenanceLifecycleCostInputs,
+    ValueOperationCapabilities,
 };
 use planner_types::post_asap::{
     SketchAlgorithm, SketchParams, SketchQuery, SummaryWindowFramework,
@@ -55,6 +57,80 @@ use crate::physical::erp::{ErpParameterDecision, ErpPlanningInput};
 use crate::planner_selection::FREQUENCY_EXT_KIND;
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::AggIntent;
+use serde::{Deserialize, Serialize};
+
+/// One measured execution profile for an exact operator composed with a
+/// maintained summary. Values use CPU nanoseconds so every term in Planner's
+/// recurring-cost formula has the same physical unit. Peak memory is retained
+/// as measured resource evidence and reported separately; it is deliberately
+/// not converted into CPU cost by an invented weight.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExactCompositionCostEvidence {
+    /// Exact pre-ASAP target serialized with the pinned Planner revision.
+    pub target: serde_json::Value,
+    /// Exact operation serialized with the pinned Planner revision.
+    pub operation: serde_json::Value,
+    pub placement: ExactOperationPlacement,
+    pub expected_input_rows: f64,
+    pub expected_output_rows: f64,
+    pub exact_cpu_ns_per_row: f64,
+    pub summary_maintenance_cpu_ns_per_update: f64,
+    pub summary_read_cpu_ns: f64,
+    pub update_rate_per_second: f64,
+    pub evaluation_rate_per_second: f64,
+    pub raw_recompute_cpu_ns: f64,
+    pub observed_peak_memory_bytes: u64,
+    pub data_snapshot_id: String,
+    pub model_version: String,
+    pub observed_at_unix_ms: u64,
+    pub valid_for_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExactOperationPlacement {
+    Read,
+    Maintenance,
+}
+
+impl ExactCompositionCostEvidence {
+    pub fn validate(&self, now_unix_ms: u64, max_age_ms: u64) -> Result<(), String> {
+        let positive = [
+            self.exact_cpu_ns_per_row,
+            self.summary_maintenance_cpu_ns_per_update,
+            self.summary_read_cpu_ns,
+            self.update_rate_per_second,
+            self.evaluation_rate_per_second,
+            self.raw_recompute_cpu_ns,
+        ];
+        let rows = [self.expected_input_rows, self.expected_output_rows];
+        if positive.iter().any(|v| !v.is_finite() || *v <= 0.0)
+            || rows.iter().any(|v| !v.is_finite() || *v < 0.0)
+            || self.observed_peak_memory_bytes == 0
+            || self.data_snapshot_id.trim().is_empty()
+            || self.model_version.trim().is_empty()
+            || self.valid_for_ms == 0
+            || self.observed_at_unix_ms > now_unix_ms
+            || now_unix_ms - self.observed_at_unix_ms > self.valid_for_ms.min(max_age_ms)
+        {
+            return Err(
+                "missing, non-physical, future, or stale exact-composition evidence".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn matches(&self, request: &ExactCompositionCostRequest<'_>) -> bool {
+        let placement = match request.composition.placement {
+            OperationPlacement::Read => ExactOperationPlacement::Read,
+            OperationPlacement::Maintenance => ExactOperationPlacement::Maintenance,
+        };
+        self.placement == placement
+            && serde_json::to_value(request.target).ok().as_ref() == Some(&self.target)
+            && serde_json::to_value(&request.composition.op).ok().as_ref() == Some(&self.operation)
+    }
+}
 
 /// See module docs.
 pub struct ControlPlaneCostModel {
@@ -67,6 +143,7 @@ pub struct ControlPlaneCostModel {
     window_framework_costs: Vec<(Option<String>, SummaryWindowFramework, Cost)>,
     offline_evidence: Option<EmpiricalEvidenceProvider>,
     offline_frequency_comparison: Option<(OfflineComparisonEvidence, OfflineComparisonRequest)>,
+    exact_composition_costs: Vec<ExactCompositionCostEvidence>,
     erp: Option<ErpPlanningInput>,
 }
 
@@ -79,19 +156,17 @@ impl ControlPlaneCostModel {
             window_framework_costs: Vec::new(),
             offline_evidence: None,
             offline_frequency_comparison: None,
+            exact_composition_costs: Vec::new(),
             erp: None,
         }
     }
 
-    /// Use offline update CPU evidence for algorithm ordering. Physical costs
-    /// and accuracy guarantees retain their deployment-specific contracts.
-    pub fn with_offline_evidence(mut self, evidence: EmpiricalEvidenceProvider) -> Self {
-        self.offline_evidence = Some(evidence);
+    pub fn with_exact_composition_costs(
+        mut self,
+        costs: Vec<ExactCompositionCostEvidence>,
+    ) -> Self {
+        self.exact_composition_costs = costs;
         self
-    }
-
-    pub fn offline_evidence(&self) -> Option<&EmpiricalEvidenceProvider> {
-        self.offline_evidence.as_ref()
     }
 
     pub fn with_erp(mut self, erp: ErpPlanningInput) -> Self {
@@ -108,6 +183,17 @@ impl ControlPlaneCostModel {
         self.erp
             .as_ref()
             .map(|erp| erp.select(algorithm, max_error, theoretical))
+    }
+
+    /// Use offline update CPU evidence for algorithm ordering. Physical costs
+    /// and accuracy guarantees retain their deployment-specific contracts.
+    pub fn with_offline_evidence(mut self, evidence: EmpiricalEvidenceProvider) -> Self {
+        self.offline_evidence = Some(evidence);
+        self
+    }
+
+    pub fn offline_evidence(&self) -> Option<&EmpiricalEvidenceProvider> {
+        self.offline_evidence.as_ref()
     }
 
     /// Opt into a fixed-snapshot frequency comparison. The caller asserts that
@@ -378,6 +464,50 @@ fn intent_accuracy(intent: &AggIntent) -> AccuracyTarget {
 }
 
 impl CostModel for ControlPlaneCostModel {
+    fn value_operation_capabilities(&self) -> ValueOperationCapabilities {
+        ValueOperationCapabilities {
+            read_time: true,
+            maintenance_time: false,
+        }
+    }
+
+    fn exact_composition_cost_inputs(
+        &self,
+        request: &ExactCompositionCostRequest<'_>,
+    ) -> ExactCompositionCostInputs {
+        let provenance = || CostProvenance {
+            model: "ASAPQuery measured exact composition".into(),
+            version: "unavailable".into(),
+        };
+        let Some(row) = self
+            .exact_composition_costs
+            .iter()
+            .find(|row| row.matches(request))
+        else {
+            return ExactCompositionCostInputs::unknown(provenance());
+        };
+        ExactCompositionCostInputs {
+            exact_cost_per_row: Some(row.exact_cpu_ns_per_row),
+            expected_input_rows: Some(row.expected_input_rows),
+            expected_output_rows: Some(row.expected_output_rows),
+            summary_maintenance_cost_per_update: Some(row.summary_maintenance_cpu_ns_per_update),
+            summary_read_cost: Some(row.summary_read_cpu_ns),
+            update_rate: Some(row.update_rate_per_second),
+            evaluation_rate: Some(EvaluationRate(
+                row.evaluation_rate_per_second * request.effective_consumer_count as f64,
+            )),
+            raw_recompute_cost: Some(row.raw_recompute_cpu_ns),
+            unit: asap_aware_mapping::CostUnit::CostUnitsPerSecond,
+            provenance: CostProvenance {
+                model: format!(
+                    "ASAPQuery measured exact composition ({})",
+                    row.data_snapshot_id
+                ),
+                version: row.model_version.clone(),
+            },
+        }
+    }
+
     fn summary_maintenance_lifecycle_cost_inputs(
         &self,
         _summary: &planner_types::post_asap::SummaryNode,
@@ -552,12 +682,7 @@ impl CostModel for ControlPlaneCostModel {
                 observed_error,
                 estimated_cost,
             }) => {
-                tracing::info!(
-                    erp_record_id = %record_id,
-                    observed_error,
-                    estimated_cost,
-                    "selected empirical ERP sketch parameters"
-                );
+                tracing::info!(erp_record_id = %record_id, observed_error, estimated_cost, "selected empirical ERP sketch parameters");
                 params
             }
             Some(ErpParameterDecision::TheoreticalFallback { params, reason }) => {
@@ -565,9 +690,6 @@ impl CostModel for ControlPlaneCostModel {
                 params
             }
             Some(ErpParameterDecision::ExactFallback { reason }) => {
-                // Selection callers post-validate this decision and preserve
-                // the pre-ASAP subtree. Return the theoretical value only to
-                // satisfy CostModel's parameter-only interface meanwhile.
                 tracing::warn!(reason = %reason, "ERP and theoretical sizing unavailable; exact fallback required");
                 theoretical
             }
@@ -750,13 +872,13 @@ impl CostModel for ForcedFamilyCostModel {
 /// won't match anything registered either way, so the outcome
 /// (`find_candidates` finds nothing) is unchanged.
 ///
-/// **Fallback status (design-backend-plan-wire-format.md §5):**
+/// **Legacy metadata fallback:**
 /// `post_asap_planner.rs` prefers reading planning's decision directly off an
-/// installed `BackendPlan`'s materializations (no reconstruction needed
+/// installed SummaryCatalog materializations (no reconstruction needed
 /// there — `Materialization.kind`/`.params` already ARE the pair
 /// `observed` needs). This type's caller
 /// (`observed_family_for_metric`, the `SketchStore`-metadata
-/// reconstruction) is the fallback for deploys with no `BackendPlan`
+/// reconstruction) is the fallback for deployments without a catalog snapshot
 /// installed yet, or for metrics a partial/stale plan doesn't cover.
 pub struct ObservedFamilyCostModel {
     inner: ControlPlaneCostModel,

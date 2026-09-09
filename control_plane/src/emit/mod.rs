@@ -319,10 +319,10 @@ fn extract_from_node(node: &Rc<SummaryNode>) -> Option<SketchAlgorithm> {
         SummaryExpr::SummaryAgg { .. } => None,
         SummaryExpr::SummaryEstimate { summary_input, .. } => extract_from_node(summary_input),
         SummaryExpr::SummaryMerge { children } => children.iter().find_map(extract_from_node),
+        SummaryExpr::ValueOperation { child, .. } => extract_from_node(child),
         // Not surfaced by any `Bind*` path yet (gated on rules that
         // haven't landed — see `deployment_expr.rs`'s module docs).
         SummaryExpr::BinaryOp { .. }
-        | SummaryExpr::ValueOperation { .. }
         | SummaryExpr::SummaryJoin { .. }
         | SummaryExpr::SummarySubtract { .. }
         | SummaryExpr::SummaryDelete { .. }

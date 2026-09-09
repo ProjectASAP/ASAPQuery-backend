@@ -99,7 +99,11 @@ Implementation scope:
 4. Reject conflicting contracts before any plan is published. Do not pick
    whichever query happened to be visited first.
 
-Acceptance: both query roots exist; one BackendPlan state and one PrecomputePlan
+> Historical note: this acceptance text predates the SummaryCatalog migration;
+> the former BackendPlan state is now represented by a catalog materialization
+> and its execution-plan references.
+
+Acceptance: both query roots exist; one catalog materialization and one PrecomputePlan
 state exist; each Collector has one producer declaration; both bindings point
 to that state. A different implementation/layout for the same fingerprint
 fails compilation. Distinct source/window/parameters must remain distinct.

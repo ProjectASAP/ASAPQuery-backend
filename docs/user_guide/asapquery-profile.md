@@ -77,7 +77,7 @@ Receiver evidence is exported from `/metrics` as
 canonical ASAPPlanner types; `implementation` contains only backend-owned
 cost/window evidence, and `environment.target` must be
 `backend_local_remote_write`. Startup validates the workload, calls the pinned
-ASAPPlanner, compiles matching PrecomputePlan/BackendPlan/QueryPlan views, and
+ASAPPlanner, compiles matching SummaryCatalog/PrecomputePlan/QueryPlan views, and
 installs the resulting immutable snapshot before accepting traffic. It does
 not create or wait for a CollectorPlan.
 
@@ -87,16 +87,16 @@ A complete canonical input is checked in at
 For reproducibility/debugging, `--physical-plan` remains an alternative to
 `--planning-snapshot`; exactly one is required. `physical-plan.json` is the
 JSON representation accepted by
-`POST /api/v1/physical-plan`: a `PrecomputePlan`, `TransmissionPlan`, encoded
-`BackendPlan`, and authoritative `QueryPlan` DAG with one shared plan identity
-and version. For this profile, the precompute ingest contract must be
+`POST /api/v1/physical-plan`: a `SummaryCatalog`, `PrecomputePlan`,
+`TransmissionPlan`, and authoritative `QueryPlan` DAG with one shared plan
+identity and version. For this profile, the precompute ingest contract must be
 `prometheus_remote_write_v1` at `/api/v1/write`; raw writes are rejected if a
 different plan is active. Startup validates all fingerprints, schemas, query
 bindings, lifecycle fields, and transmission rules before constructing the
 single active snapshot. Runtime replacement uses `POST /api/v1/physical-plan`
 to stage the complete successor and `POST /api/v1/physical-plan/activate` for
-the atomic cutover. The partial `/streaming-config` and `/backend-plan` install
-handles are not attached in this profile.
+the atomic cutover. The old partial `/backend-plan` endpoint has been removed;
+the `/streaming-config` compatibility endpoint is not attached in this profile.
 
 Query serving uses only the installed `QueryPlan` DAG. A query absent from that
 DAG is a capability miss and goes to the exact Prometheus fallback; the backend

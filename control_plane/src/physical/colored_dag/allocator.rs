@@ -184,10 +184,13 @@ impl ThreeStageWalker {
                 }
                 StageId::Backend
             }
-            SummaryExpr::ValueOperation { child, .. } => {
-                let (cid, _) = self.visit_l4node(child)?;
+            SummaryExpr::ValueOperation { child, timing, .. } => {
+                let (cid, child_stage) = self.visit_l4node(child)?;
                 self.dag.edges.push((id, cid));
-                StageId::Backend
+                match timing {
+                    planner_types::post_asap::ExecutionTiming::ReadTime => StageId::Backend,
+                    planner_types::post_asap::ExecutionTiming::MaintenanceTime => child_stage,
+                }
             }
 
             // ── SummaryAgg: always edge per design.md §6 batched-queries

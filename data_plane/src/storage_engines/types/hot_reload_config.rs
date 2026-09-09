@@ -86,12 +86,40 @@ use crate::storage_engines::types::StreamingConfig;
 /// subsystem must project its view from the same `Arc<ActivePhysicalPlan>`.
 #[derive(Debug, Clone)]
 pub struct ActivePhysicalPlan {
+    /// Authoritative generation and lifecycle identity shared by every plan
+    /// projection in this immutable snapshot.
+    pub envelope: control_plane::physical::compiler::PlanEnvelope,
+    /// Present for authoritative installations; legacy bootstrap has no catalog.
+    pub summary_catalog: Option<Arc<control_plane::physical::summary_catalog::SummaryCatalog>>,
     pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
     pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
     pub runtime_config: Arc<StreamingConfig>,
-    pub backend_plan: Arc<control_plane::backend_plan::BackendPlan>,
     pub query_plan: Arc<control_plane::query_plan::QueryPlan>,
     pub storage_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
+}
+
+impl ActivePhysicalPlan {
+    pub fn plan_id(&self) -> u64 {
+        self.envelope.plan_id
+    }
+    pub fn plan_version(&self) -> u64 {
+        self.envelope.plan_version
+    }
+    pub fn activation_unix_ms(&self) -> u64 {
+        self.envelope.activation_unix_ms
+    }
+    pub fn expiry_unix_ms(&self) -> Option<u64> {
+        self.envelope.expiry_unix_ms
+    }
+
+    fn materialization_fingerprints(
+        &self,
+    ) -> impl Iterator<Item = asap_types::PolicyFingerprint> + '_ {
+        self.precompute_plan
+            .materializations
+            .iter()
+            .map(asap_types::PrecomputeMaterialization::policy_fingerprint)
+    }
 }
 
 #[derive(Clone)]
@@ -126,13 +154,10 @@ struct MaterializationReadinessState {
 
 impl MaterializationReadinessState {
     fn for_plan(plan: &ActivePhysicalPlan) -> Self {
-        let plan_id = plan.backend_plan.plan_id;
-        let plan_version = plan.backend_plan.plan_version;
+        let plan_id = plan.plan_id();
+        let plan_version = plan.plan_version();
         let statuses = plan
-            .backend_plan
-            .materializations
-            .keys()
-            .copied()
+            .materialization_fingerprints()
             .map(|materialization| {
                 (
                     materialization,
@@ -251,12 +276,9 @@ impl PhysicalPlanLifecycle {
     pub fn new(active: HotReloadActivePhysicalPlan) -> Self {
         let snapshot = active.snapshot();
         let mut statuses = BTreeMap::new();
-        if snapshot.backend_plan.plan_id != 0 {
+        if snapshot.plan_id() != 0 {
             statuses.insert(
-                (
-                    snapshot.backend_plan.plan_id,
-                    snapshot.backend_plan.plan_version,
-                ),
+                (snapshot.plan_id(), snapshot.plan_version()),
                 status_for(&snapshot, PhysicalPlanPhase::Active),
             );
         }
@@ -274,18 +296,18 @@ impl PhysicalPlanLifecycle {
         plan: ActivePhysicalPlan,
         now: u64,
     ) -> Result<(), PhysicalPlanLifecycleError> {
-        let key = (plan.backend_plan.plan_id, plan.backend_plan.plan_version);
-        if let Some(expiry) = plan.backend_plan.expiry_unix_ms {
+        let key = (plan.plan_id(), plan.plan_version());
+        if let Some(expiry) = plan.expiry_unix_ms() {
             if expiry <= now {
                 return Err(PhysicalPlanLifecycleError::Expired { expiry, now });
             }
         }
         let active = self.active.snapshot();
-        if active.backend_plan.plan_id != 0 && key.1 <= active.backend_plan.plan_version {
+        if active.plan_id() != 0 && key.1 <= active.plan_version() {
             return Err(PhysicalPlanLifecycleError::StaleVersion {
                 plan_id: key.0,
                 incoming: key.1,
-                active: active.backend_plan.plan_version,
+                active: active.plan_version(),
             });
         }
         let mut state = self
@@ -348,34 +370,29 @@ impl PhysicalPlanLifecycle {
                 plan_id,
                 plan_version,
             })?;
-        if now < plan.backend_plan.activation_unix_ms {
+        if now < plan.activation_unix_ms() {
             return Err(PhysicalPlanLifecycleError::ActivationNotReached {
-                activation: plan.backend_plan.activation_unix_ms,
+                activation: plan.activation_unix_ms(),
                 now,
             });
         }
-        if let Some(expiry) = plan.backend_plan.expiry_unix_ms {
+        if let Some(expiry) = plan.expiry_unix_ms() {
             if now >= expiry {
                 return Err(PhysicalPlanLifecycleError::Expired { expiry, now });
             }
         }
         let current = self.active.snapshot();
-        if current.backend_plan.plan_id != 0
-            && plan.backend_plan.plan_version <= current.backend_plan.plan_version
-        {
+        if current.plan_id() != 0 && plan.plan_version() <= current.plan_version() {
             return Err(PhysicalPlanLifecycleError::StaleVersion {
                 plan_id,
                 incoming: plan_version,
-                active: current.backend_plan.plan_version,
+                active: current.plan_version(),
             });
         }
         let plan = state.staged.remove(&key).expect("staged plan disappeared");
         let old = self.active.swap(plan.clone());
-        if old.backend_plan.plan_id != 0 {
-            if let Some(status) = state
-                .statuses
-                .get_mut(&(old.backend_plan.plan_id, old.backend_plan.plan_version))
-            {
+        if old.plan_id() != 0 {
+            if let Some(status) = state.statuses.get_mut(&(old.plan_id(), old.plan_version())) {
                 status.phase = PhysicalPlanPhase::Draining;
             }
         }
@@ -414,11 +431,11 @@ impl PhysicalPlanLifecycle {
 
 fn status_for(plan: &ActivePhysicalPlan, phase: PhysicalPlanPhase) -> PhysicalPlanStatus {
     PhysicalPlanStatus {
-        plan_id: plan.backend_plan.plan_id,
-        plan_version: plan.backend_plan.plan_version,
+        plan_id: plan.plan_id(),
+        plan_version: plan.plan_version(),
         phase,
-        activation_unix_ms: plan.backend_plan.activation_unix_ms,
-        expiry_unix_ms: plan.backend_plan.expiry_unix_ms,
+        activation_unix_ms: plan.activation_unix_ms(),
+        expiry_unix_ms: plan.expiry_unix_ms(),
     }
 }
 
@@ -522,204 +539,13 @@ impl std::fmt::Debug for HotReloadActivePhysicalPlan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let snapshot = self.snapshot();
         f.debug_struct("HotReloadActivePhysicalPlan")
-            .field("plan_id", &snapshot.backend_plan.plan_id)
+            .field("plan_id", &snapshot.plan_id())
             .field("query_count", &snapshot.query_plan.entries.len())
             .field(
                 "materializations",
                 &snapshot.precompute_plan.materializations.len(),
             )
             .finish()
-    }
-}
-
-/// Hot-reloadable `BackendPlan` state — same `ArcSwap` shape as
-/// [`HotReloadStreamingConfig`], applied to
-/// `control_plane::backend_plan::BackendPlan` (see
-/// `control_plane/docs/design-backend-plan-wire-format.md`). Lives
-/// alongside [`HotReloadStreamingConfig`], not in place of it:
-/// `POST /api/v1/backend-plan` installs the latest plan here for
-/// `ASAPQueryEngine`'s serving-time lookup to read, while
-/// `POST /api/v1/streaming-config` still drives sid-catalog lifecycle
-/// (registration/retirement) on its own path.
-#[derive(Clone)]
-pub struct HotReloadBackendPlan {
-    inner: Arc<ArcSwap<control_plane::backend_plan::BackendPlan>>,
-    install_lock: Arc<std::sync::Mutex<()>>,
-    active: Option<HotReloadActivePhysicalPlan>,
-}
-
-impl HotReloadBackendPlan {
-    pub fn new(initial: control_plane::backend_plan::BackendPlan) -> Self {
-        Self {
-            inner: Arc::new(ArcSwap::new(Arc::new(initial))),
-            install_lock: Arc::new(std::sync::Mutex::new(())),
-            active: None,
-        }
-    }
-
-    pub fn from_arc(initial: Arc<control_plane::backend_plan::BackendPlan>) -> Self {
-        Self {
-            inner: Arc::new(ArcSwap::new(initial)),
-            install_lock: Arc::new(std::sync::Mutex::new(())),
-            active: None,
-        }
-    }
-
-    pub fn from_active(active: HotReloadActivePhysicalPlan) -> Self {
-        let initial = active.snapshot().backend_plan.clone();
-        Self {
-            inner: Arc::new(ArcSwap::new(initial)),
-            install_lock: Arc::new(std::sync::Mutex::new(())),
-            active: Some(active),
-        }
-    }
-
-    pub fn snapshot(&self) -> Arc<control_plane::backend_plan::BackendPlan> {
-        self.active
-            .as_ref()
-            .map(|a| a.snapshot().backend_plan.clone())
-            .unwrap_or_else(|| self.inner.load_full())
-    }
-
-    pub fn swap(
-        &self,
-        new: control_plane::backend_plan::BackendPlan,
-    ) -> Arc<control_plane::backend_plan::BackendPlan> {
-        self.inner.swap(Arc::new(new))
-    }
-
-    /// Validate then atomically install a plan. A rejected plan never becomes
-    /// observable and the previous snapshot remains active.
-    pub fn install(
-        &self,
-        new: control_plane::backend_plan::BackendPlan,
-    ) -> Result<
-        Arc<control_plane::backend_plan::BackendPlan>,
-        control_plane::backend_plan::ValidationError,
-    > {
-        let _guard = self
-            .install_lock
-            .lock()
-            .expect("backend-plan install lock poisoned");
-        new.validate()?;
-        let active = self.snapshot();
-        if new.plan_id == active.plan_id && new.plan_id != 0 {
-            if new.plan_version < active.plan_version {
-                return Err(
-                    control_plane::backend_plan::ValidationError::StalePlanVersion {
-                        plan_id: new.plan_id,
-                        incoming: new.plan_version,
-                        active: active.plan_version,
-                    },
-                );
-            }
-            if new.plan_version == active.plan_version {
-                if new == *active {
-                    return Ok(active);
-                }
-                return Err(
-                    control_plane::backend_plan::ValidationError::ReusedPlanVersion {
-                        plan_id: new.plan_id,
-                        plan_version: new.plan_version,
-                    },
-                );
-            }
-        }
-        if new.generated_at_unix_ms < active.generated_at_unix_ms {
-            return Err(
-                control_plane::backend_plan::ValidationError::StaleGeneration {
-                    incoming: new.generated_at_unix_ms,
-                    active: active.generated_at_unix_ms,
-                },
-            );
-        }
-        Ok(self.swap(new))
-    }
-}
-
-impl Default for HotReloadBackendPlan {
-    fn default() -> Self {
-        Self::new(control_plane::backend_plan::BackendPlan::default())
-    }
-}
-
-impl std::fmt::Debug for HotReloadBackendPlan {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let snap = self.snapshot();
-        f.debug_struct("HotReloadBackendPlan")
-            .field("plan_id", &snap.plan_id)
-            .field("materializations", &snap.materializations.len())
-            .field("routing", &snap.routing.len())
-            .finish()
-    }
-}
-
-#[cfg(test)]
-mod hot_reload_backend_plan_tests {
-    use super::*;
-    use control_plane::backend_plan::BackendPlan;
-
-    fn plan(plan_id: u64) -> BackendPlan {
-        BackendPlan {
-            plan_id,
-            plan_version: 1,
-            activation_unix_ms: 1,
-            backend_compat: "asap-query-backend.v1".into(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn snapshot_reflects_initial_plan() {
-        let hr = HotReloadBackendPlan::new(plan(1));
-        assert_eq!(hr.snapshot().plan_id, 1);
-    }
-
-    #[test]
-    fn swap_replaces_plan_atomically() {
-        let hr = HotReloadBackendPlan::new(plan(1));
-        let old = hr.swap(plan(2));
-        assert_eq!(old.plan_id, 1, "swap returns the pre-swap snapshot");
-        assert_eq!(hr.snapshot().plan_id, 2);
-    }
-
-    #[test]
-    fn clones_share_underlying_swap() {
-        let hr = HotReloadBackendPlan::new(plan(1));
-        let hr_clone = hr.clone();
-        hr.swap(plan(2));
-        assert_eq!(hr_clone.snapshot().plan_id, 2);
-    }
-
-    #[test]
-    fn invalid_plan_is_rejected_without_replacing_snapshot() {
-        let hr = HotReloadBackendPlan::new(plan(1));
-        let mut invalid = plan(2);
-        invalid
-            .routing
-            .push(control_plane::backend_plan::RoutingEntry {
-                satisfies: control_plane::physical::runtime_capability::Capability::ExactAgg(
-                    asap_types::AggregationType::Sum,
-                ),
-                materialization: asap_types::PolicyFingerprint(99),
-                storage_backend: control_plane::backend_plan::StorageBackend::SketchStore,
-            });
-        assert!(hr.install(invalid).is_err());
-        assert_eq!(hr.snapshot().plan_id, 1);
-    }
-
-    #[test]
-    fn older_generation_is_rejected_without_replacing_snapshot() {
-        let mut current = plan(2);
-        current.generated_at_unix_ms = 200;
-        let hr = HotReloadBackendPlan::new(current);
-        let mut stale = plan(3);
-        stale.generated_at_unix_ms = 199;
-        assert!(matches!(
-            hr.install(stale),
-            Err(control_plane::backend_plan::ValidationError::StaleGeneration { .. })
-        ));
-        assert_eq!(hr.snapshot().plan_id, 2);
     }
 }
 
@@ -821,8 +647,11 @@ mod tests {
             capability_snapshot_id: "test".into(),
         };
         ActivePhysicalPlan {
+            envelope: envelope.clone(),
+            summary_catalog: None,
             precompute_plan: control_plane::physical::compiler::PrecomputePlan {
-                envelope,
+                summary_catalog: None,
+                envelope: envelope.clone(),
                 ingest: control_plane::physical::compiler::IngestContract {
                     protocol:
                         control_plane::physical::compiler::IngestProtocol::ModifiedOtlpMetricsV1,
@@ -838,6 +667,7 @@ mod tests {
                 materializations: Vec::new(),
             },
             transmission_plan: control_plane::physical::compiler::TransmissionPlan {
+                summary_catalog: None,
                 envelope: control_plane::physical::compiler::PlanEnvelope {
                     plan_id,
                     plan_version,
@@ -857,15 +687,6 @@ mod tests {
                 rules: Vec::new(),
             },
             runtime_config: Arc::new(StreamingConfig::new(HashMap::new())),
-            backend_plan: Arc::new(control_plane::backend_plan::BackendPlan {
-                plan_id,
-                plan_version,
-                generated_at_unix_ms: activation_unix_ms,
-                activation_unix_ms,
-                expiry_unix_ms,
-                backend_compat: "asap-query-backend.v1".into(),
-                ..Default::default()
-            }),
             query_plan: Arc::new(control_plane::query_plan::QueryPlan {
                 plan_id,
                 plan_version,
@@ -985,14 +806,14 @@ mod tests {
             .stage(physical_plan(7, 2, 200, Some(500)), 150)
             .unwrap();
 
-        assert_eq!(active.snapshot().backend_plan.plan_version, 1);
+        assert_eq!(active.snapshot().plan_version(), 1);
         assert!(matches!(
             lifecycle.activate(7, 2, 199),
             Err(PhysicalPlanLifecycleError::ActivationNotReached { .. })
         ));
         let old = lifecycle.activate(7, 2, 200).unwrap();
-        assert_eq!(old.backend_plan.plan_version, 1);
-        assert_eq!(active.snapshot().backend_plan.plan_version, 2);
+        assert_eq!(old.plan_version(), 1);
+        assert_eq!(active.snapshot().plan_version(), 2);
 
         let statuses = lifecycle.statuses();
         assert_eq!(statuses.len(), 2);
@@ -1017,8 +838,8 @@ mod tests {
             .unwrap();
         lifecycle.activate(7, 2, 300).unwrap();
         assert!(lifecycle.discard_staged(7, 2).is_err());
-        assert_eq!(active.snapshot().backend_plan.plan_version, 2);
-        assert_eq!(held_reader.backend_plan.plan_version, 1);
+        assert_eq!(active.snapshot().plan_version(), 2);
+        assert_eq!(held_reader.plan_version(), 1);
     }
 
     #[test]
@@ -1086,6 +907,6 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(active.snapshot().backend_plan.plan_version, 3);
+        assert_eq!(active.snapshot().plan_version(), 3);
     }
 }

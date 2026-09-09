@@ -343,7 +343,7 @@ dependencies = [
 [[package]]
 name = "asap-aware-mapping"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=940a9928d9b77e22125a269618d8036f61b1c3b2#940a9928d9b77e22125a269618d8036f61b1c3b2"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=e28284231e861c18beb4222cada4bf5e0afeae22#e28284231e861c18beb4222cada4bf5e0afeae22"
 dependencies = [
  "asap-types",
  "serde",
@@ -354,7 +354,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=940a9928d9b77e22125a269618d8036f61b1c3b2#940a9928d9b77e22125a269618d8036f61b1c3b2"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=e28284231e861c18beb4222cada4bf5e0afeae22#e28284231e861c18beb4222cada4bf5e0afeae22"
 dependencies = [
  "asap-types",
  "promql-parser 0.10.0",
@@ -374,7 +374,7 @@ dependencies = [
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=940a9928d9b77e22125a269618d8036f61b1c3b2#940a9928d9b77e22125a269618d8036f61b1c3b2"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=e28284231e861c18beb4222cada4bf5e0afeae22#e28284231e861c18beb4222cada4bf5e0afeae22"
 dependencies = [
  "serde",
  "serde_json",
@@ -418,6 +418,8 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
+ "thiserror 1.0.69",
  "tracing",
  "xxhash-rust",
 ]
@@ -3203,6 +3205,17 @@ name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures",

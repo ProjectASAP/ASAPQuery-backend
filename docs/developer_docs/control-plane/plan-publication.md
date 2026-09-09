@@ -2,7 +2,8 @@
 
 This page describes the implemented MVP contract. The control plane compiles
 ASAPPlanner's selected post-ASAP IR once and projects that decision into one
-typed `BackendPlan` plus one target-specific `CollectorPlan` per Collector.
+authoritative `SummaryCatalog`, matching Precompute, Transmission, and Query
+plans, plus one target-specific `CollectorPlan` per Collector.
 
 ## API
 
@@ -45,7 +46,7 @@ validate request and compile one bundle
 preflight every Collector capability
               |
               v
-POST one atomic PrecomputePlan + TransmissionPlan + BackendPlan + QueryPlan bundle (stage)
+POST one atomic SummaryCatalog + PrecomputePlan + TransmissionPlan + QueryPlan bundle (stage)
               |
               v
 publish target-specific CollectorPlans over OpAMP
@@ -89,8 +90,9 @@ another Collector's plan.
 
 ## Backend wire contract
 
-The matching BackendPlan protobuf is embedded with the typed PrecomputePlan,
-TransmissionPlan, and QueryPlan in `POST /api/v1/physical-plan`. The backend validates all shared
+The authoritative SummaryCatalog snapshot is embedded with the typed PrecomputePlan,
+TransmissionPlan, CollectorPlans, and QueryPlan in `POST /api/v1/physical-plan`.
+The backend validates all shared
 identities, fingerprints, schemas, parameters, producers, and lifecycle fields
 before returning `staged`; `POST /api/v1/physical-plan/activate` performs the
 single immutable-snapshot swap.

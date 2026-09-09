@@ -26,7 +26,7 @@ ASAPQuery control plane
       +---------------------------+
       |                           |
       v                           v
-CollectorPlan                 BackendPlan
+CollectorPlan              SummaryCatalog + execution plans
       |                           |
       v                           v
 ASAPCollector -- summary state --> ASAPQuery data plane
@@ -49,7 +49,8 @@ See the [control-plane physical-planning design](https://github.com/ProjectASAP/
 
 ASAPCollector applies CollectorPlan, maintains summaries from observed OTLP
 metrics, and transmits raw observations, full state, or deltas as directed. The
-data plane accepts a payload only when it matches the active BackendPlan and
+data plane accepts a payload only when it matches the active SummaryCatalog,
+PrecomputePlan, and TransmissionPlan, then
 stores it under the declared materialization and logical window.
 
 The distributed Collector profile does not treat legacy Telegraf, OTAP, Kafka,
@@ -61,7 +62,8 @@ profile's primary OTel path.
 ## Query path
 
 A PromQL request enters through a protocol server and adapter. The data plane
-uses BackendPlan to locate a compatible readout and checks plan identity,
+uses QueryPlan bindings resolved through SummaryCatalog to locate a compatible
+readout and checks plan identity,
 coverage, freshness, and state compatibility before execution. If the selected
 logical plan requires exact execution, the request is sent to the configured
 exact backend.

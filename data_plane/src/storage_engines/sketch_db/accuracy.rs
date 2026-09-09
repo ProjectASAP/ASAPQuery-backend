@@ -1,7 +1,7 @@
 //! `AccuracyProfile` — derived error / confidence bound for each
 //! `AggregationConfig`.
 //!
-//! Implements backend accuracy metadata consumed under BackendPlan. Logical
+//! Implements backend accuracy metadata consumed through SummaryCatalog and QueryPlan. Logical
 //! guarantees are owned by ASAPPlanner and family bounds by summary libraries.
 //! Given the `aggregation_type` + `parameters` pinned on an
 //! `AggSchema`, the registry can expose the theoretical accuracy

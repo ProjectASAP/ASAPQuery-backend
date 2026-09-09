@@ -49,13 +49,11 @@ tonic          = { version = "0.12", features = ["gzip"] }
 tokio-stream   = { version = "0.1", features = ["net"] }
 asap_types.workspace = true
 
-# Transitional pin (docs/migration-plan-backend-plan.md Phase 1b; see also
-# control_plane/docs/design-asapplanner-pin-migration.md for the migration
-# this bump landed): locked to a specific commit on ASAPPlanner's main,
+# Locked to a specific commit on ASAPPlanner's main (see
+# control_plane/docs/design-asapplanner-pin-migration.md):
 # not a tag -- ASAPPlanner has no tagged releases yet. Re-pin as
 # ASAPPlanner's IR evolves; move to a tag once one exists.
 #
-# Bumped to cb70086 (main tip, 2026-08-22) from cc18c987. In between,
 # ASAPPlanner consolidated its crates (ASAPPlanner#198): `asap-ir` and
 # `asap-sketch` merged into one crate -- Cargo package `asap-types`, with
 # `pre_asap`/`post_asap` modules replacing the old L3/L4 split -- and
@@ -93,8 +91,8 @@ asap_types.workspace = true
 # scaffolding, unaware that `data_plane`'s `summary_executor.rs` in *this*
 # repo is a real one. Vendored locally instead of chased upstream -- see
 # `data_plane/src/query_engines/asap_query_engine/summary_exec.rs`.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "940a9928d9b77e22125a269618d8036f61b1c3b2" }
-asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "940a9928d9b77e22125a269618d8036f61b1c3b2" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "e28284231e861c18beb4222cada4bf5e0afeae22" }
+asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "e28284231e861c18beb4222cada4bf5e0afeae22" }
 
 # L1 adoption (design-target-architecture.md Part B): the PromQL front
 # end itself, replacing control_plane's own query_parser/promql.rs.
@@ -102,7 +100,7 @@ asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev =
 # `planner-types`/`asap-aware-mapping` above -- these three MUST move
 # together (two revs of the same upstream repo's types in one workspace
 # resolve to distinct Rust types that won't unify).
-asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "940a9928d9b77e22125a269618d8036f61b1c3b2" }
+asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "e28284231e861c18beb4222cada4bf5e0afeae22" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

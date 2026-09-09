@@ -12,7 +12,7 @@ ASAPPlanner public summary/readout types
                   v
 PhysicalCompiler capability match
             /                 \
-CollectorPlan                 BackendPlan
+CollectorPlan              SummaryCatalog + QueryPlan
       |                           |
 ASAPCollector                 SummaryDecoder
 update + encode        ->     SummaryStore -> SummaryReader
@@ -67,7 +67,8 @@ pub trait SummaryReader {
         &self,
         request: &QueryRequest,
         route: &SummaryRoute,
-        plan: &BackendPlanSnapshot,
+        catalog: &SummaryCatalog,
+        plan: &QueryPlan,
     ) -> Result<SummaryReadout, Self::Error>;
 }
 ```

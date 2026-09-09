@@ -16,7 +16,7 @@ fn readiness_requirement(
     let bindings = entry.materialization_bindings();
     let mut materializations = bindings
         .iter()
-        .map(|binding| binding.materialization)
+        .map(|binding| binding.materialization.fingerprint())
         .collect::<Vec<_>>();
     materializations.sort_unstable();
     materializations.dedup();
@@ -117,7 +117,7 @@ pub struct ASAPQueryEngine {
     archive_engine:
         Option<Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>>,
     /// Generation-consistent physical snapshot used by the production query
-    /// path. QueryPlan and BackendPlan must never be sampled separately.
+    /// path. The QueryPlan and SummaryCatalog must come from the same snapshot.
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
     exact_subquery_endpoint: Option<String>,
     exact_subquery_client: reqwest::Client,
@@ -166,10 +166,16 @@ impl ASAPQueryEngine {
     }
     async fn prepare_logical(
         &self,
-        _physical: &crate::storage_engines::types::ActivePhysicalPlan,
+        physical: &crate::storage_engines::types::ActivePhysicalPlan,
         entry: &control_plane::query_plan::QueryPlanEntry,
         times: &[u64],
     ) -> Result<super::logical_dag::PreparedLeaves, crate::query_engines::EngineError> {
+        super::catalog_resolver::validate_entry(
+            physical.summary_catalog.as_deref(),
+            entry,
+            physical.query_plan.plan_id,
+            physical.query_plan.plan_version,
+        )?;
         super::exact_subqueries::prepare(
             entry,
             times,
@@ -238,25 +244,20 @@ impl ASAPQueryEngine {
                     "readiness registry unavailable",
                 )
             })?;
-            let plan_id = physical.backend_plan.plan_id;
-            let version = physical.backend_plan.plan_version;
+            let plan_id = physical.plan_id();
+            let version = physical.plan_version();
             // Exact range accumulators preserve their actual first/last sample
             // timestamps. Sparse counter series may legitimately begin after
             // the range boundary; Prometheus evaluates the samples that exist.
             // The physical plan's retention bound guarantees stored panes were
             // not evicted, so requiring a sample at t0 would reject valid data.
-            let exact_accumulator_bindings = bindings.iter().all(|binding| {
-                matches!(
-                    physical
-                        .backend_plan
-                        .materializations
-                        .get(&binding.materialization)
-                        .map(|materialization| &materialization.family),
-                    Some(planner_types::post_asap::SummaryFamilyType::ExactAggregate(
-                        ..
-                    ))
-                )
-            });
+            let exact_accumulator_bindings =
+                physical.summary_catalog.as_deref().is_some_and(|catalog| {
+                    bindings.iter().all(|binding| {
+                        super::catalog_resolver::resolve(catalog, binding.materialization)
+                            .is_ok_and(|resolved| resolved.is_exact())
+                    })
+                });
             let sparse_exact_coverage = exact_accumulator_bindings
                 && result
                     .coverage
@@ -386,7 +387,7 @@ impl ASAPQueryEngine {
         self.active_physical_plan
             .as_ref()
             .map(|handle| handle.snapshot())
-            .filter(|plan| plan.backend_plan.plan_id != 0)
+            .filter(|plan| plan.plan_id() != 0)
     }
 
     /// Phase-5 hybrid-stitch builder — attach an archive engine the
@@ -596,9 +597,13 @@ impl ASAPQueryEngine {
         let planned = match physical_plan.as_ref() {
             Some(physical_plan) => match physical_plan.query_plan.lookup(query) {
                 Ok(query_entry) => {
+                    super::catalog_resolver::validate_entry(
+                        physical_plan.summary_catalog.as_deref(), query_entry,
+                        physical_plan.query_plan.plan_id, physical_plan.query_plan.plan_version,
+                    )?;
                     readiness = Some((
-                        physical_plan.backend_plan.plan_id,
-                        physical_plan.backend_plan.plan_version,
+                        physical_plan.plan_id(),
+                        physical_plan.plan_version(),
                         readiness_requirement(query_entry),
                     ));
                     crate::query_engines::asap_query_engine::live_serve::serve_range_steps_from_query_plan(
@@ -619,7 +624,6 @@ impl ASAPQueryEngine {
                 end_ms,
                 false,
                 control_plane::types_v2::AccuracyTarget::Epsilon(0.01),
-                None,
             ),
             #[cfg(not(test))]
             None => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(
@@ -679,7 +683,7 @@ impl ASAPQueryEngine {
             crate::query_engines::EngineError::capability_miss(
                 crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                 format!(
-                    "post-ASAP/BackendPlan resolver could not serve `{query}` over \
+                    "installed QueryPlan resolver could not serve `{query}` over \
                      [{start_ms}, {end_ms}]: {reason:?} — failing over to archive"
                 ),
             )
@@ -946,7 +950,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             }
         }
         // One authoritative warm path: ASAPPlanner post-ASAP DAG →
-        // BackendPlan/materialization resolver → SID lookup → DAG executor.
+        // SummaryCatalog/materialization resolver → SID lookup → DAG executor.
         // A typed resolver/executor error becomes CapabilityMiss, which lets
         // EngineRouter continue to the archive backend.
         if let Some(idx) = self.sketch_index.as_ref() {
@@ -956,8 +960,8 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 Some(physical_plan) => match physical_plan.query_plan.lookup(query) {
                     Ok(query_entry) => {
                         readiness = Some((
-                            physical_plan.backend_plan.plan_id,
-                            physical_plan.backend_plan.plan_version,
+                            physical_plan.plan_id(),
+                            physical_plan.plan_version(),
                             readiness_requirement(query_entry),
                         ));
                         crate::query_engines::asap_query_engine::live_serve::serve_instant_from_query_plan(
@@ -968,7 +972,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 },
                 #[cfg(test)]
                 None => crate::query_engines::asap_query_engine::live_serve::serve_instant_from_summary_executor(
-                    idx, query, now_ms, None,
+                    idx, query, now_ms,
                 ),
                 #[cfg(not(test))]
                 None => Err(crate::query_engines::asap_query_engine::post_asap_planner::LoweringSkip::QueryNotPlanned(
@@ -1028,7 +1032,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     crate::query_engines::EngineError::capability_miss(
                         crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                         format!(
-                            "post-ASAP/BackendPlan resolver could not serve `{query}`: \n                             {reason:?} — failing over to archive"
+                            "installed QueryPlan resolver could not serve `{query}`: \n                             {reason:?} — failing over to archive"
                         ),
                     )
                 })?;

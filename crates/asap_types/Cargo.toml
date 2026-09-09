@@ -9,8 +9,10 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 clap.workspace = true
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+sha2 = "0.10"
 
 # First cross-crate ASAPPlanner dependency for data_plane (transitively,
 # via this crate): WindowType -> planner_types::pre_asap::query_expr::WindowKind
@@ -30,4 +32,4 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 # exactly (`control_plane/Cargo.toml`) -- two different revs of the same
 # git dependency in one workspace resolve to two distinct Rust types that
 # won't unify.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "940a9928d9b77e22125a269618d8036f61b1c3b2" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "e28284231e861c18beb4222cada4bf5e0afeae22" }

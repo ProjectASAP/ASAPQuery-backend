@@ -58,15 +58,25 @@ struct DataDescriptor {
 
 struct SummaryInstance {
     id: SummaryInstanceId,
+    materialization_id: MaterializationId,
     summary_descriptor_id: SummaryDescriptorId,
     data_descriptor_id: DataDescriptorId,
     interval: HalfOpenInterval,
     group_values: BTreeMap<String, String>,
     completeness: Completeness,
-    lineage: Lineage,
-    state: AggPayload,
+    catalog_generation: CatalogGeneration,
+    placement: SummaryPlacement,
+    state_reference: SummaryStateReference,
+    status: SummaryInstanceStatus,
+    lifecycle: Persistent | Ephemeral(EphemeralLease),
 }
 ```
+
+The instance contract contains no payload bytes. `SummaryStateReference` is an
+opaque storage-engine locator with state-schema version, generation, sequence
+and optional checksum. `ObservedSummaryInventory` is a versioned data-plane
+report keyed by `SummaryInstanceId`; it is observed state and never part of the
+desired catalog snapshot.
 
 ## Authoritative SummaryCatalog and execution plans
 
@@ -74,6 +84,21 @@ The control-plane `SummaryCatalog` is the metadata authority. It stores immutabl
 Summary and Data Descriptors plus stable materialization identities. It does not
 store pane payloads, watermarks, completeness, or observed availability; those
 are data-plane instance/runtime metadata.
+
+The control plane reconciles two explicitly separate views:
+
+- **Desired SummaryCatalog:** persistent materializations selected through
+  workload feedback and Planner decisions.
+- **Observed Summary Inventory:** instances actually building or stored,
+  including placement, time coverage, state reference, status and generation.
+
+Reconciliation creates missing desired materializations, updates instances from
+old catalog generations, recovers failed or missing payloads, and retires then
+garbage-collects materializations removed from desired state. A data-plane fast
+path may create only an ephemeral instance with a finite lease and must report
+it immediately. A matching desired materialization promotes it; otherwise it
+expires and is collected. The data plane cannot promote an ephemeral instance
+or create persistent desired state by itself.
 
 ```text
                        ASAPPlanner post-ASAP DAG
@@ -100,8 +125,13 @@ are data-plane instance/runtime metadata.
              pane instances, completeness and lineage
 ```
 
-All four execution plans reference catalog IDs instead of copying operator,
-source, filter, grouping, fidelity, or state-schema definitions.
+All four execution plans carry catalog references and use catalog materialization
+IDs for cross-plan identity. During the compatibility migration, producer and
+precompute DTOs still repeat fields needed by existing runtimes, including
+operator parameters, source/filter/grouping, window, and state schema. Install
+validation requires those fields to agree exactly with the catalog; they are not
+independent semantic definitions. New interfaces should resolve them from the
+catalog, allowing the copied fields to be removed as consumers migrate.
 
 | Component | Responsibility |
 | --- | --- |
@@ -112,20 +142,20 @@ source, filter, grouping, fidelity, or state-schema definitions.
 | `QueryPlan` | Materialization references, readout, DAG composition and exact Prometheus boundaries |
 | SummaryStore (`SketchStore` today) | Instance state, concrete intervals/groups, completeness, lineage and rebuildable rollups |
 
-`BackendPlan` is transitional. Its materialization registry moves into
-`SummaryCatalog`; update/placement/lifecycle moves into `PrecomputePlan`; query
-routing moves into `QueryPlan`; and the common deployment envelope becomes shared
-plan metadata. After consumers install the same catalog snapshot and these plan
-references are validated, the BackendPlan protobuf and endpoint are removed.
+The former `BackendPlan` has been removed. `SummaryCatalog` owns materialization
+metadata, `PrecomputePlan` owns update/placement/lifecycle, `QueryPlan` owns
+readout and fallback routing, and the common deployment envelope carries their
+shared plan identity. Consumers atomically install one catalog snapshot with
+the plans that reference it.
 
-The migration order is:
+The implemented ownership split is:
 
 1. Move the SDS catalog contract into `asap_types`.
 2. Make the control plane own the authoritative `SummaryCatalog`.
 3. Make `PrecomputePlan` reference catalog descriptors and own update, placement and lifecycle.
 4. Make `QueryPlan::MaterializationBinding` reference catalog/materialization IDs directly.
 5. Distribute the same catalog snapshot to Collector and backend.
-6. Remove `BackendPlan`, its protobuf and install endpoint, and duplicate validation.
+6. `BackendPlan`, its protobuf and install endpoint, and duplicate validation are removed.
 
 ## Implemented backend representation
 
@@ -142,9 +172,12 @@ compatibility DTO while older sidecars are read.
 The implemented `SummaryDescriptor` currently contains one `SummaryOperator`,
 one derived `FidelityGuarantee`, and a numeric state-schema version. The
 implemented `DataDescriptor` contains metric name, canonical population filter,
-and grouping keys. Observation semantics, structured state schemas, and a
-standalone `SummaryInstance` API remain target-model work; pane state and
-completeness/lineage tracking currently live in existing `SketchStore` tables.
+grouping keys and versioned observation semantics. The shared contract now also
+defines `SummaryInstance`, `ObservedSummaryInventory`, placement, completeness,
+state references, catalog generation and ephemeral leases. The control-plane
+reconciler emits create, update, recover, retire, garbage-collect, promote and
+expire actions. Summary payloads and the application of those actions remain in
+the SummaryStore runtime.
 
 The durable `sid_metadata.json` format is versioned independently. Version 2
 contains `summary_descriptors`, `data_descriptors`, and `bindings` tables. A
@@ -156,10 +189,11 @@ An ingest record is never an SDS instance. Raw samples can be transient inputs t
 the precompute engine, but the backend does not retain them as a second exact
 query store. Exact residual subtrees run in Prometheus.
 
-The target model requires these invariants. The current implementation enforces
-descriptor binding and non-overlapping pane selection; the remaining structured
-schema and instance contracts must be completed before claiming full SDS
-conformance:
+The SDS metadata and inventory types represent the following invariants. The
+current runtime enforces descriptor binding and non-overlapping pane selection.
+Full runtime conformance still requires applying and durably persisting every
+reconciliation action, including recovery, promotion, lease expiry, retirement,
+and garbage collection:
 
 1. An instance references exactly one immutable Summary Descriptor and one
    immutable Data Descriptor.

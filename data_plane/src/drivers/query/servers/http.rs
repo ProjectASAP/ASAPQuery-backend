@@ -149,12 +149,6 @@ pub struct HttpServer {
     /// Hot-reloadable `StreamingConfig` source. `None` when hot-reload
     /// is not wired up by the caller (unit tests, legacy binaries).
     hot_reload_config: Option<crate::storage_engines::types::HotReloadStreamingConfig>,
-    /// Hot-reloadable `BackendPlan` handle for `GET/POST
-    /// /api/v1/backend-plan` (see `control_plane/docs/design-backend-plan-wire-format.md`).
-    /// `None` when not wired up (unit tests, legacy binaries) — the
-    /// endpoints return `503`. Shared with `ASAPQueryEngine` so its
-    /// serving-time lookup sees the same installed plan.
-    hot_reload_backend_plan: Option<crate::storage_engines::types::HotReloadBackendPlan>,
     /// Per-metric storage-backend routing table consulted by the HTTP
     /// instant-query handler at request time. When `Some(..)` and the
     /// query parses, the handler extracts the metric name from the
@@ -197,7 +191,7 @@ pub struct HttpServer {
     /// archive and observes the 60–90 s flush gap).
     probe_cache: Option<Arc<FreshnessProbeCache>>,
     /// Serializes multi-document physical-plan publication so two control
-    /// plane generations cannot interleave their config and BackendPlan.
+    /// plane generations cannot interleave their plan projections and catalog.
     physical_plan_lock: Arc<tokio::sync::Mutex<()>>,
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
     physical_plan_lifecycle: Option<crate::storage_engines::types::PhysicalPlanLifecycle>,
@@ -217,8 +211,6 @@ struct AppState {
     adapter: Arc<dyn HttpProtocolAdapter>,
     fallback: Option<Arc<dyn crate::drivers::query::fallback::FallbackClient>>,
     hot_reload_config: Option<crate::storage_engines::types::HotReloadStreamingConfig>,
-    /// See [`HttpServer::hot_reload_backend_plan`].
-    hot_reload_backend_plan: Option<crate::storage_engines::types::HotReloadBackendPlan>,
     /// See [`HttpServer::backend_storage_routing`].
     backend_storage_routing: Option<crate::query_engines::routing::HotReloadBackendStorageRouting>,
     /// Backfill registry (sketch DB §10). See `HttpServer::backfill`.
@@ -250,7 +242,6 @@ impl HttpServer {
             query_router,
             sketch_index,
             hot_reload_config: None,
-            hot_reload_backend_plan: None,
             backend_storage_routing: None,
             backfill: None,
             data_retention_ms: None,
@@ -308,20 +299,6 @@ impl HttpServer {
         handle: crate::storage_engines::types::HotReloadStreamingConfig,
     ) -> Self {
         self.hot_reload_config = Some(handle);
-        self
-    }
-
-    /// Attach a `HotReloadBackendPlan` handle so the
-    /// `GET/POST /api/v1/backend-plan` endpoints can install and read
-    /// the control plane's typed `BackendPlan` push. Additive alongside
-    /// [`Self::with_hot_reload_config`] — without this handle the
-    /// endpoints return `503 Service Unavailable`, same contract as the
-    /// legacy streaming-config handle.
-    pub fn with_hot_reload_backend_plan(
-        mut self,
-        handle: crate::storage_engines::types::HotReloadBackendPlan,
-    ) -> Self {
-        self.hot_reload_backend_plan = Some(handle);
         self
     }
 
@@ -442,7 +419,6 @@ impl HttpServer {
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
-            hot_reload_backend_plan: self.hot_reload_backend_plan.clone(),
             backend_storage_routing: self.backend_storage_routing.clone(),
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
@@ -475,13 +451,6 @@ impl HttpServer {
                 "/api/v1/streaming-config",
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
-            // BackendPlan wire format (design-backend-plan-wire-format.md):
-            // sibling of streaming-config above, read by ASAPQueryEngine's
-            // serving-time lookup. POST body is raw protobuf bytes.
-            .route(
-                "/api/v1/backend-plan",
-                get(handle_get_backend_plan).post(handle_post_backend_plan),
-            )
             .route("/api/v1/physical-plan", post(handle_post_physical_plan))
             .route(
                 "/api/v1/physical-plan/discard",
@@ -495,6 +464,7 @@ impl HttpServer {
                 "/api/v1/physical-plan/status",
                 get(handle_physical_plan_status),
             )
+            .route("/api/v1/summary-inventory", get(handle_summary_inventory))
             // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
             // returns a JSON snapshot for operator diagnostics.
@@ -555,7 +525,6 @@ impl HttpServer {
             adapter: adapter.clone(),
             fallback: self.config.adapter_config.fallback.clone(),
             hot_reload_config: self.hot_reload_config.clone(),
-            hot_reload_backend_plan: self.hot_reload_backend_plan.clone(),
             backend_storage_routing: self.backend_storage_routing.clone(),
             backfill: self.backfill.clone(),
             data_retention_ms: self.data_retention_ms,
@@ -586,13 +555,6 @@ impl HttpServer {
                 "/api/v1/streaming-config",
                 get(handle_get_streaming_config).post(handle_post_streaming_config),
             )
-            // BackendPlan wire format (design-backend-plan-wire-format.md):
-            // sibling of streaming-config above, read by ASAPQueryEngine's
-            // serving-time lookup. POST body is raw protobuf bytes.
-            .route(
-                "/api/v1/backend-plan",
-                get(handle_get_backend_plan).post(handle_post_backend_plan),
-            )
             .route("/api/v1/physical-plan", post(handle_post_physical_plan))
             .route(
                 "/api/v1/physical-plan/discard",
@@ -606,6 +568,7 @@ impl HttpServer {
                 "/api/v1/physical-plan/status",
                 get(handle_physical_plan_status),
             )
+            .route("/api/v1/summary-inventory", get(handle_summary_inventory))
             // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
             // returns a JSON snapshot for operator diagnostics.
@@ -2516,13 +2479,16 @@ mod tests {
             generated_at_unix_ms: 0,
             activation_unix_ms: 1,
             expiry_unix_ms: None,
-            backend_compat: control_plane::backend_plan::BACKEND_COMPAT.into(),
+            backend_compat: control_plane::physical::compiler::BACKEND_COMPAT.into(),
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
         let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(
             crate::storage_engines::types::ActivePhysicalPlan {
+                envelope: envelope.clone(),
+                summary_catalog: None,
                 precompute_plan: PrecomputePlan {
+                    summary_catalog: None,
                     envelope: envelope.clone(),
                     ingest: IngestContract {
                         protocol: IngestProtocol::PrometheusRemoteWriteV1,
@@ -2537,6 +2503,7 @@ mod tests {
                     materializations: Vec::new(),
                 },
                 transmission_plan: TransmissionPlan {
+                    summary_catalog: None,
                     envelope,
                     frame_identity: FrameIdentityContract {
                         identity_version: 1,
@@ -2547,13 +2514,6 @@ mod tests {
                     rules: Vec::new(),
                 },
                 runtime_config: streaming_config.clone(),
-                backend_plan: Arc::new(control_plane::backend_plan::BackendPlan {
-                    plan_id: 7,
-                    plan_version: 1,
-                    activation_unix_ms: 1,
-                    backend_compat: control_plane::backend_plan::BACKEND_COMPAT.into(),
-                    ..Default::default()
-                }),
                 query_plan: Arc::new(control_plane::query_plan::QueryPlan {
                     plan_id: 7,
                     plan_version: 1,
@@ -2677,32 +2637,6 @@ mod tests {
         );
         if let Some(handle) = hot_reload {
             server = server.with_hot_reload_config(handle);
-        }
-        server
-            .start_test_server()
-            .await
-            .expect("Failed to start test server")
-    }
-
-    async fn setup_test_server_with_backend_plan(
-        hot_reload: Option<crate::storage_engines::types::HotReloadBackendPlan>,
-    ) -> u16 {
-        let adapter_config =
-            AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
-        let config = HttpServerConfig {
-            port: 0,
-            handle_http_requests: true,
-            adapter_config,
-        };
-        let streaming_config = Arc::new(StreamingConfig::default());
-        let query_engine = Arc::new(ASAPQueryEngine::new(streaming_config.clone(), 15000));
-        let mut server = HttpServer::new(
-            config,
-            query_engine,
-            Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
-        );
-        if let Some(handle) = hot_reload {
-            server = server.with_hot_reload_backend_plan(handle);
         }
         server
             .start_test_server()
@@ -2914,120 +2848,6 @@ aggregations:
                 "http://127.0.0.1:{server_port}/api/v1/streaming-config"
             ))
             .body("not: : : valid: yaml: :")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
-        let body: serde_json::Value = resp.json().await.unwrap();
-        assert_eq!(body["status"], "error");
-    }
-
-    // ── BackendPlan hot-reload (design-backend-plan-wire-format.md) ─────
-
-    /// POST an encoded `BackendPlan` and verify the active state via GET
-    /// reflects the swap, and that the underlying hot-reload handle
-    /// (cloned into the server at setup) sees it too — mirroring
-    /// `test_streaming_config_hot_reload_round_trip`.
-    #[tokio::test]
-    async fn test_backend_plan_hot_reload_round_trip() {
-        use control_plane::backend_plan::BackendPlan;
-
-        let hot_reload =
-            crate::storage_engines::types::HotReloadBackendPlan::new(BackendPlan::default());
-        let server_port = setup_test_server_with_backend_plan(Some(hot_reload.clone())).await;
-        let client = Client::new();
-
-        let initial = client
-            .get(format!(
-                "http://127.0.0.1:{server_port}/api/v1/backend-plan"
-            ))
-            .send()
-            .await
-            .expect("GET failed");
-        assert!(initial.status().is_success());
-        let initial_body: serde_json::Value = initial.json().await.unwrap();
-        assert_eq!(initial_body["materialization_count"], 0);
-
-        let new_plan = BackendPlan {
-            plan_id: 7,
-            generated_at_unix_ms: 123,
-            plan_version: 1,
-            activation_unix_ms: 123,
-            backend_compat: "asap-query-backend.v1".into(),
-            ..Default::default()
-        };
-        let bytes = new_plan.encode_to_vec();
-
-        let post_resp = client
-            .post(format!(
-                "http://127.0.0.1:{server_port}/api/v1/backend-plan"
-            ))
-            .header("content-type", "application/x-protobuf")
-            .body(bytes)
-            .send()
-            .await
-            .expect("POST failed");
-        let post_status = post_resp.status();
-        let post_body: serde_json::Value = post_resp.json().await.unwrap();
-        assert!(
-            post_status.is_success(),
-            "POST returned {post_status}: {post_body}"
-        );
-        assert_eq!(post_body["status"], "success");
-        assert_eq!(post_body["plan_id"], 7);
-
-        let after = client
-            .get(format!(
-                "http://127.0.0.1:{server_port}/api/v1/backend-plan"
-            ))
-            .send()
-            .await
-            .expect("GET after swap failed");
-        let after_body: serde_json::Value = after.json().await.unwrap();
-        assert_eq!(after_body["plan_id"], 7);
-        assert_eq!(after_body["generated_at_unix_ms"], 123);
-
-        assert_eq!(hot_reload.snapshot().plan_id, 7);
-    }
-
-    #[tokio::test]
-    async fn test_backend_plan_hot_reload_missing_handle_503() {
-        let server_port = setup_test_server_with_backend_plan(None).await;
-        let client = Client::new();
-
-        let get_resp = client
-            .get(format!(
-                "http://127.0.0.1:{server_port}/api/v1/backend-plan"
-            ))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(get_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-
-        let post_resp = client
-            .post(format!(
-                "http://127.0.0.1:{server_port}/api/v1/backend-plan"
-            ))
-            .body("anything")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(post_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    #[tokio::test]
-    async fn test_backend_plan_hot_reload_rejects_bad_bytes() {
-        use control_plane::backend_plan::BackendPlan;
-        let hot_reload =
-            crate::storage_engines::types::HotReloadBackendPlan::new(BackendPlan::default());
-        let server_port = setup_test_server_with_backend_plan(Some(hot_reload)).await;
-        let client = Client::new();
-
-        let resp = client
-            .post(format!(
-                "http://127.0.0.1:{server_port}/api/v1/backend-plan"
-            ))
-            .body(vec![0xFFu8, 0xFF, 0xFF])
             .send()
             .await
             .unwrap();
@@ -5772,12 +5592,9 @@ async fn handle_health(State(state): State<AppState>) -> axum::response::Respons
             return (StatusCode::SERVICE_UNAVAILABLE, "no active PhysicalPlan").into_response();
         };
         let now = unix_time_ms();
-        let lifecycle_ready = active.backend_plan.plan_id != 0
-            && active.backend_plan.activation_unix_ms <= now
-            && active
-                .backend_plan
-                .expiry_unix_ms
-                .is_none_or(|expiry| now < expiry);
+        let lifecycle_ready = active.plan_id() != 0
+            && active.activation_unix_ms() <= now
+            && active.expiry_unix_ms().is_none_or(|expiry| now < expiry);
         let ingest_ready = matches!(
             active.precompute_plan.ingest.protocol,
             control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
@@ -5950,86 +5767,14 @@ async fn handle_post_streaming_config(
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-// ── BackendPlan hot-reload (design-backend-plan-wire-format.md) ─────────
-//
-// `GET /api/v1/backend-plan`  — return the currently installed plan as
-//                                JSON (debug / verification).
-// `POST /api/v1/backend-plan` — accept a protobuf body, decode, and
-//                                atomically swap via ArcSwap.
-//
-// Sits alongside `/api/v1/streaming-config`, not in place of it — the
-// swap here does NOT touch the sid catalog / SketchStore reconciliation;
-// that lifecycle management stays on the streaming-config path.
-
-async fn handle_get_backend_plan(State(state): State<AppState>) -> axum::response::Response {
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-
-    let Some(handle) = state.hot_reload_backend_plan else {
-        let body = serde_json::json!({
-            "status": "error",
-            "error": "hot-reload backend-plan handle not attached; backend was built without HttpServer::with_hot_reload_backend_plan"});
-        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-    };
-    let snap = handle.snapshot();
-    let body = serde_json::json!({
-        "status": "success",
-        "plan_id": snap.plan_id,
-        "generated_at_unix_ms": snap.generated_at_unix_ms,
-        "materialization_count": snap.materializations.len(),
-        "routing_count": snap.routing.len(),
-        "monitor_count": snap.monitors.len()});
-    (StatusCode::OK, axum::Json(body)).into_response()
-}
-
-async fn handle_post_backend_plan(
-    State(state): State<AppState>,
-    body: axum::body::Bytes,
-) -> axum::response::Response {
-    use axum::http::StatusCode;
-    use axum::response::IntoResponse;
-
-    let Some(handle) = state.hot_reload_backend_plan else {
-        let body = serde_json::json!({
-            "status": "error",
-            "error": "hot-reload backend-plan handle not attached; backend was built without HttpServer::with_hot_reload_backend_plan"});
-        return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(body)).into_response();
-    };
-
-    let new_plan = match control_plane::backend_plan::BackendPlan::decode(&body) {
-        Ok(p) => p,
-        Err(e) => {
-            let body = serde_json::json!({
-                "status": "error",
-                "error": format!("BackendPlan decode error: {e}")});
-            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
-        }
-    };
-
-    let materialization_count = new_plan.materializations.len();
-    let routing_count = new_plan.routing.len();
-    let plan_id = new_plan.plan_id;
-    if let Err(error) = handle.install(new_plan) {
-        let body = serde_json::json!({
-            "status": "error",
-            "error": format!("BackendPlan validation error: {error}")});
-        return (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(body)).into_response();
-    }
-
-    let body = serde_json::json!({
-        "status": "success",
-        "plan_id": plan_id,
-        "materialization_count": materialization_count,
-        "routing_count": routing_count});
-    (StatusCode::OK, axum::Json(body)).into_response()
-}
-
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhysicalPlanInstallRequest {
+    pub summary_catalog: control_plane::physical::summary_catalog::SummaryCatalog,
+    #[serde(default)]
+    pub collector_plans: Vec<control_plane::physical::compiler::CollectorPlan>,
     pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
     pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
-    pub backend_plan: Vec<u8>,
     pub query_plan: control_plane::query_plan::QueryPlan,
     pub storage_routing: Option<serde_json::Value>,
     #[serde(default)]
@@ -6043,6 +5788,39 @@ pub fn build_active_physical_plan(
     default_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
 ) -> Result<crate::storage_engines::types::ActivePhysicalPlan, String> {
     use std::collections::BTreeSet;
+    request
+        .precompute_plan
+        .validate_against_catalog(&request.summary_catalog)
+        .map_err(|error| format!("PrecomputePlan catalog validation error: {error}"))?;
+    request
+        .transmission_plan
+        .validate_against_catalog(&request.summary_catalog)
+        .map_err(|error| format!("TransmissionPlan catalog validation error: {error}"))?;
+    request
+        .query_plan
+        .validate_against_catalog(&request.summary_catalog)
+        .map_err(|error| format!("QueryPlan catalog validation error: {error}"))?;
+    for collector in &request.collector_plans {
+        collector
+            .validate_against_catalog(&request.summary_catalog)
+            .map_err(|error| format!("CollectorPlan catalog validation error: {error}"))?;
+    }
+    for entry in request.query_plan.entries.values() {
+        for binding in entry.materialization_bindings() {
+            let materialization = request
+                .precompute_plan
+                .materializations
+                .iter()
+                .find(|config| config.policy_fingerprint() == binding.materialization.fingerprint())
+                .ok_or_else(|| "query binding has no precompute definition".to_string())?;
+            if binding.window_ms != materialization.slide_interval.saturating_mul(1_000) {
+                return Err(
+                    "query physical pane duration differs from installed precompute definition"
+                        .into(),
+                );
+            }
+        }
+    }
     let runtime_materializations = request
         .precompute_plan
         .runtime_materializations()
@@ -6051,39 +5829,21 @@ pub fn build_active_physical_plan(
         .transmission_plan
         .validate(&request.precompute_plan)
         .map_err(|error| format!("TransmissionPlan validation error: {error}"))?;
-    let backend_plan = control_plane::backend_plan::BackendPlan::decode(&request.backend_plan)
-        .map_err(|error| format!("BackendPlan decode error: {error}"))?;
-    backend_plan
-        .validate()
-        .map_err(|error| format!("BackendPlan validation error: {error}"))?;
-    request
-        .precompute_plan
-        .validate_against_backend(&backend_plan)
-        .map_err(|error| format!("PrecomputePlan validation error: {error}"))?;
     let envelope = &request.precompute_plan.envelope;
-    if request.query_plan.plan_id != backend_plan.plan_id
-        || request.query_plan.plan_version != backend_plan.plan_version
-        || envelope.plan_id != backend_plan.plan_id
-        || envelope.plan_version != backend_plan.plan_version
-        || envelope.activation_unix_ms != backend_plan.activation_unix_ms
-        || envelope.expiry_unix_ms != backend_plan.expiry_unix_ms
-        || envelope.backend_compat != backend_plan.backend_compat
+    if request.query_plan.plan_id != envelope.plan_id
+        || request.query_plan.plan_version != envelope.plan_version
         || request.transmission_plan.envelope != *envelope
     {
         return Err("physical subplans have different plan identity/version".into());
     }
     let runtime_config =
         crate::storage_engines::types::StreamingConfig::new(runtime_materializations);
-    let config_fps: BTreeSet<u64> = runtime_config.aggregation_configs.keys().copied().collect();
-    let plan_fps: BTreeSet<u64> = backend_plan
-        .materializations
+    let typed_fps: BTreeSet<_> = runtime_config
+        .aggregation_configs
         .keys()
-        .map(|fp| fp.0)
+        .copied()
+        .map(asap_types::PolicyFingerprint)
         .collect();
-    if config_fps != plan_fps {
-        return Err("PrecomputePlan and BackendPlan materialization fingerprints differ".into());
-    }
-    let typed_fps: BTreeSet<_> = backend_plan.materializations.keys().copied().collect();
     request
         .query_plan
         .validate(&typed_fps)
@@ -6096,10 +5856,11 @@ pub fn build_active_physical_plan(
         None => default_routing,
     };
     Ok(crate::storage_engines::types::ActivePhysicalPlan {
+        envelope: envelope.clone(),
+        summary_catalog: Some(Arc::new(request.summary_catalog)),
         precompute_plan: request.precompute_plan,
         transmission_plan: request.transmission_plan,
         runtime_config: Arc::new(runtime_config),
-        backend_plan: Arc::new(backend_plan),
         query_plan: Arc::new(request.query_plan),
         storage_routing,
     })
@@ -6161,7 +5922,7 @@ async fn handle_post_physical_plan(
         }
     };
     if state.remote_write.is_some()
-        && (active.backend_plan.plan_id == 0
+        && (active.plan_id() == 0
             || !matches!(
                 active.precompute_plan.ingest.protocol,
                 control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
@@ -6177,9 +5938,9 @@ async fn handle_post_physical_plan(
         )
             .into_response();
     }
-    let plan_id = active.backend_plan.plan_id;
+    let plan_id = active.plan_id();
     let materialization_count = active.precompute_plan.materializations.len();
-    let plan_version = active.backend_plan.plan_version;
+    let plan_version = active.plan_version();
     let now = unix_time_ms();
     if let Err(error) = lifecycle.stage(active, now) {
         return (
@@ -6235,9 +5996,24 @@ async fn handle_activate_physical_plan(
                 .into_response()
         }
     };
-    if old.backend_plan.plan_id != 0 {
-        let draining_id = old.backend_plan.plan_id;
-        let draining_version = old.backend_plan.plan_version;
+    let activated = active_handle.snapshot();
+    if let Some(catalog) = activated.summary_catalog.as_ref() {
+        if let Err(error) = state
+            .sketch_index
+            .install_summary_catalog(Arc::clone(catalog))
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "status": "error", "error": format!("SummaryCatalog install error: {error}")
+                })),
+            )
+                .into_response();
+        }
+    }
+    if old.plan_id() != 0 {
+        let draining_id = old.plan_id();
+        let draining_version = old.plan_version();
         let lifecycle = lifecycle.clone();
         tokio::spawn(async move {
             loop {
@@ -6249,7 +6025,7 @@ async fn handle_activate_physical_plan(
             }
         });
     }
-    let snap = active_handle.snapshot().runtime_config.clone();
+    let snap = activated.runtime_config.clone();
     let retired = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
         state.sketch_index.as_ref(),
         snap.as_ref(),
@@ -6263,6 +6039,56 @@ async fn handle_activate_physical_plan(
         })),
     )
         .into_response()
+}
+
+async fn handle_summary_inventory(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(active) = state
+        .active_physical_plan
+        .as_ref()
+        .map(|handle| handle.snapshot())
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(
+                serde_json::json!({"status":"error","error":"physical plan is unavailable"}),
+            ),
+        )
+            .into_response();
+    };
+    if active.summary_catalog.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"status":"error","error":"authoritative SummaryCatalog is unavailable"})),
+        )
+            .into_response();
+    }
+    let producers = active
+        .precompute_plan
+        .producers
+        .iter()
+        .map(|producer| {
+            (
+                asap_types::sds::MaterializationId::from(producer.materialization),
+                producer.producer_id.clone(),
+            )
+        })
+        .collect();
+    let reporter = std::env::var("HOSTNAME").unwrap_or_else(|_| "asapquery-backend".into());
+    match state.sketch_index.observed_summary_inventory(
+        &reporter,
+        &reporter,
+        &producers,
+        active.plan_version(),
+        unix_time_ms() as i64,
+    ) {
+        Ok(inventory) => axum::Json(inventory).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"status":"error","error":error})),
+        )
+            .into_response(),
+    }
 }
 
 async fn handle_discard_physical_plan(
@@ -7022,5 +6848,101 @@ mod logical_provenance_tests {
         // Any observed local raw branch invalidates a deployed plan.
         let mut value = serde_json::json!({"warnings":["asap_execution:asap", "asap_logical_stats:raw=1,summary=1,memo_hits=0"]});
         assert_eq!(extract_logical_provenance(&mut value), Some(Err(())));
+    }
+}
+
+#[cfg(test)]
+mod catalog_install_tests {
+    use super::{build_active_physical_plan, PhysicalPlanInstallRequest};
+    use std::sync::Arc;
+
+    fn request() -> PhysicalPlanInstallRequest {
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        PhysicalPlanInstallRequest {
+            summary_catalog: plan.summary_catalog,
+            collector_plans: plan.collector_plans,
+            precompute_plan: plan.precompute_plan,
+            transmission_plan: plan.transmission_plan,
+            query_plan: plan.query_plan,
+            storage_routing: None,
+            adaptation_evidence: vec![],
+        }
+    }
+    fn install(
+        request: PhysicalPlanInstallRequest,
+    ) -> Result<crate::storage_engines::types::ActivePhysicalPlan, String> {
+        build_active_physical_plan(
+            request,
+            Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
+        )
+    }
+
+    // Installing transports the exact supplied snapshot, rather than rebuilding it.
+    #[test]
+    fn catalog_install_preserves_authoritative_snapshot() {
+        let request = request();
+        let expected = request.summary_catalog.clone();
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let active = install(serde_json::from_slice(&encoded).unwrap()).unwrap();
+        assert_eq!(active.summary_catalog.as_deref(), Some(&expected));
+        active
+            .query_plan
+            .validate_against_catalog(active.summary_catalog.as_deref().unwrap())
+            .unwrap();
+    }
+
+    // Catalog-aware artifacts cannot silently downgrade to a legacy installation.
+    #[test]
+    fn catalog_install_requires_snapshot_and_matching_references() {
+        let mut encoded = serde_json::to_value(request()).unwrap();
+        encoded.as_object_mut().unwrap().remove("summary_catalog");
+        assert!(serde_json::from_value::<PhysicalPlanInstallRequest>(encoded).is_err());
+        let mut request = request();
+        request.transmission_plan.summary_catalog = None;
+        assert!(install(request)
+            .unwrap_err()
+            .contains("TransmissionPlan catalog"));
+    }
+
+    // A same-version snapshot replacement fails before the active generation changes.
+    #[test]
+    fn catalog_install_rejects_drift_without_replacing_active_snapshot() {
+        let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(
+            install(request()).unwrap(),
+        );
+        let before = active.snapshot();
+        let mut changed = request();
+        changed.summary_catalog.plan_version += 1;
+        assert!(install(changed).is_err());
+        assert!(Arc::ptr_eq(&before, &active.snapshot()));
+        let mut changed = request();
+        changed.summary_catalog.summary_descriptors.clear();
+        assert!(install(changed).is_err());
+        assert!(Arc::ptr_eq(&before, &active.snapshot()));
+    }
+
+    // Physical pane width cannot be replaced by the semantic lookback at install.
+    #[test]
+    fn catalog_install_rejects_query_pane_drift() {
+        let mut request = request();
+        let binding = request
+            .query_plan
+            .entries
+            .values_mut()
+            .flat_map(|entry| entry.nodes.values_mut())
+            .find_map(|node| match node {
+                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                    Some(binding)
+                }
+                _ => None,
+            })
+            .expect("demo has maintained summaries");
+        binding.window_ms += 1;
+        assert!(install(request).unwrap_err().contains("pane duration"));
     }
 }

@@ -104,29 +104,20 @@ pub fn try_serve_from_summary_executor(
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
-    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Option<ASAPTierResult> {
     if !summary_executor_live_enabled() {
         return None;
     }
 
-    serve_from_summary_executor(
-        index,
-        query,
-        t0_ms,
-        t1_ms,
-        is_cumulative,
-        live_accuracy(),
-        backend_plan,
-    )
-    .map_err(|skip| {
-        tracing::debug!(
-            query,
-            ?skip,
-            "live: query not servable from SummaryExecutor, falling back"
-        );
-    })
-    .ok()
+    serve_from_summary_executor(index, query, t0_ms, t1_ms, is_cumulative, live_accuracy())
+        .map_err(|skip| {
+            tracing::debug!(
+                query,
+                ?skip,
+                "live: query not servable from SummaryExecutor, falling back"
+            );
+        })
+        .ok()
 }
 
 pub fn serve_from_summary_executor(
@@ -136,20 +127,11 @@ pub fn serve_from_summary_executor(
     t1_ms: u64,
     is_cumulative: bool,
     accuracy: AccuracyTarget,
-    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<ASAPTierResult, LoweringSkip> {
     if !summary_executor_live_enabled() {
         return Err(LoweringSkip::Disabled);
     }
-    let outcome = execute_post_asap_readout(
-        index,
-        query,
-        t0_ms,
-        t1_ms,
-        is_cumulative,
-        accuracy,
-        backend_plan,
-    )?;
+    let outcome = execute_post_asap_readout(index, query, t0_ms, t1_ms, is_cumulative, accuracy)?;
 
     tracing::debug!(query, "live: served from SummaryExecutor");
     Ok(ASAPTierResult {
@@ -162,13 +144,11 @@ pub fn serve_instant_from_summary_executor(
     index: &SketchStore,
     query: &str,
     now_ms: u64,
-    backend_plan: Option<&control_plane::backend_plan::BackendPlan>,
 ) -> Result<(ASAPTierResult, u64), LoweringSkip> {
     if !summary_executor_live_enabled() {
         return Err(LoweringSkip::Disabled);
     }
-    let (outcome, t0_ms) =
-        execute_post_asap_instant(index, query, now_ms, live_accuracy(), backend_plan)?;
+    let (outcome, t0_ms) = execute_post_asap_instant(index, query, now_ms, live_accuracy())?;
     Ok((
         ASAPTierResult {
             series: outcome.series,
@@ -405,7 +385,6 @@ mod tests {
             1_000,
             2_000,
             true,
-            None,
         );
         assert!(result.is_some(), "unset flag must default to serving");
     }
@@ -434,7 +413,6 @@ mod tests {
             1_000,
             2_000,
             true,
-            None,
         );
         let result = result.expect("unambiguous single-series quantile must serve");
         assert_eq!(result.series.len(), 1);
@@ -485,9 +463,7 @@ mod tests {
                     control_plane::query_plan::QueryNodeId(1),
                     control_plane::query_plan::QueryPlanNode::ReadMaterialization {
                         binding: control_plane::query_plan::MaterializationBinding {
-                            materialization: policy,
-                            metric: "bytes".into(),
-                            sid_grouping: vec![],
+                            materialization: policy.into(),
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 1_000,
                             readout_lookback_ms: Some(1_000),
@@ -525,7 +501,7 @@ mod tests {
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
         let result =
-            try_serve_from_summary_executor(&idx, "count(unique_users)", 1_000, 2_000, true, None);
+            try_serve_from_summary_executor(&idx, "count(unique_users)", 1_000, 2_000, true);
         let result = result
             .expect("global-merge shape is no longer ambiguous -- it must be served, not declined");
         assert_eq!(
@@ -545,14 +521,8 @@ mod tests {
     #[test]
     fn flag_on_unservable_query_falls_back() {
         let idx = SketchStore::new();
-        let result = try_serve_from_summary_executor(
-            &idx,
-            "rate(http_requests_total[5m])",
-            0,
-            1000,
-            true,
-            None,
-        );
+        let result =
+            try_serve_from_summary_executor(&idx, "rate(http_requests_total[5m])", 0, 1000, true);
         assert!(result.is_none());
     }
 }

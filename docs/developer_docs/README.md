@@ -11,7 +11,7 @@ cross-repository interfaces live in
 ## Query engine
 
 - [Routing, readout, and query-engine implementation](query-engine/query-engine.md)
-- [BackendPlan runtime](query-engine/backend-plan-runtime.md)
+- [Catalog-backed physical-plan runtime](query-engine/backend-plan-runtime.md)
 - [Extension points](query-engine/extension-points.md)
 
 ## Ingest engine

@@ -775,6 +775,7 @@ fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
         AggIntent::TopK { .. } => "topk",
         AggIntent::Cardinality { .. } => "cardinality",
         AggIntent::Rate => "rate",
+        AggIntent::IRate => "irate",
         AggIntent::Increase => "increase",
         AggIntent::Absent => "absent",
         AggIntent::AbsentOverTime => "absent_over_time",
@@ -806,7 +807,6 @@ fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
         AggIntent::TsOfLastOverTime => "ts_of_last_over_time",
         // Unrecognized Extension (not the Frequency one, guarded above).
         AggIntent::Extension { .. } => "extension",
-        AggIntent::IRate => "irate",
     }
 }
 
