@@ -41,7 +41,7 @@ def main():
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--advance-step-ms", type=int, default=60000)
     parser.add_argument("--base-port", type=int, default=19600)
-    parser.add_argument("--scope", choices=("full_upstream_corpus", "derived_subquery_child"), required=True)
+    parser.add_argument("--scope", choices=("full_upstream_corpus", "original_occurrence_subset", "derived_subquery_child"), required=True)
     args = parser.parse_args()
     if args.advance_step_ms <= 0 or args.trials < 1:
         parser.error("advancing step and trials must be positive")
