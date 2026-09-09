@@ -166,10 +166,16 @@ impl ASAPQueryEngine {
     }
     async fn prepare_logical(
         &self,
-        _physical: &crate::storage_engines::types::ActivePhysicalPlan,
+        physical: &crate::storage_engines::types::ActivePhysicalPlan,
         entry: &control_plane::query_plan::QueryPlanEntry,
         times: &[u64],
     ) -> Result<super::logical_dag::PreparedLeaves, crate::query_engines::EngineError> {
+        super::catalog_resolver::validate_entry(
+            physical.summary_catalog.as_deref(),
+            entry,
+            physical.query_plan.plan_id,
+            physical.query_plan.plan_version,
+        )?;
         super::exact_subqueries::prepare(
             entry,
             times,
@@ -245,18 +251,13 @@ impl ASAPQueryEngine {
             // the range boundary; Prometheus evaluates the samples that exist.
             // The physical plan's retention bound guarantees stored panes were
             // not evicted, so requiring a sample at t0 would reject valid data.
-            let exact_accumulator_bindings = bindings.iter().all(|binding| {
-                matches!(
-                    physical
-                        .backend_plan
-                        .materializations
-                        .get(&binding.materialization.fingerprint())
-                        .map(|materialization| &materialization.family),
-                    Some(planner_types::post_asap::SummaryFamilyType::ExactAggregate(
-                        ..
-                    ))
-                )
-            });
+            let exact_accumulator_bindings =
+                physical.summary_catalog.as_deref().is_some_and(|catalog| {
+                    bindings.iter().all(|binding| {
+                        super::catalog_resolver::resolve(catalog, binding.materialization)
+                            .is_ok_and(|resolved| resolved.is_exact())
+                    })
+                });
             let sparse_exact_coverage = exact_accumulator_bindings
                 && result
                     .coverage
@@ -596,6 +597,10 @@ impl ASAPQueryEngine {
         let planned = match physical_plan.as_ref() {
             Some(physical_plan) => match physical_plan.query_plan.lookup(query) {
                 Ok(query_entry) => {
+                    super::catalog_resolver::validate_entry(
+                        physical_plan.summary_catalog.as_deref(), query_entry,
+                        physical_plan.query_plan.plan_id, physical_plan.query_plan.plan_version,
+                    )?;
                     readiness = Some((
                         physical_plan.backend_plan.plan_id,
                         physical_plan.backend_plan.plan_version,
