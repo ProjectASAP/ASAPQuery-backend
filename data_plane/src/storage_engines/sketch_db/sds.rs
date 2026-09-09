@@ -114,8 +114,7 @@ pub struct SummaryDescriptorRegistry {
 
 impl SummaryDescriptorRegistry {
     pub fn bind(&self, metadata: SketchInstanceMetadata) -> SdsBinding {
-        let summary_key: Arc<str> = metadata.agg_kind.operator_canonical_string().into();
-        let summary_id = SummaryDescriptorId(summary_key);
+        let summary_id = summary_descriptor_id(&metadata.agg_kind);
         let summary_descriptor = {
             let mut summaries = self.summaries.write().unwrap();
             if let Some(existing) = summaries.get(&summary_id).and_then(Weak::upgrade) {
@@ -137,13 +136,11 @@ impl SummaryDescriptorRegistry {
         };
 
         let filter = metadata.agg_kind.spatial_filter_canonical();
-        let data_key: Arc<str> = canonical_data_key(
+        let data_id = data_descriptor_id(
             &metadata.metric_name,
             filter,
             metadata.group_by_keys.iter().map(String::as_str),
-        )
-        .into();
-        let data_id = DataDescriptorId(data_key);
+        );
         let data_descriptor = {
             let mut data = self.data.write().unwrap();
             if let Some(existing) = data.get(&data_id).and_then(Weak::upgrade) {
@@ -230,6 +227,18 @@ impl SummaryDescriptorRegistry {
         }
         total
     }
+}
+
+pub(crate) fn summary_descriptor_id(kind: &AggKind) -> SummaryDescriptorId {
+    SummaryDescriptorId(kind.operator_canonical_string().into())
+}
+
+pub(crate) fn data_descriptor_id<'a>(
+    metric: &str,
+    filter: &str,
+    group_by: impl Iterator<Item = &'a str>,
+) -> DataDescriptorId {
+    DataDescriptorId(canonical_data_key(metric, filter, group_by).into())
 }
 
 fn canonical_data_key<'a>(
