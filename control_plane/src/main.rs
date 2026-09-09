@@ -628,10 +628,8 @@ struct CompileAndPublishPhysicalPlanResponse {
     lifecycle_estimates: Vec<physical::compiler::MaterializationLifecycleEstimate>,
 }
 
-/// Compile one Planner IR decision into matching Collector, Precompute, and Backend views
-/// and install them in dependency order. Unlike the legacy planning endpoint,
-/// this MVP boundary is fail-closed: the Collector plan is never published
-/// unless the backend accepted the exact matching BackendPlan first.
+/// Compile one Planner IR decision into one catalog-backed physical plan and
+/// install it atomically before publishing collector projections.
 async fn handle_compile_and_publish_physical_plan(
     State(st): State<AppState>,
     Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
@@ -680,12 +678,7 @@ async fn handle_compile_and_publish_physical_plan(
         }
     };
     if let Err(error) = backend
-        .post_catalog_plan_typed(
-            &publication,
-            Some(bundle.backend_plan.encode_to_vec()),
-            None,
-            &adaptation_evidence,
-        )
+        .post_catalog_plan_typed(&publication, None, &adaptation_evidence)
         .await
     {
         return (
