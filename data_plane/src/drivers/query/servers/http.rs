@@ -464,6 +464,7 @@ impl HttpServer {
                 "/api/v1/physical-plan/status",
                 get(handle_physical_plan_status),
             )
+            .route("/api/v1/summary-inventory", get(handle_summary_inventory))
             // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
             // returns a JSON snapshot for operator diagnostics.
@@ -567,6 +568,7 @@ impl HttpServer {
                 "/api/v1/physical-plan/status",
                 get(handle_physical_plan_status),
             )
+            .route("/api/v1/summary-inventory", get(handle_summary_inventory))
             // Phase α (MVP): control-plane-pushed `BackendStorageRouting`
             // table. POST replaces the current table atomically; GET
             // returns a JSON snapshot for operator diagnostics.
@@ -5994,6 +5996,21 @@ async fn handle_activate_physical_plan(
                 .into_response()
         }
     };
+    let activated = active_handle.snapshot();
+    if let Some(catalog) = activated.summary_catalog.as_ref() {
+        if let Err(error) = state
+            .sketch_index
+            .install_summary_catalog(Arc::clone(catalog))
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "status": "error", "error": format!("SummaryCatalog install error: {error}")
+                })),
+            )
+                .into_response();
+        }
+    }
     if old.plan_id() != 0 {
         let draining_id = old.plan_id();
         let draining_version = old.plan_version();
@@ -6008,7 +6025,7 @@ async fn handle_activate_physical_plan(
             }
         });
     }
-    let snap = active_handle.snapshot().runtime_config.clone();
+    let snap = activated.runtime_config.clone();
     let retired = crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config(
         state.sketch_index.as_ref(),
         snap.as_ref(),
@@ -6022,6 +6039,56 @@ async fn handle_activate_physical_plan(
         })),
     )
         .into_response()
+}
+
+async fn handle_summary_inventory(State(state): State<AppState>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let Some(active) = state
+        .active_physical_plan
+        .as_ref()
+        .map(|handle| handle.snapshot())
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(
+                serde_json::json!({"status":"error","error":"physical plan is unavailable"}),
+            ),
+        )
+            .into_response();
+    };
+    if active.summary_catalog.is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"status":"error","error":"authoritative SummaryCatalog is unavailable"})),
+        )
+            .into_response();
+    }
+    let producers = active
+        .precompute_plan
+        .producers
+        .iter()
+        .map(|producer| {
+            (
+                asap_types::sds::MaterializationId::from(producer.materialization),
+                producer.producer_id.clone(),
+            )
+        })
+        .collect();
+    let reporter = std::env::var("HOSTNAME").unwrap_or_else(|_| "asapquery-backend".into());
+    match state.sketch_index.observed_summary_inventory(
+        &reporter,
+        &reporter,
+        &producers,
+        active.plan_version(),
+        unix_time_ms() as i64,
+    ) {
+        Ok(inventory) => axum::Json(inventory).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"status":"error","error":error})),
+        )
+            .into_response(),
+    }
 }
 
 async fn handle_discard_physical_plan(

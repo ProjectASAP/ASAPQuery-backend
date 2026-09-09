@@ -137,20 +137,20 @@ source, filter, grouping, fidelity, or state-schema definitions.
 | `QueryPlan` | Materialization references, readout, DAG composition and exact Prometheus boundaries |
 | SummaryStore (`SketchStore` today) | Instance state, concrete intervals/groups, completeness, lineage and rebuildable rollups |
 
-`BackendPlan` is transitional. Its materialization registry moves into
-`SummaryCatalog`; update/placement/lifecycle moves into `PrecomputePlan`; query
-routing moves into `QueryPlan`; and the common deployment envelope becomes shared
-plan metadata. After consumers install the same catalog snapshot and these plan
-references are validated, the BackendPlan protobuf and endpoint are removed.
+The former `BackendPlan` has been removed. `SummaryCatalog` owns materialization
+metadata, `PrecomputePlan` owns update/placement/lifecycle, `QueryPlan` owns
+readout and fallback routing, and the common deployment envelope carries their
+shared plan identity. Consumers atomically install one catalog snapshot with
+the plans that reference it.
 
-The migration order is:
+The implemented ownership split is:
 
 1. Move the SDS catalog contract into `asap_types`.
 2. Make the control plane own the authoritative `SummaryCatalog`.
 3. Make `PrecomputePlan` reference catalog descriptors and own update, placement and lifecycle.
 4. Make `QueryPlan::MaterializationBinding` reference catalog/materialization IDs directly.
 5. Distribute the same catalog snapshot to Collector and backend.
-6. Remove `BackendPlan`, its protobuf and install endpoint, and duplicate validation.
+6. `BackendPlan`, its protobuf and install endpoint, and duplicate validation are removed.
 
 ## Implemented backend representation
 
