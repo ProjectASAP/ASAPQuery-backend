@@ -2523,6 +2523,8 @@ mod tests {
         let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(
             crate::storage_engines::types::ActivePhysicalPlan {
                 precompute_plan: PrecomputePlan {
+                    summary_catalog: None,
+                    materialization_contracts: Default::default(),
                     envelope: envelope.clone(),
                     ingest: IngestContract {
                         protocol: IngestProtocol::PrometheusRemoteWriteV1,
@@ -2537,6 +2539,7 @@ mod tests {
                     materializations: Vec::new(),
                 },
                 transmission_plan: TransmissionPlan {
+                    summary_catalog: None,
                     envelope,
                     frame_identity: FrameIdentityContract {
                         identity_version: 1,

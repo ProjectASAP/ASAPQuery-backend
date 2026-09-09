@@ -774,6 +774,8 @@ mod tests {
         };
         let active = ActivePhysicalPlan {
             precompute_plan: PrecomputePlan {
+                summary_catalog: None,
+                materialization_contracts: Default::default(),
                 envelope: envelope.clone(),
                 ingest: IngestContract {
                     protocol: IngestProtocol::PrometheusRemoteWriteV1,
@@ -788,6 +790,7 @@ mod tests {
                 materializations: streaming.aggregation_configs.values().cloned().collect(),
             },
             transmission_plan: TransmissionPlan {
+                summary_catalog: None,
                 envelope,
                 frame_identity: FrameIdentityContract {
                     identity_version: 1,

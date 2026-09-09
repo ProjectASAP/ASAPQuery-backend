@@ -257,6 +257,9 @@ pub struct CollectorLifecycle {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollectorPlan {
+    /// Absent only in legacy artifacts; catalog-aware validation requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_catalog: Option<super::summary_catalog::SummaryCatalogReference>,
     pub collector_id: String,
     pub envelope: PlanEnvelope,
     pub materializations: Vec<CollectorMaterialization>,
@@ -270,6 +273,13 @@ pub struct CollectorPlan {
 /// series, maintains windows, and writes content-addressed materializations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputePlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_catalog: Option<super::summary_catalog::SummaryCatalogReference>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub materialization_contracts: BTreeMap<
+        asap_types::sds::MaterializationId,
+        super::precompute_contract::PrecomputeMaterializationContract,
+    >,
     pub envelope: PlanEnvelope,
     pub ingest: IngestContract,
     pub schemas: Vec<StateSchemaContract>,
@@ -396,6 +406,8 @@ pub struct ProducerContract {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PrecomputePlanError {
+    #[error("invalid precompute catalog contract: {0}")]
+    CatalogContract(String),
     #[error("PrecomputePlan envelope does not match BackendPlan identity/lifecycle")]
     PlanIdentityMismatch,
     #[error("unsupported precompute ingest protocol/endpoint/identity contract")]
@@ -467,6 +479,8 @@ impl PrecomputePlan {
             })
             .collect();
         let plan = Self {
+            summary_catalog: None,
+            materialization_contracts: BTreeMap::new(),
             envelope,
             ingest: IngestContract {
                 protocol: IngestProtocol::ModifiedOtlpMetricsV1,
@@ -605,7 +619,7 @@ impl PrecomputePlan {
                 return Err(PrecomputePlanError::MissingProducer(missing.0));
             }
         }
-        Ok(())
+        self.validate_catalog_contract()
     }
 
     pub fn validate_against_backend(
@@ -904,6 +918,9 @@ pub struct RuntimeAdaptationEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransmissionPlan {
+    /// Absent only in legacy artifacts; catalog-aware validation requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_catalog: Option<super::summary_catalog::SummaryCatalogReference>,
     pub envelope: PlanEnvelope,
     pub frame_identity: FrameIdentityContract,
     pub rules: Vec<TransmissionRule>,
@@ -943,6 +960,8 @@ pub struct SummaryFrameIdentity {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransmissionPlanError {
+    #[error("summary catalog mismatch: {0}")]
+    Catalog(String),
     #[error("TransmissionPlan envelope differs from PrecomputePlan")]
     EnvelopeMismatch,
     #[error("transmission rules do not exactly match precompute producer bindings")]
@@ -966,7 +985,67 @@ pub enum TransmissionPlanError {
     },
 }
 
+fn validate_catalog_projection(
+    reference: Option<&super::summary_catalog::SummaryCatalogReference>,
+    envelope: &PlanEnvelope,
+    materializations: impl IntoIterator<Item = asap_types::PolicyFingerprint>,
+    catalog: &super::summary_catalog::SummaryCatalog,
+) -> Result<(), TransmissionPlanError> {
+    let expected = catalog
+        .reference()
+        .map_err(|error| TransmissionPlanError::Catalog(error.to_string()))?;
+    if reference != Some(&expected)
+        || envelope.plan_id != catalog.plan_id
+        || envelope.plan_version != catalog.plan_version
+    {
+        return Err(TransmissionPlanError::Catalog(
+            "missing or different snapshot reference".into(),
+        ));
+    }
+    for id in materializations {
+        if !catalog
+            .materializations
+            .contains_key(&asap_types::sds::MaterializationId::from(id))
+        {
+            return Err(TransmissionPlanError::Catalog(format!(
+                "unknown materialization {}",
+                id.0
+            )));
+        }
+    }
+    Ok(())
+}
+
+impl CollectorPlan {
+    pub fn validate_against_catalog(
+        &self,
+        catalog: &super::summary_catalog::SummaryCatalog,
+    ) -> Result<(), TransmissionPlanError> {
+        validate_catalog_projection(
+            self.summary_catalog.as_ref(),
+            &self.envelope,
+            self.materializations
+                .iter()
+                .map(|m| m.materialization)
+                .chain(self.transmission_rules.iter().map(|r| r.materialization)),
+            catalog,
+        )
+    }
+}
+
 impl TransmissionPlan {
+    pub fn validate_against_catalog(
+        &self,
+        catalog: &super::summary_catalog::SummaryCatalog,
+    ) -> Result<(), TransmissionPlanError> {
+        validate_catalog_projection(
+            self.summary_catalog.as_ref(),
+            &self.envelope,
+            self.rules.iter().map(|r| r.materialization),
+            catalog,
+        )
+    }
+
     pub fn build(
         envelope: PlanEnvelope,
         precompute: &PrecomputePlan,
@@ -1016,7 +1095,18 @@ impl TransmissionPlan {
                 }
             })
             .collect();
+        let catalog = super::summary_catalog::SummaryCatalog::from_materializations(
+            envelope.plan_id,
+            envelope.plan_version,
+            &precompute.materializations,
+        )
+        .map_err(|error| TransmissionPlanError::Catalog(error.to_string()))?;
         let plan = Self {
+            summary_catalog: Some(
+                catalog
+                    .reference()
+                    .map_err(|error| TransmissionPlanError::Catalog(error.to_string()))?,
+            ),
             envelope,
             frame_identity: FrameIdentityContract {
                 identity_version: 1,
@@ -1031,6 +1121,15 @@ impl TransmissionPlan {
     }
 
     pub fn validate(&self, precompute: &PrecomputePlan) -> Result<(), TransmissionPlanError> {
+        if self.summary_catalog.is_some() {
+            let catalog = super::summary_catalog::SummaryCatalog::from_materializations(
+                precompute.envelope.plan_id,
+                precompute.envelope.plan_version,
+                &precompute.materializations,
+            )
+            .map_err(|error| TransmissionPlanError::Catalog(error.to_string()))?;
+            self.validate_against_catalog(&catalog)?;
+        }
         if self.envelope != precompute.envelope {
             return Err(TransmissionPlanError::EnvelopeMismatch);
         }
@@ -2241,6 +2340,20 @@ impl PhysicalCompiler {
                 .entry(materialization.policy_fingerprint())
                 .or_insert(materialization);
         }
+        // The compatibility emitter may clamp pane sizes. Publish the actual
+        // executable configuration in both projections, never the pre-clamp size.
+        for (id, config) in &materializations_by_fingerprint {
+            if let Some(state) = backend_plan.materializations.get_mut(id) {
+                state.window.size_ms =
+                    config
+                        .window_size
+                        .checked_mul(1000)
+                        .ok_or_else(|| CompileError::Query {
+                            query_id: "precompute-window".into(),
+                            reason: "window overflow".into(),
+                        })?;
+            }
+        }
         let materializations = materializations_by_fingerprint.into_values().collect();
         let mut precompute_plan = match environment.target {
             PhysicalDeploymentTarget::DistributedCollectors => PrecomputePlan::build(
@@ -2270,6 +2383,7 @@ impl PhysicalCompiler {
         let collector_plans = producer_ids
             .into_iter()
             .map(|collector_id| CollectorPlan {
+                summary_catalog: transmission_plan.summary_catalog.clone(),
                 transmission_rules: transmission_plan
                     .rules
                     .iter()
@@ -2411,6 +2525,26 @@ impl PhysicalCompiler {
             query_id: "summary-catalog".into(),
             reason: error.to_string(),
         })?;
+        precompute_plan
+            .bind_catalog(&summary_catalog)
+            .map_err(|error| CompileError::Query {
+                query_id: "precompute-catalog".into(),
+                reason: error.to_string(),
+            })?;
+        transmission_plan
+            .validate_against_catalog(&summary_catalog)
+            .map_err(|error| CompileError::Query {
+                query_id: "summary-catalog".into(),
+                reason: error.to_string(),
+            })?;
+        for collector in &collector_plans {
+            collector
+                .validate_against_catalog(&summary_catalog)
+                .map_err(|error| CompileError::Query {
+                    query_id: "summary-catalog".into(),
+                    reason: error.to_string(),
+                })?;
+        }
         Ok(PhysicalPlan {
             envelope,
             summary_catalog,
@@ -2543,7 +2677,7 @@ pub fn select_post_asap(
     )
 }
 
-fn state_schema_id(fingerprint: asap_types::PolicyFingerprint) -> String {
+pub(super) fn state_schema_id(fingerprint: asap_types::PolicyFingerprint) -> String {
     format!(
         "{}:summary-state:v1:{}",
         backend_plan::BACKEND_COMPAT,
@@ -2551,7 +2685,7 @@ fn state_schema_id(fingerprint: asap_types::PolicyFingerprint) -> String {
     )
 }
 
-fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> {
+pub(super) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> {
     match family {
         SummaryFamilyType::ExactAggregate(..) => vec![StateEncoding::ExactAccumulatorV1],
         SummaryFamilyType::Sketch(kind, _)
@@ -3360,6 +3494,7 @@ mod tests {
             .compile(request("counter", "rate(m[1m])"), environment(10_000))
             .unwrap();
         plan.precompute_plan.validate().unwrap();
+        let catalog = plan.summary_catalog.clone();
         let mut raw = plan.precompute_plan;
         raw.ingest.protocol = IngestProtocol::PrometheusRemoteWriteV1;
         raw.ingest.endpoint_path = "/api/v1/write".into();
@@ -3368,6 +3503,7 @@ mod tests {
         raw.ingest.require_materialization_identity = false;
         raw.ingest.require_registered_producer = false;
         raw.producers.clear();
+        raw.bind_catalog(&catalog).unwrap();
         raw.validate().unwrap();
     }
 
@@ -4018,6 +4154,61 @@ mod tests {
         }
     }
 
+    // Projections reference one immutable snapshot and reject drift or foreign state.
+    #[test]
+    fn catalog_projection_rejects_missing_stale_and_foreign_references() {
+        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let bundle = snapshot.compile().unwrap();
+        let catalog = &bundle.summary_catalog;
+        let mut transmission = bundle.transmission_plan.clone();
+        transmission.validate_against_catalog(catalog).unwrap();
+        assert_eq!(
+            transmission.summary_catalog.as_ref(),
+            Some(&catalog.reference().unwrap())
+        );
+        transmission
+            .summary_catalog
+            .as_mut()
+            .unwrap()
+            .snapshot_sha256
+            .push('0');
+        assert!(transmission.validate_against_catalog(catalog).is_err());
+        assert!(transmission.validate(&bundle.precompute_plan).is_err());
+        transmission.summary_catalog = None;
+        assert!(transmission.validate_against_catalog(catalog).is_err());
+        let mut collector = CollectorPlan {
+            summary_catalog: Some(catalog.reference().unwrap()),
+            collector_id: "collector-test".into(),
+            envelope: bundle.envelope.clone(),
+            materializations: vec![],
+            transmission_rules: vec![],
+        };
+        collector.validate_against_catalog(catalog).unwrap();
+        collector.envelope.plan_version += 1;
+        assert!(collector.validate_against_catalog(catalog).is_err());
+        assert!(validate_catalog_projection(
+            Some(&catalog.reference().unwrap()),
+            &bundle.envelope,
+            [asap_types::PolicyFingerprint(u64::MAX)],
+            catalog
+        )
+        .is_err());
+        let encoded = serde_json::to_value(&collector).unwrap();
+        assert!(encoded["summary_catalog"]
+            .get("summary_descriptors")
+            .is_none());
+        for actual in &bundle.collector_plans {
+            actual.validate_against_catalog(catalog).unwrap();
+            assert_eq!(
+                actual.summary_catalog,
+                bundle.transmission_plan.summary_catalog
+            );
+        }
+    }
+
     #[test]
     fn canonical_snapshot_preserves_shared_bindings_after_serialization() {
         // Two different registered readouts survive publication with one state.
@@ -4043,6 +4234,73 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(bindings.len(), 1);
         query_plan.validate(&bindings).unwrap();
+    }
+
+    #[test]
+    fn precompute_catalog_validates_without_backend_projection() {
+        let bundle = PhysicalCompiler
+            .compile(
+                request("catalog", "quantile_over_time(0.99, m[1m])"),
+                environment(10_000),
+            )
+            .unwrap();
+        let original = &bundle.precompute_plan;
+        let catalog = &bundle.summary_catalog;
+        let roundtrip: PrecomputePlan =
+            serde_json::from_slice(&serde_json::to_vec(original).unwrap()).unwrap();
+        roundtrip.validate_against_catalog(catalog).unwrap();
+        let reject =
+            |mutated: PrecomputePlan| assert!(mutated.validate_against_catalog(catalog).is_err());
+        let mut bad = original.clone();
+        bad.schemas[0].source = planner_types::pre_asap::Source::TimeSeries {
+            metric: "other".into(),
+        };
+        reject(bad);
+        let mut bad = original.clone();
+        bad.schemas[0].value_column = planner_types::pre_asap::ColumnRef::Named("other".into());
+        reject(bad);
+        let mut bad = original.clone();
+        bad.schemas[0].group_by.push("other".into());
+        reject(bad);
+        let mut bad = original.clone();
+        bad.schemas[0].window.size_ms += 1;
+        reject(bad);
+        let mut bad = original.clone();
+        bad.materialization_contracts
+            .values_mut()
+            .next()
+            .unwrap()
+            .activation_unix_ms += 1;
+        reject(bad);
+        let mut bad = original.clone();
+        bad.materialization_contracts
+            .values_mut()
+            .next()
+            .unwrap()
+            .retained_windows = Some(0);
+        reject(bad);
+        let mut bad = original.clone();
+        bad.materialization_contracts
+            .values_mut()
+            .next()
+            .unwrap()
+            .update = super::super::precompute_contract::PrecomputeUpdate::RawSamples;
+        reject(bad);
+        let mut bad = original.clone();
+        bad.summary_catalog
+            .as_mut()
+            .unwrap()
+            .snapshot_sha256
+            .push('0');
+        reject(bad);
+        let mut corrupt_catalog = catalog.clone();
+        corrupt_catalog.data_descriptors.clear();
+        assert!(original.validate_against_catalog(&corrupt_catalog).is_err());
+        let mut legacy = original.clone();
+        legacy.summary_catalog = None;
+        legacy.materialization_contracts.clear();
+        legacy.validate().unwrap();
+        assert!(legacy.validate_against_catalog(catalog).is_err());
     }
 
     #[test]
