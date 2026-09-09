@@ -110,6 +110,7 @@ fn node_is_archive(node: &Rc<SummaryNode>) -> bool {
             _ => false,
         },
         SummaryExpr::SummaryAgg { child, .. } => node_is_archive(child),
+        SummaryExpr::ValueOperation { child, .. } => node_is_archive(child),
         SummaryExpr::SummaryEstimate { summary_input, .. } => node_is_archive(summary_input),
         SummaryExpr::SummaryMerge { children } => children.iter().any(node_is_archive),
         SummaryExpr::SummaryJoin { outer, inner, .. } => {

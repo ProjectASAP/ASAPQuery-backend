@@ -316,7 +316,8 @@ impl FidelityGuarantee {
         match config.accumulator_spec().map(|s| s.family) {
             Ok(SummaryFamilyType::ExactAggregate(
                 planner_types::post_asap::ExactKind::Increase
-                | planner_types::post_asap::ExactKind::Rate,
+                | planner_types::post_asap::ExactKind::Rate
+                | planner_types::post_asap::ExactKind::IRate,
                 _,
             )) => Self::ExactCounter {
                 model: "prometheus.extrapolated-rate.v1".into(),

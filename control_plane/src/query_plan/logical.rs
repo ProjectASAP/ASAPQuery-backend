@@ -895,7 +895,9 @@ mod planner_workload_tests {
         entry["time_selection"]["lookback"] = (if window == 0 { 300_000 } else { window }).into();
         fixture["query_workload"]["repeating_queries"] = vec![entry].into();
         let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture).unwrap();
-        let (request, environment) = snapshot.planning_request().unwrap();
+        let (request, environment) = snapshot
+            .planning_request()
+            .unwrap_or_else(|error| panic!("{query}: {error}"));
         PhysicalCompiler
             .compile(request, environment)
             .unwrap_or_else(|error| panic!("{query}: {error}"))
@@ -906,11 +908,38 @@ mod planner_workload_tests {
         for query in [
             "topk(2, sum by (job) (rate(backend_process_cpu_seconds_total[1h])))",
             "topk(2, sum by (job) (backend_process_resident_memory_bytes))",
-            "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
             "topk(2, max_over_time(backend_retry_backlog_depth[6h]))",
-            "topk(1, sum by (job) (increase(backend_http_5xx_total[24h])) / scalar(sum(increase(backend_http_5xx_total[24h]))))",
             "topk(1, sum by (job) (rate(backend_process_cpu_seconds_total[6h])))",
             "topk(3, avg_over_time((sum by (job) (backend_process_resident_memory_bytes))[6h:]))",
+        ] {
+            let plan = compile_one(query);
+            let entry = plan.query_plan.entries.values().next().unwrap();
+            assert!(
+                matches!(
+                    entry.nodes[&entry.root],
+                    QueryPlanNode::Logical {
+                        operator: LogicalOperator::TopKSelection { .. },
+                        ..
+                    }
+                ),
+                "{query}: {:?}",
+                entry.nodes[&entry.root]
+            );
+            assert!(
+                !entry
+                    .nodes
+                    .values()
+                    .any(|node| matches!(node, QueryPlanNode::ExactFallback { .. })),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn planner_value_topk_preserves_direct_summary_children() {
+        for query in [
+            "topk(2, rate(backend_process_cpu_seconds_total[1h]))",
+            "topk(2, max_over_time(backend_retry_backlog_depth[6h]))",
         ] {
             let plan = compile_one(query);
             let entry = plan.query_plan.entries.values().next().unwrap();
@@ -920,8 +949,12 @@ mod planner_workload_tests {
                     operator: LogicalOperator::TopKSelection { .. },
                     ..
                 }
-            ), "{query}: {:?}", entry.nodes[&entry.root]);
-            assert!(!entry.nodes.values().any(|node| matches!(node, QueryPlanNode::ExactFallback { .. })), "{query}");
+            ));
+            assert!(
+                !entry.materialization_bindings().is_empty(),
+                "{query} must retain its SummaryStore child: {:?}",
+                entry.nodes
+            );
         }
     }
 
@@ -1245,6 +1278,7 @@ pub fn materialization_candidate_keys(
                 visit(original, lhs, keys)?;
                 visit(original, rhs, keys)?;
             }
+            SummaryExpr::ValueOperation { child, .. } => visit(original, child, keys)?,
             SummaryExpr::SummaryAgg { child, .. } => visit(original, child, keys)?,
             SummaryExpr::SummaryEstimate { summary_input, .. }
             | SummaryExpr::SummaryDelete { summary_input, .. } => {

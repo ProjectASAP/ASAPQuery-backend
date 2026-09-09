@@ -187,6 +187,7 @@ mod tests {
             ExactKind::MinMax => ExactParams::MinMax,
             ExactKind::Increase => ExactParams::Increase,
             ExactKind::Rate => ExactParams::Rate,
+            ExactKind::IRate => ExactParams::IRate,
         }
     }
 

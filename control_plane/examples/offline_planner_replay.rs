@@ -28,6 +28,7 @@ fn inspect(
     }
     match &node.expr {
         SummaryExpr::KeepPreAsap(_) => *raw += 1,
+        SummaryExpr::ValueOperation { child, .. } => inspect(child, model, seen, states, raw),
         SummaryExpr::SummaryAgg { family, child, .. } => {
             if let SummaryFamilyType::Sketch(kind, _) = family {
                 let lookup = model

@@ -2966,6 +2966,7 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
                 ExactKind::MinMax => "MinMax",
                 ExactKind::Increase => "Increase",
                 ExactKind::Rate => "Rate",
+                ExactKind::IRate => "IRate",
             }
             .to_string(),
             json!({}),

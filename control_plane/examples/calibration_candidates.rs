@@ -32,6 +32,15 @@ fn planner_forest(queries: &[control_plane::physical::compiler::PlanningQuery]) 
                 vec![lhs, rhs],
                 json!({"operator_debug":format!("{operator:?}")}),
             ),
+            SummaryExpr::ValueOperation {
+                child,
+                operation,
+                timing,
+            } => (
+                "ValueOperation",
+                vec![child],
+                json!({"operation_debug":format!("{operation:?}"),"timing_debug":format!("{timing:?}")}),
+            ),
             SummaryExpr::SummaryAgg {
                 child,
                 family,

@@ -143,7 +143,9 @@ pub fn select_summary(
         .ok_or(SelectionError::NoLegalCandidate)?;
     match candidate.replacement {
         Replacement::Summary(node) => Ok(node),
-        Replacement::Rewrite(_) => Err(SelectionError::UnexpectedRewrite),
+        Replacement::Rewrite(_) | Replacement::ExactComposition(_) => {
+            Err(SelectionError::UnexpectedRewrite)
+        }
     }
 }
 
@@ -235,7 +237,9 @@ pub fn select_summary_with_evidence(
         .ok_or(SelectionError::NoLegalCandidate)?;
     match candidate.replacement {
         Replacement::Summary(node) => Ok(node),
-        Replacement::Rewrite(_) => Err(SelectionError::UnexpectedRewrite),
+        Replacement::Rewrite(_) | Replacement::ExactComposition(_) => {
+            Err(SelectionError::UnexpectedRewrite)
+        }
     }
 }
 

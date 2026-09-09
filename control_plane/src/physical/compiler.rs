@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "abb2f20e27091ac0c60715dc42b9b59c75b3447c";
+pub const PLANNER_REVISION: &str = "24735a35442c0ada3dd4ba1e2b3ab671b29f31b6";
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 
 #[derive(Debug, Clone)]
@@ -336,6 +336,7 @@ pub enum ExactStateKind {
     MinMax,
     Increase,
     Rate,
+    IRate,
 }
 
 impl TryFrom<&SummaryFamilyType> for StateFamilyContract {
@@ -351,6 +352,7 @@ impl TryFrom<&SummaryFamilyType> for StateFamilyContract {
                     ExactKind::MinMax => ExactStateKind::MinMax,
                     ExactKind::Increase => ExactStateKind::Increase,
                     ExactKind::Rate => ExactStateKind::Rate,
+                    ExactKind::IRate => ExactStateKind::IRate,
                 },
             },
             SummaryFamilyType::Sketch(kind, _) => Self::Sketch {
@@ -2522,6 +2524,7 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 }
             }
             SummaryExpr::SummaryAgg { child, .. } => walk(child, metrics),
+            SummaryExpr::ValueOperation { child, .. } => walk(child, metrics),
             SummaryExpr::SummaryEstimate { summary_input, .. } => walk(summary_input, metrics),
             SummaryExpr::SummaryMerge { children } => {
                 for child in children {
@@ -3212,6 +3215,9 @@ fn collect_selected_materializations(
             None
         };
         match &node.expr {
+            SummaryExpr::ValueOperation { child, .. } => {
+                walk(child, readout, composable, grouping.clone(), selected)?;
+            }
             SummaryExpr::BinaryOp { lhs, rhs, .. }
                 if composable || crate::query_plan::exact_value_executable(node) =>
             {

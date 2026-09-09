@@ -519,6 +519,143 @@ where
         }
 
         let physical = match &node.expr {
+            SummaryExpr::ValueOperation {
+                child,
+                operation:
+                    planner_types::post_asap::ValueOperation::Exact(
+                        planner_types::post_asap::ExactOperation::Aggregate {
+                            reduction,
+                            measures,
+                            having: None,
+                            ..
+                        },
+                    ),
+                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+            } if measures.len() == 1 => {
+                use planner_types::pre_asap::AggIntent;
+                let operation = match &measures[0] {
+                    AggIntent::Sum { .. } => logical::Aggregation::Sum,
+                    AggIntent::Count { .. } => logical::Aggregation::Count,
+                    AggIntent::Min { .. } => logical::Aggregation::Min,
+                    AggIntent::Max { .. } => logical::Aggregation::Max,
+                    AggIntent::Avg { .. } => logical::Aggregation::Avg,
+                    _ => {
+                        return Err(QueryPlanError::Invalid(
+                            "unsupported exact value aggregation".into(),
+                        ))
+                    }
+                };
+                let keys = reduction.group_keys().ok_or_else(|| {
+                    QueryPlanError::Invalid(
+                        "per-entity exact value aggregation has no grouping".into(),
+                    )
+                })?;
+                let labels = keys
+                    .keys()
+                    .iter()
+                    .map(|&column| {
+                        child
+                            .schema
+                            .fields
+                            .get(column)
+                            .map(|field| field.name.clone())
+                            .ok_or_else(|| {
+                                QueryPlanError::Invalid(
+                                    "unresolved exact aggregation column".into(),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                QueryPlanNode::Logical {
+                    operator: logical::LogicalOperator::Aggregate {
+                        operation,
+                        grouping: logical::Grouping {
+                            labels,
+                            without: keys.is_without(),
+                        },
+                    },
+                    inputs: vec![self.lower(child)?],
+                }
+            }
+            SummaryExpr::ValueOperation {
+                child: sort,
+                operation: planner_types::post_asap::ValueOperation::Limit { n, offset: 0 },
+                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+            } => {
+                let SummaryExpr::ValueOperation {
+                    child,
+                    operation: planner_types::post_asap::ValueOperation::Sort { keys, partition_by },
+                    timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+                } = &sort.expr
+                else {
+                    return Err(QueryPlanError::Invalid(
+                        "query-time Limit must consume a query-time Sort".into(),
+                    ));
+                };
+                if keys.len() != 1 || keys[0].ascending {
+                    return Err(QueryPlanError::Invalid(
+                        "only descending value-ranked TopK is executable".into(),
+                    ));
+                }
+                let planner_types::pre_asap::QueryExpr::Column(sort_column) = &keys[0].expr else {
+                    return Err(QueryPlanError::Invalid(
+                        "TopK sort key must reference the child value column".into(),
+                    ));
+                };
+                if !matches!(
+                    child
+                        .schema
+                        .fields
+                        .get(*sort_column)
+                        .map(|field| &field.dtype),
+                    Some(SummaryFamilyType::Plain(
+                        planner_types::pre_asap::DataType::Float64
+                    )) | Some(SummaryFamilyType::ExactAggregate(..))
+                ) {
+                    return Err(QueryPlanError::Invalid(
+                        "TopK sort key must produce a numeric value".into(),
+                    ));
+                }
+                let labels = partition_by
+                    .keys()
+                    .iter()
+                    .map(|&column| {
+                        child
+                            .schema
+                            .fields
+                            .get(column)
+                            .map(|field| field.name.clone())
+                            .ok_or_else(|| {
+                                QueryPlanError::Invalid("unresolved TopK partition column".into())
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                QueryPlanNode::Logical {
+                    operator: logical::LogicalOperator::TopKSelection {
+                        k: u64::try_from(*n).map_err(|_| {
+                            QueryPlanError::Invalid("TopK limit exceeds u64".into())
+                        })?,
+                        grouping: logical::Grouping {
+                            labels,
+                            without: partition_by.is_without(),
+                        },
+                    },
+                    inputs: vec![self.lower(child)?],
+                }
+            }
+            SummaryExpr::ValueOperation {
+                child,
+                operation: planner_types::post_asap::ValueOperation::Sort { keys, .. },
+                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+            } if keys.len() == 1 => QueryPlanNode::Logical {
+                operator: logical::LogicalOperator::Sort {
+                    descending: !keys[0].ascending,
+                },
+                inputs: vec![self.lower(child)?],
+            },
+            SummaryExpr::ValueOperation { .. } => QueryPlanNode::ExactFallback {
+                reason: "unsupported post-ASAP value operation".into(),
+            },
             SummaryExpr::BinaryOp { lhs, rhs, operator } if self.logical_source.is_some() => {
                 let operator = logical::binary_operator(operator)?;
                 QueryPlanNode::Logical {
