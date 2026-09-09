@@ -221,6 +221,36 @@ impl AggKindRec {
             },
         })
     }
+
+    fn without_population_filter(&self) -> Self {
+        let mut operator = self.clone();
+        match &mut operator {
+            Self::Sketch {
+                spatial_filter_canonical,
+                ..
+            }
+            | Self::ExactAgg {
+                spatial_filter_canonical,
+                ..
+            } => spatial_filter_canonical.clear(),
+        }
+        operator
+    }
+
+    fn with_population_filter(&self, filter: &str) -> Self {
+        let mut kind = self.clone();
+        match &mut kind {
+            Self::Sketch {
+                spatial_filter_canonical,
+                ..
+            }
+            | Self::ExactAgg {
+                spatial_filter_canonical,
+                ..
+            } => *spatial_filter_canonical = filter.to_string(),
+        }
+        kind
+    }
 }
 
 /// One durable sid-metadata row. The query-critical fields
@@ -299,6 +329,113 @@ impl SidMetaRecord {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct DataDescriptorRec {
+    metric_name: String,
+    population_filter_canonical: String,
+    group_by_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SidBindingRec {
+    sid: u64,
+    summary_descriptor_id: String,
+    data_descriptor_id: String,
+    first_seen_unix_ms: i64,
+}
+
+/// Version-2 normalized sidecar. Descriptors appear once and SID bindings hold
+/// foreign keys, mirroring the in-memory SDS registry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SdsSidecar {
+    schema_version: u32,
+    summary_descriptors: HashMap<String, AggKindRec>,
+    data_descriptors: HashMap<String, DataDescriptorRec>,
+    bindings: HashMap<String, SidBindingRec>,
+}
+
+impl SdsSidecar {
+    fn from_records(records: impl IntoIterator<Item = SidMetaRecord>) -> Self {
+        use crate::storage_engines::sketch_db::sds::{data_descriptor_id, summary_descriptor_id};
+
+        let mut sidecar = Self {
+            schema_version: 2,
+            summary_descriptors: HashMap::new(),
+            data_descriptors: HashMap::new(),
+            bindings: HashMap::new(),
+        };
+        for record in records {
+            let Some(kind) = record.agg_kind() else {
+                continue;
+            };
+            let summary_id = summary_descriptor_id(&kind).canonical().to_string();
+            let filter = kind.spatial_filter_canonical().to_string();
+            let data_id = data_descriptor_id(
+                &record.metric_name,
+                &filter,
+                record.group_by_keys.iter().map(String::as_str),
+            )
+            .canonical()
+            .to_string();
+            sidecar
+                .summary_descriptors
+                .entry(summary_id.clone())
+                .or_insert_with(|| record.agg_kind.without_population_filter());
+            sidecar
+                .data_descriptors
+                .entry(data_id.clone())
+                .or_insert_with(|| DataDescriptorRec {
+                    metric_name: record.metric_name,
+                    population_filter_canonical: filter,
+                    group_by_keys: record.group_by_keys,
+                });
+            sidecar.bindings.insert(
+                record.sid.to_string(),
+                SidBindingRec {
+                    sid: record.sid,
+                    summary_descriptor_id: summary_id,
+                    data_descriptor_id: data_id,
+                    first_seen_unix_ms: record.first_seen_unix_ms,
+                },
+            );
+        }
+        sidecar
+    }
+
+    fn into_records(self) -> PersistResult<Vec<SidMetaRecord>> {
+        self.bindings
+            .into_values()
+            .map(|binding| {
+                let operator = self
+                    .summary_descriptors
+                    .get(&binding.summary_descriptor_id)
+                    .ok_or_else(|| {
+                        PersistError::Format(format!(
+                            "SID {} references missing summary descriptor {}",
+                            binding.sid, binding.summary_descriptor_id
+                        ))
+                    })?;
+                let data = self
+                    .data_descriptors
+                    .get(&binding.data_descriptor_id)
+                    .ok_or_else(|| {
+                        PersistError::Format(format!(
+                            "SID {} references missing data descriptor {}",
+                            binding.sid, binding.data_descriptor_id
+                        ))
+                    })?;
+                Ok(SidMetaRecord {
+                    sid: binding.sid,
+                    metric_name: data.metric_name.clone(),
+                    group_by_keys: data.group_by_keys.clone(),
+                    agg_kind: operator.with_population_filter(&data.population_filter_canonical),
+                    first_seen_unix_ms: binding.first_seen_unix_ms,
+                })
+            })
+            .collect()
+    }
+}
+
 /// File-backed sid-metadata sidecar. The whole map is rewritten on every
 /// upsert (atomic tmp + rename). Live sid cardinality is small, so a full
 /// rewrite per flush tick is cheap and keeps the on-disk file always
@@ -336,14 +473,46 @@ impl SidMetadataStore {
         if buf.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let map: HashMap<String, SidMetaRecord> = match serde_json::from_str(&buf) {
-            Ok(m) => m,
+        let value: serde_json::Value = match serde_json::from_str(&buf) {
+            Ok(value) => value,
             Err(e) => {
                 tracing::warn!(
                     path = %self.path.display(),
                     error = %e,
                     "sid metadata sidecar unparsable; ignoring (live ingest will re-register)"
                 );
+                return Ok(Vec::new());
+            }
+        };
+        if value.get("schema_version").and_then(|v| v.as_u64()) == Some(2) {
+            let sidecar: SdsSidecar = match serde_json::from_value(value) {
+                Ok(sidecar) => sidecar,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        %error,
+                        "SDS metadata sidecar is invalid; ignoring"
+                    );
+                    return Ok(Vec::new());
+                }
+            };
+            return match sidecar.into_records() {
+                Ok(records) => Ok(records),
+                Err(error) => {
+                    tracing::warn!(
+                        path = %self.path.display(),
+                        %error,
+                        "SDS metadata sidecar has broken descriptor references; ignoring"
+                    );
+                    Ok(Vec::new())
+                }
+            };
+        }
+        // Version 1 was a flat SID map. Read it and normalize on the next write.
+        let map: HashMap<String, SidMetaRecord> = match serde_json::from_value(value) {
+            Ok(map) => map,
+            Err(error) => {
+                tracing::warn!(path = %self.path.display(), %error, "legacy sid metadata is invalid; ignoring");
                 return Ok(Vec::new());
             }
         };
@@ -376,7 +545,8 @@ impl SidMetadataStore {
         if !changed {
             return Ok(());
         }
-        let json = serde_json::to_string(&map)
+        let sidecar = SdsSidecar::from_records(map.into_values());
+        let json = serde_json::to_string(&sidecar)
             .map_err(|e| PersistError::Serialize(format!("sid metadata: {e}")))?;
         self.write_atomic(json.as_bytes())
     }
@@ -456,6 +626,71 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0], sketch_meta(1));
         assert_eq!(got[1], exact_meta(2));
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(s.path()).unwrap()).unwrap();
+        assert_eq!(persisted["schema_version"], 2);
+        assert_eq!(
+            persisted["summary_descriptors"].as_object().unwrap().len(),
+            2
+        );
+        assert_eq!(persisted["data_descriptors"].as_object().unwrap().len(), 2);
+        assert_eq!(persisted["bindings"].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn equivalent_sids_persist_one_copy_of_each_descriptor() {
+        let tmp = TempDir::new().unwrap();
+        let store = SidMetadataStore::new(tmp.path());
+        let mut second = sketch_meta(2);
+        second.first_seen_unix_ms = 9999;
+        store.upsert_all(&[sketch_meta(1), second]).unwrap();
+
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+        assert_eq!(
+            persisted["summary_descriptors"].as_object().unwrap().len(),
+            1
+        );
+        assert_eq!(persisted["data_descriptors"].as_object().unwrap().len(), 1);
+        assert_eq!(persisted["bindings"].as_object().unwrap().len(), 2);
+        assert_eq!(store.load().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn broken_descriptor_reference_does_not_partially_recover() {
+        let tmp = TempDir::new().unwrap();
+        let store = SidMetadataStore::new(tmp.path());
+        store.upsert_all(&[sketch_meta(1), exact_meta(2)]).unwrap();
+
+        let mut persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+        let missing_id = persisted["bindings"]["1"]["summary_descriptor_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        persisted["summary_descriptors"]
+            .as_object_mut()
+            .unwrap()
+            .remove(&missing_id);
+        std::fs::write(store.path(), serde_json::to_vec(&persisted).unwrap()).unwrap();
+
+        assert!(store.load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_flat_sidecar_is_read_and_migrated_on_write() {
+        let tmp = TempDir::new().unwrap();
+        let store = SidMetadataStore::new(tmp.path());
+        let legacy = HashMap::from([("1".to_string(), sketch_meta(1))]);
+        std::fs::write(store.path(), serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        assert_eq!(store.load().unwrap(), vec![sketch_meta(1)]);
+        store.upsert_all(&[exact_meta(2)]).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+        assert_eq!(persisted["schema_version"], 2);
+        assert_eq!(store.load().unwrap().len(), 2);
     }
 
     #[test]

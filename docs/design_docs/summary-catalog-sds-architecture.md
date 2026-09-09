@@ -146,6 +146,12 @@ and grouping keys. Observation semantics, structured state schemas, and a
 standalone `SummaryInstance` API remain target-model work; pane state and
 completeness/lineage tracking currently live in existing `SketchStore` tables.
 
+The durable `sid_metadata.json` format is versioned independently. Version 2
+contains `summary_descriptors`, `data_descriptors`, and `bindings` tables. A
+binding stores only both descriptor IDs plus SID-local timestamps. Version-1
+flat SID records remain readable and are rewritten in normalized version-2 form
+on the next metadata update.
+
 An ingest record is never an SDS instance. Raw samples can be transient inputs to
 the precompute engine, but the backend does not retain them as a second exact
 query store. Exact residual subtrees run in Prometheus.
