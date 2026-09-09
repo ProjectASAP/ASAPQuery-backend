@@ -114,6 +114,8 @@ pub fn reconcile_summary_inventory(
         } else if identity.summary_descriptor_id != instance.summary_descriptor_id
             || identity.data_descriptor_id != instance.data_descriptor_id
             || instance.catalog_generation != desired_generation
+            || desired.summary_descriptors[&identity.summary_descriptor_id].state_schema_version
+                != instance.state_reference.state_schema_version
             || instance.status == SummaryInstanceStatus::Retiring
         {
             actions.push(SummaryReconcileAction::Update {
@@ -213,6 +215,7 @@ mod tests {
 
     fn inventory(instance: asap_types::sds::SummaryInstance, now: i64) -> ObservedSummaryInventory {
         ObservedSummaryInventory {
+            schema_version: 1,
             reporter_id: "store-1".into(),
             inventory_version: 1,
             observed_at_ms: now,
@@ -224,6 +227,7 @@ mod tests {
     fn creates_missing_and_updates_stale_generation() {
         let catalog = SummaryCatalog::from_materializations(1, 2, &[config("a")]).unwrap();
         let empty = ObservedSummaryInventory {
+            schema_version: 1,
             reporter_id: "store-1".into(),
             inventory_version: 1,
             observed_at_ms: 100,

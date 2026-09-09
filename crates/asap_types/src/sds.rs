@@ -205,6 +205,7 @@ impl SummaryInstance {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedSummaryInventory {
+    pub schema_version: u32,
     pub reporter_id: String,
     pub inventory_version: u64,
     pub observed_at_ms: i64,
@@ -213,6 +214,9 @@ pub struct ObservedSummaryInventory {
 
 impl ObservedSummaryInventory {
     pub fn validate(&self) -> Result<(), SdsError> {
+        if self.schema_version != 1 {
+            return Err(SdsError("unsupported observed inventory schema".into()));
+        }
         if self.reporter_id.is_empty() {
             return Err(SdsError("inventory reporter ID must not be empty".into()));
         }
@@ -628,6 +632,7 @@ mod tests {
         assert!(encoded.get("state").is_none());
         assert!(encoded.get("payload").is_none());
         let inventory = ObservedSummaryInventory {
+            schema_version: 1,
             reporter_id: "store".into(),
             inventory_version: 4,
             observed_at_ms: 10,
