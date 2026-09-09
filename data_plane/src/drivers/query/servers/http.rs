@@ -2522,6 +2522,7 @@ mod tests {
         };
         let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(
             crate::storage_engines::types::ActivePhysicalPlan {
+                summary_catalog: None,
                 precompute_plan: PrecomputePlan {
                     summary_catalog: None,
                     materialization_contracts: Default::default(),
@@ -6030,6 +6031,9 @@ async fn handle_post_backend_plan(
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhysicalPlanInstallRequest {
+    pub summary_catalog: control_plane::physical::summary_catalog::SummaryCatalog,
+    #[serde(default)]
+    pub collector_plans: Vec<control_plane::physical::compiler::CollectorPlan>,
     pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
     pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
     pub backend_plan: Vec<u8>,
@@ -6046,6 +6050,39 @@ pub fn build_active_physical_plan(
     default_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
 ) -> Result<crate::storage_engines::types::ActivePhysicalPlan, String> {
     use std::collections::BTreeSet;
+    request
+        .precompute_plan
+        .validate_against_catalog(&request.summary_catalog)
+        .map_err(|error| format!("PrecomputePlan catalog validation error: {error}"))?;
+    request
+        .transmission_plan
+        .validate_against_catalog(&request.summary_catalog)
+        .map_err(|error| format!("TransmissionPlan catalog validation error: {error}"))?;
+    request
+        .query_plan
+        .validate_against_catalog(&request.summary_catalog)
+        .map_err(|error| format!("QueryPlan catalog validation error: {error}"))?;
+    for collector in &request.collector_plans {
+        collector
+            .validate_against_catalog(&request.summary_catalog)
+            .map_err(|error| format!("CollectorPlan catalog validation error: {error}"))?;
+    }
+    for entry in request.query_plan.entries.values() {
+        for binding in entry.materialization_bindings() {
+            let materialization = request
+                .precompute_plan
+                .materializations
+                .iter()
+                .find(|config| config.policy_fingerprint() == binding.materialization.fingerprint())
+                .ok_or_else(|| "query binding has no precompute definition".to_string())?;
+            if binding.window_ms != materialization.slide_interval.saturating_mul(1_000) {
+                return Err(
+                    "query physical pane duration differs from installed precompute definition"
+                        .into(),
+                );
+            }
+        }
+    }
     let runtime_materializations = request
         .precompute_plan
         .runtime_materializations()
@@ -6099,6 +6136,7 @@ pub fn build_active_physical_plan(
         None => default_routing,
     };
     Ok(crate::storage_engines::types::ActivePhysicalPlan {
+        summary_catalog: Some(Arc::new(request.summary_catalog)),
         precompute_plan: request.precompute_plan,
         transmission_plan: request.transmission_plan,
         runtime_config: Arc::new(runtime_config),
@@ -7025,5 +7063,102 @@ mod logical_provenance_tests {
         // Any observed local raw branch invalidates a deployed plan.
         let mut value = serde_json::json!({"warnings":["asap_execution:asap", "asap_logical_stats:raw=1,summary=1,memo_hits=0"]});
         assert_eq!(extract_logical_provenance(&mut value), Some(Err(())));
+    }
+}
+
+#[cfg(test)]
+mod catalog_install_tests {
+    use super::{build_active_physical_plan, PhysicalPlanInstallRequest};
+    use std::sync::Arc;
+
+    fn request() -> PhysicalPlanInstallRequest {
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        PhysicalPlanInstallRequest {
+            summary_catalog: plan.summary_catalog,
+            collector_plans: plan.collector_plans,
+            precompute_plan: plan.precompute_plan,
+            transmission_plan: plan.transmission_plan,
+            backend_plan: plan.backend_plan.encode_to_vec(),
+            query_plan: plan.query_plan,
+            storage_routing: None,
+            adaptation_evidence: vec![],
+        }
+    }
+    fn install(
+        request: PhysicalPlanInstallRequest,
+    ) -> Result<crate::storage_engines::types::ActivePhysicalPlan, String> {
+        build_active_physical_plan(
+            request,
+            Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
+        )
+    }
+
+    // Installing transports the exact supplied snapshot, rather than rebuilding it.
+    #[test]
+    fn catalog_install_preserves_authoritative_snapshot() {
+        let request = request();
+        let expected = request.summary_catalog.clone();
+        let encoded = serde_json::to_vec(&request).unwrap();
+        let active = install(serde_json::from_slice(&encoded).unwrap()).unwrap();
+        assert_eq!(active.summary_catalog.as_deref(), Some(&expected));
+        active
+            .query_plan
+            .validate_against_catalog(active.summary_catalog.as_deref().unwrap())
+            .unwrap();
+    }
+
+    // Catalog-aware artifacts cannot silently downgrade to a legacy installation.
+    #[test]
+    fn catalog_install_requires_snapshot_and_matching_references() {
+        let mut encoded = serde_json::to_value(request()).unwrap();
+        encoded.as_object_mut().unwrap().remove("summary_catalog");
+        assert!(serde_json::from_value::<PhysicalPlanInstallRequest>(encoded).is_err());
+        let mut request = request();
+        request.transmission_plan.summary_catalog = None;
+        assert!(install(request)
+            .unwrap_err()
+            .contains("TransmissionPlan catalog"));
+    }
+
+    // A same-version snapshot replacement fails before the active generation changes.
+    #[test]
+    fn catalog_install_rejects_drift_without_replacing_active_snapshot() {
+        let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(
+            install(request()).unwrap(),
+        );
+        let before = active.snapshot();
+        let mut changed = request();
+        changed.summary_catalog.plan_version += 1;
+        assert!(install(changed).is_err());
+        assert!(Arc::ptr_eq(&before, &active.snapshot()));
+        let mut changed = request();
+        changed.summary_catalog.summary_descriptors.clear();
+        assert!(install(changed).is_err());
+        assert!(Arc::ptr_eq(&before, &active.snapshot()));
+    }
+
+    // Physical pane width cannot be replaced by the semantic lookback at install.
+    #[test]
+    fn catalog_install_rejects_query_pane_drift() {
+        let mut request = request();
+        let binding = request
+            .query_plan
+            .entries
+            .values_mut()
+            .flat_map(|entry| entry.nodes.values_mut())
+            .find_map(|node| match node {
+                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                    Some(binding)
+                }
+                _ => None,
+            })
+            .expect("demo has maintained summaries");
+        binding.window_ms += 1;
+        assert!(install(request).unwrap_err().contains("pane duration"));
     }
 }

@@ -86,6 +86,8 @@ use crate::storage_engines::types::StreamingConfig;
 /// subsystem must project its view from the same `Arc<ActivePhysicalPlan>`.
 #[derive(Debug, Clone)]
 pub struct ActivePhysicalPlan {
+    /// Present for authoritative installations; legacy bootstrap has no catalog.
+    pub summary_catalog: Option<Arc<control_plane::physical::summary_catalog::SummaryCatalog>>,
     pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
     pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
     pub runtime_config: Arc<StreamingConfig>,
@@ -821,6 +823,7 @@ mod tests {
             capability_snapshot_id: "test".into(),
         };
         ActivePhysicalPlan {
+            summary_catalog: None,
             precompute_plan: control_plane::physical::compiler::PrecomputePlan {
                 summary_catalog: None,
                 materialization_contracts: Default::default(),

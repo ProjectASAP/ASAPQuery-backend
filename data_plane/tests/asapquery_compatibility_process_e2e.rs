@@ -208,6 +208,8 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
         "count"
     );
     let artifact = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
+        summary_catalog: plan.summary_catalog,
+        collector_plans: plan.collector_plans,
         precompute_plan: plan.precompute_plan,
         transmission_plan: plan.transmission_plan,
         backend_plan: plan.backend_plan.encode_to_vec(),
