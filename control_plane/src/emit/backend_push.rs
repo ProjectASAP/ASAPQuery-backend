@@ -75,9 +75,8 @@ const RETRY_MAX_ATTEMPTS: u32 = 5;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(100);
 const RETRY_DELAY_CAP: Duration = Duration::from_millis(2700);
 
-/// Monotonic counter for `BackendPlan.plan_id` — observability only, not
-/// identity (see `BackendPlan`'s own doc). One process-wide sequence is
-/// enough; there's no existing streaming-config version counter to
+/// Monotonic plan identity for compatibility-replanner publications. One
+/// process-wide sequence is enough; there's no existing streaming-config counter to
 /// reuse for parity.
 static PLAN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -187,10 +186,7 @@ pub type BackendRoutingCache = Mutex<HashMap<(String, AggRole), BackendStageConf
 
 /// Combined outcome of one cumulative publication cycle.
 ///
-/// Streaming config, storage routing and BackendPlan are independent HTTP
-/// POSTs. The outcome records all three so callers never treat a generation
-/// with a missing authoritative plan as successfully published. It surfaces
-/// partial failure so the next replan can republish the complete generation.
+/// The authoritative physical-plan publication is one atomic HTTP request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushOutcome {
     /// No backend client configured — nothing was POSTed. Cache was still
@@ -198,7 +194,7 @@ pub enum PushOutcome {
     Skipped,
     /// A document failed to even serialise; nothing was POSTed.
     EmitFailed,
-    /// All three documents were accepted by the backend.
+    /// The complete catalog-backed generation was accepted by the backend.
     AllApplied,
     /// At least one document failed to land. The documents may now disagree
     /// on the backend; the next replan cycle re-POSTs them to restore
@@ -288,13 +284,6 @@ async fn push_documents_coupled(
     (false, false, RETRY_MAX_ATTEMPTS)
 }
 
-/// Required push of the encoded `BackendPlan` — no
-/// in-function retry loop, unlike [`push_documents_coupled`]. A dropped
-/// push just leaves `data_plane`'s serving-time lookup falling back to
-/// `SketchStore` reconstruction until the next replan cycle re-pushes,
-/// so the next cycle is itself the retry backstop — same contract
-/// [`push_or_log`] already establishes for the legacy YAML path. Logs at
-/// WARN on failure and return it to the coupled publication outcome.
 /// Update the cumulative cache with `be` for `(metric, role)` and
 /// POST the cumulative streaming-config + storage-routing JSON
 /// documents to the backend.
@@ -418,7 +407,7 @@ async fn push_cumulative_entries(
     cumulative_entries: &[((String, AggRole), BackendStageConfig)],
     metric: &str,
     role: Option<AggRole>,
-    monitors: &[crate::emit::monitor::MonitorIntent],
+    _monitors: &[crate::emit::monitor::MonitorIntent],
 ) -> PushOutcome {
     // ── Build BOTH cumulative documents up front (P2-3) ───────────────────
     //
@@ -442,25 +431,8 @@ async fn push_cumulative_entries(
             .flat_map(|(_, c)| c.readouts.iter().cloned())
             .collect(),
     };
-    // BackendPlan (design-backend-plan-wire-format.md): built from the
-    // SAME `cumulative_be` snapshot as the legacy documents above, so all
-    // three describe one consistent generation of planning state. Until
-    // BackendPlan fully replaces the compatibility documents, publication
-    // succeeds only when all three are accepted.
     let plan_id = PLAN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     let generated_at_unix_ms = now_unix_ms();
-    let backend_plan = match crate::backend_plan::from_stage_config(
-        &cumulative_be,
-        monitors,
-        plan_id,
-        generated_at_unix_ms,
-    ) {
-        Ok(plan) => plan,
-        Err(e) => {
-            warn!(error = %e, "backend_plan::from_stage_config failed; refusing partial publication");
-            return PushOutcome::EmitFailed;
-        }
-    };
     let precompute_envelope = PlanEnvelope {
         plan_id,
         plan_version: 1,
@@ -474,7 +446,7 @@ async fn push_cumulative_entries(
     let materializations = match cumulative_be
         .aggregations
         .iter()
-        .map(crate::backend_plan::aggregation_config_for_materialization)
+        .map(crate::physical::compiler::aggregation_config_for_materialization)
         .collect::<anyhow::Result<Vec<_>>>()
     {
         Ok(materializations) => materializations,
@@ -486,7 +458,6 @@ async fn push_cumulative_entries(
     let precompute_plan = match PrecomputePlan::build(
         precompute_envelope,
         materializations,
-        &backend_plan,
         &["legacy-replanner".into()],
     ) {
         Ok(plan) => plan,
@@ -906,10 +877,9 @@ mod tests {
         assert_eq!(mock.routing_hits.load(StdOrdering::SeqCst), 1);
     }
 
-    /// The dual-push also fires a best-effort `POST /api/v1/backend-plan`,
-    /// alongside — not instead of — the legacy documents.
+    /// The compatibility replanner publishes one atomic catalog-backed generation.
     #[tokio::test]
-    async fn coupled_push_also_fires_backend_plan_push() {
+    async fn coupled_push_publishes_atomic_physical_plan() {
         let (url, mock) =
             start_dual_mock(axum::http::StatusCode::OK, axum::http::StatusCode::OK).await;
         let client = StdArc::new(BackendClient::new(url));
@@ -927,10 +897,10 @@ mod tests {
         assert_eq!(mock.plan_hits.load(StdOrdering::SeqCst), 1);
     }
 
-    /// A BackendPlan push failure makes the publication generation
+    /// A physical-plan push failure makes the publication generation
     /// explicitly incomplete even if both compatibility documents landed.
     #[tokio::test]
-    async fn backend_plan_push_failure_is_reported_as_desync() {
+    async fn physical_plan_push_failure_is_reported_as_desync() {
         // A mock without the atomic endpoint: the whole generation fails.
         let app = Router::new();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

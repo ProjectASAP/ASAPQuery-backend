@@ -702,7 +702,6 @@ mod tests {
         ] {
             assert!(bodies[0].get(field).is_some(), "missing {field}");
         }
-        assert!(bodies[0].get("backend_plan").is_none());
         server.abort();
     }
 

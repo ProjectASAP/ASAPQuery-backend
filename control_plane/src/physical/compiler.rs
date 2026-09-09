@@ -2,7 +2,7 @@
 //!
 //! Planner owns semantic alternatives and guarantees. This module owns the
 //! deployment decision: evidence freshness, target capabilities, windows, the
-//! Collector execution projection, and the matching BackendPlan.
+//! Collector execution projection, SummaryCatalog, and executable plans.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
@@ -16,8 +16,7 @@ use asap_aware_mapping::{
 use planner_types::post_asap::{
     CompositionOperator, EvaluationSchedule, OutputRepresentation, SketchAlgorithm, SketchParams,
     SketchQuery, SummaryExpr, SummaryFamilyType, SummaryMaintenanceLifecycle,
-    SummaryMaintenanceLifecycleGuarantee, SummaryMaintenanceMode, SummaryNode,
-    SummaryWindowFramework,
+    SummaryMaintenanceMode, SummaryNode, SummaryWindowFramework,
 };
 use planner_types::pre_asap::QueryExpr;
 use planner_types::workload::{
@@ -29,11 +28,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use crate::backend_plan::{self, BackendPlan};
-use crate::emit::monitor::MonitorIntent;
-use crate::physical::colored_dag::emitter::{
-    AggregationInput, BackendAggregation, BackendReadout, BackendStageConfig,
-};
+use crate::physical::colored_dag::emitter::{AggregationInput, BackendAggregation};
 use crate::physical::post_asap::cost_model::ControlPlaneCostModel;
 use crate::query_plan::{
     canonical_promql, FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping,
@@ -43,6 +38,7 @@ use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
 pub const PLANNER_REVISION: &str = "abb2f20e27091ac0c60715dc42b9b59c75b3447c";
+pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
@@ -404,7 +400,7 @@ pub struct ProducerContract {
 pub enum PrecomputePlanError {
     #[error("invalid precompute catalog contract: {0}")]
     CatalogContract(String),
-    #[error("PrecomputePlan envelope does not match BackendPlan identity/lifecycle")]
+    #[error("PrecomputePlan envelope does not match its SummaryCatalog identity/lifecycle")]
     PlanIdentityMismatch,
     #[error("unsupported precompute ingest protocol/endpoint/identity contract")]
     UnsupportedIngestEndpoint,
@@ -428,38 +424,50 @@ impl PrecomputePlan {
     pub fn build(
         envelope: PlanEnvelope,
         materializations: Vec<asap_types::PrecomputeMaterialization>,
-        backend_plan: &BackendPlan,
         producer_ids: &[String],
     ) -> Result<Self, PrecomputePlanError> {
-        if envelope.plan_id != backend_plan.plan_id
-            || envelope.plan_version != backend_plan.plan_version
-            || envelope.generated_at_unix_ms != backend_plan.generated_at_unix_ms
-            || envelope.activation_unix_ms != backend_plan.activation_unix_ms
-            || envelope.expiry_unix_ms != backend_plan.expiry_unix_ms
-            || envelope.backend_compat != backend_plan.backend_compat
-        {
-            return Err(PrecomputePlanError::PlanIdentityMismatch);
-        }
-        let schemas = backend_plan
-            .materializations
+        let schemas = materializations
             .iter()
-            .map(|(fingerprint, materialization)| {
-                let family = StateFamilyContract::try_from(&materialization.family)
+            .map(|materialization| {
+                let fingerprint = materialization.policy_fingerprint();
+                let accumulator = materialization
+                    .accumulator_spec()
                     .map_err(|_| PrecomputePlanError::UnsupportedFamily(fingerprint.0))?;
-                Ok(StateSchemaContract {
-                    schema_id: state_schema_id(*fingerprint),
-                    schema_version: 1,
-                    materialization: *fingerprint,
-                    family,
-                    source: materialization.source.clone(),
-                    value_column: materialization.col.clone(),
-                    group_by: materialization.group_by.clone(),
-                    window: StateWindowContract {
-                        kind: materialization.window.kind,
-                        size_ms: materialization.window.size_ms,
-                        slide_ms: materialization.window.slide_ms,
+                let family = StateFamilyContract::try_from(&accumulator.family)
+                    .map_err(|_| PrecomputePlanError::UnsupportedFamily(fingerprint.0))?;
+                let source = materialization.table_name.as_ref().map_or_else(
+                    || Source::TimeSeries {
+                        metric: materialization.metric.clone(),
                     },
-                    encodings: state_encodings(&materialization.family),
+                    |table_ref| Source::Table {
+                        table_ref: table_ref.clone(),
+                    },
+                );
+                let value_column = materialization
+                    .value_column
+                    .clone()
+                    .map(planner_types::pre_asap::ColumnRef::Named)
+                    .unwrap_or(planner_types::pre_asap::ColumnRef::SampleValue);
+                Ok(StateSchemaContract {
+                    schema_id: state_schema_id(fingerprint),
+                    schema_version: 1,
+                    materialization: fingerprint,
+                    family,
+                    source,
+                    value_column,
+                    group_by: materialization.grouping_labels.labels.clone(),
+                    window: StateWindowContract {
+                        kind: materialization.window_type,
+                        size_ms: materialization.window_size.saturating_mul(1_000),
+                        slide_ms: match materialization.window_type {
+                            asap_types::WindowKind::Tumbling => None,
+                            asap_types::WindowKind::Sliding => {
+                                Some(materialization.slide_interval.saturating_mul(1_000))
+                            }
+                            asap_types::WindowKind::Session => None,
+                        },
+                    },
+                    encodings: state_encodings(&accumulator.family),
                 })
             })
             .collect::<Result<Vec<_>, PrecomputePlanError>>()?;
@@ -489,7 +497,7 @@ impl PrecomputePlan {
             producers,
             materializations,
         };
-        plan.validate_against_backend(backend_plan)?;
+        plan.validate()?;
         Ok(plan)
     }
 
@@ -498,14 +506,8 @@ impl PrecomputePlan {
     pub fn build_backend_local(
         envelope: PlanEnvelope,
         materializations: Vec<asap_types::PrecomputeMaterialization>,
-        backend_plan: &BackendPlan,
     ) -> Result<Self, PrecomputePlanError> {
-        let mut plan = Self::build(
-            envelope,
-            materializations,
-            backend_plan,
-            &["backend-local".into()],
-        )?;
+        let mut plan = Self::build(envelope, materializations, &["backend-local".into()])?;
         plan.ingest = IngestContract {
             protocol: IngestProtocol::PrometheusRemoteWriteV1,
             endpoint_path: "/api/v1/write".into(),
@@ -515,7 +517,7 @@ impl PrecomputePlan {
             require_registered_producer: false,
         };
         plan.producers.clear();
-        plan.validate_against_backend(backend_plan)?;
+        plan.validate()?;
         Ok(plan)
     }
 
@@ -584,6 +586,52 @@ impl PrecomputePlan {
             .iter()
             .map(|schema| (schema.materialization, schema.schema_id.as_str()))
             .collect();
+        for schema in &self.schemas {
+            let materialization = self
+                .materializations
+                .iter()
+                .find(|candidate| candidate.policy_fingerprint() == schema.materialization)
+                .ok_or(PrecomputePlanError::SchemaSetMismatch)?;
+            let accumulator = materialization
+                .accumulator_spec()
+                .map_err(|_| PrecomputePlanError::UnsupportedFamily(schema.materialization.0))?;
+            let family = StateFamilyContract::try_from(&accumulator.family)
+                .map_err(|_| PrecomputePlanError::UnsupportedFamily(schema.materialization.0))?;
+            let source = materialization.table_name.as_ref().map_or_else(
+                || Source::TimeSeries {
+                    metric: materialization.metric.clone(),
+                },
+                |table_ref| Source::Table {
+                    table_ref: table_ref.clone(),
+                },
+            );
+            let value_column = materialization
+                .value_column
+                .clone()
+                .map(planner_types::pre_asap::ColumnRef::Named)
+                .unwrap_or(planner_types::pre_asap::ColumnRef::SampleValue);
+            if schema.schema_id != state_schema_id(schema.materialization)
+                || schema.family != family
+                || schema.source != source
+                || schema.value_column != value_column
+                || schema.group_by != materialization.grouping_labels.labels
+                || schema.window.kind != materialization.window_type
+                || schema.window.size_ms != materialization.window_size.saturating_mul(1_000)
+                || schema.window.slide_ms
+                    != match materialization.window_type {
+                        asap_types::WindowKind::Tumbling => None,
+                        asap_types::WindowKind::Sliding => {
+                            Some(materialization.slide_interval.saturating_mul(1_000))
+                        }
+                        asap_types::WindowKind::Session => None,
+                    }
+                || schema.encodings != state_encodings(&accumulator.family)
+            {
+                return Err(PrecomputePlanError::InvalidSchema {
+                    schema_id: schema.schema_id.clone(),
+                });
+            }
+        }
         let mut producers = BTreeSet::new();
         let mut produced = BTreeSet::new();
         for producer in &self.producers {
@@ -616,35 +664,6 @@ impl PrecomputePlan {
         }
         Ok(())
     }
-
-    pub fn validate_against_backend(
-        &self,
-        backend_plan: &BackendPlan,
-    ) -> Result<(), PrecomputePlanError> {
-        self.validate()?;
-        for schema in &self.schemas {
-            let Some(materialization) = backend_plan.materializations.get(&schema.materialization)
-            else {
-                return Err(PrecomputePlanError::SchemaSetMismatch);
-            };
-            let expected_family = StateFamilyContract::try_from(&materialization.family)
-                .map_err(|_| PrecomputePlanError::UnsupportedFamily(schema.materialization.0))?;
-            if schema.family != expected_family
-                || schema.schema_id != state_schema_id(schema.materialization)
-                || schema.source != materialization.source
-                || schema.value_column != materialization.col
-                || schema.group_by != materialization.group_by
-                || schema.window.kind != materialization.window.kind
-                || schema.window.size_ms != materialization.window.size_ms
-                || schema.window.slide_ms != materialization.window.slide_ms
-            {
-                return Err(PrecomputePlanError::InvalidSchema {
-                    schema_id: schema.schema_id.clone(),
-                });
-            }
-        }
-        Ok(())
-    }
 }
 
 /// Complete physical projection of one post-ASAP planning decision.
@@ -656,7 +675,6 @@ pub struct PhysicalPlan {
     pub collector_plans: Vec<CollectorPlan>,
     pub precompute_plan: PrecomputePlan,
     pub transmission_plan: TransmissionPlan,
-    pub backend_plan: BackendPlan,
     pub query_plan: QueryPlan,
     /// Lifecycle component only, not a complete physical-plan comparison.
     pub lifecycle_estimates: Vec<MaterializationLifecycleEstimate>,
@@ -1591,8 +1609,8 @@ pub enum CompileError {
     InvalidEvidence { query_id: String, reason: String },
     #[error("query {query_id}: lifecycle planning failed: {reason}")]
     Lifecycle { query_id: String, reason: String },
-    #[error("failed to construct BackendPlan: {0}")]
-    BackendPlan(#[from] anyhow::Error),
+    #[error("failed to construct a physical materialization: {0}")]
+    Materialization(#[from] anyhow::Error),
     #[error("failed to construct QueryPlan: {0}")]
     QueryPlan(#[from] crate::query_plan::QueryPlanError),
 }
@@ -1951,7 +1969,6 @@ impl PhysicalCompiler {
             request.queries[id].post_asap = root;
         }
         let mut aggregations = Vec::with_capacity(request.queries.len());
-        let mut readouts = Vec::with_capacity(request.queries.len());
         let mut collector_materializations = Vec::with_capacity(request.queries.len());
         let mut plan_materializations = Vec::with_capacity(request.queries.len());
         let mut shared_materializations = BTreeMap::new();
@@ -1959,7 +1976,7 @@ impl PhysicalCompiler {
         // Binding is established while compiling the physical
         // materializations, then consumed by QueryPlan lowering. The key is
         // the planner DAG node identity across the workload; serving never scans
-        // BackendPlan candidates to rediscover this decision.
+        // downstream components to rediscover this decision.
         let mut node_bindings = HashMap::<usize, asap_types::PolicyFingerprint>::new();
         let consumers = materialization_consumers(
             &request.queries,
@@ -2105,7 +2122,7 @@ impl PhysicalCompiler {
                     environment.target,
                 );
                 let precompute_materialization =
-                    backend_plan::aggregation_config_for_materialization(&aggregation)?;
+                    aggregation_config_for_materialization(&aggregation)?;
                 let materialization = precompute_materialization.policy_fingerprint();
                 let state_consumers = consumers[&materialization]
                     .iter()
@@ -2157,8 +2174,7 @@ impl PhysicalCompiler {
                 } else {
                     window_implementation.pane_secs
                 };
-                let runtime_materialization =
-                    backend_plan::aggregation_config_for_materialization(&aggregation)?;
+                let runtime_materialization = aggregation_config_for_materialization(&aggregation)?;
                 let materialization = runtime_materialization.policy_fingerprint();
                 let consumer_query_ids = state_consumers
                     .iter()
@@ -2210,12 +2226,6 @@ impl PhysicalCompiler {
                 }
                 let physical_group_by = aggregation.grouping.clone();
                 aggregations.push(aggregation);
-                if let Some(readout) = selected.readout.clone() {
-                    readouts.push(BackendReadout {
-                        aggregation_id,
-                        op: readout,
-                    });
-                }
                 let collector_materialization = CollectorMaterialization {
                     query_id: format!("state-{}", materialization.0),
                     materialization,
@@ -2279,34 +2289,6 @@ impl PhysicalCompiler {
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: environment.capability_snapshot_id,
         };
-        let backend_stage_config = BackendStageConfig {
-            aggregations: aggregations.clone(),
-            readouts,
-        };
-        let mut backend_plan = backend_plan::from_stage_config(
-            &backend_stage_config,
-            &Vec::<MonitorIntent>::new(),
-            plan_id,
-            environment.observed_at_unix_ms,
-        )?;
-        backend_plan.plan_version = envelope.plan_version;
-        backend_plan.activation_unix_ms = envelope.activation_unix_ms;
-        backend_plan.expiry_unix_ms = envelope.expiry_unix_ms;
-        backend_plan.backend_compat = envelope.backend_compat.clone();
-        backend_plan
-            .validate()
-            .map_err(|error| CompileError::Query {
-                query_id: "physical-plan-envelope".into(),
-                reason: error.to_string(),
-            })?;
-        for materialization in backend_plan.materializations.values_mut() {
-            materialization.lifecycle = Some(SummaryMaintenanceLifecycleGuarantee {
-                summary_maintenance_lifecycle: SummaryMaintenanceLifecycle::ContinuouslyMaintained,
-                summary_maintenance_mode: SummaryMaintenanceMode::Incremental,
-                evaluation_schedule: EvaluationSchedule::PerUpdate,
-                output_representation: OutputRepresentation::SummaryState,
-            });
-        }
         let producer_ids = match environment.target {
             PhysicalDeploymentTarget::DistributedCollectors => environment.collector_ids.clone(),
             PhysicalDeploymentTarget::BackendLocalRemoteWrite => Vec::new(),
@@ -2315,40 +2297,18 @@ impl PhysicalCompiler {
         // summary. PrecomputePlan is keyed by physical identity, not query ID.
         let mut materializations_by_fingerprint = BTreeMap::new();
         for aggregation in &aggregations {
-            let materialization =
-                backend_plan::aggregation_config_for_materialization(aggregation)?;
+            let materialization = aggregation_config_for_materialization(aggregation)?;
             materializations_by_fingerprint
                 .entry(materialization.policy_fingerprint())
                 .or_insert(materialization);
         }
-        // The compatibility emitter may clamp pane sizes. Publish the actual
-        // executable configuration in both projections, never the pre-clamp size.
-        for (id, config) in &materializations_by_fingerprint {
-            if let Some(state) = backend_plan.materializations.get_mut(id) {
-                state.window.size_ms =
-                    config
-                        .window_size
-                        .checked_mul(1000)
-                        .ok_or_else(|| CompileError::Query {
-                            query_id: "precompute-window".into(),
-                            reason: "window overflow".into(),
-                        })?;
-            }
-        }
         let materializations = materializations_by_fingerprint.into_values().collect();
         let mut precompute_plan = match environment.target {
-            PhysicalDeploymentTarget::DistributedCollectors => PrecomputePlan::build(
-                envelope.clone(),
-                materializations,
-                &backend_plan,
-                &producer_ids,
-            ),
+            PhysicalDeploymentTarget::DistributedCollectors => {
+                PrecomputePlan::build(envelope.clone(), materializations, &producer_ids)
+            }
             PhysicalDeploymentTarget::BackendLocalRemoteWrite => {
-                PrecomputePlan::build_backend_local(
-                    envelope.clone(),
-                    materializations,
-                    &backend_plan,
-                )
+                PrecomputePlan::build_backend_local(envelope.clone(), materializations)
             }
         }
         .map_err(|error| CompileError::Query {
@@ -2376,8 +2336,11 @@ impl PhysicalCompiler {
                 materializations: collector_materializations.clone(),
             })
             .collect::<Vec<_>>();
-        let materialization_fingerprints: BTreeSet<_> =
-            backend_plan.materializations.keys().copied().collect();
+        let materialization_fingerprints: BTreeSet<_> = precompute_plan
+            .materializations
+            .iter()
+            .map(asap_types::PrecomputeMaterialization::policy_fingerprint)
+            .collect();
         let mut query_entries = BTreeMap::new();
         for query in &request.queries {
             let canonical = canonical_promql(&query.query_string)?;
@@ -2395,12 +2358,13 @@ impl PhysicalCompiler {
                                 "post-ASAP node has no compiled physical binding for {node_family:?}"
                             ))
                         })?;
-                    let materialization = backend_plan
+                    let materialization = precompute_plan
                         .materializations
-                        .get(&fingerprint)
+                        .iter()
+                        .find(|candidate| candidate.policy_fingerprint() == fingerprint)
                         .ok_or_else(|| {
                             crate::query_plan::QueryPlanError::Invalid(format!(
-                                "compiled binding {} is absent from BackendPlan",
+                                "compiled binding {} is absent from PrecomputePlan",
                                 fingerprint.0
                             ))
                         })?;
@@ -2417,10 +2381,14 @@ impl PhysicalCompiler {
                         })?;
                     let (_, source_window, _) = materialization_leaf_contract(node)
                         .map_err(crate::query_plan::QueryPlanError::Invalid)?;
-                    if materialization.family != physical_materialization_family(node_family)
-                        || materialization.window.size_ms == 0
+                    let materialization_family = materialization.accumulator_spec()
+                        .map_err(|error| crate::query_plan::QueryPlanError::Invalid(error.to_string()))?
+                        .family;
+                    let window_ms = materialization.window_size.saturating_mul(1_000);
+                    if materialization_family != physical_materialization_family(node_family)
+                        || window_ms == 0
                         || source_window.unwrap_or(query.window_secs).saturating_mul(1_000)
-                            % materialization.window.size_ms != 0
+                            % window_ms != 0
                     {
                         return Err(crate::query_plan::QueryPlanError::Invalid(format!(
                             "compiled binding {} disagrees with post-ASAP/deployment semantics",
@@ -2535,7 +2503,6 @@ impl PhysicalCompiler {
             collector_plans,
             precompute_plan,
             transmission_plan,
-            backend_plan,
             query_plan,
             lifecycle_estimates: lifecycle_estimates.into_values().collect(),
             cost_comparison: None,
@@ -2662,11 +2629,7 @@ pub fn select_post_asap(
 }
 
 pub(super) fn state_schema_id(fingerprint: asap_types::PolicyFingerprint) -> String {
-    format!(
-        "{}:summary-state:v1:{}",
-        backend_plan::BACKEND_COMPAT,
-        fingerprint.0
-    )
+    format!("{}:summary-state:v1:{}", BACKEND_COMPAT, fingerprint.0)
 }
 
 pub(super) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> {
@@ -3102,7 +3065,6 @@ struct SelectedMaterialization {
     spatial_filter: String,
     group_by: Option<Vec<String>>,
     family: SummaryFamilyType,
-    readout: Option<SketchQuery>,
     algorithm: String,
     parameters: Value,
 }
@@ -3138,6 +3100,26 @@ fn physical_aggregation(
     }
 }
 
+/// Convert the typed physical aggregation into the runtime's canonical
+/// content-addressed materialization contract. This is the one conversion
+/// shared by the physical compiler and the compatibility replanner; it does
+/// not create a second registry or wire plan.
+pub(crate) fn aggregation_config_for_materialization(
+    aggregation: &BackendAggregation,
+) -> anyhow::Result<asap_types::PrecomputeMaterialization> {
+    use anyhow::Context as _;
+    let json = crate::emit::stage_config::build_backend_aggregation_json(aggregation);
+    let text = serde_json::to_string(&json).context("serialize synthesized aggregation JSON")?;
+    let yaml: serde_yaml::Value =
+        serde_yaml::from_str(&text).context("parse synthesized aggregation JSON as YAML")?;
+    asap_types::PrecomputeMaterialization::from_yaml_data(
+        &yaml,
+        None,
+        asap_types::QueryLanguage::promql,
+    )
+    .context("build materialization from physical aggregation")
+}
+
 fn materialization_consumers(
     queries: &[PlanningQuery],
     target: PhysicalDeploymentTarget,
@@ -3163,9 +3145,12 @@ fn materialization_consumers(
             {
                 continue;
             }
-            let config = backend_plan::aggregation_config_for_materialization(
-                &physical_aggregation(query, &state, query.query_id.clone(), target),
-            )?;
+            let config = aggregation_config_for_materialization(&physical_aggregation(
+                query,
+                &state,
+                query.query_id.clone(),
+                target,
+            ))?;
             consumers
                 .entry(config.policy_fingerprint())
                 .or_default()
@@ -3299,7 +3284,6 @@ fn collect_selected_materializations(
                             kind.clone(),
                             planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
                         ),
-                        readout: Some(readout.clone()),
                         algorithm: format!("{:?}", kind.algorithm()).to_ascii_lowercase(),
                         parameters,
                     });
@@ -3323,7 +3307,6 @@ fn collect_selected_materializations(
                     spatial_filter,
                     group_by: grouping.clone(),
                     family: SummaryFamilyType::ExactAggregate(kind.clone(), params.clone()),
-                    readout: None,
                     algorithm: format!("{kind:?}").to_ascii_lowercase(),
                     parameters: Value::Object(Default::default()),
                 });
@@ -3796,7 +3779,7 @@ mod tests {
                 .compile(workload, env)
                 .expect("shared compile");
             assert_eq!(bundle.query_plan.entries.len(), 2);
-            assert_eq!(bundle.backend_plan.materializations.len(), 1);
+            assert_eq!(bundle.summary_catalog.materializations.len(), 1);
             assert_eq!(bundle.precompute_plan.materializations.len(), 1);
             assert_eq!(bundle.precompute_plan.schemas.len(), 1);
             let bindings = bundle
@@ -3839,7 +3822,7 @@ mod tests {
         let bundle = PhysicalCompiler
             .compile(workload, environment(10_000))
             .unwrap();
-        assert_eq!(bundle.backend_plan.materializations.len(), 2);
+        assert_eq!(bundle.summary_catalog.materializations.len(), 2);
         assert_eq!(bundle.precompute_plan.materializations.len(), 2);
         for collector in &bundle.collector_plans {
             assert_eq!(collector.materializations.len(), 2);
@@ -4282,17 +4265,14 @@ mod tests {
 
     #[test]
     fn publication_is_catalog_authoritative_and_round_trips() {
-        let mut bundle = PhysicalCompiler
+        let bundle = PhysicalCompiler
             .compile(
                 request("publication", "quantile_over_time(0.99, m[1m])"),
                 environment(10_000),
             )
             .unwrap();
-        // Compatibility bytes cannot silently determine publication identity.
-        bundle.backend_plan.plan_id += 1;
         let publication = bundle.publication().unwrap();
         let json = serde_json::to_value(&publication).unwrap();
-        assert!(json.get("backend_plan").is_none());
         let mut decoded: super::super::publication::PhysicalPlanPublication =
             serde_json::from_value(json).unwrap();
         decoded.validate().unwrap();
@@ -4331,11 +4311,10 @@ mod tests {
                 .cloned()
                 .collect::<BTreeSet<_>>(),
             bundle
-                .backend_plan
+                .precompute_plan
                 .materializations
-                .keys()
-                .copied()
-                .map(asap_types::sds::MaterializationId::from)
+                .iter()
+                .map(|config| config.policy_fingerprint().into())
                 .collect::<BTreeSet<_>>()
         );
         assert_eq!(bundle.precompute_plan.envelope, bundle.envelope);
@@ -4378,21 +4357,16 @@ mod tests {
             bundle.transmission_plan.validate_frame(&wrong_version),
             Err(TransmissionPlanError::InvalidFrame(_))
         ));
-        assert_eq!(bundle.backend_plan.materializations.len(), 1);
+        assert_eq!(bundle.summary_catalog.materializations.len(), 1);
         assert_eq!(
             bundle
-                .backend_plan
-                .materializations
+                .query_plan
+                .entries
                 .values()
-                .next()
-                .unwrap()
-                .lifecycle
-                .as_ref()
-                .unwrap()
-                .summary_maintenance_lifecycle,
-            SummaryMaintenanceLifecycle::ContinuouslyMaintained
+                .flat_map(QueryPlanEntry::materialization_bindings)
+                .count(),
+            1
         );
-        assert_eq!(bundle.backend_plan.routing.len(), 1);
         assert_eq!(bundle.query_plan.plan_id, bundle.envelope.plan_id);
         let entry = bundle
             .query_plan
@@ -4413,10 +4387,10 @@ mod tests {
         entry
             .validate(
                 &bundle
-                    .backend_plan
+                    .precompute_plan
                     .materializations
-                    .keys()
-                    .copied()
+                    .iter()
+                    .map(asap_types::PrecomputeMaterialization::policy_fingerprint)
                     .collect(),
             )
             .expect("executable physical DAG");
@@ -4464,7 +4438,6 @@ mod tests {
         let plan = PrecomputePlan::build_backend_local(
             bundle.envelope.clone(),
             bundle.precompute_plan.materializations.clone(),
-            &bundle.backend_plan,
         )
         .expect("backend-local contract");
 
@@ -4475,8 +4448,7 @@ mod tests {
         assert_eq!(plan.ingest.endpoint_path, "/api/v1/write");
         assert_eq!(plan.ingest.timestamp_unit, TimestampUnit::UnixMilliseconds);
         assert!(plan.producers.is_empty());
-        plan.validate_against_backend(&bundle.backend_plan)
-            .expect("valid backend-local projection");
+        plan.validate().expect("valid backend-local projection");
         TransmissionPlan::build(bundle.envelope, &plan, &BTreeMap::new())
             .expect("empty backend-local transmission contract")
             .validate(&plan)
@@ -4562,7 +4534,7 @@ mod tests {
             .compile()
             .expect("second deterministic plan");
         assert_eq!(first.envelope, second.envelope);
-        assert_eq!(first.backend_plan, second.backend_plan);
+        assert_eq!(first.summary_catalog, second.summary_catalog);
         assert_eq!(first.query_plan, second.query_plan);
         assert_eq!(first.transmission_plan, second.transmission_plan);
         assert_eq!(
@@ -4610,7 +4582,7 @@ mod tests {
             deployment.collector_ids.clear();
             let compiled = PhysicalCompiler.compile(request(query_id, promql), deployment);
             let plan = compiled.unwrap_or_else(|error| panic!("{promql} must compile: {error}"));
-            assert_eq!(plan.backend_plan.materializations.len(), 1, "{promql}");
+            assert_eq!(plan.summary_catalog.materializations.len(), 1, "{promql}");
             assert_eq!(plan.query_plan.entries.len(), 1, "{promql}");
             assert!(plan.collector_plans.is_empty(), "{promql}");
             let entry = plan.query_plan.entries.values().next().unwrap();
@@ -4620,9 +4592,9 @@ mod tests {
                     if *readout == expected_readout
             ));
             if expected_readout == crate::query_plan::ExactReadout::Rate {
-                let materialization = plan.backend_plan.materializations.values().next().unwrap();
+                let materialization = plan.precompute_plan.materializations.first().unwrap();
                 assert_eq!(
-                    materialization.family,
+                    materialization.accumulator_spec().unwrap().family,
                     SummaryFamilyType::ExactAggregate(
                         planner_types::post_asap::ExactKind::Increase,
                         planner_types::post_asap::ExactParams::Increase,
@@ -4724,7 +4696,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(bundle.query_plan.entries.len(), 2);
-        assert_eq!(bundle.backend_plan.materializations.len(), 1);
+        assert_eq!(bundle.summary_catalog.materializations.len(), 1);
         assert_eq!(bundle.precompute_plan.materializations.len(), 1);
         assert_eq!(bundle.precompute_plan.schemas.len(), 1);
         assert_eq!(bundle.precompute_plan.producers.len(), 2);
@@ -4766,9 +4738,17 @@ mod tests {
         let bundle = PhysicalCompiler
             .compile(planning_request, environment(10_000))
             .expect("compile merged post-ASAP DAG");
-        assert_eq!(bundle.backend_plan.materializations.len(), 2);
+        assert_eq!(bundle.summary_catalog.materializations.len(), 2);
         assert_eq!(bundle.precompute_plan.materializations.len(), 2);
-        assert_eq!(bundle.backend_plan.routing.len(), 2);
+        assert_eq!(
+            bundle
+                .query_plan
+                .entries
+                .values()
+                .flat_map(QueryPlanEntry::materialization_bindings)
+                .count(),
+            2
+        );
         let entry = bundle.query_plan.entries.values().next().unwrap();
         assert_eq!(
             entry
@@ -4804,7 +4784,7 @@ mod tests {
     }
 
     #[test]
-    fn precompute_schema_must_match_backend_semantics() {
+    fn precompute_schema_must_match_materialization_semantics() {
         let bundle = PhysicalCompiler
             .compile(
                 request("q-quantile", "quantile_over_time(0.99, m[1m])"),
@@ -4814,7 +4794,7 @@ mod tests {
         let mut plan = bundle.precompute_plan.clone();
         plan.schemas[0].group_by.push("invented".into());
         assert!(matches!(
-            plan.validate_against_backend(&bundle.backend_plan),
+            plan.validate(),
             Err(PrecomputePlanError::InvalidSchema { .. })
         ));
     }
@@ -4836,13 +4816,8 @@ mod tests {
             env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
             env.collector_ids.clear();
             let bundle = PhysicalCompiler.compile(request, env).unwrap();
-            let materialization = bundle
-                .backend_plan
-                .materializations
-                .values()
-                .next()
-                .unwrap();
-            assert_eq!(materialization.window.size_ms, expected_secs * 1000);
+            let materialization = bundle.precompute_plan.materializations.first().unwrap();
+            assert_eq!(materialization.window_size, expected_secs);
             let entry = bundle
                 .query_plan
                 .lookup("sum(sum_over_time(m[1m]))")
@@ -5023,7 +4998,7 @@ mod tests {
         let bundle = PhysicalCompiler
             .compile(request, environment(10_000))
             .expect("certified TopK compiles");
-        assert_eq!(bundle.backend_plan.materializations.len(), 1);
+        assert_eq!(bundle.summary_catalog.materializations.len(), 1);
         assert_eq!(
             bundle.collector_plans[0].materializations[0]
                 .evidence_source
