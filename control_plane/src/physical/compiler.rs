@@ -273,6 +273,13 @@ pub struct CollectorPlan {
 /// series, maintains windows, and writes content-addressed materializations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputePlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_catalog: Option<super::summary_catalog::SummaryCatalogReference>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub materialization_contracts: BTreeMap<
+        asap_types::sds::MaterializationId,
+        super::precompute_contract::PrecomputeMaterializationContract,
+    >,
     pub envelope: PlanEnvelope,
     pub ingest: IngestContract,
     pub schemas: Vec<StateSchemaContract>,
@@ -399,6 +406,8 @@ pub struct ProducerContract {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PrecomputePlanError {
+    #[error("invalid precompute catalog contract: {0}")]
+    CatalogContract(String),
     #[error("PrecomputePlan envelope does not match BackendPlan identity/lifecycle")]
     PlanIdentityMismatch,
     #[error("unsupported precompute ingest protocol/endpoint/identity contract")]
@@ -470,6 +479,8 @@ impl PrecomputePlan {
             })
             .collect();
         let plan = Self {
+            summary_catalog: None,
+            materialization_contracts: BTreeMap::new(),
             envelope,
             ingest: IngestContract {
                 protocol: IngestProtocol::ModifiedOtlpMetricsV1,
@@ -608,7 +619,7 @@ impl PrecomputePlan {
                 return Err(PrecomputePlanError::MissingProducer(missing.0));
             }
         }
-        Ok(())
+        self.validate_catalog_contract()
     }
 
     pub fn validate_against_backend(
@@ -992,7 +1003,10 @@ fn validate_catalog_projection(
         ));
     }
     for id in materializations {
-        if !catalog.materializations.contains_key(&id) {
+        if !catalog
+            .materializations
+            .contains_key(&asap_types::sds::MaterializationId::from(id))
+        {
             return Err(TransmissionPlanError::Catalog(format!(
                 "unknown materialization {}",
                 id.0
@@ -2326,6 +2340,20 @@ impl PhysicalCompiler {
                 .entry(materialization.policy_fingerprint())
                 .or_insert(materialization);
         }
+        // The compatibility emitter may clamp pane sizes. Publish the actual
+        // executable configuration in both projections, never the pre-clamp size.
+        for (id, config) in &materializations_by_fingerprint {
+            if let Some(state) = backend_plan.materializations.get_mut(id) {
+                state.window.size_ms =
+                    config
+                        .window_size
+                        .checked_mul(1000)
+                        .ok_or_else(|| CompileError::Query {
+                            query_id: "precompute-window".into(),
+                            reason: "window overflow".into(),
+                        })?;
+            }
+        }
         let materializations = materializations_by_fingerprint.into_values().collect();
         let mut precompute_plan = match environment.target {
             PhysicalDeploymentTarget::DistributedCollectors => PrecomputePlan::build(
@@ -2497,6 +2525,12 @@ impl PhysicalCompiler {
             query_id: "summary-catalog".into(),
             reason: error.to_string(),
         })?;
+        precompute_plan
+            .bind_catalog(&summary_catalog)
+            .map_err(|error| CompileError::Query {
+                query_id: "precompute-catalog".into(),
+                reason: error.to_string(),
+            })?;
         transmission_plan
             .validate_against_catalog(&summary_catalog)
             .map_err(|error| CompileError::Query {
@@ -2643,7 +2677,7 @@ pub fn select_post_asap(
     )
 }
 
-fn state_schema_id(fingerprint: asap_types::PolicyFingerprint) -> String {
+pub(super) fn state_schema_id(fingerprint: asap_types::PolicyFingerprint) -> String {
     format!(
         "{}:summary-state:v1:{}",
         backend_plan::BACKEND_COMPAT,
@@ -2651,7 +2685,7 @@ fn state_schema_id(fingerprint: asap_types::PolicyFingerprint) -> String {
     )
 }
 
-fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> {
+pub(super) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> {
     match family {
         SummaryFamilyType::ExactAggregate(..) => vec![StateEncoding::ExactAccumulatorV1],
         SummaryFamilyType::Sketch(kind, _)
@@ -3460,6 +3494,7 @@ mod tests {
             .compile(request("counter", "rate(m[1m])"), environment(10_000))
             .unwrap();
         plan.precompute_plan.validate().unwrap();
+        let catalog = plan.summary_catalog.clone();
         let mut raw = plan.precompute_plan;
         raw.ingest.protocol = IngestProtocol::PrometheusRemoteWriteV1;
         raw.ingest.endpoint_path = "/api/v1/write".into();
@@ -3468,6 +3503,7 @@ mod tests {
         raw.ingest.require_materialization_identity = false;
         raw.ingest.require_registered_producer = false;
         raw.producers.clear();
+        raw.bind_catalog(&catalog).unwrap();
         raw.validate().unwrap();
     }
 
@@ -4201,6 +4237,73 @@ mod tests {
     }
 
     #[test]
+    fn precompute_catalog_validates_without_backend_projection() {
+        let bundle = PhysicalCompiler
+            .compile(
+                request("catalog", "quantile_over_time(0.99, m[1m])"),
+                environment(10_000),
+            )
+            .unwrap();
+        let original = &bundle.precompute_plan;
+        let catalog = &bundle.summary_catalog;
+        let roundtrip: PrecomputePlan =
+            serde_json::from_slice(&serde_json::to_vec(original).unwrap()).unwrap();
+        roundtrip.validate_against_catalog(catalog).unwrap();
+        let reject =
+            |mutated: PrecomputePlan| assert!(mutated.validate_against_catalog(catalog).is_err());
+        let mut bad = original.clone();
+        bad.schemas[0].source = planner_types::pre_asap::Source::TimeSeries {
+            metric: "other".into(),
+        };
+        reject(bad);
+        let mut bad = original.clone();
+        bad.schemas[0].value_column = planner_types::pre_asap::ColumnRef::Named("other".into());
+        reject(bad);
+        let mut bad = original.clone();
+        bad.schemas[0].group_by.push("other".into());
+        reject(bad);
+        let mut bad = original.clone();
+        bad.schemas[0].window.size_ms += 1;
+        reject(bad);
+        let mut bad = original.clone();
+        bad.materialization_contracts
+            .values_mut()
+            .next()
+            .unwrap()
+            .activation_unix_ms += 1;
+        reject(bad);
+        let mut bad = original.clone();
+        bad.materialization_contracts
+            .values_mut()
+            .next()
+            .unwrap()
+            .retained_windows = Some(0);
+        reject(bad);
+        let mut bad = original.clone();
+        bad.materialization_contracts
+            .values_mut()
+            .next()
+            .unwrap()
+            .update = super::super::precompute_contract::PrecomputeUpdate::RawSamples;
+        reject(bad);
+        let mut bad = original.clone();
+        bad.summary_catalog
+            .as_mut()
+            .unwrap()
+            .snapshot_sha256
+            .push('0');
+        reject(bad);
+        let mut corrupt_catalog = catalog.clone();
+        corrupt_catalog.data_descriptors.clear();
+        assert!(original.validate_against_catalog(&corrupt_catalog).is_err());
+        let mut legacy = original.clone();
+        legacy.summary_catalog = None;
+        legacy.materialization_contracts.clear();
+        legacy.validate().unwrap();
+        assert!(legacy.validate_against_catalog(catalog).is_err());
+    }
+
+    #[test]
     fn compiles_one_decision_into_matching_collector_and_backend_views() {
         let bundle = PhysicalCompiler
             .compile(
@@ -4227,6 +4330,7 @@ mod tests {
                 .materializations
                 .keys()
                 .copied()
+                .map(asap_types::sds::MaterializationId::from)
                 .collect::<BTreeSet<_>>()
         );
         assert_eq!(bundle.precompute_plan.envelope, bundle.envelope);

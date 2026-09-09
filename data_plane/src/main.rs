@@ -674,6 +674,8 @@ async fn main() -> Result<()> {
     // sharing contract as `hot_reload_config`.
     let initial_backend_plan = control_plane::backend_plan::BackendPlan::default();
     let initial_precompute_plan = control_plane::physical::compiler::PrecomputePlan {
+                summary_catalog: None,
+                materialization_contracts: Default::default(),
         envelope: control_plane::physical::compiler::PlanEnvelope {
             plan_id: 0,
             plan_version: 0,

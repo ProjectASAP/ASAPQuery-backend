@@ -822,6 +822,8 @@ mod tests {
         };
         ActivePhysicalPlan {
             precompute_plan: control_plane::physical::compiler::PrecomputePlan {
+                summary_catalog: None,
+                materialization_contracts: Default::default(),
                 envelope,
                 ingest: control_plane::physical::compiler::IngestContract {
                     protocol:
