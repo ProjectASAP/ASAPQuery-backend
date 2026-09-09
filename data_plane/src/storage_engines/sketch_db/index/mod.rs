@@ -1880,7 +1880,7 @@ impl SketchStore {
     pub fn approx_resident_bytes(&self) -> usize {
         let mut total = 0usize;
 
-        // 1. Registry metadata (instances map + its string heaps).
+        // 1. SID bindings, compatibility metadata, and shared SDS descriptors.
         if let Ok(insts) = self.instances.read() {
             for m in insts.values() {
                 total += std::mem::size_of::<SketchInstanceMetadata>();
@@ -1889,9 +1889,10 @@ impl SketchStore {
                     total += k.len() + std::mem::size_of::<String>();
                 }
             }
-            total += insts.capacity()
-                * (std::mem::size_of::<u64>() + std::mem::size_of::<SketchInstanceMetadata>());
+            total +=
+                insts.capacity() * (std::mem::size_of::<u64>() + std::mem::size_of::<SdsBinding>());
         }
+        total += self.descriptors.approx_resident_bytes();
 
         // 2. Per-sid series storage: live payloads + interned label maps +
         //    the `Arc<RwLock<SidStoreData>>` container slot.
@@ -2079,6 +2080,7 @@ impl SketchStore {
             self.series.remove(&sid);
             self.rollups.remove_sid(sid);
             self.incomplete_summary_lineages.remove(&sid);
+            self.descriptors.prune();
         }
         removed
     }

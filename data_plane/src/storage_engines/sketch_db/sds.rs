@@ -5,7 +5,7 @@
 //! pane-local state remains in `SketchStore`.
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 
 use super::data::{AccuracyBound, AggKind, SketchAlgorithm, SketchConfig};
 use super::index::SketchInstanceMetadata;
@@ -66,7 +66,6 @@ impl SummaryOperator {
 pub enum FidelityGuarantee {
     Exact,
     Approximate(AccuracyBound),
-    Unknown,
 }
 
 #[derive(Debug)]
@@ -107,8 +106,10 @@ impl std::ops::Deref for SdsBinding {
 /// Content-addressed descriptor registry owned by one SummaryStore.
 #[derive(Default)]
 pub struct SummaryDescriptorRegistry {
-    summaries: RwLock<HashMap<SummaryDescriptorId, Arc<SummaryDescriptor>>>,
-    data: RwLock<HashMap<DataDescriptorId, Arc<DataDescriptor>>>,
+    // Weak values let descriptors disappear with their last SID binding. The
+    // registry must not turn retired materializations into a permanent leak.
+    summaries: RwLock<HashMap<SummaryDescriptorId, Weak<SummaryDescriptor>>>,
+    data: RwLock<HashMap<DataDescriptorId, Weak<DataDescriptor>>>,
 }
 
 impl SummaryDescriptorRegistry {
@@ -117,21 +118,22 @@ impl SummaryDescriptorRegistry {
         let summary_id = SummaryDescriptorId(summary_key);
         let summary_descriptor = {
             let mut summaries = self.summaries.write().unwrap();
-            Arc::clone(summaries.entry(summary_id.clone()).or_insert_with(|| {
-                let fidelity = match (&metadata.agg_kind, &metadata.accuracy) {
-                    (AggKind::ExactAgg { .. }, _) => FidelityGuarantee::Exact,
-                    (AggKind::Sketch { .. }, Some(bound)) => {
-                        FidelityGuarantee::Approximate(bound.clone())
-                    }
-                    (AggKind::Sketch { .. }, None) => FidelityGuarantee::Unknown,
+            if let Some(existing) = summaries.get(&summary_id).and_then(Weak::upgrade) {
+                existing
+            } else {
+                let fidelity = match metadata.agg_kind.capability_and_accuracy().1 {
+                    Some(bound) => FidelityGuarantee::Approximate(bound),
+                    None => FidelityGuarantee::Exact,
                 };
-                Arc::new(SummaryDescriptor {
-                    id: summary_id,
+                let descriptor = Arc::new(SummaryDescriptor {
+                    id: summary_id.clone(),
                     operator: SummaryOperator::from_agg_kind(&metadata.agg_kind),
                     fidelity,
                     state_schema_version: 1,
-                })
-            }))
+                });
+                summaries.insert(summary_id, Arc::downgrade(&descriptor));
+                descriptor
+            }
         };
 
         let filter = metadata.agg_kind.spatial_filter_canonical();
@@ -144,14 +146,18 @@ impl SummaryDescriptorRegistry {
         let data_id = DataDescriptorId(data_key);
         let data_descriptor = {
             let mut data = self.data.write().unwrap();
-            Arc::clone(data.entry(data_id.clone()).or_insert_with(|| {
-                Arc::new(DataDescriptor {
+            if let Some(existing) = data.get(&data_id).and_then(Weak::upgrade) {
+                existing
+            } else {
+                let descriptor = Arc::new(DataDescriptor {
                     id: data_id,
                     metric_name: Arc::from(metadata.metric_name.as_str()),
                     population_filter_canonical: Arc::from(filter),
                     group_by_keys: Arc::new(metadata.group_by_keys.clone()),
-                })
-            }))
+                });
+                data.insert(descriptor.id.clone(), Arc::downgrade(&descriptor));
+                descriptor
+            }
         };
 
         SdsBinding {
@@ -162,11 +168,67 @@ impl SummaryDescriptorRegistry {
     }
 
     pub fn summary_count(&self) -> usize {
-        self.summaries.read().unwrap().len()
+        self.summaries
+            .read()
+            .unwrap()
+            .values()
+            .filter(|descriptor| descriptor.strong_count() > 0)
+            .count()
     }
 
     pub fn data_count(&self) -> usize {
-        self.data.read().unwrap().len()
+        self.data
+            .read()
+            .unwrap()
+            .values()
+            .filter(|descriptor| descriptor.strong_count() > 0)
+            .count()
+    }
+
+    /// Remove dead weak entries after SID retirement. Live snapshots remain
+    /// valid and are collected by a later prune once their handles are gone.
+    pub fn prune(&self) {
+        self.summaries
+            .write()
+            .unwrap()
+            .retain(|_, descriptor| descriptor.strong_count() > 0);
+        self.data
+            .write()
+            .unwrap()
+            .retain(|_, descriptor| descriptor.strong_count() > 0);
+    }
+
+    pub fn approx_resident_bytes(&self) -> usize {
+        let summaries = self.summaries.read().unwrap();
+        let mut total = summaries.capacity()
+            * (std::mem::size_of::<SummaryDescriptorId>()
+                + std::mem::size_of::<Weak<SummaryDescriptor>>());
+        for descriptor in summaries.values().filter_map(Weak::upgrade) {
+            total += std::mem::size_of::<SummaryDescriptor>() + descriptor.id.0.len();
+            if let SummaryOperator::ExactAgg {
+                parameters_canonical,
+                ..
+            } = &descriptor.operator
+            {
+                total += parameters_canonical.len();
+            }
+        }
+        drop(summaries);
+
+        let data = self.data.read().unwrap();
+        total += data.capacity()
+            * (std::mem::size_of::<DataDescriptorId>()
+                + std::mem::size_of::<Weak<DataDescriptor>>());
+        for descriptor in data.values().filter_map(Weak::upgrade) {
+            total += std::mem::size_of::<DataDescriptor>() + descriptor.id.0.len();
+            total += descriptor.metric_name.len() + descriptor.population_filter_canonical.len();
+            total += descriptor
+                .group_by_keys
+                .iter()
+                .map(|key| std::mem::size_of::<String>() + key.len())
+                .sum::<usize>();
+        }
+        total
     }
 }
 
@@ -250,5 +312,16 @@ mod tests {
         assert!(!Arc::ptr_eq(&a.summary_descriptor, &b.summary_descriptor));
         assert!(Arc::ptr_eq(&a.data_descriptor, &b.data_descriptor));
         assert_eq!((registry.summary_count(), registry.data_count()), (2, 1));
+    }
+
+    #[test]
+    fn registry_does_not_retain_descriptors_after_bindings_are_dropped() {
+        let registry = SummaryDescriptorRegistry::default();
+        let binding = registry.bind(metadata(1, "cpu", "", AggregationType::Sum, 7));
+        assert_eq!((registry.summary_count(), registry.data_count()), (1, 1));
+
+        drop(binding);
+        registry.prune();
+        assert_eq!((registry.summary_count(), registry.data_count()), (0, 0));
     }
 }
