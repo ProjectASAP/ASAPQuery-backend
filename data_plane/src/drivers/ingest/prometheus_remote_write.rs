@@ -788,6 +788,7 @@ mod tests {
                 materializations: streaming.aggregation_configs.values().cloned().collect(),
             },
             transmission_plan: TransmissionPlan {
+                summary_catalog: None,
                 envelope,
                 frame_identity: FrameIdentityContract {
                     identity_version: 1,

@@ -2537,6 +2537,7 @@ mod tests {
                     materializations: Vec::new(),
                 },
                 transmission_plan: TransmissionPlan {
+                    summary_catalog: None,
                     envelope,
                     frame_identity: FrameIdentityContract {
                         identity_version: 1,

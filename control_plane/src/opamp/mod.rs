@@ -1004,6 +1004,7 @@ mod tests {
         plan_id: u64,
     ) -> crate::physical::compiler::CollectorPlan {
         crate::physical::compiler::CollectorPlan {
+            summary_catalog: None,
             collector_id: collector_id.into(),
             envelope: crate::physical::compiler::PlanEnvelope {
                 plan_id,

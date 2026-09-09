@@ -13,6 +13,16 @@ use serde::{Deserialize, Serialize};
 
 pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 1;
 
+/// Identifies one immutable catalog snapshot without duplicating descriptors.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryCatalogReference {
+    pub schema_version: u32,
+    pub plan_id: u64,
+    pub plan_version: u64,
+    pub snapshot_sha256: String,
+}
+
 /// Stable materialization identity binds operator and population descriptors.
 /// Concrete intervals, groups and completeness belong to runtime instances.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +56,20 @@ pub enum SummaryCatalogError {
 }
 
 impl SummaryCatalog {
+    pub fn reference(&self) -> Result<SummaryCatalogReference, SummaryCatalogError> {
+        use sha2::{Digest, Sha256};
+        self.validate()?;
+        // BTreeMap tables and typed descriptor fields serialize deterministically.
+        let bytes = serde_json::to_vec(self)
+            .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
+        Ok(SummaryCatalogReference {
+            schema_version: self.schema_version,
+            plan_id: self.plan_id,
+            plan_version: self.plan_version,
+            snapshot_sha256: format!("{:x}", Sha256::digest(bytes)),
+        })
+    }
+
     pub fn from_materializations(
         plan_id: u64,
         plan_version: u64,
@@ -174,6 +198,18 @@ mod tests {
             None,
             None,
         )
+    }
+
+    // Content changes invalidate references even when plan/version are reused.
+    #[test]
+    fn snapshot_reference_is_deterministic_and_content_sensitive() {
+        let a = config("requests", "", 60);
+        let b = config("errors", "", 60);
+        let left = SummaryCatalog::from_materializations(1, 2, &[a.clone(), b.clone()]).unwrap();
+        let reordered = SummaryCatalog::from_materializations(1, 2, &[b, a.clone()]).unwrap();
+        assert_eq!(left.reference().unwrap(), reordered.reference().unwrap());
+        let changed = SummaryCatalog::from_materializations(1, 2, &[a]).unwrap();
+        assert_ne!(left.reference().unwrap(), changed.reference().unwrap());
     }
 
     // Panes share definitions but retain distinct physical materialization IDs.
