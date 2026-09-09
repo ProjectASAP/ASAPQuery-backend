@@ -4305,6 +4305,26 @@ mod tests {
     }
 
     #[test]
+    fn publication_is_catalog_authoritative_and_round_trips() {
+        let mut bundle = PhysicalCompiler.compile(request("publication", "quantile_over_time(0.99, m[1m])"), environment(10_000)).unwrap();
+        // Compatibility bytes cannot silently determine publication identity.
+        bundle.backend_plan.plan_id += 1;
+        let publication = bundle.publication().unwrap();
+        let json = serde_json::to_value(&publication).unwrap();
+        assert!(json.get("backend_plan").is_none());
+        let mut decoded: super::super::publication::PhysicalPlanPublication = serde_json::from_value(json).unwrap();
+        decoded.validate().unwrap();
+        decoded.collector_plans.clear();
+        assert!(decoded.validate().is_err());
+        let mut decoded = publication.clone();
+        decoded.summary_catalog.plan_version += 1;
+        assert!(decoded.validate().is_err());
+        let mut decoded = publication;
+        decoded.collector_plans.push(decoded.collector_plans[0].clone());
+        assert!(decoded.validate().is_err());
+    }
+
+    #[test]
     fn compiles_one_decision_into_matching_collector_and_backend_views() {
         let bundle = PhysicalCompiler
             .compile(

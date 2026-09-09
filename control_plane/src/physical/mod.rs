@@ -43,3 +43,5 @@ pub mod workload_planner;
 // former `algebra` module relied on.
 pub use allocator::SketchAllocator;
 pub use plan::{CostEstimate, ExecutionMode, PipelineStage, PlanNode, PlanSummary};
+
+pub mod publication;
