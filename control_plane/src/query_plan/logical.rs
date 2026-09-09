@@ -671,7 +671,8 @@ mod hybrid_tests {
                     Ok(MaterializationBinding {
                         materialization: asap_types::PolicyFingerprint(
                             if spatial_filter.is_empty() { 7 } else { 8 },
-                        ),
+                        )
+                        .into(),
                         metric: "m".into(),
                         sid_grouping: vec![],
                         output_grouping: PhysicalGrouping::PerEntity,

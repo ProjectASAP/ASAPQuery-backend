@@ -485,7 +485,7 @@ mod tests {
                     control_plane::query_plan::QueryNodeId(1),
                     control_plane::query_plan::QueryPlanNode::ReadMaterialization {
                         binding: control_plane::query_plan::MaterializationBinding {
-                            materialization: policy,
+                            materialization: policy.into(),
                             metric: "bytes".into(),
                             sid_grouping: vec![],
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,

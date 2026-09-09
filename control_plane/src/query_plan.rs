@@ -15,7 +15,7 @@ use planner_types::pre_asap::Reduction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use asap_types::PolicyFingerprint;
+use asap_types::{sds::MaterializationId, PolicyFingerprint};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +39,53 @@ impl QueryPlan {
         self.entries
             .get(&identity)
             .ok_or(QueryPlanError::QueryNotPlanned(identity))
+    }
+
+    /// Validate semantic bindings against the authoritative snapshot before use.
+    pub fn validate_against_catalog(
+        &self,
+        catalog: &crate::physical::summary_catalog::SummaryCatalog,
+    ) -> Result<(), QueryPlanError> {
+        catalog
+            .validate()
+            .map_err(|error| QueryPlanError::Invalid(error.to_string()))?;
+        if self.plan_id != catalog.plan_id || self.plan_version != catalog.plan_version {
+            return Err(QueryPlanError::Invalid(
+                "QueryPlan and SummaryCatalog have different plan identity/version".into(),
+            ));
+        }
+        let available = catalog
+            .materializations
+            .keys()
+            .copied()
+            .map(Into::into)
+            .collect();
+        self.validate(&available)?;
+        for entry in self.entries.values() {
+            for binding in entry.materialization_bindings() {
+                let identity = catalog
+                    .materializations
+                    .get(&binding.materialization)
+                    .ok_or_else(|| {
+                        QueryPlanError::Invalid(
+                            "query binding references absent catalog materialization".into(),
+                        )
+                    })?;
+                let data = &catalog.data_descriptors[&identity.data_descriptor_id];
+                let grouping: BTreeSet<_> = binding.sid_grouping.iter().cloned().collect();
+                if binding.metric != data.metric_name || grouping != data.group_by_keys {
+                    return Err(QueryPlanError::Invalid(
+                        "query binding source/grouping differs from catalog data descriptor".into(),
+                    ));
+                }
+                if binding.window_ms == 0 {
+                    return Err(QueryPlanError::Invalid(
+                        "zero physical pane duration".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn validate(&self, available: &BTreeSet<PolicyFingerprint>) -> Result<(), QueryPlanError> {
@@ -196,10 +243,12 @@ impl QueryPlanEntry {
                         "zero semantic readout lookback".into(),
                     ));
                 }
-                if !available.contains(&binding.materialization) {
+                if !available.contains(&binding.materialization.fingerprint()) {
                     return Err(QueryPlanError::Invalid(format!(
                         "query `{}` node {} references absent materialization {}",
-                        self.query_id, id.0, binding.materialization.0
+                        self.query_id,
+                        id.0,
+                        binding.materialization.as_u64()
                     )));
                 }
             }
@@ -265,7 +314,7 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
-    pub materialization: PolicyFingerprint,
+    pub materialization: MaterializationId,
     pub metric: String,
     /// Exact label-key layout of the stored materialization.
     pub sid_grouping: Vec<String>,
@@ -838,5 +887,120 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cycle"));
+    }
+}
+
+#[cfg(test)]
+mod catalog_binding_tests {
+    use super::*;
+    use crate::physical::summary_catalog::SummaryCatalog;
+    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+
+    fn fixture() -> (QueryPlan, SummaryCatalog) {
+        let config = PrecomputeMaterialization::new(
+            AggregationType::Sum,
+            String::new(),
+            Default::default(),
+            KeyByLabelNames::new(vec!["job".into()]),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            10,
+            10,
+            WindowKind::Tumbling,
+            String::new(),
+            "m".into(),
+            None,
+            None,
+            None,
+        );
+        let catalog = SummaryCatalog::from_materializations(7, 2, &[config.clone()]).unwrap();
+        let entry = QueryPlanEntry {
+            query_id: "q".into(),
+            canonical_promql: "sum_over_time(m[1m])".into(),
+            root: QueryNodeId(1),
+            nodes: BTreeMap::from([(
+                QueryNodeId(1),
+                QueryPlanNode::ReadMaterialization {
+                    binding: MaterializationBinding {
+                        materialization: config.policy_fingerprint().into(),
+                        metric: "m".into(),
+                        sid_grouping: vec!["job".into()],
+                        output_grouping: PhysicalGrouping::PerEntity,
+                        window_ms: 10_000,
+                        readout_lookback_ms: Some(60_000),
+                    },
+                },
+            )]),
+            instant: InstantExecution {
+                lookback_ms: 60_000,
+                full_history: false,
+                cumulative_readout: true,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        (
+            QueryPlan {
+                plan_id: 7,
+                plan_version: 2,
+                entries: BTreeMap::from([(entry.canonical_promql.clone(), entry)]),
+            },
+            catalog,
+        )
+    }
+    fn binding(plan: &mut QueryPlan) -> &mut MaterializationBinding {
+        let QueryPlanNode::ReadMaterialization { binding } = plan
+            .entries
+            .values_mut()
+            .next()
+            .unwrap()
+            .nodes
+            .values_mut()
+            .next()
+            .unwrap()
+        else {
+            panic!("fixture")
+        };
+        binding
+    }
+
+    // One pane ID is compatible with a longer semantic readout window.
+    #[test]
+    fn catalog_binding_round_trip_preserves_pane_and_readout_windows() {
+        let (plan, catalog) = fixture();
+        let mut decoded: QueryPlan =
+            serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+        decoded.validate_against_catalog(&catalog).unwrap();
+        assert_eq!(binding(&mut decoded).window_ms, 10_000);
+        assert_eq!(binding(&mut decoded).readout_lookback_ms, Some(60_000));
+    }
+
+    // A valid fingerprint alone cannot attest a different source or grouping.
+    #[test]
+    fn catalog_binding_rejects_source_grouping_and_identity_drift() {
+        let (plan, catalog) = fixture();
+        let mut broken = plan.clone();
+        binding(&mut broken).metric = "other".into();
+        assert!(broken.validate_against_catalog(&catalog).is_err());
+        let mut broken = plan.clone();
+        binding(&mut broken).sid_grouping.clear();
+        assert!(broken.validate_against_catalog(&catalog).is_err());
+        let mut broken = plan.clone();
+        binding(&mut broken).materialization = PolicyFingerprint(123).into();
+        assert!(broken.validate_against_catalog(&catalog).is_err());
+        let mut broken = plan.clone();
+        broken.plan_version += 1;
+        assert!(broken.validate_against_catalog(&catalog).is_err());
+        let mut broken = plan;
+        binding(&mut broken).window_ms = 0;
+        assert!(broken.validate_against_catalog(&catalog).is_err());
+    }
+
+    // Catalog descriptor corruption must fail even if the materialization exists.
+    #[test]
+    fn catalog_binding_rejects_broken_descriptor_reference() {
+        let (plan, mut catalog) = fixture();
+        catalog.summary_descriptors.clear();
+        assert!(plan.validate_against_catalog(&catalog).is_err());
     }
 }

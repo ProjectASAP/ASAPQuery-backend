@@ -790,7 +790,7 @@ mod tests {
             control_plane::query_plan::FallbackPolicy::ExactBackend,
             |_node, _family| {
                 Ok(control_plane::query_plan::MaterializationBinding {
-                    materialization: asap_types::PolicyFingerprint(123),
+                    materialization: asap_types::PolicyFingerprint(123).into(),
                     metric: "unique_users".into(),
                     sid_grouping: vec!["service".into()],
                     output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
@@ -959,7 +959,7 @@ mod tests {
                     control_plane::query_plan::QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: control_plane::query_plan::MaterializationBinding {
-                            materialization: policy,
+                            materialization: policy.into(),
                             metric: "requests_total".into(),
                             sid_grouping: vec![],
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
@@ -1053,7 +1053,7 @@ mod tests {
                     control_plane::query_plan::QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: control_plane::query_plan::MaterializationBinding {
-                            materialization: policy,
+                            materialization: policy.into(),
                             metric: "requests_total".into(),
                             sid_grouping: vec![],
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
