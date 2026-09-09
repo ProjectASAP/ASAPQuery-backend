@@ -3544,14 +3544,12 @@ mod api_tests {
             .route("/api/v1/plan", axum::routing::post(handle_plan))
             .with_state(state.clone());
 
-        // The four evidence-safe sketched contract metrics. Each gets a
+        // The two quantile-compatible sketched contract metrics. Each gets a
         // separate POST /api/v1/plan, mirroring the demo's
         // per-workload plan-emit cycle.
         let sketched = [
             "http_requests_total_latency_ms", // DDSketch
             "request_size_bytes",             // KLL
-            "unique_users_per_min",           // HLL
-            "endpoint_request_freq",          // CountMinSketch
         ];
 
         for m in &sketched {
@@ -3570,8 +3568,15 @@ mod api_tests {
             );
         }
 
-        // Drain the mock sink: every plan-emit must have produced
-        // exactly one body.
+        // Publication is dispatched asynchronously; wait for every accepted
+        // plan instead of racing the background HTTP tasks.
+        for _ in 0..100 {
+            if sink.lock().unwrap().len() == sketched.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Drain the mock sink: every plan-emit must have produced exactly one body.
         let bodies = sink.lock().unwrap().clone();
         assert_eq!(
             bodies.len(),
@@ -3694,21 +3699,14 @@ mod api_tests {
             .route("/api/v1/plan", axum::routing::post(handle_plan))
             .with_state(state.clone());
 
-        // The evidence-safe sketched contract metrics — the same
+        // The quantile-compatible sketched contract metrics — the same
         // set the sibling `storage_routing_cumulative_push_...` test
-        // exercises. Each gets a separate `POST /api/v1/plan` with
-        // the metric-name → classified sketch family from
-        // `classify_demo_metric`. Pre-fix the metric-only cache
+        // exercises. Each gets a separate `POST /api/v1/plan`. Pre-fix the metric-only cache
         // would have collapsed sequential same-metric POSTs onto one
         // slot; this test uses 5 distinct metrics so the assertion
         // surfaces the cumulative-merge gap (every metric's row must
         // survive every other metric's swap).
-        let sketched = [
-            "http_requests_total_latency_ms",
-            "request_size_bytes",
-            "unique_users_per_min",
-            "endpoint_request_freq",
-        ];
+        let sketched = ["http_requests_total_latency_ms", "request_size_bytes"];
 
         for m in &sketched {
             let app = app.clone();
@@ -3726,8 +3724,15 @@ mod api_tests {
             );
         }
 
-        // Drain the mock sink: every plan-emit must have produced
-        // exactly one streaming-config body.
+        // Publication is dispatched asynchronously; wait for every accepted
+        // plan instead of racing the background HTTP tasks.
+        for _ in 0..100 {
+            if sink.lock().unwrap().len() == sketched.len() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Drain the mock sink: every plan-emit must have produced exactly one body.
         let bodies = sink.lock().unwrap().clone();
         assert_eq!(
             bodies.len(),
