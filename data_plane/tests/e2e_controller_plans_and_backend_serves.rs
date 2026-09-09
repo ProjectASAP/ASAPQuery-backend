@@ -247,31 +247,6 @@ async fn get_streaming_config(client: &reqwest::Client, port: u16) -> JsonValue 
     resp.json().await.expect("parse GET response as JSON")
 }
 
-/// POST an encoded `BackendPlan` to `/api/v1/backend-plan` on the
-/// in-process backend, using the control plane's real
-/// `BackendClient::post_backend_plan_typed` — the exact code path a live
-/// control plane process uses, not a hand-rolled request.
-async fn post_backend_plan(port: u16, plan: &control_plane::backend_plan::BackendPlan) {
-    let endpoint = format!("http://127.0.0.1:{port}/api/v1/streaming-config");
-    let client = control_plane::backend_client::BackendClient::new(endpoint);
-    client
-        .post_backend_plan_typed(plan.encode_to_vec())
-        .await
-        .expect("POST /api/v1/backend-plan via BackendClient must succeed");
-}
-
-/// GET `/api/v1/backend-plan` and return the active-plan snapshot as a
-/// `serde_json::Value`. Verifies the active state after a POST.
-async fn get_backend_plan(client: &reqwest::Client, port: u16) -> JsonValue {
-    let resp = client
-        .get(format!("http://127.0.0.1:{port}/api/v1/backend-plan"))
-        .send()
-        .await
-        .expect("GET /api/v1/backend-plan");
-    assert!(resp.status().is_success(), "GET returned {}", resp.status());
-    resp.json().await.expect("parse GET response as JSON")
-}
-
 /// Suppress the `WorkloadCharacteristics` unused warning — kept around
 /// in case future tests need to pass per-workload resource caps.
 #[allow(dead_code)]
@@ -290,7 +265,6 @@ fn _wc_anchor() -> WorkloadCharacteristics {
 struct FullStack {
     backend_port: u16,
     otlp_http_port: u16,
-    hot_reload_backend_plan: data_plane::storage_engines::types::HotReloadBackendPlan,
 }
 
 async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack {
@@ -355,9 +329,6 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
     });
 
     // HTTP query server sharing the same SketchStore + hot-reload handle.
-    let hot_reload_backend_plan = data_plane::storage_engines::types::HotReloadBackendPlan::new(
-        control_plane::backend_plan::BackendPlan::default(),
-    );
     let adapter_config =
         AdapterConfig::prometheus_promql("http://127.0.0.1:9999".to_string(), false);
     let http_config = HttpServerConfig {
@@ -376,8 +347,7 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
             .with_sketch_index(sketch_index.clone()),
     );
     let server = HttpServer::new(http_config, query_engine, sketch_index)
-        .with_hot_reload_config(hot_reload.clone())
-        .with_hot_reload_backend_plan(hot_reload_backend_plan.clone());
+        .with_hot_reload_config(hot_reload.clone());
     let backend_port = server
         .start_test_server()
         .await
@@ -389,7 +359,6 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
     FullStack {
         backend_port,
         otlp_http_port,
-        hot_reload_backend_plan,
     }
 }
 
@@ -1076,136 +1045,6 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
          did not succeed via the modern execute() trait-dispatch path. \
          Response:\n{}",
         serde_json::to_string_pretty(&response).unwrap_or_default()
-    );
-}
-
-// ── Test — BackendPlan wire format: real push, real install, real serve ────
-//
-// Same fixture as `controller_plan_to_query_full_roundtrip_ddsketch`, but
-// this time the controller ALSO builds a real `BackendPlan` (via
-// `control_plane::backend_plan::from_stage_config`, the exact function a
-// live control plane process calls) and pushes it through
-// `control_plane::backend_client::BackendClient::post_backend_plan_typed`
-// — the exact HTTP client code a live control plane process uses, not a
-// hand-rolled request. This proves the whole wire is real end to end:
-// control-plane-side construction → protobuf encode → HTTP POST →
-// backend-side decode → `ArcSwap` install → a live PromQL query answered
-// correctly with the plan installed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn controller_really_pushes_backend_plan_and_query_really_serves() {
-    let stack = start_full_stack(19_597, 19_598).await;
-    let client = reqwest::Client::new();
-
-    // ── 1. Controller plans the workload, POSTs the legacy streaming-config
-    //        (still required: it's what drives sid registration on ingest)
-    //        AND a real BackendPlan built from the SAME BackendStageConfig. ──
-    let workload = build_workload(
-        "http_latency_ms",
-        vec![AggType::Quantile],
-        0.01,
-        Duration::from_secs(1),
-        vec!["service".to_string()],
-        vec![0.99],
-    );
-    let backend_cfg = plan_backend_stage_config(&workload);
-    let streaming_config_json =
-        control_plane::emit::emit_backend_streaming_config_json(&backend_cfg, &[])
-            .expect("emit_backend_streaming_config_json must succeed");
-    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_millis() as u64;
-    let plan = control_plane::backend_plan::from_stage_config(&backend_cfg, &[], 1, now_ms)
-        .expect("backend_plan::from_stage_config must succeed");
-    assert_eq!(
-        plan.materializations.len(),
-        1,
-        "the DDSketch quantile workload must produce exactly one materialization"
-    );
-    post_backend_plan(stack.backend_port, &plan).await;
-
-    // ── 2. Confirm the backend really installed it (not just accepted the
-    //        POST) — read it back via GET, the same handle
-    //        `post_asap_planner.rs`'s serving-time lookup reads from. ──
-    let installed = get_backend_plan(&client, stack.backend_port).await;
-    assert_eq!(installed["status"], "success");
-    assert_eq!(installed["plan_id"], 1);
-    assert_eq!(
-        installed["materialization_count"],
-        1,
-        "GET /api/v1/backend-plan must reflect the just-installed plan, not a stale/empty one:\n{}",
-        serde_json::to_string_pretty(&installed).unwrap_or_default()
-    );
-    assert_eq!(
-        stack.hot_reload_backend_plan.snapshot().plan_id,
-        1,
-        "the ASAPQueryEngine-side handle (shared with the HTTP server, per main.rs's wiring) \
-         must observe the same installed plan the GET endpoint just reported"
-    );
-
-    // ── 3. Ingest a real DDSketch via OTLP (same fixture as Test 3). ──
-    let alpha = 0.01;
-    let store_counts = vec![5u64, 10, 15, 20];
-    let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
-    let sketch_bytes = dd_state.encode_to_vec();
-
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_nanos() as u64;
-    let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
-    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
-
-    let req = build_dd_sketch_export(
-        "http_latency_ms",
-        &[("service", "e2e-test")],
-        sketch_t_ns,
-        sketch_bytes,
-        alpha,
-    );
-    post_otlp_http(&client, stack.otlp_http_port, req).await;
-
-    let watermark_state = build_dd_sketch_state(alpha, Vec::new(), 0);
-    let watermark_req = build_dd_sketch_export(
-        "http_latency_ms",
-        &[("service", "e2e-test")],
-        watermark_t_ns,
-        watermark_state.encode_to_vec(),
-        alpha,
-    );
-    post_otlp_http(&client, stack.otlp_http_port, watermark_req).await;
-
-    tokio::time::sleep(Duration::from_millis(800)).await;
-
-    // ── 4. Query via PromQL — this must actually succeed AND return a
-    //        real, sane numeric quantile value, with the BackendPlan
-    //        installed (not just "some code path returned success"). ──
-    let query_url = format!("http://127.0.0.1:{}/api/v1/query", stack.backend_port);
-    let response: JsonValue = client
-        .get(&query_url)
-        .query(&[("query", "quantile_over_time(0.99, http_latency_ms[10s])")])
-        .send()
-        .await
-        .expect("PromQL query failed to send")
-        .json()
-        .await
-        .expect("PromQL response was not JSON");
-
-    assert_eq!(
-        response["status"].as_str().unwrap_or("(missing)"),
-        "success",
-        "query must succeed with a real BackendPlan installed. Response:\n{}",
-        serde_json::to_string_pretty(&response).unwrap_or_default()
-    );
-    let value = response["data"]["result"]
-        .as_array()
-        .and_then(|r| extract_first_scalar(&JsonValue::Array(r.clone())))
-        .expect("expected a scalar quantile result");
-    assert!(
-        value.is_finite() && value > 0.0,
-        "expected a real, finite p99 value from the DDSketch fixture, got {value}"
     );
 }
 

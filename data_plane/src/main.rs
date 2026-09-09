@@ -662,14 +662,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    // BackendPlan wire format (design-backend-plan-wire-format.md):
-    // install an empty hot-reload handle so `GET/POST
-    // /api/v1/backend-plan` don't 503 before the control plane's first
-    // push lands — same "install empty, let the first push fill it in"
-    // pattern as `bootstrap_routing` below. Shared with both the query
-    // engine (serving-time cutover, Phase 4) and the HTTP server (the
-    // push target) so a POST is observable by the next query, same
-    // sharing contract as `hot_reload_config`.
+    // Bootstrap projections share one immutable physical-plan envelope.
     let initial_precompute_plan = control_plane::physical::compiler::PrecomputePlan {
         summary_catalog: None,
         materialization_contracts: Default::default(),
@@ -728,10 +721,6 @@ async fn main() -> Result<()> {
         data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(initial_active_plan);
     let hot_reload_config =
         data_plane::storage_engines::types::HotReloadStreamingConfig::from_active(
-            active_physical_plan.clone(),
-        );
-    let hot_reload_backend_plan =
-        data_plane::storage_engines::types::HotReloadBackendPlan::from_active(
             active_physical_plan.clone(),
         );
 
@@ -1041,9 +1030,7 @@ async fn main() -> Result<()> {
         // Legacy partial-document endpoints remain available to distributed
         // deployments. The compatibility profile deliberately exposes only
         // the atomic PhysicalPlan stage/activate lifecycle.
-        server = server
-            .with_hot_reload_config(hot_reload_config.clone())
-            .with_hot_reload_backend_plan(hot_reload_backend_plan.clone());
+        server = server.with_hot_reload_config(hot_reload_config.clone());
     }
 
     if args.enable_remote_write || args.profile == RuntimeProfile::Asapquery {
