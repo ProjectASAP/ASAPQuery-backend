@@ -28,6 +28,9 @@ use dashmap::DashMap;
 
 use self::epoch_columnar::{LabelValuesId, SidStoreData, TimestampRange};
 use crate::storage_engines::sketch_db::lifecycle::AggStatus;
+use crate::storage_engines::sketch_db::sds::{
+    DataDescriptor, SdsBinding, SummaryDescriptor, SummaryDescriptorRegistry,
+};
 
 // Phase-5 reorg: payload taxonomy + sid hashing + accuracy moved to
 // `sketch_db::data`. Re-exported here so existing call sites
@@ -530,7 +533,9 @@ pub struct SketchStore {
     /// sid → metadata. May contain ghost sids (registered identities
     /// whose state was merged away by an upstream gateway before
     /// reaching this backend).
-    instances: RwLock<HashMap<u64, SketchInstanceMetadata>>,
+    instances: RwLock<HashMap<u64, SdsBinding>>,
+    /// Interns immutable SDS descriptors across all SIDs and panes.
+    descriptors: SummaryDescriptorRegistry,
     /// sid → item_label (the data-point attribute NAME, e.g. "service"
     /// or "endpoint") for CountMin/CountSketch sids registered in
     /// per-item mode. Its presence is what makes a CMS sid answerable by
@@ -681,11 +686,12 @@ impl SketchStore {
         let sid = meta.sid;
         let policy_fp = meta.policy_fp;
         let metric_name = meta.metric_name.clone();
+        let instance = self.descriptors.bind(meta);
         // Fixed lock order: instances → policy_to_sids → metric_to_sids.
         let mut instances = self.instances.write().unwrap();
         let mut policy_idx = self.policy_to_sids.write().unwrap();
         let mut metric_idx = self.metric_to_sids.write().unwrap();
-        instances.insert(sid, meta);
+        instances.insert(sid, instance);
         if !policy_fp.is_unset() {
             policy_idx.entry(policy_fp).or_default().insert(sid);
         }
@@ -741,8 +747,32 @@ impl SketchStore {
 
     /// Look up the metadata for a sid (cloned because callers usually
     /// release the index lock before working with it).
-    pub fn instance(&self, sid: u64) -> Option<SketchInstanceMetadata> {
-        self.instances.read().unwrap().get(&sid).cloned()
+    pub fn instance(&self, sid: u64) -> Option<Arc<SketchInstanceMetadata>> {
+        self.instances
+            .read()
+            .unwrap()
+            .get(&sid)
+            .map(|instance| Arc::clone(&instance.metadata))
+    }
+
+    /// Shared SDS descriptors bound to a materialized SID.
+    pub fn descriptors_for_sid(
+        &self,
+        sid: u64,
+    ) -> Option<(Arc<SummaryDescriptor>, Arc<DataDescriptor>)> {
+        let instances = self.instances.read().ok()?;
+        let instance = instances.get(&sid)?;
+        Some((
+            Arc::clone(&instance.summary_descriptor),
+            Arc::clone(&instance.data_descriptor),
+        ))
+    }
+
+    pub fn descriptor_counts(&self) -> (usize, usize) {
+        (
+            self.descriptors.summary_count(),
+            self.descriptors.data_count(),
+        )
     }
 
     /// Borrow-style metadata accessor (P2-2). Runs `f(&meta)` while
@@ -764,7 +794,7 @@ impl SketchStore {
         f: F,
     ) -> Option<R> {
         let g = self.instances.read().ok()?;
-        g.get(&sid).map(f)
+        g.get(&sid).map(|instance| f(&instance.metadata))
     }
 
     /// Append a window's sketch state under `sid`. Caller is responsible
@@ -1889,14 +1919,15 @@ impl SketchStore {
         total
     }
 
-    /// Clone every registered `SketchInstanceMetadata` into a snapshot
-    /// vec. Used by read-side primitives that need to scan the whole
-    /// catalog without holding the registry lock across user code
-    /// (e.g. `query::timeline::timeline_for_metric`). O(N) clone +
-    /// O(N) memory; cheap at production catalog sizes.
-    pub fn snapshot_instances(&self) -> Vec<SketchInstanceMetadata> {
+    /// Snapshot shared metadata handles without holding the registry lock
+    /// across user code. This is O(N) pointer cloning and does not copy
+    /// descriptor strings, label sets, or aggregation configuration.
+    pub fn snapshot_instances(&self) -> Vec<Arc<SketchInstanceMetadata>> {
         match self.instances.read() {
-            Ok(map) => map.values().cloned().collect(),
+            Ok(map) => map
+                .values()
+                .map(|instance| Arc::clone(&instance.metadata))
+                .collect(),
             Err(_) => Vec::new(),
         }
     }
@@ -1939,14 +1970,10 @@ impl SketchStore {
         true
     }
 
-    /// Visit every registered instance under a single read lock,
+    /// Visit every registered binding under a single read lock,
     /// invoking `f(sid, &meta)` for each. Lets read-side scans that
     /// only need to *inspect* metadata (signature derivation,
-    /// status filtering) avoid the O(N) deep clone that
-    /// [`Self::snapshot_instances`] performs — each
-    /// `SketchInstanceMetadata` carries a `String` + `BTreeSet<String>`
-    /// + `AggKind` (more strings), so the clone is allocation-heavy at
-    /// production catalog sizes.
+    /// status filtering) avoid even the O(N) `Arc` snapshot allocation.
     ///
     /// The closure runs while the read lock is held, so it must not
     /// call back into the store (which would deadlock) and should stay
@@ -1964,14 +1991,14 @@ impl SketchStore {
     /// Iterate (clones) all instance metadata matching `status`.
     /// Used by the eviction service to enumerate `Expired` sids
     /// without holding a long read lock.
-    pub fn list_by_status(&self, status: AggStatus) -> Vec<SketchInstanceMetadata> {
+    pub fn list_by_status(&self, status: AggStatus) -> Vec<Arc<SketchInstanceMetadata>> {
         let map = match self.instances.read() {
             Ok(m) => m,
             Err(_) => return Vec::new(),
         };
         map.values()
             .filter(|s| s.status() == status)
-            .cloned()
+            .map(|instance| Arc::clone(&instance.metadata))
             .collect()
     }
 
@@ -1979,13 +2006,18 @@ impl SketchStore {
     /// `retention` from now. Idempotent — re-retiring a Retired or
     /// Expired sid is a no-op and returns the unchanged metadata.
     /// Returns `None` if the sid is unknown.
-    pub fn force_retire(&self, sid: u64, retention: Duration) -> Option<SketchInstanceMetadata> {
+    pub fn force_retire(
+        &self,
+        sid: u64,
+        retention: Duration,
+    ) -> Option<Arc<SketchInstanceMetadata>> {
         let mut map = self.instances.write().ok()?;
-        let meta = map.get_mut(&sid)?;
+        let instance = map.get_mut(&sid)?;
+        let meta = Arc::make_mut(&mut instance.metadata);
         if matches!(meta.status(), AggStatus::Active) {
             meta.retire(retention);
         }
-        Some(meta.clone())
+        Some(Arc::clone(&instance.metadata))
     }
 
     /// Force `sid` into `Expired` status immediately by setting both
@@ -1993,13 +2025,14 @@ impl SketchStore {
     /// state, or `None` if the sid is unknown. Intended for
     /// operator / debug-endpoint use so eviction can be observed in
     /// e2e tests without waiting out retirement retention.
-    pub fn force_expire(&self, sid: u64) -> Option<SketchInstanceMetadata> {
+    pub fn force_expire(&self, sid: u64) -> Option<Arc<SketchInstanceMetadata>> {
         let mut map = self.instances.write().ok()?;
-        let meta = map.get_mut(&sid)?;
+        let instance = map.get_mut(&sid)?;
+        let meta = Arc::make_mut(&mut instance.metadata);
         let now = now_ms();
         meta.retired_at_ms = Some(now);
         meta.expires_at_ms = Some(now);
-        Some(meta.clone())
+        Some(Arc::clone(&instance.metadata))
     }
 
     /// Drop a sid's metadata + its series state + both secondary-index
@@ -2017,7 +2050,7 @@ impl SketchStore {
     /// `series` DashMap is touched after the index guards are released
     /// (it is independently keyed and not part of the metadata-index
     /// invariant).
-    pub fn remove_instance(&self, sid: u64) -> Option<SketchInstanceMetadata> {
+    pub fn remove_instance(&self, sid: u64) -> Option<Arc<SketchInstanceMetadata>> {
         let removed = {
             // Fixed lock order: instances → policy_to_sids → metric_to_sids.
             let mut instances = self.instances.write().ok()?;
@@ -2040,7 +2073,7 @@ impl SketchStore {
                     }
                 }
             }
-            removed
+            removed.map(|instance| instance.metadata)
         };
         if removed.is_some() {
             self.series.remove(&sid);
@@ -2701,6 +2734,23 @@ mod tests {
             expires_at_ms: None,
             policy_fp,
         }
+    }
+
+    #[test]
+    fn store_lookups_and_equivalent_sids_share_sds_allocations() {
+        let store = SketchStore::new();
+        store.register(meta(1));
+        store.register(meta(2));
+
+        let first_lookup = store.instance(1).unwrap();
+        let second_lookup = store.instance(1).unwrap();
+        assert!(Arc::ptr_eq(&first_lookup, &second_lookup));
+
+        let (summary_a, data_a) = store.descriptors_for_sid(1).unwrap();
+        let (summary_b, data_b) = store.descriptors_for_sid(2).unwrap();
+        assert!(Arc::ptr_eq(&summary_a, &summary_b));
+        assert!(Arc::ptr_eq(&data_a, &data_b));
+        assert_eq!(store.descriptor_counts(), (1, 1));
     }
 
     fn sample(b: u8) -> SketchSampleState {

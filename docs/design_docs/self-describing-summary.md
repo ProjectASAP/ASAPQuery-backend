@@ -74,6 +74,15 @@ The backend maps this model onto its execution components as follows:
 | Query engine | Resolve plan references, select complete instances, merge/read out their state and combine exact Prometheus subquery results |
 | `rollups` | Hold typed, rebuildable indexes derived from canonical instances |
 
+The in-memory representation is normalized. `SummaryDescriptorRegistry`
+content-interns Summary and Data Descriptors. A SID owns an `SdsBinding` with
+shared `Arc` references to both descriptors. Pane rows store the SID foreign
+key, `[start, end)`, interned group values and state; together these fields form
+the Summary Instance. This avoids repeating descriptors in every pane and lets
+catalog snapshots and query lookups clone pointers rather than strings, label
+sets and operator configuration. `SketchInstanceMetadata` remains the temporary
+registration and persistence compatibility DTO while older sidecars are read.
+
 An ingest record is never an SDS instance. Raw samples can be transient inputs to
 the precompute engine, but the backend does not retain them as a second exact
 query store. Exact residual subtrees run in Prometheus.

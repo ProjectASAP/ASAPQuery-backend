@@ -1403,7 +1403,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 _ => None,
                             };
                             if let Some(new_algorithm) = upgrade_to {
-                                let mut upgraded = existing;
+                                let mut upgraded = (*existing).clone();
                                 upgraded.capability =
                                     Some(Capability::FrequencyTopk(Some(new_algorithm.clone())));
                                 upgraded.agg_kind =
