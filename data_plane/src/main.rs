@@ -701,6 +701,7 @@ async fn main() -> Result<()> {
             .collect(),
     };
     let initial_transmission_plan = control_plane::physical::compiler::TransmissionPlan {
+        summary_catalog: None,
         envelope: initial_precompute_plan.envelope.clone(),
         frame_identity: control_plane::physical::compiler::FrameIdentityContract {
             identity_version: 1,

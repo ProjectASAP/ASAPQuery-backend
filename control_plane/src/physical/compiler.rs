@@ -257,6 +257,9 @@ pub struct CollectorLifecycle {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollectorPlan {
+    /// Absent only in legacy artifacts; catalog-aware validation requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_catalog: Option<super::summary_catalog::SummaryCatalogReference>,
     pub collector_id: String,
     pub envelope: PlanEnvelope,
     pub materializations: Vec<CollectorMaterialization>,
@@ -904,6 +907,9 @@ pub struct RuntimeAdaptationEvidence {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransmissionPlan {
+    /// Absent only in legacy artifacts; catalog-aware validation requires it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary_catalog: Option<super::summary_catalog::SummaryCatalogReference>,
     pub envelope: PlanEnvelope,
     pub frame_identity: FrameIdentityContract,
     pub rules: Vec<TransmissionRule>,
@@ -943,6 +949,8 @@ pub struct SummaryFrameIdentity {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransmissionPlanError {
+    #[error("summary catalog mismatch: {0}")]
+    Catalog(String),
     #[error("TransmissionPlan envelope differs from PrecomputePlan")]
     EnvelopeMismatch,
     #[error("transmission rules do not exactly match precompute producer bindings")]
@@ -966,7 +974,64 @@ pub enum TransmissionPlanError {
     },
 }
 
+fn validate_catalog_projection(
+    reference: Option<&super::summary_catalog::SummaryCatalogReference>,
+    envelope: &PlanEnvelope,
+    materializations: impl IntoIterator<Item = asap_types::PolicyFingerprint>,
+    catalog: &super::summary_catalog::SummaryCatalog,
+) -> Result<(), TransmissionPlanError> {
+    let expected = catalog
+        .reference()
+        .map_err(|error| TransmissionPlanError::Catalog(error.to_string()))?;
+    if reference != Some(&expected)
+        || envelope.plan_id != catalog.plan_id
+        || envelope.plan_version != catalog.plan_version
+    {
+        return Err(TransmissionPlanError::Catalog(
+            "missing or different snapshot reference".into(),
+        ));
+    }
+    for id in materializations {
+        if !catalog.materializations.contains_key(&id) {
+            return Err(TransmissionPlanError::Catalog(format!(
+                "unknown materialization {}",
+                id.0
+            )));
+        }
+    }
+    Ok(())
+}
+
+impl CollectorPlan {
+    pub fn validate_against_catalog(
+        &self,
+        catalog: &super::summary_catalog::SummaryCatalog,
+    ) -> Result<(), TransmissionPlanError> {
+        validate_catalog_projection(
+            self.summary_catalog.as_ref(),
+            &self.envelope,
+            self.materializations
+                .iter()
+                .map(|m| m.materialization)
+                .chain(self.transmission_rules.iter().map(|r| r.materialization)),
+            catalog,
+        )
+    }
+}
+
 impl TransmissionPlan {
+    pub fn validate_against_catalog(
+        &self,
+        catalog: &super::summary_catalog::SummaryCatalog,
+    ) -> Result<(), TransmissionPlanError> {
+        validate_catalog_projection(
+            self.summary_catalog.as_ref(),
+            &self.envelope,
+            self.rules.iter().map(|r| r.materialization),
+            catalog,
+        )
+    }
+
     pub fn build(
         envelope: PlanEnvelope,
         precompute: &PrecomputePlan,
@@ -1016,7 +1081,18 @@ impl TransmissionPlan {
                 }
             })
             .collect();
+        let catalog = super::summary_catalog::SummaryCatalog::from_materializations(
+            envelope.plan_id,
+            envelope.plan_version,
+            &precompute.materializations,
+        )
+        .map_err(|error| TransmissionPlanError::Catalog(error.to_string()))?;
         let plan = Self {
+            summary_catalog: Some(
+                catalog
+                    .reference()
+                    .map_err(|error| TransmissionPlanError::Catalog(error.to_string()))?,
+            ),
             envelope,
             frame_identity: FrameIdentityContract {
                 identity_version: 1,
@@ -1031,6 +1107,15 @@ impl TransmissionPlan {
     }
 
     pub fn validate(&self, precompute: &PrecomputePlan) -> Result<(), TransmissionPlanError> {
+        if self.summary_catalog.is_some() {
+            let catalog = super::summary_catalog::SummaryCatalog::from_materializations(
+                precompute.envelope.plan_id,
+                precompute.envelope.plan_version,
+                &precompute.materializations,
+            )
+            .map_err(|error| TransmissionPlanError::Catalog(error.to_string()))?;
+            self.validate_against_catalog(&catalog)?;
+        }
         if self.envelope != precompute.envelope {
             return Err(TransmissionPlanError::EnvelopeMismatch);
         }
@@ -2270,6 +2355,7 @@ impl PhysicalCompiler {
         let collector_plans = producer_ids
             .into_iter()
             .map(|collector_id| CollectorPlan {
+                summary_catalog: transmission_plan.summary_catalog.clone(),
                 transmission_rules: transmission_plan
                     .rules
                     .iter()
@@ -2411,6 +2497,20 @@ impl PhysicalCompiler {
             query_id: "summary-catalog".into(),
             reason: error.to_string(),
         })?;
+        transmission_plan
+            .validate_against_catalog(&summary_catalog)
+            .map_err(|error| CompileError::Query {
+                query_id: "summary-catalog".into(),
+                reason: error.to_string(),
+            })?;
+        for collector in &collector_plans {
+            collector
+                .validate_against_catalog(&summary_catalog)
+                .map_err(|error| CompileError::Query {
+                    query_id: "summary-catalog".into(),
+                    reason: error.to_string(),
+                })?;
+        }
         Ok(PhysicalPlan {
             envelope,
             summary_catalog,
@@ -4015,6 +4115,61 @@ mod tests {
                 entry.nodes[&entry.root],
                 crate::query_plan::QueryPlanNode::ExactFallback { .. }
             )));
+        }
+    }
+
+    // Projections reference one immutable snapshot and reject drift or foreign state.
+    #[test]
+    fn catalog_projection_rejects_missing_stale_and_foreign_references() {
+        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let bundle = snapshot.compile().unwrap();
+        let catalog = &bundle.summary_catalog;
+        let mut transmission = bundle.transmission_plan.clone();
+        transmission.validate_against_catalog(catalog).unwrap();
+        assert_eq!(
+            transmission.summary_catalog.as_ref(),
+            Some(&catalog.reference().unwrap())
+        );
+        transmission
+            .summary_catalog
+            .as_mut()
+            .unwrap()
+            .snapshot_sha256
+            .push('0');
+        assert!(transmission.validate_against_catalog(catalog).is_err());
+        assert!(transmission.validate(&bundle.precompute_plan).is_err());
+        transmission.summary_catalog = None;
+        assert!(transmission.validate_against_catalog(catalog).is_err());
+        let mut collector = CollectorPlan {
+            summary_catalog: Some(catalog.reference().unwrap()),
+            collector_id: "collector-test".into(),
+            envelope: bundle.envelope.clone(),
+            materializations: vec![],
+            transmission_rules: vec![],
+        };
+        collector.validate_against_catalog(catalog).unwrap();
+        collector.envelope.plan_version += 1;
+        assert!(collector.validate_against_catalog(catalog).is_err());
+        assert!(validate_catalog_projection(
+            Some(&catalog.reference().unwrap()),
+            &bundle.envelope,
+            [asap_types::PolicyFingerprint(u64::MAX)],
+            catalog
+        )
+        .is_err());
+        let encoded = serde_json::to_value(&collector).unwrap();
+        assert!(encoded["summary_catalog"]
+            .get("summary_descriptors")
+            .is_none());
+        for actual in &bundle.collector_plans {
+            actual.validate_against_catalog(catalog).unwrap();
+            assert_eq!(
+                actual.summary_catalog,
+                bundle.transmission_plan.summary_catalog
+            );
         }
     }
 

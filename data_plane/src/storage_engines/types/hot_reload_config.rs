@@ -838,6 +838,7 @@ mod tests {
                 materializations: Vec::new(),
             },
             transmission_plan: control_plane::physical::compiler::TransmissionPlan {
+                summary_catalog: None,
                 envelope: control_plane::physical::compiler::PlanEnvelope {
                     plan_id,
                     plan_version,
