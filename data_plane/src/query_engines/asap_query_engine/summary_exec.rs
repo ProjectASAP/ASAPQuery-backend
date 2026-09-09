@@ -245,9 +245,9 @@ pub fn execute<E: SummaryExecutor>(
 
         SummaryExpr::SummaryJoin { .. } => Err(ExecError::NotYetSupported("SummaryJoin")),
         SummaryExpr::BinaryOp { .. } => Err(ExecError::NotYetSupported("BinaryOp")),
+        SummaryExpr::ValueOperation { .. } => Err(ExecError::NotYetSupported("ValueOperation")),
         SummaryExpr::SummarySubtract { .. } => Err(ExecError::NotYetSupported("SummarySubtract")),
         SummaryExpr::SummaryDelete { .. } => Err(ExecError::NotYetSupported("SummaryDelete")),
-        SummaryExpr::ValueOperation { .. } => Err(ExecError::NotYetSupported("ValueOperation")),
     }
 }
 

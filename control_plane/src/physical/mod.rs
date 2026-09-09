@@ -25,6 +25,7 @@ pub mod colored_dag;
 pub mod compiler;
 pub mod deployment;
 pub mod deployment_cost;
+pub mod erp;
 pub mod plan;
 pub mod plan_cache;
 pub mod planner;
