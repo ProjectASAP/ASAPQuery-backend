@@ -214,6 +214,38 @@ pub fn agg_kind_for_config(config: &asap_types::aggregation_config::AggregationC
 }
 
 impl AggKind {
+    /// Canonical summary-operator identity. Population filters belong to the
+    /// SDS Data Descriptor and are intentionally excluded here.
+    pub fn operator_canonical_string(&self) -> String {
+        match self {
+            Self::Sketch {
+                algorithm, config, ..
+            } => format!(
+                "summary:v1:sketch:{}:{}",
+                sketch_algorithm_canonical(algorithm.clone()),
+                sketch_config_canonical(config)
+            ),
+            Self::ExactAgg {
+                agg_type,
+                parameters_canonical,
+                ..
+            } => format!("summary:v1:exact:{agg_type}:{parameters_canonical}"),
+        }
+    }
+
+    pub fn spatial_filter_canonical(&self) -> &str {
+        match self {
+            Self::Sketch {
+                spatial_filter_canonical,
+                ..
+            }
+            | Self::ExactAgg {
+                spatial_filter_canonical,
+                ..
+            } => spatial_filter_canonical,
+        }
+    }
+
     /// Runtime query capability and accuracy metadata implied by this state.
     pub fn capability_and_accuracy(&self) -> (Capability, Option<AccuracyBound>) {
         match self {

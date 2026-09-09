@@ -6490,7 +6490,10 @@ async fn handle_get_schemas(
         .snapshot_instances()
         .iter()
         .filter(|m| allowed.contains(&m.status()))
-        .map(sid_instance_to_json)
+        .map(|metadata| {
+            let descriptors = state.sketch_index.descriptors_for_sid(metadata.sid);
+            sid_instance_to_json(metadata, descriptors.as_ref())
+        })
         .collect();
     entries.sort_by_key(|v| v.get("sid").and_then(|x| x.as_u64()).unwrap_or(0));
 
@@ -6517,7 +6520,13 @@ fn status_str(s: crate::storage_engines::sketch_db::AggStatus) -> &'static str {
 /// (`sid`, `group_by_keys`, `agg_kind`, `first_seen_unix_ms`).
 fn sid_instance_to_json(
     m: &crate::storage_engines::sketch_db::index::SketchInstanceMetadata,
+    descriptors: Option<&(
+        std::sync::Arc<crate::storage_engines::sketch_db::SummaryDescriptor>,
+        std::sync::Arc<crate::storage_engines::sketch_db::DataDescriptor>,
+    )>,
 ) -> serde_json::Value {
+    let summary_descriptor_id = descriptors.map(|(summary, _)| summary.id.canonical());
+    let data_descriptor_id = descriptors.map(|(_, data)| data.id.canonical());
     serde_json::json!({
         "sid": m.sid,
         "metric_name": m.metric_name,
@@ -6526,7 +6535,9 @@ fn sid_instance_to_json(
         "retired_at_ms": m.retired_at_ms,
         "expires_at_ms": m.expires_at_ms,
         "group_by_keys": m.group_by_keys.iter().collect::<Vec<_>>(),
-        "agg_kind": format!("{:?}", m.agg_kind)})
+        "agg_kind": format!("{:?}", m.agg_kind),
+        "summary_descriptor_id": summary_descriptor_id,
+        "data_descriptor_id": data_descriptor_id})
 }
 
 /// `POST /api/v1/db/schemas/:sid/retire` — manually transition an
@@ -6544,9 +6555,10 @@ async fn handle_post_schema_retire(
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     ) {
         Some(meta) => {
+            let descriptors = state.sketch_index.descriptors_for_sid(sid);
             let body = serde_json::json!({
                 "status": "success",
-                "schema": sid_instance_to_json(&meta)});
+                "schema": sid_instance_to_json(&meta, descriptors.as_ref())});
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         None => {
@@ -6569,9 +6581,10 @@ async fn handle_post_schema_expire(
     use axum::response::IntoResponse;
     match state.sketch_index.force_expire(sid) {
         Some(meta) => {
+            let descriptors = state.sketch_index.descriptors_for_sid(sid);
             let body = serde_json::json!({
                 "status": "success",
-                "schema": sid_instance_to_json(&meta)});
+                "schema": sid_instance_to_json(&meta, descriptors.as_ref())});
             (StatusCode::OK, axum::Json(body)).into_response()
         }
         None => {

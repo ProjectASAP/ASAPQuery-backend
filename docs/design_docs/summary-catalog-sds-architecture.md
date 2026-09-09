@@ -1,4 +1,4 @@
-# Self-Describing Summary (SDS)
+# Summary Catalog and Self-Describing Summary Architecture
 
 This design defines three logical layers for summary producers and consumers.
 
@@ -14,10 +14,11 @@ copying or redefining either descriptor.
 
 ## Proposed ownership
 
-The descriptor vocabulary belongs in shared semantic contracts, suitable for
-Planner's shared types. Planner reasons about operators, fidelity, source and
-population semantics. The backend binds those descriptions to actual series,
-filters and grouping, and owns materialized instance state and its lifecycle.
+The descriptor vocabulary is a shared contract in `asap_types`. The control
+plane owns the authoritative `SummaryCatalog`; Collector and backend receive the
+same immutable catalog snapshot. Planner reasons about operators, fidelity,
+source and population semantics, while runtime components bind catalog identities
+to producers and stored instances.
 
 | Layer | Responsibility |
 | --- | --- |
@@ -32,10 +33,13 @@ using them. The current backend fields are an incremental implementation of this
 model. They must converge on the identities and invariants below rather than add
 operator-specific stores beside `SketchStore`.
 
-## Concrete backend model
+## Target semantic model
 
-The durable model has descriptor registries plus pane instances. IDs are hashes
-of canonical semantic content; display names and runtime SIDs are not identities.
+The target model has descriptor registries plus pane instances. Descriptor IDs
+are derived from canonical semantic content; display names and runtime SIDs are
+not descriptor identities. The current implementation uses the canonical string
+itself as the ID. A future hashed representation must preserve the same content
+identity and handle collisions explicitly.
 
 ```rust
 struct SummaryDescriptor {
@@ -64,21 +68,92 @@ struct SummaryInstance {
 }
 ```
 
-The backend maps this model onto its execution components as follows:
+## Authoritative SummaryCatalog and execution plans
 
-| Component | SDS responsibility |
+The control-plane `SummaryCatalog` is the metadata authority. It stores immutable
+Summary and Data Descriptors plus stable materialization identities. It does not
+store pane payloads, watermarks, completeness, or observed availability; those
+are data-plane instance/runtime metadata.
+
+```text
+                       ASAPPlanner post-ASAP DAG
+                                  |
+                                  v
+                    Control-plane SummaryCatalog
+       SummaryDescriptor + DataDescriptor + MaterializationIdentity
+                                  |
+              catalog references | shared snapshot
+          +-----------------------+-----------------------+
+          |                       |                       |
+          v                       v                       v
+    CollectorPlan           PrecomputePlan           QueryPlan DAG
+ producer placement,       backend-ingest build,     readout, combine,
+ input routing, build       update and lifecycle     Prometheus fallback
+          |                       |
+          +-----------+-----------+
+                      v
+              TransmissionPlan (when remote producers exist)
+        full/delta/checkpoint transport, sequence and encoding
+                      |
+                      v
+        Backend/Collector catalog replicas and SummaryStore
+             pane instances, completeness and lineage
+```
+
+All four execution plans reference catalog IDs instead of copying operator,
+source, filter, grouping, fidelity, or state-schema definitions.
+
+| Component | Responsibility |
 | --- | --- |
-| Physical-plan compiler | Canonicalize descriptor content, assign descriptor references and declare build/readout operations |
-| Precompute engine | Route matching observations and update the instance for one descriptor pair, group and pane |
-| SummaryStore (`SketchStore` today) | Store descriptor registries, instance metadata, state, completeness and lineage |
-| Query engine | Resolve plan references, select complete instances, merge/read out their state and combine exact Prometheus subquery results |
-| `rollups` | Hold typed, rebuildable indexes derived from canonical instances |
+| `SummaryCatalog` | Canonical descriptor definitions, stable IDs and catalog schema/version |
+| `CollectorPlan` | Collector placement, input routing, producer identity and collector-side build operations |
+| `PrecomputePlan` | Backend-ingest placement, window updates, retention and lifecycle |
+| `TransmissionPlan` | Optional producer-to-backend full state, delta, checkpoint, sequence and encoding contract |
+| `QueryPlan` | Materialization references, readout, DAG composition and exact Prometheus boundaries |
+| SummaryStore (`SketchStore` today) | Instance state, concrete intervals/groups, completeness, lineage and rebuildable rollups |
+
+`BackendPlan` is transitional. Its materialization registry moves into
+`SummaryCatalog`; update/placement/lifecycle moves into `PrecomputePlan`; query
+routing moves into `QueryPlan`; and the common deployment envelope becomes shared
+plan metadata. After consumers install the same catalog snapshot and these plan
+references are validated, the BackendPlan protobuf and endpoint are removed.
+
+The migration order is:
+
+1. Move the SDS catalog contract into `asap_types`.
+2. Make the control plane own the authoritative `SummaryCatalog`.
+3. Make `PrecomputePlan` reference catalog descriptors and own update, placement and lifecycle.
+4. Make `QueryPlan::MaterializationBinding` reference catalog/materialization IDs directly.
+5. Distribute the same catalog snapshot to Collector and backend.
+6. Remove `BackendPlan`, its protobuf and install endpoint, and duplicate validation.
+
+## Implemented backend representation
+
+The in-memory descriptor representation is normalized. `SummaryDescriptorRegistry`
+content-interns Summary and Data Descriptors. A SID owns an `SdsBinding` with
+shared `Arc` references to both descriptors. Pane rows store the SID foreign
+key, `[start, end)`, interned group values and state; together these fields form
+the Summary Instance. This avoids repeating descriptors in every pane and lets
+catalog snapshots and query lookups clone pointers rather than descriptor data.
+The registry holds weak references, so retiring the final SID also releases its
+descriptors. `SketchInstanceMetadata` remains the registration and persistence
+compatibility DTO while older sidecars are read.
+
+The implemented `SummaryDescriptor` currently contains one `SummaryOperator`,
+one derived `FidelityGuarantee`, and a numeric state-schema version. The
+implemented `DataDescriptor` contains metric name, canonical population filter,
+and grouping keys. Observation semantics, structured state schemas, and a
+standalone `SummaryInstance` API remain target-model work; pane state and
+completeness/lineage tracking currently live in existing `SketchStore` tables.
 
 An ingest record is never an SDS instance. Raw samples can be transient inputs to
 the precompute engine, but the backend does not retain them as a second exact
 query store. Exact residual subtrees run in Prometheus.
 
-The store enforces these invariants:
+The target model requires these invariants. The current implementation enforces
+descriptor binding and non-overlapping pane selection; the remaining structured
+schema and instance contracts must be completed before claiming full SDS
+conformance:
 
 1. An instance references exactly one immutable Summary Descriptor and one
    immutable Data Descriptor.

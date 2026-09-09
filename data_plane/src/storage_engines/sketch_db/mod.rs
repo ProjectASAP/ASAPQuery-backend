@@ -36,6 +36,7 @@ pub mod lifecycle;
 pub mod metrics;
 pub mod persistence;
 pub mod query;
+pub mod sds;
 
 pub use accuracy::{AccuracyEnvelope, AccuracyKind, AccuracyProfile, PerSegmentAccuracy};
 pub use backfill::{
@@ -50,3 +51,7 @@ pub use lifecycle::{
     SchemaEvictionService, DEFAULT_RETIREMENT_RETENTION,
 };
 pub use query::timeline::{TimelineCoverage, TimelineSegment};
+pub use sds::{
+    DataDescriptor, DataDescriptorId, SdsBinding, SummaryDescriptor, SummaryDescriptorId,
+    SummaryDescriptorRegistry, SummaryOperator,
+};

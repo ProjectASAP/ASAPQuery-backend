@@ -13,7 +13,7 @@ Proposals for shared-contract review:
 - [ASAPPlanner integration architecture](asapplanner-integration.md) proposes
   the Planner/backend responsibility boundary, shared semantic DAG workflow,
   and high-level consolidation milestones.
-- [Self-Describing Summary (SDS)](self-describing-summary.md) defines the proposed
+- [Summary Catalog and SDS Architecture](summary-catalog-sds-architecture.md) defines the proposed
   Summary Descriptor, Data Descriptor and Summary Instance layers.
 
 These proposals complement the canonical cross-component contracts above.
