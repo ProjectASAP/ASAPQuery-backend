@@ -224,29 +224,55 @@ def ingest(rows, endpoints, output):
                 raise RuntimeError(f"ingestion failed at batch {offset}; inspect partial acceptance before retry")
 
 
-def replay(queries, backend, output, repetitions, exact_url=None, relative_tolerance=0.0, absolute_tolerance=0.0):
+def replay(queries, backend, output, repetitions, exact_url=None, relative_tolerance=0.0, absolute_tolerance=0.0, evaluation_step_ms=0, batch_resources=False):
     rows = []
+    if evaluation_step_ms < 0:
+        raise ValueError("evaluation step must be nonnegative")
+    query_request = _http_request if batch_resources else request
+    batch_before = process_snapshots() if batch_resources else None
+    batch_started = time.perf_counter_ns()
     for repeat in range(repetitions):
         for query_index, query in enumerate(queries):
             exact_first = (repeat + query_index) % 2 == 0
-            params = urllib.parse.urlencode({"query": query["query"], "time": f'{query["eval_timestamp_ms"] / 1000:.3f}'})
+            evaluation_ms = query["eval_timestamp_ms"] - (repetitions - 1 - repeat) * evaluation_step_ms
+            if evaluation_ms < 0:
+                raise ValueError("advancing evaluation grid predates epoch")
+            params = urllib.parse.urlencode({"query": query["query"], "time": f'{evaluation_ms / 1000:.3f}'})
             # Alternate paired order to expose, rather than always favor, cache/order effects.
             exact = None
             if exact_url and exact_first:
-                exact = request(exact_url.rstrip("/") + "/api/v1/query?" + params)
-            answer = request(backend.rstrip("/") + "/api/v1/query?" + params)
+                exact = query_request(exact_url.rstrip("/") + "/api/v1/query?" + params)
+            answer = query_request(backend.rstrip("/") + "/api/v1/query?" + params)
             if exact_url and exact is None:
-                exact = request(exact_url.rstrip("/") + "/api/v1/query?" + params)
+                exact = query_request(exact_url.rstrip("/") + "/api/v1/query?" + params)
             route = classify(answer["response"], answer["headers"])
             if answer["http_status"] != 200:
                 route = "failed"
-            rows.append({**query, "repetition": repeat, "phase": "first_pass" if repeat == 0 else "repeat",
+            rows.append({**query, "original_eval_timestamp_ms": query["eval_timestamp_ms"],
+                         "eval_timestamp_ms": evaluation_ms, "repetition": repeat, "phase": "first_pass" if repeat == 0 else "repeat",
                          "execution": route, "execution_provenance": execution_provenance(answer["response"], answer["headers"]), **answer})
             if exact is not None:
                 rows[-1]["exact"] = exact
                 rows[-1]["comparison"] = compare_results(answer["response"], exact["response"], relative_tolerance, absolute_tolerance)
                 rows[-1]["pair_order"] = "exact_first" if exact_first else "backend_first"
-            write_json(output / "queries.json", rows)
+            if not batch_resources:
+                write_json(output / "queries.json", rows)
+        if batch_resources and repeat == 0:
+            first_pass_after = process_snapshots()
+    if batch_resources:
+        batch_after = first_pass_after if repetitions == 1 else process_snapshots()
+        quantum = 1_000_000_000 // os.sysconf("SC_CLK_TCK")
+        deltas = {name: process_delta(batch_before.get(name), batch_after.get(name)) for name in PROCESS_IDS}
+        write_json(output / "query-batch-resources.json", {
+            "scope": "paired query batch including service background CPU; no per-RPC resource probes",
+            "before": batch_before, "after_first_pass": first_pass_after, "after": batch_after, "resources": deltas,
+            "first_pass_resources": {name: process_delta(batch_before.get(name), first_pass_after.get(name)) for name in PROCESS_IDS},
+            "repeat_resources": {name: process_delta(first_pass_after.get(name), batch_after.get(name)) for name in PROCESS_IDS},
+            "low_resolution_services": [name for name, delta in deltas.items() if delta is None or delta["cpu_ns"] < 10 * quantum],
+            "wall_ns": time.perf_counter_ns() - batch_started, "cpu_tick_ns": quantum,
+            "cpu_resolution": "Values below ten ticks are low-resolution/censored; zero is not zero cost",
+            "evaluations_per_service": len(rows), "evaluation_step_ms": evaluation_step_ms})
+        write_json(output / "queries.json", rows)
     return rows
 
 
@@ -269,6 +295,8 @@ def main():
     parser.add_argument("--port", type=int, default=18089)
     parser.add_argument("--settle-seconds", type=float, default=0, help="deprecated; completion uses explicit finite-input drain")
     parser.add_argument("--repetitions", type=int, default=2)
+    parser.add_argument("--evaluation-step-ms", type=int, default=0, help="advance through preloaded data, ending at original timestamp; not incremental ingestion")
+    parser.add_argument("--batch-resources", action="store_true", help="measure CPU around the query batch, avoiding per-RPC /proc probes")
     parser.add_argument("--relative-tolerance", type=float, default=0.0)
     parser.add_argument("--absolute-tolerance", type=float, default=0.0)
     parser.add_argument("--output", type=Path, required=True)
@@ -371,7 +399,8 @@ def main():
             write_json(args.output / "store-after-build.json", request(backend + "/api/v1/store/metrics"))
             write_json(args.output / "process-phases.json", phases)
             results = replay(queries, backend, args.output, args.repetitions, args.exact_url if args.compare else None,
-                             args.relative_tolerance, args.absolute_tolerance)
+                             args.relative_tolerance, args.absolute_tolerance,
+                             args.evaluation_step_ms, args.batch_resources)
             phases["after_queries"] = process_snapshots()
             write_json(args.output / "process-phases.json", phases)
             store = request(backend + "/api/v1/store/metrics")

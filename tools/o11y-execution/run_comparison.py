@@ -25,6 +25,8 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--repetitions", type=int, default=20)
+    parser.add_argument("--evaluation-step-ms", type=int, default=0)
+    parser.add_argument("--batch-resources", action="store_true")
     parser.add_argument("--cpu-affinity", required=True)
     parser.add_argument("--base-port", type=int, default=19410)
     args = parser.parse_args()
@@ -89,6 +91,9 @@ def main():
                         "--cpu-affinity", args.cpu_affinity, "--port", str(base_port + 2),
                         "--repetitions", str(args.repetitions), "--relative-tolerance", "1e-9",
                         "--absolute-tolerance", "1e-12", "--output", str((folder / "replay").resolve())]
+            command += ["--evaluation-step-ms", str(args.evaluation_step_ms)]
+            if args.batch_resources:
+                command.append("--batch-resources")
             save(folder / "command.json", command)
             subprocess.run(command, check=True)
         finally:
