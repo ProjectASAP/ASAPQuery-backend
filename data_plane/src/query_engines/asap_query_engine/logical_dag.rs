@@ -1,13 +1,11 @@
 //! Executes the installed typed logical DAG. No serving-time PromQL parsing.
-use crate::drivers::ingest::prometheus_remote_write::CanonicalSample;
 use crate::query_engines::{
     query_result::{InstantVectorElement, QueryResult},
     EngineError,
 };
 use crate::storage_engines::types::KeyByLabelValues;
 use control_plane::query_plan::logical::{
-    Aggregation, BinaryOperation, Grouping, LabelMatch, LabelMatcher, LogicalOperator,
-    TemporalOperation,
+    Aggregation, BinaryOperation, Grouping, LogicalOperator, TemporalOperation,
 };
 use control_plane::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,123 +19,16 @@ pub(crate) enum Value {
     Vector(Vector),
     Matrix(Matrix, i64, i64),
 }
-struct Point {
-    timestamp_ms: i64,
-    value: Option<f64>,
-}
-struct Series {
-    max_index: std::sync::OnceLock<super::range_max_index::RangeMaxIndex>,
-    labels: Labels,
-    points: Vec<Point>,
-}
-/// One immutable indexed raw-data snapshot; callers invalidate it after ingestion.
-pub struct PreparedSamples {
-    series: Vec<Series>,
-}
 #[derive(Debug, Default, Clone)]
 pub struct ExecutionStats {
+    /// Kept in execution provenance for compatibility; deployed DAGs cannot
+    /// execute local raw scans, so this remains zero.
     pub raw_scan_evaluations: usize,
     pub summary_readout_evaluations: usize,
     pub memo_hits: usize,
     pub remote_evaluations: usize,
     pub remote_rpcs: usize,
     pub remote_branch_evaluations: usize,
-    pub index_reads: usize,
-}
-impl PreparedSamples {
-    pub fn new(samples: &[CanonicalSample]) -> Result<Self, EngineError> {
-        let mut grouped: BTreeMap<Labels, Vec<Point>> = BTreeMap::new();
-        for sample in samples {
-            let mut labels: Labels = sample.labels.clone().into_iter().collect();
-            labels.insert("__name__".into(), sample.metric.clone());
-            grouped.entry(labels).or_default().push(Point {
-                timestamp_ms: sample.timestamp_ms,
-                value: sample.value,
-            });
-        }
-        Self::from_grouped(grouped)
-    }
-
-    /// Build directly from grouped storage without duplicating labels per sample.
-    /// Label maps include the `__name__` metric label.
-    pub fn from_series(
-        input: impl IntoIterator<Item = (BTreeMap<String, String>, Vec<(i64, Option<f64>)>)>,
-    ) -> Result<Self, EngineError> {
-        let mut grouped: BTreeMap<Labels, Vec<Point>> = BTreeMap::new();
-        for (labels, points) in input {
-            grouped
-                .entry(labels)
-                .or_default()
-                .extend(points.into_iter().map(|(timestamp_ms, value)| Point {
-                    timestamp_ms,
-                    value,
-                }));
-        }
-        Self::from_grouped(grouped)
-    }
-
-    fn from_grouped(grouped: BTreeMap<Labels, Vec<Point>>) -> Result<Self, EngineError> {
-        let mut series = Vec::with_capacity(grouped.len());
-        for (labels, mut points) in grouped {
-            points.sort_by_key(|point| point.timestamp_ms);
-            for pair in points.windows(2) {
-                if pair[0].timestamp_ms == pair[1].timestamp_ms
-                    && pair[0].value.map(f64::to_bits) != pair[1].value.map(f64::to_bits)
-                {
-                    return Err(miss(
-                        "conflicting raw samples for one label set and timestamp",
-                    ));
-                }
-            }
-            points.dedup_by_key(|point| point.timestamp_ms);
-            series.push(Series {
-                labels,
-                points,
-                max_index: Default::default(),
-            });
-        }
-        Ok(Self { series })
-    }
-    pub fn prepare_range_max_indexes(&self, metrics: &BTreeSet<String>) {
-        for series in &self.series {
-            if series
-                .labels
-                .get("__name__")
-                .is_some_and(|metric| metrics.contains(metric))
-            {
-                series.max_index.get_or_init(|| {
-                    super::range_max_index::RangeMaxIndex::new(
-                        series.points.iter().map(|point| point.value),
-                    )
-                });
-            }
-        }
-    }
-    pub fn range_max_index_bytes(&self) -> usize {
-        self.series
-            .iter()
-            .filter_map(|series| series.max_index.get())
-            .map(|index| index.estimated_bytes())
-            .sum()
-    }
-    pub fn estimated_bytes(&self) -> usize {
-        self.series
-            .iter()
-            .map(|series| {
-                std::mem::size_of::<Series>()
-                    + series
-                        .max_index
-                        .get()
-                        .map_or(0, |index| index.estimated_bytes())
-                    + series.points.capacity() * std::mem::size_of::<Point>()
-                    + series
-                        .labels
-                        .iter()
-                        .map(|(key, value)| key.capacity() + value.capacity())
-                        .sum::<usize>()
-            })
-            .sum()
-    }
 }
 fn miss(detail: impl Into<String>) -> EngineError {
     EngineError::capability_miss("installed_logical_dag", detail)
@@ -184,58 +75,11 @@ pub(crate) fn from_result(result: QueryResult) -> Result<Value, EngineError> {
     Ok(Value::Vector(vector(Value::Vector(values))?))
 }
 
-pub fn execute(
-    entry: &QueryPlanEntry,
-    samples: &[CanonicalSample],
-    at: u64,
-) -> Result<QueryResult, EngineError> {
-    execute_with_summary(entry, samples, at, |_, _| {
-        Err(miss("summary callback required"))
-    })
-}
-
-pub fn execute_with_summary<F>(
-    entry: &QueryPlanEntry,
-    samples: &[CanonicalSample],
-    at: u64,
-    callback: F,
-) -> Result<QueryResult, EngineError>
-where
-    F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>,
-{
-    execute_prepared(entry, &PreparedSamples::new(samples)?, at, callback)
-}
-
-pub fn execute_prepared<F>(
-    entry: &QueryPlanEntry,
-    samples: &PreparedSamples,
-    at: u64,
-    callback: F,
-) -> Result<QueryResult, EngineError>
-where
-    F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>,
-{
-    execute_prepared_with_stats(entry, samples, at, callback).map(|(result, _)| result)
-}
-
-pub fn execute_prepared_with_stats<F>(
-    entry: &QueryPlanEntry,
-    samples: &PreparedSamples,
-    at: u64,
-    callback: F,
-) -> Result<(QueryResult, ExecutionStats), EngineError>
-where
-    F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>,
-{
-    execute_values(entry, &samples.series, None, at, callback)
-}
-
 pub(crate) struct PreparedLeaf {
     pub value: Value,
     pub remote: bool,
     pub remote_evaluations: usize,
     pub remote_rpcs: usize,
-    pub index_reads: usize,
 }
 pub(crate) type PreparedLeaves = BTreeMap<(QueryNodeId, i64), PreparedLeaf>;
 
@@ -248,13 +92,12 @@ pub(crate) fn execute_installed<F>(
 where
     F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>,
 {
-    execute_values(entry, &[], Some(leaves), at, callback)
+    execute_values(entry, leaves, at, callback)
 }
 
 fn execute_values<F>(
     entry: &QueryPlanEntry,
-    series: &[Series],
-    leaves: Option<&PreparedLeaves>,
+    leaves: &PreparedLeaves,
     at: u64,
     callback: F,
 ) -> Result<(QueryResult, ExecutionStats), EngineError>
@@ -263,17 +106,15 @@ where
 {
     let mut evaluator = Evaluator {
         entry,
-        series,
         leaves,
         callback,
         stats: ExecutionStats::default(),
         memo: BTreeMap::new(),
         active: BTreeSet::new(),
-        regexes: BTreeMap::new(),
     };
     let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
     let evaluated = evaluator.eval(entry.root, at_signed)?;
-    if leaves.is_some() && matches!(evaluated, Value::Scalar(_)) {
+    if matches!(evaluated, Value::Scalar(_)) {
         // QueryResult currently models vectors/matrices only. Preserve a scalar
         // root's HTTP type by routing it to native, while scalar intermediates
         // remain typed inside vector composition.
@@ -300,13 +141,11 @@ where
 
 struct Evaluator<'a, F> {
     entry: &'a QueryPlanEntry,
-    series: &'a [Series],
-    leaves: Option<&'a PreparedLeaves>,
+    leaves: &'a PreparedLeaves,
     stats: ExecutionStats,
     callback: F,
     memo: BTreeMap<(QueryNodeId, i64), Value>,
     active: BTreeSet<(QueryNodeId, i64)>,
-    regexes: BTreeMap<String, regex::Regex>,
 }
 impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'_, F> {
     fn eval(&mut self, id: QueryNodeId, at: i64) -> Result<Value, EngineError> {
@@ -314,7 +153,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             self.stats.memo_hits += 1;
             return Ok(value.clone());
         }
-        if let Some(leaf) = self.leaves.and_then(|leaves| leaves.get(&(id, at))) {
+        if let Some(leaf) = self.leaves.get(&(id, at)) {
             if leaf.remote {
                 self.stats.remote_branch_evaluations += 1;
                 self.stats.remote_evaluations += leaf.remote_evaluations;
@@ -322,7 +161,6 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             } else {
                 self.stats.summary_readout_evaluations += 1;
             }
-            self.stats.index_reads += leaf.index_reads;
             let value = leaf.value.clone();
             self.memo.insert((id, at), value.clone());
             return Ok(value);
@@ -342,17 +180,12 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
         let value = match node {
             QueryPlanNode::Scalar { value } => Value::Scalar(value),
             QueryPlanNode::Logical { operator, inputs } => {
-                if self.leaves.is_some()
-                    && matches!(
-                        operator,
-                        LogicalOperator::Scan { .. }
-                            | LogicalOperator::ReadRangeMaxIndex { .. }
-                            | LogicalOperator::ReadRangeCounterIndex { .. }
-                            | LogicalOperator::ExactSubquery { .. }
-                    )
-                {
+                if matches!(
+                    operator,
+                    LogicalOperator::Scan { .. } | LogicalOperator::ExactSubquery { .. }
+                ) {
                     return Err(miss(
-                        "installed leaf was not prepared; local raw execution is forbidden",
+                        "installed Prometheus leaf was not prepared; backend raw execution is forbidden",
                     ));
                 }
                 self.logical(operator, &inputs, at)?
@@ -382,22 +215,12 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 .ok_or_else(|| miss("missing logical input"))
         };
         match operator {
-            LogicalOperator::ExactSubquery { .. }
-            | LogicalOperator::ReadRangeCounterIndex { .. } => Err(miss(
-                "remote/index leaf requires prepared installed execution",
-            )),
-            LogicalOperator::ReadRangeMaxIndex {
-                metric,
-                matchers,
-                range_ms,
-                ..
-            } => self.range_max_index(&metric, &matchers, range_ms, at),
-            LogicalOperator::Scan {
-                metric,
-                matchers,
-                range_ms,
-                offset_ms,
-            } => self.scan(metric.as_deref(), &matchers, range_ms, offset_ms, at),
+            LogicalOperator::ExactSubquery { .. } => {
+                Err(miss("Prometheus exact leaf was not prepared"))
+            }
+            LogicalOperator::Scan { .. } => {
+                Err(miss("local raw Scan is forbidden in deployed plans"))
+            }
             LogicalOperator::UnaryNegate => match self.eval(input(0)?, at)? {
                 Value::Scalar(value) => Ok(Value::Scalar(-value)),
                 Value::Vector(values) => Ok(Value::Vector(
@@ -534,137 +357,6 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 Ok(Value::Matrix(values.into_iter().collect(), start, end))
             }
         }
-    }
-    fn range_max_index(
-        &mut self,
-        metric: &str,
-        matchers: &[LabelMatcher],
-        range_ms: u64,
-        at: i64,
-    ) -> Result<Value, EngineError> {
-        for matcher in matchers {
-            if matches!(matcher.operation, LabelMatch::Regex | LabelMatch::NotRegex)
-                && !self.regexes.contains_key(&matcher.value)
-            {
-                let regex = regex::Regex::new(&format!("(?s)^(?:{})$", matcher.value))
-                    .map_err(|e| miss(format!("unsupported regex: {e}")))?;
-                self.regexes.insert(matcher.value.clone(), regex);
-            }
-        }
-        let start = at
-            .checked_sub(i64::try_from(range_ms).map_err(|_| miss("range overflow"))?)
-            .ok_or_else(|| miss("range overflow"))?;
-        let mut values = Vec::new();
-        for series in self.series {
-            if series.labels.get("__name__").map(String::as_str) != Some(metric)
-                || !matchers.iter().all(|matcher| {
-                    let value = series
-                        .labels
-                        .get(&matcher.name)
-                        .map(String::as_str)
-                        .unwrap_or("");
-                    match matcher.operation {
-                        LabelMatch::Equal => value == matcher.value,
-                        LabelMatch::NotEqual => value != matcher.value,
-                        LabelMatch::Regex => self.regexes[&matcher.value].is_match(value),
-                        LabelMatch::NotRegex => !self.regexes[&matcher.value].is_match(value),
-                    }
-                })
-            {
-                continue;
-            }
-            let lo = series.points.partition_point(|p| p.timestamp_ms <= start);
-            let hi = series.points.partition_point(|p| p.timestamp_ms <= at);
-            let index = series.max_index.get_or_init(|| {
-                super::range_max_index::RangeMaxIndex::new(series.points.iter().map(|p| p.value))
-            });
-            // Count only real index access, never a generic scan or successful binding.
-            self.stats.summary_readout_evaluations += 1;
-            if let Some(value) = index.query(lo, hi) {
-                values.push((no_name(series.labels.clone()), value));
-            }
-        }
-        Ok(Value::Vector(values))
-    }
-    fn scan(
-        &mut self,
-        metric: Option<&str>,
-        matchers: &[LabelMatcher],
-        range_ms: Option<u64>,
-        offset_ms: i64,
-        at: i64,
-    ) -> Result<Value, EngineError> {
-        self.stats.raw_scan_evaluations += 1;
-        for matcher in matchers {
-            if matches!(matcher.operation, LabelMatch::Regex | LabelMatch::NotRegex)
-                && !self.regexes.contains_key(&matcher.value)
-            {
-                let pattern = regex::Regex::new(&format!("(?s)^(?:{})$", matcher.value))
-                    .map_err(|e| miss(format!("unsupported regex: {e}")))?;
-                self.regexes.insert(matcher.value.clone(), pattern);
-            }
-        }
-        let end = at
-            .checked_sub(offset_ms)
-            .ok_or_else(|| miss("offset overflow"))?;
-        let range =
-            i64::try_from(range_ms.unwrap_or(300_000)).map_err(|_| miss("range overflow"))?;
-        let start = end
-            .checked_sub(range)
-            .ok_or_else(|| miss("range overflow"))?;
-        let mut instant = Vec::new();
-        let mut matrix = Vec::new();
-        for series in self.series {
-            if metric.is_some_and(|m| series.labels.get("__name__").map(String::as_str) != Some(m))
-                || !matchers.iter().all(|matcher| {
-                    let value = series
-                        .labels
-                        .get(&matcher.name)
-                        .map(String::as_str)
-                        .unwrap_or("");
-                    match matcher.operation {
-                        LabelMatch::Equal => value == matcher.value,
-                        LabelMatch::NotEqual => value != matcher.value,
-                        LabelMatch::Regex => self.regexes[&matcher.value].is_match(value),
-                        LabelMatch::NotRegex => !self.regexes[&matcher.value].is_match(value),
-                    }
-                })
-            {
-                continue;
-            }
-            let hi = series
-                .points
-                .partition_point(|point| point.timestamp_ms <= end);
-            if range_ms.is_some() {
-                let lo = series
-                    .points
-                    .partition_point(|point| point.timestamp_ms <= start);
-                let points: Vec<_> = series.points[lo..hi]
-                    .iter()
-                    .filter_map(|point| {
-                        point
-                            .value
-                            .filter(|v| v.to_bits() != 0x7ff0000000000002)
-                            .map(|v| (point.timestamp_ms, v))
-                    })
-                    .collect();
-                if !points.is_empty() {
-                    matrix.push((series.labels.clone(), points));
-                }
-            } else if hi > 0 {
-                let point = &series.points[hi - 1];
-                if point.timestamp_ms >= start {
-                    if let Some(value) = point.value.filter(|v| v.to_bits() != 0x7ff0000000000002) {
-                        instant.push((series.labels.clone(), value));
-                    }
-                }
-            }
-        }
-        Ok(if range_ms.is_some() {
-            Value::Matrix(matrix, start, end)
-        } else {
-            Value::Vector(instant)
-        })
     }
 }
 
@@ -896,230 +588,4 @@ fn bucket_quantile(q: f64, mut b: Vec<(f64, f64)>) -> f64 {
     let (start, base) = if idx == 0 { (0., 0.) } else { buckets[idx - 1] };
     let (end, upper) = buckets[idx];
     start + (end - start) * (rank - base) / (upper - base)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use control_plane::query_plan::{FallbackPolicy, InstantExecution};
-    fn entry(query: &str) -> QueryPlanEntry {
-        QueryPlanEntry::compile_logical(
-            "q".into(),
-            query.into(),
-            InstantExecution {
-                lookback_ms: 300_000,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            FallbackPolicy::Reject,
-        )
-        .unwrap()
-    }
-    fn sample(metric: &str, job: &str, timestamp_ms: i64, value: Option<f64>) -> CanonicalSample {
-        CanonicalSample {
-            metric: metric.into(),
-            labels: [("job".into(), job.into())].into(),
-            series_key: format!("{metric}:{job}"),
-            timestamp_ms,
-            value,
-        }
-    }
-    fn values(query: &str, samples: &[CanonicalSample], at: u64) -> Vec<f64> {
-        let QueryResult::Vector(result) = execute(&entry(query), samples, at).unwrap() else {
-            panic!()
-        };
-        result.values.into_iter().map(|p| p.value).collect()
-    }
-    #[test]
-    fn indexed_max_preserves_filters_labels_boundaries_and_real_readout_provenance() {
-        let mut samples = vec![
-            sample(
-                "service_retry_queue_depth",
-                "user-service",
-                1_000,
-                Some(999.),
-            ),
-            sample("service_retry_queue_depth", "user-service", 1_001, Some(4.)),
-            sample("service_retry_queue_depth", "user-service", 2_056, Some(8.)),
-            sample(
-                "service_retry_queue_depth",
-                "order-service",
-                2_000,
-                Some(30.),
-            ),
-        ];
-        let mut extra = sample(
-            "service_retry_queue_depth",
-            "user-service",
-            1_500,
-            Some(11.),
-        );
-        extra.labels.insert("instance".into(), "other".into());
-        samples.push(extra);
-        let prepared = PreparedSamples::new(&samples).unwrap();
-        assert_eq!(prepared.range_max_index_bytes(), 0);
-        for selector in [
-            r#"job="user-service""#,
-            r#"job=~".+""#,
-            r#"job!="order-service",absent="""#,
-            r#"job!~"order.*""#,
-        ] {
-            let query = format!("max_over_time(service_retry_queue_depth{{{selector}}}[1056ms])");
-            let raw = entry(&query);
-            let mut indexed = raw.clone();
-            let scan = raw
-                .nodes
-                .values()
-                .find_map(|node| match node {
-                    QueryPlanNode::Logical {
-                        operator:
-                            LogicalOperator::Scan {
-                                metric: Some(metric),
-                                matchers,
-                                range_ms: Some(range_ms),
-                                ..
-                            },
-                        ..
-                    } => Some(LogicalOperator::ReadRangeMaxIndex {
-                        metric: metric.clone(),
-                        matchers: matchers.clone(),
-                        range_ms: *range_ms,
-                        retention_ms: *range_ms,
-                    }),
-                    _ => None,
-                })
-                .unwrap();
-            indexed.nodes = [(
-                indexed.root,
-                QueryPlanNode::Logical {
-                    operator: scan,
-                    inputs: vec![],
-                },
-            )]
-            .into();
-            for at in [2056, 2057, 2500, 4000] {
-                let (expected, _) =
-                    execute_prepared_with_stats(&raw, &prepared, at, |_, _| unreachable!())
-                        .unwrap();
-                let (actual, stats) =
-                    execute_prepared_with_stats(&indexed, &prepared, at, |_, _| unreachable!())
-                        .unwrap();
-                assert_eq!(
-                    serde_json::to_value(actual).unwrap(),
-                    serde_json::to_value(expected).unwrap(),
-                    "{query} at {at}"
-                );
-                assert_eq!(stats.raw_scan_evaluations, 0);
-                assert!(stats.summary_readout_evaluations > 0);
-            }
-        }
-        let bytes = prepared.range_max_index_bytes();
-        assert!(bytes > 0 && bytes < prepared.estimated_bytes());
-    }
-
-    // Regex alternation remains fully anchored and missing labels compare as empty.
-    #[test]
-    fn anchored_matchers_and_missing_labels() {
-        let samples = [
-            sample("up", "xorder", 1000, Some(9.)),
-            sample("up", "user", 1000, Some(2.)),
-        ];
-        assert_eq!(
-            values(r#"sum(up{job=~"user|order",absent=""})"#, &samples, 1000),
-            vec![2.]
-        );
-    }
-    // Stale markers stop instant lookup; range windows are left-open and ignore stale points.
-    #[test]
-    fn stale_and_range_boundaries() {
-        let samples = [
-            sample("up", "a", 0, Some(99.)),
-            sample("up", "a", 1000, Some(2.)),
-            sample("up", "a", 2000, None),
-        ];
-        assert!(values("up", &samples, 2000).is_empty());
-        assert_eq!(values("sum_over_time(up[2s])", &samples, 2000), vec![2.]);
-    }
-    // A shared child must be evaluated separately at each subquery grid time.
-    #[test]
-    fn shared_subquery_uses_time_in_memo_key() {
-        let samples = [
-            sample("up", "a", 1000, Some(2.)),
-            sample("up", "a", 2000, Some(4.)),
-        ];
-        assert_eq!(
-            values("avg_over_time((up + up)[2s:1s])", &samples, 2000),
-            vec![6.]
-        );
-    }
-    // Scalar-left filtering returns the vector's original value and metric name.
-    #[test]
-    fn scalar_left_comparison_preserves_vector_value() {
-        let samples = [sample("up", "a", 1000, Some(4.))];
-        assert_eq!(values("2 < up", &samples, 1000), vec![4.]);
-        assert_eq!(values("2 < bool up", &samples, 1000), vec![1.]);
-    }
-    // Materialized readouts can feed residual operators without parsing their query text.
-    #[test]
-    fn summary_callback_is_memoized_and_composed() {
-        let mut graph = entry("up + up");
-        let leaf = graph
-            .nodes
-            .iter()
-            .find_map(|(id, node)| {
-                matches!(
-                    node,
-                    QueryPlanNode::Logical {
-                        operator: LogicalOperator::Scan { .. },
-                        ..
-                    }
-                )
-                .then_some(*id)
-            })
-            .unwrap();
-        graph
-            .nodes
-            .insert(leaf, QueryPlanNode::SummaryMerge { inputs: vec![] });
-        let mut calls = 0;
-        let result = execute_with_summary(&graph, &[], 1000, |id, at| {
-            assert_eq!(id, leaf);
-            assert_eq!(at, 1000);
-            calls += 1;
-            Ok(QueryResult::vector(
-                vec![InstantVectorElement::new(
-                    KeyByLabelValues::new_with_labels(vec!["a".into()]),
-                    3.,
-                )
-                .with_label_keys_override(vec!["job".into()])],
-                at,
-            ))
-        })
-        .unwrap();
-        let QueryResult::Vector(result) = result else {
-            panic!()
-        };
-        assert_eq!(result.values[0].value, 6.);
-        assert_eq!(calls, 1);
-    }
-    // Reusing the immutable index keeps raw provenance and shares the same-time leaf.
-    #[test]
-    fn prepared_snapshot_preserves_route_counts() {
-        let data = PreparedSamples::new(&[sample("up", "a", 1000, Some(2.))]).unwrap();
-        let (_, stats) = execute_prepared_with_stats(&entry("up + up"), &data, 1000, |_, _| {
-            Err(miss("unexpected summary"))
-        })
-        .unwrap();
-        assert_eq!(stats.raw_scan_evaluations, 1);
-        assert_eq!(stats.summary_readout_evaluations, 0);
-        assert_eq!(stats.memo_hits, 1);
-        assert!(data.estimated_bytes() > 0);
-    }
-    // Conflicting values cannot be hidden by different transport series-key strings.
-    #[test]
-    fn duplicate_identity_rejected() {
-        let first = sample("up", "a", 1000, Some(1.));
-        let mut second = sample("up", "a", 1000, Some(2.));
-        second.series_key = "different".into();
-        assert!(execute(&entry("up"), &[first, second], 1000).is_err());
-    }
 }

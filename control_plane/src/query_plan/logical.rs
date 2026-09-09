@@ -16,23 +16,6 @@ pub enum LogicalOperator {
     ExactSubquery {
         query: String,
     },
-    /// Exact reset-aware per-series counter state, with independent branch time binding.
-    ReadRangeCounterIndex {
-        metric: String,
-        matchers: Vec<LabelMatcher>,
-        range_ms: u64,
-        offset_ms: i64,
-        operation: TemporalOperation,
-        retention_ms: u64,
-    },
-    /// Planner-selected exact per-series MinMax state, queried as max over an
-    /// exact event-time interval. This is an installed index, not a raw scan.
-    ReadRangeMaxIndex {
-        metric: String,
-        matchers: Vec<LabelMatcher>,
-        range_ms: u64,
-        retention_ms: u64,
-    },
     Scan {
         metric: Option<String>,
         matchers: Vec<LabelMatcher>,
@@ -59,6 +42,25 @@ pub enum LogicalOperator {
         range_ms: u64,
         step_ms: u64,
         offset_ms: i64,
+    },
+}
+
+/// Compile-time identity for a Planner-authorized SummaryStore materialization.
+/// It is never serialized into an installed QueryPlan.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MaterializationContract {
+    Counter {
+        metric: String,
+        matchers: Vec<LabelMatcher>,
+        range_ms: u64,
+        offset_ms: i64,
+        operation: TemporalOperation,
+    },
+    RangeMax {
+        metric: String,
+        matchers: Vec<LabelMatcher>,
+        range_ms: u64,
     },
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,10 +140,7 @@ fn offset(value: &Option<Offset>) -> Result<i64, QueryPlanError> {
 impl LogicalOperator {
     pub fn validate(&self, inputs: usize) -> Result<(), QueryPlanError> {
         let expected = match self {
-            Self::Scan { .. }
-            | Self::ReadRangeMaxIndex { .. }
-            | Self::ReadRangeCounterIndex { .. }
-            | Self::ExactSubquery { .. } => 0,
+            Self::Scan { .. } | Self::ExactSubquery { .. } => 0,
             Self::Binary { .. } | Self::HistogramQuantile => 2,
             _ => 1,
         };
@@ -156,41 +155,6 @@ impl LogicalOperator {
             }
         ) {
             return Err(invalid("zero range"));
-        }
-        if let Self::ReadRangeMaxIndex {
-            metric,
-            range_ms,
-            retention_ms,
-            ..
-        } = self
-        {
-            if metric.is_empty()
-                || *range_ms == 0
-                || *range_ms > i64::MAX as u64
-                || retention_ms < range_ms
-            {
-                return Err(invalid("invalid exact range-max index contract"));
-            }
-        }
-        if let Self::ReadRangeCounterIndex {
-            metric,
-            range_ms,
-            operation,
-            retention_ms,
-            ..
-        } = self
-        {
-            if metric.is_empty()
-                || *range_ms == 0
-                || *range_ms > i64::MAX as u64
-                || retention_ms < range_ms
-                || !matches!(
-                    operation,
-                    TemporalOperation::Rate | TemporalOperation::Increase
-                )
-            {
-                return Err(invalid("invalid exact range-counter index contract"));
-            }
         }
         if let Self::ExactSubquery { query } = self {
             let parsed = parser::parse(query).map_err(|e| invalid(e.to_string()))?;
@@ -820,7 +784,7 @@ mod planner_workload_tests {
         fixture["query_workload"]["repeating_queries"] = entries.into();
         let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture).unwrap();
         let (request, environment) = snapshot.planning_request().unwrap();
-        assert!(request.local_raw_execution);
+        assert!(request.hybrid_execution);
         let plan = PhysicalCompiler.compile(request, environment).unwrap();
         assert_eq!(plan.query_plan.entries.len(), 24);
         assert!(plan.query_plan.entries.values().all(|entry| !entry
@@ -888,7 +852,7 @@ mod planner_workload_tests {
 pub(crate) fn selected_range_max_materialization(
     original: &str,
     node: &planner_types::post_asap::SummaryNode,
-) -> Result<Option<LogicalOperator>, QueryPlanError> {
+) -> Result<Option<MaterializationContract>, QueryPlanError> {
     use planner_types::post_asap::{ExactKind, SummaryExpr, SummaryFamilyType};
     if !matches!(
         &node.expr,
@@ -927,19 +891,18 @@ pub(crate) fn selected_range_max_materialization(
     else {
         return Ok(None);
     };
-    Ok(Some(LogicalOperator::ReadRangeMaxIndex {
+    Ok(Some(MaterializationContract::RangeMax {
         metric: metric.clone(),
         matchers: matchers.clone(),
         range_ms: *range_ms,
-        retention_ms: *range_ms,
     }))
 }
 
 #[cfg(test)]
-mod range_max_index_tests {
+mod range_max_materialization_tests {
     use super::*;
     #[test]
-    fn real_gauge_queries_have_planner_authorized_exact_indexes() {
+    fn real_gauge_queries_have_planner_authorized_exact_materializations() {
         for (query, metric, range_ms) in [
             (
                 r#"max_over_time(service_cache_refresh_lag_seconds{job="user-service"}[12h])"#,
@@ -967,14 +930,12 @@ mod range_max_index_tests {
                 .unwrap()
                 .unwrap();
             assert!(
-                matches!(index, LogicalOperator::ReadRangeMaxIndex { metric: ref actual, range_ms: actual_range, .. } if actual == metric && actual_range == range_ms)
+                matches!(index, MaterializationContract::RangeMax { metric: ref actual, range_ms: actual_range, .. } if actual == metric && actual_range == range_ms)
             );
-            index.validate(0).unwrap();
-            assert!(index.validate(1).is_err());
         }
     }
     #[test]
-    fn min_and_shifted_or_nested_windows_do_not_become_max_indexes() {
+    fn min_and_shifted_or_nested_windows_do_not_become_max_materializations() {
         for query in [
             "min_over_time(m[1m])",
             "max_over_time(m[1m] offset 1m)",
@@ -997,7 +958,7 @@ mod range_max_index_tests {
 }
 
 /// Stable contract identity used by priced physical alternatives, independent of node IDs.
-pub fn materialization_key(operator: &LogicalOperator) -> Result<String, QueryPlanError> {
+pub fn materialization_key(operator: &MaterializationContract) -> Result<String, QueryPlanError> {
     let mut value = serde_json::to_value(operator).map_err(|e| invalid(e.to_string()))?;
     if let Some(object) = value.as_object_mut() {
         // Retention is a consumer lifetime requirement, not the materialization read's
@@ -1013,7 +974,7 @@ pub fn materialization_key(operator: &LogicalOperator) -> Result<String, QueryPl
 fn counter_contract(
     root: QueryNodeId,
     nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
-) -> Option<LogicalOperator> {
+) -> Option<MaterializationContract> {
     let QueryPlanNode::Logical {
         operator: LogicalOperator::Temporal { operation },
         inputs,
@@ -1041,20 +1002,19 @@ fn counter_contract(
     else {
         return None;
     };
-    Some(LogicalOperator::ReadRangeCounterIndex {
+    Some(MaterializationContract::Counter {
         metric: metric.clone(),
         matchers: matchers.clone(),
         range_ms: *range_ms,
         offset_ms: *offset_ms,
         operation: *operation,
-        retention_ms: range_ms.saturating_add((*offset_ms).max(0) as u64),
     })
 }
 
 pub(crate) fn selected_counter_materialization(
     original: &str,
     node: &planner_types::post_asap::SummaryNode,
-) -> Result<Option<LogicalOperator>, QueryPlanError> {
+) -> Result<Option<MaterializationContract>, QueryPlanError> {
     use planner_types::post_asap::{ExactKind, SummaryExpr, SummaryFamilyType};
     if !matches!(
         &node.expr,
@@ -1070,68 +1030,6 @@ pub(crate) fn selected_counter_materialization(
     Ok(counter_contract(root, &nodes))
 }
 
-/// A kept logical subtree may contain rate operations. Prove each physical index
-/// implementation with Planner at compile time, then match the retained typed
-/// operator exactly. The installed parent DAG and its result combination stay intact.
-pub(super) fn promote_counter_indexes(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
-    fn visit(expr: &Expr, calls: &mut Vec<String>) {
-        match expr {
-            Expr::Call(e) => {
-                if matches!(e.func.name, "rate" | "increase") {
-                    calls.push(expr.to_string());
-                }
-                for arg in &e.args.args {
-                    visit(arg, calls);
-                }
-            }
-            Expr::Paren(e) => visit(&e.expr, calls),
-            Expr::Unary(e) => visit(&e.expr, calls),
-            Expr::Subquery(e) => visit(&e.expr, calls),
-            Expr::Aggregate(e) => visit(&e.expr, calls),
-            Expr::Binary(e) => {
-                visit(&e.lhs, calls);
-                visit(&e.rhs, calls);
-            }
-            _ => {}
-        }
-    }
-    let expression = parser::parse(&entry.canonical_promql).map_err(|e| invalid(e.to_string()))?;
-    let mut calls = Vec::new();
-    visit(&expression, &mut calls);
-    let mut proven = std::collections::BTreeSet::new();
-    for call in calls {
-        let parsed = crate::query_parser::parse_query_expr_canonical(
-            &call,
-            planner_types::types::AccuracyTarget::Exact,
-        )
-        .map_err(|e| invalid(e.to_string()))?;
-        let selected = crate::planner_selection::select_summary_default(&parsed)
-            .map_err(|e| invalid(e.to_string()))?;
-        if let Some(operator) = selected_counter_materialization(&call, &selected)? {
-            proven.insert(materialization_key(&operator)?);
-        }
-    }
-    let mut changes = Vec::new();
-    for id in entry.nodes.keys() {
-        if let Some(operator) = counter_contract(*id, &entry.nodes) {
-            if proven.contains(&materialization_key(&operator)?) {
-                changes.push((*id, operator));
-            }
-        }
-    }
-    for (id, operator) in changes {
-        entry.nodes.insert(
-            id,
-            QueryPlanNode::Logical {
-                operator,
-                inputs: vec![],
-            },
-        );
-    }
-    prune(entry);
-    Ok(())
-}
-
 fn prune(entry: &mut QueryPlanEntry) {
     let mut seen = std::collections::BTreeSet::new();
     let mut pending = vec![entry.root];
@@ -1145,27 +1043,10 @@ fn prune(entry: &mut QueryPlanEntry) {
     entry.nodes.retain(|id, _| seen.contains(id));
 }
 
-/// Disabling one materialization leaf restores its Prometheus exact subtree, not the whole query.
-pub fn apply_materialization_policy(
-    entry: &mut QueryPlanEntry,
-    policy: Option<&std::collections::BTreeSet<String>>,
-) -> Result<(), QueryPlanError> {
-    if let Some(policy) = policy {
-        for node in entry.nodes.values_mut() {
-            let QueryPlanNode::Logical { operator, inputs } = node else {
-                continue;
-            };
-            if let Some(query) = operator.exact_promql()? {
-                if !policy.contains(&materialization_key(operator)?) {
-                    *operator = LogicalOperator::ExactSubquery { query };
-                    inputs.clear();
-                }
-            }
-        }
-    }
+/// Finish the installed DAG by externalizing every residual raw subtree.
+pub fn finalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
     externalize_residuals(entry)?;
-    assign_retention(entry)?;
-    Ok(())
+    assign_retention(entry)
 }
 
 pub fn materialization_candidate_keys(
@@ -1215,68 +1096,6 @@ pub fn materialization_candidate_keys(
     Ok(keys)
 }
 
-impl LogicalOperator {
-    /// Exact fallback expression belongs to the installed contract, never reparsed from user input at serving time.
-    pub fn exact_promql(&self) -> Result<Option<String>, QueryPlanError> {
-        let (metric, matchers, range, shift, function) = match self {
-            Self::ReadRangeCounterIndex {
-                metric,
-                matchers,
-                range_ms,
-                offset_ms,
-                operation,
-                ..
-            } => (
-                metric,
-                matchers,
-                range_ms,
-                *offset_ms,
-                match operation {
-                    TemporalOperation::Rate => "rate",
-                    TemporalOperation::Increase => "increase",
-                    _ => return Err(invalid("invalid counter operation")),
-                },
-            ),
-            Self::ReadRangeMaxIndex {
-                metric,
-                matchers,
-                range_ms,
-                ..
-            } => (metric, matchers, range_ms, 0, "max_over_time"),
-            _ => return Ok(None),
-        };
-        let labels = matchers
-            .iter()
-            .map(|m| {
-                let op = match m.operation {
-                    LabelMatch::Equal => "=",
-                    LabelMatch::NotEqual => "!=",
-                    LabelMatch::Regex => "=~",
-                    LabelMatch::NotRegex => "!~",
-                };
-                Ok(format!(
-                    "{}{op}{}",
-                    m.name,
-                    serde_json::to_string(&m.value).map_err(|e| invalid(e.to_string()))?
-                ))
-            })
-            .collect::<Result<Vec<_>, QueryPlanError>>()?
-            .join(",");
-        let shifted = if shift == 0 {
-            String::new()
-        } else {
-            format!(
-                " offset {}{}ms",
-                if shift < 0 { "-" } else { "" },
-                shift.unsigned_abs()
-            )
-        };
-        let query = format!("{function}({metric}{{{labels}}}[{range}ms]{shifted})");
-        let parsed = parser::parse(&query).map_err(|e| invalid(e.to_string()))?;
-        Ok(Some(parsed.to_string()))
-    }
-}
-
 fn expression_shape(
     id: QueryNodeId,
     nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
@@ -1312,7 +1131,7 @@ fn expression_shape(
     Ok(format!("{value}({})", children.join(";")))
 }
 
-/// Collapse only maximal raw residual subtrees whose full typed expression is
+/// Collapse only maximal exact residual subtrees whose full typed expression is
 /// witnessed in the original query. Matrix boundaries remain inside Prometheus.
 pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
     fn gather(expr: &Expr, out: &mut Vec<Expr>) {
@@ -1362,11 +1181,6 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         );
         let mut exact = false;
         if let QueryPlanNode::Logical { operator, .. } = node {
-            indexed |= matches!(
-                operator,
-                LogicalOperator::ReadRangeMaxIndex { .. }
-                    | LogicalOperator::ReadRangeCounterIndex { .. }
-            );
             exact = matches!(
                 operator,
                 LogicalOperator::Scan { .. } | LogicalOperator::ExactSubquery { .. }
@@ -1442,26 +1256,6 @@ fn assign_retention(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
                         .and_then(|v| v.checked_add((*offset_ms).max(0) as u64))
                         .ok_or_else(|| invalid("retention overflow"))?;
                 }
-                LogicalOperator::ReadRangeCounterIndex {
-                    range_ms,
-                    offset_ms,
-                    retention_ms,
-                    ..
-                } => {
-                    *retention_ms = depth
-                        .checked_add(*range_ms)
-                        .and_then(|v| v.checked_add((*offset_ms).max(0) as u64))
-                        .ok_or_else(|| invalid("retention overflow"))?;
-                }
-                LogicalOperator::ReadRangeMaxIndex {
-                    range_ms,
-                    retention_ms,
-                    ..
-                } => {
-                    *retention_ms = depth
-                        .checked_add(*range_ms)
-                        .ok_or_else(|| invalid("retention overflow"))?;
-                }
                 _ => {}
             }
         }
@@ -1473,9 +1267,9 @@ fn assign_retention(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
 #[cfg(test)]
 mod remote_boundary_regressions {
     use super::*;
-    // Population conjunction order and consumer retention cannot create ghost mask keys.
+
     #[test]
-    fn policy_identity_is_independent_of_matcher_order_and_retention() {
+    fn materialization_identity_is_independent_of_matcher_order() {
         let first = LabelMatcher {
             name: "job".into(),
             value: "orders".into(),
@@ -1486,30 +1280,28 @@ mod remote_boundary_regressions {
             value: "5..".into(),
             operation: LabelMatch::Regex,
         };
-        let a = LogicalOperator::ReadRangeCounterIndex {
+        let a = MaterializationContract::Counter {
             metric: "requests".into(),
             matchers: vec![first.clone(), second.clone()],
             range_ms: 300_000,
             offset_ms: 0,
             operation: TemporalOperation::Rate,
-            retention_ms: 300_000,
         };
-        let b = LogicalOperator::ReadRangeCounterIndex {
+        let b = MaterializationContract::Counter {
             metric: "requests".into(),
             matchers: vec![second, first],
             range_ms: 300_000,
             offset_ms: 0,
             operation: TemporalOperation::Rate,
-            retention_ms: 3_600_000,
         };
         assert_eq!(
             materialization_key(&a).unwrap(),
             materialization_key(&b).unwrap()
         );
     }
-    // Both policies retain the original ratio but delegate only the disabled operand to Prometheus.
+
     #[test]
-    fn real_error_ratio_has_remote_subtree_without_any_local_scan() {
+    fn real_error_ratio_exposes_two_independent_materialization_candidates() {
         let query = "sum(rate(http_requests_total{job=\"order-service\",status=~\"5..\"}[5m])) / sum(rate(http_requests_total{job=\"order-service\"}[5m]))";
         let parsed = crate::query_parser::parse_query_expr_canonical(
             query,
@@ -1517,36 +1309,11 @@ mod remote_boundary_regressions {
         )
         .unwrap();
         let selected = crate::planner_selection::select_summary_default(&parsed).unwrap();
-        let keys = materialization_candidate_keys(query, &selected).unwrap();
-        assert_eq!(keys.len(), 2);
-        for key in keys {
-            let mut entry = QueryPlanEntry::compile_bound_composable(
-                "ratio".into(),
-                query.into(),
-                &selected,
-                InstantExecution {
-                    lookback_ms: 300_000,
-                    full_history: false,
-                    cumulative_readout: true,
-                },
-                FallbackPolicy::ExactBackend,
-                |_, _| Err(invalid("no pooled producer")),
-            )
-            .unwrap();
-            apply_materialization_policy(&mut entry, Some(&[key].into_iter().collect())).unwrap();
-            let count = |predicate: fn(&LogicalOperator) -> bool| {
-                entry.nodes.values().filter(|node| matches!(node, QueryPlanNode::Logical { operator, .. } if predicate(operator))).count()
-            };
-            assert_eq!(
-                count(|op| matches!(op, LogicalOperator::ReadRangeCounterIndex { .. })),
-                1
-            );
-            assert_eq!(
-                count(|op| matches!(op, LogicalOperator::ExactSubquery { .. })),
-                1
-            );
-            assert_eq!(count(|op| matches!(op, LogicalOperator::Scan { .. })), 0);
-            entry.validate(&Default::default()).unwrap();
-        }
+        assert_eq!(
+            materialization_candidate_keys(query, &selected)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 }

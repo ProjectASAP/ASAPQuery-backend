@@ -163,8 +163,7 @@ impl QueryPlanEntry {
             instant,
             fallback,
         };
-        logical::promote_counter_indexes(&mut entry)?;
-        logical::apply_materialization_policy(&mut entry, None)?;
+        logical::finalize_residuals(&mut entry)?;
         Ok(entry)
     }
 

@@ -27,5 +27,3 @@ pub use crate::storage_engines::sketch_db::query as asap_tier;
 pub mod tests;
 
 pub use engine::ASAPQueryEngine;
-
-pub(crate) mod range_max_index;

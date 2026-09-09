@@ -65,7 +65,6 @@ def execution_provenance(response, headers=None):
                          ("summary_readout_evaluations", "x-asap-summary-readout-evaluations"),
                          ("memo_hits", "x-asap-memo-hits"),
                          ("exact_subquery_evaluations", "x-asap-exact-subquery-evaluations"),
-                         ("index_series_reads", "x-asap-index-series-reads"),
                          ("exact_subquery_rpcs", "x-asap-exact-subquery-rpcs"),
                          ("exact_branch_evaluations", "x-asap-exact-branch-evaluations")):
         value = headers.get(header)

@@ -332,7 +332,6 @@ impl ASAPQueryEngine {
             total.remote_evaluations += stats.remote_evaluations;
             total.remote_rpcs += stats.remote_rpcs;
             total.remote_branch_evaluations += stats.remote_branch_evaluations;
-            total.index_reads += stats.index_reads;
             let QueryResult::Vector(result) = result else {
                 return Err(EngineError::capability_miss(
                     "installed_logical_dag",
@@ -369,7 +368,6 @@ impl ASAPQueryEngine {
         let mut result = QueryResult::matrix(series.into_values().collect());
         total.remote_evaluations = leaves.values().map(|leaf| leaf.remote_evaluations).sum();
         total.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
-        total.index_reads = leaves.values().map(|leaf| leaf.index_reads).sum();
         annotate_logical_execution(&mut result, &total);
         Ok(result)
     }
@@ -827,12 +825,11 @@ fn annotate_logical_execution(
         );
     }
     warnings.push(format!(
-        "asap_logical_stats:raw={},summary={},memo_hits={},remote={},index_reads={},remote_rpcs={},remote_branches={}",
+        "asap_logical_stats:raw={},summary={},memo_hits={},remote={},remote_rpcs={},remote_branches={}",
         stats.raw_scan_evaluations,
         stats.summary_readout_evaluations,
         stats.memo_hits,
         stats.remote_evaluations,
-        stats.index_reads,
         stats.remote_rpcs,
         stats.remote_branch_evaluations
     ));
@@ -947,7 +944,6 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                 stats.remote_evaluations =
                     leaves.values().map(|leaf| leaf.remote_evaluations).sum();
                 stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
-                stats.index_reads = leaves.values().map(|leaf| leaf.index_reads).sum();
                 annotate_logical_execution(&mut result, &stats);
                 return Ok(result);
             }

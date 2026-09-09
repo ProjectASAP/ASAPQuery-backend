@@ -1563,7 +1563,7 @@ fn extract_logical_provenance(
                     .and_then(|v| v.strip_prefix(prefix))
                     .and_then(|v| v.parse::<u64>().ok())
             };
-            let parsed = if values.len() == 3 || values.len() == 5 || values.len() == 7 {
+            let parsed = if matches!(values.len(), 3 | 5 | 6 | 7) {
                 parse(0, "raw=")
                     .zip(parse(1, "summary="))
                     .zip(parse(2, "memo_hits="))
@@ -1572,18 +1572,22 @@ fn extract_logical_provenance(
                     } else {
                         Some(0)
                     })
-                    .zip(if values.len() >= 5 {
+                    .zip(if matches!(values.len(), 5 | 7) {
                         parse(4, "index_reads=")
                     } else {
                         Some(0)
                     })
                     .and_then(|((((raw, summary), memo), remote), indexes)| {
-                        let rpcs = if values.len() == 7 {
+                        let rpcs = if values.len() == 6 {
+                            parse(4, "remote_rpcs=")?
+                        } else if values.len() == 7 {
                             parse(5, "remote_rpcs=")?
                         } else {
                             remote
                         };
-                        let branches = if values.len() == 7 {
+                        let branches = if values.len() == 6 {
+                            parse(5, "remote_branches=")?
+                        } else if values.len() == 7 {
                             parse(6, "remote_branches=")?
                         } else {
                             remote
@@ -1653,13 +1657,12 @@ async fn annotate_data_source(response: Response, data_source_id: &'static str) 
     if data_source_id == "asap_query" {
         if let Some(provenance) = extract_logical_provenance(&mut value) {
             let (route, detail) = match provenance {
-                Ok((raw, summary, memo, remote, indexes, rpcs, branches)) => {
+                Ok((raw, summary, memo, remote, _legacy_indexes, rpcs, branches)) => {
                     for (name, count) in [
                         ("x-asap-raw-scan-evaluations", raw),
                         ("x-asap-summary-readout-evaluations", summary),
                         ("x-asap-memo-hits", memo),
                         ("x-asap-exact-subquery-evaluations", remote),
-                        ("x-asap-index-series-reads", indexes),
                         ("x-asap-exact-subquery-rpcs", rpcs),
                         ("x-asap-exact-branch-evaluations", branches),
                     ] {
@@ -6961,13 +6964,12 @@ mod logical_provenance_tests {
     #[tokio::test]
     async fn prometheus_exact_branch_is_hybrid_without_any_local_raw_scan() {
         let response = Json(serde_json::json!({"status":"success", "warnings":[
-            "asap_execution:hybrid", "asap_logical_stats:raw=0,summary=1,memo_hits=0,remote=1,index_reads=4"
+            "asap_execution:hybrid", "asap_logical_stats:raw=0,summary=1,memo_hits=0,remote=1,remote_rpcs=1,remote_branches=1"
         ], "data":{"resultType":"vector", "result":[]}})).into_response();
         let response = annotate_data_source(response, "asap_query").await;
         assert_eq!(response.headers()["x-asap-execution-detail"], "hybrid");
         assert_eq!(response.headers()["x-asap-raw-scan-evaluations"], "0");
         assert_eq!(response.headers()["x-asap-exact-subquery-evaluations"], "1");
-        assert_eq!(response.headers()["x-asap-index-series-reads"], "4");
     }
 
     #[test]

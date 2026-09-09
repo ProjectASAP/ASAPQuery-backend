@@ -195,7 +195,6 @@ pub(super) async fn prepare(
                 remote: true,
                 remote_evaluations: usize::from(!cached),
                 remote_rpcs: usize::from(!cached),
-                index_reads: 0,
             },
         );
     }

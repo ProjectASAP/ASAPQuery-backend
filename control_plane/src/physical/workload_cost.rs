@@ -244,70 +244,6 @@ pub fn manifest(
                     add(format!("source:{}", source), source, "horizon", 1.0);
                 }
             }
-            if let crate::query_plan::QueryPlanNode::Logical {
-                operator:
-                    operator @ (crate::query_plan::logical::LogicalOperator::Scan { .. }
-                    | crate::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
-                        ..
-                    }
-                    | crate::query_plan::logical::LogicalOperator::ReadRangeCounterIndex {
-                        ..
-                    }),
-                ..
-            } = node
-            {
-                let metric = match operator {
-                    crate::query_plan::logical::LogicalOperator::Scan { metric, .. } => metric
-                        .as_ref()
-                        .ok_or_else(|| invalid("local raw scan requires named-source pricing"))?,
-                    crate::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
-                        metric,
-                        ..
-                    }
-                    | crate::query_plan::logical::LogicalOperator::ReadRangeCounterIndex {
-                        metric,
-                        ..
-                    } => metric,
-                    _ => unreachable!(),
-                };
-                if matches!(
-                    operator,
-                    crate::query_plan::logical::LogicalOperator::ReadRangeMaxIndex { .. }
-                ) {
-                    for operation in ["build", "update", "residency", "retire"] {
-                        add(
-                            format!("range-max-index:{metric}:{operation}"),
-                            json!({"operation": operation, "metric": metric, "index": "exact_per_series_range_max_v1"}),
-                            "horizon",
-                            1.0,
-                        );
-                    }
-                }
-                if matches!(
-                    operator,
-                    crate::query_plan::logical::LogicalOperator::ReadRangeCounterIndex { .. }
-                ) {
-                    for operation in ["build", "update", "residency", "retire"] {
-                        add(
-                            format!("range-counter-index:{metric}:{operation}"),
-                            json!({"operation": operation, "metric": metric, "index": "exact_per_series_range_counter_v1"}),
-                            "horizon",
-                            1.0,
-                        );
-                    }
-                }
-                let source = json!({"source": planner_types::pre_asap::Source::TimeSeries { metric: metric.clone() }, "location": "backend", "ingest": plan.precompute_plan.ingest});
-                add(format!("source:{}", source), source.clone(), "horizon", 1.0);
-                // Even an indexed read requires an available exact source for
-                // cold, evicted, or numerically unsafe index fallback.
-                let exact_source = json!({"source": planner_types::pre_asap::Source::TimeSeries { metric: metric.clone() }, "location": "exact_backend"});
-                add(
-                    format!("source:{}", exact_source),
-                    exact_source,
-                    "horizon",
-                    1.0,
-                );
-            }
         }
         // Reachability comes from QueryPlan, including materialization reads,
         // arithmetic, reduction and a complete engine-native exact fallback.
@@ -463,7 +399,7 @@ pub fn select(
     }
     let policies: BTreeSet<_> = candidates
         .iter()
-        .filter(|c| c.local_raw_execution)
+        .filter(|c| c.hybrid_execution)
         .filter_map(|c| c.materialization_policy.clone())
         .collect();
     let leaves: BTreeSet<_> = policies.iter().flat_map(|p| p.iter().cloned()).collect();
@@ -553,7 +489,7 @@ pub fn with_exact_alternative(
     request: PlanningRequest,
 ) -> Result<Vec<PlanningRequest>, CompileError> {
     let mut exact = request.clone();
-    exact.local_raw_execution = false;
+    exact.hybrid_execution = false;
     exact.materialization_policy = None;
     for query in &mut exact.queries {
         let parsed = crate::query_parser::parse_query_expr_canonical(
@@ -564,7 +500,7 @@ pub fn with_exact_alternative(
         query.post_asap = crate::planner_selection::keep_pre_asap(&parsed)
             .map_err(|error| invalid(error.to_string()))?;
     }
-    if !request.local_raw_execution
+    if !request.hybrid_execution
         && request
             .queries
             .iter()
@@ -573,7 +509,7 @@ pub fn with_exact_alternative(
     {
         Ok(vec![request])
     } else {
-        if !request.local_raw_execution || request.materialization_policy.is_some() {
+        if !request.hybrid_execution || request.materialization_policy.is_some() {
             return Ok(vec![request, exact]);
         }
         let mut keys = BTreeSet::new();
@@ -723,7 +659,7 @@ mod tests {
                     crate::query_plan::QueryPlanNode::ExactFallback { .. }
                 ))));
         }
-        assert!(!candidates.last().unwrap().local_raw_execution);
+        assert!(!candidates.last().unwrap().hybrid_execution);
     }
 
     fn quoted() -> (
@@ -764,7 +700,7 @@ mod tests {
 
     // Retained local input is priced once per metric, separate from the native service.
     #[test]
-    fn counter_index_manifest_prices_owned_state_and_distinct_native_alternative() {
+    fn counter_materialization_manifest_prices_owned_state_and_distinct_native_alternative() {
         use planner_types::workload::{AccuracyRequirement, Query};
         let mut snapshot = fixture();
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];

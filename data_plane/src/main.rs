@@ -44,8 +44,8 @@ fn unix_time_ms() -> u64 {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Runtime component profile. `asapquery` enables backend-local raw
-    /// Remote Write precompute and rejects Collector/OTLP-only components.
+    /// Runtime component profile. `asapquery` enables backend ingest-time
+    /// materialization and rejects Collector/OTLP-only components.
     #[arg(long, value_enum, default_value = "distributed")]
     profile: RuntimeProfile,
 

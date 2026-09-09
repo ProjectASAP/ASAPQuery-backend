@@ -743,13 +743,6 @@ mod tests {
     }
 
     fn physical_config(streaming: StreamingConfig) -> HotReloadStreamingConfig {
-        physical_config_with_raw(streaming, false, false)
-    }
-    fn physical_config_with_raw(
-        streaming: StreamingConfig,
-        retain_raw: bool,
-        indexed: bool,
-    ) -> HotReloadStreamingConfig {
         use control_plane::physical::compiler::{
             FrameIdentityContract, IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan,
             SequenceScope, TimestampUnit, TransmissionPlan, PLANNER_REVISION,
@@ -764,7 +757,7 @@ mod tests {
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
-        let mut active = ActivePhysicalPlan {
+        let active = ActivePhysicalPlan {
             precompute_plan: PrecomputePlan {
                 envelope: envelope.clone(),
                 ingest: IngestContract {
@@ -794,47 +787,6 @@ mod tests {
             query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(BackendStorageRouting::empty()),
         };
-        if retain_raw {
-            use control_plane::query_plan::{
-                FallbackPolicy, InstantExecution, QueryNodeId, QueryPlanEntry, QueryPlanNode,
-            };
-            let id = QueryNodeId(0);
-            let query = QueryPlanEntry {
-                query_id: "raw".into(),
-                canonical_promql: "requests_total".into(),
-                root: id,
-                nodes: std::collections::BTreeMap::from([(
-                    id,
-                    QueryPlanNode::Logical {
-                        operator: if indexed {
-                            control_plane::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
-                                metric: "requests_total".into(),
-                                retention_ms: 60_000,
-                                matchers: vec![],
-                                range_ms: 60_000,
-                            }
-                        } else {
-                            control_plane::query_plan::logical::LogicalOperator::Scan {
-                                metric: Some("requests_total".into()),
-                                matchers: vec![],
-                                range_ms: None,
-                                offset_ms: 0,
-                            }
-                        },
-                        inputs: vec![],
-                    },
-                )]),
-                instant: InstantExecution {
-                    lookback_ms: 300_000,
-                    full_history: false,
-                    cumulative_readout: true,
-                },
-                fallback: FallbackPolicy::ExactBackend,
-            };
-            let mut plan = control_plane::query_plan::QueryPlan::empty();
-            plan.entries.insert("requests_total".into(), query);
-            active.query_plan = Arc::new(plan);
-        }
         HotReloadStreamingConfig::from_active(HotReloadActivePhysicalPlan::new(active))
     }
 
@@ -855,17 +807,6 @@ mod tests {
     }
 
     fn configured_receiver() -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
-        configured_receiver_with_raw(false)
-    }
-    fn configured_receiver_with_raw(
-        retain_raw: bool,
-    ) -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
-        configured_receiver_with_index(retain_raw, retain_raw)
-    }
-    fn configured_receiver_with_index(
-        retain_raw: bool,
-        indexed: bool,
-    ) -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
         use asap_types::enums::WindowKind;
         use asap_types::{AggregationConfig, AggregationType, KeyByLabelNames};
         let aggregation = AggregationConfig {
@@ -893,7 +834,7 @@ mod tests {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: physical_config_with_raw(streaming, retain_raw, indexed),
+            hot_reload_config: physical_config(streaming),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),

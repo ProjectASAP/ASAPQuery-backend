@@ -126,8 +126,8 @@ pub struct LifecyclePlanningInput {
 
 #[derive(Debug, Clone, Default)]
 pub struct PlanningRequest {
-    /// Enable installed typed raw residuals for this backend-local candidate.
-    pub local_raw_execution: bool,
+    /// Enable a composable DAG with SummaryStore materializations and Prometheus exact subtrees.
+    pub hybrid_execution: bool,
     /// Allowed materialization leaf contracts; None enables every eligible leaf.
     pub materialization_policy: Option<BTreeSet<String>>,
     /// Original dashboard demand, in the same order as queries. None is legacy input.
@@ -1563,7 +1563,7 @@ impl BackendLocalPlanningSnapshot {
                 // compatibility policy. Local residual candidates are enumerated by
                 // planning_request and admitted through measured workload selection.
                 let mut request = request;
-                request.local_raw_execution = false;
+                request.hybrid_execution = false;
                 PhysicalCompiler.compile(request, environment)
             }
         }
@@ -1708,7 +1708,7 @@ impl BackendLocalPlanningSnapshot {
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
             PlanningRequest {
-                local_raw_execution: true,
+                hybrid_execution: true,
                 materialization_policy: None,
                 query_workload: Some(workload),
                 queries,
@@ -1820,11 +1820,11 @@ impl PhysicalCompiler {
         mut request: PlanningRequest,
         environment: DeploymentEnvironment,
     ) -> Result<PhysicalPlan, CompileError> {
-        if request.local_raw_execution
+        if request.hybrid_execution
             && environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite
         {
             return Err(CompileError::Snapshot(
-                "typed raw residuals require backend-local execution".into(),
+                "hybrid execution requires backend-local deployment".into(),
             ));
         }
         if request.planner_revision != PLANNER_REVISION {
@@ -1855,7 +1855,7 @@ impl PhysicalCompiler {
         }
 
         if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite
-            && !request.local_raw_execution
+            && !request.hybrid_execution
         {
             preserve_native_unsafe_raw_roots(&mut request.queries)?;
         }
@@ -1883,7 +1883,7 @@ impl PhysicalCompiler {
         let consumers = materialization_consumers(
             &request.queries,
             environment.target,
-            request.local_raw_execution,
+            request.hybrid_execution,
         )?;
         let mut lifecycle_estimates =
             BTreeMap::<asap_types::PolicyFingerprint, MaterializationLifecycleEstimate>::new();
@@ -1894,7 +1894,7 @@ impl PhysicalCompiler {
                 validate_evidence(&query.query_id, e, &environment)?;
             }
             let node = query.post_asap.clone();
-            let selected = collect_selected_materializations(&node, request.local_raw_execution)
+            let selected = collect_selected_materializations(&node, request.hybrid_execution)
                 .map_err(|reason| CompileError::Query {
                     query_id: query.query_id.clone(),
                     reason,
@@ -1902,7 +1902,7 @@ impl PhysicalCompiler {
             let selected = selected
                 .into_iter()
                 .filter(|state| {
-                    (!request.local_raw_execution
+                    (!request.hybrid_execution
                         || state.window_secs.is_none_or(|window| {
                             query
                                 .window_implementations
@@ -1964,7 +1964,7 @@ impl PhysicalCompiler {
             {
                 return Err(CompileError::Query {
                     query_id: query.query_id.clone(),
-                    reason: "observation-count readout requires the backend-local raw producer"
+                    reason: "observation-count readout requires the backend precompute producer"
                         .into(),
                 });
             }
@@ -2179,7 +2179,7 @@ impl PhysicalCompiler {
             }
         }
 
-        let plan_id = if request.local_raw_execution {
+        let plan_id = if request.hybrid_execution {
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             stable_workload_plan_id(&plan_materializations, &request.queries).hash(&mut hash);
@@ -2349,7 +2349,7 @@ impl PhysicalCompiler {
                 full_history: false,
                 cumulative_readout: true,
             };
-            let mut entry = if request.local_raw_execution {
+            let mut entry = if request.hybrid_execution {
                 QueryPlanEntry::compile_bound_composable(
                     query.query_id.clone(),
                     canonical.clone(),
@@ -2368,14 +2368,11 @@ impl PhysicalCompiler {
                     binding,
                 )
             }?;
-            if request.local_raw_execution {
+            if request.hybrid_execution {
                 // Any Planner-selected leaf without a physical summary binding
                 // is an exact subtree boundary. Deployed plans never retain a
                 // backend-local range index leaf.
-                crate::query_plan::logical::apply_materialization_policy(
-                    &mut entry,
-                    Some(&BTreeSet::new()),
-                )?;
+                crate::query_plan::logical::finalize_residuals(&mut entry)?;
             }
             if query_entries.insert(canonical.clone(), entry).is_some() {
                 return Err(CompileError::Query {
@@ -2961,7 +2958,9 @@ pub(crate) fn materialization_leaf_contract(
             };
             Ok((metric.clone(), window_secs, spatial_filter))
         }
-        _ => Err("source predicates or temporal modifiers require a local raw residual".into()),
+        _ => {
+            Err("source predicates or temporal modifiers require a Prometheus exact subtree".into())
+        }
     }
 }
 
@@ -3485,7 +3484,7 @@ mod tests {
             evidence_by_query.insert(query_id.to_string(), evidence);
         }
         Ok(PlanningRequest {
-            local_raw_execution: false,
+            hybrid_execution: false,
             materialization_policy: None,
             query_workload: None,
             queries: vec![PlanningQuery {
@@ -3818,7 +3817,7 @@ mod tests {
             entries[0].query = Query(query.into());
             entries[0].requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
             let (mut request, environment) = snapshot.planning_request().unwrap();
-            request.local_raw_execution = false;
+            request.hybrid_execution = false;
             let bundle = PhysicalCompiler.compile(request, environment).unwrap();
             assert!(bundle.precompute_plan.materializations.is_empty());
             assert!(bundle.query_plan.entries.values().all(|entry| matches!(
