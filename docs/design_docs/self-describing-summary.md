@@ -32,10 +32,13 @@ using them. The current backend fields are an incremental implementation of this
 model. They must converge on the identities and invariants below rather than add
 operator-specific stores beside `SketchStore`.
 
-## Concrete backend model
+## Target semantic model
 
-The durable model has descriptor registries plus pane instances. IDs are hashes
-of canonical semantic content; display names and runtime SIDs are not identities.
+The target model has descriptor registries plus pane instances. Descriptor IDs
+are derived from canonical semantic content; display names and runtime SIDs are
+not descriptor identities. The current implementation uses the canonical string
+itself as the ID. A future hashed representation must preserve the same content
+identity and handle collisions explicitly.
 
 ```rust
 struct SummaryDescriptor {
@@ -74,20 +77,33 @@ The backend maps this model onto its execution components as follows:
 | Query engine | Resolve plan references, select complete instances, merge/read out their state and combine exact Prometheus subquery results |
 | `rollups` | Hold typed, rebuildable indexes derived from canonical instances |
 
-The in-memory representation is normalized. `SummaryDescriptorRegistry`
+## Implemented backend representation
+
+The in-memory descriptor representation is normalized. `SummaryDescriptorRegistry`
 content-interns Summary and Data Descriptors. A SID owns an `SdsBinding` with
 shared `Arc` references to both descriptors. Pane rows store the SID foreign
 key, `[start, end)`, interned group values and state; together these fields form
 the Summary Instance. This avoids repeating descriptors in every pane and lets
-catalog snapshots and query lookups clone pointers rather than strings, label
-sets and operator configuration. `SketchInstanceMetadata` remains the temporary
-registration and persistence compatibility DTO while older sidecars are read.
+catalog snapshots and query lookups clone pointers rather than descriptor data.
+The registry holds weak references, so retiring the final SID also releases its
+descriptors. `SketchInstanceMetadata` remains the registration and persistence
+compatibility DTO while older sidecars are read.
+
+The implemented `SummaryDescriptor` currently contains one `SummaryOperator`,
+one derived `FidelityGuarantee`, and a numeric state-schema version. The
+implemented `DataDescriptor` contains metric name, canonical population filter,
+and grouping keys. Observation semantics, structured state schemas, and a
+standalone `SummaryInstance` API remain target-model work; pane state and
+completeness/lineage tracking currently live in existing `SketchStore` tables.
 
 An ingest record is never an SDS instance. Raw samples can be transient inputs to
 the precompute engine, but the backend does not retain them as a second exact
 query store. Exact residual subtrees run in Prometheus.
 
-The store enforces these invariants:
+The target model requires these invariants. The current implementation enforces
+descriptor binding and non-overlapping pane selection; the remaining structured
+schema and instance contracts must be completed before claiming full SDS
+conformance:
 
 1. An instance references exactly one immutable Summary Descriptor and one
    immutable Data Descriptor.
