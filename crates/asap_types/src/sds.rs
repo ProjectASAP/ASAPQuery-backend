@@ -1,0 +1,490 @@
+//! Shared SDS descriptor contracts. Instances, state bytes, and registry lifetimes
+//! remain backend-owned. Canonical IDs describe content, never SID or policy IDs.
+use crate::{AggregationType, PrecomputeMaterialization};
+use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryFamilyType};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdsError(pub String);
+impl std::fmt::Display for SdsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for SdsError {}
+
+macro_rules! descriptor_id {
+    ($name:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(String);
+        impl $name {
+            pub fn canonical(&self) -> &str {
+                &self.0
+            }
+        }
+    };
+}
+descriptor_id!(SummaryDescriptorId);
+descriptor_id!(DataDescriptorId);
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SummaryOperator {
+    /// Compatibility evidence from a legacy backend record, not a complete
+    /// configured contract. Its ID can never satisfy a Configured descriptor.
+    LegacyPartial { operator_canonical: String },
+    Sketch {
+        algorithm: SketchAlgorithm,
+        parameters: BTreeMap<String, Value>,
+    },
+    ExactAgg {
+        agg_type: AggregationType,
+        parameters_canonical: String,
+    },
+    /// Complete planner materialization configuration, including heap/Hydra
+    /// dimensions and readout/update subtype. Never equal to a legacy projection.
+    Configured {
+        aggregation_type: AggregationType,
+        aggregation_sub_type: String,
+        parameters: BTreeMap<String, Value>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum FidelityGuarantee {
+    Exact,
+    KllRankError {
+        k: u32,
+        model: String,
+    },
+    DdSketchRelativeError {
+        alpha: f64,
+    },
+    HllCardinalityError {
+        precision: u32,
+        model: String,
+    },
+    CmsFrequencyError {
+        width: u32,
+        depth: u32,
+        model: String,
+    },
+    CountSketchFrequencyError {
+        width: u32,
+        depth: u32,
+        model: String,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+impl FidelityGuarantee {
+    /// Model IDs name parameterized error families/scopes, not certified numeric
+    /// epsilon/confidence values. Heap membership and Hydra cross-cell readouts
+    /// need separate models; point-frequency/per-cell rank does not attest them.
+    pub fn from_config(config: &PrecomputeMaterialization) -> Self {
+        if config.aggregation_type == AggregationType::HLL {
+            let precision = config
+                .parameters
+                .get("precision")
+                .or_else(|| config.parameters.get("p"))
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(14);
+            return Self::HllCardinalityError {
+                precision,
+                model: "asap.hll.relative-cardinality.v1".into(),
+            };
+        }
+        match config.accumulator_spec().map(|s| s.family) {
+            Ok(SummaryFamilyType::ExactAggregate(..)) => Self::Exact,
+            Ok(SummaryFamilyType::Sketch(kind, _)) => match kind.params() {
+                SketchParams::Kll { k } => Self::KllRankError {
+                    k: *k,
+                    model: if config.aggregation_type == AggregationType::HydraKLL {
+                        "asap.hydra-kll.per-cell-rank.v1"
+                    } else {
+                        "asap.kll.normalized-rank.v1"
+                    }
+                    .into(),
+                },
+                SketchParams::DDSketch { alpha } => Self::DdSketchRelativeError { alpha: *alpha },
+                SketchParams::Hll { precision } => Self::HllCardinalityError {
+                    precision: (*precision).into(),
+                    model: "asap.hll.relative-cardinality.v1".into(),
+                },
+                SketchParams::Cms { width, depth }
+                | SketchParams::CmsWithHeap { width, depth, .. } => Self::CmsFrequencyError {
+                    width: *width,
+                    depth: *depth,
+                    model: "asap.cms.point-frequency.v1".into(),
+                },
+                SketchParams::CountSketch { width, depth }
+                | SketchParams::CountSketchWithHeap { width, depth, .. } => {
+                    Self::CountSketchFrequencyError {
+                        width: *width,
+                        depth: *depth,
+                        model: "asap.count-sketch.point-frequency.v1".into(),
+                    }
+                }
+                _ => Self::Unknown {
+                    reason: "No shared parameterized error model for this sketch family".into(),
+                },
+            },
+            _ => Self::Unknown {
+                reason: "Physical accumulator family is unavailable".into(),
+            },
+        }
+    }
+    fn validate(&self) -> Result<(), SdsError> {
+        let valid = match self {
+            Self::Exact => true,
+            Self::KllRankError { k, model } => *k > 0 && !model.is_empty(),
+            Self::DdSketchRelativeError { alpha } => {
+                alpha.is_finite() && *alpha > 0.0 && *alpha < 1.0
+            }
+            Self::HllCardinalityError { precision, model } => {
+                *precision > 0 && *precision < 64 && !model.is_empty()
+            }
+            Self::CmsFrequencyError {
+                width,
+                depth,
+                model,
+            }
+            | Self::CountSketchFrequencyError {
+                width,
+                depth,
+                model,
+            } => *width > 0 && *depth > 0 && !model.is_empty(),
+            Self::Unknown { reason } => !reason.is_empty(),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(SdsError("invalid parameterized fidelity contract".into()))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryDescriptor {
+    pub id: SummaryDescriptorId,
+    pub operator: SummaryOperator,
+    pub fidelity: FidelityGuarantee,
+    pub state_schema_version: u32,
+}
+
+/// Sort every JSON object, including nested configuration values. Arrays retain
+/// order; opaque canonical strings are used verbatim, not reparsed as PromQL.
+fn canonical(value: &Value) -> String {
+    match value {
+        Value::Object(map) => {
+            let sorted: BTreeMap<_, _> = map.iter().collect();
+            format!(
+                "{{{}}}",
+                sorted
+                    .into_iter()
+                    .map(|(k, v)| format!("{}:{}", serde_json::to_string(k).unwrap(), canonical(v)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
+        Value::Array(values) => format!(
+            "[{}]",
+            values.iter().map(canonical).collect::<Vec<_>>().join(",")
+        ),
+        _ => value.to_string(),
+    }
+}
+impl SummaryDescriptor {
+    pub fn new(
+        operator: SummaryOperator,
+        fidelity: FidelityGuarantee,
+        state_schema_version: u32,
+    ) -> Result<Self, SdsError> {
+        if state_schema_version == 0 {
+            return Err(SdsError("state schema version must be positive".into()));
+        }
+        fidelity.validate()?;
+        let content = json!({"operator":operator,"fidelity":fidelity,"state_schema_version":state_schema_version});
+        let id = SummaryDescriptorId(format!("summary:v2:{}", canonical(&content)));
+        Ok(Self {
+            id,
+            operator,
+            fidelity,
+            state_schema_version,
+        })
+    }
+    pub fn id(&self) -> &SummaryDescriptorId {
+        &self.id
+    }
+    pub fn validate(&self) -> Result<(), SdsError> {
+        let rebuilt = Self::new(
+            self.operator.clone(),
+            self.fidelity.clone(),
+            self.state_schema_version,
+        )?;
+        if self.id != rebuilt.id {
+            return Err(SdsError("summary descriptor ID/content mismatch".into()));
+        }
+        Ok(())
+    }
+
+    /// Preserve every configured state/update parameter. Omitted defaults remain
+    /// distinct from explicit defaults (conservative identity, never false sharing).
+    /// Legacy AggKind projections intentionally have different operator variants:
+    /// they cannot attest heap, Hydra, or aggregation-subtype semantics they lost.
+    pub fn from_config(config: &PrecomputeMaterialization) -> Result<Self, SdsError> {
+        let fidelity = FidelityGuarantee::from_config(config);
+        Self::new(
+            SummaryOperator::Configured {
+                aggregation_type: config.aggregation_type,
+                aggregation_sub_type: config.aggregation_sub_type.clone(),
+                parameters: config
+                    .parameters
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            },
+            fidelity,
+            1,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataDescriptor {
+    pub id: DataDescriptorId,
+    pub metric_name: String,
+    pub population_filter_canonical: String,
+    pub group_by_keys: BTreeSet<String>,
+}
+impl DataDescriptor {
+    pub fn new(
+        metric: impl Into<String>,
+        filter: impl Into<String>,
+        group_by: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let metric_name = metric.into();
+        let population_filter_canonical = filter.into();
+        let group_by_keys = group_by.into_iter().collect();
+        let id = data_descriptor_id(&metric_name, &population_filter_canonical, &group_by_keys);
+        Self {
+            id,
+            metric_name,
+            population_filter_canonical,
+            group_by_keys,
+        }
+    }
+    pub fn id(&self) -> &DataDescriptorId {
+        &self.id
+    }
+    pub fn validate(&self) -> Result<(), SdsError> {
+        if self.id
+            != data_descriptor_id(
+                &self.metric_name,
+                &self.population_filter_canonical,
+                &self.group_by_keys,
+            )
+        {
+            return Err(SdsError("data descriptor ID/content mismatch".into()));
+        }
+        Ok(())
+    }
+}
+fn data_descriptor_id(metric: &str, filter: &str, group_by: &BTreeSet<String>) -> DataDescriptorId {
+    // Preserve the existing v1 length-framed data identity, now normalizing the
+    // grouping set at the shared contract boundary.
+    let mut key = format!(
+        "data:v1|{}:{metric}|{}:{filter}",
+        metric.len(),
+        filter.len()
+    );
+    for name in group_by {
+        key.push_str(&format!("|{}:{name}", name.len()));
+    }
+    DataDescriptorId(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn descriptor(k: u32, fidelity: FidelityGuarantee, version: u32) -> SummaryDescriptor {
+        SummaryDescriptor::new(
+            SummaryOperator::Sketch {
+                algorithm: SketchAlgorithm::Kll,
+                parameters: BTreeMap::from([("k".into(), json!(k))]),
+            },
+            fidelity,
+            version,
+        )
+        .unwrap()
+    }
+    #[test]
+    fn identity_includes_configuration_fidelity_and_state_schema() {
+        let base = descriptor(
+            200,
+            FidelityGuarantee::Unknown {
+                reason: "not supplied".into(),
+            },
+            1,
+        );
+        assert_ne!(
+            base.id,
+            descriptor(
+                201,
+                FidelityGuarantee::Unknown {
+                    reason: "not supplied".into()
+                },
+                1
+            )
+            .id
+        );
+        assert_ne!(base.id, descriptor(200, FidelityGuarantee::Exact, 1).id);
+        assert_ne!(
+            base.id,
+            descriptor(
+                200,
+                FidelityGuarantee::Unknown {
+                    reason: "not supplied".into()
+                },
+                2
+            )
+            .id
+        );
+    }
+    #[test]
+    fn group_order_and_duplicates_do_not_change_identity() {
+        let a = DataDescriptor::new("cpu", "{job=\"a\"}", ["z".into(), "a".into(), "a".into()]);
+        let b = DataDescriptor::new("cpu", "{job=\"a\"}", ["a".into(), "z".into()]);
+        assert_eq!(a, b);
+        assert_ne!(
+            a.id,
+            DataDescriptor::new("cpu", "{job=\"b\"}", ["a".into(), "z".into()]).id
+        );
+    }
+    #[test]
+    fn length_framing_distinguishes_delimiters_and_unicode() {
+        assert_ne!(
+            DataDescriptor::new("a|b", "c", []).id,
+            DataDescriptor::new("a", "b|c", []).id
+        );
+        assert_ne!(
+            DataDescriptor::new("π", "", ["x|y".into()]).id,
+            DataDescriptor::new("π", "", ["x".into(), "y".into()]).id
+        );
+    }
+    #[test]
+    fn wire_roundtrip_and_tampered_id_validation() {
+        let original = descriptor(
+            200,
+            FidelityGuarantee::Unknown {
+                reason: "not supplied".into(),
+            },
+            1,
+        );
+        let mut decoded: SummaryDescriptor =
+            serde_json::from_str(&serde_json::to_string(&original).unwrap()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(decoded, original);
+        decoded.state_schema_version = 2;
+        assert!(decoded.validate().is_err());
+        let mut data = DataDescriptor::new("cpu", "", []);
+        data.metric_name = "other".into();
+        assert!(data.validate().is_err());
+    }
+    #[test]
+    fn invalid_fidelity_is_rejected() {
+        assert!(SummaryDescriptor::new(
+            SummaryOperator::ExactAgg {
+                agg_type: AggregationType::Sum,
+                parameters_canonical: String::new()
+            },
+            FidelityGuarantee::DdSketchRelativeError { alpha: f64::NAN },
+            1
+        )
+        .is_err());
+    }
+    #[test]
+    fn configured_identity_preserves_heap_hydra_and_subtype_and_excludes_population() {
+        let yaml:serde_yaml::Value=serde_yaml::from_str("aggregationType: DDSketch\naggregationSubType: ''\nmetric: m\nlabels:\n  grouping: []\n  rollup: []\n  aggregated: []\nparameters:\n  relative_accuracy: 0.01\nwindowSize: 30\nwindowType: tumbling\nspatialFilter: ''\n").unwrap();
+        let mut config =
+            PrecomputeMaterialization::from_yaml_data(&yaml, None, crate::QueryLanguage::promql)
+                .unwrap();
+        assert!(matches!(
+            SummaryDescriptor::from_config(&config).unwrap().fidelity,
+            FidelityGuarantee::DdSketchRelativeError { .. }
+        ));
+        for (kind, key) in [
+            (AggregationType::CountMinSketchWithHeap, "heap_size"),
+            (AggregationType::HydraKLL, "row"),
+            (AggregationType::HydraKLL, "col"),
+            (AggregationType::HydraKLL, "k"),
+        ] {
+            config.aggregation_type = kind;
+            config.parameters.insert(key.into(), json!(10));
+            let before = SummaryDescriptor::from_config(&config).unwrap();
+            config.parameters.insert(key.into(), json!(11));
+            let after = SummaryDescriptor::from_config(&config).unwrap();
+            assert_ne!(before.id, after.id, "{key}");
+            config.metric = "other".into();
+            config.spatial_filter_normalized = "job=a".into();
+            assert_eq!(
+                after.id,
+                SummaryDescriptor::from_config(&config).unwrap().id
+            );
+        }
+        let before = SummaryDescriptor::from_config(&config).unwrap();
+        config.aggregation_sub_type = "max".into();
+        assert_ne!(
+            before.id,
+            SummaryDescriptor::from_config(&config).unwrap().id
+        );
+    }
+    #[test]
+    fn canonical_nested_parameters_and_model_versions_are_identity() {
+        let a = SummaryOperator::Configured {
+            aggregation_type: AggregationType::Sum,
+            aggregation_sub_type: String::new(),
+            parameters: BTreeMap::from([("nested".into(), json!({"z":1,"a":2}))]),
+        };
+        let b = SummaryOperator::Configured {
+            aggregation_type: AggregationType::Sum,
+            aggregation_sub_type: String::new(),
+            parameters: BTreeMap::from([("nested".into(), json!({"a":2,"z":1}))]),
+        };
+        assert_eq!(
+            SummaryDescriptor::new(a.clone(), FidelityGuarantee::Exact, 1)
+                .unwrap()
+                .id,
+            SummaryDescriptor::new(b, FidelityGuarantee::Exact, 1)
+                .unwrap()
+                .id
+        );
+        let first = SummaryDescriptor::new(
+            a.clone(),
+            FidelityGuarantee::KllRankError {
+                k: 200,
+                model: "rank.v1".into(),
+            },
+            1,
+        )
+        .unwrap();
+        let second = SummaryDescriptor::new(
+            a,
+            FidelityGuarantee::KllRankError {
+                k: 200,
+                model: "rank.v2".into(),
+            },
+            1,
+        )
+        .unwrap();
+        assert_ne!(first.id, second.id);
+    }
+}

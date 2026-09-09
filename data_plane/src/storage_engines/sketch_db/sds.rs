@@ -7,81 +7,72 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock, Weak};
 
-use super::data::{AccuracyBound, AggKind, SketchAlgorithm, SketchConfig};
+use super::data::{AggKind, SketchConfig};
 use super::index::SketchInstanceMetadata;
+#[cfg(test)]
 use crate::storage_engines::types::AggregationType;
+pub use asap_types::sds::{
+    DataDescriptor, DataDescriptorId, FidelityGuarantee, SummaryDescriptor, SummaryDescriptorId,
+    SummaryOperator,
+};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SummaryDescriptorId(Arc<str>);
-
-impl SummaryDescriptorId {
-    pub fn canonical(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DataDescriptorId(Arc<str>);
-
-impl DataDescriptorId {
-    pub fn canonical(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum SummaryOperator {
-    Sketch {
-        algorithm: SketchAlgorithm,
-        config: SketchConfig,
-    },
-    ExactAgg {
-        agg_type: AggregationType,
-        parameters_canonical: Arc<str>,
-    },
-}
-
-impl SummaryOperator {
-    fn from_agg_kind(kind: &AggKind) -> Self {
-        match kind {
-            AggKind::Sketch {
-                algorithm, config, ..
-            } => Self::Sketch {
-                algorithm: algorithm.clone(),
-                config: config.clone(),
+// Legacy records lack some state-shape dimensions (heap/Hydra/subtype). Do not
+// let these projections masquerade as an authoritative Configured descriptor.
+fn legacy_summary(kind: &AggKind) -> SummaryDescriptor {
+    let fidelity = match kind {
+        AggKind::ExactAgg { .. } => FidelityGuarantee::Exact,
+        AggKind::Sketch { config, .. } => match config {
+            SketchConfig::Kll { k } => FidelityGuarantee::KllRankError {
+                k: *k,
+                model: "asap.kll.normalized-rank.v1".into(),
             },
-            AggKind::ExactAgg {
-                agg_type,
-                parameters_canonical,
-                ..
-            } => Self::ExactAgg {
-                agg_type: *agg_type,
-                parameters_canonical: Arc::from(parameters_canonical.as_str()),
+            SketchConfig::DDSketch { relative_accuracy } => {
+                FidelityGuarantee::DdSketchRelativeError {
+                    alpha: *relative_accuracy,
+                }
+            }
+            SketchConfig::Hll { precision } => FidelityGuarantee::HllCardinalityError {
+                precision: *precision,
+                model: "asap.hll.relative-cardinality.v1".into(),
             },
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum FidelityGuarantee {
-    Exact,
-    Approximate(AccuracyBound),
-}
-
-#[derive(Debug)]
-pub struct SummaryDescriptor {
-    pub id: SummaryDescriptorId,
-    pub operator: SummaryOperator,
-    pub fidelity: FidelityGuarantee,
-    pub state_schema_version: u32,
-}
-
-#[derive(Debug)]
-pub struct DataDescriptor {
-    pub id: DataDescriptorId,
-    pub metric_name: Arc<str>,
-    pub population_filter_canonical: Arc<str>,
-    pub group_by_keys: Arc<BTreeSet<String>>,
+            SketchConfig::CountMin { rows, cols } if *rows > 0 && *cols > 0 => {
+                FidelityGuarantee::CmsFrequencyError {
+                    width: *cols as u32,
+                    depth: *rows as u32,
+                    model: "asap.cms.point-frequency.v1".into(),
+                }
+            }
+            SketchConfig::CountSketch { rows, cols } if *rows > 0 && *cols > 0 => {
+                FidelityGuarantee::CountSketchFrequencyError {
+                    width: *cols as u32,
+                    depth: *rows as u32,
+                    model: "asap.count-sketch.point-frequency.v1".into(),
+                }
+            }
+            _ => FidelityGuarantee::Unknown {
+                reason: "Legacy configuration has invalid dimensions".into(),
+            },
+        },
+    };
+    SummaryDescriptor::new(
+        SummaryOperator::LegacyPartial {
+            operator_canonical: kind.operator_canonical_string(),
+        },
+        fidelity,
+        1,
+    )
+    .unwrap_or_else(|_| {
+        SummaryDescriptor::new(
+            SummaryOperator::LegacyPartial {
+                operator_canonical: kind.operator_canonical_string(),
+            },
+            FidelityGuarantee::Unknown {
+                reason: "Legacy configuration has invalid fidelity parameters".into(),
+            },
+            1,
+        )
+        .expect("unknown legacy descriptor has valid version and reason")
+    })
 }
 
 /// Runtime foreign-key binding from one SID to shared descriptors. Every pane
@@ -120,16 +111,7 @@ impl SummaryDescriptorRegistry {
             if let Some(existing) = summaries.get(&summary_id).and_then(Weak::upgrade) {
                 existing
             } else {
-                let fidelity = match metadata.agg_kind.capability_and_accuracy().1 {
-                    Some(bound) => FidelityGuarantee::Approximate(bound),
-                    None => FidelityGuarantee::Exact,
-                };
-                let descriptor = Arc::new(SummaryDescriptor {
-                    id: summary_id.clone(),
-                    operator: SummaryOperator::from_agg_kind(&metadata.agg_kind),
-                    fidelity,
-                    state_schema_version: 1,
-                });
+                let descriptor = Arc::new(legacy_summary(&metadata.agg_kind));
                 summaries.insert(summary_id, Arc::downgrade(&descriptor));
                 descriptor
             }
@@ -146,12 +128,11 @@ impl SummaryDescriptorRegistry {
             if let Some(existing) = data.get(&data_id).and_then(Weak::upgrade) {
                 existing
             } else {
-                let descriptor = Arc::new(DataDescriptor {
-                    id: data_id,
-                    metric_name: Arc::from(metadata.metric_name.as_str()),
-                    population_filter_canonical: Arc::from(filter),
-                    group_by_keys: Arc::new(metadata.group_by_keys.clone()),
-                });
+                let descriptor = Arc::new(DataDescriptor::new(
+                    metadata.metric_name.clone(),
+                    filter,
+                    metadata.group_by_keys.iter().cloned(),
+                ));
                 data.insert(descriptor.id.clone(), Arc::downgrade(&descriptor));
                 descriptor
             }
@@ -201,14 +182,8 @@ impl SummaryDescriptorRegistry {
             * (std::mem::size_of::<SummaryDescriptorId>()
                 + std::mem::size_of::<Weak<SummaryDescriptor>>());
         for descriptor in summaries.values().filter_map(Weak::upgrade) {
-            total += std::mem::size_of::<SummaryDescriptor>() + descriptor.id.0.len();
-            if let SummaryOperator::ExactAgg {
-                parameters_canonical,
-                ..
-            } = &descriptor.operator
-            {
-                total += parameters_canonical.len();
-            }
+            total += std::mem::size_of::<SummaryDescriptor>() + descriptor.id.canonical().len();
+            total += serde_json::to_string(&descriptor.operator).map_or(0, |value| value.len());
         }
         drop(summaries);
 
@@ -217,7 +192,7 @@ impl SummaryDescriptorRegistry {
             * (std::mem::size_of::<DataDescriptorId>()
                 + std::mem::size_of::<Weak<DataDescriptor>>());
         for descriptor in data.values().filter_map(Weak::upgrade) {
-            total += std::mem::size_of::<DataDescriptor>() + descriptor.id.0.len();
+            total += std::mem::size_of::<DataDescriptor>() + descriptor.id.canonical().len();
             total += descriptor.metric_name.len() + descriptor.population_filter_canonical.len();
             total += descriptor
                 .group_by_keys
@@ -230,7 +205,7 @@ impl SummaryDescriptorRegistry {
 }
 
 pub(crate) fn summary_descriptor_id(kind: &AggKind) -> SummaryDescriptorId {
-    SummaryDescriptorId(kind.operator_canonical_string().into())
+    legacy_summary(kind).id
 }
 
 pub(crate) fn data_descriptor_id<'a>(
@@ -238,27 +213,7 @@ pub(crate) fn data_descriptor_id<'a>(
     filter: &str,
     group_by: impl Iterator<Item = &'a str>,
 ) -> DataDescriptorId {
-    DataDescriptorId(canonical_data_key(metric, filter, group_by).into())
-}
-
-fn canonical_data_key<'a>(
-    metric: &str,
-    filter: &str,
-    group_by: impl Iterator<Item = &'a str>,
-) -> String {
-    fn push_part(out: &mut String, value: &str) {
-        use std::fmt::Write;
-        let _ = write!(out, "{}:{value}", value.len());
-    }
-    let mut out = String::from("data:v1|");
-    push_part(&mut out, metric);
-    out.push('|');
-    push_part(&mut out, filter);
-    for key in group_by {
-        out.push('|');
-        push_part(&mut out, key);
-    }
-    out
+    DataDescriptor::new(metric, filter, group_by.map(str::to_string)).id
 }
 
 #[cfg(test)]
