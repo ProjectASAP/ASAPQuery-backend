@@ -95,7 +95,10 @@ def main():
     implementation["implementation_cost"].update(model_version="UNCALIBRATED-enumeration-only", observed_at_unix_ms=now,
         valid_for_ms=86400000, horizon_seconds=horizon, cpu_cost=1.0, peak_memory_bytes=0, network_bytes=0,
         storage_bytes=0, source_scan_bytes=0, weighted_cost=1.0)
-    snapshot["environment"].update(observed_at_unix_ms=now, activation_unix_ms=first_timestamp_ms, max_evidence_age_ms=86400000,
+    # Plan lifecycle is control-plane wall time. Historical event timestamps
+    # describe the replay data and must not make a newly generated plan appear
+    # active before it was generated (SummaryCatalog rejects that lifecycle).
+    snapshot["environment"].update(observed_at_unix_ms=now, activation_unix_ms=now, max_evidence_age_ms=86400000,
                                   capability_snapshot_id="o11y-backend-local-calibration-v1")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(snapshot, indent=2) + "\n")
