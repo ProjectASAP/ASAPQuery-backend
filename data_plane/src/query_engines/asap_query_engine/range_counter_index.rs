@@ -106,10 +106,11 @@ impl RangeCounterIndex {
 
     /// None means fewer than two usable samples (or an invalid time interval),
     /// while Some(NaN) preserves Prometheus's distinct numeric NaN result.
-    pub(crate) fn rate(
+    fn extrapolated_delta(
         &self,
         start_ms: i64,
         end_ms: i64,
+        is_rate: bool,
     ) -> Result<Option<f64>, CounterIndexError> {
         if start_ms >= end_ms {
             return Ok(None);
@@ -164,9 +165,23 @@ impl RangeCounterIndex {
         if to_end >= average * 1.1 {
             to_end = average / 2.0;
         }
-        Ok(Some(
-            delta * (span + to_start + to_end) / span / seconds(end_ms, start_ms),
-        ))
+        // Preserve Prometheus's arithmetic order. In particular, Prometheus
+        // computes the extrapolation factor completely before multiplying the
+        // observed delta. Reassociating these operations changes the last bit
+        // for ordinary monotonic counters and breaks exact result comparison.
+        let mut factor = (span + to_start + to_end) / span;
+        if is_rate {
+            factor /= seconds(end_ms, start_ms);
+        }
+        Ok(Some(delta * factor))
+    }
+
+    pub(crate) fn rate(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Option<f64>, CounterIndexError> {
+        self.extrapolated_delta(start_ms, end_ms, true)
     }
 
     pub(crate) fn increase(
@@ -174,9 +189,7 @@ impl RangeCounterIndex {
         start_ms: i64,
         end_ms: i64,
     ) -> Result<Option<f64>, CounterIndexError> {
-        self.rate(start_ms, end_ms).map(|value| {
-            value.map(|rate| rate * ((i128::from(end_ms) - i128::from(start_ms)) as f64 / 1000.0))
-        })
+        self.extrapolated_delta(start_ms, end_ms, false)
     }
 
     pub(crate) fn estimated_bytes(&self) -> usize {
@@ -226,7 +239,8 @@ mod tests {
         if to_end >= average * 1.1 {
             to_end = average / 2.0;
         }
-        Some(delta * (span + to_start + to_end) / span / ((end - start) as f64 / 1000.0))
+        let factor = (span + to_start + to_end) / span / ((end - start) as f64 / 1000.0);
+        Some(delta * factor)
     }
     fn assert_same(actual: Option<f64>, expected: Option<f64>) {
         match (actual, expected) {
