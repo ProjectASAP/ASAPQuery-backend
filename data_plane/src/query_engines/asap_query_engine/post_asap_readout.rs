@@ -79,7 +79,7 @@ pub fn execute_post_asap_readout(
 
 /// Execute an already-bound QueryPlan entry.  This is the production serving
 /// path: no PromQL lowering, planner cost model, observed-family lookup, or
-/// BackendPlan materialization search occurs here.
+/// Installed QueryPlan materialization resolution occurs before this legacy test helper.
 pub fn execute_query_plan_readout(
     index: &SketchStore,
     entry: &control_plane::query_plan::QueryPlanEntry,

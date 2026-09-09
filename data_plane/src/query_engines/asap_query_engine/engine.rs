@@ -117,7 +117,7 @@ pub struct ASAPQueryEngine {
     archive_engine:
         Option<Arc<dyn crate::query_engines::routing::query_engine_routing::QueryEngine>>,
     /// Generation-consistent physical snapshot used by the production query
-    /// path. QueryPlan and BackendPlan must never be sampled separately.
+    /// path. The QueryPlan and SummaryCatalog must come from the same snapshot.
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
     exact_subquery_endpoint: Option<String>,
     exact_subquery_client: reqwest::Client,
@@ -683,7 +683,7 @@ impl ASAPQueryEngine {
             crate::query_engines::EngineError::capability_miss(
                 crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                 format!(
-                    "post-ASAP/BackendPlan resolver could not serve `{query}` over \
+                    "installed QueryPlan resolver could not serve `{query}` over \
                      [{start_ms}, {end_ms}]: {reason:?} — failing over to archive"
                 ),
             )
@@ -950,7 +950,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
             }
         }
         // One authoritative warm path: ASAPPlanner post-ASAP DAG →
-        // BackendPlan/materialization resolver → SID lookup → DAG executor.
+        // SummaryCatalog/materialization resolver → SID lookup → DAG executor.
         // A typed resolver/executor error becomes CapabilityMiss, which lets
         // EngineRouter continue to the archive backend.
         if let Some(idx) = self.sketch_index.as_ref() {
@@ -1032,7 +1032,7 @@ impl crate::query_engines::routing::query_engine_routing::QueryEngine for ASAPQu
                     crate::query_engines::EngineError::capability_miss(
                         crate::storage_engines::types::StorageBackend::SketchStore.data_source_id(),
                         format!(
-                            "post-ASAP/BackendPlan resolver could not serve `{query}`: \n                             {reason:?} — failing over to archive"
+                            "installed QueryPlan resolver could not serve `{query}`: \n                             {reason:?} — failing over to archive"
                         ),
                     )
                 })?;

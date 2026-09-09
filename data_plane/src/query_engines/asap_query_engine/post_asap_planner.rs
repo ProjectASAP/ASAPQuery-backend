@@ -110,9 +110,9 @@ pub enum LoweringSkip {
     /// outcome, just detected one step earlier so the caller can skip
     /// without even constructing a `QueryExecutionContext`.
     NotRealized,
-    /// ASAPPlanner produced a maintained-summary plan, but the installed
-    /// BackendPlan has no warm route to a materialization with the exact
-    /// source, family and parameters required by that post-ASAP tree.
+    /// ASAPPlanner produced a maintained-summary plan, but no installed
+    /// QueryPlan binding has a ready materialization with the required
+    /// source, family and parameters.
     NoWarmRoute(String),
     /// The tree lowered successfully, but `crate::query_engines::asap_query_engine::summary_exec::execute()`
     /// itself returned `Err` (`NoCandidates`, `MergeKindParamsMismatch`,
@@ -505,17 +505,9 @@ pub fn plan_promql_to_post_asap(
     }
     let source_has_filter = query_expr_has_filter(&qe);
 
-    // Serving time must reproduce the REAL planning decision, not
-    // independently re-derive one -- see this module's docs. Prefer
-    // reading it straight off an installed `BackendPlan`'s
-    // materializations when one covers this metric --
-    // `Materialization.family` already carries the canonical `SketchKind`, no
-    // `AggregationConfig` reconstruction required (design-backend-plan-wire-format.md
-    // §5). Otherwise fall back to the `SketchStore`-reconstruction path
-    // (`observed_family_for_metric`), which is `None` when this metric
-    // has nothing registered (or only an `ExactAgg` sid, which bypasses
-    // `CostModel` entirely) -- `ObservedFamilyCostModel` then falls back
-    // further to the accuracy-driven default.
+    // This dynamic lowering path is retained for isolated executor tests.
+    // Production serving executes the installed QueryPlan and resolves its
+    // MaterializationId bindings through SummaryCatalog.
     let metric = find_metric_in_query_expr(&qe);
     let mut observed = Vec::new();
     if let Some(family) = metric
@@ -524,11 +516,8 @@ pub fn plan_promql_to_post_asap(
     {
         observed.push(family);
     }
-    // No installed family means the planner may use its accuracy-driven
-    // default. With a BackendPlan, try every family materialized for the
-    // metric: a fingerprint does not uniquely identify query semantics,
-    // and choosing the first family could incorrectly fall back while a
-    // later materialization is an exact match.
+    // No observed family means the test-only planner may use its
+    // accuracy-driven default.
     let candidates: Vec<_> = if observed.is_empty() {
         vec![None]
     } else {

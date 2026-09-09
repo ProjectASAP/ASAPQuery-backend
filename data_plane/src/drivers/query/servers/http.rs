@@ -191,7 +191,7 @@ pub struct HttpServer {
     /// archive and observes the 60–90 s flush gap).
     probe_cache: Option<Arc<FreshnessProbeCache>>,
     /// Serializes multi-document physical-plan publication so two control
-    /// plane generations cannot interleave their config and BackendPlan.
+    /// plane generations cannot interleave their plan projections and catalog.
     physical_plan_lock: Arc<tokio::sync::Mutex<()>>,
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
     physical_plan_lifecycle: Option<crate::storage_engines::types::PhysicalPlanLifecycle>,

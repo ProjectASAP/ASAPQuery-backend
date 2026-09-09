@@ -98,8 +98,8 @@ pub struct QueryExecutionContext<'a> {
     /// `readout_cumulative`); `false` for a per-window matrix (one merged
     /// answer per window, via `readout_per_window`).
     pub is_cumulative: bool,
-    /// Materializations authorized by the active BackendPlan's warm routes.
-    /// `None` is the explicit legacy/no-plan mode; `Some` fails closed and
+    /// Materializations authorized by the installed QueryPlan bindings.
+    /// `None` is the explicit dynamic-test mode; `Some` fails closed and
     /// excludes stale or unrelated SIDs even when their metric/family match.
     pub allowed_materializations: Option<BTreeSet<asap_types::PolicyFingerprint>>,
 }
@@ -1709,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_plan_materialization_filter_excludes_stale_sid() {
+    fn query_plan_materialization_filter_excludes_stale_sid() {
         let idx = SketchStore::new();
         let mut stale = kll_meta(1, "latency_ms", &[]);
         stale.policy_fp = asap_types::PolicyFingerprint(10);
