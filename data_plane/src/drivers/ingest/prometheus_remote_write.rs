@@ -996,10 +996,7 @@ mod tests {
         assert_eq!(samples[1].value, None);
         assert!(Arc::ptr_eq(&samples[0].metric, &samples[1].metric));
         assert!(Arc::ptr_eq(&samples[0].labels, &samples[1].labels));
-        assert!(Arc::ptr_eq(
-            &samples[0].series_key,
-            &samples[1].series_key
-        ));
+        assert!(Arc::ptr_eq(&samples[0].series_key, &samples[1].series_key));
     }
 
     #[test]
