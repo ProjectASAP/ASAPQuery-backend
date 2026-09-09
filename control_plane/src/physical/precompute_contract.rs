@@ -1,7 +1,7 @@
 //! Self-contained precompute execution contracts over a SummaryCatalog snapshot.
 //! BackendPlan remains a compatibility projection, not a validation authority.
 use super::compiler::*;
-use super::summary_catalog::{MaterializationIdentity, SummaryCatalog};
+use super::summary_catalog::SummaryCatalog;
 use asap_types::sds::{MaterializationId, SummaryDescriptor};
 use planner_types::pre_asap::{ColumnRef, Source};
 use serde::{Deserialize, Serialize};
@@ -22,7 +22,6 @@ pub enum PrecomputePlacement {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PrecomputeMaterializationContract {
-    pub descriptors: MaterializationIdentity,
     pub schema_id: String,
     pub update: PrecomputeUpdate,
     pub placement: PrecomputePlacement,
@@ -41,11 +40,9 @@ impl PrecomputePlan {
         let mut contracts = BTreeMap::new();
         for config in &self.materializations {
             let id = MaterializationId::from(config.policy_fingerprint());
-            let descriptors = catalog
-                .materializations
-                .get(&id)
-                .ok_or_else(|| invalid(format!("missing catalog materialization {}", id.as_u64())))?
-                .clone();
+            catalog.materializations.get(&id).ok_or_else(|| {
+                invalid(format!("missing catalog materialization {}", id.as_u64()))
+            })?;
             let schema = self
                 .schemas
                 .iter()
@@ -55,7 +52,6 @@ impl PrecomputePlan {
             contracts.insert(
                 id,
                 PrecomputeMaterializationContract {
-                    descriptors,
                     schema_id: schema.schema_id.clone(),
                     update,
                     placement,
@@ -151,9 +147,6 @@ impl PrecomputePlan {
             let id = MaterializationId::from(config.policy_fingerprint());
             let binding = &catalog.materializations[&id];
             let contract = &self.materialization_contracts[&id];
-            if &contract.descriptors != binding {
-                return Err(invalid("materialization descriptor reference drift"));
-            }
             let expected =
                 SummaryDescriptor::from_config(config).map_err(|e| invalid(e.to_string()))?;
             if binding.summary_descriptor_id != expected.id {

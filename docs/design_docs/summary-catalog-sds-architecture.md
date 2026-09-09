@@ -58,15 +58,25 @@ struct DataDescriptor {
 
 struct SummaryInstance {
     id: SummaryInstanceId,
+    materialization_id: MaterializationId,
     summary_descriptor_id: SummaryDescriptorId,
     data_descriptor_id: DataDescriptorId,
     interval: HalfOpenInterval,
     group_values: BTreeMap<String, String>,
     completeness: Completeness,
-    lineage: Lineage,
-    state: AggPayload,
+    catalog_generation: CatalogGeneration,
+    placement: SummaryPlacement,
+    state_reference: SummaryStateReference,
+    status: SummaryInstanceStatus,
+    lifecycle: Persistent | Ephemeral(EphemeralLease),
 }
 ```
+
+The instance contract contains no payload bytes. `SummaryStateReference` is an
+opaque storage-engine locator with state-schema version, generation, sequence
+and optional checksum. `ObservedSummaryInventory` is a versioned data-plane
+report keyed by `SummaryInstanceId`; it is observed state and never part of the
+desired catalog snapshot.
 
 ## Authoritative SummaryCatalog and execution plans
 
@@ -74,6 +84,21 @@ The control-plane `SummaryCatalog` is the metadata authority. It stores immutabl
 Summary and Data Descriptors plus stable materialization identities. It does not
 store pane payloads, watermarks, completeness, or observed availability; those
 are data-plane instance/runtime metadata.
+
+The control plane reconciles two explicitly separate views:
+
+- **Desired SummaryCatalog:** persistent materializations selected through
+  workload feedback and Planner decisions.
+- **Observed Summary Inventory:** instances actually building or stored,
+  including placement, time coverage, state reference, status and generation.
+
+Reconciliation creates missing desired materializations, updates instances from
+old catalog generations, recovers failed or missing payloads, and retires then
+garbage-collects materializations removed from desired state. A data-plane fast
+path may create only an ephemeral instance with a finite lease and must report
+it immediately. A matching desired materialization promotes it; otherwise it
+expires and is collected. The data plane cannot promote an ephemeral instance
+or create persistent desired state by itself.
 
 ```text
                        ASAPPlanner post-ASAP DAG
@@ -142,9 +167,12 @@ compatibility DTO while older sidecars are read.
 The implemented `SummaryDescriptor` currently contains one `SummaryOperator`,
 one derived `FidelityGuarantee`, and a numeric state-schema version. The
 implemented `DataDescriptor` contains metric name, canonical population filter,
-and grouping keys. Observation semantics, structured state schemas, and a
-standalone `SummaryInstance` API remain target-model work; pane state and
-completeness/lineage tracking currently live in existing `SketchStore` tables.
+grouping keys and versioned observation semantics. The shared contract now also
+defines `SummaryInstance`, `ObservedSummaryInventory`, placement, completeness,
+state references, catalog generation and ephemeral leases. The control-plane
+reconciler emits create, update, recover, retire, garbage-collect, promote and
+expire actions. Summary payloads and the application of those actions remain in
+the SummaryStore runtime.
 
 The durable `sid_metadata.json` format is versioned independently. Version 2
 contains `summary_descriptors`, `data_descriptors`, and `bindings` tables. A

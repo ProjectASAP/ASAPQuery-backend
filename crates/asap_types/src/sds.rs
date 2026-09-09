@@ -162,28 +162,38 @@ pub struct SummaryInstance {
 impl SummaryInstance {
     pub fn validate(&self) -> Result<(), SdsError> {
         if self.time_range.start_ms >= self.time_range.end_ms {
-            return Err(SdsError("summary instance time range must be non-empty".into()));
+            return Err(SdsError(
+                "summary instance time range must be non-empty".into(),
+            ));
         }
         if self.catalog_generation.schema_version == 0
             || self.catalog_generation.snapshot_digest.is_empty()
         {
-            return Err(SdsError("summary instance has invalid catalog generation".into()));
+            return Err(SdsError(
+                "summary instance has invalid catalog generation".into(),
+            ));
         }
         if self.placement.producer_id.is_empty() || self.placement.storage_node_id.is_empty() {
-            return Err(SdsError("summary instance placement must be resolved".into()));
+            return Err(SdsError(
+                "summary instance placement must be resolved".into(),
+            ));
         }
         if self.state_reference.store.is_empty()
             || self.state_reference.key.is_empty()
             || self.state_reference.state_schema_version == 0
         {
-            return Err(SdsError("summary instance has invalid state reference".into()));
+            return Err(SdsError(
+                "summary instance has invalid state reference".into(),
+            ));
         }
         if let InstanceLifecycle::Ephemeral { lease } = &self.lifecycle {
             if lease.lease_id.is_empty()
                 || lease.owner_id.is_empty()
                 || lease.issued_at_ms >= lease.expires_at_ms
             {
-                return Err(SdsError("summary instance has invalid ephemeral lease".into()));
+                return Err(SdsError(
+                    "summary instance has invalid ephemeral lease".into(),
+                ));
             }
         }
         Ok(())
@@ -212,7 +222,9 @@ impl ObservedSummaryInventory {
                 return Err(SdsError("inventory key differs from instance ID".into()));
             }
             if instance.observed_at_ms > self.observed_at_ms {
-                return Err(SdsError("instance observation is newer than inventory".into()));
+                return Err(SdsError(
+                    "instance observation is newer than inventory".into(),
+                ));
             }
         }
         Ok(())
@@ -563,6 +575,86 @@ fn data_descriptor_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn observed_instance(lifecycle: InstanceLifecycle) -> SummaryInstance {
+        SummaryInstance {
+            instance_id: SummaryInstanceId::new("instance-1").unwrap(),
+            materialization_id: MaterializationId(crate::PolicyFingerprint(7)),
+            summary_descriptor_id: descriptor(
+                200,
+                FidelityGuarantee::Unknown {
+                    reason: "test".into(),
+                },
+                1,
+            )
+            .id,
+            data_descriptor_id: DataDescriptor::new("cpu", "", []).id,
+            time_range: HalfOpenTimeRange {
+                start_ms: 0,
+                end_ms: 10,
+            },
+            group_values: BTreeMap::new(),
+            catalog_generation: CatalogGeneration {
+                schema_version: 1,
+                plan_id: 1,
+                plan_version: 2,
+                snapshot_digest: "abc".into(),
+            },
+            placement: SummaryPlacement {
+                producer_id: "producer".into(),
+                storage_node_id: "store".into(),
+            },
+            state_reference: SummaryStateReference {
+                store: "summary-store".into(),
+                key: "state/1".into(),
+                state_schema_version: 1,
+                generation: 1,
+                sequence: 3,
+                checksum: None,
+            },
+            status: SummaryInstanceStatus::Ready,
+            completeness: InstanceCompleteness::Complete,
+            lifecycle,
+            observed_at_ms: 10,
+        }
+    }
+
+    #[test]
+    fn instance_inventory_has_metadata_reference_without_payload() {
+        let instance = observed_instance(InstanceLifecycle::Persistent);
+        instance.validate().unwrap();
+        let encoded = serde_json::to_value(&instance).unwrap();
+        assert!(encoded.get("state_reference").is_some());
+        assert!(encoded.get("state").is_none());
+        assert!(encoded.get("payload").is_none());
+        let inventory = ObservedSummaryInventory {
+            reporter_id: "store".into(),
+            inventory_version: 4,
+            observed_at_ms: 10,
+            instances: BTreeMap::from([(instance.instance_id.clone(), instance)]),
+        };
+        inventory.validate().unwrap();
+    }
+
+    #[test]
+    fn invalid_range_and_lease_are_rejected() {
+        let mut instance = observed_instance(InstanceLifecycle::Ephemeral {
+            lease: EphemeralLease {
+                lease_id: "lease".into(),
+                owner_id: "fast-path".into(),
+                issued_at_ms: 10,
+                expires_at_ms: 20,
+            },
+        });
+        instance.validate().unwrap();
+        instance.time_range.end_ms = instance.time_range.start_ms;
+        assert!(instance.validate().is_err());
+        instance.time_range.end_ms = 10;
+        if let InstanceLifecycle::Ephemeral { lease } = &mut instance.lifecycle {
+            lease.expires_at_ms = lease.issued_at_ms;
+        }
+        assert!(instance.validate().is_err());
+    }
     fn descriptor(k: u32, fidelity: FidelityGuarantee, version: u32) -> SummaryDescriptor {
         SummaryDescriptor::new(
             SummaryOperator::Sketch {
