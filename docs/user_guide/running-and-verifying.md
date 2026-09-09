@@ -63,7 +63,8 @@ Inspect installed runtime state when diagnosing plan or routing problems:
 
 ```bash
 curl -fsS http://localhost:8088/api/v1/streaming-config
-curl -fsS http://localhost:8088/api/v1/backend-plan
+curl -fsS http://localhost:8088/api/v1/physical-plan/status
+curl -fsS http://localhost:8088/api/v1/summary-inventory
 curl -fsS http://localhost:8088/api/v1/storage_routing
 ```
 
