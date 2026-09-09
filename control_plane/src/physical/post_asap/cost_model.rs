@@ -831,7 +831,7 @@ impl CostModel for ForcedFamilyCostModel {
 /// won't match anything registered either way, so the outcome
 /// (`find_candidates` finds nothing) is unchanged.
 ///
-/// **Fallback status (design-backend-plan-wire-format.md §5):**
+/// **Legacy metadata fallback:**
 /// `post_asap_planner.rs` prefers reading planning's decision directly off an
 /// installed SummaryCatalog materializations (no reconstruction needed
 /// there — `Materialization.kind`/`.params` already ARE the pair

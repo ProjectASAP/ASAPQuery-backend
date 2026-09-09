@@ -255,7 +255,10 @@ fn query_expr_contains_rate(qe: &planner_types::pre_asap::QueryExpr) -> bool {
         QueryExpr::Aggregate {
             measures, child, ..
         } => {
-            measures.iter().any(|m| matches!(m, AggIntent::Rate)) || query_expr_contains_rate(child)
+            measures
+                .iter()
+                .any(|m| matches!(m, AggIntent::Rate | AggIntent::IRate))
+                || query_expr_contains_rate(child)
         }
         QueryExpr::Filter { child, .. }
         | QueryExpr::Project { child, .. }
@@ -425,7 +428,7 @@ fn ensure_warm_runtime_support(
     match &node.expr {
         SummaryExpr::SummaryAgg { child, family, .. } => {
             match family {
-                SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => {
+                SummaryFamilyType::ExactAggregate(ExactKind::Rate | ExactKind::IRate, _) => {
                     return Err(LoweringSkip::RateShape)
                 }
                 SummaryFamilyType::ExactAggregate(ExactKind::Sum, _)

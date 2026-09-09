@@ -108,7 +108,7 @@ fn build_workload(
 /// Run the controller's planning pipeline end-to-end on a `QueryWorkload`
 /// and return the `BackendStageConfig` the controller would emit from
 /// for it — the same object both `emit_backend_streaming_config_json`
-/// (legacy JSON) and `backend_plan::from_stage_config` (`BackendPlan`)
+/// (legacy JSON) and the catalog-backed physical-plan compiler
 /// consume.
 ///
 /// Mirrors the `handle_plan` flow's `StageConfig::Backend(mut be)`

@@ -582,15 +582,20 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
     let planned_window_secs = installed_aggregation["window_size"]
         .as_u64()
         .expect("controller emitted window size");
-    let backend_plan: serde_json::Value = client
-        .get(format!("{data_base}/api/v1/backend-plan"))
+    let physical_plan_status: serde_json::Value = client
+        .get(format!("{data_base}/api/v1/physical-plan/status"))
         .send()
         .await
-        .expect("read installed backend plan")
+        .expect("read installed physical plan")
         .json()
         .await
-        .expect("decode installed backend plan");
-    assert_eq!(backend_plan["materialization_count"], 1);
+        .expect("decode installed physical plan status");
+    assert_eq!(
+        physical_plan_status["materializations"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -714,7 +719,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                 "inactive generation frame was accepted"
             );
             let still_active: serde_json::Value = client
-                .get(format!("{data_base}/api/v1/backend-plan"))
+                .get(format!("{data_base}/api/v1/physical-plan/status"))
                 .send()
                 .await
                 .unwrap()
@@ -722,7 +727,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
                 .await
                 .unwrap();
             assert_eq!(
-                still_active, backend_plan,
+                still_active, physical_plan_status,
                 "failed rollout changed active plan"
             );
             let still_warm: serde_json::Value = client

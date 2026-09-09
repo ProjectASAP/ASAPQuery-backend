@@ -3,17 +3,15 @@
 //! query execution checks only reachable IDs and their requested capabilities.
 use std::collections::{BTreeMap, BTreeSet};
 
-use asap_types::sds::{DataDescriptor, MaterializationId, SummaryDescriptor, SummaryOperator};
-use asap_types::summary_catalog::{MaterializationIdentity, SummaryCatalog};
+use asap_types::sds::{MaterializationId, SummaryDescriptor, SummaryOperator};
+use asap_types::summary_catalog::SummaryCatalog;
 use asap_types::AggregationType;
 use control_plane::query_plan::{ExactReadout, QueryPlanEntry, QueryPlanNode, QueryReadout};
 
 use crate::query_engines::EngineError;
 
 pub(crate) struct ResolvedMaterialization<'a> {
-    pub identity: &'a MaterializationIdentity,
     pub summary: &'a SummaryDescriptor,
-    pub data: &'a DataDescriptor,
 }
 
 fn miss(reason: impl Into<String>) -> EngineError {
@@ -45,11 +43,7 @@ pub(crate) fn resolve(
         .map_err(|error| miss(format!("invalid summary descriptor: {error}")))?;
     data.validate()
         .map_err(|error| miss(format!("invalid data descriptor: {error}")))?;
-    Ok(ResolvedMaterialization {
-        identity,
-        summary,
-        data,
-    })
+    Ok(ResolvedMaterialization { summary })
 }
 
 impl ResolvedMaterialization<'_> {
@@ -246,16 +240,8 @@ mod tests {
         let id = *catalog.materializations.keys().next().unwrap();
         let result = resolve(catalog, id).unwrap();
         assert!(std::ptr::eq(
-            result.identity,
-            &catalog.materializations[&id]
-        ));
-        assert!(std::ptr::eq(
             result.summary,
-            &catalog.summary_descriptors[&result.identity.summary_descriptor_id]
-        ));
-        assert!(std::ptr::eq(
-            result.data,
-            &catalog.data_descriptors[&result.identity.data_descriptor_id]
+            &catalog.summary_descriptors[&catalog.materializations[&id].summary_descriptor_id]
         ));
         let mut broken = catalog.clone();
         broken.data_descriptors.clear();

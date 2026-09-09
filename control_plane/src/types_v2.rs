@@ -47,8 +47,7 @@ pub enum QueryLanguage {
 
 /// Per-target accuracy SLA, in the typed form `design.md` §6 calls for.
 ///
-/// Phase 1b (docs/migration-plan-backend-plan.md): re-exported from
-/// `planner_types::types` (formerly `asap_ir::types` -- ASAPPlanner
+/// Re-exported from `planner_types::types` (formerly `asap_ir::types` -- ASAPPlanner
 /// consolidated `asap-ir` into `asap-types`, see
 /// control_plane/docs/design-asapplanner-pin-migration.md) rather than
 /// defined locally -- `AggIntent`'s `accuracy` fields are typed against
