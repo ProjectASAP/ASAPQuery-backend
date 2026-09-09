@@ -58,11 +58,11 @@ classification. Forwarded responses carry a backend-owned `x-asap-execution`
 header; an unmarked success is not counted as warm or fallback. `ingestion.json`
 records accepted batches; acceptance does not prove worker completion.
 
-`execution_provenance` distinguishes summary-only `asap`, `hybrid`, `local_raw`
-and `external_exact`, and records actual raw scans and summary readouts. Both
-hybrid and raw-only execution remain under `exact_fallback`; they are never
-reported as summary-only warm execution. A typed residual DAG can retain selected
-summary siblings, but a particular corpus may still produce no materializations.
+`execution_provenance` distinguishes summary-only `asap`, `hybrid`, and
+`external_exact`, and records summary readouts and Prometheus exact-subquery
+requests. Hybrid execution remains under `exact_fallback`; it is never reported
+as summary-only warm execution. A typed residual DAG can retain selected summary
+siblings, but a particular corpus may still produce no materializations.
 
 The runner waits for the finite-input completion barrier. The first traversal is
 called `first_pass`, not “cold cache”; later traversals are `repeat`. All failures
@@ -157,3 +157,30 @@ This endpoint is for a finite replay, not a live ingestion watermark. Closing a
 trailing pane does not by itself prove its coverage matches every query window;
 unsupported or incomplete readouts must still follow exact fallback. Typed raw
 residual plans prepare their raw index during drain so setup costs remain visible.
+
+### Fixed-time and advancing-window repetition sweep
+
+`query_sweep.py` runs fresh paired trials for 1, 5, 20 and 100 evaluations,
+first at fixed timestamps and then at advancing timestamps over identical
+preloaded input. It accepts the same binary/input/snapshot arguments as
+`run_comparison.py`, plus `--scope full_upstream_corpus` or
+`--scope derived_subquery_child` and `--advance-step-ms 60000`. Advancing grids
+end at the original evaluation timestamp; the launcher rejects grids outside
+the actual input span. This measures moving query windows, not continuous ingestion.
+
+Keep the original 28-occurrence corpus regression separate from any derived
+subquery-child experiment. A derived query needs a matching registered workload
+and separately calibrated snapshot. The sweep never edits quotes or supplies a
+winning artifact: each fresh process invokes normal selection. The selected
+snapshot's declared cost horizon stays fixed, so sweeping repetition counts
+measures amortization rather than cost-optimal reselection at each count.
+
+The sweep uses `--batch-resources`: CPU probes occur before queries, after the
+first pass, and after repeats. Per-request latency, actual execution provenance
+and paired correctness are retained without per-RPC `/proc` sampling or repeated
+JSON writes. `query-batch-resources.json` retains raw counters; measurements below
+ten CPU ticks are marked low resolution, and zero ticks never mean free work.
+`sweep-summary.json` separates first-pass/repeat query CPU from setup, all input
+updates/build, and setup+updates+queries. Backend totals include its dedicated
+fallback and planning CPU. First pass means a fresh process, not an evicted OS
+cache; retirement and continuously updated input are outside these totals.

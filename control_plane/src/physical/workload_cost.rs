@@ -4,6 +4,8 @@
 //! second semantic DAG. Planner supplies legal alternatives; deployment quotes
 //! price every reachable operation, and the backend commits one complete plan.
 
+mod materialization_candidates;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use asap_aware_mapping::cost_model::Cost;
@@ -71,7 +73,17 @@ pub struct AlternativeCost {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MaterializationSearchCoverage {
+    pub eligible_leaves: usize,
+    pub enumerated_local_masks: usize,
+    pub exhaustive: bool,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkloadCostComparison {
+    #[serde(default, alias = "index_search_coverage")]
+    pub materialization_search_coverage: Option<MaterializationSearchCoverage>,
     pub data_snapshot_id: String,
     pub model_version: String,
     pub selected_plan_id: u64,
@@ -206,47 +218,30 @@ pub fn manifest(
         // Typed local scans require retained input and ingest/update work even
         // when no precomputed summary is installed. Deduplicate by source.
         for node in entry.nodes.values() {
+            if matches!(
+                node,
+                crate::query_plan::QueryPlanNode::Logical {
+                    operator: crate::query_plan::logical::LogicalOperator::Scan { .. },
+                    ..
+                }
+            ) {
+                return Err(invalid(
+                    "generic backend raw scans are outside the ASAP/Prometheus execution contract",
+                ));
+            }
             if let crate::query_plan::QueryPlanNode::Logical {
-                operator:
-                    operator @ (crate::query_plan::logical::LogicalOperator::Scan { .. }
-                    | crate::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
-                        ..
-                    }),
+                operator: crate::query_plan::logical::LogicalOperator::ExactSubquery { query },
                 ..
             } = node
             {
-                let metric = match operator {
-                    crate::query_plan::logical::LogicalOperator::Scan { metric, .. } => metric
-                        .as_ref()
-                        .ok_or_else(|| invalid("local raw scan requires named-source pricing"))?,
-                    crate::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
-                        metric,
-                        ..
-                    } => metric,
-                    _ => unreachable!(),
-                };
-                if matches!(
-                    operator,
-                    crate::query_plan::logical::LogicalOperator::ReadRangeMaxIndex { .. }
-                ) {
-                    for operation in ["build", "update", "residency", "retire"] {
-                        add(
-                            format!("range-max-index:{metric}:{operation}"),
-                            json!({"operation": operation, "metric": metric, "index": "exact_per_series_range_max_v1"}),
-                            "horizon",
-                            1.0,
-                        );
-                    }
-                }
-                let source = json!({"source": planner_types::pre_asap::Source::TimeSeries { metric: metric.clone() }, "location": "backend", "ingest": plan.precompute_plan.ingest});
-                add(format!("source:{}", source), source.clone(), "horizon", 1.0);
-                for operation in ["build", "update", "residency", "retire"] {
-                    add(
-                        format!("raw-state:{metric}:{operation}"),
-                        json!({"operation": operation, "source": source}),
-                        "horizon",
-                        1.0,
-                    );
+                let parsed = crate::query_parser::parse_query_expr_canonical(
+                    query,
+                    crate::types_v2::AccuracyTarget::Exact,
+                )
+                .map_err(|error| invalid(error.to_string()))?;
+                for metric in exact_source_metrics(&parsed)? {
+                    let source = json!({"source": planner_types::pre_asap::Source::TimeSeries { metric }, "location": "exact_backend"});
+                    add(format!("source:{}", source), source, "horizon", 1.0);
                 }
             }
         }
@@ -402,6 +397,18 @@ pub fn select(
             "candidate inventory must contain 1..=64 alternatives",
         ));
     }
+    let policies: BTreeSet<_> = candidates
+        .iter()
+        .filter(|c| c.hybrid_execution)
+        .filter_map(|c| c.materialization_policy.clone())
+        .collect();
+    let leaves: BTreeSet<_> = policies.iter().flat_map(|p| p.iter().cloned()).collect();
+    let materialization_search_coverage = (!policies.is_empty()).then(|| MaterializationSearchCoverage {
+        eligible_leaves: leaves.len(),
+        enumerated_local_masks: policies.len(),
+        exhaustive: leaves.len() < usize::BITS as usize && policies.len() == (1usize << leaves.len()),
+        scope: "Backend materialization versus Prometheus exact-subquery masks over Planner-authorized leaves; native alternative separate; bounded inventory does not claim an unenumerated optimum".into(),
+    });
     let mut comparison_workload = None;
     let mut alternatives = Vec::new();
     let mut best: Option<(
@@ -465,6 +472,7 @@ pub fn select(
     let (_, mut plan, selected_manifest, component_costs) =
         best.ok_or_else(|| invalid("no feasible completely costed alternative"))?;
     plan.cost_comparison = Some(WorkloadCostComparison {
+        materialization_search_coverage,
         data_snapshot_id: evidence.data_snapshot_id.clone(),
         model_version: evidence.model_version.clone(),
         selected_plan_id: plan.envelope.plan_id,
@@ -481,7 +489,8 @@ pub fn with_exact_alternative(
     request: PlanningRequest,
 ) -> Result<Vec<PlanningRequest>, CompileError> {
     let mut exact = request.clone();
-    exact.local_raw_execution = false;
+    exact.hybrid_execution = false;
+    exact.materialization_policy = None;
     for query in &mut exact.queries {
         let parsed = crate::query_parser::parse_query_expr_canonical(
             &query.query_string,
@@ -491,7 +500,7 @@ pub fn with_exact_alternative(
         query.post_asap = crate::planner_selection::keep_pre_asap(&parsed)
             .map_err(|error| invalid(error.to_string()))?;
     }
-    if !request.local_raw_execution
+    if !request.hybrid_execution
         && request
             .queries
             .iter()
@@ -500,7 +509,37 @@ pub fn with_exact_alternative(
     {
         Ok(vec![request])
     } else {
-        Ok(vec![request, exact])
+        if !request.hybrid_execution || request.materialization_policy.is_some() {
+            return Ok(vec![request, exact]);
+        }
+        let mut keys = BTreeSet::new();
+        for query in &request.queries {
+            match crate::query_plan::logical::materialization_candidate_keys(
+                &query.query_string,
+                &query.post_asap,
+            ) {
+                Ok(found) => keys.extend(found),
+                // A failed local projection must not make the native alternative
+                // disappear. Compile/select retains its concrete unavailability.
+                Err(_) => return Ok(vec![request, exact]),
+            }
+        }
+        if keys.is_empty() {
+            return Ok(vec![request, exact]);
+        }
+        let inventory = materialization_candidates::enumerate(keys);
+        debug_assert_eq!(inventory.exhaustive, inventory.eligible_leaves <= 4);
+        let mut alternatives: Vec<_> = inventory
+            .masks
+            .into_iter()
+            .map(|mask| {
+                let mut candidate = request.clone();
+                candidate.materialization_policy = Some(mask);
+                candidate
+            })
+            .collect();
+        alternatives.push(exact);
+        Ok(alternatives)
     }
 }
 
@@ -520,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn range_max_index_costs_share_state_across_filters_and_charge_retained_input() {
+    fn filtered_max_materializations_have_distinct_sds_populations() {
         let mut snapshot = fixture();
         let entries = snapshot.query_workload.repeating_queries.as_mut().unwrap();
         entries[0].query = planner_types::workload::Query(
@@ -529,6 +568,7 @@ mod tests {
         entries[0].requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
             planner_types::types::AccuracyTarget::Exact,
         );
+        entries[0].time_selection.lookback = Some(planner_types::workload::DurationMs(21_600_000));
         let mut second = entries[0].clone();
         second.query = planner_types::workload::Query(
             "max_over_time(service_retry_queue_depth{job=\"order-service\"}[6h])".into(),
@@ -541,9 +581,9 @@ mod tests {
             costs
                 .components
                 .keys()
-                .filter(|id| id.starts_with("range-max-index:"))
+                .filter(|id| id.starts_with("state:"))
                 .count(),
-            4
+            8
         );
         assert_eq!(
             costs
@@ -551,18 +591,75 @@ mod tests {
                 .keys()
                 .filter(|id| id.starts_with("raw-state:"))
                 .count(),
-            4
+            0
         );
-        for operation in ["build", "update", "residency", "retire"] {
+        assert_eq!(
+            plan.query_plan
+                .entries
+                .values()
+                .flat_map(|entry| entry.nodes.values())
+                .filter(|node| matches!(
+                    node,
+                    crate::query_plan::QueryPlanNode::ReadMaterialization { .. }
+                ))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn mixed_materialization_masks_price_state_and_prometheus_subquery_sources() {
+        let mut snapshot = fixture();
+        let q = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        q.query =
+            planner_types::workload::Query("max_over_time(a[1m]) + max_over_time(b[1m])".into());
+        q.requirements.accuracy = planner_types::workload::AccuracyRequirement::Explicit(
+            crate::types_v2::AccuracyTarget::Exact,
+        );
+        let (request, environment) = snapshot.planning_request().unwrap();
+        let candidates = with_exact_alternative(request).unwrap();
+        assert_eq!(candidates.len(), 5, "four legal masks plus native");
+        let mut identities = BTreeSet::new();
+        for candidate in &candidates[..4] {
+            let enabled = candidate.materialization_policy.as_ref().unwrap().len();
+            let plan = PhysicalCompiler
+                .compile(candidate.clone(), environment.clone())
+                .unwrap();
+            assert!(identities.insert(plan.envelope.plan_id));
+            let cost = manifest(&plan, &candidate.queries).unwrap();
             assert_eq!(
-                costs.components[&format!("range-max-index:service_retry_queue_depth:{operation}")]
-                    .multiplicity,
-                1.0
+                cost.components
+                    .keys()
+                    .filter(|k| k.starts_with("state:backend:"))
+                    .count(),
+                enabled * 4
             );
+            assert_eq!(
+                cost.components
+                    .keys()
+                    .filter(|k| k.starts_with("raw-state:"))
+                    .count(),
+                0
+            );
+            assert_eq!(
+                cost.components
+                    .values()
+                    .filter(|v| v.unit == "horizon"
+                        && v.implementation.get("location").and_then(Value::as_str)
+                            == Some("exact_backend"))
+                    .count(),
+                2 - enabled
+            );
+            assert!(!plan
+                .query_plan
+                .entries
+                .values()
+                .any(|entry| entry.nodes.values().any(|node| matches!(
+                    node,
+                    crate::query_plan::QueryPlanNode::ExactFallback { .. }
+                ))));
         }
-        assert_eq!(plan.query_plan.entries.values().flat_map(|entry| entry.nodes.values()).filter(|node|
-            matches!(node, crate::query_plan::QueryPlanNode::Logical { operator:
-                crate::query_plan::logical::LogicalOperator::ReadRangeMaxIndex { .. }, .. })).count(), 2);
+        assert!(!candidates.last().unwrap().hybrid_execution);
     }
 
     fn quoted() -> (
@@ -603,7 +700,7 @@ mod tests {
 
     // Retained local input is priced once per metric, separate from the native service.
     #[test]
-    fn local_raw_manifest_prices_shared_storage_and_distinct_native_alternative() {
+    fn counter_materialization_manifest_prices_owned_state_and_distinct_native_alternative() {
         use planner_types::workload::{AccuracyRequirement, Query};
         let mut snapshot = fixture();
         let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
@@ -612,12 +709,12 @@ mod tests {
             AccuracyRequirement::Explicit(crate::types_v2::AccuracyTarget::Exact);
         let (request, environment) = snapshot.planning_request().unwrap();
         let candidates = with_exact_alternative(request).unwrap();
-        assert_eq!(candidates.len(), 2);
+        assert!(candidates.len() >= 2);
         let local = PhysicalCompiler
             .compile(candidates[0].clone(), environment.clone())
             .unwrap();
         let native = PhysicalCompiler
-            .compile(candidates[1].clone(), environment)
+            .compile(candidates.last().unwrap().clone(), environment)
             .unwrap();
         assert_ne!(local.envelope.plan_id, native.envelope.plan_id);
         let manifest = manifest(&local, &candidates[0].queries).unwrap();
@@ -627,7 +724,7 @@ mod tests {
                 .keys()
                 .filter(|key| key.starts_with("raw-state:a:"))
                 .count(),
-            4
+            0
         );
         assert_eq!(
             manifest
@@ -638,7 +735,7 @@ mod tests {
                 .count(),
             1
         );
-        assert!(!manifest
+        assert!(manifest
             .components
             .values()
             .any(|demand| demand.implementation.get("location")

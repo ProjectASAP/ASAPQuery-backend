@@ -135,6 +135,13 @@ fn build_attrs_fp_and_label_map(
     agg_cfg: &asap_types::aggregation_config::AggregationConfig,
     output: &crate::storage_engines::types::PrecomputedOutput,
 ) -> (String, BTreeMap<String, String>) {
+    if let Some(labels) = &output.population_labels {
+        let attrs_fp = labels
+            .iter()
+            .map(|(name, value)| format!("{name}={value};"))
+            .collect();
+        return (attrs_fp, labels.clone());
+    }
     let label_values_vec = output
         .key
         .as_ref()
@@ -275,6 +282,219 @@ impl SketchInstanceMetadata {
 /// `SketchStore` can host both sketches and precomputes.
 type SidStore = Arc<RwLock<SidStoreData<BTreeMap<String, String>, AggPayload>>>;
 
+#[derive(Debug, Clone, Copy)]
+struct MaxRollupNode {
+    end_ms: u64,
+    value: f64,
+}
+
+#[derive(Debug, Default)]
+struct MaxRollupSeries {
+    anchor_start_ms: Option<u64>,
+    base_width_ms: Option<u64>,
+    next_start_ms: Option<u64>,
+    valid: bool,
+    levels: Vec<BTreeMap<u64, MaxRollupNode>>,
+}
+
+impl MaxRollupSeries {
+    fn append(&mut self, window: TimestampRange, value: f64, retention_horizon_ms: Option<u64>) {
+        let width = window.1.saturating_sub(window.0);
+        if width == 0 || self.next_start_ms.is_some_and(|next| next != window.0) {
+            self.valid = false;
+            return;
+        }
+        let anchor = *self.anchor_start_ms.get_or_insert(window.0);
+        let base_width = *self.base_width_ms.get_or_insert(width);
+        if width != base_width || window.0 < anchor || (window.0 - anchor) % base_width != 0 {
+            self.valid = false;
+            return;
+        }
+        self.valid = true;
+        self.next_start_ms = Some(window.1);
+        if self.levels.is_empty() {
+            self.levels.push(BTreeMap::new());
+        }
+        self.levels[0].insert(
+            window.0,
+            MaxRollupNode {
+                end_ms: window.1,
+                value,
+            },
+        );
+
+        let mut level = 0usize;
+        let mut node_start = window.0;
+        let mut node = MaxRollupNode {
+            end_ms: window.1,
+            value,
+        };
+        loop {
+            let level_width = match base_width.checked_shl(level as u32) {
+                Some(width) => width,
+                None => break,
+            };
+            let ordinal = (node_start - anchor) / level_width;
+            if ordinal % 2 == 0 || node_start < level_width {
+                break;
+            }
+            let left_start = node_start - level_width;
+            let Some(left) = self.levels[level].get(&left_start).copied() else {
+                break;
+            };
+            if left.end_ms != node_start {
+                break;
+            }
+            node_start = left_start;
+            node = MaxRollupNode {
+                end_ms: node.end_ms,
+                value: left.value.max(node.value),
+            };
+            level += 1;
+            if self.levels.len() <= level {
+                self.levels.push(BTreeMap::new());
+            }
+            self.levels[level].insert(node_start, node);
+        }
+
+        if let Some(horizon) = retention_horizon_ms {
+            let cutoff = window.1.saturating_sub(horizon);
+            for nodes in &mut self.levels {
+                while nodes
+                    .first_key_value()
+                    .is_some_and(|(_, node)| node.end_ms < cutoff)
+                {
+                    nodes.pop_first();
+                }
+            }
+        }
+    }
+
+    fn query(&self, start_ms: u64, end_ms: u64) -> Option<f64> {
+        if !self.valid {
+            return None;
+        }
+        let base = self.levels.first()?;
+        let mut cursor = start_ms;
+        let mut result: Option<f64> = None;
+        loop {
+            let Some((&base_start, base_node)) =
+                base.range(cursor..).find(|(_, node)| node.end_ms <= end_ms)
+            else {
+                return result;
+            };
+            let mut chosen = *base_node;
+            for nodes in self.levels.iter().skip(1) {
+                match nodes.get(&base_start) {
+                    Some(node) if node.end_ms <= end_ms => chosen = *node,
+                    _ => break,
+                }
+            }
+            result = Some(result.map_or(chosen.value, |current| current.max(chosen.value)));
+            cursor = chosen.end_ms;
+            if cursor >= end_ms || base.range(cursor..).next().is_none() {
+                return result;
+            }
+        }
+    }
+
+    fn approx_bytes(&self) -> usize {
+        self.levels
+            .iter()
+            .map(|nodes| nodes.len() * std::mem::size_of::<(u64, MaxRollupNode)>())
+            .sum()
+    }
+}
+
+/// Readout categories supported by the derived rollup tier. New categories
+/// belong here rather than as additional top-level `SketchStore` fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollupCategory {
+    ExactMax,
+}
+
+type ExactMaxRollups =
+    DashMap<u64, Arc<RwLock<HashMap<BTreeMap<String, String>, MaxRollupSeries>>>>;
+
+/// Rebuildable indexes over canonical SummaryStore panes. This owns derived
+/// query accelerators only; base summary instances remain the source of truth.
+#[derive(Default)]
+struct Rollups {
+    exact_max: ExactMaxRollups,
+}
+
+impl Rollups {
+    fn append_exact_max(
+        &self,
+        sid: u64,
+        labels: BTreeMap<String, String>,
+        window: TimestampRange,
+        value: f64,
+        retention_horizon_ms: Option<u64>,
+    ) {
+        self.exact_max
+            .entry(sid)
+            .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
+            .write()
+            .unwrap()
+            .entry(labels)
+            .or_default()
+            .append(window, value, retention_horizon_ms);
+    }
+
+    fn query(
+        &self,
+        category: RollupCategory,
+        sid: u64,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+    ) -> Option<Vec<(BTreeMap<String, String>, f64)>> {
+        match category {
+            RollupCategory::ExactMax => {
+                let rollups = self.exact_max.get(&sid)?.clone();
+                let guard = rollups.read().unwrap();
+                let values = guard
+                    .iter()
+                    .map(|(labels, series)| {
+                        series
+                            .query(start_unix_ms, end_unix_ms)
+                            .map(|value| (labels.clone(), value))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                (!values.is_empty()).then_some(values)
+            }
+        }
+    }
+
+    fn remove_sid(&self, sid: u64) {
+        self.exact_max.remove(&sid);
+    }
+
+    fn clear(&self) {
+        self.exact_max.clear();
+    }
+
+    fn approx_bytes(&self) -> usize {
+        self.exact_max
+            .iter()
+            .filter_map(|entry| {
+                entry.value().read().ok().map(|series| {
+                    series
+                        .iter()
+                        .map(|(labels, rollup)| {
+                            labels
+                                .iter()
+                                .map(|(key, value)| key.len() + value.len())
+                                .sum::<usize>()
+                                + rollup.approx_bytes()
+                        })
+                        .sum::<usize>()
+                })
+            })
+            .sum()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct IncompleteSummaryLineage {
     plan_id: u64,
@@ -325,6 +545,8 @@ pub struct SketchStore {
     /// key) for ghost sids — query path detects this and falls through
     /// to Thanos archive.
     series: DashMap<u64, SidStore>,
+    /// Derived rollup categories over canonical SummaryStore panes.
+    rollups: Rollups,
     /// Receiver-observed delta gaps. Query reads overlapping an incomplete
     /// lineage fail closed to the exact tier until a recovery full checkpoint
     /// for that exact producer/window lineage is accepted.
@@ -600,14 +822,51 @@ impl SketchStore {
         window: TimestampRange,
         payload: Box<dyn crate::storage_engines::types::AggregateCore>,
     ) {
+        let max_value = payload
+            .as_any()
+            .downcast_ref::<crate::precompute_engine::operators::MinMaxAccumulator>()
+            .filter(|acc| acc.sub_type == "max")
+            .map(|acc| acc.value);
         let store = self
             .series
             .entry(sid)
             .or_insert_with(|| Arc::new(RwLock::new(self.fresh_sid_store())))
             .clone();
         let mut guard = store.write().unwrap();
-        guard.insert(window, series_label_values, AggPayload::ExactAgg(payload));
+        guard.insert(
+            window,
+            series_label_values.clone(),
+            AggPayload::ExactAgg(Arc::from(payload)),
+        );
         guard.last_write_unix_ms = now_ms();
+        let retention_horizon_ms = guard.retention_horizon_ms;
+        drop(guard);
+        if let Some(value) = max_value.filter(|_| self.persistence_read.read().unwrap().is_none()) {
+            self.rollups.append_exact_max(
+                sid,
+                series_label_values,
+                window,
+                value,
+                retention_horizon_ms,
+            );
+        }
+    }
+
+    /// Read a category through the derived in-memory rollup. Returns `None`
+    /// when persistence/recovery is active or no complete rollup exists, so
+    /// callers can fall back to the canonical exact-agg range path.
+    pub fn query_rollup_range(
+        &self,
+        category: RollupCategory,
+        sid: u64,
+        start_unix_ms: u64,
+        end_unix_ms: u64,
+    ) -> Option<Vec<(BTreeMap<String, String>, f64)>> {
+        if self.persistence_read.read().unwrap().is_some() {
+            return None;
+        }
+        self.rollups
+            .query(category, sid, start_unix_ms, end_unix_ms)
     }
 
     /// Range-query the ASAP-tier state for one sid. Window-end-keyed
@@ -1090,11 +1349,11 @@ impl SketchStore {
                 .current_epoch
                 .range_query_into(start_unix_ms, end_unix_ms, &mut buf);
             for (win, label_id, payload) in &buf {
-                if let Some(p) = payload.as_exact_agg() {
+                if let Some(p) = payload.as_exact_agg_arc() {
                     by_label_id
                         .entry(*label_id)
                         .or_default()
-                        .insert(win.1 as i64, Arc::from(p.clone_boxed_core()));
+                        .insert(win.1 as i64, Arc::clone(p));
                 }
             }
             buf.clear();
@@ -1102,11 +1361,11 @@ impl SketchStore {
             for sealed in guard.sealed_epochs.values() {
                 sealed.range_query_into(start_unix_ms, end_unix_ms, &mut buf);
                 for (win, label_id, payload) in &buf {
-                    if let Some(p) = payload.as_exact_agg() {
+                    if let Some(p) = payload.as_exact_agg_arc() {
                         by_label_id
                             .entry(*label_id)
                             .or_default()
-                            .insert(win.1 as i64, Arc::from(p.clone_boxed_core()));
+                            .insert(win.1 as i64, Arc::clone(p));
                     }
                 }
                 buf.clear();
@@ -1565,6 +1824,7 @@ impl SketchStore {
                     .unwrap_or(false)
             });
             if removed.is_some() {
+                self.rollups.remove_sid(sid);
                 evicted += 1;
             }
         }
@@ -1620,6 +1880,11 @@ impl SketchStore {
             total += data.intern.approx_heap_bytes();
             total += std::mem::size_of::<SidStore>();
         }
+
+        // 3. Derived exact-max rollups. They are deliberately reported in
+        // resident memory even though they are not part of the durable
+        // payload/flush accounting.
+        total += self.rollups.approx_bytes();
 
         total
     }
@@ -1779,6 +2044,7 @@ impl SketchStore {
         };
         if removed.is_some() {
             self.series.remove(&sid);
+            self.rollups.remove_sid(sid);
             self.incomplete_summary_lineages.remove(&sid);
         }
         removed
@@ -1920,6 +2186,26 @@ impl SketchStore {
                 return None;
             }
             Some(_) => {}
+        }
+
+        if let Some(retained_windows) = agg_cfg.num_aggregates_to_retain {
+            let required_horizon_ms = retained_windows
+                .saturating_mul(agg_cfg.slide_interval)
+                .saturating_mul(1_000);
+            let store = self
+                .series
+                .entry(sid)
+                .or_insert_with(|| Arc::new(RwLock::new(self.fresh_sid_store())))
+                .clone();
+            let mut store = store.write().unwrap();
+            if !store.persistence_enabled {
+                store.retention_horizon_ms = Some(
+                    store
+                        .retention_horizon_ms
+                        .unwrap_or(0)
+                        .max(required_horizon_ms),
+                );
+            }
         }
 
         let window = (output.start_timestamp, output.end_timestamp);
@@ -2158,6 +2444,7 @@ impl SketchStore {
     ) {
         use std::sync::atomic::Ordering;
         *self.persistence_read.write().unwrap() = Some(read_handle);
+        self.rollups.clear();
         self.seal_window_count
             .store(seal_window_count, Ordering::Relaxed);
         if seal_window_count > 0 {
@@ -2363,6 +2650,29 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_rollup_answers_aligned_and_partial_ranges_and_prunes_history() {
+        let mut rollup = MaxRollupSeries::default();
+        for index in 0..16u64 {
+            let start = 5_000 + index * 30_000;
+            rollup.append((start, start + 30_000), index as f64, Some(12 * 30_000));
+        }
+        assert_eq!(
+            rollup.query(5_000 + 4 * 30_000, 5_000 + 16 * 30_000),
+            Some(15.0)
+        );
+        assert_eq!(
+            rollup.query(5_000 + 7 * 30_000, 5_000 + 11 * 30_000),
+            Some(10.0)
+        );
+        assert_eq!(rollup.query(5_000, 35_000), None);
+
+        let mut gapped = MaxRollupSeries::default();
+        gapped.append((0, 30_000), 1.0, None);
+        gapped.append((60_000, 90_000), 2.0, None);
+        assert_eq!(gapped.query(0, 90_000), None);
+    }
 
     fn meta(sid: u64) -> SketchInstanceMetadata {
         meta_with_policy(sid, asap_types::PolicyFingerprint::UNSET)
@@ -3057,7 +3367,7 @@ mod tests {
         assert!(sketch.as_exact_agg().is_none());
 
         use crate::precompute_engine::operators::SumAccumulator;
-        let exact_agg = AggPayload::ExactAgg(Box::new(SumAccumulator::with_sum(1.0)));
+        let exact_agg = AggPayload::ExactAgg(Arc::new(SumAccumulator::with_sum(1.0)));
         assert!(exact_agg.as_sketch().is_none());
         assert!(exact_agg.as_exact_agg().is_some());
     }

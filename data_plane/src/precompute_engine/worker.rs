@@ -20,6 +20,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, debug_span, info, warn};
 
+const POPULATION_GROUP_KEY_PREFIX: &str = "__asap_population__";
+
 /// Per-bucket aggregation state: window manager + active pane accumulators.
 ///
 /// B7.6 (schema-retirement #5): one `GroupState` per `sid`, where `sid` is
@@ -422,6 +424,12 @@ impl Worker {
                 ts
             }
         };
+        if right_closed {
+            if let Some(first) = samples.iter().map(|(_, timestamp, _)| *timestamp).min() {
+                let origin = first.saturating_sub(state.window_manager.window_size_ms());
+                state.window_manager.anchor_to_first_sample(origin);
+            }
+        }
         // Find the timestamp span in this batch. A first batch may contain
         // several windows (Prometheus commonly sends catch-up samples after
         // startup), so its minimum timestamp is also the initial closure
@@ -481,11 +489,12 @@ impl Worker {
                         let mut updater = create_accumulator_updater(&state.config);
                         apply_sample(&mut *updater, series_key, *val, *ts, &state.config);
                         let key = build_group_key_label_values(group_key);
-                        let output = PrecomputedOutput::new(
+                        let output = precomputed_output_for_group(
                             window_start as u64,
                             window_end as u64,
-                            Some(key),
+                            key,
                             PolicyFingerprint::from_config(&state.config),
+                            group_key,
                         );
                         emit_batch.push((output, updater.take_accumulator()));
                         debug!(
@@ -527,11 +536,12 @@ impl Worker {
             if let Some(accumulator) = merge_panes_for_window(&mut state.active_panes, &pane_starts)
             {
                 let key = build_group_key_label_values(group_key);
-                let output = PrecomputedOutput::new(
+                let output = precomputed_output_for_group(
                     *window_start as u64,
                     window_end as u64,
-                    Some(key),
+                    key,
                     PolicyFingerprint::from_config(&state.config),
+                    group_key,
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -630,11 +640,12 @@ impl Worker {
                     let window_start = pane_start;
                     let window_end = pane_start + state.window_manager.window_size_ms();
                     let key = build_group_key_label_values(group_key);
-                    let output = PrecomputedOutput::new(
+                    let output = precomputed_output_for_group(
                         window_start as u64,
                         window_end as u64,
-                        Some(key),
+                        key,
                         PolicyFingerprint::from_config(&state.config),
+                        group_key,
                     );
                     emit_batch.push((output, incoming));
                     debug!(
@@ -678,11 +689,12 @@ impl Worker {
             if let Some(accumulator) = merge_panes_for_window(&mut state.active_panes, &pane_starts)
             {
                 let key = build_group_key_label_values(group_key);
-                let output = PrecomputedOutput::new(
+                let output = precomputed_output_for_group(
                     *window_start as u64,
                     window_end as u64,
-                    Some(key),
+                    key,
                     PolicyFingerprint::from_config(&state.config),
+                    group_key,
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -692,11 +704,12 @@ impl Worker {
                 merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
             {
                 let key = build_group_key_label_values(group_key);
-                let output = PrecomputedOutput::new(
+                let output = precomputed_output_for_group(
                     *window_start as u64,
                     window_end as u64,
-                    Some(key),
+                    key,
                     PolicyFingerprint::from_config(&state.config),
+                    group_key,
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -882,11 +895,12 @@ impl Worker {
                     merge_panes_for_window(&mut state.active_panes, &pane_starts)
                 {
                     let key = build_group_key_label_values(&group_key);
-                    let output = PrecomputedOutput::new(
+                    let output = precomputed_output_for_group(
                         *window_start as u64,
                         window_end as u64,
-                        Some(key),
+                        key,
                         PolicyFingerprint::from_config(&state.config),
+                        &group_key,
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -895,11 +909,12 @@ impl Worker {
                     merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
                 {
                     let key = build_group_key_label_values(&group_key);
-                    let output = PrecomputedOutput::new(
+                    let output = precomputed_output_for_group(
                         *window_start as u64,
                         window_end as u64,
-                        Some(key),
+                        key,
                         PolicyFingerprint::from_config(&state.config),
+                        &group_key,
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -982,11 +997,12 @@ impl Worker {
                     merge_panes_for_window(&mut state.active_panes, &pane_starts)
                 {
                     let key = build_group_key_label_values(&group_key);
-                    let output = PrecomputedOutput::new(
+                    let output = precomputed_output_for_group(
                         *window_start as u64,
                         window_end as u64,
-                        Some(key),
+                        key,
                         PolicyFingerprint::from_config(&state.config),
+                        &group_key,
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -995,11 +1011,12 @@ impl Worker {
                     merge_sketch_panes_for_window(&mut state.sketch_panes, &pane_starts)
                 {
                     let key = build_group_key_label_values(&group_key);
-                    let output = PrecomputedOutput::new(
+                    let output = precomputed_output_for_group(
                         *window_start as u64,
                         window_end as u64,
-                        Some(key),
+                        key,
                         PolicyFingerprint::from_config(&state.config),
+                        &group_key,
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1053,8 +1070,27 @@ fn watermark_for_event_time(max_event_time_ms: i64, allowed_lateness_ms: i64) ->
 }
 
 fn build_group_key_label_values(group_key: &str) -> KeyByLabelValues {
+    if let Some(labels) = population_labels_from_group_key(group_key) {
+        return KeyByLabelValues::new_with_labels(labels.into_values().collect());
+    }
     let labels: Vec<String> = group_key.split(';').map(|s| s.to_string()).collect();
     KeyByLabelValues::new_with_labels(labels)
+}
+
+fn population_labels_from_group_key(group_key: &str) -> Option<BTreeMap<String, String>> {
+    let encoded = group_key.strip_prefix(POPULATION_GROUP_KEY_PREFIX)?;
+    serde_json::from_str(encoded).ok()
+}
+
+fn precomputed_output_for_group(
+    start_timestamp: u64,
+    end_timestamp: u64,
+    key: KeyByLabelValues,
+    policy_fp: PolicyFingerprint,
+    group_key: &str,
+) -> PrecomputedOutput {
+    PrecomputedOutput::new(start_timestamp, end_timestamp, Some(key), policy_fp)
+        .with_population_labels(population_labels_from_group_key(group_key))
 }
 
 /// Extract the metric name from a series key like `"metric_name{key1=\"val1\"}"`.
@@ -2274,6 +2310,18 @@ aggregations:
 
         let key = build_group_key_label_values("");
         assert_eq!(key.labels, vec!["".to_string()]);
+
+        let group = r#"__asap_population__{"instance":"a","job":"api"}"#;
+        let key = build_group_key_label_values(group);
+        assert_eq!(key.labels, vec!["a".to_string(), "api".to_string()]);
+        let output = precomputed_output_for_group(0, 5_000, key, PolicyFingerprint(7), group);
+        assert_eq!(
+            output.population_labels,
+            Some(BTreeMap::from([
+                ("instance".to_string(), "a".to_string()),
+                ("job".to_string(), "api".to_string()),
+            ]))
+        );
     }
 
     // -----------------------------------------------------------------------

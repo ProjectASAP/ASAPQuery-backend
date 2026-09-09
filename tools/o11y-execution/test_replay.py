@@ -55,6 +55,22 @@ class ReplayTests(unittest.TestCase):
                           "http://backend", Path(directory), 2, "http://exact")
         self.assertEqual([r["pair_order"] for r in rows], ["exact_first", "backend_first"])
 
+    def test_advancing_batch_ends_at_original_time_without_per_rpc_probes(self):
+        """Moving windows preserve paired timestamps and never move beyond the corpus endpoint."""
+        response = {"http_status": 200, "headers": {}, "elapsed_ns": 1,
+                    "response": {"status": "success", "data": {"resultType": "vector", "result": []}}}
+        with TemporaryDirectory() as directory, patch("replay.request", side_effect=AssertionError("per-RPC probe")), \
+             patch("replay._http_request", return_value=response) as http, \
+             patch("replay.process_snapshots", return_value={}) as probes:
+            rows = replay([{"id": "q", "query": "up", "eval_timestamp_ms": 3000}],
+                          "http://backend", Path(directory), 3, "http://exact",
+                          evaluation_step_ms=1000, batch_resources=True)
+            self.assertEqual([r["eval_timestamp_ms"] for r in rows], [1000, 2000, 3000])
+            self.assertEqual([r["original_eval_timestamp_ms"] for r in rows], [3000] * 3)
+            self.assertEqual(http.call_count, 6)
+            self.assertEqual(probes.call_count, 3)
+            self.assertTrue((Path(directory) / "query-batch-resources.json").exists())
+
     def test_bad_input_fails_before_any_ingest(self):
         """No silent sample drops, duplicate samples, or time reordering."""
         for lines in [["x NaN 1"], ["x 1"], ["x 1 2", "x 2 1"], ["x 1 1", "x 2 1"]]:

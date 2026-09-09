@@ -3013,7 +3013,13 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
         clamp_window_secs(Some(agg.window_secs)).expect("clamp_window_secs preserves Some");
     json!({
         "aggregationType": aggregation_type,
-        "aggregationSubType": "",
+        "aggregationSubType": if matches!(
+            &agg.family,
+            planner_types::post_asap::SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::MinMax,
+                _
+            )
+        ) { "max" } else { "" },
         "metric": agg.metric_name,
         "labels": {
             "grouping": agg.grouping,

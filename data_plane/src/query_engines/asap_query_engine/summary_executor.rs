@@ -70,12 +70,16 @@ use planner_types::post_asap::{
 };
 use planner_types::pre_asap::{ColumnId, ColumnRef, QueryExpr, Reduction, Source};
 
+use crate::precompute_engine::operators::increase_accumulator::IncreaseAccumulator;
+use crate::precompute_engine::operators::min_max_accumulator::MinMaxAccumulator;
 use crate::storage_engines::sketch_db::data::{AggKind, SketchConfig, SketchTimeSeries};
 use crate::storage_engines::sketch_db::index::{SketchSampleState, SketchStore};
 use crate::storage_engines::sketch_db::query::delta_apply::{
     cumulative_summary_state, per_window_summary_states, DeltaSketchKind, SummaryState,
 };
-use crate::storage_engines::types::{AggregateCore, AggregationType, KeyByLabelValues};
+use crate::storage_engines::types::{
+    AggregateCore, AggregationType, KeyByLabelValues, MergeableAccumulator,
+};
 
 /// Per-query, per-call execution context — constructed fresh for each
 /// incoming query (never shared across concurrent queries, never
@@ -248,8 +252,52 @@ impl GroupState {
                 control_plane::query_plan::ExactReadout::Rate,
                 AggregationType::Increase | AggregationType::MultipleIncrease,
             ) => asap_types::Statistic::Rate,
+            (
+                control_plane::query_plan::ExactReadout::Max,
+                AggregationType::MinMax | AggregationType::MultipleMinMax,
+            ) => asap_types::Statistic::Max,
             _ => return None,
         };
+
+        // Temporal exact summaries are the hot path for long-window
+        // dashboards. Merge their concrete, fixed-size states in one batch
+        // instead of allocating a boxed trait object for every pane.
+        if matches!(
+            agg_type,
+            AggregationType::Increase | AggregationType::MultipleIncrease
+        ) {
+            let accumulators = entries
+                .iter()
+                .flat_map(|windows| windows.values())
+                .map(|acc| acc.as_any().downcast_ref::<IncreaseAccumulator>().cloned())
+                .collect::<Option<Vec<_>>>()?;
+            let merged = <IncreaseAccumulator as MergeableAccumulator<
+                IncreaseAccumulator,
+            >>::merge_accumulators(accumulators)
+            .ok()?;
+            let query_kwargs = std::collections::HashMap::from([
+                ("range_start_ms".to_string(), range_start_ms.to_string()),
+                ("range_end_ms".to_string(), range_end_ms.to_string()),
+            ]);
+            return merged.query_statistic(stat, key, &query_kwargs).ok();
+        }
+        if matches!(
+            agg_type,
+            AggregationType::MinMax | AggregationType::MultipleMinMax
+        ) && readout == control_plane::query_plan::ExactReadout::Max
+        {
+            return entries
+                .iter()
+                .flat_map(|windows| windows.values())
+                .map(|acc| {
+                    acc.as_any()
+                        .downcast_ref::<MinMaxAccumulator>()
+                        .map(|a| a.value)
+                })
+                .collect::<Option<Vec<_>>>()?
+                .into_iter()
+                .reduce(f64::max);
+        }
         let mut merged: Option<Box<dyn AggregateCore>> = None;
         for windows in entries {
             for acc in windows.values() {
@@ -383,9 +431,6 @@ impl QueryExecutionContext<'_> {
             if self.t1_ms.saturating_sub(self.t0_ms) <= width {
                 return Ok(());
             }
-            if self.t0_ms % width != 0 || self.t1_ms % width != 0 {
-                return Err(SummaryExecutorError::Unsupported("partial pane interval"));
-            }
             let mut expected = self.t0_ms.checked_add(width);
             for end in ends {
                 let Ok(end) = u64::try_from(end) else {
@@ -459,16 +504,55 @@ impl QueryExecutionContext<'_> {
                     });
                 }
                 Candidate::ExactAgg(agg_type) => {
+                    if matches!(
+                        agg_type,
+                        AggregationType::MinMax | AggregationType::MultipleMinMax
+                    ) {
+                        if let Some(series) = self.index.query_rollup_range(
+                            crate::storage_engines::sketch_db::index::RollupCategory::ExactMax,
+                            sid,
+                            self.t0_ms,
+                            self.t1_ms,
+                        ) {
+                            for (labels, value) in series {
+                                let key = match &binding.output_grouping {
+                                    PhysicalGrouping::PerEntity => labels,
+                                    PhysicalGrouping::Reduce(keys) => {
+                                        project_group_key(keys, &labels)
+                                    }
+                                };
+                                let accumulator =
+                                    MinMaxAccumulator::with_value(value, "max".to_string());
+                                by_group.entry(key).or_default().push(GroupState::ExactAgg {
+                                    entries: vec![Rc::new(BTreeMap::from([(
+                                        self.t1_ms as i64,
+                                        Arc::new(accumulator) as Arc<dyn AggregateCore>,
+                                    )]))],
+                                    agg_type,
+                                });
+                            }
+                            continue;
+                        }
+                    }
                     let Some((labels, windows)) = self
                         .index
                         .query_exact_agg_range(sid, self.t0_ms, self.t1_ms)
                         .into_iter()
                         .next()
                     else {
-                        check_panes(Vec::new())?;
                         continue;
                     };
-                    check_panes(windows.keys().copied().collect())?;
+                    // Exact accumulators carry their own first/last event
+                    // timestamps. Empty panes need no stored identity and
+                    // gaps between sampled panes are therefore valid for
+                    // counter and extrema state. Additive pane summaries must
+                    // remain contiguous because a missing pane is not zero.
+                    if matches!(
+                        agg_type,
+                        AggregationType::Sum | AggregationType::MultipleSum
+                    ) {
+                        check_panes(windows.keys().copied().collect())?;
+                    }
                     let key = match &binding.output_grouping {
                         PhysicalGrouping::PerEntity => labels,
                         PhysicalGrouping::Reduce(keys) => project_group_key(keys, &labels),
@@ -1003,18 +1087,10 @@ fn summary_family_matches_sketch(
 /// -> ExactKind::Increase` — confirmed against that module's own
 /// dispatch table rather than invented here).
 ///
-/// `ExactKind::MinMax` is deliberately NOT matched: `AggregationType`
-/// carries no min-vs-max DIRECTION (that lives in the write-side
-/// `AggregationConfig::aggregation_sub_type` string, which this sid's
-/// `AggKind::ExactAgg` metadata doesn't retain), so there's no honest way
-/// for `GroupState::exact_value` to know which statistic to compute --
-/// matching it here would force a later caller to silently guess a
-/// direction. `ExactKind::Count`/`Rate` are ALSO not matched: no
-/// `AggregationType` variant resolves to either today (mirrors
-/// `sketch_reducer.rs::evaluate_exact_agg`'s own `stat` mapping, which
-/// only handles `Sum`/`Increase` for the same reason); `Rate` in
-/// particular is "outer-agg-fold" territory the user has explicitly
-/// deferred pending a design conversation with ASAPController.
+/// `ExactKind::Count`/`Rate`/`MinMax` are not matched by this legacy
+/// family-discovery path because their final operation is ambiguous from the
+/// stored accumulator alone. Installed QueryPlans carry an explicit
+/// `ExactReadout`, and `read_bound_materialization` serves those forms safely.
 fn summary_family_matches_exact(family: &SummaryFamilyType, agg_type: AggregationType) -> bool {
     matches!(
         (family, agg_type),

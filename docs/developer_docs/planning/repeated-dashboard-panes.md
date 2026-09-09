@@ -32,10 +32,10 @@ formula. Version 2 still requires complete workload-versus-exact quotes.
 
 ## Execution guarantees and limits
 
-Backend-local raw plans encode `promql_right_closed: true` in state parameters
-and therefore in the fingerprint. Raw workers assign boundary samples to
-PromQL's `(start, end]` panes, while preserving original timestamps inside
-accumulators. Legacy half-open states have a different identity.
+Backend-local summary plans encode `promql_right_closed: true` in state
+parameters and therefore in the fingerprint. Precompute workers assign boundary
+samples to PromQL's `(start, end]` panes, while preserving original timestamps
+inside accumulators. Legacy half-open states have a different identity.
 
 At every instant/range evaluation, serving checks each binding's pane alignment.
 Multi-pane reads require contiguous stored pane ends for every matched stored

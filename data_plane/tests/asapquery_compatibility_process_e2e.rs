@@ -1259,7 +1259,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         .time_selection
         .scope = planner_types::workload::QueryTimeScope::Unknown;
     let (mut legacy_request, mut environment) = snapshot.planning_request().unwrap();
-    legacy_request.local_raw_execution = false;
+    legacy_request.hybrid_execution = false;
     let query = &mut legacy_request.queries[0];
     let parsed = control_plane::query_parser::parse_query_expr_canonical(
         &query.query_string,

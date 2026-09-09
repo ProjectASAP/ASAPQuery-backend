@@ -12,7 +12,8 @@ import json
 from pathlib import Path
 import re
 import time
-from replay import parse_samples
+import math
+from replay import iter_samples
 
 
 def duration_ms(text):
@@ -30,18 +31,38 @@ def main():
     parser.add_argument("--repetitions", type=int, default=20, help="query evaluations per bounded replay batch")
     args = parser.parse_args()
     corpus = json.loads(args.corpus.read_text())
-    rows = parse_samples(args.metrics.read_text().splitlines())
+    sample_count = 0
+    first_timestamp_ms = None
+    last_timestamp_ms = None
+    series = set()
+    last_by_series = {}
+    source_sample_interval_ms = None
+    with args.metrics.open() as metrics:
+        for labels, _, timestamp in iter_samples(metrics):
+            key = tuple(sorted(labels.items()))
+            prior = last_by_series.get(key)
+            if prior is not None:
+                source_sample_interval_ms = (
+                    timestamp - prior
+                    if source_sample_interval_ms is None
+                    else math.gcd(source_sample_interval_ms, timestamp - prior)
+                )
+            last_by_series[key] = timestamp
+            series.add(key)
+            sample_count += 1
+            first_timestamp_ms = timestamp if first_timestamp_ms is None else first_timestamp_ms
+            last_timestamp_ms = timestamp
     snapshot = json.loads(args.template.read_text())
     now = int(time.time() * 1000)
-    input_span = (rows[-1][2] - rows[0][2]) / 1000
+    input_span = (last_timestamp_ms - first_timestamp_ms) / 1000
     horizon = args.repetitions * args.interval_ms / 1000
     if input_span <= 0 or horizon <= 0 or args.interval_ms <= 0:
         raise ValueError("positive input horizon and recurrence required")
     def evidence(value):
         return {"value": value, "source": "observed", "observed_at_ms": now, "valid_for_ms": 86400000}
     data = snapshot["data_workload"]
-    data.update(ingestion_volume=evidence(len(rows)), ingestion_rate=evidence(len(rows)/horizon),
-                input_cardinality=evidence(len({tuple(sorted(labels.items())) for labels, _, _ in rows})))
+    data.update(ingestion_volume=evidence(sample_count), ingestion_rate=evidence(sample_count/horizon),
+                input_cardinality=evidence(len(series)))
     data["ingestion_rate"]["source"] = "derived"
     registrations, query_audit = [], []
     frequencies = Counter(row["query"] for row in corpus["queries"])
@@ -63,12 +84,18 @@ def main():
     snapshot["snapshot_version"] = 2
     snapshot.pop("workload_cost_evidence", None)
     implementation = snapshot["implementation"]
+    if source_sample_interval_ms:
+        implementation["source_sample_interval_ms"] = source_sample_interval_ms
+    # Finite replay evaluates the oldest repetition first after loading the
+    # complete input. Preserve that admitted historical-query span separately
+    # from each query's PromQL range selector.
+    implementation["query_staleness_margin_ms"] = max(0, (args.repetitions - 1) * args.interval_ms)
     implementation.update(evidence_observed_at_unix_ms=now, evidence_valid_for_ms=86400000, horizon_seconds=horizon)
     implementation["lifecycle_costs"] = dict.fromkeys(("build", "maintenance_per_update", "read", "retention_per_second", "retirement"), 1.0)
     implementation["implementation_cost"].update(model_version="UNCALIBRATED-enumeration-only", observed_at_unix_ms=now,
         valid_for_ms=86400000, horizon_seconds=horizon, cpu_cost=1.0, peak_memory_bytes=0, network_bytes=0,
         storage_bytes=0, source_scan_bytes=0, weighted_cost=1.0)
-    snapshot["environment"].update(observed_at_unix_ms=now, activation_unix_ms=rows[0][2], max_evidence_age_ms=86400000,
+    snapshot["environment"].update(observed_at_unix_ms=now, activation_unix_ms=first_timestamp_ms, max_evidence_age_ms=86400000,
                                   capability_snapshot_id="o11y-backend-local-calibration-v1")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(snapshot, indent=2) + "\n")
@@ -76,12 +103,12 @@ def main():
         "purpose": "candidate discovery only; uncalibrated costs are NOT execution quotes or benefit evidence",
         "input_sha256": hashlib.sha256(args.metrics.read_bytes()).hexdigest(),
         "corpus_sha256": hashlib.sha256(args.corpus.read_bytes()).hexdigest(),
-        "upstream_revision": corpus["upstream_revision"], "sample_count": len(rows),
-        "series_count": data["input_cardinality"]["value"], "first_timestamp_ms": rows[0][2], "last_timestamp_ms": rows[-1][2],
+        "upstream_revision": corpus["upstream_revision"], "sample_count": sample_count,
+        "series_count": data["input_cardinality"]["value"], "first_timestamp_ms": first_timestamp_ms, "last_timestamp_ms": last_timestamp_ms,
         "declared_query_interval_ms": args.interval_ms, "repetitions": args.repetitions,
         "input_span_seconds": input_span, "cost_horizon_seconds": horizon,
-        "event_time_ingestion_rate": len(rows) / input_span,
-        "derived_bounded_replay_ingestion_rate": len(rows) / horizon,
+        "event_time_ingestion_rate": sample_count / input_span,
+        "derived_bounded_replay_ingestion_rate": sample_count / horizon,
         "cost_scope": "bounded accelerated replay: entire finite input once plus declared query repetitions; logical horizon is not wall-clock residency",
         "accuracy": "exact",
         "queries": query_audit}, indent=2) + "\n")

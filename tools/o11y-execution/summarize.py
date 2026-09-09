@@ -76,7 +76,10 @@ def summarize(directory):
             'query_occurrences': run['query_occurrences'], 'aggregate': aggregate,
             'by_phase': {k: {a: b for a, b in v.items() if a != 'comparisons'} for k, v in comparison['by_phase'].items()},
             'selected_plan_id': planning['cost_comparison']['selected_plan_id'],
-            'candidate_costs': planning['cost_comparison']['alternatives'],
+            # Smoke-test planning records the selected manifest without priced
+            # alternatives. Preserve that evidence instead of making report
+            # generation depend on calibrated selection fields.
+            'candidate_costs': planning['cost_comparison'].get('alternatives', []),
             'query_cost_comparison': aligned, 'phase_resources': comparison['phase_resources'],
             'storage': comparison['storage'], 'limitations': limitations, 'acceptance_complete': False,
             'evidence_sha256': {n: hashlib.sha256((directory / n).read_bytes()).hexdigest() for n in

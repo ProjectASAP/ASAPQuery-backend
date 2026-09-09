@@ -155,14 +155,16 @@ impl QueryPlanEntry {
             logical_source: Some(canonical_promql.clone()),
         };
         let root = compiler.lower(root)?;
-        Ok(Self {
+        let mut entry = Self {
             query_id,
             canonical_promql,
             root,
             nodes: compiler.nodes,
             instant,
             fallback,
-        })
+        };
+        logical::finalize_residuals(&mut entry)?;
+        Ok(entry)
     }
 
     /// Validate references, bindings, reachability, and cycles before activation.
@@ -341,6 +343,7 @@ pub enum ExactReadout {
     Count,
     Increase,
     Rate,
+    Max,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -429,18 +432,6 @@ where
         let id = QueryNodeId(self.next_id);
         self.next_id += 1;
         self.seen.insert(identity, id);
-        if let Some(original) = &self.logical_source {
-            if let Some(operator) = logical::selected_range_max_index(original, node)? {
-                self.nodes.insert(
-                    id,
-                    QueryPlanNode::Logical {
-                        operator,
-                        inputs: vec![],
-                    },
-                );
-                return Ok(id);
-            }
-        }
         let residual = match (&self.logical_source, &node.expr) {
             (Some(original), SummaryExpr::KeepPreAsap(expr)) => {
                 Some(logical::residual_nodes(original, expr)?)
@@ -449,7 +440,7 @@ where
                 if matches!(child.expr, SummaryExpr::KeepPreAsap(_))
                     && !matches!(
                         crate::physical::compiler::materialization_leaf_contract(node),
-                        Ok((_, Some(_)))
+                        Ok((_, Some(_), _))
                     ) =>
             {
                 Some(logical::selected_residual_nodes(original, node)?)
@@ -666,6 +657,7 @@ fn exact_readout(family: &SummaryFamilyType) -> Option<ExactReadout> {
         SummaryFamilyType::ExactAggregate(ExactKind::Count, _) => Some(ExactReadout::Count),
         SummaryFamilyType::ExactAggregate(ExactKind::Increase, _) => Some(ExactReadout::Increase),
         SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => Some(ExactReadout::Rate),
+        SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _) => Some(ExactReadout::Max),
         _ => None,
     }
 }

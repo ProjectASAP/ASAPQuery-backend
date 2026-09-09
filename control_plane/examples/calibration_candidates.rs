@@ -3,7 +3,89 @@ use control_plane::physical::{
     compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler},
     workload_cost,
 };
-use serde_json::json;
+use planner_types::post_asap::{SummaryExpr, SummaryNode};
+use serde_json::{json, Value};
+use std::{collections::BTreeMap, rc::Rc};
+
+// Planner IR does not implement Serialize. Preserve actual DAG identity and
+// typed variant/edges; leaf metadata uses explicitly labelled Debug encoding.
+fn planner_forest(queries: &[control_plane::physical::compiler::PlanningQuery]) -> Value {
+    fn visit(
+        node: &Rc<SummaryNode>,
+        seen: &mut BTreeMap<usize, usize>,
+        nodes: &mut BTreeMap<usize, Value>,
+    ) -> usize {
+        let pointer = Rc::as_ptr(node) as usize;
+        if let Some(id) = seen.get(&pointer) {
+            return *id;
+        }
+        let id = seen.len();
+        seen.insert(pointer, id);
+        let (kind, children, detail): (&str, Vec<&Rc<SummaryNode>>, Value) = match &node.expr {
+            SummaryExpr::KeepPreAsap(expr) => (
+                "KeepPreAsap",
+                vec![],
+                json!({"query_expr_debug":format!("{expr:#?}")}),
+            ),
+            SummaryExpr::BinaryOp { lhs, rhs, operator } => (
+                "BinaryOp",
+                vec![lhs, rhs],
+                json!({"operator_debug":format!("{operator:?}")}),
+            ),
+            SummaryExpr::SummaryAgg {
+                child,
+                family,
+                reduction,
+                grouping,
+                input,
+                ..
+            } => (
+                "SummaryAgg",
+                vec![child],
+                json!({"family_debug":format!("{family:?}"),"reduction_debug":format!("{reduction:?}"),"grouping_debug":format!("{grouping:?}"),"input_debug":format!("{input:?}")}),
+            ),
+            SummaryExpr::SummaryJoin {
+                outer,
+                inner,
+                key,
+                family,
+            } => (
+                "SummaryJoin",
+                vec![outer, inner],
+                json!({"key_debug":format!("{key:?}"),"family_debug":format!("{family:?}")}),
+            ),
+            SummaryExpr::SummarySubtract { left, right } => {
+                ("SummarySubtract", vec![left, right], json!({}))
+            }
+            SummaryExpr::SummaryDelete { summary_input, key } => (
+                "SummaryDelete",
+                vec![summary_input],
+                json!({"key_debug":format!("{key:?}")}),
+            ),
+            SummaryExpr::SummaryEstimate {
+                summary_input,
+                query,
+            } => (
+                "SummaryEstimate",
+                vec![summary_input],
+                json!({"query_debug":format!("{query:?}")}),
+            ),
+            SummaryExpr::SummaryMerge { children } => {
+                ("SummaryMerge", children.iter().collect(), json!({}))
+            }
+        };
+        let inputs: Vec<_> = children
+            .into_iter()
+            .map(|child| visit(child, seen, nodes))
+            .collect();
+        nodes.insert(id,json!({"kind":kind,"inputs":inputs,"detail":detail,"schema_debug":format!("{:?}",node.schema),"guarantee_debug":format!("{:?}",node.guarantee)}));
+        id
+    }
+    let mut seen = BTreeMap::new();
+    let mut nodes = BTreeMap::new();
+    let roots:Vec<_>=queries.iter().map(|q|json!({"query_id":q.query_id,"original_promql":q.query_string,"root":visit(&q.post_asap,&mut seen,&mut nodes)})).collect();
+    json!({"encoding":"structured_graph_with_debug_metadata_v1","scope":"actual candidate Planner post-ASAP input before physical binding; not reconstructed from installed nodes","roots":roots,"nodes":nodes})
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
@@ -17,11 +99,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enumerate()
     {
         let queries = candidate.queries.clone();
+        let materialization_policy = candidate.materialization_policy.clone();
+        let planner_selected_queries = planner_forest(&queries);
         let plan = match PhysicalCompiler.compile(candidate, environment.clone()) {
             Ok(plan) => plan,
             Err(error) => {
                 results.push(
-                    json!({"candidate_index": index, "unavailable_reason": error.to_string()}),
+                    json!({"candidate_index": index, "materialization_policy": materialization_policy, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
                 );
                 continue;
             }
@@ -30,13 +114,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(manifest) => manifest,
             Err(error) => {
                 results.push(
-                    json!({"candidate_index": index, "unavailable_reason": error.to_string()}),
+                    json!({"candidate_index": index, "materialization_policy": materialization_policy, "planner_selected_queries": planner_selected_queries, "unavailable_reason": error.to_string()}),
                 );
                 continue;
             }
         };
         results.push(json!({
             "candidate_index": index,
+            "materialization_policy": materialization_policy,
+            "planner_selected_queries": planner_selected_queries,
             "manifest": manifest,
             "lifecycle_estimates": plan.lifecycle_estimates,
             "install_request": {

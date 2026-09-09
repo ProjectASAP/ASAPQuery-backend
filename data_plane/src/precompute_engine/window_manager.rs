@@ -8,6 +8,10 @@ pub struct WindowManager {
     window_size_ms: i64,
     /// Slide interval in milliseconds (== window_size_ms for tumbling windows).
     slide_interval_ms: i64,
+    /// Event-time phase of this materialization instance. It is learned from
+    /// the first admitted sample so panes follow the source cadence instead
+    /// of assuming that every Prometheus series is epoch-aligned.
+    origin_ms: Option<i64>,
 }
 
 impl WindowManager {
@@ -25,7 +29,12 @@ impl WindowManager {
         Self {
             window_size_ms,
             slide_interval_ms,
+            origin_ms: None,
         }
+    }
+
+    pub fn anchor_to_first_sample(&mut self, timestamp_ms: i64) {
+        self.origin_ms.get_or_insert(timestamp_ms);
     }
 
     pub fn window_size_ms(&self) -> i64 {
@@ -36,8 +45,8 @@ impl WindowManager {
     /// Windows are aligned to epoch (multiples of slide_interval_ms).
     pub fn window_start_for(&self, timestamp_ms: i64) -> i64 {
         // Floor-divide to the nearest slide interval boundary
-        let n = timestamp_ms.div_euclid(self.slide_interval_ms);
-        n * self.slide_interval_ms
+        let origin = self.origin_ms.unwrap_or(0);
+        origin + (timestamp_ms - origin).div_euclid(self.slide_interval_ms) * self.slide_interval_ms
     }
 
     /// Return window starts whose windows are now closed, given that the
@@ -130,6 +139,15 @@ mod tests {
         assert_eq!(wm.window_start_for(60_000), 60_000);
         assert_eq!(wm.window_start_for(119_999), 60_000);
         assert_eq!(wm.window_start_for(120_000), 120_000);
+    }
+
+    #[test]
+    fn source_phase_anchor_aligns_repeated_event_time_queries() {
+        let mut windows = WindowManager::new(5, 5);
+        windows.anchor_to_first_sample(25_000);
+        assert_eq!(windows.window_start_for(25_000), 25_000);
+        assert_eq!(windows.window_start_for(55_000), 55_000);
+        assert_eq!(windows.window_start_for(21_655_000), 21_655_000);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use crate::precompute_engine::ingest_handler::IngestState;
 use crate::precompute_engine::series_router::{TryRouteError, WorkerMessage};
 use prost::Message;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -96,14 +96,14 @@ struct ReceiverInner {
     ingest: Arc<IngestState>,
     dedup: Mutex<DedupState>,
     stats: Arc<RemoteWriteStats>,
-    raw_store: Arc<crate::query_engines::raw_store::RawSampleStore>,
 }
 
 #[derive(Default)]
 struct DedupState {
     input_closed: bool,
-    values: HashMap<(u64, u64, String, i64), DedupValue>,
-    expiry: VecDeque<(Instant, u64, u64, String, i64)>,
+    values: HashMap<(u64, u64, Arc<str>, i64), DedupValue>,
+    expiry_by_event_time: BTreeMap<i64, Vec<(u64, u64, Arc<str>)>>,
+    max_event_timestamp_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -148,36 +148,25 @@ pub enum RemoteWriteError {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CanonicalSample {
-    pub metric: String,
-    pub labels: HashMap<String, String>,
-    pub series_key: String,
+    pub metric: Arc<str>,
+    pub labels: Arc<HashMap<String, String>>,
+    pub series_key: Arc<str>,
+    population_key: Arc<str>,
+    all_attrs_fingerprint: Arc<str>,
     pub timestamp_ms: i64,
     pub value: Option<f64>,
 }
 
 impl PrometheusRemoteWriteReceiver {
     pub fn new(config: PrometheusRemoteWriteConfig, ingest: Arc<IngestState>) -> Self {
-        Self::new_with_raw_store(config, ingest, Arc::new(Default::default()))
-    }
-
-    pub fn new_with_raw_store(
-        config: PrometheusRemoteWriteConfig,
-        ingest: Arc<IngestState>,
-        raw_store: Arc<crate::query_engines::raw_store::RawSampleStore>,
-    ) -> Self {
         Self {
             inner: Arc::new(ReceiverInner {
                 config,
                 ingest,
                 dedup: Mutex::new(DedupState::default()),
                 stats: Arc::new(RemoteWriteStats::default()),
-                raw_store,
             }),
         }
-    }
-
-    pub fn raw_store(&self) -> Arc<crate::query_engines::raw_store::RawSampleStore> {
-        self.inner.raw_store.clone()
     }
 
     pub fn config(&self) -> &PrometheusRemoteWriteConfig {
@@ -193,43 +182,16 @@ impl PrometheusRemoteWriteReceiver {
         {
             let mut state = self.inner.dedup.lock().map_err(|e| e.to_string())?;
             state.input_closed = true;
+            // No write or retry is admissible after the finite-input barrier,
+            // so retry identities have no remaining correctness role during
+            // the query phase. Release them before waiting for materialization.
+            state.values.clear();
+            state.values.shrink_to_fit();
+            state.expiry_by_event_time.clear();
+            state.max_event_timestamp_ms = None;
         }
         self.inner.ingest.router.drain().await?;
-        // Finite-input preparation includes the residual index, so its build
-        // cost is not silently amortized into the first query's read cost.
-        if self.inner.raw_store.sample_count() > 0 {
-            let plan = self
-                .inner
-                .ingest
-                .physical_plan_snapshot()
-                .ok_or_else(|| "active plan disappeared during input drain".to_string())?;
-            let prepared = self
-                .inner
-                .raw_store
-                .snapshot(
-                    plan.precompute_plan.envelope.plan_id,
-                    plan.precompute_plan.envelope.plan_version,
-                )
-                .map_err(|error| error.to_string())?;
-            let metrics = plan
-                .query_plan
-                .entries
-                .values()
-                .flat_map(|entry| entry.nodes.values())
-                .filter_map(|node| match node {
-                    control_plane::query_plan::QueryPlanNode::Logical {
-                        operator:
-                            control_plane::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
-                                metric,
-                                ..
-                            },
-                        ..
-                    } => Some(metric.clone()),
-                    _ => None,
-                })
-                .collect();
-            prepared.prepare_range_max_indexes(&metrics);
-        }
+        trim_process_allocator();
         Ok(())
     }
 
@@ -291,7 +253,6 @@ impl PrometheusRemoteWriteReceiver {
             physical_plan.precompute_plan.envelope.plan_version,
         );
 
-        let now = Instant::now();
         let mut dedup = self
             .inner
             .dedup
@@ -300,11 +261,19 @@ impl PrometheusRemoteWriteReceiver {
         if dedup.input_closed {
             return Err(RemoteWriteError::InputClosed);
         }
-        dedup.evict_before(now.checked_sub(config.dedup_horizon).unwrap_or(now));
+        let batch_max_timestamp_ms = samples.iter().map(|sample| sample.timestamp_ms).max();
+        let max_event_timestamp_ms = match (dedup.max_event_timestamp_ms, batch_max_timestamp_ms) {
+            (Some(current), Some(batch)) => Some(current.max(batch)),
+            (current, batch) => current.or(batch),
+        };
+        let horizon_ms = i64::try_from(config.dedup_horizon.as_millis()).unwrap_or(i64::MAX);
+        let retention_cutoff_ms = max_event_timestamp_ms
+            .map(|timestamp| timestamp.saturating_sub(horizon_ms))
+            .unwrap_or(i64::MIN);
 
         // Validate conflicts both against committed history and inside this
         // request before reserving any worker capacity.
-        let mut batch_values: HashMap<(u64, u64, String, i64), DedupValue> = HashMap::new();
+        let mut batch_values: HashMap<(u64, u64, Arc<str>, i64), DedupValue> = HashMap::new();
         let mut new_samples = Vec::with_capacity(samples.len());
         let mut duplicates = 0u64;
         for sample in samples {
@@ -318,14 +287,18 @@ impl PrometheusRemoteWriteReceiver {
                 .value
                 .map(|v| DedupValue::Number(v.to_bits()))
                 .unwrap_or(DedupValue::Stale);
-            let prior = batch_values.get(&key).or_else(|| dedup.values.get(&key));
+            let prior = batch_values.get(&key).or_else(|| {
+                (sample.timestamp_ms >= retention_cutoff_ms)
+                    .then(|| dedup.values.get(&key))
+                    .flatten()
+            });
             match prior {
                 Some(previous) if *previous == value => {
                     duplicates += 1;
                 }
                 Some(_) => {
                     return Err(RemoteWriteError::Conflict {
-                        series: sample.series_key,
+                        series: sample.series_key.to_string(),
                         timestamp: sample.timestamp_ms,
                     });
                 }
@@ -335,7 +308,16 @@ impl PrometheusRemoteWriteReceiver {
                 }
             }
         }
-        if dedup.values.len().saturating_add(batch_values.len()) > config.max_dedup_entries {
+        let retained_existing = dedup
+            .values
+            .keys()
+            .filter(|key| key.3 >= retention_cutoff_ms)
+            .count();
+        let retained_batch = batch_values
+            .keys()
+            .filter(|key| key.3 >= retention_cutoff_ms)
+            .count();
+        if retained_existing.saturating_add(retained_batch) > config.max_dedup_entries {
             return Err(RemoteWriteError::DedupCapacity(config.max_dedup_entries));
         }
 
@@ -345,49 +327,23 @@ impl PrometheusRemoteWriteReceiver {
             .router
             .try_route_group_batch_atomic(messages)?;
 
-        let mut raw_metrics = std::collections::BTreeSet::new();
-        let mut all_metrics = false;
-        for entry in physical_plan.query_plan.entries.values() {
-            for node in entry.nodes.values() {
-                if let control_plane::query_plan::QueryPlanNode::Logical {
-                    operator:
-                        control_plane::query_plan::logical::LogicalOperator::Scan { metric, .. },
-                    ..
-                } = node
-                {
-                    if let Some(metric) = metric {
-                        raw_metrics.insert(metric.clone());
-                    } else {
-                        all_metrics = true;
-                    }
-                } else if let control_plane::query_plan::QueryPlanNode::Logical {
-                    operator:
-                        control_plane::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
-                            metric,
-                            ..
-                        },
-                    ..
-                } = node
-                {
-                    raw_metrics.insert(metric.clone());
-                }
-            }
-        }
-        self.inner.raw_store.append_admitted(
-            plan_identity.0,
-            plan_identity.1,
-            &new_samples,
-            &raw_metrics,
-            all_metrics,
-        );
-
+        // Commit dedup mutation only after the entire routed batch was
+        // reserved successfully. A rejected/backpressured request must not
+        // advance event time or erase retry history.
+        dedup.max_event_timestamp_ms = max_event_timestamp_ms;
+        dedup.evict_event_times_before(retention_cutoff_ms);
         for ((plan_id, plan_version, series, timestamp), value) in batch_values {
+            if timestamp < retention_cutoff_ms {
+                continue;
+            }
             dedup
                 .values
                 .insert((plan_id, plan_version, series.clone(), timestamp), value);
             dedup
-                .expiry
-                .push_back((now, plan_id, plan_version, series, timestamp));
+                .expiry_by_event_time
+                .entry(timestamp)
+                .or_default()
+                .push((plan_id, plan_version, series));
         }
         let stale_count = new_samples
             .iter()
@@ -413,16 +369,35 @@ impl PrometheusRemoteWriteReceiver {
     }
 }
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_process_allocator() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // The input barrier has drained all worker-owned batches and permanently
+    // rejects future writes, so pages released by the dedup map and ingest
+    // buffers are no longer reachable by application code.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_process_allocator() {}
+
 impl DedupState {
-    fn evict_before(&mut self, cutoff: Instant) {
-        while self
-            .expiry
-            .front()
-            .is_some_and(|(accepted_at, _, _, _, _)| *accepted_at < cutoff)
-        {
-            if let Some((_, plan_id, plan_version, series, timestamp)) = self.expiry.pop_front() {
-                self.values
-                    .remove(&(plan_id, plan_version, series, timestamp));
+    fn evict_event_times_before(&mut self, cutoff_ms: i64) {
+        let expired_timestamps = self
+            .expiry_by_event_time
+            .range(..cutoff_ms)
+            .map(|(timestamp, _)| *timestamp)
+            .collect::<Vec<_>>();
+        for timestamp in expired_timestamps {
+            if let Some(entries) = self.expiry_by_event_time.remove(&timestamp) {
+                for (plan_id, plan_version, series) in entries {
+                    self.values
+                        .remove(&(plan_id, plan_version, series, timestamp));
+                }
             }
         }
     }
@@ -449,12 +424,31 @@ fn canonicalize_request(
             return Err(RemoteWriteError::TooManySamples(config.max_samples));
         }
         let (metric, labels, series_key) = canonicalize_labels(&timeseries.labels)?;
+        let metric: Arc<str> = metric.into();
+        let labels = Arc::new(labels);
+        let series_key: Arc<str> = series_key.into();
+        let mut sorted_attrs = labels
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        sorted_attrs.sort_unstable();
+        let all_attrs_fingerprint: Arc<str> =
+            super::canonical_attrs_fingerprint(&sorted_attrs).into();
+        let population_labels = sorted_attrs
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let population_key: Arc<str> = format!(
+            "__asap_population__{}",
+            serde_json::to_string(&population_labels).expect("label map serialization")
+        )
+        .into();
         for sample in &timeseries.samples {
             let value = if sample.value.to_bits() == STALE_NAN_BITS {
                 None
             } else if !sample.value.is_finite() {
                 return Err(RemoteWriteError::InvalidSample {
-                    series: series_key.clone(),
+                    series: series_key.to_string(),
                     timestamp: sample.timestamp,
                     reason: "only finite values or the Prometheus stale marker are accepted".into(),
                 });
@@ -465,6 +459,8 @@ fn canonicalize_request(
                 metric: metric.clone(),
                 labels: labels.clone(),
                 series_key: series_key.clone(),
+                population_key: population_key.clone(),
+                all_attrs_fingerprint: all_attrs_fingerprint.clone(),
                 timestamp_ms: sample.timestamp,
                 value,
             });
@@ -536,32 +532,64 @@ fn route_messages(
         &snapshot,
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     );
+    let configs = snapshot
+        .get_all_aggregation_configs()
+        .values()
+        .filter_map(|config| {
+            compile_spatial_filter(&config.spatial_filter_normalized)
+                .ok()
+                .map(|filter| (config, filter))
+        })
+        .collect::<Vec<_>>();
     let mut buckets: HashMap<u64, (Bucket, Vec<RoutedSample>)> = HashMap::new();
     for sample in samples {
         let Some(value) = sample.value else {
             // Staleness is a lifecycle signal, never an accumulator input.
             continue;
         };
-        for config in snapshot.get_all_aggregation_configs().values() {
-            if config.metric != sample.metric
-                && config.spatial_filter_normalized != sample.metric
-                && config.spatial_filter != sample.metric
-            {
+        for (config, filter) in &configs {
+            if config.metric.as_str() != sample.metric.as_ref() || !filter.matches(&sample.labels) {
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&sample.series_key, config);
-            let grouping_pairs: Vec<(&str, &str)> = config
-                .grouping_labels
-                .labels
-                .iter()
-                .map(|name| {
-                    (
-                        name.as_str(),
-                        sample.labels.get(name).map(String::as_str).unwrap_or(""),
-                    )
-                })
-                .collect();
-            let attrs_fp = super::canonical_attrs_fingerprint(&grouping_pairs);
+            // Reset-aware counters and temporal min/max must keep one
+            // accumulator per source series. Their emitted label values still
+            // follow the physical grouping, so query-time Reduce nodes can
+            // combine those independent SDS instances safely.
+            let series_scoped = matches!(
+                config.aggregation_type,
+                asap_types::AggregationType::Increase
+                    | asap_types::AggregationType::MultipleIncrease
+                    | asap_types::AggregationType::MinMax
+                    | asap_types::AggregationType::MultipleMinMax
+            );
+            let grouping_pairs: Vec<(&str, &str)> = if series_scoped {
+                Vec::new()
+            } else {
+                config
+                    .grouping_labels
+                    .labels
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.as_str(),
+                            sample.labels.get(name).map(String::as_str).unwrap_or(""),
+                        )
+                    })
+                    .collect()
+            };
+            let group_key = if series_scoped {
+                sample.population_key.to_string()
+            } else {
+                group_key
+            };
+            let computed_attrs_fp;
+            let attrs_fp = if series_scoped {
+                sample.all_attrs_fingerprint.as_ref()
+            } else {
+                computed_attrs_fp = super::canonical_attrs_fingerprint(&grouping_pairs);
+                &computed_attrs_fp
+            };
             let policy_fp = asap_types::PolicyFingerprint(config.policy_fp_u64());
             // A sketch family is not a complete physical identity. Two
             // materializations may use the same family and grouping while
@@ -572,12 +600,12 @@ fn route_messages(
             let sid =
                 ingest
                     .series_resolver
-                    .resolve(&config.metric, &attrs_fp, &materialization_kind);
+                    .resolve(&config.metric, attrs_fp, &materialization_kind);
             buckets
                 .entry(sid)
                 .or_insert_with(|| ((sid, policy_fp, group_key), Vec::new()))
                 .1
-                .push((sample.series_key.clone(), sample.timestamp_ms, value));
+                .push((sample.series_key.to_string(), sample.timestamp_ms, value));
         }
     }
     let received_at = Instant::now();
@@ -593,6 +621,98 @@ fn route_messages(
             },
         )
         .collect()
+}
+
+#[derive(Debug)]
+enum CompiledLabelMatcher {
+    Equal(String, String),
+    NotEqual(String, String),
+    Regex(String, regex::Regex),
+    NotRegex(String, regex::Regex),
+}
+
+#[derive(Debug, Default)]
+struct CompiledSpatialFilter(Vec<CompiledLabelMatcher>);
+
+impl CompiledSpatialFilter {
+    fn matches(&self, labels: &HashMap<String, String>) -> bool {
+        self.0.iter().all(|matcher| {
+            let (name, expected, negate) = match matcher {
+                CompiledLabelMatcher::Equal(name, value) => {
+                    return labels.get(name).map(String::as_str).unwrap_or("") == value
+                }
+                CompiledLabelMatcher::NotEqual(name, value) => {
+                    return labels.get(name).map(String::as_str).unwrap_or("") != value
+                }
+                CompiledLabelMatcher::Regex(name, regex) => (name, regex, false),
+                CompiledLabelMatcher::NotRegex(name, regex) => (name, regex, true),
+            };
+            let matched = expected.is_match(labels.get(name).map(String::as_str).unwrap_or(""));
+            matched != negate
+        })
+    }
+}
+
+fn compile_spatial_filter(filter: &str) -> Result<CompiledSpatialFilter, String> {
+    let body = filter.trim().trim_start_matches('{').trim_end_matches('}');
+    if body.trim().is_empty() {
+        return Ok(CompiledSpatialFilter::default());
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in body.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' && quoted {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if ch == ',' && !quoted {
+            parts.push(body[start..index].trim());
+            start = index + 1;
+        }
+    }
+    if quoted {
+        return Err("unterminated spatial-filter string".into());
+    }
+    parts.push(body[start..].trim());
+    let mut compiled = Vec::with_capacity(parts.len());
+    for part in parts {
+        let (name, operator, raw_value) = ["!~", "=~", "!=", "="]
+            .into_iter()
+            .find_map(|operator| {
+                part.find(operator).map(|at| {
+                    (
+                        part[..at].trim(),
+                        operator,
+                        part[at + operator.len()..].trim(),
+                    )
+                })
+            })
+            .ok_or_else(|| format!("invalid spatial matcher {part:?}"))?;
+        if name.is_empty() {
+            return Err("spatial matcher has an empty label name".into());
+        }
+        let value: String = serde_json::from_str(raw_value)
+            .map_err(|error| format!("invalid spatial matcher value: {error}"))?;
+        compiled.push(match operator {
+            "=" => CompiledLabelMatcher::Equal(name.into(), value),
+            "!=" => CompiledLabelMatcher::NotEqual(name.into(), value),
+            "=~" | "!~" => {
+                let regex = regex::Regex::new(&format!("^(?:{value})$"))
+                    .map_err(|error| format!("invalid spatial matcher regex: {error}"))?;
+                if operator == "=~" {
+                    CompiledLabelMatcher::Regex(name.into(), regex)
+                } else {
+                    CompiledLabelMatcher::NotRegex(name.into(), regex)
+                }
+            }
+            _ => unreachable!(),
+        });
+    }
+    Ok(CompiledSpatialFilter(compiled))
 }
 
 fn valid_label_name(name: &str) -> bool {
@@ -638,13 +758,6 @@ mod tests {
     }
 
     fn physical_config(streaming: StreamingConfig) -> HotReloadStreamingConfig {
-        physical_config_with_raw(streaming, false, false)
-    }
-    fn physical_config_with_raw(
-        streaming: StreamingConfig,
-        retain_raw: bool,
-        indexed: bool,
-    ) -> HotReloadStreamingConfig {
         use control_plane::physical::compiler::{
             FrameIdentityContract, IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan,
             SequenceScope, TimestampUnit, TransmissionPlan, PLANNER_REVISION,
@@ -659,7 +772,7 @@ mod tests {
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
-        let mut active = ActivePhysicalPlan {
+        let active = ActivePhysicalPlan {
             precompute_plan: PrecomputePlan {
                 envelope: envelope.clone(),
                 ingest: IngestContract {
@@ -689,46 +802,6 @@ mod tests {
             query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(BackendStorageRouting::empty()),
         };
-        if retain_raw {
-            use control_plane::query_plan::{
-                FallbackPolicy, InstantExecution, QueryNodeId, QueryPlanEntry, QueryPlanNode,
-            };
-            let id = QueryNodeId(0);
-            let query = QueryPlanEntry {
-                query_id: "raw".into(),
-                canonical_promql: "requests_total".into(),
-                root: id,
-                nodes: std::collections::BTreeMap::from([(
-                    id,
-                    QueryPlanNode::Logical {
-                        operator: if indexed {
-                            control_plane::query_plan::logical::LogicalOperator::ReadRangeMaxIndex {
-                                metric: "requests_total".into(),
-                                matchers: vec![],
-                                range_ms: 60_000,
-                            }
-                        } else {
-                            control_plane::query_plan::logical::LogicalOperator::Scan {
-                                metric: Some("requests_total".into()),
-                                matchers: vec![],
-                                range_ms: None,
-                                offset_ms: 0,
-                            }
-                        },
-                        inputs: vec![],
-                    },
-                )]),
-                instant: InstantExecution {
-                    lookback_ms: 300_000,
-                    full_history: false,
-                    cumulative_readout: true,
-                },
-                fallback: FallbackPolicy::ExactBackend,
-            };
-            let mut plan = control_plane::query_plan::QueryPlan::empty();
-            plan.entries.insert("requests_total".into(), query);
-            active.query_plan = Arc::new(plan);
-        }
         HotReloadStreamingConfig::from_active(HotReloadActivePhysicalPlan::new(active))
     }
 
@@ -749,17 +822,6 @@ mod tests {
     }
 
     fn configured_receiver() -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
-        configured_receiver_with_raw(false)
-    }
-    fn configured_receiver_with_raw(
-        retain_raw: bool,
-    ) -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
-        configured_receiver_with_index(retain_raw, false)
-    }
-    fn configured_receiver_with_index(
-        retain_raw: bool,
-        indexed: bool,
-    ) -> (PrometheusRemoteWriteReceiver, mpsc::Receiver<WorkerMessage>) {
         use asap_types::enums::WindowKind;
         use asap_types::{AggregationConfig, AggregationType, KeyByLabelNames};
         let aggregation = AggregationConfig {
@@ -787,7 +849,7 @@ mod tests {
             router: SeriesRouter::new(vec![sender]),
             samples_ingested: AtomicU64::new(0),
             samples_blocked_by_schema_barrier: AtomicU64::new(0),
-            hot_reload_config: physical_config_with_raw(streaming, retain_raw, indexed),
+            hot_reload_config: physical_config(streaming),
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
@@ -823,64 +885,26 @@ mod tests {
         })
     }
 
-    // A rejected or duplicate Remote Write request never changes retained raw input.
     #[test]
-    fn retained_raw_samples_follow_atomic_admission_and_deduplication() {
-        let (receiver, _worker) = configured_receiver_with_raw(true);
-        receiver.accept(&one_sample(1.0)).unwrap();
-        receiver.accept(&one_sample(1.0)).unwrap();
-        assert_eq!(receiver.raw_store().sample_count(), 1);
-        assert!(receiver.accept(&one_sample(2.0)).is_err());
-        assert_eq!(receiver.raw_store().sample_count(), 1);
-        for timestamp in 101..108 {
-            let bytes = snap::raw::Decoder::new()
-                .decompress_vec(&one_sample(1.0))
-                .unwrap();
-            let mut write = WriteRequest::decode(bytes.as_slice()).unwrap();
-            write.timeseries[0].samples[0].timestamp = timestamp;
-            receiver.accept(&compressed(write)).unwrap();
-        }
-        assert_eq!(receiver.raw_store().sample_count(), 8);
-        let bytes = snap::raw::Decoder::new()
-            .decompress_vec(&one_sample(1.0))
-            .unwrap();
-        let mut write = WriteRequest::decode(bytes.as_slice()).unwrap();
-        write.timeseries[0].samples[0].timestamp = 108;
-        assert!(matches!(
-            receiver.accept(&compressed(write)),
-            Err(RemoteWriteError::Backpressure(_))
-        ));
-        assert_eq!(receiver.raw_store().sample_count(), 8);
-        let (native, _worker) = configured_receiver();
-        native.accept(&one_sample(1.0)).unwrap();
-        assert_eq!(native.raw_store().sample_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn finite_drain_eagerly_builds_installed_range_max_index() {
-        let (receiver, mut worker) = configured_receiver_with_index(true, true);
-        receiver.accept(&one_sample(3.0)).unwrap();
-        assert_eq!(
-            receiver.raw_store().sample_count(),
-            1,
-            "index-only plan must retain admitted input"
-        );
-        assert_eq!(receiver.raw_store().range_max_index_bytes(), 0);
-        let handle = receiver.clone();
-        let drain = tokio::spawn(async move { handle.drain().await });
-        assert!(matches!(
-            worker.recv().await.unwrap(),
-            WorkerMessage::GroupSamples { .. }
-        ));
-        let WorkerMessage::Drain(reply) = worker.recv().await.unwrap() else {
-            panic!()
-        };
-        reply.send(Ok(())).unwrap();
-        drain.await.unwrap().unwrap();
+    fn spatial_filter_matches_prometheus_label_semantics() {
+        let labels = HashMap::from([
+            ("job".to_string(), "order-service".to_string()),
+            ("status".to_string(), "503".to_string()),
+        ]);
         assert!(
-            receiver.raw_store().range_max_index_bytes() > 0,
-            "complete must include index construction before query calibration"
+            compile_spatial_filter(r#"{job="order-service",status=~"5.."}"#)
+                .unwrap()
+                .matches(&labels)
         );
+        assert!(!compile_spatial_filter(r#"{job!="order-service"}"#)
+            .unwrap()
+            .matches(&labels));
+        assert!(compile_spatial_filter(r#"{missing!="present"}"#)
+            .unwrap()
+            .matches(&labels));
+        assert!(!compile_spatial_filter(r#"{status!~"5.."}"#)
+            .unwrap()
+            .matches(&labels));
     }
 
     // Closing finite input prevents writes racing behind the completion barrier.
@@ -965,11 +989,14 @@ mod tests {
         let samples =
             canonicalize_request(&request, &PrometheusRemoteWriteConfig::default()).unwrap();
         assert_eq!(
-            samples[0].series_key,
+            samples[0].series_key.as_ref(),
             "http_requests_total{job=\"api\",zone=\"a\\n\\\"b\"}"
         );
         assert_eq!(samples[0].value, Some(3.0));
         assert_eq!(samples[1].value, None);
+        assert!(Arc::ptr_eq(&samples[0].metric, &samples[1].metric));
+        assert!(Arc::ptr_eq(&samples[0].labels, &samples[1].labels));
+        assert!(Arc::ptr_eq(&samples[0].series_key, &samples[1].series_key));
     }
 
     #[test]
@@ -1039,6 +1066,25 @@ mod tests {
             receiver.stats().rejected_requests.load(Ordering::Relaxed),
             1
         );
+    }
+
+    #[test]
+    fn dedup_history_is_evicted_by_event_time_during_fast_replay() {
+        let mut state = DedupState::default();
+        for timestamp in [0, 60_000, 600_000, 660_000] {
+            let series: Arc<str> = format!("series-{timestamp}").into();
+            state
+                .values
+                .insert((7, 3, series.clone(), timestamp), DedupValue::Number(1));
+            state
+                .expiry_by_event_time
+                .entry(timestamp)
+                .or_default()
+                .push((7, 3, series));
+        }
+        state.evict_event_times_before(600_000);
+        assert_eq!(state.values.len(), 2);
+        assert!(state.values.keys().all(|key| key.3 >= 600_000));
     }
 
     #[test]

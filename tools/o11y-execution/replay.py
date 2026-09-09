@@ -3,6 +3,7 @@
 import argparse
 from decimal import Decimal
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -41,7 +42,7 @@ def classify(response, headers=None):
     if declared in ("exact_fallback", "failed"):
         return declared
     detail = (headers or {}).get("x-asap-execution-detail")
-    if detail in ("hybrid", "local_raw"):
+    if detail == "hybrid":
         return "exact_fallback"
     if detail == "invalid_provenance":
         return "failed"
@@ -62,7 +63,10 @@ def execution_provenance(response, headers=None):
     counts = {}
     for name, header in (("raw_scan_evaluations", "x-asap-raw-scan-evaluations"),
                          ("summary_readout_evaluations", "x-asap-summary-readout-evaluations"),
-                         ("memo_hits", "x-asap-memo-hits")):
+                         ("memo_hits", "x-asap-memo-hits"),
+                         ("exact_subquery_evaluations", "x-asap-exact-subquery-evaluations"),
+                         ("exact_subquery_rpcs", "x-asap-exact-subquery-rpcs"),
+                         ("exact_branch_evaluations", "x-asap-exact-branch-evaluations")):
         value = headers.get(header)
         counts[name] = int(value) if value is not None and value.isdigit() else None
     return {"detail": detail, **counts}
@@ -91,9 +95,9 @@ _SAMPLE = re.compile(r'([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?\s+(\S+)\s+(\d+(?:
 _LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\[\\"n])*)"')
 
 
-def parse_samples(lines):
+def iter_samples(lines):
     """Strict OpenMetrics subset: seconds converted losslessly to Remote Write milliseconds."""
-    rows, seen, latest = [], {}, -1
+    seen, latest, yielded = {}, -1, False
     for number, line in enumerate(lines, 1):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -122,10 +126,14 @@ def parse_samples(lines):
         if not math.isfinite(value) or timestamp > 2**63 - 1 or timestamp < latest or timestamp <= seen.get(key, -1):
             raise ValueError(f"nonfinite, duplicate, or out-of-order sample at line {number}")
         latest, seen[key] = timestamp, timestamp
-        rows.append((labels, value, timestamp))
-    if not rows:
+        yielded = True
+        yield labels, value, timestamp
+    if not yielded:
         raise ValueError("empty dataset")
-    return rows
+
+
+def parse_samples(lines):
+    return list(iter_samples(lines))
 
 
 def varint(value):
@@ -205,48 +213,86 @@ def write_json(path, value):
 
 
 def ingest(rows, endpoints, output):
+    batch_size = 50_000
     batches = []
-    for offset in range(0, len(rows), 5000):
-        payload = encode_write(rows[offset:offset + 5000])
-        batch = {"offset": offset, "sample_count": len(rows[offset:offset + 5000]),
-                 "payload_sha256": hashlib.sha256(payload).hexdigest(), "endpoints": {}}
-        batches.append(batch)
-        for endpoint in endpoints:
-            # Persist intent first: a timeout can follow partial acceptance. Never retry silently.
-            batch["endpoints"][endpoint] = {"status": "attempting"}
-            write_json(output / "ingestion.json", batches)
-            result = request(endpoint.rstrip("/") + "/api/v1/write", payload, {
-                "Content-Type": "application/x-protobuf", "Content-Encoding": "snappy",
-                "X-Prometheus-Remote-Write-Version": "0.1.0"})
-            batch["endpoints"][endpoint] = result
-            write_json(output / "ingestion.json", batches)
-            if not result["http_status"] or not 200 <= result["http_status"] < 300:
-                raise RuntimeError(f"ingestion failed at batch {offset}; inspect partial acceptance before retry")
+    offset = 0
+    journal_path = output / "ingestion.jsonl"
+    with journal_path.open("w") as journal:
+        iterator = iter(rows)
+        while batch_rows := list(itertools.islice(iterator, batch_size)):
+            payload = encode_write(batch_rows)
+            batch = {"offset": offset, "sample_count": len(batch_rows),
+                     "payload_sha256": hashlib.sha256(payload).hexdigest(), "endpoints": {}}
+            batches.append(batch)
+            for endpoint in endpoints:
+                # Append and fsync intent before the request: a timeout can
+                # follow partial acceptance, so a retry must never be silent.
+                intent = {"offset": offset, "endpoint": endpoint, "status": "attempting"}
+                journal.write(json.dumps(intent, allow_nan=False) + "\n")
+                journal.flush()
+                os.fsync(journal.fileno())
+                result = request(endpoint.rstrip("/") + "/api/v1/write", payload, {
+                    "Content-Type": "application/x-protobuf", "Content-Encoding": "snappy",
+                    "X-Prometheus-Remote-Write-Version": "0.1.0"})
+                batch["endpoints"][endpoint] = result
+                journal.write(json.dumps({"offset": offset, "endpoint": endpoint, "result": result}, allow_nan=False) + "\n")
+                journal.flush()
+                if not result["http_status"] or not 200 <= result["http_status"] < 300:
+                    write_json(output / "ingestion.json", batches)
+                    raise RuntimeError(f"ingestion failed at batch {offset}; inspect ingestion.jsonl before retry")
+            offset += len(batch_rows)
+    write_json(output / "ingestion.json", batches)
 
 
-def replay(queries, backend, output, repetitions, exact_url=None, relative_tolerance=0.0, absolute_tolerance=0.0):
+def replay(queries, backend, output, repetitions, exact_url=None, relative_tolerance=0.0, absolute_tolerance=0.0, evaluation_step_ms=0, batch_resources=False):
     rows = []
+    if evaluation_step_ms < 0:
+        raise ValueError("evaluation step must be nonnegative")
+    query_request = _http_request if batch_resources else request
+    batch_before = process_snapshots() if batch_resources else None
+    batch_started = time.perf_counter_ns()
     for repeat in range(repetitions):
         for query_index, query in enumerate(queries):
             exact_first = (repeat + query_index) % 2 == 0
-            params = urllib.parse.urlencode({"query": query["query"], "time": f'{query["eval_timestamp_ms"] / 1000:.3f}'})
+            evaluation_ms = query["eval_timestamp_ms"] - (repetitions - 1 - repeat) * evaluation_step_ms
+            if evaluation_ms < 0:
+                raise ValueError("advancing evaluation grid predates epoch")
+            params = urllib.parse.urlencode({"query": query["query"], "time": f'{evaluation_ms / 1000:.3f}'})
             # Alternate paired order to expose, rather than always favor, cache/order effects.
             exact = None
             if exact_url and exact_first:
-                exact = request(exact_url.rstrip("/") + "/api/v1/query?" + params)
-            answer = request(backend.rstrip("/") + "/api/v1/query?" + params)
+                exact = query_request(exact_url.rstrip("/") + "/api/v1/query?" + params)
+            answer = query_request(backend.rstrip("/") + "/api/v1/query?" + params)
             if exact_url and exact is None:
-                exact = request(exact_url.rstrip("/") + "/api/v1/query?" + params)
+                exact = query_request(exact_url.rstrip("/") + "/api/v1/query?" + params)
             route = classify(answer["response"], answer["headers"])
             if answer["http_status"] != 200:
                 route = "failed"
-            rows.append({**query, "repetition": repeat, "phase": "first_pass" if repeat == 0 else "repeat",
+            rows.append({**query, "original_eval_timestamp_ms": query["eval_timestamp_ms"],
+                         "eval_timestamp_ms": evaluation_ms, "repetition": repeat, "phase": "first_pass" if repeat == 0 else "repeat",
                          "execution": route, "execution_provenance": execution_provenance(answer["response"], answer["headers"]), **answer})
             if exact is not None:
                 rows[-1]["exact"] = exact
                 rows[-1]["comparison"] = compare_results(answer["response"], exact["response"], relative_tolerance, absolute_tolerance)
                 rows[-1]["pair_order"] = "exact_first" if exact_first else "backend_first"
-            write_json(output / "queries.json", rows)
+            if not batch_resources:
+                write_json(output / "queries.json", rows)
+        if batch_resources and repeat == 0:
+            first_pass_after = process_snapshots()
+    if batch_resources:
+        batch_after = first_pass_after if repetitions == 1 else process_snapshots()
+        quantum = 1_000_000_000 // os.sysconf("SC_CLK_TCK")
+        deltas = {name: process_delta(batch_before.get(name), batch_after.get(name)) for name in PROCESS_IDS}
+        write_json(output / "query-batch-resources.json", {
+            "scope": "paired query batch including service background CPU; no per-RPC resource probes",
+            "before": batch_before, "after_first_pass": first_pass_after, "after": batch_after, "resources": deltas,
+            "first_pass_resources": {name: process_delta(batch_before.get(name), first_pass_after.get(name)) for name in PROCESS_IDS},
+            "repeat_resources": {name: process_delta(first_pass_after.get(name), batch_after.get(name)) for name in PROCESS_IDS},
+            "low_resolution_services": [name for name, delta in deltas.items() if delta is None or delta["cpu_ns"] < 10 * quantum],
+            "wall_ns": time.perf_counter_ns() - batch_started, "cpu_tick_ns": quantum,
+            "cpu_resolution": "Values below ten ticks are low-resolution/censored; zero is not zero cost",
+            "evaluations_per_service": len(rows), "evaluation_step_ms": evaluation_step_ms})
+        write_json(output / "queries.json", rows)
     return rows
 
 
@@ -269,6 +315,8 @@ def main():
     parser.add_argument("--port", type=int, default=18089)
     parser.add_argument("--settle-seconds", type=float, default=0, help="deprecated; completion uses explicit finite-input drain")
     parser.add_argument("--repetitions", type=int, default=2)
+    parser.add_argument("--evaluation-step-ms", type=int, default=0, help="advance through preloaded data, ending at original timestamp; not incremental ingestion")
+    parser.add_argument("--batch-resources", action="store_true", help="measure CPU around the query batch, avoiding per-RPC /proc probes")
     parser.add_argument("--relative-tolerance", type=float, default=0.0)
     parser.add_argument("--absolute-tolerance", type=float, default=0.0)
     parser.add_argument("--output", type=Path, required=True)
@@ -298,7 +346,14 @@ def main():
             constrain_process(pid, cpus, args.address_space_bytes)
     corpus = json.loads(args.queries.read_text())
     queries = validate_workload(json.loads(args.snapshot.read_text()), corpus)
-    samples = parse_samples(args.metrics.read_text().splitlines())
+    sample_count = 0
+    timestamp_min_ms = None
+    timestamp_max_ms = None
+    with args.metrics.open() as metrics:
+        for _, _, timestamp in iter_samples(metrics):
+            sample_count += 1
+            timestamp_min_ms = timestamp if timestamp_min_ms is None else timestamp_min_ms
+            timestamp_max_ms = timestamp
     if args.exact_pid is not None and process_snapshot(args.exact_pid) is None:
         parser.error("exact-pid must name a readable live local process")
     with socket.socket() as probe:
@@ -307,7 +362,7 @@ def main():
     provenance = {"schema_version": 1, "upstream_revision": corpus["upstream_revision"],
                   "inputs": {str(p.resolve()): hashlib.sha256(p.read_bytes()).hexdigest()
                              for p in [args.metrics, args.queries, args.snapshot, args.compiler, args.data_plane]},
-                  "samples": len(samples), "timestamp_min_ms": samples[0][2], "timestamp_max_ms": samples[-1][2],
+                  "samples": sample_count, "timestamp_min_ms": timestamp_min_ms, "timestamp_max_ms": timestamp_max_ms,
                   "query_occurrences": len(queries), "configuration": {k: str(v) for k, v in vars(args).items()},
                   "limitations": ["generator provenance must be supplied separately", "first pass is not a guaranteed cold cache", "finite-input drain closes trailing panes and permanently seals Remote Write; no live-ingestion claim"]}
     write_json(args.output / "run.json", provenance)
@@ -361,7 +416,8 @@ def main():
                 raise RuntimeError("runtime has not activated the selected plan generation")
             phases["before_ingest"] = process_snapshots()
             ingest_start = time.perf_counter_ns()
-            ingest(samples, list(dict.fromkeys([args.exact_url, fallback_url, backend])), args.output)
+            with args.metrics.open() as metrics:
+                ingest(iter_samples(metrics), list(dict.fromkeys([args.exact_url, fallback_url, backend])), args.output)
             drained = request(backend + "/api/v1/precompute/drain", b"")
             write_json(args.output / "drain.json", drained)
             if drained["http_status"] != 200 or drained["response"].get("complete") is not True:
@@ -371,7 +427,8 @@ def main():
             write_json(args.output / "store-after-build.json", request(backend + "/api/v1/store/metrics"))
             write_json(args.output / "process-phases.json", phases)
             results = replay(queries, backend, args.output, args.repetitions, args.exact_url if args.compare else None,
-                             args.relative_tolerance, args.absolute_tolerance)
+                             args.relative_tolerance, args.absolute_tolerance,
+                             args.evaluation_step_ms, args.batch_resources)
             phases["after_queries"] = process_snapshots()
             write_json(args.output / "process-phases.json", phases)
             store = request(backend + "/api/v1/store/metrics")
@@ -386,7 +443,7 @@ def main():
             write_json(args.output / "storage.json", storage)
             write_json(args.output / "completion.json", {"complete": True,
                        "execution_counts": {k: sum(r["execution"] == k for r in results) for k in ["warm", "exact_fallback", "failed"]},
-                       "execution_detail_counts": {k: sum(r["execution_provenance"]["detail"] == k for r in results) for k in ["asap", "hybrid", "local_raw", "external_exact", "failed", "invalid_provenance"]},
+                       "execution_detail_counts": {k: sum(r["execution_provenance"]["detail"] == k for r in results) for k in ["asap", "hybrid", "external_exact", "failed", "invalid_provenance"]},
                        "benefit_claim": None})
             if args.compare:
                 report = {"schema_version": 1, "all_requests": summarize(results),
@@ -397,7 +454,7 @@ def main():
                           "by_execution": {route: summarize([r for r in results if r["execution"] == route])
                                            for route in ["warm", "exact_fallback", "failed"]},
                           "by_execution_detail": {detail: summarize([r for r in results if r["execution_provenance"]["detail"] == detail])
-                                                  for detail in ["asap", "hybrid", "local_raw", "external_exact"]},
+                                                  for detail in ["asap", "hybrid", "external_exact"]},
                           "estimated_cost": plan["cost_comparison"],
                           "measurement_units": {"latency": "nanoseconds", "cpu": "process CPU nanoseconds", "memory": "bytes"},
                           "resource_limits": {"cpu_affinity": sorted(cpus) if cpus else None,
