@@ -264,6 +264,9 @@ pub struct DataDescriptor {
     pub metric_name: String,
     pub population_filter_canonical: String,
     pub group_by_keys: BTreeSet<String>,
+    /// Versioned contract for value projection, timestamp interpretation and
+    /// missing/duplicate/invalid observation handling.
+    pub observation_semantics: String,
 }
 impl DataDescriptor {
     pub fn new(
@@ -271,15 +274,36 @@ impl DataDescriptor {
         filter: impl Into<String>,
         group_by: impl IntoIterator<Item = String>,
     ) -> Self {
+        Self::new_with_semantics(
+            metric,
+            filter,
+            group_by,
+            "asap.timestamped-metric-samples.v1",
+        )
+    }
+
+    pub fn new_with_semantics(
+        metric: impl Into<String>,
+        filter: impl Into<String>,
+        group_by: impl IntoIterator<Item = String>,
+        observation_semantics: impl Into<String>,
+    ) -> Self {
         let metric_name = metric.into();
         let population_filter_canonical = filter.into();
         let group_by_keys = group_by.into_iter().collect();
-        let id = data_descriptor_id(&metric_name, &population_filter_canonical, &group_by_keys);
+        let observation_semantics = observation_semantics.into();
+        let id = data_descriptor_id(
+            &metric_name,
+            &population_filter_canonical,
+            &group_by_keys,
+            &observation_semantics,
+        );
         Self {
             id,
             metric_name,
             population_filter_canonical,
             group_by_keys,
+            observation_semantics,
         }
     }
     pub fn id(&self) -> &DataDescriptorId {
@@ -291,6 +315,7 @@ impl DataDescriptor {
                 &self.metric_name,
                 &self.population_filter_canonical,
                 &self.group_by_keys,
+                &self.observation_semantics,
             )
         {
             return Err(SdsError("data descriptor ID/content mismatch".into()));
@@ -298,7 +323,12 @@ impl DataDescriptor {
         Ok(())
     }
 }
-fn data_descriptor_id(metric: &str, filter: &str, group_by: &BTreeSet<String>) -> DataDescriptorId {
+fn data_descriptor_id(
+    metric: &str,
+    filter: &str,
+    group_by: &BTreeSet<String>,
+    observation_semantics: &str,
+) -> DataDescriptorId {
     // Preserve the existing v1 length-framed data identity, now normalizing the
     // grouping set at the shared contract boundary.
     let mut key = format!(
@@ -309,6 +339,10 @@ fn data_descriptor_id(metric: &str, filter: &str, group_by: &BTreeSet<String>) -
     for name in group_by {
         key.push_str(&format!("|{}:{name}", name.len()));
     }
+    key.push_str(&format!(
+        "|{}:{observation_semantics}",
+        observation_semantics.len()
+    ));
     DataDescriptorId(key)
 }
 
@@ -378,6 +412,13 @@ mod tests {
         assert_ne!(
             DataDescriptor::new("π", "", ["x|y".into()]).id,
             DataDescriptor::new("π", "", ["x".into(), "y".into()]).id
+        );
+    }
+    #[test]
+    fn observation_semantics_is_part_of_data_identity() {
+        assert_ne!(
+            DataDescriptor::new_with_semantics("cpu", "", [], "samples.v1").id,
+            DataDescriptor::new_with_semantics("cpu", "", [], "samples.v2").id
         );
     }
     #[test]
