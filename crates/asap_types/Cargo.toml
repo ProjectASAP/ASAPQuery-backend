@@ -9,8 +9,10 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 anyhow.workspace = true
+thiserror.workspace = true
 clap.workspace = true
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+sha2 = "0.10"
 
 # First cross-crate ASAPPlanner dependency for data_plane (transitively,
 # via this crate): WindowType -> planner_types::pre_asap::query_expr::WindowKind

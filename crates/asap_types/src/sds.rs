@@ -436,6 +436,11 @@ impl SummaryDescriptor {
             return Err(SdsError("state schema version must be positive".into()));
         }
         fidelity.validate()?;
+        if !fidelity.is_compatible_with(&operator) {
+            return Err(SdsError(
+                "summary operator and fidelity guarantee are incompatible".into(),
+            ));
+        }
         let content = json!({"operator":operator,"fidelity":fidelity,"state_schema_version":state_schema_version});
         let id = SummaryDescriptorId(format!("summary:v2:{}", canonical(&content)));
         Ok(Self {
@@ -484,6 +489,80 @@ impl SummaryDescriptor {
             fidelity,
             state_schema_version,
         )
+    }
+}
+
+impl FidelityGuarantee {
+    /// Reject a descriptor that advertises an error model belonging to a
+    /// different state family. This is part of the shared wire contract, so a
+    /// consumer must not need to trust the process that produced the catalog.
+    pub fn is_compatible_with(&self, operator: &SummaryOperator) -> bool {
+        use AggregationType as A;
+        use FidelityGuarantee::*;
+        use SketchAlgorithm as S;
+
+        let configured = |aggregation_type| match (aggregation_type, self) {
+            (A::Sum | A::MultipleSum | A::MinMax | A::MultipleMinMax, Exact) => true,
+            (A::Increase | A::MultipleIncrease, ExactCounter { .. }) => true,
+            (A::DatasketchesKLL | A::HydraKLL, KllRankError { .. }) => true,
+            (A::DDSketch, DdSketchRelativeError { .. }) => true,
+            (A::HLL, HllCardinalityError { .. }) => true,
+            (A::CountMinSketch | A::CountMinSketchWithHeap, CmsFrequencyError { .. }) => true,
+            (A::CountSketch | A::CountSketchWithHeap, CountSketchFrequencyError { .. }) => true,
+            (A::SingleSubpopulation | A::MultipleSubpopulation, Unknown { .. }) => true,
+            _ => false,
+        };
+
+        match operator {
+            SummaryOperator::LegacyPartial { .. } => matches!(self, Unknown { .. }),
+            SummaryOperator::ExactAgg { agg_type, .. } => configured(*agg_type),
+            SummaryOperator::Configured {
+                aggregation_type,
+                parameters,
+                ..
+            } => configured(*aggregation_type) && self.matches_parameters(parameters),
+            SummaryOperator::Sketch {
+                algorithm,
+                parameters,
+            } => {
+                matches!(
+                    (algorithm, self),
+                    (S::Kll, KllRankError { .. })
+                        | (S::DDSketch, DdSketchRelativeError { .. })
+                        | (S::Hll, HllCardinalityError { .. })
+                        | (S::Cms | S::CmsWithHeap, CmsFrequencyError { .. })
+                        | (
+                            S::CountSketch | S::CountSketchWithHeap,
+                            CountSketchFrequencyError { .. }
+                        )
+                        | (S::Kmv | S::Theta, Unknown { .. })
+                ) && self.matches_parameters(parameters)
+            }
+        }
+    }
+
+    fn matches_parameters(&self, parameters: &BTreeMap<String, Value>) -> bool {
+        let u32_parameter = |names: &[&str], expected: u32| {
+            names
+                .iter()
+                .find_map(|name| parameters.get(*name))
+                .is_none_or(|value| value.as_u64() == Some(u64::from(expected)))
+        };
+        match self {
+            Self::KllRankError { k, .. } => u32_parameter(&["k", "K"], *k),
+            Self::HllCardinalityError { precision, .. } => {
+                u32_parameter(&["precision", "p"], *precision)
+            }
+            Self::CmsFrequencyError { width, depth, .. }
+            | Self::CountSketchFrequencyError { width, depth, .. } => {
+                u32_parameter(&["width"], *width) && u32_parameter(&["depth"], *depth)
+            }
+            Self::DdSketchRelativeError { alpha } => parameters
+                .get("alpha")
+                .or_else(|| parameters.get("relative_accuracy"))
+                .is_none_or(|value| value.as_f64() == Some(*alpha)),
+            _ => true,
+        }
     }
 }
 
@@ -586,8 +665,9 @@ mod tests {
             materialization_id: MaterializationId(crate::PolicyFingerprint(7)),
             summary_descriptor_id: descriptor(
                 200,
-                FidelityGuarantee::Unknown {
-                    reason: "test".into(),
+                FidelityGuarantee::KllRankError {
+                    k: 200,
+                    model: "rank.v1".into(),
                 },
                 1,
             )
@@ -675,8 +755,9 @@ mod tests {
     fn identity_includes_configuration_fidelity_and_state_schema() {
         let base = descriptor(
             200,
-            FidelityGuarantee::Unknown {
-                reason: "not supplied".into(),
+            FidelityGuarantee::KllRankError {
+                k: 200,
+                model: "rank.v1".into(),
             },
             1,
         );
@@ -684,20 +765,30 @@ mod tests {
             base.id,
             descriptor(
                 201,
-                FidelityGuarantee::Unknown {
-                    reason: "not supplied".into()
+                FidelityGuarantee::KllRankError {
+                    k: 201,
+                    model: "rank.v1".into()
                 },
                 1
             )
             .id
         );
-        assert_ne!(base.id, descriptor(200, FidelityGuarantee::Exact, 1).id);
+        assert!(SummaryDescriptor::new(
+            SummaryOperator::Sketch {
+                algorithm: SketchAlgorithm::Kll,
+                parameters: BTreeMap::from([("k".into(), json!(200))]),
+            },
+            FidelityGuarantee::Exact,
+            1,
+        )
+        .is_err());
         assert_ne!(
             base.id,
             descriptor(
                 200,
-                FidelityGuarantee::Unknown {
-                    reason: "not supplied".into()
+                FidelityGuarantee::KllRankError {
+                    k: 200,
+                    model: "rank.v1".into()
                 },
                 2
             )
@@ -736,8 +827,9 @@ mod tests {
     fn wire_roundtrip_and_tampered_id_validation() {
         let original = descriptor(
             200,
-            FidelityGuarantee::Unknown {
-                reason: "not supplied".into(),
+            FidelityGuarantee::KllRankError {
+                k: 200,
+                model: "rank.v1".into(),
             },
             1,
         );
@@ -760,6 +852,31 @@ mod tests {
             },
             FidelityGuarantee::DdSketchRelativeError { alpha: f64::NAN },
             1
+        )
+        .is_err());
+        assert!(SummaryDescriptor::new(
+            SummaryOperator::Configured {
+                aggregation_type: AggregationType::Sum,
+                aggregation_sub_type: String::new(),
+                parameters: BTreeMap::new(),
+            },
+            FidelityGuarantee::KllRankError {
+                k: 200,
+                model: "rank.v1".into(),
+            },
+            1,
+        )
+        .is_err());
+        assert!(SummaryDescriptor::new(
+            SummaryOperator::Sketch {
+                algorithm: SketchAlgorithm::Kll,
+                parameters: BTreeMap::from([("k".into(), json!(100))]),
+            },
+            FidelityGuarantee::KllRankError {
+                k: 200,
+                model: "rank.v1".into(),
+            },
+            1,
         )
         .is_err());
     }
@@ -836,8 +953,12 @@ mod tests {
                 .unwrap()
                 .id
         );
+        let kll = SummaryOperator::Sketch {
+            algorithm: SketchAlgorithm::Kll,
+            parameters: BTreeMap::from([("k".into(), json!(200))]),
+        };
         let first = SummaryDescriptor::new(
-            a.clone(),
+            kll.clone(),
             FidelityGuarantee::KllRankError {
                 k: 200,
                 model: "rank.v1".into(),
@@ -846,7 +967,7 @@ mod tests {
         )
         .unwrap();
         let second = SummaryDescriptor::new(
-            a,
+            kll,
             FidelityGuarantee::KllRankError {
                 k: 200,
                 model: "rank.v2".into(),

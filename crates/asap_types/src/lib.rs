@@ -10,6 +10,7 @@ pub mod query_requirements;
 pub mod routing_index;
 pub mod sds;
 pub mod storage_backend;
+pub mod summary_catalog;
 pub mod traits;
 pub mod utils;
 

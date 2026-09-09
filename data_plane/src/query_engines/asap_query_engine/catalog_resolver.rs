@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use asap_types::sds::{DataDescriptor, MaterializationId, SummaryDescriptor, SummaryOperator};
+use asap_types::summary_catalog::{MaterializationIdentity, SummaryCatalog};
 use asap_types::AggregationType;
-use control_plane::physical::summary_catalog::{MaterializationIdentity, SummaryCatalog};
 use control_plane::query_plan::{ExactReadout, QueryPlanEntry, QueryPlanNode, QueryReadout};
 
 use crate::query_engines::EngineError;
@@ -37,6 +37,14 @@ pub(crate) fn resolve(
         .data_descriptors
         .get(&identity.data_descriptor_id)
         .ok_or_else(|| miss("missing data descriptor"))?;
+    // Installation validates the whole snapshot. Keep resolution fail-closed as
+    // defense in depth for catalogs restored from disk or supplied by a future
+    // transport implementation.
+    summary
+        .validate()
+        .map_err(|error| miss(format!("invalid summary descriptor: {error}")))?;
+    data.validate()
+        .map_err(|error| miss(format!("invalid data descriptor: {error}")))?;
     Ok(ResolvedMaterialization {
         identity,
         summary,
@@ -166,6 +174,8 @@ pub(crate) fn validate_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asap_types::summary_catalog::SummaryCatalog;
+    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
     use control_plane::physical::compiler::BackendLocalPlanningSnapshot;
 
     fn fixture() -> control_plane::physical::compiler::PhysicalPlan {
@@ -177,6 +187,27 @@ mod tests {
             "sum(sum_over_time(m[1m]))".into();
         let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(value).unwrap();
         snapshot.compile().unwrap()
+    }
+
+    fn catalog_fixture() -> SummaryCatalog {
+        let config = PrecomputeMaterialization::new(
+            AggregationType::Sum,
+            String::new(),
+            Default::default(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            60,
+            60,
+            WindowKind::Tumbling,
+            String::new(),
+            "m".into(),
+            None,
+            None,
+            None,
+        );
+        SummaryCatalog::from_materializations(1, 1, &[config]).unwrap()
     }
 
     // A readout cannot relabel a valid sum materialization as a rate capability.
@@ -229,5 +260,21 @@ mod tests {
         let mut broken = catalog.clone();
         broken.data_descriptors.clear();
         assert!(resolve(&broken, id).is_err());
+    }
+
+    #[test]
+    fn rejects_operator_fidelity_mismatch_during_resolution() {
+        let mut catalog = catalog_fixture();
+        let id = *catalog.materializations.keys().next().unwrap();
+        let descriptor_id = catalog.materializations[&id].summary_descriptor_id.clone();
+        catalog
+            .summary_descriptors
+            .get_mut(&descriptor_id)
+            .unwrap()
+            .fidelity = asap_types::sds::FidelityGuarantee::KllRankError {
+            k: 200,
+            model: "rank.v1".into(),
+        };
+        assert!(resolve(&catalog, id).is_err());
     }
 }
