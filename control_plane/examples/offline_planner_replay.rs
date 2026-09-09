@@ -58,6 +58,7 @@ fn inspect(
         | SummaryExpr::SummaryDelete { summary_input, .. } => {
             inspect(summary_input, model, seen, states, raw)
         }
+        SummaryExpr::ValueOperation { child, .. } => inspect(child, model, seen, states, raw),
         SummaryExpr::SummaryMerge { children } => {
             for child in children {
                 inspect(child, model, seen, states, raw);
