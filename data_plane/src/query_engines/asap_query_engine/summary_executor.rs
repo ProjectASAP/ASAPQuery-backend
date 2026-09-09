@@ -508,6 +508,24 @@ impl QueryExecutionContext<'_> {
                 Candidate::ExactAgg(agg_type) => {
                     if matches!(
                         agg_type,
+                        AggregationType::Increase | AggregationType::MultipleIncrease
+                    ) {
+                        // Counter pane statistics are sufficient for Prometheus
+                        // extrapolatedRate only when no query boundary cuts a
+                        // pane. A partial pane would require its first/last
+                        // in-range raw sample, which this SDS intentionally
+                        // does not retain. Fail closed to the exact subtree.
+                        let coverage = self
+                            .index
+                            .exact_agg_coverage_bounds(sid, self.t0_ms, self.t1_ms);
+                        if coverage != Some((self.t0_ms, self.t1_ms)) {
+                            return Err(SummaryExecutorError::Unsupported(
+                                "counter SDS requires full-pane query coverage",
+                            ));
+                        }
+                    }
+                    if matches!(
+                        agg_type,
                         AggregationType::MinMax | AggregationType::MultipleMinMax
                     ) {
                         if let Some(series) = self.index.query_rollup_range(

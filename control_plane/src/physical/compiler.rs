@@ -320,6 +320,7 @@ pub enum StateEncoding {
     SketchlibProtobufV1,
     SketchCoreMsgpackV1,
     ExactAccumulatorV1,
+    ExactCounterAccumulatorV2,
 }
 
 /// Serializable physical state identity derived from Planner's canonical
@@ -2688,6 +2689,11 @@ pub(super) fn state_schema_id(fingerprint: asap_types::PolicyFingerprint) -> Str
 
 pub(super) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> {
     match family {
+        SummaryFamilyType::ExactAggregate(
+            planner_types::post_asap::ExactKind::Increase
+            | planner_types::post_asap::ExactKind::Rate,
+            _,
+        ) => vec![StateEncoding::ExactCounterAccumulatorV2],
         SummaryFamilyType::ExactAggregate(..) => vec![StateEncoding::ExactAccumulatorV1],
         SummaryFamilyType::Sketch(kind, _)
             if matches!(

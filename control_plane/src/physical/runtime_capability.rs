@@ -358,14 +358,11 @@ impl Capability {
             // serving multi-pop) is NOT allowed — the single-pop
             // policy has lost the key dimension and can't recover it.
             //
-            // Cross-family ExactAgg combos are mostly non-satisfiable
-            // (Sum vs MinMax, etc. are different operations) — except
-            // Sum-family serving a required Increase/Rate capability,
-            // which IS sound; see `sum_satisfies_increase`.
+            // Exact counter summaries are a distinct state contract. A sum of
+            // cumulative sample values cannot reconstruct reset correction or
+            // Prometheus boundary extrapolation.
             (Capability::ExactAgg(req), Capability::ExactAgg(have)) => {
-                req == have
-                    || multi_pop_satisfies_single(*req, *have)
-                    || sum_satisfies_increase(*req, *have)
+                req == have || multi_pop_satisfies_single(*req, *have)
             }
             _ => false,
         }
@@ -399,47 +396,6 @@ fn multi_pop_satisfies_single(required: AggregationType, available: AggregationT
         (AggregationType::Sum, AggregationType::MultipleSum)
             | (AggregationType::Increase, AggregationType::MultipleIncrease)
             | (AggregationType::MinMax, AggregationType::MultipleMinMax)
-    )
-}
-
-/// True when an available Sum-family accumulator can answer a required
-/// Increase/Rate capability.
-///
-/// `rate()`/`increase()` PromQL both lower to a required
-/// `Capability::ExactAgg(AggregationType::Increase)` (`capability_for`'s
-/// `AggIntent::Rate | AggIntent::Increase` case, matching
-/// `asap_aware_mapping::boundary::implementation_for`'s `SummaryKind::Increase |
-/// SummaryKind::Rate` — ASAPController models Rate as its own summary
-/// family). But this workspace's data plane has no storage kind distinct
-/// from Sum for it: `evaluate_exact_agg_rate` (`sketch_reducer.rs`)
-/// already reduces `Sum`/`MultipleSum`/`Increase`/`MultipleIncrease`
-/// identically — all read as `Statistic::Sum` per window, then divided
-/// by the coverage-aware elapsed range — so a Sum-registered sid's raw
-/// per-window deltas answer a rate query exactly as well as an
-/// Increase-registered one's. This is what lets counter metrics ingested
-/// as plain `Sum` (not every ingest path distinguishes Increase from
-/// Sum at registration time) still answer `rate(...)`/`increase(...)`.
-///
-/// Respects the same single/multi-population direction as
-/// [`multi_pop_satisfies_single`]: a multi-pop available (`MultipleSum`)
-/// can serve a single- or multi-pop required capability; a single-pop
-/// available (`Sum`) can only serve a single-pop required one — it has
-/// already lost the per-key breakdown a multi-pop required capability
-/// would need.
-///
-/// Deliberately does NOT apply to a required `Capability::ExactAgg(Sum)`
-/// (plain `sum_over_time`) — reconstructing Σ-of-cumulative-counter-
-/// samples from per-window deltas is unsound (issue #301); that shape is
-/// refused explicitly at the query-dispatch layer, not routed here.
-fn sum_satisfies_increase(required: AggregationType, available: AggregationType) -> bool {
-    matches!(
-        (required, available),
-        (AggregationType::Increase, AggregationType::Sum)
-            | (AggregationType::Increase, AggregationType::MultipleSum)
-            | (
-                AggregationType::MultipleIncrease,
-                AggregationType::MultipleSum
-            )
     )
 }
 
@@ -914,17 +870,15 @@ mod tests {
     }
 
     #[test]
-    fn is_satisfied_by_sum_family_answers_required_increase() {
-        // A Sum-registered sid's raw per-window deltas answer a
-        // rate()/increase() query exactly as well as an Increase-
-        // registered one's -- evaluate_exact_agg_rate (sketch_reducer.rs)
-        // reduces both identically. See sum_satisfies_increase's doc.
+    fn sum_family_cannot_impersonate_exact_counter_state() {
         let required = Capability::ExactAgg(AggregationType::Increase);
-        assert!(required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
-        assert!(required.is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleSum)));
+        assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::Sum)));
+        assert!(!required.is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleSum)));
 
         let required_multi = Capability::ExactAgg(AggregationType::MultipleIncrease);
-        assert!(required_multi.is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleSum)));
+        assert!(
+            !required_multi.is_satisfied_by(&Capability::ExactAgg(AggregationType::MultipleSum))
+        );
     }
 
     #[test]

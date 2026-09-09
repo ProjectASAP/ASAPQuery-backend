@@ -84,6 +84,33 @@ impl QueryPlan {
                     ));
                 }
             }
+            for node in entry.nodes.values() {
+                let QueryPlanNode::ExactReadout { input, readout } = node else {
+                    continue;
+                };
+                if !matches!(readout, ExactReadout::Increase | ExactReadout::Rate) {
+                    continue;
+                }
+                let Some(QueryPlanNode::ReadMaterialization { binding }) = entry.nodes.get(input)
+                else {
+                    return Err(QueryPlanError::Invalid(
+                        "counter readout must directly consume one catalog materialization".into(),
+                    ));
+                };
+                let identity = &catalog.materializations[&binding.materialization];
+                let descriptor = &catalog.summary_descriptors[&identity.summary_descriptor_id];
+                if !matches!(
+                    descriptor.fidelity,
+                    asap_types::sds::FidelityGuarantee::ExactCounter {
+                        full_pane_coverage_required: true,
+                        ..
+                    }
+                ) {
+                    return Err(QueryPlanError::Invalid(
+                        "rate/increase binding does not reference an exact counter SDS".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -1002,5 +1029,55 @@ mod catalog_binding_tests {
         let (plan, mut catalog) = fixture();
         catalog.summary_descriptors.clear();
         assert!(plan.validate_against_catalog(&catalog).is_err());
+    }
+
+    #[test]
+    fn counter_readout_requires_counter_sds_fidelity() {
+        fn as_rate_plan(mut plan: QueryPlan) -> QueryPlan {
+            let entry = plan.entries.values_mut().next().unwrap();
+            let read = entry.root;
+            let root = QueryNodeId(2);
+            entry.root = root;
+            entry.nodes.insert(
+                root,
+                QueryPlanNode::ExactReadout {
+                    input: read,
+                    readout: ExactReadout::Rate,
+                },
+            );
+            plan
+        }
+
+        let (sum_plan, sum_catalog) = fixture();
+        assert!(as_rate_plan(sum_plan)
+            .validate_against_catalog(&sum_catalog)
+            .unwrap_err()
+            .to_string()
+            .contains("exact counter SDS"));
+
+        let counter = PrecomputeMaterialization::new(
+            AggregationType::Increase,
+            String::new(),
+            Default::default(),
+            KeyByLabelNames::new(vec!["job".into()]),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            10,
+            10,
+            WindowKind::Tumbling,
+            String::new(),
+            "m".into(),
+            None,
+            None,
+            None,
+        );
+        let counter_catalog =
+            SummaryCatalog::from_materializations(7, 2, &[counter.clone()]).unwrap();
+        let (mut counter_plan, _) = fixture();
+        binding(&mut counter_plan).materialization = counter.policy_fingerprint().into();
+        as_rate_plan(counter_plan)
+            .validate_against_catalog(&counter_catalog)
+            .unwrap();
     }
 }
