@@ -1,4 +1,4 @@
-# Self-Describing Summary (SDS)
+# Summary Catalog and Self-Describing Summary Architecture
 
 This design defines three logical layers for summary producers and consumers.
 
@@ -14,10 +14,11 @@ copying or redefining either descriptor.
 
 ## Proposed ownership
 
-The descriptor vocabulary belongs in shared semantic contracts, suitable for
-Planner's shared types. Planner reasons about operators, fidelity, source and
-population semantics. The backend binds those descriptions to actual series,
-filters and grouping, and owns materialized instance state and its lifecycle.
+The descriptor vocabulary is a shared contract in `asap_types`. The control
+plane owns the authoritative `SummaryCatalog`; Collector and backend receive the
+same immutable catalog snapshot. Planner reasons about operators, fidelity,
+source and population semantics, while runtime components bind catalog identities
+to producers and stored instances.
 
 | Layer | Responsibility |
 | --- | --- |
@@ -67,15 +68,64 @@ struct SummaryInstance {
 }
 ```
 
-The backend maps this model onto its execution components as follows:
+## Authoritative SummaryCatalog and execution plans
 
-| Component | SDS responsibility |
+The control-plane `SummaryCatalog` is the metadata authority. It stores immutable
+Summary and Data Descriptors plus stable materialization identities. It does not
+store pane payloads, watermarks, completeness, or observed availability; those
+are data-plane instance/runtime metadata.
+
+```text
+                       ASAPPlanner post-ASAP DAG
+                                  |
+                                  v
+                    Control-plane SummaryCatalog
+       SummaryDescriptor + DataDescriptor + MaterializationIdentity
+                                  |
+              catalog references | shared snapshot
+          +-----------------------+-----------------------+
+          |                       |                       |
+          v                       v                       v
+    CollectorPlan           PrecomputePlan           QueryPlan DAG
+ producer placement,       backend-ingest build,     readout, combine,
+ input routing, build       update and lifecycle     Prometheus fallback
+          |                       |
+          +-----------+-----------+
+                      v
+              TransmissionPlan (when remote producers exist)
+        full/delta/checkpoint transport, sequence and encoding
+                      |
+                      v
+        Backend/Collector catalog replicas and SummaryStore
+             pane instances, completeness and lineage
+```
+
+All four execution plans reference catalog IDs instead of copying operator,
+source, filter, grouping, fidelity, or state-schema definitions.
+
+| Component | Responsibility |
 | --- | --- |
-| Physical-plan compiler | Canonicalize descriptor content, assign descriptor references and declare build/readout operations |
-| Precompute engine | Route matching observations and update the instance for one descriptor pair, group and pane |
-| SummaryStore (`SketchStore` today) | Store descriptor registries, instance metadata, state, completeness and lineage |
-| Query engine | Resolve plan references, select complete instances, merge/read out their state and combine exact Prometheus subquery results |
-| `rollups` | Hold typed, rebuildable indexes derived from canonical instances |
+| `SummaryCatalog` | Canonical descriptor definitions, stable IDs and catalog schema/version |
+| `CollectorPlan` | Collector placement, input routing, producer identity and collector-side build operations |
+| `PrecomputePlan` | Backend-ingest placement, window updates, retention and lifecycle |
+| `TransmissionPlan` | Optional producer-to-backend full state, delta, checkpoint, sequence and encoding contract |
+| `QueryPlan` | Materialization references, readout, DAG composition and exact Prometheus boundaries |
+| SummaryStore (`SketchStore` today) | Instance state, concrete intervals/groups, completeness, lineage and rebuildable rollups |
+
+`BackendPlan` is transitional. Its materialization registry moves into
+`SummaryCatalog`; update/placement/lifecycle moves into `PrecomputePlan`; query
+routing moves into `QueryPlan`; and the common deployment envelope becomes shared
+plan metadata. After consumers install the same catalog snapshot and these plan
+references are validated, the BackendPlan protobuf and endpoint are removed.
+
+The migration order is:
+
+1. Move the SDS catalog contract into `asap_types`.
+2. Make the control plane own the authoritative `SummaryCatalog`.
+3. Make `PrecomputePlan` reference catalog descriptors and own update, placement and lifecycle.
+4. Make `QueryPlan::MaterializationBinding` reference catalog/materialization IDs directly.
+5. Distribute the same catalog snapshot to Collector and backend.
+6. Remove `BackendPlan`, its protobuf and install endpoint, and duplicate validation.
 
 ## Implemented backend representation
 
