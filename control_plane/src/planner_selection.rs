@@ -347,6 +347,14 @@ mod workload_tests {
         let SummaryExpr::BinaryOp { lhs, .. } = &roots[1].1.expr else {
             panic!("{:?}", roots[1].1)
         };
-        assert!(Rc::ptr_eq(&roots[0].1, lhs));
+        let shared = match &lhs.expr {
+            SummaryExpr::ValueOperation {
+                child,
+                operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+                ..
+            } => child,
+            _ => lhs,
+        };
+        assert!(Rc::ptr_eq(&roots[0].1, shared));
     }
 }

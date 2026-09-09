@@ -496,6 +496,19 @@ where
         if let Some(id) = self.seen.get(&identity) {
             return Ok(*id);
         }
+        if let SummaryExpr::ValueOperation {
+            child,
+            operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+            timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+        } = &node.expr
+        {
+            // SummaryAgg lowering already emits the family-specific ExactReadout.
+            // Preserve the Planner's explicit state boundary without adding a
+            // second runtime readout node.
+            let child_id = self.lower(child)?;
+            self.seen.insert(identity, child_id);
+            return Ok(child_id);
+        }
         let id = QueryNodeId(self.next_id);
         self.next_id += 1;
         self.seen.insert(identity, id);

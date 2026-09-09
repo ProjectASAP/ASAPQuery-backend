@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "54f581b4be69a0d62379869916e387b899e05a43";
+pub const PLANNER_REVISION: &str = "661154b6d6e8b6b76102fb9d8cdcc440b298418f";
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 
 #[derive(Debug, Clone)]
@@ -3963,7 +3963,7 @@ mod tests {
             PhysicalDeploymentTarget::BackendLocalRemoteWrite,
         ] {
             let (first, second) = if target == PhysicalDeploymentTarget::BackendLocalRemoteWrite {
-                ("sum(sum_over_time(m[1m]))", "sum(sum_over_time(m[1m])) * 2")
+                ("sum(rate(m[1m]))", "sum by (job) (rate(m[1m]))")
             } else {
                 (
                     "quantile_over_time(0.90, m[1m])",
