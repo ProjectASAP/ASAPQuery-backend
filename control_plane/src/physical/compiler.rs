@@ -2398,7 +2398,9 @@ impl PhysicalCompiler {
                     Ok(MaterializationBinding {
                         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1_000)),
                         materialization: fingerprint.into(),
-                        output_grouping: PhysicalGrouping::Reduce(materialization.group_by.clone()),
+                        output_grouping: PhysicalGrouping::Reduce(
+                            materialization.grouping_labels.labels.clone(),
+                        ),
                         window_ms: pane_ms,
                     })
             };

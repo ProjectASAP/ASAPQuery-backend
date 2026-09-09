@@ -496,7 +496,6 @@ async fn main() -> Result<()> {
                 collector_plans: plan.collector_plans,
                 precompute_plan: plan.precompute_plan,
                 transmission_plan: plan.transmission_plan,
-                backend_plan: plan.backend_plan.encode_to_vec(),
                 query_plan: plan.query_plan,
                 storage_routing: None,
                 adaptation_evidence: Vec::new(),

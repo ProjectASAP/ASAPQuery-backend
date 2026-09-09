@@ -134,7 +134,7 @@ fn ddsketch_export(
         ("plan_version", plan["envelope"]["plan_version"].to_string()),
         (
             "backend_compat",
-            control_plane::backend_plan::BACKEND_COMPAT.into(),
+            control_plane::physical::compiler::BACKEND_COMPAT.into(),
         ),
         ("materialization", materialization.to_string()),
         (
@@ -145,7 +145,7 @@ fn ddsketch_export(
             "schema_id",
             format!(
                 "{}:summary-state:v1:{materialization}",
-                control_plane::backend_plan::BACKEND_COMPAT
+                control_plane::physical::compiler::BACKEND_COMPAT
             ),
         ),
         ("producer_id", "whole-e2e-collector".into()),
@@ -515,7 +515,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
         "plan_version": 1,
         "activation_unix_ms": observed_at_ms,
         "expiry_unix_ms": null,
-        "backend_compat": control_plane::backend_plan::BACKEND_COMPAT,
+        "backend_compat": control_plane::physical::compiler::BACKEND_COMPAT,
         "apply_timeout_ms": 10000
     });
     let mut second = request["queries"][0].clone();

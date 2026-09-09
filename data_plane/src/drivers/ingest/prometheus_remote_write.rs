@@ -768,7 +768,7 @@ mod tests {
             generated_at_unix_ms: 1,
             activation_unix_ms: 1,
             expiry_unix_ms: None,
-            backend_compat: control_plane::backend_plan::BACKEND_COMPAT.into(),
+            backend_compat: control_plane::physical::compiler::BACKEND_COMPAT.into(),
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };

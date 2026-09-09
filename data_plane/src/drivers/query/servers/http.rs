@@ -2477,7 +2477,7 @@ mod tests {
             generated_at_unix_ms: 0,
             activation_unix_ms: 1,
             expiry_unix_ms: None,
-            backend_compat: control_plane::backend_plan::BACKEND_COMPAT.into(),
+            backend_compat: control_plane::physical::compiler::BACKEND_COMPAT.into(),
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
@@ -5773,7 +5773,6 @@ pub struct PhysicalPlanInstallRequest {
     pub collector_plans: Vec<control_plane::physical::compiler::CollectorPlan>,
     pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
     pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
-    pub backend_plan: Vec<u8>,
     pub query_plan: control_plane::query_plan::QueryPlan,
     pub storage_routing: Option<serde_json::Value>,
     #[serde(default)]
@@ -5828,39 +5827,21 @@ pub fn build_active_physical_plan(
         .transmission_plan
         .validate(&request.precompute_plan)
         .map_err(|error| format!("TransmissionPlan validation error: {error}"))?;
-    let backend_plan = control_plane::backend_plan::BackendPlan::decode(&request.backend_plan)
-        .map_err(|error| format!("BackendPlan decode error: {error}"))?;
-    backend_plan
-        .validate()
-        .map_err(|error| format!("BackendPlan validation error: {error}"))?;
-    request
-        .precompute_plan
-        .validate_against_backend(&backend_plan)
-        .map_err(|error| format!("PrecomputePlan validation error: {error}"))?;
     let envelope = &request.precompute_plan.envelope;
-    if request.query_plan.plan_id != backend_plan.plan_id
-        || request.query_plan.plan_version != backend_plan.plan_version
-        || envelope.plan_id != backend_plan.plan_id
-        || envelope.plan_version != backend_plan.plan_version
-        || envelope.activation_unix_ms != backend_plan.activation_unix_ms
-        || envelope.expiry_unix_ms != backend_plan.expiry_unix_ms
-        || envelope.backend_compat != backend_plan.backend_compat
+    if request.query_plan.plan_id != envelope.plan_id
+        || request.query_plan.plan_version != envelope.plan_version
         || request.transmission_plan.envelope != *envelope
     {
         return Err("physical subplans have different plan identity/version".into());
     }
     let runtime_config =
         crate::storage_engines::types::StreamingConfig::new(runtime_materializations);
-    let config_fps: BTreeSet<u64> = runtime_config.aggregation_configs.keys().copied().collect();
-    let plan_fps: BTreeSet<u64> = backend_plan
-        .materializations
+    let typed_fps: BTreeSet<_> = runtime_config
+        .aggregation_configs
         .keys()
-        .map(|fp| fp.0)
+        .copied()
+        .map(asap_types::PolicyFingerprint)
         .collect();
-    if config_fps != plan_fps {
-        return Err("PrecomputePlan and BackendPlan materialization fingerprints differ".into());
-    }
-    let typed_fps: BTreeSet<_> = backend_plan.materializations.keys().copied().collect();
     request
         .query_plan
         .validate(&typed_fps)
@@ -6820,7 +6801,6 @@ mod catalog_install_tests {
             collector_plans: plan.collector_plans,
             precompute_plan: plan.precompute_plan,
             transmission_plan: plan.transmission_plan,
-            backend_plan: plan.backend_plan.encode_to_vec(),
             query_plan: plan.query_plan,
             storage_routing: None,
             adaptation_evidence: vec![],
