@@ -671,10 +671,21 @@ async fn handle_compile_and_publish_physical_plan(
     }
     let publication = match bundle.publication() {
         Ok(publication) => publication,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("invalid catalog publication: {error}")).into_response(),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("invalid catalog publication: {error}"),
+            )
+                .into_response()
+        }
     };
     if let Err(error) = backend
-        .post_catalog_plan_typed(&publication, Some(bundle.backend_plan.encode_to_vec()), None, &adaptation_evidence)
+        .post_catalog_plan_typed(
+            &publication,
+            Some(bundle.backend_plan.encode_to_vec()),
+            None,
+            &adaptation_evidence,
+        )
         .await
     {
         return (

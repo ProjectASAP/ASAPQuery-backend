@@ -1,5 +1,5 @@
-//! Shared SDS descriptor contracts. Instances, state bytes, and registry lifetimes
-//! remain backend-owned. Canonical IDs describe content, never SID or policy IDs.
+//! Shared SDS metadata contracts. Summary payload bytes remain storage-engine
+//! owned; catalogs and inventories contain identities and state references only.
 use crate::{AggregationType, PrecomputeMaterialization};
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryFamilyType};
 use serde::{Deserialize, Serialize};
@@ -53,6 +53,171 @@ impl From<MaterializationId> for crate::PolicyFingerprint {
 
 descriptor_id!(SummaryDescriptorId);
 descriptor_id!(DataDescriptorId);
+
+descriptor_id!(SummaryInstanceId);
+
+impl SummaryInstanceId {
+    pub fn new(value: impl Into<String>) -> Result<Self, SdsError> {
+        let value = value.into();
+        if value.trim().is_empty() {
+            return Err(SdsError("summary instance ID must not be empty".into()));
+        }
+        Ok(Self(value))
+    }
+}
+
+/// Immutable identity of the desired catalog generation used to create state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogGeneration {
+    pub schema_version: u32,
+    pub plan_id: u64,
+    pub plan_version: u64,
+    pub snapshot_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HalfOpenTimeRange {
+    pub start_ms: i64,
+    pub end_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstanceCompleteness {
+    Complete,
+    Partial,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryInstanceStatus {
+    Building,
+    Ready,
+    Retiring,
+    Failed,
+    MissingPayload,
+}
+
+/// Logical producer and physical state location. Placement changes do not
+/// change descriptor or materialization identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryPlacement {
+    pub producer_id: String,
+    pub storage_node_id: String,
+}
+
+/// Opaque storage-engine locator. `key` identifies payload stored elsewhere;
+/// encoded summary state must never be placed in this metadata contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryStateReference {
+    pub store: String,
+    pub key: String,
+    pub state_schema_version: u32,
+    pub generation: u64,
+    pub sequence: u64,
+    pub checksum: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EphemeralLease {
+    pub lease_id: String,
+    pub owner_id: String,
+    pub issued_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstanceLifecycle {
+    Persistent,
+    Ephemeral { lease: EphemeralLease },
+}
+
+/// Observed metadata for one concrete SDS instance. Payload remains in the
+/// storage engine and is reached only through `state_reference`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryInstance {
+    pub instance_id: SummaryInstanceId,
+    pub materialization_id: MaterializationId,
+    pub summary_descriptor_id: SummaryDescriptorId,
+    pub data_descriptor_id: DataDescriptorId,
+    pub time_range: HalfOpenTimeRange,
+    pub group_values: BTreeMap<String, String>,
+    pub catalog_generation: CatalogGeneration,
+    pub placement: SummaryPlacement,
+    pub state_reference: SummaryStateReference,
+    pub status: SummaryInstanceStatus,
+    pub completeness: InstanceCompleteness,
+    pub lifecycle: InstanceLifecycle,
+    pub observed_at_ms: i64,
+}
+
+impl SummaryInstance {
+    pub fn validate(&self) -> Result<(), SdsError> {
+        if self.time_range.start_ms >= self.time_range.end_ms {
+            return Err(SdsError("summary instance time range must be non-empty".into()));
+        }
+        if self.catalog_generation.schema_version == 0
+            || self.catalog_generation.snapshot_digest.is_empty()
+        {
+            return Err(SdsError("summary instance has invalid catalog generation".into()));
+        }
+        if self.placement.producer_id.is_empty() || self.placement.storage_node_id.is_empty() {
+            return Err(SdsError("summary instance placement must be resolved".into()));
+        }
+        if self.state_reference.store.is_empty()
+            || self.state_reference.key.is_empty()
+            || self.state_reference.state_schema_version == 0
+        {
+            return Err(SdsError("summary instance has invalid state reference".into()));
+        }
+        if let InstanceLifecycle::Ephemeral { lease } = &self.lifecycle {
+            if lease.lease_id.is_empty()
+                || lease.owner_id.is_empty()
+                || lease.issued_at_ms >= lease.expires_at_ms
+            {
+                return Err(SdsError("summary instance has invalid ephemeral lease".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Data-plane report of what is actually stored. This is observed state and is
+/// deliberately separate from the control-plane desired SummaryCatalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedSummaryInventory {
+    pub reporter_id: String,
+    pub inventory_version: u64,
+    pub observed_at_ms: i64,
+    pub instances: BTreeMap<SummaryInstanceId, SummaryInstance>,
+}
+
+impl ObservedSummaryInventory {
+    pub fn validate(&self) -> Result<(), SdsError> {
+        if self.reporter_id.is_empty() {
+            return Err(SdsError("inventory reporter ID must not be empty".into()));
+        }
+        for (id, instance) in &self.instances {
+            instance.validate()?;
+            if id != &instance.instance_id {
+                return Err(SdsError("inventory key differs from instance ID".into()));
+            }
+            if instance.observed_at_ms > self.observed_at_ms {
+                return Err(SdsError("instance observation is newer than inventory".into()));
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]

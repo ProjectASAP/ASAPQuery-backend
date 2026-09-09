@@ -352,8 +352,7 @@ mod tests {
         };
 
         const AT: u64 = 300_000;
-        const MATERIALIZATION: asap_types::PolicyFingerprint =
-            asap_types::PolicyFingerprint(9001);
+        const MATERIALIZATION: asap_types::PolicyFingerprint = asap_types::PolicyFingerprint(9001);
         let store = crate::storage_engines::sketch_db::index::SketchStore::new();
         store.register(SketchInstanceMetadata {
             sid: 41,
@@ -371,12 +370,8 @@ mod tests {
             expires_at_ms: None,
             policy_fp: MATERIALIZATION,
         });
-        let mut denominator = IncreaseAccumulator::new(
-            Measurement::new(100.0),
-            0,
-            Measurement::new(100.0),
-            0,
-        );
+        let mut denominator =
+            IncreaseAccumulator::new(Measurement::new(100.0), 0, Measurement::new(100.0), 0);
         denominator.update(Measurement::new(400.0), AT as i64);
         store.append_precompute(
             41,
@@ -465,11 +460,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let (result, stats) = super::super::logical_dag::execute_installed(
-            &entry,
-            &prepared,
-            AT,
-            |root, at| {
+        let (result, stats) =
+            super::super::logical_dag::execute_installed(&entry, &prepared, AT, |root, at| {
                 assert_eq!(root, QueryNodeId(2));
                 let mut summary = entry.clone();
                 summary.root = root;
@@ -494,15 +486,17 @@ mod tests {
                     })
                     .collect::<Result<Vec<_>, EngineError>>()?;
                 Ok(QueryResult::vector(rows, at))
-            },
-        )
-        .unwrap();
+            })
+            .unwrap();
         let QueryResult::Vector(result) = result else {
             panic!("instant vector expected")
         };
         assert_eq!(result.timestamp, AT);
         assert_eq!(result.values.len(), 1);
-        assert_eq!(result.values[0].label_keys_override.as_deref(), Some(&["job".into()][..]));
+        assert_eq!(
+            result.values[0].label_keys_override.as_deref(),
+            Some(&["job".into()][..])
+        );
         assert_eq!(result.values[0].labels.labels, vec!["user-service"]);
         assert!((result.values[0].value - 0.1).abs() < 1e-12);
         assert_eq!(stats.raw_scan_evaluations, 0);

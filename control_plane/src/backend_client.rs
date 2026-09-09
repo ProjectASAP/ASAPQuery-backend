@@ -369,21 +369,39 @@ impl BackendClient {
         storage_routing: Option<serde_json::Value>,
         adaptation_evidence: &[crate::physical::compiler::RuntimeAdaptationEvidence],
     ) -> std::result::Result<(), BackendPostError> {
-        publication.validate().map_err(|error| BackendPostError::Permanent(anyhow::anyhow!(error)))?;
+        publication
+            .validate()
+            .map_err(|error| BackendPostError::Permanent(anyhow::anyhow!(error)))?;
         let mut body = serde_json::to_value(publication)
             .map_err(|error| BackendPostError::Permanent(error.into()))?;
-        let fields = body.as_object_mut().expect("publication serializes as object");
+        let fields = body
+            .as_object_mut()
+            .expect("publication serializes as object");
         if let Some(bytes) = compatibility_backend_plan {
             fields.insert("backend_plan".into(), serde_json::json!(bytes));
         }
         fields.insert("storage_routing".into(), serde_json::json!(storage_routing));
-        fields.insert("adaptation_evidence".into(), serde_json::json!(adaptation_evidence));
-        let response = self.http.post(derive_physical_plan_url(&self.endpoint)).json(&body)
-            .send().await.map_err(classify_reqwest_error)?;
+        fields.insert(
+            "adaptation_evidence".into(),
+            serde_json::json!(adaptation_evidence),
+        );
+        let response = self
+            .http
+            .post(derive_physical_plan_url(&self.endpoint))
+            .json(&body)
+            .send()
+            .await
+            .map_err(classify_reqwest_error)?;
         let status = response.status();
-        if status.is_success() { Ok(()) } else {
+        if status.is_success() {
+            Ok(())
+        } else {
             let body = response.text().await.unwrap_or_default();
-            Err(classify_http_status(status, body, "catalog physical-plan POST"))
+            Err(classify_http_status(
+                status,
+                body,
+                "catalog physical-plan POST",
+            ))
         }
     }
 
@@ -402,14 +420,24 @@ impl BackendClient {
         // Compatibility replanner has no Planner-selected query/collector DAG.
         // Still publish the actual catalog and bind every provided projection.
         let catalog = crate::physical::summary_catalog::SummaryCatalog::from_materializations(
-            precompute_plan.envelope.plan_id, precompute_plan.envelope.plan_version,
+            precompute_plan.envelope.plan_id,
+            precompute_plan.envelope.plan_version,
             &precompute_plan.materializations,
-        ).map_err(|error| BackendPostError::Permanent(error.into()))?;
+        )
+        .map_err(|error| BackendPostError::Permanent(error.into()))?;
         let mut precompute_plan = precompute_plan.clone();
-        precompute_plan.bind_catalog(&catalog).map_err(|error| BackendPostError::Permanent(error.into()))?;
+        precompute_plan
+            .bind_catalog(&catalog)
+            .map_err(|error| BackendPostError::Permanent(error.into()))?;
         let mut transmission_plan = transmission_plan.clone();
-        transmission_plan.summary_catalog = Some(catalog.reference().map_err(|error| BackendPostError::Permanent(error.into()))?);
-        query_plan.validate_against_catalog(&catalog).map_err(|error| BackendPostError::Permanent(error.into()))?;
+        transmission_plan.summary_catalog = Some(
+            catalog
+                .reference()
+                .map_err(|error| BackendPostError::Permanent(error.into()))?,
+        );
+        query_plan
+            .validate_against_catalog(&catalog)
+            .map_err(|error| BackendPostError::Permanent(error.into()))?;
         let url = derive_physical_plan_url(&self.endpoint);
         let response = self
             .http
@@ -713,22 +741,43 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_publication_posts_canonical_document_without_legacy_bytes() {
-        let snapshot: crate::physical::compiler::BackendLocalPlanningSnapshot = serde_json::from_str(include_str!("../../docs/examples/asapquery-planning-snapshot.json")).unwrap();
+        let snapshot: crate::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../docs/examples/asapquery-planning-snapshot.json"
+            ))
+            .unwrap();
         let publication = snapshot.compile().unwrap().publication().unwrap();
         let hits: StdArc<Mutex<Vec<serde_json::Value>>> = StdArc::new(Mutex::new(Vec::new()));
         let route_hits = hits.clone();
-        let app = Router::new().route("/api/v1/physical-plan", post(move |axum::Json(body): axum::Json<serde_json::Value>| {
-            let hits = route_hits.clone();
-            async move { hits.lock().unwrap().push(body); axum::http::StatusCode::OK }
-        }));
+        let app = Router::new().route(
+            "/api/v1/physical-plan",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let hits = route_hits.clone();
+                async move {
+                    hits.lock().unwrap().push(body);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
         let client = BackendClient::new(format!("http://{addr}/api/v1/streaming-config"));
-        client.post_catalog_plan_typed(&publication, None, None, &[]).await.unwrap();
+        client
+            .post_catalog_plan_typed(&publication, None, None, &[])
+            .await
+            .unwrap();
         let bodies = hits.lock().unwrap();
         assert_eq!(bodies.len(), 1);
-        for field in ["summary_catalog", "precompute_plan", "collector_plans", "transmission_plan", "query_plan"] {
+        for field in [
+            "summary_catalog",
+            "precompute_plan",
+            "collector_plans",
+            "transmission_plan",
+            "query_plan",
+        ] {
             assert!(bodies[0].get(field).is_some(), "missing {field}");
         }
         assert!(bodies[0].get("backend_plan").is_none());
