@@ -4324,7 +4324,7 @@ mod tests {
                 .summary_catalog
                 .materializations
                 .keys()
-                .map(|id| id.fingerprint())
+                .cloned()
                 .collect::<BTreeSet<_>>(),
             bundle
                 .backend_plan
