@@ -122,9 +122,12 @@ impl SummaryDescriptorRegistry {
 
     pub fn bind(&self, metadata: SketchInstanceMetadata) -> Result<SdsBinding, String> {
         let authoritative = self.authoritative_catalog.read().unwrap().clone();
-        let configured = if metadata.policy_fp.is_unset() {
-            None
-        } else if let Some(catalog) = authoritative.as_ref() {
+        let configured = if let Some(catalog) = authoritative.as_ref() {
+            if metadata.policy_fp.is_unset() {
+                return Err(
+                    "materialization identity is required by the installed SummaryCatalog".into(),
+                );
+            }
             let materialization = asap_types::sds::MaterializationId::from(metadata.policy_fp);
             let identity = catalog
                 .materializations
@@ -383,6 +386,9 @@ mod tests {
         assert_eq!(binding.data_descriptor.as_ref(), &data);
         assert!(registry
             .bind(metadata(2, "cpu", "", AggregationType::Sum, 8))
+            .is_err());
+        assert!(registry
+            .bind(metadata(3, "cpu", "", AggregationType::Sum, 0))
             .is_err());
     }
 }
