@@ -184,6 +184,11 @@ impl ThreeStageWalker {
                 }
                 StageId::Backend
             }
+            SummaryExpr::ValueOperation { child, .. } => {
+                let (cid, _) = self.visit_l4node(child)?;
+                self.dag.edges.push((id, cid));
+                StageId::Backend
+            }
 
             // ── SummaryAgg: always edge per design.md §6 batched-queries
             // table — true for both approximate sketches (the old

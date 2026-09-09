@@ -1068,6 +1068,7 @@ pub fn materialization_candidate_keys(
                 visit(original, lhs, keys)?;
                 visit(original, rhs, keys)?;
             }
+            SummaryExpr::ValueOperation { child, .. } => visit(original, child, keys)?,
             SummaryExpr::SummaryAgg { child, .. } => visit(original, child, keys)?,
             SummaryExpr::SummaryEstimate { summary_input, .. }
             | SummaryExpr::SummaryDelete { summary_input, .. } => {

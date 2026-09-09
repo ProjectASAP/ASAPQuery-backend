@@ -42,7 +42,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "abb2f20e27091ac0c60715dc42b9b59c75b3447c";
+pub const PLANNER_REVISION: &str = "940a9928d9b77e22125a269618d8036f61b1c3b2";
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
@@ -134,6 +134,9 @@ pub struct PlanningRequest {
     pub query_workload: Option<QueryWorkload>,
     pub queries: Vec<PlanningQuery>,
     pub evidence: HashMap<String, TopKMembershipEvidence>,
+    /// Optional distribution-conditioned empirical sizing policy. Hybrid
+    /// mode falls back to theoretical sizing and then exact execution.
+    pub erp: Option<super::erp::ErpPlanningInput>,
     pub planner_revision: String,
     /// Observed cadence of source samples. Exact temporal panes must divide
     /// both this cadence and the repeated-query evaluation interval.
@@ -211,6 +214,8 @@ pub struct BackendLocalImplementation {
     /// before workload selection so one query cannot borrow another's evidence.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub topk_evidence: HashMap<String, TopKMembershipEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub erp: Option<super::erp::ErpPlanningInput>,
 }
 
 fn u64_is_zero(value: &u64) -> bool {
@@ -348,7 +353,7 @@ impl TryFrom<&SummaryFamilyType> for StateFamilyContract {
                     ExactKind::Count => ExactStateKind::Count,
                     ExactKind::MinMax => ExactStateKind::MinMax,
                     ExactKind::Increase => ExactStateKind::Increase,
-                    ExactKind::Rate => ExactStateKind::Rate,
+                    ExactKind::Rate | ExactKind::IRate => ExactStateKind::Rate,
                 },
             },
             SummaryFamilyType::Sketch(kind, _) => Self::Sketch {
@@ -1704,7 +1709,12 @@ impl BackendLocalPlanningSnapshot {
                 runtime_policy: RuntimeRulePolicy::default(),
             });
         }
-        select_workload_roots(&mut queries, canonical_roots, &topk_evidence_by_id)?;
+        select_workload_roots_with_erp(
+            &mut queries,
+            canonical_roots,
+            &topk_evidence_by_id,
+            self.implementation.erp.as_ref(),
+        )?;
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
             PlanningRequest {
@@ -1713,6 +1723,7 @@ impl BackendLocalPlanningSnapshot {
                 query_workload: Some(workload),
                 queries,
                 evidence: topk_evidence_by_id,
+                erp: self.implementation.erp,
                 planner_revision: PLANNER_REVISION.into(),
                 source_sample_interval_ms: self.implementation.source_sample_interval_ms,
                 query_staleness_margin_ms: self.implementation.query_staleness_margin_ms,
@@ -2424,6 +2435,7 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 }
             }
             SummaryExpr::SummaryAgg { child, .. } => walk(child, metrics),
+            SummaryExpr::ValueOperation { child, .. } => walk(child, metrics),
             SummaryExpr::SummaryEstimate { summary_input, .. } => walk(summary_input, metrics),
             SummaryExpr::SummaryMerge { children } => {
                 for child in children {
@@ -2462,6 +2474,15 @@ pub fn select_workload_roots(
     roots: Vec<Rc<QueryExpr>>,
     evidence: &HashMap<String, TopKMembershipEvidence>,
 ) -> Result<(), CompileError> {
+    select_workload_roots_with_erp(queries, roots, evidence, None)
+}
+
+pub fn select_workload_roots_with_erp(
+    queries: &mut [PlanningQuery],
+    roots: Vec<Rc<QueryExpr>>,
+    evidence: &HashMap<String, TopKMembershipEvidence>,
+    erp: Option<&super::erp::ErpPlanningInput>,
+) -> Result<(), CompileError> {
     if roots.len() != queries.len() {
         return Err(CompileError::Snapshot(
             "canonical root/query mapping is incomplete".into(),
@@ -2469,6 +2490,7 @@ pub fn select_workload_roots(
     }
     let mut cohorts: Vec<(AccuracyTarget, Option<String>, Vec<(usize, Rc<QueryExpr>)>)> =
         Vec::new();
+    let original_roots = roots.clone();
     for (index, root) in roots.into_iter().enumerate() {
         let accuracy = &queries[index].accuracy;
         let certificate_scope = evidence
@@ -2484,7 +2506,10 @@ pub fn select_workload_roots(
         }
     }
     for (accuracy, scope, roots) in cohorts {
-        let model = ControlPlaneCostModel::new(accuracy.clone());
+        let mut model = ControlPlaneCostModel::new(accuracy.clone());
+        if let Some(erp) = erp {
+            model = model.with_erp(erp.clone());
+        }
         let certificate = scope.as_ref().and_then(|id| evidence.get(id));
         let selected = crate::planner_selection::select_workload_with_evidence(
             roots,
@@ -2494,10 +2519,75 @@ pub fn select_workload_roots(
         )
         .map_err(|error| CompileError::Snapshot(error.to_string()))?;
         for (index, node) in selected {
-            queries[index].post_asap = node;
+            if erp.is_some_and(|erp| {
+                requires_exact_erp_fallback(&node, &queries[index].accuracy, erp)
+            }) {
+                tracing::warn!(
+                    query_id = %queries[index].query_id,
+                    "ERP and theoretical sketch configuration unavailable; preserving exact subtree"
+                );
+                queries[index].post_asap =
+                    crate::planner_selection::keep_pre_asap(&original_roots[index])
+                        .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+            } else {
+                queries[index].post_asap = node;
+            }
         }
     }
     Ok(())
+}
+
+fn requires_exact_erp_fallback(
+    node: &SummaryNode,
+    accuracy: &AccuracyTarget,
+    erp: &super::erp::ErpPlanningInput,
+) -> bool {
+    fn walk(node: &SummaryNode, out: &mut Vec<(SketchAlgorithm, SketchParams)>) {
+        match &node.expr {
+            SummaryExpr::SummaryAgg { family, child, .. } => {
+                if let SummaryFamilyType::Sketch(kind, _) = family {
+                    out.push((kind.algorithm().clone(), kind.params().clone()));
+                }
+                walk(child, out);
+            }
+            SummaryExpr::SummaryEstimate { summary_input, .. }
+            | SummaryExpr::SummaryDelete { summary_input, .. } => walk(summary_input, out),
+            SummaryExpr::ValueOperation { child, .. } => walk(child, out),
+            SummaryExpr::SummaryMerge { children } => {
+                for child in children {
+                    walk(child, out);
+                }
+            }
+            SummaryExpr::SummaryJoin { outer, inner, .. } => {
+                walk(outer, out);
+                walk(inner, out);
+            }
+            SummaryExpr::SummarySubtract { left, right }
+            | SummaryExpr::BinaryOp {
+                lhs: left,
+                rhs: right,
+                ..
+            } => {
+                walk(left, out);
+                walk(right, out);
+            }
+            SummaryExpr::KeepPreAsap(_) => {}
+        }
+    }
+    let max_error = match accuracy {
+        AccuracyTarget::Epsilon(value) | AccuracyTarget::EpsilonDelta { epsilon: value, .. } => {
+            *value
+        }
+        AccuracyTarget::Exact => return false,
+    };
+    let mut sketches = Vec::new();
+    walk(node, &mut sketches);
+    sketches.into_iter().any(|(algorithm, params)| {
+        matches!(
+            erp.select(algorithm, max_error, params),
+            super::erp::ErpParameterDecision::ExactFallback { .. }
+        )
+    })
 }
 
 /// Planner-adapter selection step used before physical compilation. Keeping
@@ -3195,6 +3285,7 @@ fn collect_selected_materializations(
                 });
             }
             SummaryExpr::BinaryOp { .. }
+            | SummaryExpr::ValueOperation { .. }
             | SummaryExpr::KeepPreAsap(_)
             | SummaryExpr::SummaryAgg { .. }
             | SummaryExpr::SummaryJoin { .. }
@@ -3515,6 +3606,7 @@ mod tests {
                 runtime_policy: RuntimeRulePolicy::default(),
             }],
             evidence: evidence_by_query,
+            erp: None,
             planner_revision: PLANNER_REVISION.into(),
             source_sample_interval_ms: None,
             query_staleness_margin_ms: 0,
@@ -3577,6 +3669,53 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["q90", "q99"])
         );
+    }
+
+    /// The canonical workload boundary preserves the original query when an
+    /// ERP miss cannot use a runtime-supported theoretical sketch.
+    #[test]
+    fn hybrid_erp_capability_miss_preserves_exact_subtree() {
+        let mut workload = request("q", "quantile_over_time(0.9, m[1m])");
+        let roots = vec![Rc::new(
+            crate::query_parser::parse_query_expr_canonical(
+                &workload.queries[0].query_string,
+                workload.queries[0].accuracy.clone(),
+            )
+            .unwrap(),
+        )];
+        let erp = super::super::erp::ErpPlanningInput {
+            artifact: asap_aware_mapping::erp::ErpArtifact {
+                schema_version: asap_aware_mapping::erp::ERP_SCHEMA_VERSION,
+                producer_version: "bench-rev".into(),
+                records: vec![],
+            },
+            distribution: serde_json::json!({"synthetic":{"kind":"zipf"}}),
+            implementation: None,
+            error_metric: "relative_error".into(),
+            min_trials: 10,
+            expected_updates: 1000.0,
+            expected_queries: 10.0,
+            expected_merges: 0.0,
+            retention_seconds: 60.0,
+            cpu_weight: 1.0,
+            byte_second_weight: 1e-9,
+            mode: super::super::erp::ErpAccuracyMode::Hybrid,
+            runtime: super::super::erp::ErpRuntimeCapabilities {
+                allowed_algorithms: vec![SketchAlgorithm::Hll],
+                max_memory_bytes: None,
+            },
+        };
+        select_workload_roots_with_erp(
+            &mut workload.queries,
+            roots,
+            &workload.evidence,
+            Some(&erp),
+        )
+        .unwrap();
+        assert!(matches!(
+            workload.queries[0].post_asap.expr,
+            SummaryExpr::KeepPreAsap(_)
+        ));
     }
 
     // A broken input mapping must be rejected, never silently drop a root.
@@ -4245,6 +4384,7 @@ mod tests {
                 source_sample_interval_ms: None,
                 query_staleness_margin_ms: 0,
                 topk_evidence: HashMap::new(),
+                erp: None,
             },
             environment,
         };

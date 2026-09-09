@@ -806,6 +806,7 @@ fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
         AggIntent::TsOfLastOverTime => "ts_of_last_over_time",
         // Unrecognized Extension (not the Frequency one, guarded above).
         AggIntent::Extension { .. } => "extension",
+        AggIntent::IRate => "irate",
     }
 }
 

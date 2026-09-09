@@ -95,7 +95,8 @@ pub fn from_stage_config(
                 | planner_types::post_asap::ExactKind::Count => asap_types::AggregationType::Sum,
                 planner_types::post_asap::ExactKind::MinMax => asap_types::AggregationType::MinMax,
                 planner_types::post_asap::ExactKind::Increase
-                | planner_types::post_asap::ExactKind::Rate => {
+                | planner_types::post_asap::ExactKind::Rate
+                | planner_types::post_asap::ExactKind::IRate => {
                     asap_types::AggregationType::Increase
                 }
             };
@@ -202,7 +203,8 @@ fn capability_for_readout(
                 planner_types::post_asap::ExactKind::Count => AggregationType::Sum,
                 planner_types::post_asap::ExactKind::MinMax => AggregationType::MinMax,
                 planner_types::post_asap::ExactKind::Increase
-                | planner_types::post_asap::ExactKind::Rate => AggregationType::Increase,
+                | planner_types::post_asap::ExactKind::Rate
+                | planner_types::post_asap::ExactKind::IRate => AggregationType::Increase,
             };
             Ok(Capability::ExactAgg(agg_type))
         }

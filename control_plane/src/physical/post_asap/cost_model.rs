@@ -51,6 +51,7 @@ use planner_types::post_asap::{
 use planner_types::pre_asap::expr_ir::ColumnRef;
 
 use crate::physical::deployment_cost::wire::WireCostTable;
+use crate::physical::erp::{ErpParameterDecision, ErpPlanningInput};
 use crate::planner_selection::FREQUENCY_EXT_KIND;
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::AggIntent;
@@ -66,6 +67,7 @@ pub struct ControlPlaneCostModel {
     window_framework_costs: Vec<(Option<String>, SummaryWindowFramework, Cost)>,
     offline_evidence: Option<EmpiricalEvidenceProvider>,
     offline_frequency_comparison: Option<(OfflineComparisonEvidence, OfflineComparisonRequest)>,
+    erp: Option<ErpPlanningInput>,
 }
 
 impl ControlPlaneCostModel {
@@ -77,6 +79,7 @@ impl ControlPlaneCostModel {
             window_framework_costs: Vec::new(),
             offline_evidence: None,
             offline_frequency_comparison: None,
+            erp: None,
         }
     }
 
@@ -89,6 +92,22 @@ impl ControlPlaneCostModel {
 
     pub fn offline_evidence(&self) -> Option<&EmpiricalEvidenceProvider> {
         self.offline_evidence.as_ref()
+    }
+
+    pub fn with_erp(mut self, erp: ErpPlanningInput) -> Self {
+        self.erp = Some(erp);
+        self
+    }
+
+    pub fn erp_parameter_decision(
+        &self,
+        algorithm: SketchAlgorithm,
+        max_error: f64,
+        theoretical: SketchParams,
+    ) -> Option<ErpParameterDecision> {
+        self.erp
+            .as_ref()
+            .map(|erp| erp.select(algorithm, max_error, theoretical))
     }
 
     /// Opt into a fixed-snapshot frequency comparison. The caller asserts that
@@ -471,7 +490,7 @@ impl CostModel for ControlPlaneCostModel {
         eps: f64,
         delta: f64,
     ) -> SketchParams {
-        match intent {
+        let (max_error, theoretical) = match intent {
             AggIntent::TopK { k, .. } => {
                 let (eps, delta) = self.topk_eps_delta(&intent_accuracy(intent));
                 let (w, d) = Self::cms_width_depth(eps, delta);
@@ -481,7 +500,7 @@ impl CostModel for ControlPlaneCostModel {
                 // additive bound (ε ≤ e/w).
                 let w = w.next_power_of_two();
                 let heap_size = *k as u32;
-                match kind {
+                let params = match kind {
                     SketchAlgorithm::CmsWithHeap => SketchParams::CmsWithHeap {
                         width: w,
                         depth: d,
@@ -492,7 +511,8 @@ impl CostModel for ControlPlaneCostModel {
                         depth: d,
                         heap_size,
                     },
-                }
+                };
+                (eps, params)
             }
             _ => {
                 let Some((eps, delta)) = self.combined_eps_delta(&intent_accuracy(intent)) else {
@@ -504,7 +524,7 @@ impl CostModel for ControlPlaneCostModel {
                     return asap_aware_mapping::DefaultCostModel
                         .size_params(kind, intent, eps, delta);
                 };
-                match kind {
+                let params = match kind.clone() {
                     SketchAlgorithm::Kll => SketchParams::Kll {
                         k: kll_k_for_eps(eps),
                     },
@@ -521,8 +541,37 @@ impl CostModel for ControlPlaneCostModel {
                     other => {
                         asap_aware_mapping::DefaultCostModel.size_params(other, intent, eps, delta)
                     }
-                }
+                };
+                (eps, params)
             }
+        };
+        match self.erp_parameter_decision(kind, max_error, theoretical.clone()) {
+            Some(ErpParameterDecision::Empirical {
+                params,
+                record_id,
+                observed_error,
+                estimated_cost,
+            }) => {
+                tracing::info!(
+                    erp_record_id = %record_id,
+                    observed_error,
+                    estimated_cost,
+                    "selected empirical ERP sketch parameters"
+                );
+                params
+            }
+            Some(ErpParameterDecision::TheoreticalFallback { params, reason }) => {
+                tracing::warn!(reason = %reason, "ERP miss or drift; using theoretical sizing");
+                params
+            }
+            Some(ErpParameterDecision::ExactFallback { reason }) => {
+                // Selection callers post-validate this decision and preserve
+                // the pre-ASAP subtree. Return the theoretical value only to
+                // satisfy CostModel's parameter-only interface meanwhile.
+                tracing::warn!(reason = %reason, "ERP and theoretical sizing unavailable; exact fallback required");
+                theoretical
+            }
+            None => theoretical,
         }
     }
 
