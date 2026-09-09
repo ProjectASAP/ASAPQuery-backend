@@ -602,6 +602,9 @@ struct CompileAndPublishPhysicalPlanRequest {
     #[serde(default)]
     evidence: HashMap<String, physical::compiler::TopKMembershipEvidence>,
     #[serde(default)]
+    exact_composition_costs:
+        HashMap<String, Vec<physical::post_asap::cost_model::ExactCompositionCostEvidence>>,
+    #[serde(default)]
     runtime_adaptation_evidence: Vec<physical::compiler::RuntimeAdaptationEvidence>,
     planner_revision: String,
     max_evidence_age_ms: u64,
@@ -820,9 +823,12 @@ fn compile_physical_plan_request(
         });
     }
 
-    if let Err(error) =
-        physical::compiler::select_workload_roots(&mut queries, canonical_roots, &request.evidence)
-    {
+    if let Err(error) = physical::compiler::select_workload_roots(
+        &mut queries,
+        canonical_roots,
+        &request.evidence,
+        &request.exact_composition_costs,
+    ) {
         return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string()));
     }
 
@@ -832,6 +838,7 @@ fn compile_physical_plan_request(
         hybrid_execution: false,
         materialization_policy: None,
         evidence: request.evidence,
+        exact_composition_costs: request.exact_composition_costs,
         planner_revision: request.planner_revision,
         source_sample_interval_ms: None,
         query_staleness_margin_ms: 0,

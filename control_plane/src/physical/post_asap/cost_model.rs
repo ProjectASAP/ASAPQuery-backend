@@ -42,8 +42,10 @@ use asap_aware_mapping::empirical_comparison::{
 };
 use asap_aware_mapping::empirical_cost::EmpiricalEvidenceProvider;
 use asap_aware_mapping::{
-    CompleteSummaryCandidateEstimate, CostModel, Horizon, Implementation,
-    SummaryMaintenanceCapabilities, SummaryMaintenanceLifecycleCostInputs,
+    CompleteSummaryCandidateEstimate, CostModel, CostProvenance, EvaluationRate,
+    ExactCompositionCostInputs, ExactCompositionCostRequest, Horizon, Implementation,
+    OperationPlacement, SummaryMaintenanceCapabilities, SummaryMaintenanceLifecycleCostInputs,
+    ValueOperationCapabilities,
 };
 use planner_types::post_asap::{
     SketchAlgorithm, SketchParams, SketchQuery, SummaryWindowFramework,
@@ -54,6 +56,80 @@ use crate::physical::deployment_cost::wire::WireCostTable;
 use crate::planner_selection::FREQUENCY_EXT_KIND;
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::AggIntent;
+use serde::{Deserialize, Serialize};
+
+/// One measured execution profile for an exact operator composed with a
+/// maintained summary. Values use CPU nanoseconds so every term in Planner's
+/// recurring-cost formula has the same physical unit. Peak memory is retained
+/// as measured resource evidence and reported separately; it is deliberately
+/// not converted into CPU cost by an invented weight.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExactCompositionCostEvidence {
+    /// Exact pre-ASAP target serialized with the pinned Planner revision.
+    pub target: serde_json::Value,
+    /// Exact operation serialized with the pinned Planner revision.
+    pub operation: serde_json::Value,
+    pub placement: ExactOperationPlacement,
+    pub expected_input_rows: f64,
+    pub expected_output_rows: f64,
+    pub exact_cpu_ns_per_row: f64,
+    pub summary_maintenance_cpu_ns_per_update: f64,
+    pub summary_read_cpu_ns: f64,
+    pub update_rate_per_second: f64,
+    pub evaluation_rate_per_second: f64,
+    pub raw_recompute_cpu_ns: f64,
+    pub observed_peak_memory_bytes: u64,
+    pub data_snapshot_id: String,
+    pub model_version: String,
+    pub observed_at_unix_ms: u64,
+    pub valid_for_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExactOperationPlacement {
+    Read,
+    Maintenance,
+}
+
+impl ExactCompositionCostEvidence {
+    pub fn validate(&self, now_unix_ms: u64, max_age_ms: u64) -> Result<(), String> {
+        let positive = [
+            self.exact_cpu_ns_per_row,
+            self.summary_maintenance_cpu_ns_per_update,
+            self.summary_read_cpu_ns,
+            self.update_rate_per_second,
+            self.evaluation_rate_per_second,
+            self.raw_recompute_cpu_ns,
+        ];
+        let rows = [self.expected_input_rows, self.expected_output_rows];
+        if positive.iter().any(|v| !v.is_finite() || *v <= 0.0)
+            || rows.iter().any(|v| !v.is_finite() || *v < 0.0)
+            || self.observed_peak_memory_bytes == 0
+            || self.data_snapshot_id.trim().is_empty()
+            || self.model_version.trim().is_empty()
+            || self.valid_for_ms == 0
+            || self.observed_at_unix_ms > now_unix_ms
+            || now_unix_ms - self.observed_at_unix_ms > self.valid_for_ms.min(max_age_ms)
+        {
+            return Err(
+                "missing, non-physical, future, or stale exact-composition evidence".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn matches(&self, request: &ExactCompositionCostRequest<'_>) -> bool {
+        let placement = match request.composition.placement {
+            OperationPlacement::Read => ExactOperationPlacement::Read,
+            OperationPlacement::Maintenance => ExactOperationPlacement::Maintenance,
+        };
+        self.placement == placement
+            && serde_json::to_value(request.target).ok().as_ref() == Some(&self.target)
+            && serde_json::to_value(&request.composition.op).ok().as_ref() == Some(&self.operation)
+    }
+}
 
 /// See module docs.
 pub struct ControlPlaneCostModel {
@@ -66,6 +142,7 @@ pub struct ControlPlaneCostModel {
     window_framework_costs: Vec<(Option<String>, SummaryWindowFramework, Cost)>,
     offline_evidence: Option<EmpiricalEvidenceProvider>,
     offline_frequency_comparison: Option<(OfflineComparisonEvidence, OfflineComparisonRequest)>,
+    exact_composition_costs: Vec<ExactCompositionCostEvidence>,
 }
 
 impl ControlPlaneCostModel {
@@ -77,7 +154,16 @@ impl ControlPlaneCostModel {
             window_framework_costs: Vec::new(),
             offline_evidence: None,
             offline_frequency_comparison: None,
+            exact_composition_costs: Vec::new(),
         }
+    }
+
+    pub fn with_exact_composition_costs(
+        mut self,
+        costs: Vec<ExactCompositionCostEvidence>,
+    ) -> Self {
+        self.exact_composition_costs = costs;
+        self
     }
 
     /// Use offline update CPU evidence for algorithm ordering. Physical costs
@@ -359,6 +445,50 @@ fn intent_accuracy(intent: &AggIntent) -> AccuracyTarget {
 }
 
 impl CostModel for ControlPlaneCostModel {
+    fn value_operation_capabilities(&self) -> ValueOperationCapabilities {
+        ValueOperationCapabilities {
+            read_time: true,
+            maintenance_time: false,
+        }
+    }
+
+    fn exact_composition_cost_inputs(
+        &self,
+        request: &ExactCompositionCostRequest<'_>,
+    ) -> ExactCompositionCostInputs {
+        let provenance = || CostProvenance {
+            model: "ASAPQuery measured exact composition".into(),
+            version: "unavailable".into(),
+        };
+        let Some(row) = self
+            .exact_composition_costs
+            .iter()
+            .find(|row| row.matches(request))
+        else {
+            return ExactCompositionCostInputs::unknown(provenance());
+        };
+        ExactCompositionCostInputs {
+            exact_cost_per_row: Some(row.exact_cpu_ns_per_row),
+            expected_input_rows: Some(row.expected_input_rows),
+            expected_output_rows: Some(row.expected_output_rows),
+            summary_maintenance_cost_per_update: Some(row.summary_maintenance_cpu_ns_per_update),
+            summary_read_cost: Some(row.summary_read_cpu_ns),
+            update_rate: Some(row.update_rate_per_second),
+            evaluation_rate: Some(EvaluationRate(
+                row.evaluation_rate_per_second * request.effective_consumer_count as f64,
+            )),
+            raw_recompute_cost: Some(row.raw_recompute_cpu_ns),
+            unit: asap_aware_mapping::CostUnit::CostUnitsPerSecond,
+            provenance: CostProvenance {
+                model: format!(
+                    "ASAPQuery measured exact composition ({})",
+                    row.data_snapshot_id
+                ),
+                version: row.model_version.clone(),
+            },
+        }
+    }
+
     fn summary_maintenance_lifecycle_cost_inputs(
         &self,
         _summary: &planner_types::post_asap::SummaryNode,

@@ -187,6 +187,9 @@ pub fn select_workload_with_evidence(
             &asap_aware_mapping::EqualSplitAllocator,
             evidence,
         )),
+        Box::new(asap_aware_mapping::ExactCompositionStrategy::new(
+            cost_model,
+        )),
         Box::new(asap_aware_mapping::SemanticEquivalentRewriteStrategy),
     ];
     let space = asap_aware_mapping::search_workload_with_targets(

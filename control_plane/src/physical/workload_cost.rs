@@ -927,8 +927,13 @@ mod tests {
                 )
             })
             .collect();
-        super::super::compiler::select_workload_roots(&mut shared.queries, roots, &shared.evidence)
-            .unwrap();
+        super::super::compiler::select_workload_roots(
+            &mut shared.queries,
+            roots,
+            &shared.evidence,
+            &shared.exact_composition_costs,
+        )
+        .unwrap();
         let plan = PhysicalCompiler.compile(shared.clone(), env).unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 1);
         let second = manifest(&plan, &shared.queries).unwrap();

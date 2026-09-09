@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use thiserror::Error;
 
 use crate::physical::colored_dag::emitter::{AggregationInput, BackendAggregation};
-use crate::physical::post_asap::cost_model::ControlPlaneCostModel;
+use crate::physical::post_asap::cost_model::{ControlPlaneCostModel, ExactCompositionCostEvidence};
 use crate::query_plan::{
     canonical_promql, FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping,
     QueryPlan, QueryPlanEntry,
@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "24735a35442c0ada3dd4ba1e2b3ab671b29f31b6";
+pub const PLANNER_REVISION: &str = "54f581b4be69a0d62379869916e387b899e05a43";
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 
 #[derive(Debug, Clone)]
@@ -130,6 +130,9 @@ pub struct PlanningRequest {
     pub query_workload: Option<QueryWorkload>,
     pub queries: Vec<PlanningQuery>,
     pub evidence: HashMap<String, TopKMembershipEvidence>,
+    /// Fresh measured costs for Planner exact/summary composition sites,
+    /// scoped to query IDs just like accuracy evidence.
+    pub exact_composition_costs: HashMap<String, Vec<ExactCompositionCostEvidence>>,
     pub planner_revision: String,
     /// Observed cadence of source samples. Exact temporal panes must divide
     /// both this cadence and the repeated-query evaluation interval.
@@ -207,6 +210,10 @@ pub struct BackendLocalImplementation {
     /// before workload selection so one query cannot borrow another's evidence.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub topk_evidence: HashMap<String, TopKMembershipEvidence>,
+    /// Measured exact/summary composition profiles keyed by registered
+    /// PromQL. Missing rows keep the corresponding Planner site opaque.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub exact_composition_costs: HashMap<String, Vec<ExactCompositionCostEvidence>>,
 }
 
 fn u64_is_zero(value: &u64) -> bool {
@@ -1805,7 +1812,33 @@ impl BackendLocalPlanningSnapshot {
                 runtime_policy: RuntimeRulePolicy::default(),
             });
         }
-        select_workload_roots(&mut queries, canonical_roots, &topk_evidence_by_id)?;
+        let mut exact_costs_by_id = HashMap::new();
+        for (index, entry) in workload.entries().enumerate() {
+            if let Some(rows) = self
+                .implementation
+                .exact_composition_costs
+                .get(&entry.query.0)
+            {
+                for row in rows {
+                    row.validate(
+                        self.environment.observed_at_unix_ms,
+                        self.environment.max_evidence_age_ms,
+                    )
+                    .map_err(|reason| {
+                        CompileError::Snapshot(format!(
+                            "query {index}: invalid exact-composition evidence: {reason}"
+                        ))
+                    })?;
+                }
+                exact_costs_by_id.insert(format!("compat-query-{index}"), rows.clone());
+            }
+        }
+        select_workload_roots(
+            &mut queries,
+            canonical_roots,
+            &topk_evidence_by_id,
+            &exact_costs_by_id,
+        )?;
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
             PlanningRequest {
@@ -1814,6 +1847,7 @@ impl BackendLocalPlanningSnapshot {
                 query_workload: Some(workload),
                 queries,
                 evidence: topk_evidence_by_id,
+                exact_composition_costs: exact_costs_by_id,
                 planner_revision: PLANNER_REVISION.into(),
                 source_sample_interval_ms: self.implementation.source_sample_interval_ms,
                 query_staleness_margin_ms: self.implementation.query_staleness_margin_ms,
@@ -2562,6 +2596,7 @@ pub fn select_workload_roots(
     queries: &mut [PlanningQuery],
     roots: Vec<Rc<QueryExpr>>,
     evidence: &HashMap<String, TopKMembershipEvidence>,
+    exact_costs: &HashMap<String, Vec<ExactCompositionCostEvidence>>,
 ) -> Result<(), CompileError> {
     if roots.len() != queries.len() {
         return Err(CompileError::Snapshot(
@@ -2572,9 +2607,9 @@ pub fn select_workload_roots(
         Vec::new();
     for (index, root) in roots.into_iter().enumerate() {
         let accuracy = &queries[index].accuracy;
-        let certificate_scope = evidence
-            .contains_key(&queries[index].query_id)
-            .then(|| queries[index].query_id.clone());
+        let certificate_scope = (evidence.contains_key(&queries[index].query_id)
+            || exact_costs.contains_key(&queries[index].query_id))
+        .then(|| queries[index].query_id.clone());
         if let Some((_, _, roots)) = cohorts
             .iter_mut()
             .find(|(target, scope, _)| target == accuracy && scope == &certificate_scope)
@@ -2585,7 +2620,13 @@ pub fn select_workload_roots(
         }
     }
     for (accuracy, scope, roots) in cohorts {
-        let model = ControlPlaneCostModel::new(accuracy.clone());
+        let model = ControlPlaneCostModel::new(accuracy.clone()).with_exact_composition_costs(
+            scope
+                .as_ref()
+                .and_then(|id| exact_costs.get(id))
+                .cloned()
+                .unwrap_or_default(),
+        );
         let certificate = scope.as_ref().and_then(|id| evidence.get(id));
         let selected = crate::planner_selection::select_workload_with_evidence(
             roots,
@@ -3642,6 +3683,7 @@ mod tests {
                 runtime_policy: RuntimeRulePolicy::default(),
             }],
             evidence: evidence_by_query,
+            exact_composition_costs: HashMap::new(),
             planner_revision: PLANNER_REVISION.into(),
             source_sample_interval_ms: None,
             query_staleness_margin_ms: 0,
@@ -3650,6 +3692,146 @@ mod tests {
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    fn measured_exact_composition_rows(
+        expr: &QueryExpr,
+        observed_at_unix_ms: u64,
+    ) -> Vec<ExactCompositionCostEvidence> {
+        fn visit(
+            expr: &QueryExpr,
+            observed_at_unix_ms: u64,
+            rows: &mut Vec<ExactCompositionCostEvidence>,
+        ) {
+            use planner_types::post_asap::ExactOperation;
+            match expr {
+                QueryExpr::Aggregate {
+                    reduction,
+                    measures,
+                    output_names,
+                    having,
+                    child,
+                } => {
+                    rows.push(ExactCompositionCostEvidence {
+                        target: serde_json::to_value(expr).unwrap(),
+                        operation: serde_json::to_value(ExactOperation::Aggregate {
+                            reduction: reduction.clone(),
+                            measures: measures.clone(),
+                            output_names: output_names.clone(),
+                            having: having.clone(),
+                        })
+                        .unwrap(),
+                        placement:
+                            crate::physical::post_asap::cost_model::ExactOperationPlacement::Read,
+                        expected_input_rows: 100.0,
+                        expected_output_rows: 10.0,
+                        exact_cpu_ns_per_row: 2.0,
+                        summary_maintenance_cpu_ns_per_update: 3.0,
+                        summary_read_cpu_ns: 20.0,
+                        update_rate_per_second: 100.0,
+                        evaluation_rate_per_second: 0.1,
+                        raw_recompute_cpu_ns: 100_000.0,
+                        observed_peak_memory_bytes: 4096,
+                        data_snapshot_id: "topk-planning-fixture".into(),
+                        model_version: "measured-test-v1".into(),
+                        observed_at_unix_ms,
+                        valid_for_ms: 60_000,
+                    });
+                    visit(child, observed_at_unix_ms, rows);
+                }
+                QueryExpr::Sort { child, .. }
+                | QueryExpr::Limit { child, .. }
+                | QueryExpr::TimeRange { child, .. }
+                | QueryExpr::Filter { child, .. }
+                | QueryExpr::Project { child, .. }
+                | QueryExpr::PromqlSubquery { child, .. }
+                | QueryExpr::TimeShift { child, .. }
+                | QueryExpr::PromqlScalarBridge(child)
+                | QueryExpr::PromqlVectorFromScalar(child)
+                | QueryExpr::PromqlScalarFromVector(child)
+                | QueryExpr::PromqlRelabel { child, .. }
+                | QueryExpr::PromqlSeriesSample { child, .. }
+                | QueryExpr::Dedup { child, .. } => visit(child, observed_at_unix_ms, rows),
+                _ => {}
+            }
+        }
+        let mut rows = Vec::new();
+        visit(expr, observed_at_unix_ms, &mut rows);
+        rows
+    }
+
+    #[test]
+    fn sum_rate_uses_summary_child_only_with_measured_composition_costs() {
+        let promql = "sum by (job) (rate(m[1m]))";
+        let mut with_evidence = request("topk-rate", promql);
+        with_evidence.hybrid_execution = true;
+        let root = Rc::new(
+            crate::query_parser::parse_query_expr_canonical(
+                promql,
+                with_evidence.queries[0].accuracy.clone(),
+            )
+            .unwrap(),
+        );
+        with_evidence.exact_composition_costs.insert(
+            "topk-rate".into(),
+            measured_exact_composition_rows(&root, 9_500),
+        );
+        select_workload_roots(
+            &mut with_evidence.queries,
+            vec![root],
+            &with_evidence.evidence,
+            &with_evidence.exact_composition_costs,
+        )
+        .unwrap();
+        let mut backend = environment(10_000);
+        backend.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        backend.collector_ids.clear();
+        let plan = PhysicalCompiler.compile(with_evidence, backend).unwrap();
+        assert!(
+            !plan.summary_catalog.materializations.is_empty(),
+            "measured exact-composition evidence must expose the rate child as a SummaryStore binding"
+        );
+    }
+
+    #[test]
+    fn sum_rate_without_composition_costs_does_not_invent_a_composition_cost() {
+        let promql = "sum by (job) (rate(m[1m]))";
+        let mut unavailable = request("topk-rate", promql);
+        unavailable.hybrid_execution = true;
+        let root = Rc::new(
+            crate::query_parser::parse_query_expr_canonical(
+                promql,
+                unavailable.queries[0].accuracy.clone(),
+            )
+            .unwrap(),
+        );
+        select_workload_roots(
+            &mut unavailable.queries,
+            vec![root],
+            &unavailable.evidence,
+            &unavailable.exact_composition_costs,
+        )
+        .unwrap();
+        let mut backend = environment(10_000);
+        backend.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        backend.collector_ids.clear();
+        let plan = PhysicalCompiler.compile(unavailable, backend).unwrap();
+        // Planner 54f can realize this particular shape directly as an exact
+        // counter readout plus a query-time reduce; it does not require an
+        // ExactComposition candidate. The absence of evidence must therefore
+        // leave that direct legal path intact rather than inventing a composed
+        // cost or forcing an exact fallback.
+        assert!(!plan.summary_catalog.materializations.is_empty());
+        let entry = plan
+            .query_plan
+            .entries
+            .values()
+            .find(|entry| entry.query_id == "topk-rate")
+            .unwrap();
+        assert!(entry
+            .nodes
+            .values()
+            .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExactReadout { .. })));
     }
 
     #[test]
@@ -3689,7 +3871,13 @@ mod tests {
                 )
             })
             .collect();
-        select_workload_roots(&mut workload.queries, roots, &workload.evidence).unwrap();
+        select_workload_roots(
+            &mut workload.queries,
+            roots,
+            &workload.evidence,
+            &workload.exact_composition_costs,
+        )
+        .unwrap();
         let bundle = PhysicalCompiler
             .compile(workload, environment(10000))
             .unwrap();
@@ -3710,7 +3898,13 @@ mod tests {
     #[test]
     fn shared_selection_rejects_incomplete_root_mapping() {
         let mut workload = request("q", "quantile_over_time(0.9, m[1m])");
-        assert!(select_workload_roots(&mut workload.queries, vec![], &workload.evidence).is_err());
+        assert!(select_workload_roots(
+            &mut workload.queries,
+            vec![],
+            &workload.evidence,
+            &workload.exact_composition_costs,
+        )
+        .is_err());
     }
 
     // Adding another readout adds recurring reads, not another update stream.
@@ -4520,6 +4714,7 @@ mod tests {
                 source_sample_interval_ms: None,
                 query_staleness_margin_ms: 0,
                 topk_evidence: HashMap::new(),
+                exact_composition_costs: HashMap::new(),
             },
             environment,
         };
