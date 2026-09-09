@@ -5,7 +5,9 @@
 
 use std::collections::BTreeMap;
 
-use asap_types::sds::{DataDescriptor, DataDescriptorId, SummaryDescriptor, SummaryDescriptorId};
+use asap_types::sds::{
+    DataDescriptor, DataDescriptorId, MaterializationId, SummaryDescriptor, SummaryDescriptorId,
+};
 use asap_types::PolicyFingerprint;
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +30,7 @@ pub struct SummaryCatalog {
     pub plan_version: u64,
     pub summary_descriptors: BTreeMap<SummaryDescriptorId, SummaryDescriptor>,
     pub data_descriptors: BTreeMap<DataDescriptorId, DataDescriptor>,
-    pub materializations: BTreeMap<PolicyFingerprint, MaterializationIdentity>,
+    pub materializations: BTreeMap<MaterializationId, MaterializationIdentity>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -78,7 +80,8 @@ impl SummaryCatalog {
             data_descriptors: BTreeMap::new(),
             materializations: BTreeMap::new(),
         };
-        for (materialization, summary, data) in entries {
+        for (fingerprint, summary, data) in entries {
+            let materialization = MaterializationId::from(fingerprint);
             summary
                 .validate()
                 .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
@@ -94,7 +97,7 @@ impl SummaryCatalog {
                 .is_some_and(|old| old != &binding)
             {
                 return Err(SummaryCatalogError::ConflictingMaterialization(
-                    materialization.0,
+                    materialization.as_u64(),
                 ));
             }
             catalog
@@ -141,7 +144,7 @@ impl SummaryCatalog {
                     .data_descriptors
                     .contains_key(&binding.data_descriptor_id)
             {
-                return Err(SummaryCatalogError::MissingDescriptor(id.0));
+                return Err(SummaryCatalogError::MissingDescriptor(id.as_u64()));
             }
         }
         Ok(())

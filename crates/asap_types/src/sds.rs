@@ -27,6 +27,30 @@ macro_rules! descriptor_id {
         }
     };
 }
+/// Semantic materialization reference. Wire-compatible with PolicyFingerprint,
+/// but distinct from descriptor IDs and runtime instance/SID identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MaterializationId(pub crate::PolicyFingerprint);
+impl MaterializationId {
+    pub fn fingerprint(self) -> crate::PolicyFingerprint {
+        self.0
+    }
+    pub fn as_u64(self) -> u64 {
+        self.0 .0
+    }
+}
+impl From<crate::PolicyFingerprint> for MaterializationId {
+    fn from(value: crate::PolicyFingerprint) -> Self {
+        Self(value)
+    }
+}
+impl From<MaterializationId> for crate::PolicyFingerprint {
+    fn from(value: MaterializationId) -> Self {
+        value.0
+    }
+}
+
 descriptor_id!(SummaryDescriptorId);
 descriptor_id!(DataDescriptorId);
 
@@ -528,4 +552,15 @@ mod tests {
         .unwrap();
         assert_ne!(first.id, second.id);
     }
+    #[test]
+    fn materialization_id_preserves_legacy_wire_identity() {
+        let fingerprint = crate::PolicyFingerprint(42);
+        let id = MaterializationId::from(fingerprint);
+        assert_eq!(id.fingerprint(), fingerprint);
+        assert_eq!(id.as_u64(), 42);
+        assert_eq!(crate::PolicyFingerprint::from(id), fingerprint);
+        assert_eq!(serde_json::to_value(id).unwrap(), serde_json::to_value(fingerprint).unwrap());
+        assert_eq!(serde_json::from_str::<MaterializationId>("42").unwrap(), id);
+    }
+
 }
