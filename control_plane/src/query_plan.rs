@@ -22,24 +22,7 @@ use asap_types::{sds::SummaryDefinitionId, PolicyFingerprint};
 pub struct QueryPlan {
     pub plan_id: u64,
     pub plan_version: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clickhouse_context: Option<ClickHousePlanningContext>,
     pub entries: BTreeMap<String, QueryPlanEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ClickHousePlanningContext {
-    pub tables: std::collections::HashMap<String, planner_types::pre_asap::Schema>,
-    pub accuracy: planner_types::types::AccuracyTarget,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct FixedEvaluationRange {
-    pub start_ms: u64,
-    pub end_ms: u64,
-    pub cumulative: bool,
 }
 
 impl QueryPlan {
@@ -47,41 +30,15 @@ impl QueryPlan {
         Self {
             plan_id: 0,
             plan_version: 0,
-            clickhouse_context: None,
             entries: BTreeMap::new(),
         }
     }
 
     pub fn lookup(&self, promql: &str) -> Result<&QueryPlanEntry, QueryPlanError> {
         let identity = canonical_promql(promql)?;
-        self.lookup_canonical(QueryLanguage::PromQl, &identity)
-    }
-
-    pub fn lookup_canonical(
-        &self,
-        language: QueryLanguage,
-        identity: &str,
-    ) -> Result<&QueryPlanEntry, QueryPlanError> {
-        let key = Self::catalog_key(language, identity);
         self.entries
-            .get(&key)
-            .filter(|entry| entry.language == language)
-            .ok_or_else(|| QueryPlanError::QueryNotPlanned(identity.into()))
-    }
-
-    pub fn catalog_key(language: QueryLanguage, identity: &str) -> String {
-        match language {
-            QueryLanguage::PromQl => identity.to_owned(),
-            QueryLanguage::MetricsQl => format!("metricsql:{identity}"),
-            QueryLanguage::ClickHouseSql => format!("clickhouse:{identity}"),
-        }
-    }
-
-    pub fn lookup_clickhouse(
-        &self,
-        canonical_sql: &str,
-    ) -> Result<&QueryPlanEntry, QueryPlanError> {
-        self.lookup_canonical(QueryLanguage::ClickHouseSql, canonical_sql)
+            .get(&identity)
+            .ok_or(QueryPlanError::QueryNotPlanned(identity))
     }
 
     /// Validate semantic bindings against the authoritative snapshot before use.
@@ -164,53 +121,16 @@ impl QueryPlan {
             ));
         }
         for (identity, entry) in &self.entries {
-            let expected = Self::catalog_key(entry.language, &entry.canonical_query);
-            if identity != &expected {
+            if identity != &entry.canonical_promql {
                 return Err(QueryPlanError::Invalid(format!(
                     "query map key `{identity}` differs from entry identity `{}`",
-                    entry.canonical_query
+                    entry.canonical_promql
                 )));
-            }
-            match entry.language {
-                QueryLanguage::PromQl | QueryLanguage::MetricsQl
-                    if entry.fixed_evaluation.is_some() =>
-                {
-                    return Err(QueryPlanError::Invalid(
-                        "PromQL query entry carries a ClickHouse fixed evaluation range".into(),
-                    ));
-                }
-                QueryLanguage::ClickHouseSql => {
-                    if self.clickhouse_context.is_none() {
-                        return Err(QueryPlanError::Invalid(
-                            "ClickHouse query entry has no planning context".into(),
-                        ));
-                    }
-                    let Some(range) = entry.fixed_evaluation else {
-                        return Err(QueryPlanError::Invalid(
-                            "ClickHouse query entry has no fixed evaluation range".into(),
-                        ));
-                    };
-                    if range.end_ms <= range.start_ms {
-                        return Err(QueryPlanError::Invalid(
-                            "ClickHouse query entry has an empty evaluation range".into(),
-                        ));
-                    }
-                }
-                QueryLanguage::PromQl | QueryLanguage::MetricsQl => {}
             }
             entry.validate(available)?;
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum QueryLanguage {
-    #[default]
-    PromQl,
-    MetricsQl,
-    ClickHouseSql,
 }
 
 /// Stable identity inside one query entry. Edges are IDs so common
@@ -222,59 +142,61 @@ pub struct QueryNodeId(pub u64);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct QueryPlanEntry {
-    #[serde(default)]
-    pub language: QueryLanguage,
     pub query_id: String,
-    #[serde(alias = "canonical_promql")]
-    pub canonical_query: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fixed_evaluation: Option<FixedEvaluationRange>,
+    pub canonical_promql: String,
     pub root: QueryNodeId,
     pub nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
     pub instant: InstantExecution,
     pub fallback: FallbackPolicy,
 }
 
-fn topological_order(
-    root: QueryNodeId,
-    nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
-) -> Result<Vec<QueryNodeId>, QueryPlanError> {
-    fn visit(
-        id: QueryNodeId,
-        nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
-        visiting: &mut BTreeSet<QueryNodeId>,
-        visited: &mut BTreeSet<QueryNodeId>,
-        out: &mut Vec<QueryNodeId>,
-    ) -> Result<(), QueryPlanError> {
-        if visited.contains(&id) {
-            return Ok(());
+/// Language-neutral executable projection of a compiled physical query DAG.
+///
+/// This is deliberately separate from [`QueryPlanEntry`], whose serialized
+/// `canonical_promql` identity remains part of the stable PromQL contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableQueryPlan {
+    pub root: QueryNodeId,
+    pub nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
+    pub instant: InstantExecution,
+    pub fallback: FallbackPolicy,
+}
+
+impl QueryPlanEntry {
+    pub fn executable(&self) -> ExecutableQueryPlan {
+        ExecutableQueryPlan {
+            root: self.root,
+            nodes: self.nodes.clone(),
+            instant: self.instant.clone(),
+            fallback: self.fallback.clone(),
         }
-        if !visiting.insert(id) {
-            return Err(QueryPlanError::Invalid(format!(
-                "cycle detected at query node {}",
-                id.0
-            )));
-        }
-        let node = nodes
-            .get(&id)
-            .ok_or_else(|| QueryPlanError::Invalid(format!("missing query node {}", id.0)))?;
-        for input in node.inputs() {
-            visit(*input, nodes, visiting, visited, out)?;
-        }
-        visiting.remove(&id);
-        visited.insert(id);
-        out.push(id);
-        Ok(())
     }
-    let mut out = Vec::with_capacity(nodes.len());
-    visit(
-        root,
-        nodes,
-        &mut BTreeSet::new(),
-        &mut BTreeSet::new(),
-        &mut out,
-    )?;
-    Ok(out)
+}
+
+impl ExecutableQueryPlan {
+    pub fn materialization_bindings(&self) -> Vec<&MaterializationBinding> {
+        self.nodes
+            .values()
+            .filter_map(|node| match node {
+                QueryPlanNode::ReadMaterialization { binding } => Some(binding),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Internal compatibility view for the existing executor. The supplied
+    /// identity is never serialized into the PromQL plan catalog.
+    pub fn execution_view(&self, query_id: String, source: String) -> QueryPlanEntry {
+        QueryPlanEntry {
+            query_id,
+            canonical_promql: source,
+            root: self.root,
+            nodes: self.nodes.clone(),
+            instant: self.instant.clone(),
+            fallback: self.fallback.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -299,20 +221,9 @@ impl QueryPlanEntry {
             .collect()
     }
 
-    pub fn topological_order(&self) -> Result<Vec<QueryNodeId>, QueryPlanError> {
-        topological_order(self.root, &self.nodes)
-    }
-
-    pub fn topological_order_from(
-        &self,
-        root: QueryNodeId,
-    ) -> Result<Vec<QueryNodeId>, QueryPlanError> {
-        topological_order(root, &self.nodes)
-    }
-
     pub fn compile_bound<F>(
         query_id: String,
-        canonical_query: String,
+        canonical_promql: String,
         root: &Rc<SummaryNode>,
         instant: InstantExecution,
         fallback: FallbackPolicy,
@@ -330,50 +241,11 @@ impl QueryPlanEntry {
             seen: BTreeMap::new(),
             bind: &mut bind,
             logical_source: None,
-            preserve_relational: false,
         };
         let root = compiler.lower(root)?;
         Ok(Self {
-            language: QueryLanguage::PromQl,
             query_id,
-            canonical_query,
-            fixed_evaluation: None,
-            root,
-            nodes: compiler.nodes,
-            instant,
-            fallback,
-        })
-    }
-
-    pub fn compile_bound_relational<F>(
-        query_id: String,
-        canonical_query: String,
-        root: &Rc<SummaryNode>,
-        fixed_evaluation: FixedEvaluationRange,
-        instant: InstantExecution,
-        fallback: FallbackPolicy,
-        mut bind: F,
-    ) -> Result<Self, QueryPlanError>
-    where
-        F: FnMut(
-            &SummaryNode,
-            &SummaryFamilyType,
-        ) -> Result<MaterializationBinding, QueryPlanError>,
-    {
-        let mut compiler = DagCompiler {
-            next_id: 0,
-            nodes: BTreeMap::new(),
-            seen: BTreeMap::new(),
-            bind: &mut bind,
-            logical_source: None,
-            preserve_relational: true,
-        };
-        let root = compiler.lower(root)?;
-        Ok(Self {
-            language: QueryLanguage::ClickHouseSql,
-            query_id,
-            canonical_query,
-            fixed_evaluation: Some(fixed_evaluation),
+            canonical_promql,
             root,
             nodes: compiler.nodes,
             instant,
@@ -385,7 +257,7 @@ impl QueryPlanEntry {
     /// This is a distinct physical alternative; native execution remains available.
     pub fn compile_bound_composable<F>(
         query_id: String,
-        canonical_query: String,
+        canonical_promql: String,
         root: &Rc<SummaryNode>,
         instant: InstantExecution,
         fallback: FallbackPolicy,
@@ -402,15 +274,12 @@ impl QueryPlanEntry {
             nodes: BTreeMap::new(),
             seen: BTreeMap::new(),
             bind: &mut bind,
-            logical_source: Some(canonical_query.clone()),
-            preserve_relational: false,
+            logical_source: Some(canonical_promql.clone()),
         };
         let root = compiler.lower(root)?;
         let mut entry = Self {
-            language: QueryLanguage::PromQl,
             query_id,
-            canonical_query,
-            fixed_evaluation: None,
+            canonical_promql,
             root,
             nodes: compiler.nodes,
             instant,
@@ -490,6 +359,46 @@ impl QueryPlanEntry {
         }
         Ok(())
     }
+
+    /// Return reachable nodes with every input before its consumer.
+    pub fn topological_order(&self) -> Result<Vec<QueryNodeId>, QueryPlanError> {
+        fn visit(
+            id: QueryNodeId,
+            nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
+            visiting: &mut BTreeSet<QueryNodeId>,
+            visited: &mut BTreeSet<QueryNodeId>,
+            out: &mut Vec<QueryNodeId>,
+        ) -> Result<(), QueryPlanError> {
+            if visited.contains(&id) {
+                return Ok(());
+            }
+            if !visiting.insert(id) {
+                return Err(QueryPlanError::Invalid(format!(
+                    "cycle detected at query node {}",
+                    id.0
+                )));
+            }
+            let node = nodes
+                .get(&id)
+                .ok_or_else(|| QueryPlanError::Invalid(format!("missing query node {}", id.0)))?;
+            for input in node.inputs() {
+                visit(*input, nodes, visiting, visited, out)?;
+            }
+            visiting.remove(&id);
+            visited.insert(id);
+            out.push(id);
+            Ok(())
+        }
+        let mut out = Vec::with_capacity(self.nodes.len());
+        visit(
+            self.root,
+            &self.nodes,
+            &mut BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut out,
+        )?;
+        Ok(out)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -532,14 +441,6 @@ pub enum PhysicalGrouping {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
-    Relational {
-        input: QueryNodeId,
-        /// Serialized planner-owned operation. Keeping the wire form here makes
-        /// the published catalog Send + Sync even though the planner AST uses Rc.
-        operation: serde_json::Value,
-        input_schema: planner_types::post_asap::SummarySchema,
-        output_schema: planner_types::post_asap::SummarySchema,
-    },
     Logical {
         operator: logical::LogicalOperator,
         inputs: Vec<QueryNodeId>,
@@ -591,7 +492,6 @@ impl QueryPlanNode {
             }
             Self::Binary { inputs, .. } => inputs,
             Self::ReduceSum { input, .. }
-            | Self::Relational { input, .. }
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
             Self::SummaryMerge { inputs } | Self::Logical { inputs, .. } => inputs,
@@ -656,7 +556,6 @@ struct DagCompiler<'a, F> {
     seen: BTreeMap<usize, QueryNodeId>,
     bind: &'a mut F,
     logical_source: Option<String>,
-    preserve_relational: bool,
 }
 
 impl<F> DagCompiler<'_, F>
@@ -695,8 +594,7 @@ where
                 }
                 QueryPlanNode::SummaryEstimate { input, .. }
                 | QueryPlanNode::ExactReadout { input, .. }
-                | QueryPlanNode::ReduceSum { input, .. }
-                | QueryPlanNode::Relational { input, .. } => *input = remap[input],
+                | QueryPlanNode::ReduceSum { input, .. } => *input = remap[input],
                 QueryPlanNode::Scalar { .. }
                 | QueryPlanNode::ReadMaterialization { .. }
                 | QueryPlanNode::ExactFallback { .. } => {}
@@ -747,28 +645,6 @@ where
         }
 
         let physical = match &node.expr {
-            SummaryExpr::ValueOperation {
-                child, operation, ..
-            } if self.preserve_relational
-                && matches!(
-                    operation,
-                    planner_types::post_asap::ValueOperation::Project { .. }
-                        | planner_types::post_asap::ValueOperation::Filter { .. }
-                        | planner_types::post_asap::ValueOperation::Sort { .. }
-                        | planner_types::post_asap::ValueOperation::Limit { .. }
-                ) =>
-            {
-                QueryPlanNode::Relational {
-                    input: self.lower(child)?,
-                    operation: serde_json::to_value(operation).map_err(|error| {
-                        QueryPlanError::UnsupportedNode(format!(
-                            "cannot serialize relational operation: {error}"
-                        ))
-                    })?,
-                    input_schema: child.schema.clone(),
-                    output_schema: node.schema.clone(),
-                }
-            }
             SummaryExpr::ValueOperation {
                 child,
                 operation:
@@ -929,60 +805,8 @@ where
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                let candidate_input = self.lower(candidates)?;
-                let value_input = if let Some(original) = &self.logical_source {
-                    let parsed = promql_parser::parser::parse(original)
-                        .map_err(|error| QueryPlanError::Invalid(error.to_string()))?;
-                    let promql_parser::parser::Expr::Aggregate(aggregate) = parsed else {
-                        return Err(QueryPlanError::Invalid(
-                            "CandidateTopK requires a top-level PromQL aggregate".into(),
-                        ));
-                    };
-                    if aggregate.op.to_string() != "topk" {
-                        return Err(QueryPlanError::Invalid(
-                            "CandidateTopK requires a topk source expression".into(),
-                        ));
-                    }
-                    fn item_label(node: &SummaryNode) -> Option<String> {
-                        match &node.expr {
-                            SummaryExpr::SummaryEstimate { summary_input, .. } => {
-                                item_label(summary_input)
-                            }
-                            SummaryExpr::SummaryAgg { input, .. } => match &input.item {
-                                Some(planner_types::post_asap::SummaryInputExpr::Column(
-                                    planner_types::pre_asap::ColumnRef::Named(label),
-                                )) => Some(label.clone()),
-                                Some(planner_types::post_asap::SummaryInputExpr::Column(
-                                    planner_types::pre_asap::ColumnRef::Qualified { name, .. },
-                                )) => Some(name.clone()),
-                                _ => None,
-                            },
-                            _ => None,
-                        }
-                    }
-                    let item_label = item_label(candidates).ok_or_else(|| {
-                        QueryPlanError::Invalid(
-                            "CandidateTopK membership has no named item label".into(),
-                        )
-                    })?;
-                    let value_id = QueryNodeId(self.next_id);
-                    self.next_id += 1;
-                    self.nodes.insert(
-                        value_id,
-                        QueryPlanNode::Logical {
-                            operator: logical::LogicalOperator::CandidateExactSubquery {
-                                query: aggregate.expr.to_string(),
-                                item_label,
-                            },
-                            inputs: vec![candidate_input],
-                        },
-                    );
-                    value_id
-                } else {
-                    self.lower(values)?
-                };
                 QueryPlanNode::CandidateTopK {
-                    inputs: [candidate_input, value_input],
+                    inputs: [self.lower(candidates)?, self.lower(values)?],
                     k: u64::try_from(*k).map_err(|_| {
                         QueryPlanError::Invalid("CandidateTopK k exceeds u64".into())
                     })?,
@@ -1354,12 +1178,10 @@ mod tests {
     }
 
     #[test]
-    fn language_tag_preserves_query_entry_serde() {
+    fn executable_extraction_preserves_promql_entry_serde() {
         let entry = QueryPlanEntry {
-            language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
-            canonical_query: canonical_promql("up").unwrap(),
-            fixed_evaluation: None,
+            canonical_promql: canonical_promql("up").unwrap(),
             root: QueryNodeId(0),
             nodes: BTreeMap::from([(
                 QueryNodeId(0),
@@ -1375,70 +1197,10 @@ mod tests {
             fallback: FallbackPolicy::ExactBackend,
         };
         let before = serde_json::to_value(&entry).unwrap();
+        let _payload = entry.executable();
         assert_eq!(before, serde_json::to_value(&entry).unwrap());
-        assert!(before.get("canonical_query").is_some());
+        assert!(before.get("canonical_promql").is_some());
         assert!(before.get("executable").is_none());
-    }
-
-    #[test]
-    fn language_catalog_keys_keep_equal_query_text_distinct() {
-        let base = QueryPlanEntry {
-            language: QueryLanguage::PromQl,
-            query_id: "prom".into(),
-            canonical_query: "shared".into(),
-            fixed_evaluation: None,
-            root: QueryNodeId(0),
-            nodes: BTreeMap::from([(
-                QueryNodeId(0),
-                QueryPlanNode::ExactFallback {
-                    reason: "fixture".into(),
-                },
-            )]),
-            instant: InstantExecution {
-                lookback_ms: 1,
-                full_history: false,
-                cumulative_readout: false,
-            },
-            fallback: FallbackPolicy::ExactBackend,
-        };
-        let mut metricsql = base.clone();
-        metricsql.language = QueryLanguage::MetricsQl;
-        metricsql.query_id = "metrics".into();
-        let mut clickhouse = base.clone();
-        clickhouse.language = QueryLanguage::ClickHouseSql;
-        clickhouse.query_id = "sql".into();
-        clickhouse.fixed_evaluation = Some(FixedEvaluationRange {
-            start_ms: 1,
-            end_ms: 2,
-            cumulative: true,
-        });
-        let plan = QueryPlan {
-            plan_id: 0,
-            plan_version: 0,
-            clickhouse_context: Some(ClickHousePlanningContext {
-                tables: Default::default(),
-                accuracy: planner_types::types::AccuracyTarget::Exact,
-            }),
-            entries: [base, metricsql, clickhouse]
-                .into_iter()
-                .map(|entry| (QueryPlan::catalog_key(entry.language, "shared"), entry))
-                .collect(),
-        };
-
-        assert_eq!(plan.entries.len(), 3);
-        assert_eq!(
-            plan.lookup_canonical(QueryLanguage::PromQl, "shared")
-                .unwrap()
-                .query_id,
-            "prom"
-        );
-        assert_eq!(
-            plan.lookup_canonical(QueryLanguage::MetricsQl, "shared")
-                .unwrap()
-                .query_id,
-            "metrics"
-        );
-        assert_eq!(plan.lookup_clickhouse("shared").unwrap().query_id, "sql");
     }
 
     #[test]
@@ -1451,10 +1213,8 @@ mod tests {
             },
         );
         let entry = QueryPlanEntry {
-            language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
-            canonical_query: "up".into(),
-            fixed_evaluation: None,
+            canonical_promql: "up".into(),
             root: QueryNodeId(0),
             nodes,
             instant: InstantExecution {
@@ -1477,10 +1237,8 @@ mod tests {
             reason: "prepared".into(),
         };
         let entry = QueryPlanEntry {
-            language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
-            canonical_query: "topk(2, rate(m[5m]))".into(),
-            fixed_evaluation: None,
+            canonical_promql: "topk(2, rate(m[5m]))".into(),
             root: QueryNodeId(2),
             nodes: BTreeMap::from([
                 (QueryNodeId(0), leaf.clone()),
@@ -1548,10 +1306,8 @@ mod catalog_binding_tests {
         config.pane_origin_ms = Some(0);
         let catalog = SummaryCatalog::from_materializations(7, 2, &[config.clone()]).unwrap();
         let entry = QueryPlanEntry {
-            language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
-            canonical_query: "sum_over_time(m[1m])".into(),
-            fixed_evaluation: None,
+            canonical_promql: "sum_over_time(m[1m])".into(),
             root: QueryNodeId(1),
             nodes: BTreeMap::from([(
                 QueryNodeId(1),
@@ -1577,8 +1333,7 @@ mod catalog_binding_tests {
             QueryPlan {
                 plan_id: 7,
                 plan_version: 2,
-                clickhouse_context: None,
-                entries: BTreeMap::from([(entry.canonical_query.clone(), entry)]),
+                entries: BTreeMap::from([(entry.canonical_promql.clone(), entry)]),
             },
             catalog,
         )
@@ -1603,17 +1358,9 @@ mod catalog_binding_tests {
     #[test]
     fn catalog_binding_round_trip_preserves_pane_and_readout_windows() {
         let (plan, catalog) = fixture();
-        let wire = serde_json::to_vec(&plan).unwrap();
-        let mut decoded: QueryPlan = serde_json::from_slice(&wire).unwrap();
+        let mut decoded: QueryPlan =
+            serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
         decoded.validate_against_catalog(&catalog).unwrap();
-        assert_eq!(
-            decoded
-                .lookup("sum_over_time(m[1m])")
-                .unwrap()
-                .canonical_query,
-            "sum_over_time(m[1m])"
-        );
-        assert!(String::from_utf8(wire).unwrap().contains("canonical_query"));
         assert_eq!(binding(&mut decoded).window_ms, 10_000);
         assert_eq!(binding(&mut decoded).readout_lookback_ms, Some(60_000));
     }
