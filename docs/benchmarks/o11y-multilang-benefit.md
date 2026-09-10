@@ -30,8 +30,6 @@ The checked-in evidence is one fresh trial with three repetitions and 27 queries
 
 The parser/canonical stage accepts 12/27 MetricsQL expressions, the early planner accepts 7/27, and the production compiler/publication validator accepts 2/27. The SQL acceleration frontend accepts 0/27 of the exact ClickHouse dialect mappings. Every row records its observed terminal fallback stage. Although q03 and q16 pass offline publication validation, the benchmark physical plan deliberately contains no corpus sidecars, so their measured requests terminate at a publication catalog miss. Binder, validator, and executor are not reached in this fallback-only experiment.
 
-A supplementary synthetic test runs ClickHouseReader → BackfillService → SummaryStore → published shared DAG with Filter, Project, global Sort, and Limit. It passed correctness in three fresh ClickHouse runs. It invokes the accelerator directly once per run, so it is lifecycle correctness evidence rather than a latency measurement and is outside the self-contained fallback result.
-
 ## Evidence files
 
 - `stage-coverage.json`: per-query parser, planner, compiler, publication, terminal, adapter, and fallback result.
@@ -42,4 +40,4 @@ A supplementary synthetic test runs ClickHouseReader → BackfillService → Sum
 
 ## Limitations
 
-This is one fresh trial and does not estimate variance across trials. CPU is process scheduler ticks rather than normalized CPU time. Container writable-layer size is an operational proxy for VM and ClickHouse storage. The production corpus has no warm executions, so it cannot quantify acceleration benefit. The synthetic warm check has one query per process and cannot fill that gap. Native-histogram exponential interpolation is outside q21, which consumes classic `_bucket` series.
+This is one fresh trial and does not estimate variance across trials. CPU is process scheduler ticks rather than normalized CPU time. Container writable-layer size is an operational proxy for VM and ClickHouse storage. The production corpus has no warm executions, so it cannot quantify acceleration benefit. Native-histogram exponential interpolation is outside q21, which consumes classic `_bucket` series.
