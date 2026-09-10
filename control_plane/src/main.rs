@@ -822,14 +822,15 @@ async fn handle_compile_and_publish_clickhouse_plan(
         )
             .into_response();
     };
+    let publication = physical::publication::PhysicalPlanPublication {
+        summary_catalog: bundle.sds,
+        precompute_plan: bundle.precompute_plan,
+        collector_plans: Vec::new(),
+        transmission_plan: bundle.transmission_plan,
+        query_plan: bundle.query_plan,
+    };
     if let Err(error) = client
-        .post_physical_plan_typed(
-            &bundle.precompute_plan,
-            &bundle.transmission_plan,
-            &bundle.query_plan,
-            None,
-            &[],
-        )
+        .post_catalog_plan_typed(&publication, None, &[])
         .await
     {
         return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
