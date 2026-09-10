@@ -426,6 +426,9 @@ impl Worker {
             .get("promql_right_closed")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        // Pane origins remain epoch-aligned across batches. Right-closed
+        // semantics shift boundary samples only; changing the origin from a
+        // batch's first sample would make published query windows unreadable.
         let pane_timestamp = |ts: i64| {
             if right_closed {
                 ts.saturating_sub(1)

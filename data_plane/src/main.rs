@@ -730,6 +730,11 @@ async fn main() -> Result<()> {
             ),
         }
     });
+    if let Some(catalog) = initial_active_plan.summary_catalog.as_ref() {
+        sketch_index
+            .install_summary_catalog(Arc::clone(catalog))
+            .map_err(|error| format!("startup SummaryCatalog install failed: {error}"))?;
+    }
     let active_physical_plan =
         data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(initial_active_plan);
     let hot_reload_config =
