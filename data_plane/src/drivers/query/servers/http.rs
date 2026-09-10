@@ -915,8 +915,8 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
                     if !matches!(backend, StorageBackend::SketchStore)
                         && matches!(
                             shape,
-                            crate::storage_engines::types::QueryShape::RatePostHoc
-                                | crate::storage_engines::types::QueryShape::Topk
+                            crate::storage_engines::types::QueryOperatorShape::RatePostHoc
+                                | crate::storage_engines::types::QueryOperatorShape::Topk
                         )
                         && metric_has_exact_agg_sum_sid(&state.sketch_index, &metric_name)
                     {
@@ -956,7 +956,10 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
                     // for `topk(K, sum by (..) (rate(..)))` shapes, already
                     // pulled back to `SketchStore` by the override above).
                     if matches!(backend, StorageBackend::SketchStore)
-                        && matches!(shape, crate::storage_engines::types::QueryShape::Topk)
+                        && matches!(
+                            shape,
+                            crate::storage_engines::types::QueryOperatorShape::Topk
+                        )
                         && !metric_has_frequency_topk_sid(&state.sketch_index, &metric_name)
                         && !metric_has_exact_agg_sum_sid(&state.sketch_index, &metric_name)
                     {
@@ -973,7 +976,7 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
 
                     // ── Archive override for sum_over_time over a counter ──
                     // `sum_over_time(metric[r])` and instant `sum by (..)
-                    // (metric)` BOTH classify as `QueryShape::Sum`, but only
+                    // (metric)` BOTH classify as `QueryOperatorShape::Sum`, but only
                     // the range form is the counter-delta case the warm tier
                     // cannot serve: the ExactAgg(Sum) sids store per-window
                     // counter *deltas*, and `sum_over_time` wants the
@@ -990,7 +993,10 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
                     // GorillaObjectStore] → Thanos). Instant `sum by (..)` is
                     // left on `SketchStore` (it is served warm).
                     if matches!(backend, StorageBackend::SketchStore)
-                        && matches!(shape, crate::storage_engines::types::QueryShape::Sum)
+                        && matches!(
+                            shape,
+                            crate::storage_engines::types::QueryOperatorShape::Sum
+                        )
                         && query_is_sum_over_time(&expr)
                         && metric_has_exact_agg_sum_sid(&state.sketch_index, &metric_name)
                     {
@@ -1033,7 +1039,7 @@ fn resolve_metric_storage(state: &AppState, query: &str, tenant: &str) -> Storag
 
 /// True when the query's effective shape is a `sum_over_time(...)` range
 /// aggregation, as opposed to an instant `sum by (...)`. Both classify as
-/// [`QueryShape::Sum`], so [`resolve_metric_storage`] disambiguates on the
+/// [`QueryOperatorShape::Sum`], so [`resolve_metric_storage`] disambiguates on the
 /// AST: only the range form is the counter-delta case the warm
 /// ExactAgg(Sum) tier cannot reconstruct (issue #301), so only it is
 /// re-routed to the archive. Walks through the wrapping aggregate / paren /
@@ -4605,7 +4611,9 @@ aggregations:
 
     #[tokio::test]
     async fn http_v7_dual_routing_count_lands_on_archive() {
-        use crate::storage_engines::types::{BackendStorageRouting, QueryShape, RoutingTarget};
+        use crate::storage_engines::types::{
+            BackendStorageRouting, QueryOperatorShape, RoutingTarget,
+        };
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
@@ -4613,7 +4621,11 @@ aggregations:
                 RoutingTarget::always(StorageBackend::SketchStore),
                 RoutingTarget::for_shapes(
                     StorageBackend::GorillaObjectStore,
-                    vec![QueryShape::Count, QueryShape::Topk, QueryShape::RatePostHoc],
+                    vec![
+                        QueryOperatorShape::Count,
+                        QueryOperatorShape::Topk,
+                        QueryOperatorShape::RatePostHoc,
+                    ],
                 ),
             ],
         );
@@ -4651,7 +4663,9 @@ aggregations:
 
     #[tokio::test]
     async fn http_v7_dual_routing_quantile_stays_on_asap_tier() {
-        use crate::storage_engines::types::{BackendStorageRouting, QueryShape, RoutingTarget};
+        use crate::storage_engines::types::{
+            BackendStorageRouting, QueryOperatorShape, RoutingTarget,
+        };
         let mut metrics = std::collections::HashMap::new();
         metrics.insert(
             "http_requests_total".to_string(),
@@ -4659,7 +4673,11 @@ aggregations:
                 RoutingTarget::always(StorageBackend::SketchStore),
                 RoutingTarget::for_shapes(
                     StorageBackend::GorillaObjectStore,
-                    vec![QueryShape::Count, QueryShape::Topk, QueryShape::RatePostHoc],
+                    vec![
+                        QueryOperatorShape::Count,
+                        QueryOperatorShape::Topk,
+                        QueryOperatorShape::RatePostHoc,
+                    ],
                 ),
             ],
         );
@@ -4774,7 +4792,9 @@ aggregations:
     /// shape-classifier and dispatches to the explicitly named engine.
     #[tokio::test]
     async fn http_engine_override_header_routes_to_named_engine() {
-        use crate::storage_engines::types::{BackendStorageRouting, QueryShape, RoutingTarget};
+        use crate::storage_engines::types::{
+            BackendStorageRouting, QueryOperatorShape, RoutingTarget,
+        };
 
         let (gorilla, gorilla_calls) =
             MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
@@ -4785,10 +4805,13 @@ aggregations:
         metrics.insert(
             "metric_warm".to_string(),
             vec![
-                RoutingTarget::for_shapes(StorageBackend::SketchStore, vec![QueryShape::Quantile]),
+                RoutingTarget::for_shapes(
+                    StorageBackend::SketchStore,
+                    vec![QueryOperatorShape::Quantile],
+                ),
                 RoutingTarget::for_shapes(
                     StorageBackend::GorillaObjectStore,
-                    vec![QueryShape::Count],
+                    vec![QueryOperatorShape::Count],
                 ),
             ],
         );
@@ -4829,7 +4852,9 @@ aggregations:
     /// backwards-compatible.
     #[tokio::test]
     async fn http_engine_override_missing_uses_default_routing() {
-        use crate::storage_engines::types::{BackendStorageRouting, QueryShape, RoutingTarget};
+        use crate::storage_engines::types::{
+            BackendStorageRouting, QueryOperatorShape, RoutingTarget,
+        };
 
         let (gorilla, gorilla_calls) =
             MockQueryEngine::new(StorageBackend::GorillaObjectStore, MockOutcome::OkEmpty);
@@ -4838,10 +4863,13 @@ aggregations:
         metrics.insert(
             "metric_warm".to_string(),
             vec![
-                RoutingTarget::for_shapes(StorageBackend::SketchStore, vec![QueryShape::Quantile]),
+                RoutingTarget::for_shapes(
+                    StorageBackend::SketchStore,
+                    vec![QueryOperatorShape::Quantile],
+                ),
                 RoutingTarget::for_shapes(
                     StorageBackend::GorillaObjectStore,
-                    vec![QueryShape::Count],
+                    vec![QueryOperatorShape::Count],
                 ),
             ],
         );
@@ -5283,14 +5311,14 @@ aggregations:
         assert_eq!(
             snap.lookup_with_shape(
                 "http_requests_total",
-                crate::storage_engines::types::QueryShape::Count,
+                crate::storage_engines::types::QueryOperatorShape::Count,
             ),
             StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
             snap.lookup_with_shape(
                 "http_requests_total",
-                crate::storage_engines::types::QueryShape::Quantile,
+                crate::storage_engines::types::QueryOperatorShape::Quantile,
             ),
             StorageBackend::SketchStore,
         );
@@ -6010,19 +6038,7 @@ async fn handle_post_streaming_config(
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PhysicalPlanInstallRequest {
-    pub summary_catalog: control_plane::physical::summary_catalog::SummaryCatalog,
-    #[serde(default)]
-    pub collector_plans: Vec<control_plane::physical::compiler::CollectorPlan>,
-    pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
-    pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
-    pub query_plan: control_plane::query_plan::QueryPlan,
-    pub storage_routing: Option<serde_json::Value>,
-    #[serde(default)]
-    pub adaptation_evidence: Vec<control_plane::physical::compiler::RuntimeAdaptationEvidence>,
-}
+pub use control_plane::physical::publication::PhysicalPlanInstallRequest;
 
 /// Decode and cross-validate every backend view before it can become visible.
 /// Used by both startup artifact loading and the staged HTTP install path.
