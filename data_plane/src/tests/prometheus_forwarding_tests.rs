@@ -73,10 +73,7 @@ async fn setup_test_server(prometheus_port: u16) -> (HttpServer, u16) {
     };
 
     let streaming_config = Arc::new(StreamingConfig::default());
-    let query_engine = Arc::new(ASAPQueryEngine::new(
-        streaming_config.clone(),
-        15000, // 15s scrape interval
-    ));
+    let query_engine = Arc::new(ASAPQueryEngine::new(15000));
 
     let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let server = HttpServer::new(config, query_engine, idx);
@@ -158,10 +155,7 @@ async fn test_forwarding_disabled() {
     };
 
     let streaming_config = Arc::new(StreamingConfig::default());
-    let query_engine = Arc::new(ASAPQueryEngine::new(
-        streaming_config.clone(),
-        15000, // 15s scrape interval
-    ));
+    let query_engine = Arc::new(ASAPQueryEngine::new(15000));
 
     let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let server = HttpServer::new(config, query_engine, idx);
@@ -205,10 +199,7 @@ async fn test_prometheus_server_unreachable() {
     };
 
     let streaming_config = Arc::new(StreamingConfig::default());
-    let query_engine = Arc::new(ASAPQueryEngine::new(
-        streaming_config.clone(),
-        15000, // 15s scrape interval
-    ));
+    let query_engine = Arc::new(ASAPQueryEngine::new(15000));
 
     let idx = std::sync::Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
     let server = HttpServer::new(config, query_engine, idx);

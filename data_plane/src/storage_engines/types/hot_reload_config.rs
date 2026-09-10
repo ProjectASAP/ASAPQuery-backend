@@ -7,16 +7,13 @@
 //!
 //! ## How the pieces see the swap
 //!
-//! All three readers share clones of the same `HotReloadStreamingConfig`
+//! Runtime bootstrap readers share clones of the same `HotReloadStreamingConfig`
 //! handle (internally `Arc<ArcSwap<StreamingConfig>>`), so they
 //! observe the swap at the same instant:
 //!
 //! * **Writes** — atomic via `ArcSwap::store`. Lock-free; readers that
 //!   hold a stale snapshot finish their work with the old config and
 //!   drop it when the last reference goes out of scope.
-//! * **ASAPQueryEngine** — re-snapshots per query
-//!   (`streaming_config_snapshot()`). New aggregations are
-//!   query-matchable immediately after the swap lands.
 //! * **IngestState** — re-snapshots per ingest batch
 //!   (`config_snapshot()`). New aggregations start receiving data on
 //!   the next batch.
@@ -24,6 +21,9 @@
 //!   `get_or_create_group_state()`. No message passing, no polling;
 //!   new agg_ids are visible the moment a worker tries to create a
 //!   `GroupState` for them.
+//!
+//! Query execution obtains its generation-consistent runtime configuration,
+//! query plan, and catalog from `ActivePhysicalPlan` instead of this handle.
 //!
 //! ## Config-upgrade contract for the control plane
 //!

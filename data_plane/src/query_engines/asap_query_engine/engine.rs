@@ -1,4 +1,3 @@
-use crate::storage_engines::types::StreamingConfig;
 use std::sync::Arc;
 
 use asap_types::query_requirements::QueryRequirements;
@@ -78,16 +77,6 @@ pub struct ASAPQueryEngine {
     // Phase 5 M2.3.6g — `store: Arc<dyn Store>` field retired. The
     // engine reads precomputes exclusively from `SketchStore` after
     // M2.3.6f. Constructor signatures no longer take a `store` arg.
-    /// Hot-reloadable `StreamingConfig` handle. Internal read sites
-    /// call `Self::streaming_config_snapshot()` which re-snapshots
-    /// from this handle, so runtime swaps pushed through PR #10's
-    /// `POST /api/v1/streaming-config` endpoint take effect on the
-    /// **next** query without restarting the binary (PR E phase 2).
-    /// Clones of `HotReloadStreamingConfig` share the same
-    /// underlying `ArcSwap`, so when `main.rs` hands the same handle
-    /// to both `ASAPQueryEngine` and `HttpServer::with_hot_reload_config`,
-    /// a POST is immediately visible to the next query.
-    streaming_config_source: crate::storage_engines::types::HotReloadStreamingConfig,
     #[allow(dead_code)]
     prometheus_scrape_interval: u64,
     /// Optional `ControlPlaneClient` used to notify the control plane
@@ -182,29 +171,10 @@ impl ASAPQueryEngine {
             .await
     }
 
-    /// Construct a `ASAPQueryEngine` with a static `Arc<StreamingConfig>`.
-    /// Wraps the config in a fresh `HotReloadStreamingConfig` internally
-    /// — callers that need to share the hot-reload handle with the HTTP
-    /// server should use `new_with_hot_reload` instead so a POST to
-    /// `/api/v1/streaming-config` is visible to both. The `_static`
-    /// variant stays as the simple entry point for tests, binaries,
-    /// and legacy callers that don't own a `HotReloadStreamingConfig`.
-    pub fn new(streaming_config: Arc<StreamingConfig>, prometheus_scrape_interval: u64) -> Self {
-        let hot_reload =
-            crate::storage_engines::types::HotReloadStreamingConfig::from_arc(streaming_config);
-        Self::new_with_hot_reload(hot_reload, prometheus_scrape_interval)
-    }
-
-    /// Construct a `ASAPQueryEngine` that shares a `HotReloadStreamingConfig`
-    /// handle with another holder (typically the HTTP server). This is
-    /// the constructor `main.rs` should call so `POST /api/v1/streaming-config`
-    /// is observable by the next query.
-    pub fn new_with_hot_reload(
-        streaming_config_source: crate::storage_engines::types::HotReloadStreamingConfig,
-        prometheus_scrape_interval: u64,
-    ) -> Self {
+    /// Construct the query executor. Runtime configuration is read only from
+    /// the generation-consistent `ActivePhysicalPlan` installed separately.
+    pub fn new(prometheus_scrape_interval: u64) -> Self {
         Self {
-            streaming_config_source,
             prometheus_scrape_interval,
             control_plane_client: None,
             sketch_index: None,
@@ -520,22 +490,6 @@ impl ASAPQueryEngine {
     ) -> Self {
         self.sketch_index = Some(index);
         self
-    }
-
-    /// Take a fresh snapshot of the current `StreamingConfig`. Each
-    /// call observes whatever was most recently pushed through PR #10's
-    /// `POST /api/v1/streaming-config` endpoint. The returned `Arc`
-    /// is stable for the caller's lifetime — a concurrent swap
-    /// produces a new `Arc` and leaves the one returned here alone.
-    ///
-    /// Internal read sites inside `ASAPQueryEngine` bind this once per
-    /// logical unit of work (typically per query-handler invocation
-    /// or per helper call) and use the local Arc for the duration,
-    /// so references into the underlying `StreamingConfig` stay
-    /// valid and a single query sees internally-consistent config
-    /// fields even if a concurrent swap lands mid-query.
-    pub fn streaming_config_snapshot(&self) -> Arc<StreamingConfig> {
-        self.streaming_config_source.snapshot()
     }
 
     /// Attach a `ControlPlaneClient` so capability misses fire a
@@ -1454,129 +1408,6 @@ mod sketch_query_tests {
     // }
 }
 
-// ─── PR E phase 2: per-query re-snapshot tests ─────────────────────────
-#[cfg(test)]
-mod hot_reload_phase2_tests {
-    use super::*;
-    use crate::storage_engines::types::{
-        AggregationType, CleanupPolicy, HotReloadStreamingConfig, StreamingConfig, WindowKind,
-    };
-    use asap_types::KeyByLabelNames;
-
-    fn dummy_agg(_id: u64, metric: &str) -> crate::storage_engines::types::AggregationConfig {
-        // `_id` is unused after PR 5 — identity is content-addressed.
-        crate::storage_engines::types::AggregationConfig::new(
-            AggregationType::Sum,
-            String::new(),
-            std::collections::HashMap::new(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            KeyByLabelNames::empty(),
-            String::new(),
-            60,
-            60,
-            WindowKind::Tumbling,
-            String::new(),
-            metric.to_string(),
-            None,
-            None,
-            None,
-        )
-    }
-
-    /// Returns the StreamingConfig and the policy-fingerprint u64 that
-    /// became the map key for the single inserted agg.
-    fn cfg_with_agg(id: u64, metric: &str) -> (StreamingConfig, u64) {
-        let mut map = std::collections::HashMap::new();
-        let cfg = dummy_agg(id, metric);
-        let fp = cfg.policy_fp_u64();
-        map.insert(fp, cfg);
-        (StreamingConfig::new(map), fp)
-    }
-
-    fn build_engine(handle: HotReloadStreamingConfig) -> ASAPQueryEngine {
-        let _ = Arc::new(StreamingConfig::default());
-        ASAPQueryEngine::new_with_hot_reload(handle, 15000)
-    }
-
-    #[test]
-    fn streaming_config_snapshot_starts_at_initial_config() {
-        let (cfg, fp) = cfg_with_agg(101, "metric_a");
-        let handle = HotReloadStreamingConfig::new(cfg);
-        let engine = build_engine(handle);
-        let snap = engine.streaming_config_snapshot();
-        assert_eq!(snap.aggregation_configs.len(), 1);
-        assert!(snap.aggregation_configs.contains_key(&fp));
-    }
-
-    #[test]
-    fn streaming_config_snapshot_observes_post_construction_swap() {
-        // Core of PR E phase 2: once the engine is built, swapping
-        // the shared HotReloadStreamingConfig handle must take
-        // effect on the next snapshot call — this is the guarantee
-        // that makes POST /api/v1/streaming-config actually useful
-        // for query-time behavior.
-        let (cfg_a, fp_a) = cfg_with_agg(101, "metric_a");
-        let (cfg_b, fp_b) = cfg_with_agg(202, "metric_b");
-        let handle = HotReloadStreamingConfig::new(cfg_a);
-        let engine = build_engine(handle.clone());
-
-        // Initial snapshot: metric_a only.
-        let snap_before = engine.streaming_config_snapshot();
-        assert_eq!(snap_before.aggregation_configs.len(), 1);
-        assert!(snap_before.aggregation_configs.contains_key(&fp_a));
-        assert!(!snap_before.aggregation_configs.contains_key(&fp_b));
-
-        // Simulate a control plane push via `HotReloadStreamingConfig::swap`.
-        // Clones of the handle share the same underlying ArcSwap, so a
-        // swap on `handle` is observable through the engine's stored
-        // clone.
-        handle.swap(cfg_b);
-
-        // Next snapshot: metric_b, metric_a gone.
-        let snap_after = engine.streaming_config_snapshot();
-        assert_eq!(snap_after.aggregation_configs.len(), 1);
-        assert!(snap_after.aggregation_configs.contains_key(&fp_b));
-        assert!(!snap_after.aggregation_configs.contains_key(&fp_a));
-
-        // The old snapshot is still internally consistent — it's a
-        // separate Arc that was cheap-cloned before the swap and
-        // continues to reflect the pre-swap state. This matches the
-        // per-query-entry-snapshot contract: a query that started
-        // before the swap sees old config for its entire execution.
-        assert!(snap_before.aggregation_configs.contains_key(&fp_a));
-    }
-
-    #[test]
-    fn legacy_new_constructor_is_independent_of_external_handle() {
-        // The legacy `ASAPQueryEngine::new` path wraps the provided
-        // Arc<StreamingConfig> in a FRESH HotReloadStreamingConfig
-        // internally, so external swaps must NOT leak in. This is
-        // the behavior tests and binaries that don't own a shared
-        // handle depend on.
-        let (cfg_a, fp_a) = cfg_with_agg(101, "metric_a");
-        let external_handle = HotReloadStreamingConfig::new(cfg_a);
-        let streaming_config = external_handle.snapshot();
-
-        let engine = ASAPQueryEngine::new(streaming_config, 15000);
-
-        // External swap should NOT be visible inside the engine — the
-        // legacy constructor snapshotted the initial Arc into its own
-        // fresh hot-reload wrapper.
-        let (cfg_swapped, fp_swapped) = cfg_with_agg(999, "metric_swapped");
-        external_handle.swap(cfg_swapped);
-
-        let engine_snap = engine.streaming_config_snapshot();
-        assert_eq!(engine_snap.aggregation_configs.len(), 1);
-        assert!(
-            engine_snap.aggregation_configs.contains_key(&fp_a),
-            "legacy `new` constructor should pin the initial config, \
-             external swaps to unrelated handles must not leak in"
-        );
-        assert!(!engine_snap.aggregation_configs.contains_key(&fp_swapped));
-    }
-}
-
 // ============================================================
 // Phase 1b tests: AuxStats pushdown on `query_precompute_for_statistic`
 // ============================================================
@@ -1675,7 +1506,7 @@ mod aux_pushdown_tests {
         let sc = Arc::new(StreamingConfig::new(HashMap::new()));
         let hr = HotReloadStreamingConfig::from_arc(sc.clone());
         let _ = sc;
-        ASAPQueryEngine::new_with_hot_reload(hr, 60)
+        ASAPQueryEngine::new(60)
     }
 
     #[test]
@@ -1818,7 +1649,7 @@ mod asap_tier_classify_tests {
     fn build_engine_with_index(idx: Arc<SketchStore>) -> ASAPQueryEngine {
         let streaming_config = Arc::new(crate::storage_engines::types::StreamingConfig::default());
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
-        ASAPQueryEngine::new_with_hot_reload(hot_reload, 15000).with_sketch_index(idx)
+        ASAPQueryEngine::new(15000).with_sketch_index(idx)
     }
 
     fn dd_meta(sid: u64, metric: &str, group_by: &[&str]) -> SketchInstanceMetadata {
@@ -3171,7 +3002,7 @@ mod outer_agg_integration_tests {
     fn build_engine_with_index(idx: Arc<SketchStore>) -> ASAPQueryEngine {
         let streaming_config = Arc::new(crate::storage_engines::types::StreamingConfig::default());
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
-        ASAPQueryEngine::new_with_hot_reload(hot_reload, 15000).with_sketch_index(idx)
+        ASAPQueryEngine::new(15000).with_sketch_index(idx)
     }
 
     fn dd_sketch_with_values(values: &[f64]) -> Vec<u8> {
@@ -3651,7 +3482,7 @@ mod range_stitch_tests {
 
         let streaming_config = Arc::new(crate::storage_engines::types::StreamingConfig::default());
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
-        let engine = ASAPQueryEngine::new_with_hot_reload(hot_reload, 15000)
+        let engine = ASAPQueryEngine::new(15000)
             .with_sketch_index(idx)
             .with_archive_engine(archive);
 
@@ -3734,7 +3565,7 @@ mod range_stitch_tests {
         // No `.with_archive_engine(...)` — stitch must NOT fire.
         let streaming_config = Arc::new(crate::storage_engines::types::StreamingConfig::default());
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config);
-        let engine = ASAPQueryEngine::new_with_hot_reload(hot_reload, 15000).with_sketch_index(idx);
+        let engine = ASAPQueryEngine::new(15000).with_sketch_index(idx);
 
         let result = engine
             .execute_range_promql_modern("count_over_time(req_count[5m])", start_ms, end_ms, 15_000)
@@ -3814,8 +3645,7 @@ mod range_stitch_tests {
         active.envelope.expiry_unix_ms = None;
         let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active);
         let hot = HotReloadStreamingConfig::from_active(active.clone());
-        let engine =
-            ASAPQueryEngine::new_with_hot_reload(hot, 15).with_active_physical_plan(active);
+        let engine = ASAPQueryEngine::new(15).with_active_physical_plan(active);
         let error = engine
             .execute_metricsql_at(&identity, 1_000)
             .await

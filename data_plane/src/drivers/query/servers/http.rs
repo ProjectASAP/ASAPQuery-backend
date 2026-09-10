@@ -2759,7 +2759,7 @@ mod tests {
                 handle_http_requests: true,
                 adapter_config,
             },
-            Arc::new(ASAPQueryEngine::new(streaming_config, 15_000)),
+            Arc::new(ASAPQueryEngine::new(15_000)),
             Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
         )
         .with_active_physical_plan(active)
@@ -2841,7 +2841,7 @@ mod tests {
         };
 
         let streaming_config = Arc::new(StreamingConfig::default());
-        let query_engine = Arc::new(ASAPQueryEngine::new(streaming_config.clone(), 15000));
+        let query_engine = Arc::new(ASAPQueryEngine::new(15000));
 
         let mut server = HttpServer::new(
             config,
@@ -2867,10 +2867,7 @@ mod tests {
                 handle_http_requests: true,
                 adapter_config: adapter_config.clone(),
             },
-            Arc::new(ASAPQueryEngine::new(
-                Arc::new(StreamingConfig::default()),
-                15_000,
-            )),
+            Arc::new(ASAPQueryEngine::new(15_000)),
             Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
         )
         .with_protocol_adapter(Arc::new(VictoriaMetricsHttpAdapter::new(adapter_config)));
@@ -3122,7 +3119,7 @@ aggregations:
             adapter_config,
         };
         let streaming_config = Arc::new(StreamingConfig::default());
-        let query_engine = Arc::new(ASAPQueryEngine::new(streaming_config.clone(), 15000));
+        let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let server =
             HttpServer::new(config, query_engine, sketch_index).with_hot_reload_config(hot_reload);
         server
@@ -3686,7 +3683,7 @@ aggregations:
         }
         let streaming_config = Arc::new(StreamingConfig::new(agg_map));
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_config.clone());
-        let query_engine = Arc::new(ASAPQueryEngine::new(streaming_config.clone(), 15000));
+        let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let sketch_index = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
         for marker in active_agg_ids {
             let fp = marker_to_fp[marker];
@@ -4062,7 +4059,7 @@ aggregations:
             StreamingConfig::with_storage_backend(Default::default(), metric_storage_backend);
         let streaming_arc = Arc::new(streaming_cfg);
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
-        let query_engine = Arc::new(ASAPQueryEngine::new(streaming_arc, 15000));
+        let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let mut server = HttpServer::new(
             config,
             query_engine,
@@ -4106,7 +4103,7 @@ aggregations:
         let streaming_cfg = StreamingConfig::default();
         let streaming_arc = Arc::new(streaming_cfg);
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
-        let query_engine = Arc::new(ASAPQueryEngine::new(streaming_arc, 15000));
+        let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let mut server = HttpServer::new(
             config,
             query_engine,
@@ -5017,7 +5014,7 @@ aggregations:
         let streaming_cfg = StreamingConfig::default();
         let streaming_arc = Arc::new(streaming_cfg);
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
-        let query_engine = Arc::new(ASAPQueryEngine::new(streaming_arc, 15000));
+        let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let routing_handle = HotReloadBackendStorageRouting::empty();
         let server = HttpServer::new(
             config,
@@ -5554,7 +5551,7 @@ aggregations:
             StreamingConfig::with_storage_backend(Default::default(), metric_storage_backend);
         let streaming_arc = Arc::new(streaming_cfg);
         let hot_reload = HotReloadStreamingConfig::from_arc(streaming_arc.clone());
-        let query_engine = Arc::new(ASAPQueryEngine::new(streaming_arc, 15000));
+        let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let mut server = HttpServer::new(
             config,
             query_engine,
@@ -5600,7 +5597,7 @@ aggregations:
             adapter_config,
         };
         let streaming_arc = Arc::new(StreamingConfig::default());
-        let query_engine = Arc::new(ASAPQueryEngine::new(streaming_arc, 15000));
+        let query_engine = Arc::new(ASAPQueryEngine::new(15000));
         let cache = Arc::new(crate::query_engines::routing::FreshnessProbeCache::new());
         let server = HttpServer::new(
             config,

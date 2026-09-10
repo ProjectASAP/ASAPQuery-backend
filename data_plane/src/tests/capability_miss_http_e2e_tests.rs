@@ -165,7 +165,7 @@ async fn start_mock_control_plane(state: MockControlPlaneState) -> u16 {
 async fn start_backend(control_plane_url: String, hot_reload: HotReloadStreamingConfig) -> u16 {
     let _streaming_config = hot_reload.snapshot();
     let engine = Arc::new(
-        ASAPQueryEngine::new_with_hot_reload(hot_reload.clone(), 15_000)
+        ASAPQueryEngine::new(15_000)
             .with_control_plane_client(Arc::new(HttpControlPlaneClient::new(control_plane_url))
                 as Arc<dyn ControlPlaneClient>),
     );
