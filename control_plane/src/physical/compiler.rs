@@ -2153,17 +2153,7 @@ impl PhysicalCompiler {
         // materializations, then consumed by QueryPlan lowering. The key is
         // the planner DAG node identity across the workload; serving never scans
         // downstream components to rediscover this decision.
-        let executable_dags = request
-            .queries
-            .iter()
-            .map(|query| {
-                planner_types::post_asap::compile_executable_dag_with_node_ids(&query.post_asap)
-                    .map_err(|error| CompileError::Query {
-                        query_id: query.query_id.clone(),
-                        reason: format!("invalid executable subDAG: {error}"),
-                    })
-            })
-            .collect::<Result<Vec<ExecutableDagCompilation>, CompileError>>()?;
+        let mut executable_dags = vec![None::<ExecutableDagCompilation>; request.queries.len()];
         let mut node_bindings =
             BTreeMap::<(usize, PostAsapNodeId), asap_types::PolicyFingerprint>::new();
         let consumers = materialization_consumers(
@@ -2232,6 +2222,13 @@ impl PhysicalCompiler {
             if selected.is_empty() {
                 continue;
             }
+            let executable =
+                planner_types::post_asap::compile_executable_dag_with_node_ids(&query.post_asap)
+                    .map_err(|error| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: format!("invalid executable subDAG: {error}"),
+                    })?;
+            executable_dags[query_index] = Some(executable);
             validate_lifecycle_input(&query.query_id, &query.lifecycle)?;
             if environment.target == PhysicalDeploymentTarget::DistributedCollectors
                 && selected.iter().any(|state| {
@@ -2403,6 +2400,8 @@ impl PhysicalCompiler {
                         lifecycle_cost: planner_selection.lifecycle_cost,
                     });
                 let node_id = executable_dags[query_index]
+                    .as_ref()
+                    .expect("selected query has a compiled executable DAG")
                     .node_ids
                     .node_id(&selected.node)
                     .ok_or_else(|| CompileError::Query {
@@ -2567,6 +2566,12 @@ impl PhysicalCompiler {
                         )
                     })?;
                     let node_id = executable_dags[query_index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            crate::query_plan::QueryPlanError::Invalid(
+                                "materialized query has no compiled executable DAG".into(),
+                            )
+                        })?
                         .node_ids
                         .node_id(node)
                         .ok_or_else(|| {
