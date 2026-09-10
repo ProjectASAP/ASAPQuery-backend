@@ -94,6 +94,22 @@ struct Args {
     #[arg(long, default_value = "http://localhost:8428")]
     victoriametrics_url: String,
 
+    /// Optional independent ClickHouse-compatible HTTP listener.
+    #[arg(long, env = "ASAP_CLICKHOUSE_HTTP_PORT")]
+    clickhouse_http_port: Option<u16>,
+
+    /// Exact ClickHouse HTTP endpoint used by the SQL listener.
+    #[arg(
+        long,
+        env = "ASAP_CLICKHOUSE_URL",
+        default_value = "http://localhost:8123"
+    )]
+    clickhouse_url: String,
+
+    /// Default database supplied when a ClickHouse request omits one.
+    #[arg(long, env = "ASAP_CLICKHOUSE_DATABASE", default_value = "default")]
+    clickhouse_database: String,
+
     /// Deprecated/no-op: the backend's only HTTP listener is the
     /// PromQL query surface (`--http-port` / `--query-port`). The
     /// old PRW ingest port was deleted in PR #100; this flag is
@@ -1312,6 +1328,25 @@ async fn main() -> Result<()> {
 
     let victoria_task = victoria_server.map(|server| tokio::spawn(server.run()));
 
+    let clickhouse_server_handle = args.clickhouse_http_port.map(|port| {
+        let fallback = Arc::new(
+            data_plane::query_engines::asap_clickhouse_query_engine::ClickHouseHttpFallback::new(
+                args.clickhouse_url.clone(),
+                args.clickhouse_database.clone(),
+            ),
+        );
+        let clickhouse_server =
+            data_plane::query_engines::asap_clickhouse_query_engine::ClickHouseHttpServer {
+                listen_address: format!("0.0.0.0:{port}"),
+                fallback,
+            };
+        info!("Starting ClickHouse-compatible HTTP proxy on port {port}");
+        tokio::spawn(async move {
+            if let Err(error) = clickhouse_server.run().await {
+                error!("ClickHouse HTTP server error: {error}");
+            }
+        })
+    });
     // Wait for shutdown signal
     tokio::select! {
         result = server.run() => {
@@ -1337,6 +1372,10 @@ async fn main() -> Result<()> {
     if let Some(handle) = schema_eviction_handle {
         info!("Shutting down schema eviction service...");
         handle.shutdown().await;
+    }
+
+    if let Some(handle) = clickhouse_server_handle {
+        handle.abort();
     }
 
     if let Some(handle) = otel_handle {

@@ -17,8 +17,10 @@
 //! * [`EngineError`] — the trait-level error envelope every
 //!   `crate::query_engines::routing::QueryEngine` impl returns.
 
+pub mod asap_clickhouse_query_engine;
 pub mod asap_query_engine;
 pub mod asap_victoriametrics_query_engine;
+pub mod canonical;
 pub mod no_data_archive;
 pub mod query_result;
 pub mod routing;

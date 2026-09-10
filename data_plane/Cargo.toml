@@ -134,6 +134,8 @@ asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev =
 tempfile = "3.20.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio-tungstenite = "0.21"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [[bench]]
 name = "sketch_db"
