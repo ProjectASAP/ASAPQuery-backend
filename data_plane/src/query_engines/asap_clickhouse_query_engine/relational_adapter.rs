@@ -93,6 +93,23 @@ impl ClickHouseRelation {
 pub struct ClickHouseRelationalAdapter;
 
 impl ClickHouseRelationalAdapter {
+    pub fn apply_filter(
+        &self,
+        pred: &planner_types::pre_asap::Predicate,
+        mut input: ClickHouseRelation,
+    ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
+        input.rows = input
+            .rows
+            .into_iter()
+            .filter_map(|row| match eval(&pred.0, &row) {
+                Ok(Cell::Bool(true)) => Some(Ok(row)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(input)
+    }
+
     pub fn apply_operation(
         &self,
         operation: &ValueOperation,
@@ -111,17 +128,6 @@ impl ClickHouseRelationalAdapter {
                 }
                 input.rows = rows;
                 input.fields = fields_from_schema(output_schema);
-            }
-            ValueOperation::Filter { pred } => {
-                input.rows = input
-                    .rows
-                    .into_iter()
-                    .filter_map(|row| match eval(&pred.0, &row) {
-                        Ok(Cell::Bool(true)) => Some(Ok(row)),
-                        Ok(_) => None,
-                        Err(error) => Some(Err(error)),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
             }
             ValueOperation::Sort { keys, partition_by } => {
                 if partition_by.is_without() || !partition_by.is_empty() {
@@ -564,23 +570,12 @@ mod tests {
             schema: input_schema.clone(),
             guarantee: None,
         });
-        let filtered = value_node(
-            leaf,
-            ValueOperation::Filter {
-                pred: Predicate(Rc::new(QueryExpr::Compare {
-                    left: Rc::new(QueryExpr::Column(1)),
-                    op: CompareOpKind::Gt,
-                    right: Rc::new(QueryExpr::Literal(ScalarValue::Float64(1.0))),
-                })),
-            },
-            input_schema,
-        );
         let projected_schema = schema(&[
             ("bucket", DataType::Timestamp),
             ("score", DataType::Float64),
         ]);
         let projected = value_node(
-            filtered,
+            leaf,
             ValueOperation::Project {
                 cols: vec![
                     ProjectItem {

@@ -136,6 +136,26 @@ pub fn execute_sql_dag(
     };
     let adapter = ClickHouseRelationalAdapter;
     for (wire_operation, _, output_schema) in relational.into_iter().rev() {
+        if let Some(filter) = wire_operation.get("Filter") {
+            let predicate = filter
+                .get("pred")
+                .cloned()
+                .ok_or_else(|| "published Filter lacks pred".to_owned())
+                .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()));
+            relation = match predicate.and_then(|predicate| {
+                adapter
+                    .apply_filter(&predicate, relation)
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(relation) => relation,
+                Err(error) => {
+                    return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
+                        format!("invalid published Filter: {error}"),
+                    ))
+                }
+            };
+            continue;
+        }
         let operation: ValueOperation = match serde_json::from_value(wire_operation) {
             Ok(operation) => operation,
             Err(error) => {

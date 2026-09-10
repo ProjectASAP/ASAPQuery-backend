@@ -312,6 +312,7 @@ mod tests {
                             materialization,
                             output_grouping: PhysicalGrouping::Reduce(Vec::new()),
                             window_ms: 1_000,
+                            pane_origin_ms: Some(0),
                             readout_lookback_ms: None,
                         },
                     },
@@ -327,14 +328,11 @@ mod tests {
                     filter,
                     QueryPlanNode::Relational {
                         input: readout,
-                        operation: serde_json::to_value(ValueOperation::Filter {
-                            pred: Predicate(Rc::new(QueryExpr::Compare {
-                                left: Rc::new(QueryExpr::Column(1)),
-                                op: CompareOpKind::Gt,
-                                right: Rc::new(QueryExpr::Literal(ScalarValue::Float64(1.0))),
-                            })),
-                        })
-                        .unwrap(),
+                    operation: serde_json::json!({"Filter": {"pred": Predicate(Rc::new(QueryExpr::Compare {
+                            left: Rc::new(QueryExpr::Column(1)),
+                            op: CompareOpKind::Gt,
+                            right: Rc::new(QueryExpr::Literal(ScalarValue::Float64(1.0))),
+                        }))}}),
                         input_schema: input_schema.clone(),
                         output_schema: input_schema.clone(),
                     },
