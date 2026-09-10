@@ -1291,6 +1291,64 @@ where
                     value: scalar_literal(expr).unwrap(),
                 }
             }
+            SummaryExpr::KeepPreAsap(expr) if self.preserve_relational => {
+                let planner_types::pre_asap::QueryExpr::Scan {
+                    source: planner_types::pre_asap::Source::Table { table_ref },
+                    predicates,
+                    schema,
+                } = expr.as_ref()
+                else {
+                    return Err(QueryPlanError::UnsupportedNode(
+                        "SQL exact cut is not a direct table scan".into(),
+                    ));
+                };
+                if !predicates.is_empty() {
+                    return Err(QueryPlanError::UnsupportedNode(
+                        "SQL exact table cut contains unrendered predicates".into(),
+                    ));
+                }
+                fn quoted(identifier: &str) -> String {
+                    identifier
+                        .split('.')
+                        .map(|part| format!("`{}`", part.replace('`', "``")))
+                        .collect::<Vec<_>>()
+                        .join(".")
+                }
+                let columns = schema
+                    .columns
+                    .iter()
+                    .map(|column| quoted(&column.name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let time_filter = schema.time_index.and_then(|index| {
+                    schema.columns.get(index).map(|source_column| {
+                        let column = quoted(&source_column.name);
+                        format!(" WHERE {column} >= {{from:UInt64}} AND {column} <= {{to:UInt64}}")
+                    })
+                });
+                QueryPlanNode::ExternalExact {
+                    request: ExternalExactRequest {
+                        language: QueryLanguage::ClickHouseSql,
+                        expression: format!(
+                            "SELECT {columns} FROM {}{}",
+                            quoted(table_ref),
+                            time_filter.unwrap_or_default()
+                        ),
+                        output: ExternalExactOutput::Relation {
+                            schema: serde_json::to_value(&node.schema).map_err(|error| {
+                                QueryPlanError::Invalid(format!(
+                                    "cannot serialize external exact schema: {error}"
+                                ))
+                            })?,
+                        },
+                        parameters: BTreeMap::new(),
+                        start_parameter: Some("from".into()),
+                        end_parameter: Some("to".into()),
+                        input_contracts: Vec::new(),
+                    },
+                    inputs: Vec::new(),
+                }
+            }
             SummaryExpr::SummaryAgg {
                 family:
                     SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _),
