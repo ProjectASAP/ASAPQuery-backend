@@ -1018,7 +1018,7 @@ mod tests {
             },
             materializations: vec![crate::physical::compiler::CollectorMaterialization {
                 query_id: "q".into(),
-                materialization: asap_types::PolicyFingerprint(1),
+                materialization: asap_types::PolicyFingerprint(1).into(),
                 metric: "requests".into(),
                 algorithm: "hll".into(),
                 parameters: serde_json::json!({"precision": 14}),
@@ -1039,7 +1039,7 @@ mod tests {
                 },
             }],
             transmission_rules: vec![crate::physical::compiler::TransmissionRule {
-                materialization: asap_types::PolicyFingerprint(1),
+                materialization: asap_types::PolicyFingerprint(1).into(),
                 producer_id: collector_id.into(),
                 schema_id: "asap-query-backend.v1:summary-state:v1:1".into(),
                 mode: crate::physical::compiler::TransmissionMode::Full,

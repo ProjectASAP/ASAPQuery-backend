@@ -171,7 +171,7 @@ pub fn manifest(
                 .precompute_plan
                 .materializations
                 .iter()
-                .find(|m| m.policy_fingerprint() == schema.materialization)
+                .find(|m| m.policy_fingerprint() == schema.materialization.fingerprint())
                 .ok_or_else(|| invalid("state has no physical implementation"))?;
             let identity = json!({"schema": schema, "location": location, "physical": physical,
                 "window_implementation": plan.lifecycle_estimates.iter().find(|e| e.materialization == schema.materialization).map(|e| &e.window_implementation_id)});

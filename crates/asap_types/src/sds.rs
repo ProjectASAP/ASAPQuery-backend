@@ -28,7 +28,7 @@ macro_rules! descriptor_id {
     };
 }
 /// Semantic materialization reference. Wire-compatible with PolicyFingerprint,
-/// but distinct from descriptor IDs and runtime instance/SID identity.
+/// but distinct from descriptor IDs and concrete [`SummaryInstanceId`] identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SummaryDefinitionId(pub crate::PolicyFingerprint);

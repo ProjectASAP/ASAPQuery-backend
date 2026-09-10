@@ -83,7 +83,7 @@ impl PrecomputePlan {
             let schema = self
                 .schemas
                 .iter()
-                .find(|s| s.materialization == id.fingerprint())
+                .find(|s| s.materialization == id)
                 .ok_or(PrecomputePlanError::SchemaSetMismatch)?;
             let family = config
                 .accumulator_spec()
