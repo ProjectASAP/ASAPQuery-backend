@@ -24,7 +24,7 @@ impl SqlQueryFingerprint {
 /// SQL parsing and semantic canonicalization remain ASAPPlanner's job; keeping
 /// the text alongside the hash makes hash collisions fail closed.
 pub fn fingerprint_sql(sql: &str) -> SqlQueryFingerprint {
-    let key = sql.trim();
+    let key = control_plane::clickhouse::sql_request_template_identity(sql);
     SqlQueryFingerprint(format!(
         "clickhouse-sql:v1:{:016x}",
         xxh64(key.as_bytes(), 0)
@@ -115,10 +115,13 @@ impl<P> SqlPlanCatalogGeneration<P> {
     }
 
     pub fn lookup(&self, sql: &str) -> Option<Arc<SqlPlanEntry<P>>> {
-        let normalized = sql.trim();
+        let normalized = control_plane::clickhouse::sql_request_template_identity(sql);
         self.entries
-            .get(&fingerprint_sql(normalized))
-            .filter(|entry| entry.sql_template.trim() == normalized)
+            .get(&fingerprint_sql(&normalized))
+            .filter(|entry| {
+                control_plane::clickhouse::sql_request_template_identity(&entry.sql_template)
+                    == normalized
+            })
             .cloned()
     }
 
@@ -315,6 +318,18 @@ mod tests {
                 .lookup("  SELECT sum(value) FROM requests  ")
                 .unwrap()
                 .plan,
+            "dag"
+        );
+    }
+
+    #[test]
+    fn clickhouse_only_template_does_not_require_planner_parsing() {
+        let sds = sds(3);
+        let exact = "SELECT samples[1].1, arraySum(i -> samples[i].2, range(1, 3)) FROM raw";
+        let generation =
+            SqlPlanCatalogGeneration::build(&sds, [entry(&sds, exact, "dag")]).unwrap();
+        assert_eq!(
+            generation.lookup(&format!("  {exact};  ")).unwrap().plan,
             "dag"
         );
     }

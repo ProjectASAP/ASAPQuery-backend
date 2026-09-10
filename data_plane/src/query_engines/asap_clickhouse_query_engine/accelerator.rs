@@ -40,7 +40,12 @@ pub struct SqlRuntimePlan {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ClickHousePublishedPlan {
+    /// Exact ClickHouse request/fallback template used as the lookup key.
     pub sql: String,
+    /// ASAPPlanner canonical identity of the explicitly equivalent planning
+    /// SQL. Retained on wire for audit; serving never executes it as fallback.
+    #[serde(default)]
+    pub planning_sql: String,
     pub runtime: SqlRuntimePlan,
     pub descriptors: SdsDescriptorReferences,
 }
@@ -229,19 +234,15 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
             .as_ref()
             .map(|s| s.binder.clone())
             .or_else(|| self.binder.read().unwrap().clone());
-        let Some(binder) = binder else {
+        if binder.is_none() {
             return ClickHouseAccelerationOutcome::Fallback(
                 ClickHouseAccelerationFallback::CatalogMiss,
             );
-        };
-        let canonical_sql = match binder.canonical_identity(&request.sql).await {
-            Ok(canonical) => canonical,
-            Err(error) => {
-                return ClickHouseAccelerationOutcome::Fallback(
-                    ClickHouseAccelerationFallback::Planning(error.to_string()),
-                )
-            }
-        };
+        }
+        // Lookup uses the exact ClickHouse request template published by the
+        // control plane. Do not reparse it here: publication may deliberately
+        // pair ClickHouse-only exact SQL with equivalent Planner SQL.
+        let canonical_sql = control_plane::clickhouse::sql_request_template_identity(&request.sql);
         let (entry, generation) = if let Some(sidecar) = sidecar {
             (
                 sidecar.catalog.lookup(&canonical_sql),
@@ -507,21 +508,16 @@ mod tests {
             vec![],
         );
         let tables = HashMap::from([("requests".into(), table_schema)]);
-        let canonical_sql = control_plane::clickhouse::canonicalize_clickhouse_sql(
+        let canonical_sql = control_plane::clickhouse::sql_request_template_identity(
             "SELECT sum(value) FROM requests",
-            &control_plane::clickhouse::ClickHouseSqlCatalog {
-                tables: tables.clone(),
-            },
-            planner_types::types::AccuracyTarget::Exact,
-        )
-        .await
-        .unwrap();
+        );
         let bundle = ClickHousePlanBundle {
             sds: sds.clone(),
             tables,
             accuracy: planner_types::types::AccuracyTarget::Exact,
             plans: vec![ClickHousePublishedPlan {
                 sql: canonical_sql,
+                planning_sql: String::new(),
                 runtime: SqlRuntimePlan {
                     start_ms: 0,
                     end_ms,

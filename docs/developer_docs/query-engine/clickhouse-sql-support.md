@@ -62,6 +62,22 @@ workload and uses the ordinary physical-plan stage and activate endpoints. The
 data plane has no ClickHouse-specific stage or activate endpoints and no SQL
 plan token or startup sidecar bundle.
 
+Each workload query may carry two ClickHouse-private SQL strings:
+
+- `sql` is the exact request template. It is also the query sent to ClickHouse
+  when coverage or execution requires fallback.
+- `planning_sql`, when present, is a semantically equivalent rewrite restricted
+  to ASAPPlanner's SQL surface. When absent, `sql` is planned directly.
+
+This split is useful for exact ClickHouse expressions containing tuple access,
+array lambdas, or engine-specific functions. The control plane never guesses
+that a simpler aggregate is equivalent. Workload generation owns that explicit
+equivalence assertion. The data plane binds the normalized exact template to
+the published DAG without reparsing ClickHouse-only syntax. Whitespace around
+the request and one trailing semicolon are ignored; the SQL body otherwise has
+to match exactly, so a different predicate or literal fails closed to
+ClickHouse.
+
 ## Execution and fallback
 
 The accelerated path supports the relational operations represented by the

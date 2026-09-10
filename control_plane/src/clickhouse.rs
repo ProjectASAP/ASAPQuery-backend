@@ -40,14 +40,11 @@ pub async fn plan_clickhouse_sql(
     let canonical = lower_sql_dialect(sql, catalog, SqlDialect::ClickhouseSQL, accuracy.clone())
         .await
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
-    // SQL keeps relational parents such as Project and Filter above a
-    // summary-capable Aggregate. Use ASAPPlanner's recursive selector here;
-    // the PromQL deployment lowering retains its existing conservative rules.
-    let cost_model = ControlPlaneCostModel::new(accuracy.clone());
     // SQL commonly keeps relational operators (Project/Filter/Sort/Limit)
     // above the summary-capable aggregate. Workload search materializes those
     // residual parents around the selected inner summary; root-only candidate
     // selection incorrectly rejects such queries before recursive mapping.
+    let cost_model = ControlPlaneCostModel::new(accuracy.clone());
     let selected = crate::planner_selection::select_workload(
         vec![(0, Rc::new(canonical.clone()))],
         accuracy,
@@ -80,6 +77,17 @@ pub async fn canonicalize_clickhouse_sql(
     Ok(canonical_sql_identity(&canonical))
 }
 
+/// Stable identity of the SQL text accepted by the ClickHouse endpoint.
+///
+/// This intentionally does not parse the request. ClickHouse's executable SQL
+/// surface is larger than ASAPPlanner's planning surface (tuple fields, array
+/// lambdas, and engine-specific functions are common examples). Publication
+/// may bind such an exact request template to a separately supplied,
+/// semantically equivalent planning SQL expression.
+pub fn sql_request_template_identity(sql: &str) -> String {
+    sql.trim().trim_end_matches(';').trim_end().to_owned()
+}
+
 /// Identity derived from ASAPPlanner's resolved canonical AST. Equivalent SQL
 /// formatting therefore maps to one catalog key without reparsing at serving.
 pub fn canonical_sql_identity(canonical: &QueryExpr) -> String {
@@ -100,7 +108,16 @@ pub struct ClickHouseSqlWorkload {
 
 #[derive(Debug, Deserialize)]
 pub struct ClickHouseSqlWorkloadEntry {
+    /// Exact SQL template received by the data plane and sent to ClickHouse on
+    /// fallback.
     pub sql: String,
+    /// Semantically equivalent SQL written against Planner's supported SQL
+    /// surface. When absent, `sql` is planned directly.
+    ///
+    /// The control plane treats this as an explicit workload contract; it
+    /// never guesses equivalence by simplifying engine-specific expressions.
+    #[serde(default)]
+    pub planning_sql: Option<String>,
     pub start_ms: u64,
     pub end_ms: u64,
     pub cumulative: bool,
@@ -133,7 +150,12 @@ pub async fn compile_clickhouse_workload(
     };
     let mut plans = Vec::with_capacity(request.queries.len());
     for query in &request.queries {
-        let planned = plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
+        let planned = plan_clickhouse_sql(
+            query.planning_sql.as_deref().unwrap_or(&query.sql),
+            &catalog,
+            request.accuracy.clone(),
+        )
+        .await?;
         let PhysicalExpr::Committed(crate::physical::post_asap::PostAsapPlan::Summary(root)) =
             planned.physical
         else {
@@ -181,7 +203,8 @@ pub async fn compile_clickhouse_workload(
             })
             .collect::<Result<Vec<_>, _>>()?;
         plans.push(serde_json::json!({
-            "sql": planned.canonical_sql,
+            "sql": sql_request_template_identity(&query.sql),
+            "planning_sql": planned.canonical_sql,
             "runtime": { "start_ms": query.start_ms, "end_ms": query.end_ms,
                 "cumulative": query.cumulative,
                 "materializations": materializations,
@@ -256,6 +279,17 @@ fn select_materialization<'a>(
         )));
     }
     Ok(selected)
+}
+
+#[cfg(test)]
+mod planning_tests {
+    use super::*;
+
+    #[test]
+    fn request_identity_accepts_clickhouse_only_syntax_without_parsing() {
+        let sql = "SELECT samples[1].1, arraySum(i -> samples[i].2, range(1, 3)) FROM raw";
+        assert_eq!(sql_request_template_identity(&format!("  {sql};  ")), sql);
+    }
 }
 
 #[cfg(test)]
