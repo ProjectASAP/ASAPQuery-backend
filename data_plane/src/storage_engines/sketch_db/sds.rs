@@ -235,7 +235,10 @@ impl SummaryDescriptorRegistry {
                 + std::mem::size_of::<Weak<DataDescriptor>>());
         for descriptor in data.values().filter_map(Weak::upgrade) {
             total += std::mem::size_of::<DataDescriptor>() + descriptor.id.canonical().len();
-            total += descriptor.metric_name.len() + descriptor.population_filter_canonical.len();
+            total += serde_json::to_string(&descriptor.source).map_or(0, |value| value.len());
+            total +=
+                serde_json::to_string(&descriptor.value_projection).map_or(0, |value| value.len());
+            total += descriptor.population_filter_canonical.len();
             total += descriptor
                 .group_by_keys
                 .iter()
