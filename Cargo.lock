@@ -980,10 +980,12 @@ dependencies = [
  "promql-parser 0.9.0",
  "prost",
  "prost-build",
+ "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "serde_yaml",
+ "sqlparser",
  "thiserror 1.0.69",
  "tokio",
  "tokio-stream",
@@ -993,6 +995,7 @@ dependencies = [
  "tower 0.4.13",
  "tracing",
  "tracing-subscriber",
+ "xxhash-rust",
  "zstd",
 ]
 
@@ -1198,6 +1201,7 @@ dependencies = [
  "base64 0.21.7",
  "bincode",
  "chrono",
+ "chrono-tz",
  "clap 4.6.1",
  "control_plane",
  "crc32fast",

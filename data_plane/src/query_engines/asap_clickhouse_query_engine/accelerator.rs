@@ -5,7 +5,7 @@ use axum::{
     body::Bytes,
     http::{HeaderMap, HeaderValue, StatusCode},
 };
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use super::{
     clickhouse_result_adapter::ClickHouseFormat,
@@ -55,6 +55,7 @@ impl CatalogClickHouseAccelerator {
         entry: &control_plane::query_plan::QueryPlanEntry,
         start_ms: u64,
         end_ms: u64,
+        request_context: Option<&ClickHouseQueryRequest>,
     ) -> Result<PreparedSqlLeaves, String> {
         let mut prepared = PreparedSqlLeaves::new();
         let external = entry
@@ -75,7 +76,11 @@ impl CatalogClickHouseAccelerator {
             .as_ref()
             .ok_or_else(|| "ClickHouse exact subtree endpoint unavailable".to_owned())?;
         for (id, bound) in external {
-            let mut parameters = bound.parameters.clone();
+            let mut parameters = bound
+                .parameters
+                .iter()
+                .map(|(name, value)| (format!("param_{name}"), value.clone()))
+                .collect::<BTreeMap<_, _>>();
             if let Some(name) = &bound.start_parameter {
                 parameters.insert(format!("param_{name}"), start_ms.to_string());
             }
@@ -83,12 +88,17 @@ impl CatalogClickHouseAccelerator {
                 parameters.insert(format!("param_{name}"), end_ms.to_string());
             }
             parameters.insert("default_format".into(), "JSONCompact".into());
+            if let Some(database) = request_context.and_then(ClickHouseQueryRequest::database) {
+                parameters.insert("database".into(), database.into());
+            }
             let request = ClickHouseQueryRequest {
                 method: axum::http::Method::POST,
                 sql: bound.sql.clone(),
                 body: Bytes::from(bound.sql.clone()),
                 parameters,
-                headers: HeaderMap::new(),
+                headers: request_context
+                    .map(|request| request.headers.clone())
+                    .unwrap_or_default(),
             };
             let response = backend
                 .execute(&request)
@@ -180,7 +190,7 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
             );
         };
         let prepared = match self
-            .prepare_external_sql(entry, range.start_ms, range.end_ms)
+            .prepare_external_sql(entry, range.start_ms, range.end_ms, Some(request))
             .await
         {
             Ok(prepared) => prepared,
@@ -271,7 +281,10 @@ mod tests {
             request: &ClickHouseQueryRequest,
         ) -> Result<ClickHouseRawResponse, super::super::fallback::ClickHouseFallbackError>
         {
-            assert_eq!(request.sql, "SELECT 2000 AS timestamp, 10.0 AS divisor");
+            assert_eq!(
+                request.sql,
+                "SELECT 2000 AS timestamp, 10.0 AS divisor WHERE {from:UInt64} <= {to:UInt64}"
+            );
             assert_eq!(request.parameters.get("param_from"), Some(&"0".into()));
             assert_eq!(request.parameters.get("param_to"), Some(&"2000".into()));
             Ok(ClickHouseRawResponse {
@@ -649,7 +662,7 @@ mod tests {
             external,
             QueryPlanNode::ExternalSqlLeaf {
                 query: BoundClickHouseQuery {
-                    sql: "SELECT 2000 AS timestamp, 10.0 AS divisor".into(),
+                sql: "SELECT 2000 AS timestamp, 10.0 AS divisor WHERE {from:UInt64} <= {to:UInt64}".into(),
                     parameters: BTreeMap::new(),
                     start_parameter: Some("from".into()),
                     end_parameter: Some("to".into()),
@@ -702,7 +715,7 @@ mod tests {
         entry.root = project;
         let accelerator = accelerator.with_exact_backend(Arc::new(FixedExactSubtree));
         let prepared = accelerator
-            .prepare_external_sql(&entry, 0, 2_000)
+            .prepare_external_sql(&entry, 0, 2_000, None)
             .await
             .unwrap();
         let ClickHouseDagOutcome::Accelerated(result) = execute_sql_dag_with_external(
@@ -719,6 +732,94 @@ mod tests {
         assert_eq!(
             String::from_utf8(result.encode(ClickHouseFormat::TabSeparated).unwrap()).unwrap(),
             "1970-01-01T00:00:02\t0.5\n"
+        );
+        let QueryPlanNode::ExternalSqlLeaf { query } = entry.nodes.get_mut(&external).unwrap()
+        else {
+            unreachable!()
+        };
+        query.output_schema.fields[0].name = "wrong_timestamp".into();
+        assert!(matches!(
+            execute_sql_dag_with_external(
+                accelerator.store.as_ref(),
+                &entry,
+                physical.summary_catalog.as_ref().unwrap(),
+                &prepared,
+                0,
+                2_000,
+                true,
+            ),
+            ClickHouseDagOutcome::Fallback(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn real_clickhouse_datetime64_external_leaf_is_typed() {
+        use control_plane::query_plan::BoundClickHouseQuery;
+        let Ok(base_url) = std::env::var("CLICKHOUSE_URL") else {
+            return;
+        };
+        let schema = relation_schema(&[("timestamp", DataType::Timestamp)]);
+        let leaf = QueryNodeId(0);
+        let entry = QueryPlanEntry {
+            language: QueryLanguage::ClickHouseSql,
+            query_id: "datetime64".into(),
+            canonical_query: "datetime64".into(),
+            fixed_evaluation: Some(FixedEvaluationRange {
+                start_ms: 0,
+                end_ms: 2_000,
+                cumulative: false,
+            }),
+            root: leaf,
+            nodes: BTreeMap::from([(
+                leaf,
+                QueryPlanNode::ExternalSqlLeaf {
+                    query: BoundClickHouseQuery {
+                        sql: "SELECT toDateTime64('1970-01-01 00:00:00.123', 3, 'UTC') AS timestamp WHERE {from:UInt64} <= {to:UInt64}".into(),
+                        parameters: BTreeMap::new(),
+                        start_parameter: Some("from".into()),
+                        end_parameter: Some("to".into()),
+                        output_schema: schema,
+                    },
+                },
+            )]),
+            instant: InstantExecution {
+                lookback_ms: 2_000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        let accelerator = CatalogClickHouseAccelerator::empty(Arc::new(SketchStore::new()))
+            .with_exact_backend(Arc::new(
+                super::super::fallback::ClickHouseHttpFallback::new(base_url, "default".into()),
+            ));
+        let mut headers = HeaderMap::new();
+        if let Ok(user) = std::env::var("CLICKHOUSE_USER") {
+            headers.insert("x-clickhouse-user", user.parse().unwrap());
+        }
+        if let Ok(password) = std::env::var("CLICKHOUSE_PASSWORD") {
+            headers.insert("x-clickhouse-key", password.parse().unwrap());
+        }
+        let context = ClickHouseQueryRequest {
+            method: Method::POST,
+            sql: String::new(),
+            body: Bytes::new(),
+            parameters: BTreeMap::new(),
+            headers,
+        };
+        let prepared = accelerator
+            .prepare_external_sql(&entry, 0, 2_000, Some(&context))
+            .await
+            .unwrap();
+        let encoded = prepared[&leaf]
+            .clone()
+            .into_result()
+            .unwrap()
+            .encode(ClickHouseFormat::TabSeparated)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(encoded).unwrap(),
+            "1970-01-01T00:00:00.123\n"
         );
     }
 

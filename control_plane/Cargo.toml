@@ -24,6 +24,9 @@ thiserror   = "1"
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 chrono      = { version = "0.4",  features = ["serde"] }
+regex       = "1"
+sqlparser   = "0.51"
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 # Private mirror of GreptimeTeam/promql-parser (Apache-2.0), matching
 # ASAPPlanner's frontend-promql historically -- carries local patches
 # (limitk / limit_ratio, a batch of experimental Prometheus functions)

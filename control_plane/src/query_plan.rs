@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use planner_types::post_asap::{SketchQuery, SummaryExpr, SummaryFamilyType, SummaryNode};
-use planner_types::pre_asap::Reduction;
+use planner_types::pre_asap::{QueryExpr, Reduction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -362,6 +362,7 @@ impl QueryPlanEntry {
             bind: &mut bind,
             logical_source: None,
             preserve_relational: false,
+            bind_external: None,
         };
         let root = compiler.lower(root)?;
         Ok(Self {
@@ -398,6 +399,49 @@ impl QueryPlanEntry {
             bind: &mut bind,
             logical_source: None,
             preserve_relational: true,
+            bind_external: None,
+        };
+        let root = compiler.lower(root)?;
+        Ok(Self {
+            language: QueryLanguage::ClickHouseSql,
+            query_id,
+            canonical_query,
+            fixed_evaluation: Some(fixed_evaluation),
+            root,
+            nodes: compiler.nodes,
+            instant,
+            fallback,
+        })
+    }
+
+    pub fn compile_bound_relational_with_external<F, E>(
+        query_id: String,
+        canonical_query: String,
+        root: &Rc<SummaryNode>,
+        fixed_evaluation: FixedEvaluationRange,
+        instant: InstantExecution,
+        fallback: FallbackPolicy,
+        mut bind: F,
+        mut bind_external: E,
+    ) -> Result<Self, QueryPlanError>
+    where
+        F: FnMut(
+            &SummaryNode,
+            &SummaryFamilyType,
+        ) -> Result<MaterializationBinding, QueryPlanError>,
+        E: FnMut(
+            &QueryExpr,
+            &planner_types::post_asap::SummarySchema,
+        ) -> Result<Option<BoundClickHouseQuery>, QueryPlanError>,
+    {
+        let mut compiler = DagCompiler {
+            next_id: 0,
+            nodes: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            bind: &mut bind,
+            logical_source: None,
+            preserve_relational: true,
+            bind_external: Some(&mut bind_external),
         };
         let root = compiler.lower(root)?;
         Ok(Self {
@@ -435,6 +479,7 @@ impl QueryPlanEntry {
             bind: &mut bind,
             logical_source: Some(canonical_query.clone()),
             preserve_relational: false,
+            bind_external: None,
         };
         let root = compiler.lower(root)?;
         let mut entry = Self {
@@ -469,6 +514,7 @@ impl QueryPlanEntry {
                 query.validate()?;
             }
             if let QueryPlanNode::RelationalJoin {
+                inputs,
                 join_kind,
                 pred,
                 left_schema,
@@ -519,6 +565,39 @@ impl QueryPlanEntry {
                     return Err(QueryPlanError::Invalid(
                         "external SQL join schema or key bounds are invalid".into(),
                     ));
+                }
+                let mut expected_fields = left_schema.fields.clone();
+                expected_fields.extend(right_schema.fields.clone());
+                let expected_time_index = left_schema.time_index.or_else(|| {
+                    right_schema
+                        .time_index
+                        .map(|index| left_schema.fields.len() + index)
+                });
+                if output_schema.fields != expected_fields
+                    || output_schema.time_index != expected_time_index
+                {
+                    return Err(QueryPlanError::Invalid(
+                        "relational join output schema is not the strict input concatenation"
+                            .into(),
+                    ));
+                }
+                for (input, declared) in [(inputs[0], left_schema), (inputs[1], right_schema)] {
+                    let actual = match self.nodes.get(&input) {
+                        Some(QueryPlanNode::ExternalSqlLeaf { query }) => {
+                            Some(&query.output_schema)
+                        }
+                        Some(QueryPlanNode::Relational { output_schema, .. })
+                        | Some(QueryPlanNode::RelationalJoin { output_schema, .. }) => {
+                            Some(output_schema)
+                        }
+                        _ => None,
+                    };
+                    if actual.is_some_and(|actual| actual != declared) {
+                        return Err(QueryPlanError::Invalid(
+                            "relational join child output differs from its declared input schema"
+                                .into(),
+                        ));
+                    }
                 }
             }
             if let QueryPlanNode::Logical { operator, inputs } = node {
@@ -641,15 +720,59 @@ impl BoundClickHouseQuery {
                 "ClickHouse external subtree has empty output schema".into(),
             ));
         }
+        let placeholder = regex::Regex::new(r"\{([A-Za-z_][A-Za-z0-9_]*):[^{}]+\}")
+            .expect("static placeholder regex");
+        let parseable_sql = placeholder.replace_all(&self.sql, "0");
+        let statements = sqlparser::parser::Parser::parse_sql(
+            &sqlparser::dialect::ClickHouseDialect {},
+            &parseable_sql,
+        )
+        .map_err(|error| QueryPlanError::Invalid(format!("invalid external SQL: {error}")))?;
+        let [sqlparser::ast::Statement::Query(parsed_query)] = statements.as_slice() else {
+            return Err(QueryPlanError::Invalid(
+                "ClickHouse external subtree must be one read-only SELECT".into(),
+            ));
+        };
+        if parsed_query.format_clause.is_some() {
+            return Err(QueryPlanError::Invalid(
+                "ClickHouse external subtree must not choose its wire format".into(),
+            ));
+        }
+        let declared = placeholder
+            .captures_iter(&self.sql)
+            .map(|capture| capture[1].to_owned())
+            .collect::<BTreeSet<_>>();
+        let mut supplied = self.parameters.keys().cloned().collect::<BTreeSet<_>>();
+        supplied.extend(
+            [&self.start_parameter, &self.end_parameter]
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+        if declared != supplied {
+            return Err(QueryPlanError::Invalid(
+                "ClickHouse placeholder declarations and bindings differ".into(),
+            ));
+        }
         for name in [&self.start_parameter, &self.end_parameter]
             .into_iter()
             .flatten()
         {
-            if name.is_empty() || self.parameters.contains_key(name) {
+            if name.is_empty() || self.parameters.contains_key(name) || name.starts_with("param_") {
                 return Err(QueryPlanError::Invalid(
                     "ClickHouse time parameter is empty or shadows a static parameter".into(),
                 ));
             }
+        }
+        if self
+            .parameters
+            .keys()
+            .any(|name| name.starts_with("param_"))
+        {
+            return Err(QueryPlanError::Invalid(
+                "ClickHouse bindings use logical placeholder names, without the HTTP param_ prefix"
+                    .into(),
+            ));
         }
         if self.start_parameter.is_some() && self.start_parameter == self.end_parameter {
             return Err(QueryPlanError::Invalid(
@@ -809,6 +932,12 @@ struct DagCompiler<'a, F> {
     bind: &'a mut F,
     logical_source: Option<String>,
     preserve_relational: bool,
+    bind_external: Option<
+        &'a mut dyn FnMut(
+            &QueryExpr,
+            &planner_types::post_asap::SummarySchema,
+        ) -> Result<Option<BoundClickHouseQuery>, QueryPlanError>,
+    >,
 }
 
 impl<F> DagCompiler<'_, F>
@@ -901,6 +1030,19 @@ where
         }
 
         let physical = match &node.expr {
+            SummaryExpr::KeepPreAsap(expr) if self.preserve_relational => {
+                match self.bind_external.as_mut() {
+                    Some(bind) => match bind(expr, &node.schema)? {
+                        Some(query) => QueryPlanNode::ExternalSqlLeaf { query },
+                        None => QueryPlanNode::ExactFallback {
+                            reason: "planner exact SQL cut has no bound external artifact".into(),
+                        },
+                    },
+                    None => QueryPlanNode::ExactFallback {
+                        reason: "planner exact SQL cut has no external binder".into(),
+                    },
+                }
+            }
             SummaryExpr::ValueOperation {
                 child, operation, ..
             } if self.preserve_relational
@@ -1886,11 +2028,11 @@ mod catalog_binding_tests {
             .bind_external_sql_leaf(
                 cut,
                 BoundClickHouseQuery {
-                    sql: "SELECT value FROM exact_source".into(),
+                    sql: "SELECT value FROM exact_source WHERE ts >= {from:UInt64} AND ts < {to:UInt64}".into(),
                     parameters: BTreeMap::new(),
                     start_parameter: Some("from".into()),
                     end_parameter: Some("to".into()),
-                    output_schema: schema,
+                    output_schema: schema.clone(),
                 },
             )
             .unwrap();
@@ -1914,5 +2056,21 @@ mod catalog_binding_tests {
                 }
             )
             .is_err());
+        let bad = BoundClickHouseQuery {
+            sql: "SELECT value FROM t FORMAT JSONCompact".into(),
+            parameters: BTreeMap::new(),
+            start_parameter: None,
+            end_parameter: None,
+            output_schema: schema.clone(),
+        };
+        assert!(bad.validate().is_err());
+        let missing = BoundClickHouseQuery {
+            sql: "SELECT value FROM t WHERE ts >= {from:Int64}".into(),
+            parameters: BTreeMap::new(),
+            start_parameter: None,
+            end_parameter: None,
+            output_schema: schema,
+        };
+        assert!(missing.validate().is_err());
     }
 }

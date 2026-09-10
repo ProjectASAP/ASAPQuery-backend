@@ -51,6 +51,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 chrono.workspace = true
+chrono-tz = "0.10"
 promql-parser.workspace = true
 tokio.workspace = true
 arc-swap.workspace = true

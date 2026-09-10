@@ -11,12 +11,14 @@ use planner_types::workload::SqlDialect;
 use crate::physical::compiler::{PrecomputePlan, TransmissionPlan};
 use crate::physical::post_asap::{cost_model::ControlPlaneCostModel, PhysicalExpr};
 use crate::query_plan::{
-    ClickHousePlanningContext, FallbackPolicy, FixedEvaluationRange, InstantExecution,
-    MaterializationBinding, PhysicalGrouping, QueryLanguage, QueryPlan, QueryPlanEntry,
+    BoundClickHouseQuery, ClickHousePlanningContext, FallbackPolicy, FixedEvaluationRange,
+    InstantExecution, MaterializationBinding, PhysicalGrouping, QueryLanguage, QueryPlan,
+    QueryPlanEntry,
 };
 use asap_types::summary_catalog::SummaryCatalog;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClickHousePlanningError {
@@ -43,8 +45,20 @@ pub async fn plan_clickhouse_sql(
     // SQL keeps relational parents such as Project and Filter above a
     // summary-capable Aggregate. Use ASAPPlanner's recursive selector here;
     // the PromQL deployment lowering retains its existing conservative rules.
-    let cost_model = ControlPlaneCostModel::new(accuracy);
-    let selected = crate::planner_selection::select_summary(&canonical, &cost_model)?;
+    let cost_model = ControlPlaneCostModel::new(accuracy.clone());
+    let selected = crate::planner_selection::select_workload(
+        vec![(0, Rc::new(canonical.clone()))],
+        accuracy,
+        &cost_model,
+    )?
+    .into_iter()
+    .next()
+    .map(|(_, node)| node)
+    .ok_or_else(|| {
+        crate::planner_selection::SelectionError::Workload(
+            "SQL workload search returned no root".into(),
+        )
+    })?;
     let physical = PhysicalExpr::committed(selected);
     Ok(ClickHousePlannedQuery {
         canonical_sql: canonical_sql_identity(&canonical),
@@ -88,6 +102,24 @@ pub struct ClickHouseSqlWorkloadEntry {
     pub start_ms: u64,
     pub end_ms: u64,
     pub cumulative: bool,
+    /// Exact subtree artifacts emitted alongside ASAPPlanner's selected DAG.
+    #[serde(default)]
+    pub exact_subtrees: Vec<ClickHouseExactSubtreeArtifact>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClickHouseExactSubtreeArtifact {
+    pub canonical_subtree: serde_json::Value,
+    pub canonical_subtree_fingerprint: u64,
+    pub query: BoundClickHouseQuery,
+}
+
+pub fn canonical_subtree_fingerprint(
+    canonical_subtree: &serde_json::Value,
+) -> Result<u64, ClickHousePlanningError> {
+    let encoded = serde_json::to_vec(canonical_subtree)
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+    Ok(xxhash_rust::xxh64::xxh64(&encoded, 0))
 }
 
 /// Physical-plan components produced for the normal atomic install path.
@@ -125,7 +157,22 @@ pub async fn compile_clickhouse_workload(
                 "SQL did not produce a summary DAG".into(),
             ));
         };
-        let executable = QueryPlanEntry::compile_bound_relational(
+        let mut fingerprints = std::collections::BTreeSet::new();
+        for artifact in &query.exact_subtrees {
+            let actual = canonical_subtree_fingerprint(&artifact.canonical_subtree)?;
+            if actual != artifact.canonical_subtree_fingerprint {
+                return Err(ClickHousePlanningError::Lower(
+                    "exact SQL artifact fingerprint differs from its canonical subtree".into(),
+                ));
+            }
+            if !fingerprints.insert(actual) {
+                return Err(ClickHousePlanningError::Lower(
+                    "duplicate exact SQL subtree artifact".into(),
+                ));
+            }
+        }
+        let mut used = std::collections::BTreeSet::new();
+        let executable = QueryPlanEntry::compile_bound_relational_with_external(
             query.sql.clone(),
             planned.canonical_sql.clone(),
             &root,
@@ -141,8 +188,41 @@ pub async fn compile_clickhouse_workload(
             },
             FallbackPolicy::ExactBackend,
             |node, family| bind_selected_node(node, family, query, request),
+            |cut, schema| {
+                let canonical_subtree = serde_json::to_value(cut).map_err(|error| {
+                    crate::query_plan::QueryPlanError::Invalid(error.to_string())
+                })?;
+                let fingerprint =
+                    canonical_subtree_fingerprint(&canonical_subtree).map_err(|error| {
+                        crate::query_plan::QueryPlanError::Invalid(error.to_string())
+                    })?;
+                let Some((index, artifact)) =
+                    query
+                        .exact_subtrees
+                        .iter()
+                        .enumerate()
+                        .find(|(_, artifact)| {
+                            artifact.canonical_subtree_fingerprint == fingerprint
+                                && artifact.canonical_subtree == canonical_subtree
+                        })
+                else {
+                    return Ok(None);
+                };
+                if &artifact.query.output_schema != schema {
+                    return Err(crate::query_plan::QueryPlanError::Invalid(
+                        "exact SQL artifact schema differs from the Planner cut".into(),
+                    ));
+                }
+                used.insert(index);
+                Ok(Some(artifact.query.clone()))
+            },
         )
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+        if used.len() != query.exact_subtrees.len() {
+            return Err(ClickHousePlanningError::Lower(
+                "one or more exact SQL subtree artifacts were not used by the Planner DAG".into(),
+            ));
+        }
         if executable
             .nodes
             .values()
@@ -376,5 +456,122 @@ mod tests {
                 .to_string()
                 .contains("ambiguous")
         );
+    }
+
+    #[tokio::test]
+    async fn production_compile_publishes_only_the_planner_matched_exact_cut() {
+        use crate::physical::compiler::{PlanEnvelope, BACKEND_COMPAT, PLANNER_REVISION};
+        use planner_types::{
+            post_asap::{SummaryExpr, SummaryNode},
+            pre_asap::{Column, DataType, Schema},
+        };
+        use std::{collections::BTreeMap, rc::Rc};
+
+        fn exact_cut(
+            node: &Rc<SummaryNode>,
+        ) -> Option<(&QueryExpr, &planner_types::post_asap::SummarySchema)> {
+            match &node.expr {
+                SummaryExpr::KeepPreAsap(expr) => Some((expr, &node.schema)),
+                SummaryExpr::ValueOperation { child, .. } => exact_cut(child),
+                _ => None,
+            }
+        }
+
+        let table = Schema::with_time_index(
+            vec![
+                Column::new("timestamp", DataType::Timestamp, false),
+                Column::new("value", DataType::Float64, false),
+            ],
+            0,
+            vec![],
+        );
+        let tables = HashMap::from([("requests".into(), table)]);
+        let planned = plan_clickhouse_sql(
+            "SELECT timestamp, value FROM requests",
+            &SqlCatalog {
+                tables: tables.clone(),
+            },
+            AccuracyTarget::Exact,
+        )
+        .await
+        .unwrap();
+        let PhysicalExpr::Committed(crate::physical::post_asap::PostAsapPlan::Summary(root)) =
+            planned.physical
+        else {
+            panic!("summary plan")
+        };
+        let (cut, schema) = exact_cut(&root).expect("Planner exact cut");
+        let canonical_subtree = serde_json::to_value(cut).unwrap();
+        let fingerprint = canonical_subtree_fingerprint(&canonical_subtree).unwrap();
+
+        let sds = SummaryCatalog::from_materializations(91, 1, &[]).unwrap();
+        let envelope = PlanEnvelope {
+            plan_id: 91,
+            plan_version: 1,
+            generated_at_unix_ms: 0,
+            activation_unix_ms: 0,
+            expiry_unix_ms: None,
+            backend_compat: BACKEND_COMPAT.into(),
+            planner_revision: PLANNER_REVISION.into(),
+            capability_snapshot_id: "sql-exact-cut".into(),
+        };
+        let mut precompute_plan = PrecomputePlan::build(envelope.clone(), vec![], &[]).unwrap();
+        precompute_plan.summary_catalog = Some(sds.reference().unwrap());
+        let mut transmission_plan =
+            TransmissionPlan::build(envelope, &precompute_plan, &BTreeMap::new()).unwrap();
+        transmission_plan.summary_catalog = Some(sds.reference().unwrap());
+        let workload = ClickHouseSqlWorkload {
+            sds: sds.clone(),
+            precompute_plan,
+            transmission_plan,
+            tables,
+            accuracy: AccuracyTarget::Exact,
+            queries: vec![ClickHouseSqlWorkloadEntry {
+                sql: "SELECT timestamp, value FROM requests".into(),
+                start_ms: 0,
+                end_ms: 2_000,
+                cumulative: false,
+                exact_subtrees: vec![ClickHouseExactSubtreeArtifact {
+                    canonical_subtree,
+                    canonical_subtree_fingerprint: fingerprint,
+                    query: BoundClickHouseQuery {
+                        sql: "SELECT timestamp, value FROM requests WHERE timestamp >= {from:Int64} AND timestamp < {to:Int64}".into(),
+                        parameters: BTreeMap::new(),
+                        start_parameter: Some("from".into()),
+                        end_parameter: Some("to".into()),
+                        output_schema: schema.clone(),
+                    },
+                }],
+            }],
+        };
+        let bundle = compile_clickhouse_workload(&workload).await.unwrap();
+        bundle.query_plan.validate_against_catalog(&sds).unwrap();
+        assert!(bundle
+            .query_plan
+            .entries
+            .values()
+            .next()
+            .unwrap()
+            .nodes
+            .values()
+            .any(|node| matches!(
+                node,
+                crate::query_plan::QueryPlanNode::ExternalSqlLeaf { .. }
+            )));
+
+        let mut unused = workload;
+        let duplicate = unused.queries[0].exact_subtrees[0].clone();
+        unused.queries[0].exact_subtrees.push(duplicate);
+        assert!(compile_clickhouse_workload(&unused).await.is_err());
+        unused.queries[0].exact_subtrees.pop();
+        unused.queries[0].exact_subtrees[0].canonical_subtree =
+            serde_json::to_value(QueryExpr::<usize>::Literal(
+                planner_types::pre_asap::ScalarValue::Float64(1.0),
+            ))
+            .unwrap();
+        unused.queries[0].exact_subtrees[0].canonical_subtree_fingerprint =
+            canonical_subtree_fingerprint(&unused.queries[0].exact_subtrees[0].canonical_subtree)
+                .unwrap();
+        assert!(compile_clickhouse_workload(&unused).await.is_err());
     }
 }

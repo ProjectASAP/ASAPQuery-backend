@@ -9,6 +9,7 @@ use arrow::{
     datatypes::{DataType as ArrowDataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use chrono::{DateTime, NaiveDateTime, TimeZone};
 use planner_types::{
     post_asap::{SummaryFamilyType, SummaryNode, SummarySchema, ValueOperation},
     pre_asap::{ArithmeticOpKind, CompareOpKind, DataType, QueryExpr, ScalarValue, SortKey},
@@ -62,6 +63,7 @@ fn json_cell(
     value: &serde_json::Value,
     dtype: &DataType,
     nullable: bool,
+    clickhouse_type: &str,
 ) -> Result<Cell, ClickHouseRelationalError> {
     if value.is_null() && nullable {
         return Ok(Cell::Null);
@@ -79,8 +81,62 @@ fn json_cell(
             .map(|value| Cell::Utf8(value.into()))
             .ok_or_else(invalid),
         DataType::Bool => value.as_bool().map(Cell::Bool).ok_or_else(invalid),
-        DataType::Timestamp => value.as_i64().map(Cell::Timestamp).ok_or_else(invalid),
+        DataType::Timestamp => parse_clickhouse_timestamp(value, clickhouse_type)
+            .map(Cell::Timestamp)
+            .ok_or_else(invalid),
     }
+}
+
+fn parse_clickhouse_timestamp(value: &serde_json::Value, clickhouse_type: &str) -> Option<i64> {
+    let clickhouse_type = clickhouse_type
+        .strip_prefix("Nullable(")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(clickhouse_type);
+    if clickhouse_type == "Int64" {
+        return value.as_i64();
+    }
+    let text = value.as_str()?;
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(text) {
+        return Some(timestamp.timestamp_millis());
+    }
+    let (scale, timezone) = if clickhouse_type == "DateTime" {
+        (0, "UTC")
+    } else {
+        let args = clickhouse_type
+            .strip_prefix("DateTime64(")?
+            .strip_suffix(')')?;
+        let mut args = args.split(',').map(str::trim);
+        let scale = args.next()?.parse::<usize>().ok()?;
+        if scale > 9 {
+            return None;
+        }
+        let timezone = args.next().unwrap_or("UTC").trim_matches('\'');
+        if args.next().is_some() {
+            return None;
+        }
+        (scale, timezone)
+    };
+    let fraction_digits = text
+        .split_once('.')
+        .map(|(_, fraction)| fraction.len())
+        .unwrap_or(0);
+    if fraction_digits != scale {
+        return None;
+    }
+    let naive = NaiveDateTime::parse_from_str(
+        text,
+        if scale == 0 {
+            "%Y-%m-%d %H:%M:%S"
+        } else {
+            "%Y-%m-%d %H:%M:%S%.f"
+        },
+    )
+    .ok()?;
+    let timezone: chrono_tz::Tz = timezone.parse().ok()?;
+    timezone
+        .from_local_datetime(&naive)
+        .single()
+        .map(|value| value.timestamp_millis())
 }
 
 #[derive(Clone, Debug)]
@@ -147,7 +203,15 @@ impl ClickHouseRelation {
                 encoded
                     .iter()
                     .zip(&fields)
-                    .map(|(value, (_, dtype, nullable))| json_cell(value, dtype, *nullable))
+                    .zip(meta)
+                    .map(|((value, (_, dtype, nullable)), metadata)| {
+                        json_cell(
+                            value,
+                            dtype,
+                            *nullable,
+                            metadata["type"].as_str().expect("metadata validated"),
+                        )
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }

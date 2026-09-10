@@ -75,10 +75,15 @@ fn execute_relation_subtree(
     is_cumulative: bool,
 ) -> Result<ClickHouseRelation, String> {
     match entry.nodes.get(&root) {
-        Some(QueryPlanNode::ExternalSqlLeaf { .. }) => prepared
-            .get(&root)
-            .cloned()
-            .ok_or_else(|| "published external SQL leaf was not prepared".into()),
+        Some(QueryPlanNode::ExternalSqlLeaf { query }) => {
+            if &query.output_schema != expected_schema {
+                return Err("external SQL leaf schema differs from its parent edge".into());
+            }
+            prepared
+                .get(&root)
+                .cloned()
+                .ok_or_else(|| "published external SQL leaf was not prepared".into())
+        }
         Some(QueryPlanNode::Relational {
             input,
             operation,
