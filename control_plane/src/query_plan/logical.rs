@@ -1500,7 +1500,7 @@ mod remote_boundary_regressions {
     use super::*;
 
     #[test]
-    fn materialization_identity_is_independent_of_matcher_order() {
+    fn summary_definition_identity_is_independent_of_matcher_order() {
         let first = LabelMatcher {
             name: "job".into(),
             value: "orders".into(),

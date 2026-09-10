@@ -128,7 +128,7 @@ impl SummaryDescriptorRegistry {
                     "materialization identity is required by the installed SummaryCatalog".into(),
                 );
             }
-            let materialization = asap_types::sds::MaterializationId::from(metadata.policy_fp);
+            let materialization = asap_types::sds::SummaryDefinitionId::from(metadata.policy_fp);
             let identity = catalog
                 .materializations
                 .get(&materialization)

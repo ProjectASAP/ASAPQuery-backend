@@ -31,8 +31,8 @@ macro_rules! descriptor_id {
 /// but distinct from descriptor IDs and runtime instance/SID identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct MaterializationId(pub crate::PolicyFingerprint);
-impl MaterializationId {
+pub struct SummaryDefinitionId(pub crate::PolicyFingerprint);
+impl SummaryDefinitionId {
     pub fn fingerprint(self) -> crate::PolicyFingerprint {
         self.0
     }
@@ -40,13 +40,13 @@ impl MaterializationId {
         self.0 .0
     }
 }
-impl From<crate::PolicyFingerprint> for MaterializationId {
+impl From<crate::PolicyFingerprint> for SummaryDefinitionId {
     fn from(value: crate::PolicyFingerprint) -> Self {
         Self(value)
     }
 }
-impl From<MaterializationId> for crate::PolicyFingerprint {
-    fn from(value: MaterializationId) -> Self {
+impl From<SummaryDefinitionId> for crate::PolicyFingerprint {
+    fn from(value: SummaryDefinitionId) -> Self {
         value.0
     }
 }
@@ -145,7 +145,8 @@ pub enum InstanceLifecycle {
 #[serde(deny_unknown_fields)]
 pub struct SummaryInstance {
     pub instance_id: SummaryInstanceId,
-    pub materialization_id: MaterializationId,
+    #[serde(alias = "materialization_id")]
+    pub summary_definition_id: SummaryDefinitionId,
     pub summary_descriptor_id: SummaryDescriptorId,
     pub data_descriptor_id: DataDescriptorId,
     pub time_range: HalfOpenTimeRange,
@@ -663,7 +664,7 @@ mod tests {
     fn observed_instance(lifecycle: InstanceLifecycle) -> SummaryInstance {
         SummaryInstance {
             instance_id: SummaryInstanceId::new("instance-1").unwrap(),
-            materialization_id: MaterializationId(crate::PolicyFingerprint(7)),
+            summary_definition_id: SummaryDefinitionId(crate::PolicyFingerprint(7)),
             summary_descriptor_id: descriptor(
                 200,
                 FidelityGuarantee::KllRankError {
@@ -979,9 +980,9 @@ mod tests {
         assert_ne!(first.id, second.id);
     }
     #[test]
-    fn materialization_id_preserves_legacy_wire_identity() {
+    fn summary_definition_id_preserves_legacy_wire_identity() {
         let fingerprint = crate::PolicyFingerprint(42);
-        let id = MaterializationId::from(fingerprint);
+        let id = SummaryDefinitionId::from(fingerprint);
         assert_eq!(id.fingerprint(), fingerprint);
         assert_eq!(id.as_u64(), 42);
         assert_eq!(crate::PolicyFingerprint::from(id), fingerprint);
@@ -989,6 +990,9 @@ mod tests {
             serde_json::to_value(id).unwrap(),
             serde_json::to_value(fingerprint).unwrap()
         );
-        assert_eq!(serde_json::from_str::<MaterializationId>("42").unwrap(), id);
+        assert_eq!(
+            serde_json::from_str::<SummaryDefinitionId>("42").unwrap(),
+            id
+        );
     }
 }
