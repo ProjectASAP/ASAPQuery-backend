@@ -95,6 +95,7 @@ pub struct ActivePhysicalPlan {
     pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
     pub runtime_config: Arc<StreamingConfig>,
     pub query_plan: Arc<control_plane::query_plan::QueryPlan>,
+    pub metricsql_plan_catalog: Arc<control_plane::metricsql_plan::MetricsQlPlanCatalog>,
     pub storage_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
 }
 
@@ -692,6 +693,9 @@ mod tests {
                 plan_version,
                 entries: Default::default(),
             }),
+            metricsql_plan_catalog: Arc::new(
+                control_plane::metricsql_plan::MetricsQlPlanCatalog::empty(),
+            ),
             storage_routing: Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
         }
     }

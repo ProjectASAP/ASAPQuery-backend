@@ -407,20 +407,19 @@ impl QueryPlanEntry {
     /// Callers retain a separate external-native alternative for cost comparison.
     pub fn compile_logical(
         query_id: String,
-        canonical_query: String,
+        canonical_promql: String,
         instant: InstantExecution,
         fallback: FallbackPolicy,
     ) -> Result<Self, QueryPlanError> {
-        let expr = parser::parse(&canonical_query).map_err(|e| invalid(e.to_string()))?;
+        let expr = parser::parse(&canonical_promql).map_err(|e| invalid(e.to_string()))?;
         let mut lower = Lower {
             nodes: BTreeMap::new(),
             seen: BTreeMap::new(),
         };
         let root = lower.lower(&expr)?;
         let entry = Self {
-            language: super::QueryLanguage::PromQl,
             query_id,
-            canonical_query,
+            canonical_promql,
             root,
             nodes: lower.nodes,
             instant,
@@ -443,7 +442,7 @@ impl QueryPlanEntry {
         }
         Self::compile_logical(
             self.query_id.clone(),
-            self.canonical_query.clone(),
+            self.canonical_promql.clone(),
             self.instant,
             self.fallback,
         )
@@ -1374,7 +1373,7 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
             _ => {}
         }
     }
-    let expr = parser::parse(&entry.canonical_query).map_err(|e| invalid(e.to_string()))?;
+    let expr = parser::parse(&entry.canonical_promql).map_err(|e| invalid(e.to_string()))?;
     let mut expressions = Vec::new();
     gather(&expr, &mut expressions);
     let mut witnesses = BTreeMap::new();

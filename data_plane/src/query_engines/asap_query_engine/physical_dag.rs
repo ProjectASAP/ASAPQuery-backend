@@ -133,9 +133,8 @@ mod tests {
         .into_iter()
         .collect();
         let entry = QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
-            canonical_query: "up".into(),
+            canonical_promql: "up".into(),
             root,
             nodes,
             instant: InstantExecution {

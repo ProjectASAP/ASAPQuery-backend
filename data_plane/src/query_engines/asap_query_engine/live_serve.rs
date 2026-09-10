@@ -448,9 +448,8 @@ mod tests {
             );
         }
         let entry = control_plane::query_plan::QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "q-sum".into(),
-            canonical_query: "sum_over_time(bytes[1s])".into(),
+            canonical_promql: "sum_over_time(bytes[1s])".into(),
             root: control_plane::query_plan::QueryNodeId(0),
             nodes: BTreeMap::from([
                 (

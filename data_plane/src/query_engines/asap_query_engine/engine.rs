@@ -132,22 +132,26 @@ impl ASAPQueryEngine {
     {
         let physical = self.physical_plan_snapshot().ok_or_else(|| {
             crate::query_engines::EngineError::capability_miss(
-                "query_plan",
+                "metricsql_catalog",
                 "no active physical plan",
             )
         })?;
         let planned = physical
-            .query_plan
-            .lookup_canonical(
-                control_plane::query_plan::QueryLanguage::MetricsQl,
-                identity,
-            )
+            .metricsql_plan_catalog
+            .lookup(identity)
             .map_err(|error| {
-                crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
+                crate::query_engines::EngineError::capability_miss(
+                    "metricsql_catalog",
+                    error.to_string(),
+                )
             })?;
-        let leaves = self.prepare_logical(&physical, planned, &[now_ms]).await?;
+        let entry = planned.executable.execution_view(
+            planned.query_id.clone(),
+            planned.canonical_metricsql.clone(),
+        );
+        let leaves = self.prepare_logical(&physical, &entry, &[now_ms]).await?;
         let (mut result, mut stats) =
-            self.execute_logical_entry(&physical, planned, &leaves, now_ms)?;
+            self.execute_logical_entry(&physical, &entry, &leaves, now_ms)?;
         stats.remote_evaluations = leaves.values().map(|leaf| leaf.remote_evaluations).sum();
         stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
         annotate_logical_execution(&mut result, &stats);
@@ -164,20 +168,24 @@ impl ASAPQueryEngine {
     {
         let physical = self.physical_plan_snapshot().ok_or_else(|| {
             crate::query_engines::EngineError::capability_miss(
-                "query_plan",
+                "metricsql_catalog",
                 "no active physical plan",
             )
         })?;
         let planned = physical
-            .query_plan
-            .lookup_canonical(
-                control_plane::query_plan::QueryLanguage::MetricsQl,
-                identity,
-            )
+            .metricsql_plan_catalog
+            .lookup(identity)
             .map_err(|error| {
-                crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
+                crate::query_engines::EngineError::capability_miss(
+                    "metricsql_catalog",
+                    error.to_string(),
+                )
             })?;
-        self.execute_logical_range(&physical, planned, start_ms, end_ms, step_ms)
+        let entry = planned.executable.execution_view(
+            planned.query_id.clone(),
+            planned.canonical_metricsql.clone(),
+        );
+        self.execute_logical_range(&physical, &entry, start_ms, end_ms, step_ms)
             .await
     }
 
@@ -3708,44 +3716,49 @@ mod range_stitch_tests {
     }
 
     #[tokio::test]
-    async fn active_metricsql_entry_reaches_the_shared_dag_executor() {
+    async fn active_metricsql_sidecar_reaches_the_shared_dag_executor() {
+        use control_plane::metricsql_plan::{MetricsQlPlanCatalog, MetricsQlPlanEntry};
         use control_plane::query_plan::{
-            FallbackPolicy, InstantExecution, QueryLanguage, QueryNodeId, QueryPlanEntry,
-            QueryPlanNode,
+            ExecutableQueryPlan, FallbackPolicy, InstantExecution, QueryNodeId, QueryPlanNode,
         };
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_str(include_str!(
                 "../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
             ))
             .unwrap();
-        let mut plan = snapshot.compile().unwrap();
+        let plan = snapshot.compile().unwrap();
         let identity = asap_frontend_metricsql::canonical_metricsql("1 + 2").unwrap();
-        plan.query_plan.entries.insert(
-            identity.clone(),
-            QueryPlanEntry {
-                language: QueryLanguage::MetricsQl,
-                query_id: "vm-scalar".into(),
-                canonical_query: identity.clone(),
-                root: QueryNodeId(2),
-                nodes: std::collections::BTreeMap::from([
-                    (QueryNodeId(0), QueryPlanNode::Scalar { value: 1.0 }),
-                    (QueryNodeId(1), QueryPlanNode::Scalar { value: 2.0 }),
-                    (
-                        QueryNodeId(2),
-                        QueryPlanNode::Binary {
-                            inputs: [QueryNodeId(0), QueryNodeId(1)],
-                            operator: planner_types::pre_asap::ArithmeticOpKind::Add,
+        let sidecar = MetricsQlPlanCatalog {
+            plan_id: plan.envelope.plan_id,
+            plan_version: plan.envelope.plan_version,
+            entries: std::collections::BTreeMap::from([(
+                identity.clone(),
+                MetricsQlPlanEntry {
+                    query_id: "vm-scalar".into(),
+                    canonical_metricsql: identity.clone(),
+                    executable: ExecutableQueryPlan {
+                        root: QueryNodeId(2),
+                        nodes: std::collections::BTreeMap::from([
+                            (QueryNodeId(0), QueryPlanNode::Scalar { value: 1.0 }),
+                            (QueryNodeId(1), QueryPlanNode::Scalar { value: 2.0 }),
+                            (
+                                QueryNodeId(2),
+                                QueryPlanNode::Binary {
+                                    inputs: [QueryNodeId(0), QueryNodeId(1)],
+                                    operator: planner_types::pre_asap::ArithmeticOpKind::Add,
+                                },
+                            ),
+                        ]),
+                        instant: InstantExecution {
+                            lookback_ms: 1,
+                            full_history: false,
+                            cumulative_readout: false,
                         },
-                    ),
-                ]),
-                instant: InstantExecution {
-                    lookback_ms: 1,
-                    full_history: false,
-                    cumulative_readout: false,
+                        fallback: FallbackPolicy::ExactBackend,
+                    },
                 },
-                fallback: FallbackPolicy::ExactBackend,
-            },
-        );
+            )]),
+        };
         let mut active = crate::drivers::query::servers::http::build_active_physical_plan(
             crate::drivers::query::servers::http::PhysicalPlanInstallRequest {
                 summary_catalog: plan.summary_catalog,
@@ -3753,6 +3766,7 @@ mod range_stitch_tests {
                 precompute_plan: plan.precompute_plan,
                 transmission_plan: plan.transmission_plan,
                 query_plan: plan.query_plan,
+                metricsql_plan_catalog: Some(sidecar),
                 storage_routing: None,
                 adaptation_evidence: vec![],
             },

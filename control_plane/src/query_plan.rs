@@ -36,18 +36,9 @@ impl QueryPlan {
 
     pub fn lookup(&self, promql: &str) -> Result<&QueryPlanEntry, QueryPlanError> {
         let identity = canonical_promql(promql)?;
-        self.lookup_canonical(QueryLanguage::PromQl, &identity)
-    }
-
-    pub fn lookup_canonical(
-        &self,
-        language: QueryLanguage,
-        identity: &str,
-    ) -> Result<&QueryPlanEntry, QueryPlanError> {
         self.entries
-            .get(identity)
-            .filter(|entry| entry.language == language)
-            .ok_or_else(|| QueryPlanError::QueryNotPlanned(identity.into()))
+            .get(&identity)
+            .ok_or(QueryPlanError::QueryNotPlanned(identity))
     }
 
     /// Validate semantic bindings against the authoritative snapshot before use.
@@ -130,24 +121,16 @@ impl QueryPlan {
             ));
         }
         for (identity, entry) in &self.entries {
-            if identity != &entry.canonical_query {
+            if identity != &entry.canonical_promql {
                 return Err(QueryPlanError::Invalid(format!(
                     "query map key `{identity}` differs from entry identity `{}`",
-                    entry.canonical_query
+                    entry.canonical_promql
                 )));
             }
             entry.validate(available)?;
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum QueryLanguage {
-    #[default]
-    PromQl,
-    MetricsQl,
 }
 
 /// Stable identity inside one query entry. Edges are IDs so common
@@ -159,15 +142,61 @@ pub struct QueryNodeId(pub u64);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct QueryPlanEntry {
-    #[serde(default)]
-    pub language: QueryLanguage,
     pub query_id: String,
-    #[serde(alias = "canonical_promql")]
-    pub canonical_query: String,
+    pub canonical_promql: String,
     pub root: QueryNodeId,
     pub nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
     pub instant: InstantExecution,
     pub fallback: FallbackPolicy,
+}
+
+/// Language-neutral executable projection of a compiled physical query DAG.
+///
+/// This is deliberately separate from [`QueryPlanEntry`], whose serialized
+/// `canonical_promql` identity remains part of the stable PromQL contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableQueryPlan {
+    pub root: QueryNodeId,
+    pub nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
+    pub instant: InstantExecution,
+    pub fallback: FallbackPolicy,
+}
+
+impl QueryPlanEntry {
+    pub fn executable(&self) -> ExecutableQueryPlan {
+        ExecutableQueryPlan {
+            root: self.root,
+            nodes: self.nodes.clone(),
+            instant: self.instant.clone(),
+            fallback: self.fallback.clone(),
+        }
+    }
+}
+
+impl ExecutableQueryPlan {
+    pub fn materialization_bindings(&self) -> Vec<&MaterializationBinding> {
+        self.nodes
+            .values()
+            .filter_map(|node| match node {
+                QueryPlanNode::ReadMaterialization { binding } => Some(binding),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Internal compatibility view for the existing executor. The supplied
+    /// identity is never serialized into the PromQL plan catalog.
+    pub fn execution_view(&self, query_id: String, source: String) -> QueryPlanEntry {
+        QueryPlanEntry {
+            query_id,
+            canonical_promql: source,
+            root: self.root,
+            nodes: self.nodes.clone(),
+            instant: self.instant.clone(),
+            fallback: self.fallback.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,7 +223,7 @@ impl QueryPlanEntry {
 
     pub fn compile_bound<F>(
         query_id: String,
-        canonical_query: String,
+        canonical_promql: String,
         root: &Rc<SummaryNode>,
         instant: InstantExecution,
         fallback: FallbackPolicy,
@@ -215,9 +244,8 @@ impl QueryPlanEntry {
         };
         let root = compiler.lower(root)?;
         Ok(Self {
-            language: QueryLanguage::PromQl,
             query_id,
-            canonical_query,
+            canonical_promql,
             root,
             nodes: compiler.nodes,
             instant,
@@ -229,7 +257,7 @@ impl QueryPlanEntry {
     /// This is a distinct physical alternative; native execution remains available.
     pub fn compile_bound_composable<F>(
         query_id: String,
-        canonical_query: String,
+        canonical_promql: String,
         root: &Rc<SummaryNode>,
         instant: InstantExecution,
         fallback: FallbackPolicy,
@@ -246,13 +274,12 @@ impl QueryPlanEntry {
             nodes: BTreeMap::new(),
             seen: BTreeMap::new(),
             bind: &mut bind,
-            logical_source: Some(canonical_query.clone()),
+            logical_source: Some(canonical_promql.clone()),
         };
         let root = compiler.lower(root)?;
         let mut entry = Self {
-            language: QueryLanguage::PromQl,
             query_id,
-            canonical_query,
+            canonical_promql,
             root,
             nodes: compiler.nodes,
             instant,
@@ -1153,11 +1180,10 @@ mod tests {
     }
 
     #[test]
-    fn language_tag_preserves_query_entry_serde() {
+    fn executable_extraction_preserves_promql_entry_serde() {
         let entry = QueryPlanEntry {
-            language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
-            canonical_query: canonical_promql("up").unwrap(),
+            canonical_promql: canonical_promql("up").unwrap(),
             root: QueryNodeId(0),
             nodes: BTreeMap::from([(
                 QueryNodeId(0),
@@ -1173,8 +1199,9 @@ mod tests {
             fallback: FallbackPolicy::ExactBackend,
         };
         let before = serde_json::to_value(&entry).unwrap();
+        let _payload = entry.executable();
         assert_eq!(before, serde_json::to_value(&entry).unwrap());
-        assert!(before.get("canonical_query").is_some());
+        assert!(before.get("canonical_promql").is_some());
         assert!(before.get("executable").is_none());
     }
 
@@ -1188,9 +1215,8 @@ mod tests {
             },
         );
         let entry = QueryPlanEntry {
-            language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
-            canonical_query: "up".into(),
+            canonical_promql: "up".into(),
             root: QueryNodeId(0),
             nodes,
             instant: InstantExecution {
@@ -1213,9 +1239,8 @@ mod tests {
             reason: "prepared".into(),
         };
         let entry = QueryPlanEntry {
-            language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
-            canonical_query: "topk(2, rate(m[5m]))".into(),
+            canonical_promql: "topk(2, rate(m[5m]))".into(),
             root: QueryNodeId(2),
             nodes: BTreeMap::from([
                 (QueryNodeId(0), leaf.clone()),
@@ -1283,9 +1308,8 @@ mod catalog_binding_tests {
         config.pane_origin_ms = Some(0);
         let catalog = SummaryCatalog::from_materializations(7, 2, &[config.clone()]).unwrap();
         let entry = QueryPlanEntry {
-            language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
-            canonical_query: "sum_over_time(m[1m])".into(),
+            canonical_promql: "sum_over_time(m[1m])".into(),
             root: QueryNodeId(1),
             nodes: BTreeMap::from([(
                 QueryNodeId(1),
@@ -1311,7 +1335,7 @@ mod catalog_binding_tests {
             QueryPlan {
                 plan_id: 7,
                 plan_version: 2,
-                entries: BTreeMap::from([(entry.canonical_query.clone(), entry)]),
+                entries: BTreeMap::from([(entry.canonical_promql.clone(), entry)]),
             },
             catalog,
         )
