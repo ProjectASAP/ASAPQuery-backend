@@ -1,0 +1,823 @@
+{
+  "eval_ms": 1788891296000,
+  "results": [
+    {
+      "id": "q01",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.040431266846
+        ],
+        [
+          [
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.096514745308
+        ],
+        [
+          [
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          0.035040431267
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.040431266846
+        ],
+        [
+          [
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.096514745308
+        ],
+        [
+          [
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          0.035040431267
+        ]
+      ],
+      "sql": "SELECT * FROM (SELECT a.labels,a.value/b.value value FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) a INNER JOIN (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) b ON a.labels=b.labels) ORDER BY value DESC,labels FORMAT JSON"
+    },
+    {
+      "id": "q02",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.096514745308
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.096514745308
+        ]
+      ],
+      "sql": "SELECT * FROM (SELECT a.labels,a.value/b.value value FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) a INNER JOIN (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) b ON a.labels=b.labels) ORDER BY value DESC,labels LIMIT 1 FORMAT JSON"
+    },
+    {
+      "id": "q03",
+      "valid": true,
+      "prometheus": [
+        [
+          [],
+          0.017857142857
+        ]
+      ],
+      "clickhouse": [
+        [
+          [],
+          0.017857142857
+        ]
+      ],
+      "sql": "SELECT a.labels,a.value/b.value value FROM (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='payment_service_http_5xx_total' AND ts_ms>=((1788891296000-0)-3600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) a INNER JOIN (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='payment_service_http_requests_total' AND ts_ms>=((1788891296000-0)-3600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) b ON a.labels=b.labels FORMAT JSON"
+    },
+    {
+      "id": "q04",
+      "valid": true,
+      "prometheus": [
+        [
+          [],
+          0.01724137931
+        ]
+      ],
+      "clickhouse": [
+        [
+          [],
+          0.01724137931
+        ]
+      ],
+      "sql": "SELECT a.labels,a.value/b.value value FROM (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-21600000)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-21600000)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-21600000)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-21600000)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='payment_service_http_5xx_total' AND ts_ms>=((1788891296000-21600000)-3600000) AND ts_ms<=(1788891296000-21600000) GROUP BY labels) WHERE n>=2))) a INNER JOIN (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-21600000)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-21600000)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-21600000)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-21600000)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='payment_service_http_requests_total' AND ts_ms>=((1788891296000-21600000)-3600000) AND ts_ms<=(1788891296000-21600000) GROUP BY labels) WHERE n>=2))) b ON a.labels=b.labels FORMAT JSON"
+    },
+    {
+      "id": "q05",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "instance",
+              "api-gateway:8081"
+            ],
+            [
+              "job",
+              "api-gateway"
+            ]
+          ],
+          0.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "order-service:8083"
+            ],
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "payment-service:8084"
+            ],
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "user-service:8082"
+            ],
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          530.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "webapp:8080"
+            ],
+            [
+              "job",
+              "webapp"
+            ]
+          ],
+          0.0
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "instance",
+              "api-gateway:8081"
+            ],
+            [
+              "job",
+              "api-gateway"
+            ]
+          ],
+          0.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "order-service:8083"
+            ],
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "payment-service:8084"
+            ],
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "user-service:8082"
+            ],
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          530.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "webapp:8080"
+            ],
+            [
+              "job",
+              "webapp"
+            ]
+          ],
+          0.0
+        ]
+      ],
+      "sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='cache_refresh_lag_seconds' AND ts_ms>1788891296000-43200000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY labels FORMAT JSON"
+    },
+    {
+      "id": "q06",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "instance",
+              "user-service:8082"
+            ],
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          530.0
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "instance",
+              "user-service:8082"
+            ],
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          530.0
+        ]
+      ],
+      "sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>1788891296000-43200000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY labels FORMAT JSON"
+    },
+    {
+      "id": "q07",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "__name__",
+              "user_service_cache_refresh_lag_seconds"
+            ],
+            [
+              "instance",
+              "user-service:8082"
+            ],
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          0.0
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "__name__",
+              "user_service_cache_refresh_lag_seconds"
+            ],
+            [
+              "instance",
+              "user-service:8082"
+            ],
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          0.0
+        ]
+      ],
+      "sql": "SELECT mapConcat(labels,map('__name__','user_service_cache_refresh_lag_seconds')) AS labels, argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>1788891296000-300000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY labels FORMAT JSON"
+    },
+    {
+      "id": "q08",
+      "valid": true,
+      "prometheus": [
+        [
+          [],
+          0.007247222222
+        ]
+      ],
+      "clickhouse": [
+        [
+          [],
+          0.007247222222
+        ]
+      ],
+      "sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(3600000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>=((1788891296000-0)-3600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2)) FORMAT JSON"
+    },
+    {
+      "id": "q09",
+      "valid": true,
+      "prometheus": [
+        [
+          [],
+          570522659.0
+        ]
+      ],
+      "clickhouse": [
+        [
+          [],
+          570522659.0
+        ]
+      ],
+      "sql": "SELECT map() AS labels, sum(value) AS value FROM (SELECT labels,argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms>1788891296000-300000 AND ts_ms<=1788891296000 GROUP BY labels) FORMAT JSON"
+    },
+    {
+      "id": "q11",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.001469444444
+        ],
+        [
+          [
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.001470555556
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.001469444444
+        ],
+        [
+          [
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.001470555556
+        ]
+      ],
+      "sql": "SELECT * FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(3600000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>=((1788891296000-0)-3600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) ORDER BY value DESC,labels LIMIT 2 FORMAT JSON"
+    },
+    {
+      "id": "q12",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "job",
+              "api-gateway"
+            ]
+          ],
+          116909806.0
+        ],
+        [
+          [
+            [
+              "job",
+              "webapp"
+            ]
+          ],
+          119294036.0
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "job",
+              "api-gateway"
+            ]
+          ],
+          116909806.0
+        ],
+        [
+          [
+            [
+              "job",
+              "webapp"
+            ]
+          ],
+          119294036.0
+        ]
+      ],
+      "sql": "SELECT map('job',job) AS labels,sum(value) AS value FROM (SELECT labels['job'] AS job,labels,argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms>1788891296000-300000 AND ts_ms<=1788891296000 GROUP BY job,labels) GROUP BY job ORDER BY value DESC,job LIMIT 2 FORMAT JSON"
+    },
+    {
+      "id": "q14",
+      "valid": true,
+      "prometheus": [
+        [
+          [],
+          0.07
+        ]
+      ],
+      "clickhouse": [
+        [
+          [],
+          0.07
+        ]
+      ],
+      "sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-300000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=((1788891296000-0)-300000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2)) FORMAT JSON"
+    },
+    {
+      "id": "q15",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.043333333333
+        ],
+        [
+          [
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.006666666667
+        ],
+        [
+          [
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          0.02
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.043333333333
+        ],
+        [
+          [
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.006666666667
+        ],
+        [
+          [
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          0.02
+        ]
+      ],
+      "sql": "SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-300000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=((1788891296000-0)-300000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job FORMAT JSON"
+    },
+    {
+      "id": "q16",
+      "valid": true,
+      "prometheus": [
+        [
+          [],
+          0.04609929078
+        ]
+      ],
+      "clickhouse": [
+        [
+          [],
+          0.04609929078
+        ]
+      ],
+      "sql": "SELECT a.labels,a.value/b.value value FROM (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-3600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) a INNER JOIN (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=((1788891296000-0)-3600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) b ON a.labels=b.labels FORMAT JSON"
+    },
+    {
+      "id": "q17",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.096514745308
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.096514745308
+        ]
+      ],
+      "sql": "SELECT * FROM (SELECT a.labels,a.value/b.value value FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) a INNER JOIN (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) b ON a.labels=b.labels) ORDER BY value DESC,labels LIMIT 1 FORMAT JSON"
+    },
+    {
+      "id": "q18",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          79.013893774182
+        ],
+        [
+          [
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          46.008164714235
+        ],
+        [
+          [
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          23.004220183486
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          79.013893774182
+        ],
+        [
+          [
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          46.008164714235
+        ],
+        [
+          [
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          23.004220183486
+        ]
+      ],
+      "sql": "SELECT * FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-86400000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-86400000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-86400000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) WHERE value>0 FORMAT JSON"
+    },
+    {
+      "id": "q19",
+      "valid": true,
+      "prometheus": [
+        [
+          [],
+          0.043333333333
+        ]
+      ],
+      "clickhouse": [
+        [
+          [],
+          0.043333333333
+        ]
+      ],
+      "sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-300000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_requests_total' AND ts_ms>=((1788891296000-0)-300000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2)) FORMAT JSON"
+    },
+    {
+      "id": "q20",
+      "valid": true,
+      "prometheus": [
+        [
+          [],
+          0.066666666667
+        ]
+      ],
+      "clickhouse": [
+        [
+          [],
+          0.066666666667
+        ]
+      ],
+      "sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-3600000)-300000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-3600000)-300000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-3600000)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-3600000)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_requests_total' AND ts_ms>=((1788891296000-3600000)-300000) AND ts_ms<=(1788891296000-3600000) GROUP BY labels) WHERE n>=2)) FORMAT JSON"
+    },
+    {
+      "id": "q22",
+      "valid": true,
+      "prometheus": [
+        [
+          [],
+          0.043333333333
+        ]
+      ],
+      "clickhouse": [
+        [
+          [],
+          0.043333333333
+        ]
+      ],
+      "sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-300000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_requests_total' AND ts_ms>=((1788891296000-0)-300000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2)) FORMAT JSON"
+    },
+    {
+      "id": "q23",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "instance",
+              "order-service:8083"
+            ],
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          24.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "payment-service:8084"
+            ],
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          101.0
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "instance",
+              "order-service:8083"
+            ],
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          24.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "payment-service:8084"
+            ],
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          101.0
+        ]
+      ],
+      "sql": "SELECT labels,max(value) AS value FROM raw_samples WHERE metric='backend_retry_backlog_depth' AND ts_ms>1788891296000-21600000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY value DESC,labels LIMIT 2 FORMAT JSON"
+    },
+    {
+      "id": "q25",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.533782882898
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.533782882898
+        ]
+      ],
+      "sql": "SELECT * FROM (SELECT a.labels,a.value/b.value value FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-86400000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-86400000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-86400000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) a CROSS JOIN (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-86400000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-86400000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-86400000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) b) ORDER BY value DESC,labels LIMIT 1 FORMAT JSON"
+    },
+    {
+      "id": "q26",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.001575555556
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.001575555556
+        ]
+      ],
+      "sql": "SELECT * FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(21600000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) ORDER BY value DESC,labels LIMIT 1 FORMAT JSON"
+    }
+  ]
+}
