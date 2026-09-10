@@ -114,6 +114,12 @@ impl PrecomputeEngine {
     /// the same `IngestState` handle returned by `ingest_state()`.
     pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let num_workers = self.config.num_workers;
+        let output_sink: Arc<dyn crate::precompute_engine::output_sink::OutputSink> = Arc::new(
+            crate::precompute_engine::maintenance_runtime::MaintenanceDagSink::new(
+                Arc::clone(&self.output_sink),
+                self.hot_reload_config.clone(),
+            ),
+        );
 
         // Take ownership of receivers (they can only be used once).
         let receivers = std::mem::take(&mut self.receivers);
@@ -126,7 +132,7 @@ impl PrecomputeEngine {
             let worker = Worker::new(
                 id,
                 rx,
-                self.output_sink.clone(),
+                output_sink.clone(),
                 self.hot_reload_config.clone(),
                 WorkerRuntimeConfig {
                     max_buffer_per_series: self.config.max_buffer_per_series,
