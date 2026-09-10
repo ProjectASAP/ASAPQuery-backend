@@ -1,34 +1,37 @@
 {
   "queries": [
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 13,
       "exact_sql": "oracle_valid",
       "id": "q01",
       "parser_planner": "pass",
       "planning_sql": "SELECT * FROM (SELECT a.job, a.value/b.value AS value FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' GROUP BY metric, labels, job) GROUP BY job) a INNER JOIN (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' GROUP BY metric, labels, job) GROUP BY job) b ON a.job=b.job) ORDER BY value DESC, job",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 14,
       "exact_sql": "oracle_valid",
       "id": "q02",
       "parser_planner": "pass",
       "planning_sql": "SELECT * FROM (SELECT a.job, a.value/b.value AS value FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' GROUP BY metric, labels, job) GROUP BY job) a INNER JOIN (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' GROUP BY metric, labels, job) GROUP BY job) b ON a.job=b.job) ORDER BY value DESC, job LIMIT 1",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 14,
       "exact_sql": "oracle_valid",
       "id": "q03",
       "parser_planner": "pass",
       "planning_sql": "SELECT a.value/b.value AS value FROM (SELECT 1 AS k, value FROM (SELECT sum(v) AS value FROM (SELECT metric, labels, asap_increase(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='payment_service_http_5xx_total' GROUP BY metric, labels))) a INNER JOIN (SELECT 1 AS k, value FROM (SELECT sum(v) AS value FROM (SELECT metric, labels, asap_increase(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='payment_service_http_requests_total' GROUP BY metric, labels))) b ON a.k=b.k",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
       "backend_bind_execute": "exact_fallback",
@@ -73,14 +76,15 @@
       "reason": "typed_unsupported: instant-vector last-sample selection is not a summary aggregate"
     },
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 5,
       "exact_sql": "oracle_valid",
       "id": "q08",
       "parser_planner": "pass",
       "planning_sql": "SELECT sum(v) AS value FROM (SELECT metric, labels, asap_rate(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' GROUP BY metric, labels)",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
       "backend_bind_execute": "exact_fallback",
@@ -103,14 +107,15 @@
       "reason": "typed_unsupported: PromQL subquery evaluation grid is not represented by the SQL DAG"
     },
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 7,
       "exact_sql": "oracle_valid",
       "id": "q11",
       "parser_planner": "pass",
       "planning_sql": "SELECT * FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_rate(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' GROUP BY metric, labels, job) GROUP BY job) ORDER BY value DESC, job LIMIT 2",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
       "backend_bind_execute": "exact_fallback",
@@ -133,64 +138,70 @@
       "reason": "typed_unsupported: PromQL subquery evaluation grid is not represented by the SQL DAG"
     },
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 5,
       "exact_sql": "oracle_valid",
       "id": "q14",
       "parser_planner": "pass",
       "planning_sql": "SELECT sum(v) AS value FROM (SELECT metric, labels, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' GROUP BY metric, labels)",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 5,
       "exact_sql": "oracle_valid",
       "id": "q15",
       "parser_planner": "pass",
       "planning_sql": "SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' GROUP BY metric, labels, job) GROUP BY job",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 14,
       "exact_sql": "oracle_valid",
       "id": "q16",
       "parser_planner": "pass",
       "planning_sql": "SELECT a.value/b.value AS value FROM (SELECT 1 AS k, value FROM (SELECT sum(v) AS value FROM (SELECT metric, labels, asap_increase(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' GROUP BY metric, labels))) a INNER JOIN (SELECT 1 AS k, value FROM (SELECT sum(v) AS value FROM (SELECT metric, labels, asap_increase(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' GROUP BY metric, labels))) b ON a.k=b.k",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 14,
       "exact_sql": "oracle_valid",
       "id": "q17",
       "parser_planner": "pass",
       "planning_sql": "SELECT * FROM (SELECT a.job, a.value/b.value AS value FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' GROUP BY metric, labels, job) GROUP BY job) a INNER JOIN (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' GROUP BY metric, labels, job) GROUP BY job) b ON a.job=b.job) ORDER BY value DESC, job LIMIT 1",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 6,
       "exact_sql": "oracle_valid",
       "id": "q18",
       "parser_planner": "pass",
       "planning_sql": "SELECT * FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 86400000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' GROUP BY metric, labels, job) GROUP BY job) WHERE value>0",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 5,
       "exact_sql": "oracle_valid",
       "id": "q19",
       "parser_planner": "pass",
       "planning_sql": "SELECT sum(v) AS value FROM (SELECT metric, labels, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='order_service_http_requests_total' GROUP BY metric, labels)",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
       "backend_bind_execute": "exact_fallback",
@@ -213,14 +224,15 @@
       "reason": "typed_unsupported: classic-histogram interpolation has no canonical SQL DAG operator"
     },
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 5,
       "exact_sql": "oracle_valid",
       "id": "q22",
       "parser_planner": "pass",
       "planning_sql": "SELECT sum(v) AS value FROM (SELECT metric, labels, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='order_service_http_requests_total' GROUP BY metric, labels)",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
       "backend_bind": "pass",
@@ -254,14 +266,15 @@
       "reason": "typed_unsupported: vector/scalar label semantics are not represented by relational joins"
     },
     {
-      "backend_bind_execute": "exact_fallback",
-      "compiler": "typed_fallback",
+      "backend_bind": "pass",
+      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "compiler": "pass",
+      "dag_nodes": 7,
       "exact_sql": "oracle_valid",
       "id": "q26",
       "parser_planner": "pass",
       "planning_sql": "SELECT * FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_rate(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' GROUP BY metric, labels, job) GROUP BY job) ORDER BY value DESC, job LIMIT 1",
-      "publication": "not_reached",
-      "reason": "SQL lowering failed: invalid QueryPlan: source predicates or temporal modifiers require a Prometheus exact subtree"
+      "publication": "pass"
     },
     {
       "backend_bind_execute": "exact_fallback",
