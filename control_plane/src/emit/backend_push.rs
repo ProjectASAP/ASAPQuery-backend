@@ -477,16 +477,14 @@ async fn push_cumulative_entries(
     // engine.  It must not manufacture a distributed collector producer: an
     // authoritative publication requires every producer to have a matching
     // CollectorPlan, and no collector exists on this path.
-    let precompute_plan = match PrecomputePlan::build_backend_local(
-        precompute_envelope,
-        materializations,
-    ) {
-        Ok(plan) => plan,
-        Err(error) => {
-            warn!(%error, "failed to validate typed PrecomputePlan");
-            return PushOutcome::EmitFailed;
-        }
-    };
+    let precompute_plan =
+        match PrecomputePlan::build_backend_local(precompute_envelope, materializations) {
+            Ok(plan) => plan,
+            Err(error) => {
+                warn!(%error, "failed to validate typed PrecomputePlan");
+                return PushOutcome::EmitFailed;
+            }
+        };
 
     // Storage-routing: the routing classifier (`build_routing_entry` in
     // `emit/stage_config.rs`) reads `cfg.aggregations` to derive shape
