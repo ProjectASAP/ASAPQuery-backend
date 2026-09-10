@@ -35,8 +35,16 @@ pub fn execute<R: QueryNodeRuntime>(
     entry: &QueryPlanEntry,
     runtime: &R,
 ) -> Result<R::Output, DagExecutionError<R::Error>> {
+    execute_from(entry, entry.root, runtime)
+}
+
+pub fn execute_from<R: QueryNodeRuntime>(
+    entry: &QueryPlanEntry,
+    root: QueryNodeId,
+    runtime: &R,
+) -> Result<R::Output, DagExecutionError<R::Error>> {
     let order = entry
-        .topological_order()
+        .topological_order_from(root)
         .map_err(|error| DagExecutionError::InvalidGraph(error.to_string()))?;
     let mut outputs = BTreeMap::<QueryNodeId, R::Output>::new();
     for id in order {
@@ -65,8 +73,8 @@ pub fn execute<R: QueryNodeRuntime>(
                 })?;
         outputs.insert(id, output);
     }
-    outputs.remove(&entry.root).ok_or_else(|| {
-        DagExecutionError::InvalidGraph(format!("root {} produced no output", entry.root.0))
+    outputs.remove(&root).ok_or_else(|| {
+        DagExecutionError::InvalidGraph(format!("root {} produced no output", root.0))
     })
 }
 
@@ -136,6 +144,7 @@ mod tests {
             language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "up".into(),
+            fixed_evaluation: None,
             root,
             nodes,
             instant: InstantExecution {

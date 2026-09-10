@@ -94,6 +94,61 @@ struct Args {
     #[arg(long, default_value = "http://localhost:8428")]
     victoriametrics_url: String,
 
+    /// Optional independent ClickHouse-compatible HTTP listener.
+    #[arg(long, env = "ASAP_CLICKHOUSE_HTTP_PORT")]
+    clickhouse_http_port: Option<u16>,
+
+    /// Exact ClickHouse HTTP endpoint used by the SQL listener.
+    #[arg(
+        long,
+        env = "ASAP_CLICKHOUSE_URL",
+        default_value = "http://localhost:8123"
+    )]
+    clickhouse_url: String,
+
+    /// Default database supplied when a ClickHouse request omits one.
+    #[arg(long, env = "ASAP_CLICKHOUSE_DATABASE", default_value = "default")]
+    clickhouse_database: String,
+
+    /// Enable ClickHouse as a source for queued backfill jobs whose source URL
+    /// is `clickhouse://configured`.
+    #[arg(long, env = "ASAP_CLICKHOUSE_BACKFILL_TABLE")]
+    clickhouse_backfill_table: Option<String>,
+    #[arg(
+        long,
+        env = "ASAP_CLICKHOUSE_BACKFILL_DATABASE",
+        default_value = "default"
+    )]
+    clickhouse_backfill_database: String,
+    #[arg(
+        long,
+        env = "ASAP_CLICKHOUSE_BACKFILL_METRIC_COLUMN",
+        default_value = "metric"
+    )]
+    clickhouse_backfill_metric_column: String,
+    #[arg(
+        long,
+        env = "ASAP_CLICKHOUSE_BACKFILL_LABELS_COLUMN",
+        default_value = "labels"
+    )]
+    clickhouse_backfill_labels_column: String,
+    #[arg(
+        long,
+        env = "ASAP_CLICKHOUSE_BACKFILL_TIMESTAMP_COLUMN",
+        default_value = "timestamp_ms"
+    )]
+    clickhouse_backfill_timestamp_column: String,
+    #[arg(
+        long,
+        env = "ASAP_CLICKHOUSE_BACKFILL_VALUE_COLUMN",
+        default_value = "value"
+    )]
+    clickhouse_backfill_value_column: String,
+    #[arg(long, env = "ASAP_CLICKHOUSE_USER")]
+    clickhouse_user: Option<String>,
+    #[arg(long, env = "ASAP_CLICKHOUSE_PASSWORD")]
+    clickhouse_password: Option<String>,
+
     /// Deprecated/no-op: the backend's only HTTP listener is the
     /// PromQL query surface (`--http-port` / `--query-port`). The
     /// old PRW ingest port was deleted in PR #100; this flag is
@@ -1226,10 +1281,26 @@ async fn main() -> Result<()> {
         // Schema retirement #5 — `BackfillService::new` no longer
         // takes a `SchemaRegistry`; it consults sid-level lifecycle on
         // `SketchStore` instead.
+        let reader_factory = match args.clickhouse_backfill_table.as_ref() {
+            Some(table) => data_plane::storage_engines::sketch_db::clickhouse_reader_factory(
+                data_plane::storage_engines::sketch_db::ClickHouseReaderConfig {
+                    base_url: args.clickhouse_url.clone(),
+                    database: args.clickhouse_backfill_database.clone(),
+                    table: table.clone(),
+                    metric_column: args.clickhouse_backfill_metric_column.clone(),
+                    labels_column: args.clickhouse_backfill_labels_column.clone(),
+                    timestamp_ms_column: args.clickhouse_backfill_timestamp_column.clone(),
+                    value_column: args.clickhouse_backfill_value_column.clone(),
+                    user: args.clickhouse_user.clone(),
+                    password: args.clickhouse_password.clone(),
+                },
+            ),
+            None => data_plane::storage_engines::sketch_db::default_reader_factory(),
+        };
         let service = data_plane::storage_engines::sketch_db::BackfillService::new(
             backfill_registry.clone(),
             hot_reload_config.clone(),
-            data_plane::storage_engines::sketch_db::default_reader_factory(),
+            reader_factory,
             data_plane::storage_engines::sketch_db::BackfillServiceConfig::default(),
         )
         // M2.3.6e — replayed batches land in SketchStore (the only
@@ -1312,6 +1383,41 @@ async fn main() -> Result<()> {
 
     let victoria_task = victoria_server.map(|server| tokio::spawn(server.run()));
 
+    let clickhouse_accelerator = if args.clickhouse_http_port.is_some() {
+        let accelerator = Arc::new(
+            data_plane::query_engines::asap_clickhouse_query_engine::accelerator::CatalogClickHouseAccelerator::with_active_physical_plan(
+                sketch_index.clone(),
+                active_physical_plan.clone(),
+            ),
+        );
+        Some(accelerator)
+    } else {
+        None
+    };
+
+    let clickhouse_server_handle = args.clickhouse_http_port.map(|port| {
+        let fallback = Arc::new(
+            data_plane::query_engines::asap_clickhouse_query_engine::ClickHouseHttpFallback::new(
+                args.clickhouse_url.clone(),
+                args.clickhouse_database.clone(),
+            ),
+        );
+        let clickhouse_server =
+            data_plane::query_engines::asap_clickhouse_query_engine::ClickHouseHttpServer {
+                listen_address: format!("0.0.0.0:{port}"),
+                fallback,
+            };
+        info!("Starting ClickHouse-compatible HTTP proxy on port {port}");
+        tokio::spawn(async move {
+            let result = match clickhouse_accelerator {
+                Some(accelerator) => clickhouse_server.run_with_accelerator(accelerator).await,
+                None => clickhouse_server.run().await,
+            };
+            if let Err(error) = result {
+                error!("ClickHouse HTTP server error: {error}");
+            }
+        })
+    });
     // Wait for shutdown signal
     tokio::select! {
         result = server.run() => {
@@ -1337,6 +1443,10 @@ async fn main() -> Result<()> {
     if let Some(handle) = schema_eviction_handle {
         info!("Shutting down schema eviction service...");
         handle.shutdown().await;
+    }
+
+    if let Some(handle) = clickhouse_server_handle {
+        handle.abort();
     }
 
     if let Some(handle) = otel_handle {

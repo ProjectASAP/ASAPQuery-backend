@@ -40,11 +40,12 @@ pub mod sds;
 
 pub use accuracy::{AccuracyEnvelope, AccuracyKind, AccuracyProfile, PerSegmentAccuracy};
 pub use backfill::{
-    build_backfilled_accumulator, default_reader_factory, noop_reader_factory, BackfillJob,
-    BackfillRegistry, BackfillService, BackfillServiceConfig, BackfillServiceHandle,
-    BackfillSource, BackfillStatus, BackfillWindowProcessor, BackfillWorker, BackfillWorkerError,
-    Coverage, CreateError, LabelFilter, MockRawSampleReader, PrometheusReader, RawSample,
-    RawSampleReader, RawSampleReaderError, ReaderFactory, WindowProcessor,
+    build_backfilled_accumulator, clickhouse_reader_factory, default_reader_factory,
+    noop_reader_factory, BackfillJob, BackfillRegistry, BackfillService, BackfillServiceConfig,
+    BackfillServiceHandle, BackfillSource, BackfillStatus, BackfillWindowProcessor, BackfillWorker,
+    BackfillWorkerError, ClickHouseReaderConfig, Coverage, CreateError, LabelFilter,
+    MockRawSampleReader, PrometheusReader, RawSample, RawSampleReader, RawSampleReaderError,
+    ReaderFactory, WindowProcessor,
 };
 pub use lifecycle::{
     warn_if_retention_inverted, AggStatus, SchemaEvictionConfig, SchemaEvictionHandle,

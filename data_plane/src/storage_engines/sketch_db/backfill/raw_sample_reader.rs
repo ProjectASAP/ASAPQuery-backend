@@ -208,7 +208,7 @@ impl RawSampleReader for MockRawSampleReader {
 /// the filter: metric name must match, and every equality-matcher
 /// entry must be present with the expected value. Unknown labels
 /// on the series are ignored.
-fn sample_matches(series_key: &str, filter: &LabelFilter) -> bool {
+pub(super) fn sample_matches(series_key: &str, filter: &LabelFilter) -> bool {
     let (metric, labels_str) = match series_key.find('{') {
         Some(i) => (
             &series_key[..i],

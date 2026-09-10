@@ -43,6 +43,7 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
     let mut query_plan = QueryPlan {
         plan_id: 1,
         plan_version: 1,
+        clickhouse_context: None,
         entries: BTreeMap::new(),
     };
     for config in &precompute.materializations {
@@ -106,6 +107,7 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
                     language: control_plane::query_plan::QueryLanguage::PromQl,
                     query_id: canonical.clone(),
                     canonical_query: canonical,
+                    fixed_evaluation: None,
                     root: QueryNodeId(1),
                     nodes: BTreeMap::from([
                         (

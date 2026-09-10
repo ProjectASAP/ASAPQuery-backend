@@ -9,7 +9,7 @@
 //! the JSONL deprecation means the archive tier or a hard 404 —
 //! the JSONL leg has been deleted).
 
-mod catalog_resolver;
+pub(crate) mod catalog_resolver;
 pub mod engine;
 mod exact_subqueries;
 pub mod live_serve;

@@ -475,7 +475,7 @@ mod tests {
     // ── canonical-IR entry point ─────────────────────────────────────────────
 
     #[test]
-    fn canonical_promql_quantile_yields_aggregate_over_time_range() {
+    fn canonical_query_quantile_yields_aggregate_over_time_range() {
         use planner_types::pre_asap::QueryExpr as CQueryExpr;
         // `asap_l2::lower` models a range-vector selector (`m[5m]`) as
         // `TimeRange`, not `Window` -- `Window` is reserved for real
@@ -496,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_promql_avg_over_time_yields_aggregate_over_time_range() {
+    fn canonical_query_avg_over_time_yields_aggregate_over_time_range() {
         use planner_types::pre_asap::QueryExpr as CQueryExpr;
         // A bare `avg_over_time(m[w])` (no `by`) lowers to canonical
         // `Aggregate { child: TimeRange { child: Scan } }`.

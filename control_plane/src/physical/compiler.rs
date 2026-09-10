@@ -2612,7 +2612,8 @@ impl PhysicalCompiler {
             if metricsql {
                 entry.language = crate::query_plan::QueryLanguage::MetricsQl;
             }
-            if query_entries.insert(canonical.clone(), entry).is_some() {
+            let catalog_key = QueryPlan::catalog_key(entry.language, &canonical);
+            if query_entries.insert(catalog_key, entry).is_some() {
                 return Err(CompileError::Query {
                     query_id: query.query_id.clone(),
                     reason: format!("duplicate canonical query identity `{canonical}`"),
@@ -2622,6 +2623,7 @@ impl PhysicalCompiler {
         let query_plan = QueryPlan {
             plan_id,
             plan_version: envelope.plan_version,
+            clickhouse_context: None,
             entries: query_entries,
         };
         for materialization in &mut precompute_plan.materializations {
@@ -3850,7 +3852,7 @@ fn collect_selected_materializations(
     Ok(selected)
 }
 
-fn physical_materialization_family(family: &SummaryFamilyType) -> SummaryFamilyType {
+pub(crate) fn physical_materialization_family(family: &SummaryFamilyType) -> SummaryFamilyType {
     match family {
         SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _) => {
             // The SummaryStore Sum accumulator retains the observation count

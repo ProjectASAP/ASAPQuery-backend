@@ -690,6 +690,7 @@ mod tests {
             query_plan: Arc::new(control_plane::query_plan::QueryPlan {
                 plan_id,
                 plan_version,
+                clickhouse_context: None,
                 entries: Default::default(),
             }),
             storage_routing: Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),

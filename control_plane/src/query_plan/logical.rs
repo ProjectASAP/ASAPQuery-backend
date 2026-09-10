@@ -428,6 +428,7 @@ impl QueryPlanEntry {
             language: super::QueryLanguage::PromQl,
             query_id,
             canonical_query,
+            fixed_evaluation: None,
             root,
             nodes: lower.nodes,
             instant,

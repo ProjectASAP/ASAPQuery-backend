@@ -386,6 +386,7 @@ mod tests {
             language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "remote-cut".into(),
             canonical_query: "a / b".into(),
+            fixed_evaluation: None,
             root: QueryNodeId(0),
             nodes,
             instant: InstantExecution {

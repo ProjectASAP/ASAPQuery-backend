@@ -1,4 +1,5 @@
 use control_plane::backend_client;
+use control_plane::clickhouse;
 use control_plane::emit;
 use control_plane::epsilon_alloc;
 use control_plane::metrics_exposer;
@@ -562,6 +563,10 @@ async fn main() {
             "/api/v1/metricsql/physical-plan/compile-and-publish",
             post(handle_compile_and_publish_metricsql_physical_plan),
         )
+        .route(
+            "/api/v1/clickhouse-plan/compile-and-publish",
+            post(handle_compile_and_publish_clickhouse_plan),
+        )
         .route("/api/v1/plan/auto", post(handle_plan_auto))
         .route("/api/v1/plan/pareto", post(handle_pareto))
         .route("/api/v1/plan/:metric", get(handle_get_plan))
@@ -797,6 +802,49 @@ async fn compile_and_publish_physical_plan(
         collector_ids,
         lifecycle_estimates: bundle.lifecycle_estimates,
     })
+    .into_response()
+}
+
+async fn handle_compile_and_publish_clickhouse_plan(
+    State(state): State<AppState>,
+    Json(request): Json<clickhouse::ClickHouseSqlWorkload>,
+) -> impl IntoResponse {
+    let bundle = match clickhouse::compile_clickhouse_workload(&request).await {
+        Ok(bundle) => bundle,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let plan_id = bundle.sds.plan_id;
+    let plan_version = bundle.sds.plan_version;
+    let Some(client) = state.backend_client.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backend publication is not configured",
+        )
+            .into_response();
+    };
+    if let Err(error) = client
+        .post_physical_plan_typed(
+            &bundle.precompute_plan,
+            &bundle.transmission_plan,
+            &bundle.query_plan,
+            None,
+            &[],
+        )
+        .await
+    {
+        return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
+    }
+    if let Err(error) = client.activate_physical_plan(plan_id, plan_version).await {
+        let _ = client
+            .discard_staged_physical_plan(plan_id, plan_version)
+            .await;
+        return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
+    }
+    Json(serde_json::json!({
+        "plan_id": plan_id,
+        "plan_version": plan_version,
+        "status": "active"
+    }))
     .into_response()
 }
 

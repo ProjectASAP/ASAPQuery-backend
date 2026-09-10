@@ -58,6 +58,7 @@
 
 pub mod accuracy;
 pub mod backend_client;
+pub mod clickhouse;
 pub mod emit;
 pub mod epsilon_alloc;
 pub mod metrics_exposer;

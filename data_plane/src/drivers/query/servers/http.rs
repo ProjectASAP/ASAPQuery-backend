@@ -2711,6 +2711,7 @@ mod tests {
                 query_plan: Arc::new(control_plane::query_plan::QueryPlan {
                     plan_id: 7,
                     plan_version: 1,
+                    clickhouse_context: None,
                     entries: Default::default(),
                 }),
                 storage_routing: Arc::new(
@@ -6181,6 +6182,12 @@ async fn handle_post_physical_plan(
         .values()
         .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::MetricsQl)
         .count();
+    let clickhouse_plan_count = active
+        .query_plan
+        .entries
+        .values()
+        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::ClickHouseSql)
+        .count();
     let plan_version = active.plan_version();
     let now = unix_time_ms();
     if let Err(error) = lifecycle.stage(active, now) {
@@ -6195,7 +6202,8 @@ async fn handle_post_physical_plan(
         axum::Json(serde_json::json!({
             "status": "staged", "plan_id": plan_id, "plan_version": plan_version,
             "materialization_count": materialization_count,
-            "metricsql_query_count": metricsql_query_count
+            "metricsql_query_count": metricsql_query_count,
+            "clickhouse_plan_count": clickhouse_plan_count
         })),
     )
         .into_response()
@@ -6239,6 +6247,12 @@ async fn handle_activate_physical_plan(
         }
     };
     let activated = active_handle.snapshot();
+    let clickhouse_plan_count = activated
+        .query_plan
+        .entries
+        .values()
+        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::ClickHouseSql)
+        .count();
     if let Some(catalog) = activated.summary_catalog.as_ref() {
         if let Err(error) = state
             .sketch_index
@@ -6277,7 +6291,8 @@ async fn handle_activate_physical_plan(
         StatusCode::OK,
         axum::Json(serde_json::json!({
             "status": "active", "plan_id": request.plan_id, "plan_version": request.plan_version,
-            "sids_retired": retired.retired
+            "sids_retired": retired.retired,
+            "clickhouse_plan_count": clickhouse_plan_count
         })),
     )
         .into_response()
@@ -7122,6 +7137,52 @@ mod catalog_install_tests {
             request,
             Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
         )
+    }
+
+    #[test]
+    fn invalid_clickhouse_entry_cannot_change_active_generation() {
+        let active = install(request()).expect("baseline plan installs");
+        let handle = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active);
+        let before = handle.snapshot();
+        let mut candidate = request();
+        candidate.query_plan.clickhouse_context =
+            Some(control_plane::query_plan::ClickHousePlanningContext {
+                tables: Default::default(),
+                accuracy: planner_types::types::AccuracyTarget::Exact,
+            });
+        let (_, mut entry) = candidate
+            .query_plan
+            .entries
+            .pop_first()
+            .expect("fixture has a query entry");
+        entry.language = control_plane::query_plan::QueryLanguage::ClickHouseSql;
+        entry.fixed_evaluation = Some(control_plane::query_plan::FixedEvaluationRange {
+            start_ms: 0,
+            end_ms: 1_000,
+            cumulative: true,
+        });
+        let canonical = entry.canonical_query.clone();
+        let binding = entry
+            .nodes
+            .values_mut()
+            .find_map(|node| match node {
+                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                    Some(binding)
+                }
+                _ => None,
+            })
+            .expect("fixture query reads a materialization");
+        binding.pane_origin_ms = Some(999);
+        candidate
+            .query_plan
+            .entries
+            .insert(format!("clickhouse:{canonical}"), entry);
+
+        let error = install(candidate).expect_err("invalid SQL binding must fail staging");
+        assert!(error.contains("pane origin"), "{error}");
+        let after = handle.snapshot();
+        assert_eq!(after.plan_id(), before.plan_id());
+        assert_eq!(after.plan_version(), before.plan_version());
     }
 
     // Installing transports the exact supplied snapshot, rather than rebuilding it.
