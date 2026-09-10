@@ -264,12 +264,31 @@ fn clickhouse_materialization_leaf_contract(
     let SummaryExpr::KeepPreAsap(expr) = &child.expr else {
         return crate::physical::compiler::materialization_leaf_contract(node);
     };
-    let QueryExpr::Scan {
-        source: Source::Table { .. },
-        predicates,
-        schema,
-    } = expr.as_ref()
-    else {
+    fn table_scan(
+        expr: &QueryExpr,
+    ) -> Option<(
+        &[planner_types::pre_asap::Predicate],
+        &planner_types::pre_asap::Schema,
+    )> {
+        match expr {
+            QueryExpr::Project { child, .. } => table_scan(child),
+            QueryExpr::Scan {
+                source: Source::Table { .. },
+                predicates,
+                schema,
+            } => Some((predicates, schema)),
+            _ => None,
+        }
+    }
+    let (source, explicit_window) = match expr.as_ref() {
+        QueryExpr::TimeRange { child, range }
+            if range.as_millis() > 0 && range.as_millis() % 1_000 == 0 =>
+        {
+            (child.as_ref(), Some(range.as_secs()))
+        }
+        source => (source, None),
+    };
+    let Some((predicates, schema)) = table_scan(source) else {
         return crate::physical::compiler::materialization_leaf_contract(node);
     };
 
@@ -335,15 +354,19 @@ fn clickhouse_materialization_leaf_contract(
         }
     }
     let metric = metric.ok_or_else(|| "SQL table summary requires metric='...'".to_string())?;
-    let window_secs = match (lower_ms, upper_ms) {
+    let inferred_window = match (lower_ms, upper_ms) {
         (Some(lower), Some(upper)) if upper > lower && (upper - lower) % 1_000 == 0 => {
             Some((upper - lower) as u64 / 1_000)
         }
+        (None, None) => None,
         _ => {
-            return Err("SQL table summary requires a positive whole-second timestamp range".into())
+            return Err("SQL timestamp range must provide compatible lower and upper bounds".into())
         }
     };
-    Ok((metric, window_secs, String::new()))
+    let window_secs = explicit_window.or(inferred_window).ok_or_else(|| {
+        "SQL table summary requires a positive whole-second timestamp range".to_string()
+    })?;
+    Ok((metric, Some(window_secs), String::new()))
 }
 
 fn select_materialization<'a>(
@@ -441,7 +464,73 @@ mod tests {
         )
         .await
         .expect("explicit temporal SQL must use the shared rate DAG");
-        assert!(matches!(planned.physical, PhysicalExpr::Committed(_)));
+        let PhysicalExpr::Committed(crate::physical::post_asap::PostAsapPlan::Summary(root)) =
+            planned.physical
+        else {
+            panic!("rate SQL did not produce a summary DAG")
+        };
+        let mut aggregate = root.as_ref();
+        while let planner_types::post_asap::SummaryExpr::ValueOperation { child, .. } =
+            &aggregate.expr
+        {
+            aggregate = child;
+        }
+        assert_eq!(
+            clickhouse_materialization_leaf_contract(aggregate).unwrap(),
+            ("requests_total".into(), Some(300), String::new())
+        );
+
+        let mut config = PrecomputeMaterialization::new(
+            AggregationType::Increase,
+            String::new(),
+            Default::default(),
+            KeyByLabelNames::new(vec!["labels".into()]),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            300,
+            300,
+            WindowKind::Tumbling,
+            String::new(),
+            "requests_total".into(),
+            None,
+            Some("raw_samples".into()),
+            Some("value".into()),
+        );
+        config.pane_origin_ms = Some(0);
+        let sds = SummaryCatalog::from_materializations(74, 1, &[config.clone()]).unwrap();
+        let envelope = crate::physical::compiler::PlanEnvelope {
+            plan_id: 74,
+            plan_version: 1,
+            generated_at_unix_ms: 0,
+            activation_unix_ms: 0,
+            expiry_unix_ms: None,
+            backend_compat: "test".into(),
+            planner_revision: "test".into(),
+            capability_snapshot_id: "test".into(),
+        };
+        let mut precompute =
+            PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
+        precompute.summary_catalog = Some(sds.reference().unwrap());
+        let mut transmission =
+            TransmissionPlan::build(envelope, &precompute, &Default::default()).unwrap();
+        transmission.summary_catalog = precompute.summary_catalog.clone();
+        let bundle = compile_clickhouse_workload(&ClickHouseSqlWorkload {
+            sds,
+            precompute_plan: precompute,
+            transmission_plan: transmission,
+            tables: HashMap::from([("raw_samples".into(), catalog.tables["raw_samples"].clone())]),
+            accuracy: AccuracyTarget::Exact,
+            queries: vec![ClickHouseSqlWorkloadEntry {
+                sql: "SELECT labels, asap_rate(value, ts_ms, 300000) AS value FROM raw_samples WHERE metric='requests_total' GROUP BY labels".into(),
+                start_ms: 0,
+                end_ms: 300_000,
+                cumulative: true,
+            }],
+        })
+        .await
+        .expect("rate SQL must compile into a publishable shared DAG");
+        assert_eq!(bundle.plans.len(), 1);
     }
 
     #[tokio::test]
