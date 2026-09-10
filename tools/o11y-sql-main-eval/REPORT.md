@@ -19,11 +19,14 @@ The parser and Planner accept q05, q06, and q23 and select an exact MinMax
 summary followed by shared relational Project/Sort/Limit nodes. Publication
 rejects all three because the `metric = ...` table predicate has no canonical
 population binding in the summary catalog. The other 24 queries fail closed in
-the SQL frontend. The data-plane accelerator was invoked for every query using
-an installed, validated current-generation catalog. It returns `Planning` for
-the 24 frontend misses and `CatalogMiss` for the three entries whose publication
-was refused. The HTTP adapter maps both outcomes to the configured exact
-ClickHouse backend, so these are exact fallbacks rather than failed requests.
+the SQL frontend. Every query was sent through the production ClickHouse HTTP
+listener with an installed, validated current-generation catalog and a real
+ClickHouse 26.8.2.7 exact backend. The accelerator returns `Planning` for the 24
+frontend misses and `CatalogMiss` for the three entries whose publication was
+refused. The listener then executed exact ClickHouse: all 27 responses were HTTP
+200 and byte-for-byte equal to a direct request sent to the same exact backend.
+The artifacts record `fallback_requested`, `exact_executed`, `exact_success`,
+both HTTP statuses, response provenance headers, and the returned result.
 
 The machine-readable per-query evidence is in `artifacts/matrix.json`. Full
 canonical AST, selected post-ASAP tree, publication result, and data-plane
@@ -114,8 +117,7 @@ Artifacts:
 - `artifacts/baseline.txt`
 - `artifacts/corpus.sha256`
 
-The run validates routing through the in-process data-plane accelerator. It does
-not claim differential value equality against a live ClickHouse instance because
-no query is published into a warm or hybrid state on this corpus. A live exact
-server remains necessary for the separate HTTP differential E2E and latency
-experiment.
+The run validates exact fallback execution and response equality through the
+production HTTP listener against live ClickHouse. It does not claim accelerated
+versus exact value equality or performance benefit because no query is published
+into a warm or hybrid state on this corpus.

@@ -12,7 +12,7 @@ use data_plane::{
     drivers::query::servers::http::{build_active_physical_plan, PhysicalPlanInstallRequest},
     query_engines::asap_clickhouse_query_engine::{
         accelerator::CatalogClickHouseAccelerator, ClickHouseAccelerationOutcome,
-        ClickHouseAccelerator,
+        ClickHouseAccelerator, ClickHouseHttpFallback, ClickHouseHttpServer,
     },
     storage_engines::{
         sketch_db::index::SketchStore,
@@ -101,10 +101,21 @@ async fn main() {
         Arc::new(BackendStorageRouting::empty()),
     )
     .unwrap();
-    let accelerator = CatalogClickHouseAccelerator::with_active_physical_plan(
+    let exact_url =
+        std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:18123".into());
+    let exact = Arc::new(ClickHouseHttpFallback::new(
+        exact_url.clone(),
+        std::env::var("CLICKHOUSE_DATABASE").unwrap_or_else(|_| "default".into()),
+    ));
+    let accelerator = Arc::new(CatalogClickHouseAccelerator::with_active_physical_plan(
         Arc::new(SketchStore::new()),
         HotReloadActivePhysicalPlan::new(active),
-    );
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = ClickHouseHttpServer::router_with_accelerator(exact, accelerator.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
     let mut rows = Vec::new();
     for row in corpus.queries {
         let sql = row
@@ -118,16 +129,54 @@ async fn main() {
             parameters: BTreeMap::new(),
             headers: HeaderMap::new(),
         };
-        let outcome = accelerator.execute(&request).await;
-        rows.push(match outcome {
+        let acceleration = accelerator.execute(&request).await;
+        let mut outbound = client
+            .post(format!("http://{address}/"))
+            .body(request.sql.clone());
+        if let Ok(user) = std::env::var("CLICKHOUSE_USER") {
+            outbound = outbound.header("x-clickhouse-user", user);
+        }
+        if let Ok(password) = std::env::var("CLICKHOUSE_PASSWORD") {
+            outbound = outbound.header("x-clickhouse-key", password);
+        }
+        let response = outbound.send().await.unwrap();
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap();
+        let mut direct = client.post(&exact_url).body(request.sql.clone());
+        if let Ok(user) = std::env::var("CLICKHOUSE_USER") {
+            direct = direct.header("x-clickhouse-user", user);
+        }
+        if let Ok(password) = std::env::var("CLICKHOUSE_PASSWORD") {
+            direct = direct.header("x-clickhouse-key", password);
+        }
+        let direct = direct.send().await.unwrap();
+        let direct_status = direct.status().as_u16();
+        let direct_body = direct.text().await.unwrap();
+        let matches_direct_exact = status == direct_status && body == direct_body;
+        rows.push(match acceleration {
             ClickHouseAccelerationOutcome::Fallback(reason) => json!({
                 "id": row.id,
-                "route": "exact_fallback",
-                "reason": format!("{reason:?}"),
+                "fallback_requested": true,
+                "acceleration_reason": format!("{reason:?}"),
+                "exact_executed": status != 502,
+                "exact_success": (200..300).contains(&status) && matches_direct_exact,
+                "exact_status": status,
+                "direct_exact_status": direct_status,
+                "matches_direct_exact": matches_direct_exact,
+                "clickhouse_summary": headers.get("x-clickhouse-summary").and_then(|v| v.to_str().ok()),
+                "clickhouse_exception_code": headers.get("x-clickhouse-exception-code").and_then(|v| v.to_str().ok()),
+                "result": body,
             }),
             ClickHouseAccelerationOutcome::Accelerated(_) => json!({
                 "id": row.id,
-                "route": "warm",
+                "fallback_requested": false,
+                "exact_executed": false,
+                "exact_success": false,
+                "exact_status": null,
+                "direct_exact_status": direct_status,
+                "matches_direct_exact": false,
+                "result": body,
             }),
         });
     }
@@ -135,4 +184,5 @@ async fn main() {
         "{}",
         serde_json::to_string_pretty(&json!({"queries": rows})).unwrap()
     );
+    server.abort();
 }

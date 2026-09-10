@@ -6,6 +6,10 @@ artifact_dir="$repo_root/tools/o11y-sql-main-eval/artifacts"
 corpus="$repo_root/tools/o11y-sql-main-eval/corpus.json"
 baseline=791f7d7b0feab3827e7e6f5100e65ef29aec68de
 
+export CLICKHOUSE_URL=${CLICKHOUSE_URL:-http://127.0.0.1:18123}
+: "${CLICKHOUSE_USER:?set CLICKHOUSE_USER for the exact ClickHouse backend}"
+: "${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD for the exact ClickHouse backend}"
+
 if [[ $(git merge-base "$baseline" HEAD) != "$baseline" ]]; then
   echo "HEAD does not descend from recorded main baseline $baseline" >&2
   exit 1

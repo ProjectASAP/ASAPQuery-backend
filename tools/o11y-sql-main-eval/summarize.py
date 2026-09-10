@@ -22,13 +22,24 @@ def main() -> None:
     rows = []
     for stage in planner["queries"]:
         route = runtime[stage["id"]]
+        if route["fallback_requested"] and route["exact_success"]:
+            classification = "exact_fallback"
+        elif not route["fallback_requested"]:
+            classification = "warm"
+        else:
+            classification = "failure"
         rows.append({
             "id": stage["id"],
             "operators": stage["operators"],
             "parser_planner": stage["parser_planner"],
             "publication": stage.get("publication", "not_reached"),
-            "data_plane_route": route["route"],
-            "classification": route["route"],
+            "fallback_requested": route["fallback_requested"],
+            "exact_executed": route["exact_executed"],
+            "exact_success": route["exact_success"],
+            "exact_status": route["exact_status"],
+            "direct_exact_status": route["direct_exact_status"],
+            "matches_direct_exact": route["matches_direct_exact"],
+            "classification": classification,
             "reason": short_reason(stage.get("reason", route.get("reason", ""))),
         })
     counts = {name: sum(row["classification"] == name for row in rows)
