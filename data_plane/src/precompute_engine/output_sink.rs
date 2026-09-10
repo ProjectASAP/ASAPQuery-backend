@@ -180,7 +180,7 @@ impl OutputSink for SketchStoreSink {
             )
             .into());
         }
-        crate::precompute_engine::metrics::record_materialized_outputs(outputs.len() as u64);
+        crate::precompute_engine::metrics::record_materialized_outputs(output_count as u64);
         Ok(())
     }
 }
