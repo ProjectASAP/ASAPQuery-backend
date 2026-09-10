@@ -41,3 +41,19 @@ CPU     = updates*Cupdate + merges*Cmerge + queries*Cquery
 This separates machine-specific atomic measurement from workload-specific
 window planning and makes tumbling, sliding/pane, retention, and sharing costs
 auditable.
+
+### Observation payload migration
+
+Runtime producers must replace the old single `shape` object with an
+`observation` containing `cardinality`, `observed_events`, `fits`, and optional
+`empirical_fingerprint`. Each fit supplies `family`, `parameters`,
+`goodness_of_fit`, and `confidence`; shape-match policy must also supply the fit
+quality and confidence thresholds. Old payloads are rejected rather than given
+invented confidence. Publish a new observation after upgrading the producer.
+
+The bounded observer models ranked key frequencies. Its output does not describe
+the numeric spacing of KLL sample values and must not be advertised as a general
+numeric-distribution observation. Equal frequencies produce the canonical
+uniform fit only: Zipf exponent zero describes the same distribution and must
+not create a false ambiguity. Near-uniform, genuinely distinct fits still pass
+through the normal ambiguity policy.

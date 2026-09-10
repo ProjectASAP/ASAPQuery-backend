@@ -89,6 +89,8 @@ impl ErpShapeObserver {
         let exponent = fit_zipf_exponent(&counts);
         let fits = [("uniform", 0.0), ("zipf", exponent)]
             .into_iter()
+            // Zipf(0) is exactly uniform; duplicate models are not ambiguity.
+            .filter(|(family, _)| *family != "zipf" || counts.first() != counts.last())
             .map(|(family, slope)| {
                 let expected: Vec<_> = (1..=counts.len())
                     .map(|rank| (rank as f64).powf(-slope))
@@ -837,6 +839,44 @@ mod tests {
         observer.updates = u64::MAX;
         assert!(observer.observe("a", 0).is_err());
         assert!(observer.snapshot().is_none());
+    }
+
+    #[test]
+    fn uniform_observation_matches_without_degenerate_zipf_ambiguity() {
+        let mut observer = ErpShapeObserver::new(4).unwrap();
+        for _ in 0..1000 {
+            for key in ["a", "b", "c", "d"] {
+                observer.observe(key, 0).unwrap();
+            }
+        }
+        let observed = observer.snapshot().unwrap().observation;
+        assert_eq!(observed.fits.len(), 1);
+        assert_eq!(observed.fits[0].family, "uniform");
+        let mut policy = input(ErpAccuracyMode::Hybrid);
+        policy.artifact.records[0].distribution = serde_json::json!({"erp_shape": {
+            "cardinality": 4, "family": "uniform", "parameters": {},
+            "benchmark_events": 4000
+        }});
+        policy.observed_shape = Some(observed);
+        policy.shape_match = Some(ErpShapeMatchPolicy {
+            minimum_benchmark_events: 1000,
+            max_log2_cardinality_distance: 1.0,
+            max_parameter_distance: 0.1,
+            max_goodness_of_fit: 0.1,
+            minimum_confidence: 0.9,
+            minimum_confidence_margin: 0.05,
+        });
+        assert!(matches!(
+            policy.select(
+                SketchAlgorithm::Cms,
+                0.01,
+                SketchParams::Cms {
+                    width: 4096,
+                    depth: 5
+                }
+            ),
+            ErpParameterDecision::Empirical { .. }
+        ));
     }
 
     #[test]
