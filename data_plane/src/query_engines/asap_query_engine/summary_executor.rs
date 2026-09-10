@@ -551,7 +551,7 @@ impl QueryExecutionContext<'_> {
                         AggregationType::MinMax | AggregationType::MultipleMinMax
                     ) {
                         if let Some(series) = self.index.query_rollup_range(
-                            crate::storage_engines::sketch_db::index::RollupCategory::ExactMax,
+                            crate::storage_engines::sketch_db::index::RollupReduction::Max,
                             sid,
                             self.t0_ms,
                             self.t1_ms,

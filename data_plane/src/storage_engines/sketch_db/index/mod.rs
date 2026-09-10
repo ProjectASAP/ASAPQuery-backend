@@ -291,21 +291,35 @@ impl SketchInstanceMetadata {
 type SidStore = Arc<RwLock<SidStoreData<BTreeMap<String, String>, AggPayload>>>;
 
 #[derive(Debug, Clone, Copy)]
-struct MaxRollupNode {
+struct ReductionRollupNode {
     end_ms: u64,
     value: f64,
 }
 
-#[derive(Debug, Default)]
-struct MaxRollupSeries {
+#[derive(Debug)]
+struct ReductionRollupSeries {
+    reduction: RollupReduction,
     anchor_start_ms: Option<u64>,
     base_width_ms: Option<u64>,
     next_start_ms: Option<u64>,
     valid: bool,
-    levels: Vec<BTreeMap<u64, MaxRollupNode>>,
+    levels: Vec<BTreeMap<u64, ReductionRollupNode>>,
 }
 
-impl MaxRollupSeries {
+impl ReductionRollupSeries {
+    fn new(reduction: RollupReduction) -> Self {
+        Self {
+            reduction,
+            anchor_start_ms: None,
+            base_width_ms: None,
+            next_start_ms: None,
+            valid: false,
+            levels: Vec::new(),
+        }
+    }
+}
+
+impl ReductionRollupSeries {
     fn append(&mut self, window: TimestampRange, value: f64, retention_horizon_ms: Option<u64>) {
         let width = window.1.saturating_sub(window.0);
         if width == 0 || self.next_start_ms.is_some_and(|next| next != window.0) {
@@ -325,7 +339,7 @@ impl MaxRollupSeries {
         }
         self.levels[0].insert(
             window.0,
-            MaxRollupNode {
+            ReductionRollupNode {
                 end_ms: window.1,
                 value,
             },
@@ -333,7 +347,7 @@ impl MaxRollupSeries {
 
         let mut level = 0usize;
         let mut node_start = window.0;
-        let mut node = MaxRollupNode {
+        let mut node = ReductionRollupNode {
             end_ms: window.1,
             value,
         };
@@ -354,9 +368,9 @@ impl MaxRollupSeries {
                 break;
             }
             node_start = left_start;
-            node = MaxRollupNode {
+            node = ReductionRollupNode {
                 end_ms: node.end_ms,
-                value: left.value.max(node.value),
+                value: self.reduction.combine(left.value, node.value),
             };
             level += 1;
             if self.levels.len() <= level {
@@ -398,7 +412,9 @@ impl MaxRollupSeries {
                     _ => break,
                 }
             }
-            result = Some(result.map_or(chosen.value, |current| current.max(chosen.value)));
+            result = Some(result.map_or(chosen.value, |current| {
+                self.reduction.combine(current, chosen.value)
+            }));
             cursor = chosen.end_ms;
             if cursor >= end_ms || base.range(cursor..).next().is_none() {
                 return result;
@@ -409,81 +425,89 @@ impl MaxRollupSeries {
     fn approx_bytes(&self) -> usize {
         self.levels
             .iter()
-            .map(|nodes| nodes.len() * std::mem::size_of::<(u64, MaxRollupNode)>())
+            .map(|nodes| nodes.len() * std::mem::size_of::<(u64, ReductionRollupNode)>())
             .sum()
     }
 }
 
 /// Readout categories supported by the derived rollup tier. New categories
 /// belong here rather than as additional top-level `SketchStore` fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RollupCategory {
-    ExactMax,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RollupReduction {
+    Max,
 }
 
-type ExactMaxRollups =
-    DashMap<u64, Arc<RwLock<HashMap<BTreeMap<String, String>, MaxRollupSeries>>>>;
+impl RollupReduction {
+    fn combine(self, left: f64, right: f64) -> f64 {
+        match self {
+            Self::Max => left.max(right),
+        }
+    }
+}
+
+type ReductionRollupMap = DashMap<
+    (RollupReduction, u64),
+    Arc<RwLock<HashMap<BTreeMap<String, String>, ReductionRollupSeries>>>,
+>;
 
 /// Rebuildable indexes over canonical SummaryStore panes. This owns derived
 /// query accelerators only; base summary instances remain the source of truth.
 #[derive(Default)]
 struct Rollups {
-    exact_max: ExactMaxRollups,
+    reductions: ReductionRollupMap,
 }
 
 impl Rollups {
-    fn append_exact_max(
+    fn append(
         &self,
+        reduction: RollupReduction,
         sid: u64,
         labels: BTreeMap<String, String>,
         window: TimestampRange,
         value: f64,
         retention_horizon_ms: Option<u64>,
     ) {
-        self.exact_max
-            .entry(sid)
+        self.reductions
+            .entry((reduction, sid))
             .or_insert_with(|| Arc::new(RwLock::new(HashMap::new())))
             .write()
             .unwrap()
             .entry(labels)
-            .or_default()
+            .or_insert_with(|| ReductionRollupSeries::new(reduction))
             .append(window, value, retention_horizon_ms);
     }
 
     fn query(
         &self,
-        category: RollupCategory,
+        reduction: RollupReduction,
         sid: u64,
         start_unix_ms: u64,
         end_unix_ms: u64,
     ) -> Option<Vec<(BTreeMap<String, String>, f64)>> {
-        match category {
-            RollupCategory::ExactMax => {
-                let rollups = self.exact_max.get(&sid)?.clone();
-                let guard = rollups.read().unwrap();
-                let values = guard
-                    .iter()
-                    .map(|(labels, series)| {
-                        series
-                            .query(start_unix_ms, end_unix_ms)
-                            .map(|value| (labels.clone(), value))
-                    })
-                    .collect::<Option<Vec<_>>>()?;
-                (!values.is_empty()).then_some(values)
-            }
-        }
+        let rollups = self.reductions.get(&(reduction, sid))?.clone();
+        let guard = rollups.read().unwrap();
+        let values = guard
+            .iter()
+            .map(|(labels, series)| {
+                series
+                    .query(start_unix_ms, end_unix_ms)
+                    .map(|value| (labels.clone(), value))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (!values.is_empty()).then_some(values)
     }
 
     fn remove_sid(&self, sid: u64) {
-        self.exact_max.remove(&sid);
+        self.reductions
+            .retain(|(_, series_id), _| *series_id != sid);
     }
 
     fn clear(&self) {
-        self.exact_max.clear();
+        self.reductions.clear();
     }
 
     fn approx_bytes(&self) -> usize {
-        self.exact_max
+        self.reductions
             .iter()
             .filter_map(|entry| {
                 entry.value().read().ok().map(|series| {
@@ -1058,7 +1082,8 @@ impl SketchStore {
         let retention_horizon_ms = guard.retention_horizon_ms;
         drop(guard);
         if let Some(value) = max_value.filter(|_| self.persistence_read.read().unwrap().is_none()) {
-            self.rollups.append_exact_max(
+            self.rollups.append(
+                RollupReduction::Max,
                 sid,
                 series_label_values,
                 window,
@@ -1073,7 +1098,7 @@ impl SketchStore {
     /// callers can fall back to the canonical exact-agg range path.
     pub fn query_rollup_range(
         &self,
-        category: RollupCategory,
+        category: RollupReduction,
         sid: u64,
         start_unix_ms: u64,
         end_unix_ms: u64,
@@ -2874,7 +2899,7 @@ mod tests {
 
     #[test]
     fn max_rollup_answers_aligned_and_partial_ranges_and_prunes_history() {
-        let mut rollup = MaxRollupSeries::default();
+        let mut rollup = ReductionRollupSeries::new(RollupReduction::Max);
         for index in 0..16u64 {
             let start = 5_000 + index * 30_000;
             rollup.append((start, start + 30_000), index as f64, Some(12 * 30_000));
@@ -2889,7 +2914,7 @@ mod tests {
         );
         assert_eq!(rollup.query(5_000, 35_000), None);
 
-        let mut gapped = MaxRollupSeries::default();
+        let mut gapped = ReductionRollupSeries::new(RollupReduction::Max);
         gapped.append((0, 30_000), 1.0, None);
         gapped.append((60_000, 90_000), 2.0, None);
         assert_eq!(gapped.query(0, 90_000), None);
