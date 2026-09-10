@@ -172,6 +172,7 @@ mod tests {
                 )])
                 .collect(),
             query_sink: PostAsapNodeId(4),
+            query_plan_sink: control_plane::query_plan::QueryNodeId(9),
             precompute_sinks: vec![PostAsapNodeId(3)],
         }
     }
@@ -323,6 +324,7 @@ mod tests {
             .into_iter()
             .collect(),
             query_sink: PostAsapNodeId(0),
+            query_plan_sink: control_plane::query_plan::QueryNodeId(1),
             precompute_sinks: vec![PostAsapNodeId(1)],
         };
         assert!(matches!(

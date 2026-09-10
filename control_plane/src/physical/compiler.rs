@@ -317,6 +317,11 @@ pub struct PrecomputePlan {
     pub schemas: Vec<StateSchemaContract>,
     pub producers: Vec<ProducerContract>,
     pub materializations: Vec<asap_types::PrecomputeMaterialization>,
+    /// Planner semantic DAGs and backend-owned placement for this generation.
+    /// Empty only for legacy/config-only construction paths.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub executable_dags:
+        BTreeMap<String, crate::physical::executable_binding::InstalledPostAsapDag>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -547,6 +552,7 @@ impl PrecomputePlan {
             schemas,
             producers,
             materializations,
+            executable_dags: BTreeMap::new(),
         };
         plan.validate()?;
         Ok(plan)
@@ -603,6 +609,16 @@ impl PrecomputePlan {
         };
         if !valid_ingest {
             return Err(PrecomputePlanError::UnsupportedIngestEndpoint);
+        }
+        for (query_id, installed) in &self.executable_dags {
+            if query_id != &installed.document.query_id {
+                return Err(PrecomputePlanError::CatalogContract(
+                    "post-ASAP DAG map key differs from document query ID".into(),
+                ));
+            }
+            installed
+                .validate()
+                .map_err(PrecomputePlanError::CatalogContract)?;
         }
         let mut materializations = BTreeSet::new();
         for materialization in &self.materializations {
@@ -2094,6 +2110,16 @@ impl PhysicalCompiler {
                 reason: "backend-local target cannot declare Collector producers".into(),
             });
         }
+        let query_ids = request
+            .queries
+            .iter()
+            .map(|query| query.query_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if query_ids.len() != request.queries.len() {
+            return Err(CompileError::Snapshot(
+                "planning query IDs must be unique within a plan generation".into(),
+            ));
+        }
 
         if let Some(workload) = &request.query_workload {
             let entries = workload.entries().collect::<Vec<_>>();
@@ -2136,6 +2162,8 @@ impl PhysicalCompiler {
         let mut executable_dags = vec![None::<ExecutableDagCompilation>; request.queries.len()];
         let mut node_bindings =
             BTreeMap::<(usize, PostAsapNodeId), asap_types::PolicyFingerprint>::new();
+        let mut query_node_bindings =
+            BTreeMap::<(usize, PostAsapNodeId), crate::query_plan::QueryNodeId>::new();
         let consumers = materialization_consumers(
             &request.queries,
             environment.target,
@@ -2621,22 +2649,38 @@ impl PhysicalCompiler {
                 cumulative_readout: true,
             };
             let mut entry = if request.hybrid_execution {
-                QueryPlanEntry::compile_bound_composable(
+                QueryPlanEntry::compile_bound_composable_mapped(
                     query.query_id.clone(),
                     canonical.clone(),
                     &query.post_asap,
                     instant,
                     FallbackPolicy::ExactBackend,
                     binding,
+                    |node, query_node| {
+                        if let Some(post_asap_node) = executable_dags[query_index]
+                            .as_ref()
+                            .and_then(|compiled| compiled.node_ids.node_id(node))
+                        {
+                            query_node_bindings.insert((query_index, post_asap_node), query_node);
+                        }
+                    },
                 )
             } else {
-                QueryPlanEntry::compile_bound(
+                QueryPlanEntry::compile_bound_mapped(
                     query.query_id.clone(),
                     canonical.clone(),
                     &query.post_asap,
                     instant,
                     FallbackPolicy::ExactBackend,
                     binding,
+                    |node, query_node| {
+                        if let Some(post_asap_node) = executable_dags[query_index]
+                            .as_ref()
+                            .and_then(|compiled| compiled.node_ids.node_id(node))
+                        {
+                            query_node_bindings.insert((query_index, post_asap_node), query_node);
+                        }
+                    },
                 )
             }?;
             if request.hybrid_execution {
@@ -2662,6 +2706,60 @@ impl PhysicalCompiler {
             clickhouse_context: None,
             entries: query_entries,
         };
+        for (query_index, compiled) in executable_dags.iter().enumerate() {
+            let Some(compiled) = compiled else { continue };
+            let query_id = request.queries[query_index].query_id.clone();
+            let mut placements = BTreeMap::new();
+            let mut precompute_sinks = Vec::new();
+            for node in &compiled.dag.nodes {
+                let placement =
+                    if let Some(definition) = node_bindings.get(&(query_index, node.id)).copied() {
+                        precompute_sinks.push(node.id);
+                        crate::physical::executable_binding::BackendNodeBinding::Materialization {
+                            summary_definition: definition.into(),
+                        }
+                    } else if node.output_state.timing
+                        == planner_types::post_asap::ExecutionTiming::MaintenanceTime
+                    {
+                        super::executable_binding::BackendNodeBinding::MaintenanceInput
+                    } else {
+                        match query_node_bindings.get(&(query_index, node.id)).copied() {
+                            Some(query_node) => {
+                                super::executable_binding::BackendNodeBinding::Query { query_node }
+                            }
+                            None => super::executable_binding::BackendNodeBinding::QueryInput,
+                        }
+                    };
+                placements.insert(node.id, placement);
+            }
+            precompute_sinks.sort();
+            let installed = crate::physical::executable_binding::InstalledPostAsapDag {
+                document: super::executable_binding::PostAsapDagDocument::from_executable(
+                    query_id.clone(),
+                    &compiled.dag,
+                )
+                .map_err(|reason| CompileError::Query {
+                    query_id: query_id.clone(),
+                    reason,
+                })?,
+                binding: super::executable_binding::BackendExecutableBinding {
+                    nodes: placements,
+                    query_sink: compiled.dag.root,
+                    query_plan_sink: query_plan
+                        .entries
+                        .values()
+                        .find(|entry| entry.query_id == query_id)
+                        .expect("compiled query entry exists")
+                        .root,
+                    precompute_sinks,
+                },
+            };
+            installed.validate().map_err(|reason| CompileError::Query {
+                query_id: query_id.clone(),
+                reason,
+            })?;
+            precompute_plan.executable_dags.insert(query_id, installed);
+        }
         for materialization in &mut precompute_plan.materializations {
             let fingerprint = materialization.policy_fingerprint();
             let max_lookback_ms = query_plan
@@ -2696,6 +2794,22 @@ impl PhysicalCompiler {
                 .unwrap_or(DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES),
         )?;
         query_plan.validate(&materialization_fingerprints)?;
+        for (query_id, installed) in &precompute_plan.executable_dags {
+            let entry = query_plan
+                .entries
+                .values()
+                .find(|entry| &entry.query_id == query_id)
+                .ok_or_else(|| CompileError::Query {
+                    query_id: query_id.clone(),
+                    reason: "installed post-ASAP DAG has no query-plan entry".into(),
+                })?;
+            installed
+                .validate_query_plan(entry)
+                .map_err(|reason| CompileError::Query {
+                    query_id: query_id.clone(),
+                    reason,
+                })?;
+        }
         let summary_catalog = super::summary_catalog::SummaryCatalog::from_materializations(
             envelope.plan_id,
             envelope.plan_version,
@@ -4195,7 +4309,9 @@ mod tests {
 
     #[test]
     fn hybrid_weighted_topk_installs_only_candidates_and_delegates_filtered_exact_values() {
-        use crate::query_plan::{logical::LogicalOperator, QueryPlanNode};
+        use crate::query_plan::{
+            logical::LogicalOperator, ExternalExactInput, ExternalExactOutput, QueryPlanNode,
+        };
         let query = "topk(2, sum by (job) (rate(m[1m])))";
         let evidence = TopKMembershipEvidence {
             selected_lower_bound: 101.0,
@@ -4223,11 +4339,15 @@ mod tests {
         };
         assert!(matches!(
             &entry.nodes[&inputs[1]],
-            QueryPlanNode::Logical {
-                operator: LogicalOperator::CandidateExactSubquery { query, item_label },
+            QueryPlanNode::ExternalExact {
+                request,
                 inputs: exact_inputs,
-            } if query == "sum by (job) (rate(m[1m]))"
-                && item_label == "job"
+            } if request.language == crate::query_plan::QueryLanguage::PromQl
+                && request.expression == "sum by (job) (rate(m[1m]))"
+                && request.output == ExternalExactOutput::InstantVector
+                && request.input_contracts == vec![ExternalExactInput::CandidateMembership {
+                    item_label: "job".into(),
+                }]
                 && exact_inputs == &vec![inputs[0]]
         ));
         assert!(entry.nodes.values().all(|node| !matches!(
@@ -4238,6 +4358,27 @@ mod tests {
                     ..
                 }
         )));
+        let installed = plan
+            .precompute_plan
+            .executable_dags
+            .get(&entry.query_id)
+            .expect("compiled query retains its Planner DAG and backend placement");
+        installed.validate().expect("typed DAG document");
+        installed
+            .validate_query_plan(entry)
+            .expect("query node bindings");
+        assert_eq!(installed.binding.query_plan_sink, entry.root);
+        assert!(installed.binding.nodes.values().any(|placement| matches!(
+            placement,
+            crate::physical::executable_binding::BackendNodeBinding::Materialization { .. }
+        )));
+        let encoded = serde_json::to_value(installed).unwrap();
+        let decoded: crate::physical::executable_binding::InstalledPostAsapDag =
+            serde_json::from_value(encoded).unwrap();
+        assert_eq!(&decoded, installed);
+        decoded
+            .validate()
+            .expect("round-tripped typed DAG document");
     }
 
     #[test]
@@ -4411,6 +4552,23 @@ mod tests {
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    #[test]
+    fn duplicate_query_ids_cannot_overwrite_installed_dag_documents() {
+        let mut workload = request("shared-id", "max_over_time(a[1m])");
+        let mut second = workload.queries[0].clone();
+        second.query_string = "max_over_time(b[1m])".into();
+        workload.queries.push(second);
+
+        let error = PhysicalCompiler
+            .compile(workload, environment(10_000))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            CompileError::Snapshot(reason)
+                if reason == "planning query IDs must be unique within a plan generation"
+        ));
     }
 
     #[test]

@@ -789,6 +789,7 @@ mod tests {
                 },
                 schemas: Vec::new(),
                 producers: Vec::new(),
+                executable_dags: Default::default(),
                 materializations: streaming.aggregation_configs.values().cloned().collect(),
             },
             transmission_plan: TransmissionPlan {

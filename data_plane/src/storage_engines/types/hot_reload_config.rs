@@ -683,7 +683,8 @@ mod tests {
                 },
                 schemas: Vec::new(),
                 producers: Vec::new(),
-                materializations: Vec::new(),
+                executable_dags: Default::default(),
+            materializations: Vec::new(),
             },
             transmission_plan: control_plane::physical::compiler::TransmissionPlan {
                 summary_catalog: None,
