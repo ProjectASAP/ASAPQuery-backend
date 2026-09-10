@@ -374,7 +374,7 @@ dependencies = [
 [[package]]
 name = "asap-aware-mapping"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=26e580710cf9b44b282598719d6c5ea9a9cc62be#26e580710cf9b44b282598719d6c5ea9a9cc62be"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=63455ab580baad914aa2b20a62aba620d7ed6e7b#63455ab580baad914aa2b20a62aba620d7ed6e7b"
 dependencies = [
  "asap-types",
  "serde",
@@ -385,7 +385,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-metricsql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=26e580710cf9b44b282598719d6c5ea9a9cc62be#26e580710cf9b44b282598719d6c5ea9a9cc62be"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=63455ab580baad914aa2b20a62aba620d7ed6e7b#63455ab580baad914aa2b20a62aba620d7ed6e7b"
 dependencies = [
  "asap-types",
  "metricsql_parser",
@@ -395,7 +395,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=26e580710cf9b44b282598719d6c5ea9a9cc62be#26e580710cf9b44b282598719d6c5ea9a9cc62be"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=63455ab580baad914aa2b20a62aba620d7ed6e7b#63455ab580baad914aa2b20a62aba620d7ed6e7b"
 dependencies = [
  "asap-types",
  "promql-parser 0.10.0",
@@ -404,7 +404,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-sql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=26e580710cf9b44b282598719d6c5ea9a9cc62be#26e580710cf9b44b282598719d6c5ea9a9cc62be"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=63455ab580baad914aa2b20a62aba620d7ed6e7b#63455ab580baad914aa2b20a62aba620d7ed6e7b"
 dependencies = [
  "asap-sql-function-catalog",
  "asap-types",
@@ -426,12 +426,12 @@ dependencies = [
 [[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=26e580710cf9b44b282598719d6c5ea9a9cc62be#26e580710cf9b44b282598719d6c5ea9a9cc62be"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=63455ab580baad914aa2b20a62aba620d7ed6e7b#63455ab580baad914aa2b20a62aba620d7ed6e7b"
 
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=26e580710cf9b44b282598719d6c5ea9a9cc62be#26e580710cf9b44b282598719d6c5ea9a9cc62be"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=63455ab580baad914aa2b20a62aba620d7ed6e7b#63455ab580baad914aa2b20a62aba620d7ed6e7b"
 dependencies = [
  "serde",
  "serde_json",
@@ -1711,7 +1711,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2260,7 +2260,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2453,7 +2453,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2801,7 +2801,7 @@ dependencies = [
 [[package]]
 name = "metricsql_common"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=26e580710cf9b44b282598719d6c5ea9a9cc62be#26e580710cf9b44b282598719d6c5ea9a9cc62be"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=63455ab580baad914aa2b20a62aba620d7ed6e7b#63455ab580baad914aa2b20a62aba620d7ed6e7b"
 dependencies = [
  "chrono",
 ]
@@ -2809,7 +2809,7 @@ dependencies = [
 [[package]]
 name = "metricsql_parser"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=26e580710cf9b44b282598719d6c5ea9a9cc62be#26e580710cf9b44b282598719d6c5ea9a9cc62be"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=63455ab580baad914aa2b20a62aba620d7ed6e7b#63455ab580baad914aa2b20a62aba620d7ed6e7b"
 dependencies = [
  "ahash",
  "chrono",
@@ -3433,7 +3433,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
  "heck 0.5.0",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -3453,7 +3453,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -3551,7 +3551,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.40",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3588,7 +3588,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.52.0",
 ]
@@ -3904,7 +3904,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4438,7 +4438,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5260,7 +5260,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

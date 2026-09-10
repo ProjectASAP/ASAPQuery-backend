@@ -421,6 +421,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn temporal_sql_reuses_existing_rate_summary_intent() {
+        let schema = Schema::with_time_index(
+            vec![
+                Column::new("metric", DataType::Utf8, false),
+                Column::new("labels", DataType::Utf8, false),
+                Column::new("ts_ms", DataType::Timestamp, false),
+                Column::new("value", DataType::Float64, false),
+            ],
+            2,
+            vec![],
+        );
+        let catalog = SqlCatalog::new().with_table("raw_samples", schema);
+        let planned = plan_clickhouse_sql(
+            "SELECT labels, asap_rate(value, ts_ms, 300000) AS value \
+             FROM raw_samples WHERE metric='requests_total' GROUP BY labels",
+            &catalog,
+            AccuracyTarget::Exact,
+        )
+        .await
+        .expect("explicit temporal SQL must use the shared rate DAG");
+        assert!(matches!(planned.physical, PhysicalExpr::Committed(_)));
+    }
+
+    #[tokio::test]
     async fn q05_max_over_time_sql_compiles_to_publishable_summary_dag() {
         let schema = Schema::with_time_index(
             vec![
