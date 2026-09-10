@@ -87,6 +87,7 @@ async fn compiled_ratio_bundle_executes_two_real_store_summaries() {
         accuracy: planner_types::types::AccuracyTarget::Exact,
         queries: vec![ClickHouseSqlWorkloadEntry {
             sql: sql.into(),
+            planning_sql: None,
             start_ms: 0,
             end_ms: 300_000,
             cumulative: true,
