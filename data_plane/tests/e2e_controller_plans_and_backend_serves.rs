@@ -86,7 +86,7 @@ async fn post_full_config(client: &reqwest::Client, stack: &FullStack, json: &Js
         .query_plan
         .entries
         .values_mut()
-        .filter(|e| e.canonical_promql.starts_with("count("))
+        .filter(|e| e.canonical_query.starts_with("count("))
     {
         entry.instant.lookback_ms = 1000;
         for node in entry.nodes.values_mut() {

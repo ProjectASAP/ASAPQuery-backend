@@ -258,7 +258,7 @@ pub fn manifest(
         for node_id in entry.topological_order()? {
             add(
                 format!("query:{}:{}", entry.query_id, node_id.0),
-                json!({"node": entry.nodes[&node_id], "query": entry.canonical_promql, "instant": entry.instant}),
+                json!({"node": entry.nodes[&node_id], "query": entry.canonical_query, "instant": entry.instant}),
                 "query_evaluation",
                 evaluations,
             );
@@ -410,6 +410,23 @@ pub fn select(
     env: DeploymentEnvironment,
     evidence: &WorkloadCostEvidence,
 ) -> Result<PhysicalPlan, CompileError> {
+    select_with_frontend(candidates, env, evidence, false)
+}
+
+pub fn select_metricsql(
+    candidates: Vec<PlanningRequest>,
+    env: DeploymentEnvironment,
+    evidence: &WorkloadCostEvidence,
+) -> Result<PhysicalPlan, CompileError> {
+    select_with_frontend(candidates, env, evidence, true)
+}
+
+fn select_with_frontend(
+    candidates: Vec<PlanningRequest>,
+    env: DeploymentEnvironment,
+    evidence: &WorkloadCostEvidence,
+    metricsql: bool,
+) -> Result<PhysicalPlan, CompileError> {
     evidence.validate(&env)?;
     if candidates.is_empty() || candidates.len() > 64 {
         return Err(invalid(
@@ -438,7 +455,11 @@ pub fn select(
     )> = None;
     for candidate in candidates {
         let queries = candidate.queries.clone();
-        let plan = match PhysicalCompiler.compile(candidate, env.clone()) {
+        let plan = match if metricsql {
+            PhysicalCompiler.compile_metricsql(candidate, env.clone())
+        } else {
+            PhysicalCompiler.compile(candidate, env.clone())
+        } {
             Ok(plan) => plan,
             Err(error) => {
                 alternatives.push(AlternativeCost {

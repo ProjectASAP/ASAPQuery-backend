@@ -140,6 +140,12 @@ pub trait HttpProtocolAdapter: QueryRequestAdapter + QueryResponseAdapter + Send
     /// Get a descriptive name for this adapter (for logging/debugging)
     fn adapter_name(&self) -> &'static str;
 
+    /// Language-owned canonical identity for an independently published plan
+    /// catalog. Protocols without a sidecar catalog return `None`.
+    fn canonical_plan_identity(&self, _query: &str) -> Result<Option<String>, AdapterError> {
+        Ok(None)
+    }
+
     /// Get the path for the runtime info endpoint
     ///
     /// Example: "/api/v1/status/runtimeinfo" for Prometheus

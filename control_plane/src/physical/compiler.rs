@@ -2050,8 +2050,25 @@ fn preserve_invalid_exact_fallback_roots(
 impl PhysicalCompiler {
     pub fn compile(
         &self,
+        request: PlanningRequest,
+        environment: DeploymentEnvironment,
+    ) -> Result<PhysicalPlan, CompileError> {
+        self.compile_language(request, environment, false)
+    }
+
+    pub fn compile_metricsql(
+        &self,
+        request: PlanningRequest,
+        environment: DeploymentEnvironment,
+    ) -> Result<PhysicalPlan, CompileError> {
+        self.compile_language(request, environment, true)
+    }
+
+    fn compile_language(
+        &self,
         mut request: PlanningRequest,
         environment: DeploymentEnvironment,
+        metricsql: bool,
     ) -> Result<PhysicalPlan, CompileError> {
         if request.hybrid_execution
             && environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite
@@ -2490,7 +2507,16 @@ impl PhysicalCompiler {
             .collect();
         let mut query_entries = BTreeMap::new();
         for query in &request.queries {
-            let canonical = canonical_promql(&query.query_string)?;
+            let canonical = if metricsql {
+                asap_frontend_metricsql::canonical_metricsql(&query.query_string).map_err(
+                    |error| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: format!("frontend.metricsql.identity: {error}"),
+                    },
+                )?
+            } else {
+                canonical_promql(&query.query_string)?
+            };
             let binding = |node: &SummaryNode, node_family: &SummaryFamilyType| -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
                     summary_agg_metric(node).ok_or_else(|| {
                         crate::query_plan::QueryPlanError::Invalid(
@@ -2582,6 +2608,9 @@ impl PhysicalCompiler {
                 // is an exact subtree boundary. Deployed plans never retain a
                 // backend-local range index leaf.
                 crate::query_plan::logical::finalize_residuals(&mut entry)?;
+            }
+            if metricsql {
+                entry.language = crate::query_plan::QueryLanguage::MetricsQl;
             }
             if query_entries.insert(canonical.clone(), entry).is_some() {
                 return Err(CompileError::Query {
@@ -4348,6 +4377,27 @@ mod tests {
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    #[test]
+    fn metricsql_compilation_publishes_a_language_tagged_query_entry() {
+        let query = "default_rollup(m[1m])";
+        let mut workload = request("vm-q", "last_over_time(m[1m])");
+        let accuracy = workload.queries[0].accuracy.clone();
+        let canonical = asap_frontend_metricsql::lower_metricsql(query, accuracy.clone()).unwrap();
+        workload.queries[0].query_string = query.into();
+        workload.queries[0].post_asap =
+            crate::planner_selection::keep_pre_asap(&canonical).unwrap();
+        let plan = PhysicalCompiler
+            .compile_metricsql(workload, environment(10_000))
+            .unwrap();
+        let identity = asap_frontend_metricsql::canonical_metricsql(query).unwrap();
+        let entry = plan
+            .query_plan
+            .lookup_canonical(crate::query_plan::QueryLanguage::MetricsQl, &identity)
+            .unwrap();
+        assert_eq!(entry.query_id, "vm-q");
+        assert_eq!(entry.language, crate::query_plan::QueryLanguage::MetricsQl);
     }
 
     #[test]

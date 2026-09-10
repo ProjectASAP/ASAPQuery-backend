@@ -103,8 +103,9 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
             query_plan.entries.insert(
                 canonical.clone(),
                 QueryPlanEntry {
+                    language: control_plane::query_plan::QueryLanguage::PromQl,
                     query_id: canonical.clone(),
-                    canonical_promql: canonical,
+                    canonical_query: canonical,
                     root: QueryNodeId(1),
                     nodes: BTreeMap::from([
                         (

@@ -1,7 +1,7 @@
 use crate::drivers::query::adapters::{ParsedQueryRequest, ParsedRangeQueryRequest};
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Form, Query, State},
+    extract::{DefaultBodyLimit, Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -132,6 +132,7 @@ pub struct HttpServerConfig {
 #[derive(Clone)]
 pub struct HttpServer {
     config: HttpServerConfig,
+    adapter_override: Option<Arc<dyn HttpProtocolAdapter>>,
     query_engine: Arc<ASAPQueryEngine>,
     /// Phase-5/6 capability router. Built from `query_engine` at
     /// construction time (`ASAPQueryEngine` registered as the ASAP-tier
@@ -238,6 +239,7 @@ impl HttpServer {
         let query_router = Arc::new(router);
         Self {
             config,
+            adapter_override: None,
             query_engine,
             query_router,
             sketch_index,
@@ -251,6 +253,22 @@ impl HttpServer {
             physical_plan_lifecycle: None,
             remote_write: None,
         }
+    }
+
+    /// Use a language-specific protocol adapter without extending the shared
+    /// protocol enum. This keeps VictoriaMetrics transport policy at its own
+    /// listener boundary.
+    pub fn with_protocol_adapter(mut self, adapter: Arc<dyn HttpProtocolAdapter>) -> Self {
+        self.adapter_override = Some(adapter);
+        self
+    }
+
+    /// Clone the fully configured query service onto another query listener.
+    pub fn with_query_listener(mut self, port: u16, adapter_config: AdapterConfig) -> Self {
+        self.config.port = port;
+        self.config.adapter_config = adapter_config;
+        self.remote_write = None;
+        self
     }
 
     /// Enable Prometheus Remote Write v1 on the same public HTTP listener.
@@ -395,7 +413,10 @@ impl HttpServer {
         srv_metrics::register_all();
 
         // Create adapter using factory
-        let adapter = create_http_adapter(self.config.adapter_config.clone());
+        let adapter = self
+            .adapter_override
+            .clone()
+            .unwrap_or_else(|| create_http_adapter(self.config.adapter_config.clone()));
 
         let query_endpoint = adapter.get_query_endpoint();
         let runtime_info_path = adapter.get_runtime_info_path();
@@ -487,8 +508,20 @@ impl HttpServer {
             .route(
                 "/api/v1/db/backfill/jobs/:job_id",
                 get(handle_get_backfill_job).delete(handle_delete_backfill_job),
+            );
+        let app = if adapter.adapter_name() == "VictoriaMetrics HTTP / MetricsQL" {
+            app.route(
+                "/select/:tenant/prometheus/api/v1/query",
+                get(handle_vm_cluster_instant).post(handle_vm_cluster_instant_post),
             )
-            .with_state(app_state);
+            .route(
+                "/select/:tenant/prometheus/api/v1/query_range",
+                get(handle_vm_cluster_range).post(handle_vm_cluster_range_post),
+            )
+        } else {
+            app
+        };
+        let app = app.with_state(app_state);
 
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.config.port)).await?;
         info!("HTTP server listening on port {}", self.config.port);
@@ -507,7 +540,10 @@ impl HttpServer {
     /// the regular `start()` method.
     pub async fn start_test_server(&self) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         // Create adapter using factory
-        let adapter = create_http_adapter(self.config.adapter_config.clone());
+        let adapter = self
+            .adapter_override
+            .clone()
+            .unwrap_or_else(|| create_http_adapter(self.config.adapter_config.clone()));
 
         let query_endpoint = adapter.get_query_endpoint();
         let runtime_info_path = adapter.get_runtime_info_path();
@@ -591,8 +627,20 @@ impl HttpServer {
             .route(
                 "/api/v1/db/backfill/jobs/:job_id",
                 get(handle_get_backfill_job).delete(handle_delete_backfill_job),
+            );
+        let app = if adapter.adapter_name() == "VictoriaMetrics HTTP / MetricsQL" {
+            app.route(
+                "/select/:tenant/prometheus/api/v1/query",
+                get(handle_vm_cluster_instant).post(handle_vm_cluster_instant_post),
             )
-            .with_state(app_state);
+            .route(
+                "/select/:tenant/prometheus/api/v1/query_range",
+                get(handle_vm_cluster_range).post(handle_vm_cluster_range_post),
+            )
+        } else {
+            app
+        };
+        let app = app.with_state(app_state);
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let actual_port = listener.local_addr()?.port();
@@ -671,6 +719,54 @@ async fn process_query_request(
     // apples-to-apples relative error per replay row.
     if let Some(override_id) = engine_override.as_deref() {
         return process_via_named_engine(state, parsed_request, start_time, override_id).await;
+    }
+
+    let language_identity = state.adapter.canonical_plan_identity(&parsed_request.query);
+    if state.adapter.adapter_name() == "VictoriaMetrics HTTP / MetricsQL"
+        && language_identity.is_err()
+    {
+        if let Some(fallback) = &state.fallback {
+            return match fallback
+                .execute_query_with_headers(parsed_request, headers)
+                .await
+            {
+                Ok(response) => response.into_response(),
+                Err(status) => status.into_response(),
+            };
+        }
+    }
+    if let Ok(Some(identity)) = language_identity {
+        let evaluation_ms = if parsed_request.time > 0.0 {
+            (parsed_request.time * 1_000.0) as u64
+        } else {
+            unix_time_ms()
+        };
+        if let Ok(query_result) = state
+            .query_engine
+            .execute_metricsql_at(&identity, evaluation_ms)
+            .await
+        {
+            let result = crate::drivers::query::adapters::QueryExecutionResult {
+                query_output_labels: asap_types::KeyByLabelNames::default(),
+                query_result,
+            };
+            return match state.adapter.format_success_response(&result).await {
+                Ok(response) => {
+                    annotate_data_source(response, StorageBackend::SketchStore.data_source_id())
+                        .await
+                }
+                Err(status) => status.into_response(),
+            };
+        }
+        if let Some(fallback) = &state.fallback {
+            return match fallback
+                .execute_query_with_headers(parsed_request, headers)
+                .await
+            {
+                Ok(response) => response.into_response(),
+                Err(status) => status.into_response(),
+            };
+        }
     }
 
     // Issue #46 ⑥ — freshness-probe short-circuit.
@@ -1700,6 +1796,61 @@ async fn annotate_data_source(response: Response, data_source_id: &'static str) 
     Response::from_parts(parts, axum::body::Body::from(serialized))
 }
 
+fn vm_tenant_headers(tenant: String, mut headers: HeaderMap) -> Result<HeaderMap, Response> {
+    let value = axum::http::HeaderValue::from_str(&tenant)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid VictoriaMetrics tenant").into_response())?;
+    headers.insert(TENANT_HEADER, value);
+    Ok(headers)
+}
+
+async fn handle_vm_cluster_instant(
+    Path(tenant): Path<String>,
+    query: Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    state: State<AppState>,
+) -> Response {
+    let Ok(headers) = vm_tenant_headers(tenant, headers) else {
+        return (StatusCode::BAD_REQUEST, "invalid VictoriaMetrics tenant").into_response();
+    };
+    handle_instant_query(query, headers, state).await
+}
+
+async fn handle_vm_cluster_instant_post(
+    Path(tenant): Path<String>,
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Ok(headers) = vm_tenant_headers(tenant, headers) else {
+        return (StatusCode::BAD_REQUEST, "invalid VictoriaMetrics tenant").into_response();
+    };
+    handle_instant_query_post(state, headers, body).await
+}
+
+async fn handle_vm_cluster_range(
+    Path(tenant): Path<String>,
+    query: Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    state: State<AppState>,
+) -> Response {
+    let Ok(headers) = vm_tenant_headers(tenant, headers) else {
+        return (StatusCode::BAD_REQUEST, "invalid VictoriaMetrics tenant").into_response();
+    };
+    handle_range_query(query, headers, state).await
+}
+
+async fn handle_vm_cluster_range_post(
+    Path(tenant): Path<String>,
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Ok(headers) = vm_tenant_headers(tenant, headers) else {
+        return (StatusCode::BAD_REQUEST, "invalid VictoriaMetrics tenant").into_response();
+    };
+    handle_range_query_post(state, headers, body).await
+}
+
 async fn handle_instant_query(
     query_params: Query<HashMap<String, String>>,
     headers: axum::http::HeaderMap,
@@ -2111,6 +2262,49 @@ async fn process_range_query_request(
     let start_ms = (parsed_request.start * 1000.0) as u64;
     let end_ms = (parsed_request.end * 1000.0) as u64;
     let step_ms = (parsed_request.step * 1000.0) as u64;
+
+    let language_identity = state.adapter.canonical_plan_identity(&parsed_request.query);
+    if state.adapter.adapter_name() == "VictoriaMetrics HTTP / MetricsQL"
+        && language_identity.is_err()
+    {
+        if let Some(fallback) = &state.fallback {
+            return match fallback
+                .execute_range_query_with_headers(parsed_request, forwarding_headers)
+                .await
+            {
+                Ok(response) => response.into_response(),
+                Err(status) => status.into_response(),
+            };
+        }
+    }
+    if let Ok(Some(identity)) = language_identity {
+        if let Ok(result) = state
+            .query_engine
+            .execute_metricsql_range(&identity, start_ms, end_ms, step_ms)
+            .await
+        {
+            return match state
+                .adapter
+                .format_range_success_response(&result, &asap_types::KeyByLabelNames::default())
+                .await
+            {
+                Ok(response) => {
+                    annotate_data_source(response, StorageBackend::SketchStore.data_source_id())
+                        .await
+                }
+                Err(status) => status.into_response(),
+            };
+        }
+        if let Some(fallback) = &state.fallback {
+            return match fallback
+                .execute_range_query_with_headers(parsed_request, forwarding_headers)
+                .await
+            {
+                Ok(response) => response.into_response(),
+                Err(status) => status.into_response(),
+            };
+        }
+    }
 
     let metric_storage = resolve_metric_storage(state, &parsed_request.query, tenant);
 
@@ -2642,6 +2836,40 @@ mod tests {
             .start_test_server()
             .await
             .expect("Failed to start test server")
+    }
+
+    async fn setup_victoriametrics_test_server() -> u16 {
+        use crate::drivers::query::adapters::VictoriaMetricsHttpAdapter;
+        let adapter_config =
+            AdapterConfig::victoriametrics_metricsql("http://127.0.0.1:9999".to_string());
+        let server = HttpServer::new(
+            HttpServerConfig {
+                port: 0,
+                handle_http_requests: true,
+                adapter_config: adapter_config.clone(),
+            },
+            Arc::new(ASAPQueryEngine::new(
+                Arc::new(StreamingConfig::default()),
+                15_000,
+            )),
+            Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+        )
+        .with_protocol_adapter(Arc::new(VictoriaMetricsHttpAdapter::new(adapter_config)));
+        server.start_test_server().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn victoriametrics_cluster_routes_are_registered() {
+        let port = setup_victoriametrics_test_server().await;
+        let response = Client::new()
+            .get(format!(
+                "http://127.0.0.1:{port}/select/42/prometheus/api/v1/query"
+            ))
+            .query(&[("query", "default_rollup(cpu[5m])"), ("time", "1")])
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(response.status(), reqwest::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -5947,6 +6175,12 @@ async fn handle_post_physical_plan(
     }
     let plan_id = active.plan_id();
     let materialization_count = active.precompute_plan.materializations.len();
+    let metricsql_query_count = active
+        .query_plan
+        .entries
+        .values()
+        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::MetricsQl)
+        .count();
     let plan_version = active.plan_version();
     let now = unix_time_ms();
     if let Err(error) = lifecycle.stage(active, now) {
@@ -5960,7 +6194,8 @@ async fn handle_post_physical_plan(
         StatusCode::ACCEPTED,
         axum::Json(serde_json::json!({
             "status": "staged", "plan_id": plan_id, "plan_version": plan_version,
-            "materialization_count": materialization_count
+            "materialization_count": materialization_count,
+            "metricsql_query_count": metricsql_query_count
         })),
     )
         .into_response()
@@ -6951,5 +7186,24 @@ mod catalog_install_tests {
             .expect("demo has maintained summaries");
         binding.window_ms += 1;
         assert!(install(request).unwrap_err().contains("pane duration"));
+    }
+
+    #[test]
+    fn catalog_install_applies_pane_origin_validation_to_metricsql_entries() {
+        let mut request = request();
+        let entry = request.query_plan.entries.values_mut().next().unwrap();
+        entry.language = control_plane::query_plan::QueryLanguage::MetricsQl;
+        let binding = entry
+            .nodes
+            .values_mut()
+            .find_map(|node| match node {
+                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                    Some(binding)
+                }
+                _ => None,
+            })
+            .expect("demo has maintained summaries");
+        binding.pane_origin_ms = Some(1);
+        assert!(install(request).unwrap_err().contains("pane origin"));
     }
 }

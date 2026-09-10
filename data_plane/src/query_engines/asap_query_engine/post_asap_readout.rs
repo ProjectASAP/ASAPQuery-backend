@@ -1026,8 +1026,9 @@ mod tests {
         }
 
         let entry = control_plane::query_plan::QueryPlanEntry {
+            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "q-rate".into(),
-            canonical_promql: "rate(requests_total[1m])".into(),
+            canonical_query: "rate(requests_total[1m])".into(),
             root: control_plane::query_plan::QueryNodeId(0),
             nodes: BTreeMap::from([
                 (
@@ -1120,8 +1121,9 @@ mod tests {
         idx.append_precompute(7, BTreeMap::new(), (0, 60_000), Box::new(accumulator));
 
         let entry = control_plane::query_plan::QueryPlanEntry {
+            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "q-rate".into(),
-            canonical_promql: "rate(requests_total[1m])".into(),
+            canonical_query: "rate(requests_total[1m])".into(),
             root: control_plane::query_plan::QueryNodeId(0),
             nodes: BTreeMap::from([
                 (
