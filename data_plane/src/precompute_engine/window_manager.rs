@@ -8,6 +8,8 @@ pub struct WindowManager {
     window_size_ms: i64,
     /// Slide interval in milliseconds (== window_size_ms for tumbling windows).
     slide_interval_ms: i64,
+    /// Width of independently stored non-overlapping panes.
+    pane_interval_ms: i64,
     /// Planned event-time phase of this materialization definition.
     origin_ms: Option<i64>,
 }
@@ -35,8 +37,22 @@ impl WindowManager {
         Self {
             window_size_ms,
             slide_interval_ms,
+            pane_interval_ms: slide_interval_ms,
             origin_ms,
         }
+    }
+
+    pub fn with_layout(
+        window_size_secs: u64,
+        slide_interval_secs: u64,
+        origin_ms: Option<i64>,
+        layout: &asap_types::WindowMaterializationLayout,
+    ) -> Self {
+        let mut manager = Self::with_origin(window_size_secs, slide_interval_secs, origin_ms);
+        if !matches!(layout, asap_types::WindowMaterializationLayout::FullWindow) {
+            manager.pane_interval_ms = (layout.base_pane_secs() * 1_000) as i64;
+        }
+        manager
     }
 
     pub fn window_size_ms(&self) -> i64 {
@@ -95,13 +111,12 @@ impl WindowManager {
             return Vec::new();
         }
         let mut panes = Vec::new();
-        let mut start =
-            self.window_start_for(previous_wm.saturating_sub(self.slide_interval_ms - 1));
-        while start.saturating_add(self.slide_interval_ms) <= current_wm {
-            if start.saturating_add(self.slide_interval_ms) > previous_wm {
+        let mut start = self.pane_start_for(previous_wm.saturating_sub(self.pane_interval_ms - 1));
+        while start.saturating_add(self.pane_interval_ms) <= current_wm {
+            if start.saturating_add(self.pane_interval_ms) > previous_wm {
                 panes.push(start);
             }
-            start = start.saturating_add(self.slide_interval_ms);
+            start = start.saturating_add(self.pane_interval_ms);
         }
         panes
     }
@@ -126,7 +141,7 @@ impl WindowManager {
     }
 
     pub fn pane_bounds(&self, pane_start: i64) -> (i64, i64) {
-        (pane_start, pane_start + self.slide_interval_ms)
+        (pane_start, pane_start + self.pane_interval_ms)
     }
 
     /// Slide interval accessor.
@@ -137,16 +152,17 @@ impl WindowManager {
     /// Pane start for a timestamp. Panes are aligned to the slide_interval grid,
     /// which is the same grid as `window_start_for`.
     pub fn pane_start_for(&self, timestamp_ms: i64) -> i64 {
-        self.window_start_for(timestamp_ms)
+        let origin = self.origin_ms.unwrap_or(0);
+        origin + (timestamp_ms - origin).div_euclid(self.pane_interval_ms) * self.pane_interval_ms
     }
 
     /// All pane starts composing a window, in ascending order.
     /// A window `[ws, ws + window_size)` is composed of
     /// `window_size / slide_interval` consecutive panes.
     pub fn panes_for_window(&self, window_start: i64) -> Vec<i64> {
-        let num_panes = self.window_size_ms / self.slide_interval_ms;
+        let num_panes = self.window_size_ms / self.pane_interval_ms;
         (0..num_panes)
-            .map(|i| window_start + i * self.slide_interval_ms)
+            .map(|i| window_start + i * self.pane_interval_ms)
             .collect()
     }
 }
@@ -211,6 +227,23 @@ mod tests {
             vec![10_000, 20_000, 30_000]
         );
         assert_eq!(wm.pane_bounds(20_000), (20_000, 30_000));
+    }
+
+    #[test]
+    fn physical_pane_width_is_independent_of_query_slide() {
+        let wm = WindowManager::with_layout(
+            60,
+            30,
+            Some(0),
+            &asap_types::WindowMaterializationLayout::Pane { pane_secs: 10 },
+        );
+        assert_eq!(wm.pane_start_for(29_999), 20_000);
+        assert_eq!(wm.pane_bounds(20_000), (20_000, 30_000));
+        assert_eq!(
+            wm.panes_for_window(0),
+            vec![0, 10_000, 20_000, 30_000, 40_000, 50_000]
+        );
+        assert_eq!(wm.closed_panes(15_000, 35_000), vec![10_000, 20_000]);
     }
 
     #[test]
