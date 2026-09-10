@@ -365,7 +365,6 @@ impl PrometheusRemoteWriteReceiver {
             .ingest
             .samples_ingested
             .fetch_add(new_samples.len() as u64, Ordering::Relaxed);
-        crate::precompute_engine::metrics::record_accepted_samples(new_samples.len() as u64);
         Ok(())
     }
 }
@@ -840,6 +839,7 @@ mod tests {
             window_size: 60,
             slide_interval: 60,
             window_type: WindowKind::Tumbling,
+            window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 },
             pane_origin_ms: None,
             spatial_filter: String::new(),
             spatial_filter_normalized: String::new(),
@@ -892,6 +892,7 @@ mod tests {
                 window_size: 60,
                 slide_interval: 60,
                 window_type: WindowKind::Tumbling,
+                window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 },
                 pane_origin_ms: Some(0),
                 spatial_filter: String::new(),
                 spatial_filter_normalized: String::new(),

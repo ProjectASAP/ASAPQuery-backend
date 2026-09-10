@@ -50,7 +50,6 @@
     "evidence_valid_for_ms": 60000,
     "horizon_seconds": 300.0,
     "window_implementation_id": "backend-tumbling-v1",
-    "state_layout": "anchored-pane-v1",
     "implementation_cost": {
       "model_version": "compat-cost-v1",
       "workload_fingerprint": "replaced-with-canonical-promql",

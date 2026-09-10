@@ -180,7 +180,6 @@ impl OutputSink for SketchStoreSink {
             )
             .into());
         }
-        crate::precompute_engine::metrics::record_materialized_outputs(output_count as u64);
         Ok(())
     }
 }
@@ -286,6 +285,7 @@ mod tests {
             window_size: 1,
             slide_interval: 1,
             window_type: WindowKind::Tumbling,
+            window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
             pane_origin_ms: None,
             spatial_filter: String::new(),
             spatial_filter_normalized: String::new(),

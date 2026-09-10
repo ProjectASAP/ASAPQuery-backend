@@ -10,6 +10,79 @@ use crate::utils::normalize_spatial_filter;
 use crate::AggregationType;
 use crate::KeyByLabelNames;
 
+/// Physical maintenance layout for one semantic windowed summary.
+///
+/// `window_size` and `slide_interval` on [`PrecomputeMaterialization`] retain
+/// the query's window and evaluation cadence. This enum describes how that
+/// semantic window is represented in storage; it must never be inferred by
+/// overloading either semantic duration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WindowMaterializationLayout {
+    /// Store disjoint mergeable states and compose a query window at read time.
+    Pane { pane_secs: u64 },
+    /// Maintain one complete state for every evaluation point.
+    FullWindow,
+    /// Store base panes plus coarser mergeable rollups. Every level is a
+    /// duration in seconds and is an integer multiple of its predecessor.
+    HierarchicalRollup {
+        base_pane_secs: u64,
+        levels_secs: Vec<u64>,
+    },
+}
+
+impl WindowMaterializationLayout {
+    pub fn base_pane_secs(&self) -> u64 {
+        match self {
+            Self::Pane { pane_secs } => *pane_secs,
+            Self::FullWindow => 0,
+            Self::HierarchicalRollup { base_pane_secs, .. } => *base_pane_secs,
+        }
+    }
+
+    pub fn validate(&self, window_secs: u64, slide_secs: u64) -> Result<(), String> {
+        if window_secs == 0 || slide_secs == 0 || slide_secs > window_secs {
+            return Err(
+                "window and slide must be positive and slide must not exceed window".into(),
+            );
+        }
+        match self {
+            Self::Pane { pane_secs } => {
+                if *pane_secs == 0 || window_secs % pane_secs != 0 || slide_secs % pane_secs != 0 {
+                    return Err("pane size must divide both window size and slide".into());
+                }
+            }
+            Self::FullWindow => {}
+            Self::HierarchicalRollup {
+                base_pane_secs,
+                levels_secs,
+            } => {
+                if *base_pane_secs == 0
+                    || window_secs % base_pane_secs != 0
+                    || slide_secs % base_pane_secs != 0
+                    || levels_secs.is_empty()
+                {
+                    return Err(
+                        "rollup base pane must divide window and slide, with at least one level"
+                            .into(),
+                    );
+                }
+                let mut previous = *base_pane_secs;
+                for level in levels_secs {
+                    if *level <= previous || *level % previous != 0 || window_secs % level != 0 {
+                        return Err(
+                            "rollup levels must increase by integral factors and divide the window"
+                                .into(),
+                        );
+                    }
+                    previous = *level;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Per-aggregation policy carried in the streaming config.
 ///
 /// **PR 5 (merged-sid-identity refactor)** retired the
@@ -34,6 +107,7 @@ pub struct PrecomputeMaterialization {
     pub window_size: u64,        // Window size in seconds (e.g., 900s for 15m)
     pub slide_interval: u64,     // Slide/hop interval in seconds (e.g., 30s)
     pub window_type: WindowKind, // Tumbling or Sliding
+    pub window_layout: WindowMaterializationLayout,
     /// Unix millisecond timestamp on the pane-boundary grid selected from
     /// the consuming query workload. Missing on legacy definitions, which
     /// must not be used for certified pane-only reads.
@@ -121,6 +195,13 @@ impl PrecomputeMaterialization {
             window_size,
             slide_interval,
             window_type,
+            window_layout: WindowMaterializationLayout::Pane {
+                pane_secs: if slide_interval == 0 {
+                    window_size
+                } else {
+                    slide_interval
+                },
+            },
             pane_origin_ms: None,
             spatial_filter,
             spatial_filter_normalized,
@@ -417,6 +498,38 @@ impl SerializableToSink for PrecomputeMaterialization {
 
     fn serialize_to_bytes(&self) -> Vec<u8> {
         self.original_yaml.as_bytes().to_vec()
+    }
+}
+
+#[cfg(test)]
+mod window_layout_tests {
+    use super::WindowMaterializationLayout;
+
+    #[test]
+    fn validates_multiple_slides_and_rejects_uncomposable_panes() {
+        for slide in [5, 10, 15, 30] {
+            WindowMaterializationLayout::Pane { pane_secs: 5 }
+                .validate(60, slide)
+                .unwrap();
+            WindowMaterializationLayout::FullWindow
+                .validate(60, slide)
+                .unwrap();
+        }
+        assert!(WindowMaterializationLayout::Pane { pane_secs: 7 }
+            .validate(60, 10)
+            .is_err());
+        assert!(WindowMaterializationLayout::HierarchicalRollup {
+            base_pane_secs: 5,
+            levels_secs: vec![10, 30],
+        }
+        .validate(60, 10)
+        .is_ok());
+        assert!(WindowMaterializationLayout::HierarchicalRollup {
+            base_pane_secs: 5,
+            levels_secs: vec![12],
+        }
+        .validate(60, 10)
+        .is_err());
     }
 }
 
