@@ -67,8 +67,25 @@ impl AdapterConfig {
         use crate::drivers::query::fallback::VictoriaMetricsHttpFallback;
         Self::new(
             QueryProtocol::PrometheusHttp,
-            QueryLanguage::PromQl,
+            QueryLanguage::MetricsQl,
             Some(Arc::new(VictoriaMetricsHttpFallback::new(fallback_url))),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listener_factories_preserve_their_query_language() {
+        assert_eq!(
+            AdapterConfig::prometheus_promql(String::new(), false).language,
+            QueryLanguage::PromQl
+        );
+        assert_eq!(
+            AdapterConfig::victoriametrics_metricsql(String::new()).language,
+            QueryLanguage::MetricsQl
+        );
     }
 }

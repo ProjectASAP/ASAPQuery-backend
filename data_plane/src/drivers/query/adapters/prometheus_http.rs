@@ -358,6 +358,10 @@ impl QueryResponseAdapter for PrometheusHttpAdapter {
 
 #[async_trait]
 impl HttpProtocolAdapter for PrometheusHttpAdapter {
+    fn query_language(&self) -> asap_types::QueryLanguage {
+        asap_types::QueryLanguage::PromQl
+    }
+
     fn adapter_name(&self) -> &'static str {
         "PrometheusHTTP"
     }

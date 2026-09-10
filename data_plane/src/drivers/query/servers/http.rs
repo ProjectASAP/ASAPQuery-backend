@@ -516,7 +516,7 @@ impl HttpServer {
         } else {
             app
         };
-        let app = if adapter.adapter_name() == "VictoriaMetrics HTTP / MetricsQL" {
+        let app = if adapter.query_language() == asap_types::QueryLanguage::MetricsQl {
             app.route(
                 "/select/:tenant/prometheus/api/v1/query",
                 get(handle_vm_cluster_instant).post(handle_vm_cluster_instant_post),
@@ -639,7 +639,7 @@ impl HttpServer {
         } else {
             app
         };
-        let app = if adapter.adapter_name() == "VictoriaMetrics HTTP / MetricsQL" {
+        let app = if adapter.query_language() == asap_types::QueryLanguage::MetricsQl {
             app.route(
                 "/select/:tenant/prometheus/api/v1/query",
                 get(handle_vm_cluster_instant).post(handle_vm_cluster_instant_post),
@@ -733,7 +733,7 @@ async fn process_query_request(
     }
 
     let language_identity = state.adapter.canonical_plan_identity(&parsed_request.query);
-    if state.adapter.adapter_name() == "VictoriaMetrics HTTP / MetricsQL"
+    if state.adapter.query_language() == asap_types::QueryLanguage::MetricsQl
         && language_identity.is_err()
     {
         if let Some(fallback) = &state.fallback {
@@ -2275,7 +2275,7 @@ async fn process_range_query_request(
     let step_ms = (parsed_request.step * 1000.0) as u64;
 
     let language_identity = state.adapter.canonical_plan_identity(&parsed_request.query);
-    if state.adapter.adapter_name() == "VictoriaMetrics HTTP / MetricsQL"
+    if state.adapter.query_language() == asap_types::QueryLanguage::MetricsQl
         && language_identity.is_err()
     {
         if let Some(fallback) = &state.fallback {

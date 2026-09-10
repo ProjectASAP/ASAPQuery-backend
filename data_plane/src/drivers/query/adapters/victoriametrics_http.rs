@@ -95,6 +95,10 @@ impl QueryResponseAdapter for VictoriaMetricsHttpAdapter {
 
 #[async_trait]
 impl HttpProtocolAdapter for VictoriaMetricsHttpAdapter {
+    fn query_language(&self) -> asap_types::QueryLanguage {
+        asap_types::QueryLanguage::MetricsQl
+    }
+
     fn adapter_name(&self) -> &'static str {
         "VictoriaMetrics HTTP / MetricsQL"
     }
