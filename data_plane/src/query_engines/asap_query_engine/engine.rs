@@ -124,6 +124,71 @@ pub struct ASAPQueryEngine {
 }
 
 impl ASAPQueryEngine {
+    pub async fn execute_metricsql_at(
+        &self,
+        identity: &str,
+        now_ms: u64,
+    ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
+    {
+        let physical = self.physical_plan_snapshot().ok_or_else(|| {
+            crate::query_engines::EngineError::capability_miss(
+                "metricsql_catalog",
+                "no active physical plan",
+            )
+        })?;
+        let planned = physical
+            .metricsql_plan_catalog
+            .lookup(identity)
+            .map_err(|error| {
+                crate::query_engines::EngineError::capability_miss(
+                    "metricsql_catalog",
+                    error.to_string(),
+                )
+            })?;
+        let entry = planned.executable.execution_view(
+            planned.query_id.clone(),
+            planned.canonical_metricsql.clone(),
+        );
+        let leaves = self.prepare_logical(&physical, &entry, &[now_ms]).await?;
+        let (mut result, mut stats) =
+            self.execute_logical_entry(&physical, &entry, &leaves, now_ms)?;
+        stats.remote_evaluations = leaves.values().map(|leaf| leaf.remote_evaluations).sum();
+        stats.remote_rpcs = leaves.values().map(|leaf| leaf.remote_rpcs).sum();
+        annotate_logical_execution(&mut result, &stats);
+        Ok(result)
+    }
+
+    pub async fn execute_metricsql_range(
+        &self,
+        identity: &str,
+        start_ms: u64,
+        end_ms: u64,
+        step_ms: u64,
+    ) -> Result<crate::query_engines::query_result::QueryResult, crate::query_engines::EngineError>
+    {
+        let physical = self.physical_plan_snapshot().ok_or_else(|| {
+            crate::query_engines::EngineError::capability_miss(
+                "metricsql_catalog",
+                "no active physical plan",
+            )
+        })?;
+        let planned = physical
+            .metricsql_plan_catalog
+            .lookup(identity)
+            .map_err(|error| {
+                crate::query_engines::EngineError::capability_miss(
+                    "metricsql_catalog",
+                    error.to_string(),
+                )
+            })?;
+        let entry = planned.executable.execution_view(
+            planned.query_id.clone(),
+            planned.canonical_metricsql.clone(),
+        );
+        self.execute_logical_range(&physical, &entry, start_ms, end_ms, step_ms)
+            .await
+    }
+
     /// Construct a `ASAPQueryEngine` with a static `Arc<StreamingConfig>`.
     /// Wraps the config in a fresh `HotReloadStreamingConfig` internally
     /// — callers that need to share the hot-reload handle with the HTTP
@@ -3647,6 +3712,81 @@ mod range_stitch_tests {
             ts,
             vec![w_end],
             "warm-only result must carry just the warm window sample: {ts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_metricsql_sidecar_reaches_the_shared_dag_executor() {
+        use control_plane::metricsql_plan::{MetricsQlPlanCatalog, MetricsQlPlanEntry};
+        use control_plane::query_plan::{
+            ExecutableQueryPlan, FallbackPolicy, InstantExecution, QueryNodeId, QueryPlanNode,
+        };
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let identity = asap_frontend_metricsql::canonical_metricsql("1 + 2").unwrap();
+        let sidecar = MetricsQlPlanCatalog {
+            plan_id: plan.envelope.plan_id,
+            plan_version: plan.envelope.plan_version,
+            entries: std::collections::BTreeMap::from([(
+                identity.clone(),
+                MetricsQlPlanEntry {
+                    query_id: "vm-scalar".into(),
+                    canonical_metricsql: identity.clone(),
+                    executable: ExecutableQueryPlan {
+                        root: QueryNodeId(2),
+                        nodes: std::collections::BTreeMap::from([
+                            (QueryNodeId(0), QueryPlanNode::Scalar { value: 1.0 }),
+                            (QueryNodeId(1), QueryPlanNode::Scalar { value: 2.0 }),
+                            (
+                                QueryNodeId(2),
+                                QueryPlanNode::Binary {
+                                    inputs: [QueryNodeId(0), QueryNodeId(1)],
+                                    operator: planner_types::pre_asap::ArithmeticOpKind::Add,
+                                },
+                            ),
+                        ]),
+                        instant: InstantExecution {
+                            lookback_ms: 1,
+                            full_history: false,
+                            cumulative_readout: false,
+                        },
+                        fallback: FallbackPolicy::ExactBackend,
+                    },
+                },
+            )]),
+        };
+        let mut active = crate::drivers::query::servers::http::build_active_physical_plan(
+            crate::drivers::query::servers::http::PhysicalPlanInstallRequest {
+                summary_catalog: plan.summary_catalog,
+                collector_plans: plan.collector_plans,
+                precompute_plan: plan.precompute_plan,
+                transmission_plan: plan.transmission_plan,
+                query_plan: plan.query_plan,
+                metricsql_plan_catalog: Some(sidecar),
+                storage_routing: None,
+                adaptation_evidence: vec![],
+            },
+            Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
+        )
+        .unwrap();
+        active.envelope.expiry_unix_ms = None;
+        let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active);
+        let hot = HotReloadStreamingConfig::from_active(active.clone());
+        let engine =
+            ASAPQueryEngine::new_with_hot_reload(hot, 15).with_active_physical_plan(active);
+        let error = engine
+            .execute_metricsql_at(&identity, 1_000)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("bound subtree requires one explicit positive window"),
+            "{error}"
         );
     }
 }

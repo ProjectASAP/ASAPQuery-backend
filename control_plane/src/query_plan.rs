@@ -150,6 +150,55 @@ pub struct QueryPlanEntry {
     pub fallback: FallbackPolicy,
 }
 
+/// Language-neutral executable projection of a compiled physical query DAG.
+///
+/// This is deliberately separate from [`QueryPlanEntry`], whose serialized
+/// `canonical_promql` identity remains part of the stable PromQL contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableQueryPlan {
+    pub root: QueryNodeId,
+    pub nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
+    pub instant: InstantExecution,
+    pub fallback: FallbackPolicy,
+}
+
+impl QueryPlanEntry {
+    pub fn executable(&self) -> ExecutableQueryPlan {
+        ExecutableQueryPlan {
+            root: self.root,
+            nodes: self.nodes.clone(),
+            instant: self.instant.clone(),
+            fallback: self.fallback.clone(),
+        }
+    }
+}
+
+impl ExecutableQueryPlan {
+    pub fn materialization_bindings(&self) -> Vec<&MaterializationBinding> {
+        self.nodes
+            .values()
+            .filter_map(|node| match node {
+                QueryPlanNode::ReadMaterialization { binding } => Some(binding),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Internal compatibility view for the existing executor. The supplied
+    /// identity is never serialized into the PromQL plan catalog.
+    pub fn execution_view(&self, query_id: String, source: String) -> QueryPlanEntry {
+        QueryPlanEntry {
+            query_id,
+            canonical_promql: source,
+            root: self.root,
+            nodes: self.nodes.clone(),
+            instant: self.instant.clone(),
+            fallback: self.fallback.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InstantExecution {
@@ -1126,6 +1175,32 @@ mod tests {
             canonical_promql("sum by (service) ( rate(http_requests_total[5m]) )").unwrap(),
             canonical_promql("sum by(service)(rate(http_requests_total[5m]))").unwrap()
         );
+    }
+
+    #[test]
+    fn executable_extraction_preserves_promql_entry_serde() {
+        let entry = QueryPlanEntry {
+            query_id: "q".into(),
+            canonical_promql: canonical_promql("up").unwrap(),
+            root: QueryNodeId(0),
+            nodes: BTreeMap::from([(
+                QueryNodeId(0),
+                QueryPlanNode::ExactFallback {
+                    reason: "fixture".into(),
+                },
+            )]),
+            instant: InstantExecution {
+                lookback_ms: 1,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        let before = serde_json::to_value(&entry).unwrap();
+        let _payload = entry.executable();
+        assert_eq!(before, serde_json::to_value(&entry).unwrap());
+        assert!(before.get("canonical_promql").is_some());
+        assert!(before.get("executable").is_none());
     }
 
     #[test]

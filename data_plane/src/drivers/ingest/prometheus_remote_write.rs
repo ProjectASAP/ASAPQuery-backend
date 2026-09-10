@@ -803,6 +803,9 @@ mod tests {
             },
             runtime_config: Arc::new(streaming),
             query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
+            metricsql_plan_catalog: Arc::new(
+                control_plane::metricsql_plan::MetricsQlPlanCatalog::empty(),
+            ),
             storage_routing: Arc::new(BackendStorageRouting::empty()),
         };
         HotReloadStreamingConfig::from_active(HotReloadActivePhysicalPlan::new(active))

@@ -17,7 +17,7 @@ use control_plane::workload;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -551,8 +551,16 @@ async fn main() {
             post(handle_workload_cost_manifests),
         )
         .route(
+            "/api/v1/metricsql/physical-plan/cost-manifests",
+            post(handle_metricsql_workload_cost_manifests),
+        )
+        .route(
             "/api/v1/physical-plan/compile-and-publish",
             post(handle_compile_and_publish_physical_plan),
+        )
+        .route(
+            "/api/v1/metricsql/physical-plan/compile-and-publish",
+            post(handle_compile_and_publish_metricsql_physical_plan),
         )
         .route("/api/v1/plan/auto", post(handle_plan_auto))
         .route("/api/v1/plan/pareto", post(handle_pareto))
@@ -622,6 +630,39 @@ fn default_physical_plan_timeout_ms() -> u64 {
     10_000
 }
 
+#[derive(Clone, Copy)]
+enum PhysicalQueryFrontend {
+    PromQl,
+    MetricsQl,
+}
+
+impl PhysicalQueryFrontend {
+    fn parse(
+        self,
+        query: &str,
+        accuracy: types_v2::AccuracyTarget,
+    ) -> Result<planner_types::pre_asap::QueryExpr, String> {
+        match self {
+            Self::PromQl => parse_query_expr_canonical(query, accuracy)
+                .map_err(|e| format!("frontend.promql: {e}")),
+            Self::MetricsQl => asap_frontend_metricsql::lower_metricsql(query, accuracy)
+                .map_err(|e| format!("frontend.metricsql: {e}")),
+        }
+    }
+    fn compile(
+        self,
+        request: physical::compiler::PlanningRequest,
+        environment: physical::compiler::DeploymentEnvironment,
+    ) -> Result<physical::compiler::PhysicalPlan, physical::compiler::CompileError> {
+        match self {
+            Self::PromQl => physical::compiler::PhysicalCompiler.compile(request, environment),
+            Self::MetricsQl => {
+                physical::compiler::PhysicalCompiler.compile_metricsql(request, environment)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct CompileAndPublishPhysicalPlanResponse {
     cost_comparison: Option<physical::workload_cost::WorkloadCostComparison>,
@@ -638,9 +679,24 @@ struct CompileAndPublishPhysicalPlanResponse {
 async fn handle_compile_and_publish_physical_plan(
     State(st): State<AppState>,
     Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
-) -> impl IntoResponse {
+) -> Response {
+    compile_and_publish_physical_plan(st, request, PhysicalQueryFrontend::PromQl).await
+}
+
+async fn handle_compile_and_publish_metricsql_physical_plan(
+    State(st): State<AppState>,
+    Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
+) -> Response {
+    compile_and_publish_physical_plan(st, request, PhysicalQueryFrontend::MetricsQl).await
+}
+
+async fn compile_and_publish_physical_plan(
+    st: AppState,
+    request: CompileAndPublishPhysicalPlanRequest,
+    frontend: PhysicalQueryFrontend,
+) -> Response {
     let (bundle, collector_ids, apply_timeout, adaptation_evidence, _) =
-        match compile_physical_plan_request(request, false) {
+        match compile_physical_plan_request(request, false, frontend) {
             Ok((Some(bundle), ids, timeout, adaptation, manifests)) => {
                 (bundle, ids, timeout, adaptation, manifests)
             }
@@ -749,6 +805,7 @@ async fn handle_compile_and_publish_physical_plan(
 fn compile_physical_plan_request(
     request: CompileAndPublishPhysicalPlanRequest,
     manifests_only: bool,
+    frontend: PhysicalQueryFrontend,
 ) -> Result<
     (
         Option<physical::compiler::PhysicalPlan>,
@@ -800,7 +857,7 @@ fn compile_physical_plan_request(
                 "query_id, metric, and window_secs must be non-empty/non-zero".to_string(),
             ));
         }
-        let expr = match parse_query_expr_canonical(&query.query_string, query.accuracy.clone()) {
+        let expr = match frontend.parse(&query.query_string, query.accuracy.clone()) {
             Ok(expr) => expr,
             Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
         };
@@ -864,7 +921,7 @@ fn compile_physical_plan_request(
     let manifests: Vec<_> = candidates
         .iter()
         .filter_map(|candidate| {
-            physical::compiler::PhysicalCompiler
+            frontend
                 .compile(candidate.clone(), environment.clone())
                 .and_then(|plan| physical::workload_cost::manifest(&plan, &candidate.queries))
                 .ok()
@@ -889,8 +946,15 @@ fn compile_physical_plan_request(
         ));
     }
     let compiled = match request.workload_cost_evidence {
-        Some(evidence) => physical::workload_cost::select(candidates, environment, &evidence),
-        None => physical::compiler::PhysicalCompiler.compile(planning_request, environment),
+        Some(evidence) => match frontend {
+            PhysicalQueryFrontend::PromQl => {
+                physical::workload_cost::select(candidates, environment, &evidence)
+            }
+            PhysicalQueryFrontend::MetricsQl => {
+                physical::workload_cost::select_metricsql(candidates, environment, &evidence)
+            }
+        },
+        None => frontend.compile(planning_request, environment),
     };
     let bundle = match compiled {
         Ok(bundle) => bundle,
@@ -909,6 +973,19 @@ fn compile_physical_plan_request(
 async fn handle_workload_cost_manifests(
     Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
 ) -> impl IntoResponse {
+    workload_cost_manifests(request, PhysicalQueryFrontend::PromQl)
+}
+
+async fn handle_metricsql_workload_cost_manifests(
+    Json(request): Json<CompileAndPublishPhysicalPlanRequest>,
+) -> impl IntoResponse {
+    workload_cost_manifests(request, PhysicalQueryFrontend::MetricsQl)
+}
+
+fn workload_cost_manifests(
+    request: CompileAndPublishPhysicalPlanRequest,
+    frontend: PhysicalQueryFrontend,
+) -> Response {
     if request.workload_cost_evidence.is_some() {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -916,7 +993,7 @@ async fn handle_workload_cost_manifests(
         )
             .into_response();
     }
-    match compile_physical_plan_request(request, true) {
+    match compile_physical_plan_request(request, true, frontend) {
         Ok((_, _, _, _, manifests)) => Json(manifests).into_response(),
         Err(error) => error.into_response(),
     }

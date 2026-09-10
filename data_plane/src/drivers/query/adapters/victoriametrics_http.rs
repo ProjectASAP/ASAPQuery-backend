@@ -98,6 +98,11 @@ impl HttpProtocolAdapter for VictoriaMetricsHttpAdapter {
     fn adapter_name(&self) -> &'static str {
         "VictoriaMetrics HTTP / MetricsQL"
     }
+    fn canonical_plan_identity(&self, query: &str) -> Result<Option<String>, AdapterError> {
+        asap_frontend_metricsql::canonical_metricsql(query)
+            .map(Some)
+            .map_err(|error| AdapterError::ParseError(format!("frontend.metricsql: {error}")))
+    }
     fn get_runtime_info_path(&self) -> &'static str {
         "/api/v1/status/runtimeinfo"
     }

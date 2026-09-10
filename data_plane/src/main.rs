@@ -512,6 +512,7 @@ async fn main() -> Result<()> {
                 precompute_plan: plan.precompute_plan,
                 transmission_plan: plan.transmission_plan,
                 query_plan: plan.query_plan,
+                metricsql_plan_catalog: plan.metricsql_plan_catalog,
                 storage_routing: None,
                 adaptation_evidence: Vec::new(),
             },
@@ -725,6 +726,9 @@ async fn main() -> Result<()> {
             transmission_plan: initial_transmission_plan,
             runtime_config: streaming_config.clone(),
             query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
+            metricsql_plan_catalog: Arc::new(
+                control_plane::metricsql_plan::MetricsQlPlanCatalog::empty(),
+            ),
             storage_routing: Arc::new(
                 data_plane::storage_engines::types::BackendStorageRouting::empty(),
             ),
@@ -1113,6 +1117,7 @@ async fn main() -> Result<()> {
             transmission_plan: current.transmission_plan.clone(),
             runtime_config: current.runtime_config.clone(),
             query_plan: current.query_plan.clone(),
+            metricsql_plan_catalog: current.metricsql_plan_catalog.clone(),
             storage_routing: Arc::new(bootstrap_routing),
         });
     }

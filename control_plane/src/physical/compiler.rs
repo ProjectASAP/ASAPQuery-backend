@@ -737,6 +737,7 @@ pub struct PhysicalPlan {
     pub precompute_plan: PrecomputePlan,
     pub transmission_plan: TransmissionPlan,
     pub query_plan: QueryPlan,
+    pub metricsql_plan_catalog: Option<crate::metricsql_plan::MetricsQlPlanCatalog>,
     /// Lifecycle component only, not a complete physical-plan comparison.
     pub lifecycle_estimates: Vec<MaterializationLifecycleEstimate>,
     pub cost_comparison: Option<super::workload_cost::WorkloadCostComparison>,
@@ -2050,8 +2051,25 @@ fn preserve_invalid_exact_fallback_roots(
 impl PhysicalCompiler {
     pub fn compile(
         &self,
+        request: PlanningRequest,
+        environment: DeploymentEnvironment,
+    ) -> Result<PhysicalPlan, CompileError> {
+        self.compile_language(request, environment, false)
+    }
+
+    pub fn compile_metricsql(
+        &self,
+        request: PlanningRequest,
+        environment: DeploymentEnvironment,
+    ) -> Result<PhysicalPlan, CompileError> {
+        self.compile_language(request, environment, true)
+    }
+
+    fn compile_language(
+        &self,
         mut request: PlanningRequest,
         environment: DeploymentEnvironment,
+        metricsql: bool,
     ) -> Result<PhysicalPlan, CompileError> {
         if request.hybrid_execution
             && environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite
@@ -2489,8 +2507,18 @@ impl PhysicalCompiler {
             .map(asap_types::PrecomputeMaterialization::policy_fingerprint)
             .collect();
         let mut query_entries = BTreeMap::new();
+        let mut metricsql_entries = BTreeMap::new();
         for query in &request.queries {
-            let canonical = canonical_promql(&query.query_string)?;
+            let canonical = if metricsql {
+                asap_frontend_metricsql::canonical_metricsql(&query.query_string).map_err(
+                    |error| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: format!("frontend.metricsql.identity: {error}"),
+                    },
+                )?
+            } else {
+                canonical_promql(&query.query_string)?
+            };
             let binding = |node: &SummaryNode, node_family: &SummaryFamilyType| -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
                     summary_agg_metric(node).ok_or_else(|| {
                         crate::query_plan::QueryPlanError::Invalid(
@@ -2583,7 +2611,22 @@ impl PhysicalCompiler {
                 // backend-local range index leaf.
                 crate::query_plan::logical::finalize_residuals(&mut entry)?;
             }
-            if query_entries.insert(canonical.clone(), entry).is_some() {
+            if metricsql {
+                let metrics_entry = crate::metricsql_plan::MetricsQlPlanEntry {
+                    query_id: query.query_id.clone(),
+                    canonical_metricsql: canonical.clone(),
+                    executable: entry.executable(),
+                };
+                if metricsql_entries
+                    .insert(canonical.clone(), metrics_entry)
+                    .is_some()
+                {
+                    return Err(CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: format!("duplicate canonical MetricsQL identity `{canonical}`"),
+                    });
+                }
+            } else if query_entries.insert(canonical.clone(), entry).is_some() {
                 return Err(CompileError::Query {
                     query_id: query.query_id.clone(),
                     reason: format!("duplicate canonical query identity `{canonical}`"),
@@ -2595,12 +2638,24 @@ impl PhysicalCompiler {
             plan_version: envelope.plan_version,
             entries: query_entries,
         };
+        let metricsql_plan_catalog =
+            metricsql.then_some(crate::metricsql_plan::MetricsQlPlanCatalog {
+                plan_id,
+                plan_version: envelope.plan_version,
+                entries: metricsql_entries,
+            });
         for materialization in &mut precompute_plan.materializations {
             let fingerprint = materialization.policy_fingerprint();
             let max_lookback_ms = query_plan
                 .entries
                 .values()
                 .flat_map(QueryPlanEntry::materialization_bindings)
+                .chain(
+                    metricsql_plan_catalog
+                        .iter()
+                        .flat_map(|catalog| catalog.entries.values())
+                        .flat_map(|entry| entry.executable.materialization_bindings()),
+                )
                 .filter(|binding| binding.materialization.fingerprint() == fingerprint)
                 .filter_map(|binding| binding.readout_lookback_ms)
                 .max();
@@ -2629,6 +2684,9 @@ impl PhysicalCompiler {
                 .unwrap_or(DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES),
         )?;
         query_plan.validate(&materialization_fingerprints)?;
+        if let Some(catalog) = &metricsql_plan_catalog {
+            catalog.validate(&materialization_fingerprints)?;
+        }
         let summary_catalog = super::summary_catalog::SummaryCatalog::from_materializations(
             envelope.plan_id,
             envelope.plan_version,
@@ -2670,6 +2728,7 @@ impl PhysicalCompiler {
             precompute_plan,
             transmission_plan,
             query_plan,
+            metricsql_plan_catalog,
             lifecycle_estimates: lifecycle_estimates.into_values().collect(),
             cost_comparison: None,
         })
@@ -4296,6 +4355,26 @@ mod tests {
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    #[test]
+    fn metricsql_compilation_publishes_only_the_independent_sidecar() {
+        let query = "default_rollup(m[1m])";
+        let mut workload = request("vm-q", "last_over_time(m[1m])");
+        let accuracy = workload.queries[0].accuracy.clone();
+        let canonical = asap_frontend_metricsql::lower_metricsql(query, accuracy.clone()).unwrap();
+        workload.queries[0].query_string = query.into();
+        workload.queries[0].post_asap =
+            crate::planner_selection::keep_pre_asap(&canonical).unwrap();
+        let plan = PhysicalCompiler
+            .compile_metricsql(workload, environment(10_000))
+            .unwrap();
+        assert!(plan.query_plan.entries.is_empty());
+        let sidecar = plan.metricsql_plan_catalog.unwrap();
+        let identity = asap_frontend_metricsql::canonical_metricsql(query).unwrap();
+        assert_eq!(sidecar.lookup(&identity).unwrap().query_id, "vm-q");
+        let encoded = serde_json::to_string(&sidecar).unwrap();
+        assert!(!encoded.contains("canonical_promql"));
     }
 
     #[test]

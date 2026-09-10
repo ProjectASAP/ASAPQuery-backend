@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use axum::{
-    http::StatusCode,
+    body::Bytes,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Json, Response},
 };
 use serde_json::Value;
@@ -15,6 +16,13 @@ pub enum FallbackResponse {
     Json(Value),
     /// Plain text response.
     Text(String),
+    /// Exact upstream HTTP response for protocols whose status and response
+    /// metadata are part of the compatibility contract.
+    Forwarded {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Bytes,
+    },
 }
 
 impl IntoResponse for FallbackResponse {
@@ -31,6 +39,15 @@ impl IntoResponse for FallbackResponse {
                     text,
                 )
                     .into_response()
+            }
+            FallbackResponse::Forwarded {
+                status,
+                headers,
+                body,
+            } => {
+                let mut response = (status, body).into_response();
+                *response.headers_mut() = headers;
+                response
             }
         };
         response.headers_mut().insert(

@@ -61,6 +61,7 @@ pub mod backend_client;
 pub mod emit;
 pub mod epsilon_alloc;
 pub mod metrics_exposer;
+pub mod metricsql_plan;
 pub mod monitor;
 pub mod opamp;
 pub mod physical;

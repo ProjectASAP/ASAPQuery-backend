@@ -47,8 +47,46 @@ Run an independent listener with `--victoriametrics-http-port` and select the
 exact backend with `--victoriametrics-url`. The ordinary Prometheus listener and
 its fallback remain unchanged.
 
+The listener also accepts VictoriaMetrics cluster paths
+`/select/{tenant}/prometheus/api/v1/query` and
+`/select/{tenant}/prometheus/api/v1/query_range`. The path tenant scopes the
+installed routing snapshot and is preserved in the exact fallback URL.
+
+The control plane exposes an independent MetricsQL physical-plan publication
+endpoint. It lowers the MetricsQL AST to `QueryExpr`, invokes the shared
+ASAP-aware physical compiler, and publishes a `MetricsQlPlanCatalog` sidecar.
+Each sidecar entry owns `canonical_metricsql` and a language-neutral executable
+payload. The existing `QueryPlanEntry.canonical_promql`, its wire encoding, and
+its lookup rules remain unchanged.
+
+The backend stages and activates the sidecar atomically with the SDS catalog,
+precompute plan, transmission plan, and PromQL query plan. A VictoriaMetrics
+request can execute only a matching entry in the active sidecar. The executable
+payload uses the shared DAG validator, descriptor resolver, SummaryStore
+readout, and executor. A catalog miss, incomplete coverage, validation failure,
+or execution failure routes the original request to VictoriaMetrics.
+
+## MetricsQL operator coverage
+
+| Construct | Canonical acceleration | Boundary behavior |
+| --- | --- | --- |
+| metric selectors and one matcher set | yes | AST lowers to a time-series scan |
+| explicit positive range selectors | yes | lowers to `TimeRange` |
+| `default_rollup` with explicit range; `last/first/avg/min/max/sum/count/stddev/stdvar_over_time`; `rate`, `irate`, `increase`, `changes`, `delta`, `idelta`, `deriv`, `resets`, `mad`, `present`, `absent`, and numeric `quantile_over_time` | yes | exact arity is required |
+| `sum`, `avg`, `min`, `max`, `count`, `stddev`, `stdvar`, `group`, numeric `quantile`, with `by`/`without` | yes | exact arity is required |
+| scalar unary and binary arithmetic/comparison/set operators without vector modifiers | yes | lowers to canonical binary nodes |
+| `keep_metric_names`, aggregate `limit`, implicit `default_rollup`, offsets, `@`, subquery/inherited steps, OR-delimited matcher groups, binary vector matching, `if`, `ifnot`, `default`, non-rollup functions, unsupported aggregates, malformed or extra arguments | no | typed frontend rejection, then exact VictoriaMetrics fallback |
+
+The vendored upstream parser currently has 21 known upstream-baseline failures
+and three parser-support compatibility failures in its broader internal suite.
+They cover WITH expansion, OR matcher/tokenization, filter pushdown, and
+simplifier behavior. Those constructs are outside the accelerated subset and
+remain in the fail-closed fallback denominator; they are not reported as
+accelerated queries.
+
 ## Verification
 
-Focused tests cover request parsing, response compatibility, canonical binding
-of the common subset, fail-closed handling of MetricsQL-only syntax, and exact
-fallback forwarding for instant and range queries.
+Focused tests cover request parsing, response compatibility, canonical binding,
+strict aggregate arity, independent sidecar serialization and validation,
+unchanged PromQL entry serialization, atomic installation, tenant-prefixed
+fallback, upstream status/header preservation, and instant/range fallback.

@@ -72,4 +72,12 @@ mod tests {
             Err(MetricsQlBindingError::Unsupported(_))
         ));
     }
+
+    #[test]
+    fn invalid_multi_argument_aggregate_fails_closed_without_dropping_arguments() {
+        assert!(matches!(
+            bind_metricsql("sum(foo, bar)", accuracy()),
+            Err(MetricsQlBindingError::Unsupported(_))
+        ));
+    }
 }
