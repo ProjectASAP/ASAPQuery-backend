@@ -28,6 +28,15 @@ pub trait OutputSink: Send + Sync {
         &self,
         outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Publish an explicit source-partition event-time barrier after every
+    /// preceding window from that partition has reached this sink.
+    fn advance_summary_watermark(
+        &self,
+        _barrier: &asap_types::sds::SummaryWatermarkBarrier,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
 }
 
 fn consume_in_order<T>(items: Vec<T>, mut persist: impl FnMut(&T) -> bool) -> usize {

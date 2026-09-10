@@ -77,11 +77,54 @@ pub struct CatalogGeneration {
     pub snapshot_sha256: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HalfOpenTimeRange {
     pub start_ms: i64,
     pub end_ms: i64,
+}
+
+/// One ordered producer partition. Completion and watermark claims are scoped
+/// to this identity; a maximum timestamp observed by an unrelated worker is
+/// never a source-completeness signal.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummarySourcePartition {
+    pub producer_id: String,
+    pub partition_id: String,
+}
+
+/// A closed materialization bucket, including named group values so a
+/// downstream maintenance DAG can project or shuffle groups without parsing a
+/// routing key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryWindowIdentity {
+    pub summary_definition_id: SummaryDefinitionId,
+    pub time_range: HalfOpenTimeRange,
+    pub group_values: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryWindowCompletion {
+    pub catalog_generation: CatalogGeneration,
+    pub source: SummarySourcePartition,
+    pub window: SummaryWindowIdentity,
+    /// Collision-free opaque producer lineage. Retries repeat these bytes.
+    pub input_lineage: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryWatermarkBarrier {
+    pub catalog_generation: CatalogGeneration,
+    pub source: SummarySourcePartition,
+    /// Monotonic sequence within the producer partition.
+    pub sequence: u64,
+    /// Every event in this partition at or before this event-time watermark
+    /// was published before the barrier.
+    pub watermark_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
