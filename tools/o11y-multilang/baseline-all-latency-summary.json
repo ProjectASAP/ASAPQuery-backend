@@ -1,0 +1,30 @@
+{
+  "source": "tools/o11y-multilang/baseline-all-latency-raw.json",
+  "engines": {
+    "clickhouse": {
+      "attempted": 135,
+      "ok": 135,
+      "p50_ms": 42.707183,
+      "p95_ms": 500.264468,
+      "mean_ms": 123.24630983703705
+    },
+    "prometheus": {
+      "attempted": 135,
+      "ok": 135,
+      "p50_ms": 3.401703,
+      "p95_ms": 10.053765,
+      "mean_ms": 5.148079207407408
+    },
+    "victoriametrics": {
+      "attempted": 135,
+      "ok": 135,
+      "p50_ms": 2.330898,
+      "p95_ms": 3.589128,
+      "mean_ms": 2.654461637037037,
+      "prometheus_differential": {
+        "valid": 90,
+        "total": 135
+      }
+    }
+  }
+}
