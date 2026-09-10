@@ -88,8 +88,7 @@ prometheus = "0.13"
 lazy_static = "1.4"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
 tracing-appender = "0.2"
-# Bloom/CountingBloom are supplied by asap_sketchlib PR #94 until merged.
-asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", rev = "6fe916d" }
+asap_sketchlib = { git = "https://github.com/ProjectASAP/asap_sketchlib", branch = "main" }
 # Generic MessagePack codec for decoding the heap-bearing CountSketch
 # DELTA-HEAP wire frame (`MSGPACK_DELTA`) directly in the backend, WITHOUT
 # adding a delta API to the public `asap_sketchlib`: the frame is decoded
