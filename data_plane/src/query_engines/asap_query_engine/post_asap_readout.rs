@@ -87,17 +87,18 @@ pub fn execute_query_plan_readout(
     t1_ms: u64,
     is_cumulative: bool,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    execute_physical_query_payload(index, &entry.executable(), t0_ms, t1_ms, is_cumulative)
+    execute_physical_query_payload(index, entry, entry.root, t0_ms, t1_ms, is_cumulative)
 }
 
-pub fn execute_query_plan_payload_readout(
+pub fn execute_query_plan_from_readout(
     index: &SketchStore,
-    entry: &control_plane::query_plan::ExecutableQueryPlan,
+    entry: &control_plane::query_plan::QueryPlanEntry,
+    root: control_plane::query_plan::QueryNodeId,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    execute_physical_query_payload(index, entry, t0_ms, t1_ms, is_cumulative)
+    execute_physical_query_payload(index, entry, root, t0_ms, t1_ms, is_cumulative)
 }
 
 pub fn execute_query_plan_instant(
@@ -521,12 +522,13 @@ fn execute_physical_query_plan(
     t1_ms: u64,
     is_cumulative: bool,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    execute_physical_query_payload(index, &entry.executable(), t0_ms, t1_ms, is_cumulative)
+    execute_physical_query_payload(index, entry, entry.root, t0_ms, t1_ms, is_cumulative)
 }
 
 fn execute_physical_query_payload(
     index: &SketchStore,
-    entry: &control_plane::query_plan::ExecutableQueryPlan,
+    entry: &control_plane::query_plan::QueryPlanEntry,
+    root: control_plane::query_plan::QueryNodeId,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
@@ -540,7 +542,7 @@ fn execute_physical_query_payload(
             allowed_materializations: None,
         },
     };
-    let output = physical_dag::execute_payload(entry, &runtime)
+    let output = physical_dag::execute_from(entry, root, &runtime)
         .map_err(|error| LoweringSkip::ExecuteFailed(format!("{error:?}")))?;
     match output {
         PhysicalQueryOutput::Scalar(_) => Err(LoweringSkip::ExecuteFailed(

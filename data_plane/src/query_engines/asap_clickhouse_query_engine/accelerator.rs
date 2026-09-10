@@ -111,7 +111,7 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
         };
         match execute_sql_dag(
             self.store.as_ref(),
-            &entry.executable(),
+            entry,
             catalog.as_ref(),
             range.start_ms,
             range.end_ms,
@@ -164,9 +164,9 @@ mod tests {
     use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
     use axum::http::Method;
     use control_plane::query_plan::{
-        ClickHousePlanningContext, ExactReadout, ExecutableQueryPlan, FallbackPolicy,
-        FixedEvaluationRange, InstantExecution, MaterializationBinding, PhysicalGrouping,
-        QueryLanguage, QueryNodeId, QueryPlan, QueryPlanEntry, QueryPlanNode,
+        ClickHousePlanningContext, ExactReadout, FallbackPolicy, FixedEvaluationRange,
+        InstantExecution, MaterializationBinding, PhysicalGrouping, QueryLanguage, QueryNodeId,
+        QueryPlan, QueryPlanEntry, QueryPlanNode,
     };
     use planner_types::{
         post_asap::{SummaryFamilyType, SummaryField, SummarySchema, ValueOperation},
@@ -239,7 +239,15 @@ mod tests {
         let project = QueryNodeId(3);
         let sort = QueryNodeId(4);
         let root = QueryNodeId(5);
-        let executable = ExecutableQueryPlan {
+        let executable = QueryPlanEntry {
+            language: QueryLanguage::ClickHouseSql,
+            query_id: "SELECT value FROM samples".into(),
+            canonical_query: "SELECT value FROM samples".into(),
+            fixed_evaluation: Some(FixedEvaluationRange {
+                start_ms: 0,
+                end_ms: 2_000,
+                cumulative: true,
+            }),
             root,
             nodes: [
                 (

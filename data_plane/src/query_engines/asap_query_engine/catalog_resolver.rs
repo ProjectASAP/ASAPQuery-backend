@@ -114,12 +114,12 @@ pub(crate) fn validate_entry(
     plan_id: u64,
     plan_version: u64,
 ) -> Result<(), EngineError> {
-    validate_payload(catalog, &entry.executable(), plan_id, plan_version)
+    validate_payload(catalog, entry, plan_id, plan_version)
 }
 
 pub(crate) fn validate_payload(
     catalog: Option<&SummaryCatalog>,
-    entry: &control_plane::query_plan::ExecutableQueryPlan,
+    entry: &QueryPlanEntry,
     plan_id: u64,
     plan_version: u64,
 ) -> Result<(), EngineError> {

@@ -126,7 +126,14 @@ pub async fn compile_clickhouse_workload(
             ));
         };
         let executable = QueryPlanEntry::compile_bound_relational(
+            query.sql.clone(),
+            planned.canonical_sql.clone(),
             &root,
+            FixedEvaluationRange {
+                start_ms: query.start_ms,
+                end_ms: query.end_ms,
+                cumulative: query.cumulative,
+            },
             InstantExecution {
                 lookback_ms: query.end_ms.saturating_sub(query.start_ms),
                 full_history: query.start_ms == 0,
@@ -171,22 +178,8 @@ pub async fn compile_clickhouse_workload(
                 )
             })
             .collect::<Vec<_>>();
-        let entry = QueryPlanEntry {
-            query_id: query.sql.clone(),
-            canonical_query: planned.canonical_sql.clone(),
-            language: QueryLanguage::ClickHouseSql,
-            fixed_evaluation: Some(FixedEvaluationRange {
-                start_ms: query.start_ms,
-                end_ms: query.end_ms,
-                cumulative: query.cumulative,
-            }),
-            root: executable.root,
-            nodes: executable.nodes,
-            instant: executable.instant,
-            fallback: executable.fallback,
-        };
         let identity = QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &planned.canonical_sql);
-        if entries.insert(identity.clone(), entry).is_some() {
+        if entries.insert(identity.clone(), executable).is_some() {
             return Err(ClickHousePlanningError::Lower(format!(
                 "duplicate canonical SQL query identity `{identity}`"
             )));

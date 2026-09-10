@@ -235,17 +235,6 @@ pub struct QueryPlanEntry {
     pub fallback: FallbackPolicy,
 }
 
-/// Language-neutral executable physical DAG. Language catalogs own query
-/// identity; this payload owns only execution semantics and SDS bindings.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ExecutableQueryPlan {
-    pub root: QueryNodeId,
-    pub nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
-    pub instant: InstantExecution,
-    pub fallback: FallbackPolicy,
-}
-
 fn topological_order(
     root: QueryNodeId,
     nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
@@ -288,33 +277,6 @@ fn topological_order(
     Ok(out)
 }
 
-impl QueryPlanEntry {
-    pub fn executable(&self) -> ExecutableQueryPlan {
-        ExecutableQueryPlan {
-            root: self.root,
-            nodes: self.nodes.clone(),
-            instant: self.instant,
-            fallback: self.fallback.clone(),
-        }
-    }
-}
-
-impl ExecutableQueryPlan {
-    pub fn materialization_bindings(&self) -> Vec<&MaterializationBinding> {
-        self.nodes
-            .values()
-            .filter_map(|node| match node {
-                QueryPlanNode::ReadMaterialization { binding } => Some(binding),
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub fn topological_order(&self) -> Result<Vec<QueryNodeId>, QueryPlanError> {
-        topological_order(self.root, &self.nodes)
-    }
-}
-
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InstantExecution {
@@ -335,6 +297,17 @@ impl QueryPlanEntry {
                 _ => None,
             })
             .collect()
+    }
+
+    pub fn topological_order(&self) -> Result<Vec<QueryNodeId>, QueryPlanError> {
+        topological_order(self.root, &self.nodes)
+    }
+
+    pub fn topological_order_from(
+        &self,
+        root: QueryNodeId,
+    ) -> Result<Vec<QueryNodeId>, QueryPlanError> {
+        topological_order(root, &self.nodes)
     }
 
     pub fn compile_bound<F>(
@@ -373,11 +346,14 @@ impl QueryPlanEntry {
     }
 
     pub fn compile_bound_relational<F>(
+        query_id: String,
+        canonical_query: String,
         root: &Rc<SummaryNode>,
+        fixed_evaluation: FixedEvaluationRange,
         instant: InstantExecution,
         fallback: FallbackPolicy,
         mut bind: F,
-    ) -> Result<ExecutableQueryPlan, QueryPlanError>
+    ) -> Result<Self, QueryPlanError>
     where
         F: FnMut(
             &SummaryNode,
@@ -393,7 +369,11 @@ impl QueryPlanEntry {
             preserve_relational: true,
         };
         let root = compiler.lower(root)?;
-        Ok(ExecutableQueryPlan {
+        Ok(Self {
+            language: QueryLanguage::ClickHouseSql,
+            query_id,
+            canonical_query,
+            fixed_evaluation: Some(fixed_evaluation),
             root,
             nodes: compiler.nodes,
             instant,
@@ -511,45 +491,6 @@ impl QueryPlanEntry {
         Ok(())
     }
 
-    /// Return reachable nodes with every input before its consumer.
-    pub fn topological_order(&self) -> Result<Vec<QueryNodeId>, QueryPlanError> {
-        fn visit(
-            id: QueryNodeId,
-            nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
-            visiting: &mut BTreeSet<QueryNodeId>,
-            visited: &mut BTreeSet<QueryNodeId>,
-            out: &mut Vec<QueryNodeId>,
-        ) -> Result<(), QueryPlanError> {
-            if visited.contains(&id) {
-                return Ok(());
-            }
-            if !visiting.insert(id) {
-                return Err(QueryPlanError::Invalid(format!(
-                    "cycle detected at query node {}",
-                    id.0
-                )));
-            }
-            let node = nodes
-                .get(&id)
-                .ok_or_else(|| QueryPlanError::Invalid(format!("missing query node {}", id.0)))?;
-            for input in node.inputs() {
-                visit(*input, nodes, visiting, visited, out)?;
-            }
-            visiting.remove(&id);
-            visited.insert(id);
-            out.push(id);
-            Ok(())
-        }
-        let mut out = Vec::with_capacity(self.nodes.len());
-        visit(
-            self.root,
-            &self.nodes,
-            &mut BTreeSet::new(),
-            &mut BTreeSet::new(),
-            &mut out,
-        )?;
-        Ok(out)
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
