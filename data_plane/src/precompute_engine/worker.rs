@@ -466,11 +466,11 @@ impl Worker {
             let pane_start = state.window_manager.pane_start_for(pane_timestamp(*ts));
             let pane_end = pane_start + state.window_manager.slide_interval_ms();
             let pane_closed = !state.active_panes.contains_key(&pane_start)
-                && previous_closure_watermark >= pane_start + state.window_manager.window_size_ms();
+                && previous_closure_watermark >= pane_end;
 
             if too_late || pane_closed {
                 let window_start = pane_start;
-                let window_end = pane_start + state.window_manager.window_size_ms();
+                let window_end = pane_end;
                 match late_data_policy {
                     LateDataPolicy::Drop => {
                         record_late_input("drop", "raw_sample");
@@ -560,11 +560,11 @@ impl Worker {
         };
         let closed = state
             .window_manager
-            .closed_windows(closure_scan_start, event_watermark);
+            .closed_panes(closure_scan_start, event_watermark);
 
         for window_start in &closed {
-            let (_, window_end) = state.window_manager.window_bounds(*window_start);
-            let pane_starts = state.window_manager.panes_for_window(*window_start);
+            let (_, window_end) = state.window_manager.pane_bounds(*window_start);
+            let pane_starts = [*window_start];
 
             if let Some(accumulator) = merge_panes_for_window(&mut state.active_panes, &pane_starts)
             {
@@ -656,8 +656,9 @@ impl Worker {
         let too_late = previous_event_time != i64::MIN
             && timestamp_ms < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
         let pane_start = state.window_manager.pane_start_for(timestamp_ms);
-        let pane_closed = !state.sketch_panes.contains_key(&pane_start)
-            && previous_closure_watermark >= pane_start + state.window_manager.window_size_ms();
+        let pane_end = pane_start + state.window_manager.slide_interval_ms();
+        let pane_closed =
+            !state.sketch_panes.contains_key(&pane_start) && previous_closure_watermark >= pane_end;
 
         if too_late || pane_closed {
             match late_data_policy {
@@ -671,7 +672,7 @@ impl Worker {
                 LateDataPolicy::ForwardToStore => {
                     record_late_input("append_correction", "prebuilt_sketch");
                     let window_start = pane_start;
-                    let window_end = pane_start + state.window_manager.window_size_ms();
+                    let window_end = pane_end;
                     let key = build_group_key_label_values(group_key);
                     let output = precomputed_output_for_group(
                         window_start as u64,
@@ -712,10 +713,10 @@ impl Worker {
         // Check for closed windows and emit merged outputs.
         let closed = state
             .window_manager
-            .closed_windows(previous_closure_watermark, event_watermark);
+            .closed_panes(previous_closure_watermark, event_watermark);
         for window_start in &closed {
-            let (_, window_end) = state.window_manager.window_bounds(*window_start);
-            let pane_starts = state.window_manager.panes_for_window(*window_start);
+            let (_, window_end) = state.window_manager.pane_bounds(*window_start);
+            let pane_starts = [*window_start];
 
             // Emit from the raw-sample pane map (in case both sources are
             // populated for the same group; rare but supported).
@@ -918,11 +919,11 @@ impl Worker {
 
             let closed = state
                 .window_manager
-                .closed_windows(state.closure_watermark_ms, effective_wm);
+                .closed_panes(state.closure_watermark_ms, effective_wm);
 
             for window_start in &closed {
-                let (_, window_end) = state.window_manager.window_bounds(*window_start);
-                let pane_starts = state.window_manager.panes_for_window(*window_start);
+                let (_, window_end) = state.window_manager.pane_bounds(*window_start);
+                let pane_starts = [*window_start];
 
                 if let Some(accumulator) =
                     merge_panes_for_window(&mut state.active_panes, &pane_starts)
@@ -1015,16 +1016,16 @@ impl Worker {
                 (None, Some(b)) => b,
                 (None, None) => continue, // no open panes
             };
-            let force_wm = max_pane.saturating_add(state.window_manager.window_size_ms());
+            let force_wm = max_pane.saturating_add(state.window_manager.slide_interval_ms());
 
             let group_key = state.group_key.clone();
             let closed = state
                 .window_manager
-                .closed_windows(state.closure_watermark_ms, force_wm);
+                .closed_panes(state.closure_watermark_ms, force_wm);
 
             for window_start in &closed {
-                let (_, window_end) = state.window_manager.window_bounds(*window_start);
-                let pane_starts = state.window_manager.panes_for_window(*window_start);
+                let (_, window_end) = state.window_manager.pane_bounds(*window_start);
+                let pane_starts = [*window_start];
 
                 if let Some(accumulator) =
                     merge_panes_for_window(&mut state.active_panes, &pane_starts)
@@ -2033,14 +2034,9 @@ mod tests {
             .unwrap();
 
         let captured = sink.drain();
-        assert_eq!(
-            captured.len(),
-            2,
-            "two windows containing the pane should emit"
-        );
+        assert_eq!(captured.len(), 1, "one immutable pane should emit once");
 
         let window_starts: Vec<u64> = captured.iter().map(|(o, _)| o.start_timestamp).collect();
-        assert!(window_starts.contains(&0));
         assert!(window_starts.contains(&10_000));
 
         for (_output, acc) in &captured {
@@ -2050,7 +2046,7 @@ mod tests {
                 .expect("should be SumAccumulator");
             assert!(
                 (sum_acc.sum - 42.0).abs() < 1e-10,
-                "window should have sum=42 via pane sharing, got {}",
+                "pane should have sum=42, got {}",
                 sum_acc.sum
             );
         }

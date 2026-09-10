@@ -87,6 +87,25 @@ impl WindowManager {
         closed
     }
 
+    /// Return non-overlapping pane starts that became immutable as the
+    /// watermark advanced. Persisted summary instances use these pane
+    /// intervals; query-time DAG nodes compose panes into semantic windows.
+    pub fn closed_panes(&self, previous_wm: i64, current_wm: i64) -> Vec<i64> {
+        if current_wm <= previous_wm || previous_wm == i64::MIN {
+            return Vec::new();
+        }
+        let mut panes = Vec::new();
+        let mut start =
+            self.window_start_for(previous_wm.saturating_sub(self.slide_interval_ms - 1));
+        while start.saturating_add(self.slide_interval_ms) <= current_wm {
+            if start.saturating_add(self.slide_interval_ms) > previous_wm {
+                panes.push(start);
+            }
+            start = start.saturating_add(self.slide_interval_ms);
+        }
+        panes
+    }
+
     /// Return all window starts whose window `[start, start + window_size_ms)`
     /// contains the given timestamp. For tumbling windows this returns exactly
     /// one start; for sliding windows it returns `ceil(window_size / slide)`
@@ -104,6 +123,10 @@ impl WindowManager {
     /// Return the window `[start, end)` boundaries for a given window start.
     pub fn window_bounds(&self, window_start: i64) -> (i64, i64) {
         (window_start, window_start + self.window_size_ms)
+    }
+
+    pub fn pane_bounds(&self, pane_start: i64) -> (i64, i64) {
+        (pane_start, pane_start + self.slide_interval_ms)
     }
 
     /// Slide interval accessor.
@@ -178,6 +201,16 @@ mod tests {
         // Watermark jumps from 5_000 to 35_000 — closes windows 0, 10_000, 20_000
         let closed = wm.closed_windows(5_000, 35_000);
         assert_eq!(closed, vec![0, 10_000, 20_000]);
+    }
+
+    #[test]
+    fn sliding_materialization_closes_each_non_overlapping_pane_once() {
+        let wm = WindowManager::new(30, 10);
+        assert_eq!(
+            wm.closed_panes(15_000, 45_000),
+            vec![10_000, 20_000, 30_000]
+        );
+        assert_eq!(wm.pane_bounds(20_000), (20_000, 30_000));
     }
 
     #[test]
