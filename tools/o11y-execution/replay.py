@@ -183,10 +183,10 @@ def encode_write(rows):
     return varint(length) + literal + wire
 
 
-def _http_request(url, data=None, headers=None):
+def _http_request(url, data=None, headers=None, timeout=60):
     start = time.perf_counter_ns()
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers or {}), timeout=60) as response:
+        with urllib.request.urlopen(urllib.request.Request(url, data=data, headers=headers or {}), timeout=timeout) as response:
             body, status, received = response.read(), response.status, dict(response.headers.items())
         try:
             body = json.loads(body)
@@ -212,9 +212,9 @@ def process_snapshots():
     return {name: process_snapshot(pid) for name, pid in PROCESS_IDS.items()}
 
 
-def request(url, data=None, headers=None):
+def request(url, data=None, headers=None, timeout=60):
     before = process_snapshots()
-    result = _http_request(url, data, headers)
+    result = _http_request(url, data, headers, timeout)
     after = process_snapshots()
     result["process_resources"] = {name: process_delta(before.get(name), after.get(name)) for name in PROCESS_IDS}
     return result

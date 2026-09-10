@@ -90,7 +90,7 @@ def measure(args, artifact, corpus, snapshot, folder):
         runner.PROCESS_IDS.clear()
         runner.PROCESS_IDS.update({"backend": dp.pid, "fallback_service": prom.pid})
         runner.ingest_sample_file(args.metrics, [fallback, backend], folder)
-        drained = runner.request(backend + "/api/v1/precompute/drain", b"")
+        drained = runner.request(backend + "/api/v1/precompute/drain", b"", timeout=300)
         runner.write_json(folder / "drain.json", drained)
         if drained["http_status"] != 200 or drained["response"].get("complete") is not True:
             raise RuntimeError("precompute drain did not complete")
