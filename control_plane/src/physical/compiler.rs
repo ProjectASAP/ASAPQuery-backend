@@ -249,6 +249,12 @@ pub struct CollectorMaterialization {
     pub abstract_window_framework: SummaryWindowFramework,
     pub window_implementation_id: String,
     pub pane_secs: u64,
+    #[serde(
+        default,
+        alias = "paneOriginMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pane_origin_ms: Option<i64>,
     pub state_layout: String,
     pub evidence_source: Option<String>,
     pub lifecycle: CollectorLifecycle,
@@ -398,6 +404,12 @@ pub struct StateWindowContract {
     pub kind: asap_types::WindowKind,
     pub size_ms: u64,
     pub slide_ms: Option<u64>,
+    #[serde(
+        default,
+        alias = "paneOriginMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pane_origin_ms: Option<i64>,
 }
 
 /// A collector authorized to produce state for one materialization. Runtime
@@ -481,6 +493,7 @@ impl PrecomputePlan {
                             }
                             asap_types::WindowKind::Session => None,
                         },
+                        pane_origin_ms: materialization.pane_origin_ms,
                     },
                     encodings: state_encodings(&accumulator.family),
                 })
@@ -640,6 +653,7 @@ impl PrecomputePlan {
                         }
                         asap_types::WindowKind::Session => None,
                     }
+                || schema.window.pane_origin_ms != materialization.pane_origin_ms
                 || schema.encodings != state_encodings(&accumulator.family)
             {
                 return Err(PrecomputePlanError::InvalidSchema {
@@ -1741,10 +1755,12 @@ impl BackendLocalPlanningSnapshot {
         let mut topk_evidence_by_id = HashMap::new();
         for (index, entry) in entries.into_iter().enumerate() {
             let evaluation_interval_ms = match entry.recurrence {
-                QueryRecurrence::Repeated(RepeatedDemand::FixedInterval(interval)) => interval.0,
+                QueryRecurrence::Repeated(RepeatedDemand::FixedIntervalAt {
+                    interval, ..
+                }) => interval.0,
                 _ => {
                     return Err(CompileError::Snapshot(format!(
-                        "query {index} must use fixed-interval repeated demand in the MVP profile"
+                        "query {index} must use phase-bearing fixed-interval repeated demand in the MVP profile"
                     )))
                 }
             };
@@ -2053,7 +2069,7 @@ impl PhysicalCompiler {
         for (id, root) in planner_types::post_asap::share_common_summary_subtrees(roots) {
             request.queries[id].post_asap = root;
         }
-        let mut aggregations = Vec::with_capacity(request.queries.len());
+        let mut compiled_materializations = Vec::with_capacity(request.queries.len());
         let mut collector_materializations = Vec::with_capacity(request.queries.len());
         let mut plan_materializations = Vec::with_capacity(request.queries.len());
         let mut shared_materializations = BTreeMap::new();
@@ -2259,7 +2275,18 @@ impl PhysicalCompiler {
                 } else {
                     window_implementation.pane_secs
                 };
-                let runtime_materialization = aggregation_config_for_materialization(&aggregation)?;
+                let mut runtime_materialization =
+                    aggregation_config_for_materialization(&aggregation)?;
+                let pane_width_ms = runtime_materialization.slide_interval.saturating_mul(1_000);
+                runtime_materialization.pane_origin_ms = shared_pane_origin_ms(
+                    request.query_workload.as_ref(),
+                    consumers[&materialization].iter().copied(),
+                    pane_width_ms,
+                )
+                .map_err(|reason| CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason,
+                })?;
                 let materialization = runtime_materialization.policy_fingerprint();
                 let consumer_query_ids = state_consumers
                     .iter()
@@ -2310,7 +2337,7 @@ impl PhysicalCompiler {
                     }
                 }
                 let physical_group_by = aggregation.grouping.clone();
-                aggregations.push(aggregation);
+                compiled_materializations.push(runtime_materialization.clone());
                 let collector_materialization = CollectorMaterialization {
                     query_id: format!("state-{}", materialization.0),
                     materialization,
@@ -2322,6 +2349,7 @@ impl PhysicalCompiler {
                     abstract_window_framework: planner_selection.window_framework.clone(),
                     window_implementation_id: window_implementation.implementation_id.clone(),
                     pane_secs: runtime_materialization.slide_interval,
+                    pane_origin_ms: runtime_materialization.pane_origin_ms,
                     state_layout: window_implementation.state_layout.clone(),
                     evidence_source: evidence.map(|e| e.source.clone()),
                     lifecycle: planner_selection.lifecycle.clone(),
@@ -2381,8 +2409,7 @@ impl PhysicalCompiler {
         // Several queries/readouts may intentionally share one maintained
         // summary. PrecomputePlan is keyed by physical identity, not query ID.
         let mut materializations_by_fingerprint = BTreeMap::new();
-        for aggregation in &aggregations {
-            let materialization = aggregation_config_for_materialization(aggregation)?;
+        for materialization in compiled_materializations {
             materializations_by_fingerprint
                 .entry(materialization.policy_fingerprint())
                 .or_insert(materialization);
@@ -2487,6 +2514,7 @@ impl PhysicalCompiler {
                             materialization.grouping_labels.labels.clone(),
                         ),
                         window_ms: pane_ms,
+                        pane_origin_ms: materialization.pane_origin_ms,
                     })
             };
             let instant = InstantExecution {
@@ -3358,6 +3386,52 @@ fn materialization_consumers(
     Ok(consumers)
 }
 
+fn shared_pane_origin_ms(
+    workload: Option<&QueryWorkload>,
+    consumer_indices: impl IntoIterator<Item = usize>,
+    pane_width_ms: u64,
+) -> Result<Option<i64>, String> {
+    if pane_width_ms == 0 {
+        return Err("materialized pane width is zero".into());
+    }
+    let pane_width = i64::try_from(pane_width_ms)
+        .map_err(|_| "materialized pane width exceeds runtime timestamp range".to_string())?;
+    let Some(workload) = workload else {
+        // Compatibility-only PlanningRequest callers do not claim a certified
+        // phase. The read path rejects this binding and uses exact fallback.
+        return Ok(None);
+    };
+    let entries = workload.entries().collect::<Vec<_>>();
+    let mut selected_phase = None;
+    for index in consumer_indices {
+        let entry = entries
+            .get(index)
+            .ok_or_else(|| format!("consumer index {index} is absent from QueryWorkload"))?;
+        let QueryRecurrence::Repeated(demand @ RepeatedDemand::FixedIntervalAt { .. }) =
+            &entry.recurrence
+        else {
+            return Err(format!(
+                "shared pane-only summary consumer {index} has unknown evaluation phase"
+            ));
+        };
+        let binding = planner_types::post_asap::plan_pane_phase(demand, pane_width_ms)
+            .map_err(|error| format!("invalid pane phase for consumer {index}: {error:?}"))?;
+        let origin = binding.pane_origin_ms.ok_or_else(|| {
+            format!("shared pane-only summary consumer {index} has unknown evaluation phase")
+        })?;
+        let phase = origin.rem_euclid(pane_width);
+        if selected_phase.is_some_and(|selected| selected != phase) {
+            return Err(format!(
+                "shared pane-only summary consumers have conflicting phases {selected_phase:?} and {phase} for pane width {pane_width_ms}ms"
+            ));
+        }
+        selected_phase = Some(phase);
+    }
+    selected_phase
+        .ok_or_else(|| "materialized summary has no workload consumers".to_string())
+        .map(Some)
+}
+
 /// Collect every executable materialization leaf in the selected post-ASAP
 /// graph. Readout context flows through merge nodes, so a graph such as
 /// `Estimate(Merge(Agg(a), Agg(b)))` creates two physical bindings while the
@@ -4128,6 +4202,51 @@ mod tests {
         assert_eq!(exact_temporal_pane_secs(86_400, 60_000, Some(30_000)), 30);
         assert_eq!(exact_temporal_pane_secs(43_200, 60_000, Some(30_000)), 30);
         assert_eq!(exact_temporal_pane_secs(21_600, 60_000, None), 5);
+    }
+
+    fn phase_workload(phases: &[u64]) -> QueryWorkload {
+        QueryWorkload {
+            language: QueryLanguage::PromQL,
+            query_batch: None,
+            repeating_queries: Some(
+                phases
+                    .iter()
+                    .enumerate()
+                    .map(|(index, phase)| RepeatingEntry {
+                        query: Query(format!("q{index}")),
+                        demand: RepeatedDemand::FixedIntervalAt {
+                            interval: RepetitionInterval(10_000),
+                            evaluation_phase: planner_types::workload::TimestampMs(*phase),
+                        },
+                        requirements: QueryRequirements::default(),
+                        predictability: Predictability::Predictable { known_at: None },
+                        time_selection: TimeSelection::default(),
+                    })
+                    .collect(),
+            ),
+            data_workload: None,
+        }
+    }
+
+    #[test]
+    fn shared_summary_requires_one_consumer_phase() {
+        let aligned = phase_workload(&[7_000, 67_000]);
+        assert_eq!(
+            shared_pane_origin_ms(Some(&aligned), [0, 1], 60_000).unwrap(),
+            Some(7_000)
+        );
+
+        let conflicting = phase_workload(&[7_000, 8_000]);
+        assert!(shared_pane_origin_ms(Some(&conflicting), [0, 1], 60_000)
+            .unwrap_err()
+            .contains("conflicting phases"));
+
+        let mut unknown = phase_workload(&[7_000]);
+        unknown.repeating_queries.as_mut().unwrap()[0].demand =
+            RepeatedDemand::FixedInterval(RepetitionInterval(10_000));
+        assert!(shared_pane_origin_ms(Some(&unknown), [0], 60_000)
+            .unwrap_err()
+            .contains("unknown evaluation phase"));
     }
 
     #[test]
@@ -5015,7 +5134,10 @@ mod tests {
             query_batch: None,
             repeating_queries: Some(vec![RepeatingEntry {
                 query: Query("sum(sum_over_time(m[1m]))".into()),
-                demand: RepeatedDemand::FixedInterval(RepetitionInterval(10_000)),
+                demand: RepeatedDemand::FixedIntervalAt {
+                    interval: RepetitionInterval(10_000),
+                    evaluation_phase: planner_types::workload::TimestampMs(7_000),
+                },
                 requirements: QueryRequirements {
                     accuracy: AccuracyRequirement::Explicit(AccuracyTarget::EpsilonDelta {
                         epsilon: 0.01,
@@ -5101,6 +5223,26 @@ mod tests {
         assert!(bundle.precompute_plan.producers.is_empty());
         assert_eq!(bundle.query_plan.entries.len(), 1);
         assert_eq!(bundle.envelope.planner_revision, PLANNER_REVISION);
+        let config = &bundle.precompute_plan.materializations[0];
+        assert_eq!(config.pane_origin_ms, Some(7_000));
+        assert_eq!(
+            bundle.precompute_plan.schemas[0].window.pane_origin_ms,
+            Some(7_000)
+        );
+        let definition = &bundle.summary_catalog.materializations
+            [&asap_types::sds::SummaryDefinitionId::from(config.policy_fingerprint())];
+        assert_eq!(definition.pane_origin_ms, Some(7_000));
+        assert_eq!(
+            bundle
+                .query_plan
+                .entries
+                .values()
+                .next()
+                .unwrap()
+                .materialization_bindings()[0]
+                .pane_origin_ms,
+            Some(7_000)
+        );
     }
 
     #[test]

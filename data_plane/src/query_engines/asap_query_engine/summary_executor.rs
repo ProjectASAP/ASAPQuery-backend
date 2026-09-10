@@ -405,6 +405,30 @@ impl SummaryValue {
     }
 }
 
+fn validate_binding_phase(
+    binding: &control_plane::query_plan::MaterializationBinding,
+    evaluation_ms: u64,
+) -> Result<(), SummaryExecutorError> {
+    if i64::try_from(binding.window_ms).is_err() {
+        return Err(SummaryExecutorError::Unsupported(
+            "materialized pane width exceeds runtime timestamp range",
+        ));
+    }
+    planner_types::post_asap::validate_pane_coverage(
+        &planner_types::post_asap::PanePhaseBinding {
+            pane_width_ms: binding.window_ms,
+            pane_origin_ms: binding.pane_origin_ms,
+        },
+        i64::try_from(evaluation_ms).ok(),
+        &planner_types::post_asap::BoundaryCoverage::PaneAligned,
+    )
+    .map_err(|_| {
+        SummaryExecutorError::Unsupported(
+            "query evaluation phase does not match materialized pane origin",
+        )
+    })
+}
+
 impl QueryExecutionContext<'_> {
     /// Resolve exactly one compiler-bound materialization. This is the formal
     /// QueryPlan path: fingerprint -> SID is the only lookup; metadata checks
@@ -414,6 +438,8 @@ impl QueryExecutionContext<'_> {
         binding: &control_plane::query_plan::MaterializationBinding,
     ) -> Result<Vec<(BTreeMap<String, String>, GroupState)>, SummaryExecutorError> {
         use control_plane::query_plan::PhysicalGrouping;
+
+        validate_binding_phase(binding, self.t1_ms)?;
 
         enum Candidate {
             Sketch(DeltaSketchKind),
@@ -1299,6 +1325,25 @@ mod tests {
     use planner_types::post_asap::{SummaryField, SummarySchema};
     use planner_types::pre_asap::{Column, DataType, Schema};
     use std::rc::Rc;
+
+    #[test]
+    fn pane_only_reads_require_the_planned_evaluation_phase() {
+        let binding = control_plane::query_plan::MaterializationBinding {
+            materialization: asap_types::PolicyFingerprint(7).into(),
+            output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
+            window_ms: 60_000,
+            pane_origin_ms: Some(7_000),
+            readout_lookback_ms: Some(60_000),
+        };
+        validate_binding_phase(&binding, 67_000).unwrap();
+        assert!(validate_binding_phase(&binding, 68_000).is_err());
+
+        let legacy = control_plane::query_plan::MaterializationBinding {
+            pane_origin_ms: None,
+            ..binding
+        };
+        assert!(validate_binding_phase(&legacy, 67_000).is_err());
+    }
 
     fn sketch_family(
         algorithm: planner_types::post_asap::SketchAlgorithm,

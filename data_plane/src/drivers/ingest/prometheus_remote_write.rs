@@ -838,6 +838,7 @@ mod tests {
             window_size: 60,
             slide_interval: 60,
             window_type: WindowKind::Tumbling,
+            pane_origin_ms: None,
             spatial_filter: String::new(),
             spatial_filter_normalized: String::new(),
             metric: "requests_total".into(),

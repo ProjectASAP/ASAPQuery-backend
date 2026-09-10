@@ -778,6 +778,7 @@ mod tests {
                     materialization: asap_types::PolicyFingerprint(123).into(),
                     output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                     window_ms: 60_000,
+                    pane_origin_ms: Some(2_000),
                     readout_lookback_ms: Some(60_000),
                 })
             },
@@ -930,6 +931,7 @@ mod tests {
                             materialization: policy.into(),
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 10_000,
+                            pane_origin_ms: Some(0),
                             readout_lookback_ms: Some(60_000),
                         },
                     },
@@ -1022,6 +1024,7 @@ mod tests {
                             materialization: policy.into(),
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 60_000,
+                            pane_origin_ms: Some(0),
                             readout_lookback_ms: Some(60_000),
                         },
                     },

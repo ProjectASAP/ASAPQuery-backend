@@ -267,6 +267,7 @@ mod tests {
             window_size: 1,
             slide_interval: 1,
             window_type: WindowKind::Tumbling,
+            pane_origin_ms: None,
             spatial_filter: String::new(),
             spatial_filter_normalized: String::new(),
             metric: format!("metric_{id}"),

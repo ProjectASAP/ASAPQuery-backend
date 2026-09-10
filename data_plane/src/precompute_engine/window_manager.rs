@@ -8,9 +8,7 @@ pub struct WindowManager {
     window_size_ms: i64,
     /// Slide interval in milliseconds (== window_size_ms for tumbling windows).
     slide_interval_ms: i64,
-    /// Event-time phase of this materialization instance. It is learned from
-    /// the first admitted sample so panes follow the source cadence instead
-    /// of assuming that every Prometheus series is epoch-aligned.
+    /// Planned event-time phase of this materialization definition.
     origin_ms: Option<i64>,
 }
 
@@ -20,6 +18,14 @@ impl WindowManager {
     /// `window_size_secs` and `slide_interval_secs` come from `AggregationConfig`
     /// (which stores them in seconds). They are converted to milliseconds internally.
     pub fn new(window_size_secs: u64, slide_interval_secs: u64) -> Self {
+        Self::with_origin(window_size_secs, slide_interval_secs, None)
+    }
+
+    pub fn with_origin(
+        window_size_secs: u64,
+        slide_interval_secs: u64,
+        origin_ms: Option<i64>,
+    ) -> Self {
         let window_size_ms = (window_size_secs * 1000) as i64;
         let slide_interval_ms = if slide_interval_secs == 0 {
             window_size_ms // tumbling window
@@ -29,12 +35,8 @@ impl WindowManager {
         Self {
             window_size_ms,
             slide_interval_ms,
-            origin_ms: None,
+            origin_ms,
         }
-    }
-
-    pub fn anchor_to_first_sample(&mut self, timestamp_ms: i64) {
-        self.origin_ms.get_or_insert(timestamp_ms);
     }
 
     pub fn window_size_ms(&self) -> i64 {
@@ -42,7 +44,8 @@ impl WindowManager {
     }
 
     /// Compute the window start for a given timestamp.
-    /// Windows are aligned to epoch (multiples of slide_interval_ms).
+    /// Windows are aligned to the planned origin. Legacy definitions without
+    /// an origin retain epoch alignment but cannot pass certified reads.
     pub fn window_start_for(&self, timestamp_ms: i64) -> i64 {
         // Floor-divide to the nearest slide interval boundary
         let origin = self.origin_ms.unwrap_or(0);
@@ -142,12 +145,11 @@ mod tests {
     }
 
     #[test]
-    fn source_phase_anchor_aligns_repeated_event_time_queries() {
-        let mut windows = WindowManager::new(5, 5);
-        windows.anchor_to_first_sample(25_000);
-        assert_eq!(windows.window_start_for(25_000), 25_000);
-        assert_eq!(windows.window_start_for(55_000), 55_000);
-        assert_eq!(windows.window_start_for(21_655_000), 21_655_000);
+    fn planned_origin_aligns_repeated_event_time_queries() {
+        let windows = WindowManager::with_origin(5, 5, Some(27_000));
+        assert_eq!(windows.window_start_for(27_000), 27_000);
+        assert_eq!(windows.window_start_for(57_000), 57_000);
+        assert_eq!(windows.window_start_for(21_657_000), 21_657_000);
     }
 
     #[test]

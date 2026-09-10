@@ -364,7 +364,11 @@ impl Worker {
             let cfg = snap.get_aggregation_config(policy_fp.as_u64())?;
             let config = Arc::new(cfg.clone());
             let gs = GroupState {
-                window_manager: WindowManager::new(config.window_size, config.slide_interval),
+                window_manager: WindowManager::with_origin(
+                    config.window_size,
+                    config.slide_interval,
+                    config.pane_origin_ms,
+                ),
                 config,
                 policy_fp,
                 group_key: group_key.to_string(),
@@ -429,12 +433,6 @@ impl Worker {
                 ts
             }
         };
-        if right_closed {
-            if let Some(first) = samples.iter().map(|(_, timestamp, _)| *timestamp).min() {
-                let origin = first.saturating_sub(state.window_manager.window_size_ms());
-                state.window_manager.anchor_to_first_sample(origin);
-            }
-        }
         // Find the timestamp span in this batch. A first batch may contain
         // several windows (Prometheus commonly sends catch-up samples after
         // startup), so its minimum timestamp is also the initial closure

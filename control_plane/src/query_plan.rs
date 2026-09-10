@@ -77,6 +77,11 @@ impl QueryPlan {
                         "zero physical pane duration".into(),
                     ));
                 }
+                if binding.pane_origin_ms != identity.pane_origin_ms {
+                    return Err(QueryPlanError::Invalid(
+                        "query pane origin differs from catalog definition".into(),
+                    ));
+                }
             }
             for node in entry.nodes.values() {
                 let QueryPlanNode::ExactReadout { input, readout } = node else {
@@ -361,6 +366,14 @@ pub struct MaterializationBinding {
     /// Query operator grouping applied while folding those SIDs.
     pub output_grouping: PhysicalGrouping,
     pub window_ms: u64,
+    /// Unix millisecond timestamp on the materialized pane-boundary grid.
+    /// Legacy plans deserialize this as unknown and fall back at read time.
+    #[serde(
+        default,
+        alias = "paneOriginMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pane_origin_ms: Option<i64>,
     /// Semantic query lookback, independent of the physical pane duration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readout_lookback_ms: Option<u64>,
@@ -1195,7 +1208,7 @@ mod catalog_binding_tests {
     use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
 
     fn fixture() -> (QueryPlan, SummaryCatalog) {
-        let config = PrecomputeMaterialization::new(
+        let mut config = PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
             Default::default(),
@@ -1212,6 +1225,7 @@ mod catalog_binding_tests {
             None,
             None,
         );
+        config.pane_origin_ms = Some(0);
         let catalog = SummaryCatalog::from_materializations(7, 2, &[config.clone()]).unwrap();
         let entry = QueryPlanEntry {
             query_id: "q".into(),
@@ -1224,6 +1238,7 @@ mod catalog_binding_tests {
                         materialization: config.policy_fingerprint().into(),
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 10_000,
+                        pane_origin_ms: Some(0),
                         readout_lookback_ms: Some(60_000),
                     },
                 },
@@ -1318,7 +1333,7 @@ mod catalog_binding_tests {
             .to_string()
             .contains("exact counter SDS"));
 
-        let counter = PrecomputeMaterialization::new(
+        let mut counter = PrecomputeMaterialization::new(
             AggregationType::Increase,
             String::new(),
             Default::default(),
@@ -1335,6 +1350,7 @@ mod catalog_binding_tests {
             None,
             None,
         );
+        counter.pane_origin_ms = Some(0);
         let counter_catalog =
             SummaryCatalog::from_materializations(7, 2, &[counter.clone()]).unwrap();
         let (mut counter_plan, _) = fixture();

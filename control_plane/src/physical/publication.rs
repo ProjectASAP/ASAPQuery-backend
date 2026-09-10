@@ -44,6 +44,9 @@ impl PhysicalPlanPublication {
                 if config.slide_interval.checked_mul(1000) != Some(binding.window_ms) {
                     return Err("query pane differs from precompute emission interval".into());
                 }
+                if config.pane_origin_ms != binding.pane_origin_ms {
+                    return Err("query pane origin differs from precompute definition".into());
+                }
             }
         }
         let mut collectors = std::collections::BTreeSet::new();
