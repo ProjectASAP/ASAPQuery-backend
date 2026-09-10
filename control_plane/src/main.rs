@@ -697,9 +697,14 @@ async fn handle_compile_and_publish_metricsql_physical_plan(
 
 async fn compile_and_publish_physical_plan(
     st: AppState,
-    request: CompileAndPublishPhysicalPlanRequest,
+    mut request: CompileAndPublishPhysicalPlanRequest,
     frontend: PhysicalQueryFrontend,
 ) -> Response {
+    if let Some(erp) = &mut request.erp {
+        if let Err(error) = erp.hydrate_observed_shape(&st.runtime_samples) {
+            return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response();
+        }
+    }
     let (bundle, collector_ids, apply_timeout, adaptation_evidence, _) =
         match compile_physical_plan_request(request, false, frontend) {
             Ok((Some(bundle), ids, timeout, adaptation, manifests)) => {

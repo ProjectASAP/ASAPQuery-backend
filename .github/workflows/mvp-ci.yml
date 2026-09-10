@@ -51,6 +51,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: ASAPQuery-backend
+          # The compiled workspace fills the hosted runner before the cache
+          # post-step can package `target`; registry/git inputs are sufficient.
+          cache-targets: false
 
       - name: Check formatting
         working-directory: ASAPQuery-backend

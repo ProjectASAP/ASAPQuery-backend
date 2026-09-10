@@ -1,10 +1,16 @@
 //! Repeated-window execution comparison using the real ASAP CMS implementation.
+use asap_aware_mapping::replacement::default_size_params;
 use asap_sketchlib::CountMinSketch;
 use clap::Parser;
+use planner_types::{
+    post_asap::{SketchAlgorithm, SketchParams},
+    pre_asap::AggIntent,
+    types::AccuracyTarget,
+};
 use serde::Serialize;
 use std::{collections::VecDeque, hint::black_box, time::Instant};
 
-#[derive(Debug, Parser, Serialize)]
+#[derive(Clone, Debug, Parser, Serialize)]
 struct Args {
     #[arg(long)]
     output: std::path::PathBuf,
@@ -19,10 +25,21 @@ struct Args {
     events_per_pane: usize,
     #[arg(long, default_value_t = 1000)]
     cardinality: usize,
+    /// Zero is uniform; positive values use a truncated Zipf distribution.
+    #[arg(long, default_value_t = 0.0)]
+    zipf: f64,
     #[arg(long, default_value_t = 256)]
     width: usize,
     #[arg(long, default_value_t = 4)]
     depth: usize,
+    /// Accuracy target passed to ASAPPlanner's analytical sizing baseline.
+    #[arg(long, default_value_t = 0.01)]
+    epsilon: f64,
+    #[arg(long, default_value_t = 0.01)]
+    delta: f64,
+    /// Common candidate-space payload limit per sketch.
+    #[arg(long, default_value_t = 32768)]
+    memory_budget_bytes: usize,
     #[arg(long, default_value_t = 5)]
     trials: usize,
     /// Repeat all four end-of-stream queries to model recurring executions.
@@ -49,10 +66,21 @@ impl Rng {
 
 fn workload(args: &Args, trial: usize) -> Vec<Vec<usize>> {
     let mut rng = Rng(args.seed.wrapping_add(trial as u64));
+    let mut cumulative = Vec::with_capacity(args.cardinality);
+    let mut total = 0.0;
+    for rank in 1..=args.cardinality {
+        total += (rank as f64).powf(-args.zipf);
+        cumulative.push(total);
+    }
     (0..args.panes)
         .map(|_| {
             (0..args.events_per_pane)
-                .map(|_| rng.next() as usize % args.cardinality)
+                .map(|_| {
+                    let sample = (rng.next() >> 11) as f64 / ((1_u64 << 53) as f64) * total;
+                    cumulative
+                        .partition_point(|value| *value <= sample)
+                        .min(args.cardinality - 1)
+                })
                 .collect()
         })
         .collect()
@@ -164,7 +192,7 @@ fn per_query(method: &'static str, data: &[Vec<usize>], args: &Args) -> ResultRo
     )
 }
 
-fn shared(data: &[Vec<usize>], args: &Args) -> ResultRow {
+fn shared(method: &'static str, data: &[Vec<usize>], args: &Args) -> ResultRow {
     let mut panes = VecDeque::new();
     let started = Instant::now();
     for pane in data {
@@ -185,7 +213,7 @@ fn shared(data: &[Vec<usize>], args: &Args) -> ResultRow {
         .collect();
     // Report physical shared storage, not the temporary query views above.
     let mut row = evaluate(
-        "asap_full_shared",
+        method,
         &states,
         data,
         args,
@@ -195,6 +223,29 @@ fn shared(data: &[Vec<usize>], args: &Args) -> ResultRow {
     row.retained_sketches = panes.len();
     row.logical_payload_bytes = panes.len() * args.width * args.depth * 8;
     row
+}
+
+fn analytical_args(args: &Args) -> Result<Args, Box<dyn std::error::Error>> {
+    let intent = AggIntent::Count {
+        accuracy: AccuracyTarget::EpsilonDelta {
+            epsilon: args.epsilon,
+            delta: args.delta,
+        },
+    };
+    let SketchParams::Cms { width, depth } =
+        default_size_params(SketchAlgorithm::Cms, &intent, args.epsilon, args.delta)
+    else {
+        unreachable!("CMS analytical sizing must return CMS parameters")
+    };
+    // The comparison uses the same power-of-two width/depth grid as the
+    // AutoSketch adaptation. Round theory upward so its guarantee is not weakened.
+    let mut analytical = args.clone();
+    analytical.width = usize::try_from(width)?.max(64).next_power_of_two();
+    analytical.depth = usize::try_from(depth)?;
+    if analytical.width * analytical.depth * 8 > args.memory_budget_bytes {
+        return Err("ASAPPlanner analytical CMS exceeds the common memory budget".into());
+    }
+    Ok(analytical)
 }
 
 fn exact(data: &[Vec<usize>], args: &Args) -> ResultRow {
@@ -243,6 +294,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || (args.input_tsv.is_none() && (args.events_per_pane == 0 || args.cardinality == 0))
         || args.width == 0
         || args.depth == 0
+        || !args.zipf.is_finite()
+        || args.zipf < 0.0
+        || !args.epsilon.is_finite()
+        || args.epsilon <= 0.0
+        || !args.delta.is_finite()
+        || args.delta <= 0.0
+        || args.delta >= 1.0
+        || args.width * args.depth * 8 > args.memory_budget_bytes
         || args.trials == 0
         || args.query_repetitions == 0
         || args.backend_revision.trim().is_empty()
@@ -262,10 +321,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if data.len() < *args.window_panes.last().unwrap() {
             return Err("replay does not cover the largest window".into());
         }
+        let analytical = analytical_args(&args)?;
         let rows = vec![
             per_query("autosketch_per_query", &data, &args),
             per_query("asap_no_sharing", &data, &args),
-            shared(&data, &args),
+            shared("asapplanner_erp", &data, &args),
+            shared("asapplanner_analytical", &data, &analytical),
             exact(&data, &args),
         ];
         eprintln!("trial {trial} complete");
@@ -278,7 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "pane_seconds":args.pane_seconds,"args":args,
             "timing_metric":"wall seconds; methods execute sequentially and are not CPU profiles",
             "memory_metric":"logical retained payload; CMS counters or raw usize keys; excludes allocator overhead",
-            "adaptation":"AutoSketch is deployed independently per recurring query; ASAP-NoSharing intentionally has the same physical plan and isolates configuration; ASAP-Full shares one minute panes",
+            "adaptation":"AutoSketch is deployed independently per recurring query; width/depth are selected by the companion Rust AutoSketch/ERP calibration runner; ASAP-NoSharing isolates sharing; ASAPPlanner-ERP shares panes; ASAPPlanner-Analytical calls Planner default_size_params and rounds upward to the common candidate grid",
             "trials":trials
         }),
     )?;
@@ -296,8 +357,12 @@ mod tests {
             panes: 60,
             events_per_pane: 10,
             cardinality: 20,
+            zipf: 0.0,
             width: 64,
             depth: 2,
+            epsilon: 0.01,
+            delta: 0.01,
+            memory_budget_bytes: 32768,
             trials: 1,
             query_repetitions: 2,
             seed: 42,
@@ -310,7 +375,7 @@ mod tests {
         let args = args();
         let data = workload(&args, 0);
         let per = per_query("autosketch_per_query", &data, &args);
-        let full = shared(&data, &args);
+        let full = shared("asapplanner_erp", &data, &args);
         assert_eq!(per.maintenance_updates, full.maintenance_updates * 4);
         assert_eq!(per.retained_sketches, 81);
         assert_eq!(full.retained_sketches, 60);

@@ -1,9 +1,123 @@
 //! Deployment adapter for ASAPPlanner Error–Resource Profiles.
 
-use asap_aware_mapping::erp::{AccuracyMode, ErpArtifact, ErpSelectionRequest};
+use asap_aware_mapping::erp::{
+    AccuracyMode, ErpArtifact, ErpDataShape, ErpNearestSelectionRequest, ErpSelectionRequest,
+};
 use planner_types::post_asap::{SketchAlgorithm, SketchParams};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, HashMap};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ErpObservedShape {
+    pub shape: ErpDataShape,
+    /// Largest interval rate divided by the median non-zero interval rate.
+    pub burst_ratio: f64,
+}
+
+/// Bounded online observer fed by the same keys that enter a summary. It keeps
+/// exact sampled frequencies up to a configured cap and fails closed beyond it
+/// instead of silently under-reporting cardinality.
+#[derive(Debug)]
+pub struct ErpShapeObserver {
+    frequencies: HashMap<String, u64>,
+    interval_updates: Vec<u64>,
+    max_observed_keys: usize,
+    updates: u64,
+}
+
+impl ErpShapeObserver {
+    pub fn new(max_observed_keys: usize) -> Result<Self, &'static str> {
+        if max_observed_keys == 0 {
+            return Err("max_observed_keys must be positive");
+        }
+        Ok(Self {
+            frequencies: HashMap::new(),
+            interval_updates: Vec::new(),
+            max_observed_keys,
+            updates: 0,
+        })
+    }
+
+    pub fn observe(&mut self, key: &str, interval: usize) -> Result<(), &'static str> {
+        if !self.frequencies.contains_key(key) && self.frequencies.len() == self.max_observed_keys {
+            return Err("ERP shape observer cardinality cap exceeded");
+        }
+        *self.frequencies.entry(key.to_owned()).or_default() += 1;
+        if self.interval_updates.len() <= interval {
+            self.interval_updates.resize(interval + 1, 0);
+        }
+        self.interval_updates[interval] += 1;
+        self.updates += 1;
+        Ok(())
+    }
+
+    pub fn snapshot(&self, uniform_exponent_threshold: f64) -> Option<ErpObservedShape> {
+        if self.frequencies.is_empty()
+            || !uniform_exponent_threshold.is_finite()
+            || uniform_exponent_threshold < 0.0
+        {
+            return None;
+        }
+        let mut counts: Vec<_> = self.frequencies.values().copied().collect();
+        counts.sort_unstable_by(|left, right| right.cmp(left));
+        let exponent = fit_zipf_exponent(&counts);
+        let (family, parameters) = if exponent > uniform_exponent_threshold {
+            (
+                "zipf".to_owned(),
+                BTreeMap::from([("exponent".to_owned(), exponent)]),
+            )
+        } else {
+            ("uniform".to_owned(), BTreeMap::new())
+        };
+        let mut nonzero: Vec<_> = self
+            .interval_updates
+            .iter()
+            .copied()
+            .filter(|count| *count > 0)
+            .collect();
+        nonzero.sort_unstable();
+        let median = nonzero.get(nonzero.len() / 2).copied().unwrap_or(1);
+        let peak = nonzero.last().copied().unwrap_or(median);
+        Some(ErpObservedShape {
+            shape: ErpDataShape {
+                cardinality: self.frequencies.len() as u64,
+                family,
+                parameters,
+                benchmark_events: self.updates,
+            },
+            burst_ratio: peak as f64 / median as f64,
+        })
+    }
+}
+
+fn fit_zipf_exponent(descending_counts: &[u64]) -> f64 {
+    if descending_counts.len() < 2 {
+        return 0.0;
+    }
+    let points: Vec<_> = descending_counts
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count > 0)
+        .map(|(index, count)| (((index + 1) as f64).ln(), (*count as f64).ln()))
+        .collect();
+    let mean_x = points.iter().map(|(x, _)| x).sum::<f64>() / points.len() as f64;
+    let mean_y = points.iter().map(|(_, y)| y).sum::<f64>() / points.len() as f64;
+    let covariance = points
+        .iter()
+        .map(|(x, y)| (x - mean_x) * (y - mean_y))
+        .sum::<f64>();
+    let variance = points
+        .iter()
+        .map(|(x, _)| (x - mean_x).powi(2))
+        .sum::<f64>();
+    if variance == 0.0 {
+        0.0
+    } else {
+        (-covariance / variance).max(0.0)
+    }
+}
 
 /// ERP v1 measures error magnitudes, not tail probabilities. Only an explicit
 /// epsilon-only request may use these observations as its accuracy contract.
@@ -116,8 +230,69 @@ pub struct ErpPlanningInput {
     pub cpu_weight: f64,
     pub byte_second_weight: f64,
     pub mode: ErpAccuracyMode,
+    /// Runtime-observed shape. If present, exact descriptor equality is
+    /// replaced by bounded nearest-profile matching.
+    #[serde(default)]
+    pub observed_shape: Option<ErpDataShape>,
+    /// Runtime-samples ring key from which the backend resolves the freshest
+    /// `erp_observed_shape` payload before compiling a plan.
+    #[serde(default)]
+    pub observed_shape_source: Option<ErpObservedShapeSource>,
+    #[serde(default)]
+    pub shape_match: Option<ErpShapeMatchPolicy>,
     #[serde(default)]
     pub runtime: ErpRuntimeCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ErpObservedShapeSource {
+    pub source: String,
+    pub sketch: String,
+    pub implementation: String,
+}
+
+impl ErpPlanningInput {
+    pub fn hydrate_observed_shape(
+        &mut self,
+        samples: &crate::runtime_samples::RuntimeSamplesStore,
+    ) -> Result<(), String> {
+        if self.observed_shape.is_some() {
+            return Ok(());
+        }
+        let Some(source) = &self.observed_shape_source else {
+            return Ok(());
+        };
+        let key = crate::runtime_samples::SampleKey {
+            source: source.source.clone(),
+            sketch: source.sketch.clone(),
+            impl_name: source.implementation.clone(),
+        };
+        let record = samples.latest(&key).ok_or_else(|| {
+            format!(
+                "no runtime shape sample for {}/{}/{}",
+                source.source, source.sketch, source.implementation
+            )
+        })?;
+        let value = record.payload.get("erp_observed_shape").ok_or_else(|| {
+            format!(
+                "latest runtime sample for {}/{}/{} has no erp_observed_shape",
+                source.source, source.sketch, source.implementation
+            )
+        })?;
+        let observed: ErpObservedShape = serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid erp_observed_shape: {error}"))?;
+        self.observed_shape = Some(observed.shape);
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ErpShapeMatchPolicy {
+    pub minimum_benchmark_events: u64,
+    pub max_log2_cardinality_distance: f64,
+    pub max_parameter_distance: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -193,7 +368,27 @@ impl ErpPlanningInput {
         let empirical = if request.allowed_sketches.is_empty() {
             Err(asap_aware_mapping::erp::ErpError::NoApplicableConfiguration)
         } else {
-            self.artifact.select(&request).and_then(|selected| {
+            let custom_dataset = self.distribution.pointer("/workload/external").is_some();
+            let selected = match (custom_dataset, &self.observed_shape, self.shape_match) {
+                // Custom/external datasets intentionally have no portable
+                // shape descriptor. Their complete distribution identity is
+                // the applicability key even if runtime observations exist.
+                (true, _, _) => self.artifact.select(&request),
+                (false, Some(observed), Some(policy)) => {
+                    self.artifact.select_nearest(&ErpNearestSelectionRequest {
+                        selection: request.clone(),
+                        observed: observed.clone(),
+                        minimum_benchmark_events: policy.minimum_benchmark_events,
+                        max_log2_cardinality_distance: policy.max_log2_cardinality_distance,
+                        max_parameter_distance: policy.max_parameter_distance,
+                    })
+                }
+                (false, None, None) => self.artifact.select(&request),
+                _ => Err(asap_aware_mapping::erp::ErpError::Invalid(
+                    "observed_shape and shape_match must be supplied together",
+                )),
+            };
+            selected.and_then(|selected| {
                 parse_params(&algorithm, &selected.record.parameters)
                     .filter(|params| {
                         self.runtime.supports(
@@ -427,6 +622,9 @@ mod tests {
             cpu_weight: 1.0,
             byte_second_weight: 1e-9,
             mode,
+            observed_shape: None,
+            observed_shape_source: None,
+            shape_match: None,
             runtime: ErpRuntimeCapabilities::default(),
         }
     }
@@ -486,6 +684,130 @@ mod tests {
                 }
             ),
             ErpParameterDecision::ExactFallback { .. }
+        ));
+    }
+
+    #[test]
+    fn observer_detects_skew_cardinality_and_burst() {
+        let mut observer = ErpShapeObserver::new(10).unwrap();
+        for _ in 0..100 {
+            observer.observe("hot", 5).unwrap();
+        }
+        for key in ["a", "b", "c"] {
+            observer.observe(key, 0).unwrap();
+        }
+        for interval in 1..5 {
+            for _ in 0..3 {
+                observer.observe("a", interval).unwrap();
+            }
+        }
+        let observed = observer.snapshot(0.05).unwrap();
+        assert_eq!(observed.shape.cardinality, 4);
+        assert_eq!(observed.shape.family, "zipf");
+        assert!(observed.shape.parameters["exponent"] > 1.0);
+        assert!(observed.burst_ratio > 30.0);
+    }
+
+    #[test]
+    fn planning_input_hydrates_shape_from_runtime_feedback() {
+        let samples = crate::runtime_samples::RuntimeSamplesStore::new(4);
+        samples.append_for_test(crate::runtime_samples::RuntimeRecord {
+            source: "edge-a".into(),
+            sketch: "cms".into(),
+            impl_name: "oxide".into(),
+            schema_version: 1,
+            payload: serde_json::json!({
+                "erp_observed_shape": {
+                    "shape": {
+                        "cardinality": 1000,
+                        "family": "zipf",
+                        "parameters": {"exponent": 1.1},
+                        "benchmark_events": 500000
+                    },
+                    "burst_ratio": 2.5
+                }
+            }),
+        });
+        let mut policy = input(ErpAccuracyMode::Hybrid);
+        policy.observed_shape_source = Some(ErpObservedShapeSource {
+            source: "edge-a".into(),
+            sketch: "cms".into(),
+            implementation: "oxide".into(),
+        });
+        policy.hydrate_observed_shape(&samples).unwrap();
+        assert_eq!(policy.observed_shape.unwrap().cardinality, 1000);
+    }
+
+    #[test]
+    fn observer_fails_loud_at_cardinality_cap() {
+        let mut observer = ErpShapeObserver::new(1).unwrap();
+        observer.observe("a", 0).unwrap();
+        assert_eq!(
+            observer.observe("b", 0),
+            Err("ERP shape observer cardinality cap exceeded")
+        );
+    }
+
+    #[test]
+    fn nearest_profile_miss_keeps_hybrid_fallback() {
+        let mut policy = input(ErpAccuracyMode::Hybrid);
+        policy.observed_shape = Some(ErpDataShape {
+            cardinality: 1_000_000,
+            family: "zipf".into(),
+            parameters: BTreeMap::from([("exponent".into(), 2.0)]),
+            benchmark_events: 10_000,
+        });
+        policy.shape_match = Some(ErpShapeMatchPolicy {
+            minimum_benchmark_events: 1_000,
+            max_log2_cardinality_distance: 1.0,
+            max_parameter_distance: 0.2,
+        });
+        let theory = SketchParams::Cms {
+            width: 4096,
+            depth: 5,
+        };
+        assert!(matches!(
+            policy.select(SketchAlgorithm::Cms, 0.01, theory.clone()),
+            ErpParameterDecision::TheoreticalFallback { params, .. } if params == theory
+        ));
+    }
+
+    #[test]
+    fn custom_dataset_identity_is_exact_even_with_runtime_shape() {
+        let mut policy = input(ErpAccuracyMode::Hybrid);
+        policy.distribution = serde_json::json!({
+            "workload": {"external": {"dataset": "customer-a"}}
+        });
+        policy.artifact.records[0].distribution = serde_json::json!({
+            "workload": {"external": {"dataset": "customer-b"}},
+            "erp_shape": {
+                "cardinality": 1000,
+                "family": "zipf",
+                "parameters": {"exponent": 1.1},
+                "benchmark_events": 100000
+            }
+        });
+        policy.observed_shape = Some(ErpDataShape {
+            cardinality: 1000,
+            family: "zipf".into(),
+            parameters: BTreeMap::from([("exponent".into(), 1.1)]),
+            benchmark_events: 100000,
+        });
+        policy.shape_match = Some(ErpShapeMatchPolicy {
+            minimum_benchmark_events: 1000,
+            max_log2_cardinality_distance: 1.0,
+            max_parameter_distance: 0.2,
+        });
+        assert!(matches!(
+            policy.select(
+                SketchAlgorithm::Cms,
+                0.01,
+                SketchParams::Cms {
+                    width: 4096,
+                    depth: 5,
+                }
+            ),
+            ErpParameterDecision::TheoreticalFallback { .. }
         ));
     }
 }

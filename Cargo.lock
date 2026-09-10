@@ -374,7 +374,7 @@ dependencies = [
 [[package]]
 name = "asap-aware-mapping"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=3dda28032c2a2badb64bf5358e0f40fef9918227#3dda28032c2a2badb64bf5358e0f40fef9918227"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=9f526a9#9f526a93130781e3d16744a8cc28e86f6b827f0c"
 dependencies = [
  "asap-types",
  "serde",
@@ -385,7 +385,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-metricsql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=3dda28032c2a2badb64bf5358e0f40fef9918227#3dda28032c2a2badb64bf5358e0f40fef9918227"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=9f526a9#9f526a93130781e3d16744a8cc28e86f6b827f0c"
 dependencies = [
  "asap-types",
  "metricsql_parser",
@@ -395,7 +395,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=3dda28032c2a2badb64bf5358e0f40fef9918227#3dda28032c2a2badb64bf5358e0f40fef9918227"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=9f526a9#9f526a93130781e3d16744a8cc28e86f6b827f0c"
 dependencies = [
  "asap-types",
  "promql-parser 0.10.0",
@@ -404,7 +404,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-sql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=3dda28032c2a2badb64bf5358e0f40fef9918227#3dda28032c2a2badb64bf5358e0f40fef9918227"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=9f526a9#9f526a93130781e3d16744a8cc28e86f6b827f0c"
 dependencies = [
  "asap-sql-function-catalog",
  "asap-types",
@@ -426,12 +426,12 @@ dependencies = [
 [[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=3dda28032c2a2badb64bf5358e0f40fef9918227#3dda28032c2a2badb64bf5358e0f40fef9918227"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=9f526a9#9f526a93130781e3d16744a8cc28e86f6b827f0c"
 
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=3dda28032c2a2badb64bf5358e0f40fef9918227#3dda28032c2a2badb64bf5358e0f40fef9918227"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=9f526a9#9f526a93130781e3d16744a8cc28e86f6b827f0c"
 dependencies = [
  "serde",
  "serde_json",
@@ -2801,7 +2801,7 @@ dependencies = [
 [[package]]
 name = "metricsql_common"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=3dda28032c2a2badb64bf5358e0f40fef9918227#3dda28032c2a2badb64bf5358e0f40fef9918227"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=9f526a9#9f526a93130781e3d16744a8cc28e86f6b827f0c"
 dependencies = [
  "chrono",
 ]
@@ -2809,7 +2809,7 @@ dependencies = [
 [[package]]
 name = "metricsql_parser"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=3dda28032c2a2badb64bf5358e0f40fef9918227#3dda28032c2a2badb64bf5358e0f40fef9918227"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=9f526a9#9f526a93130781e3d16744a8cc28e86f6b827f0c"
 dependencies = [
  "ahash",
  "chrono",
