@@ -157,4 +157,18 @@ mod tests {
         assert_eq!(adapter().get_query_endpoint(), "/api/v1/query");
         assert_eq!(adapter().get_range_query_endpoint(), "/api/v1/query_range");
     }
+
+    #[test]
+    fn acceleration_identity_accepts_only_the_shared_promql_subset() {
+        assert!(adapter()
+            .canonical_plan_identity("mad_over_time(cpu_usage[5m])")
+            .unwrap()
+            .is_some());
+        assert!(adapter()
+            .canonical_plan_identity("default_rollup(cpu_usage[5m])")
+            .is_err());
+        assert!(adapter()
+            .canonical_plan_identity("distinct_over_time(cpu_usage[5m])")
+            .is_err());
+    }
 }
