@@ -1,4 +1,4 @@
-use control_plane::physical::executable_binding::{BackendExecutableBinding, BackendNodeBinding};
+use asap_types::executable_plan::{BackendExecutableBinding, BackendNodeBinding};
 use planner_types::post_asap::PostAsapNodeId;
 use planner_types::post_asap::{ExecutableDag, ExecutableDagNode, ExecutionDataState};
 use std::{

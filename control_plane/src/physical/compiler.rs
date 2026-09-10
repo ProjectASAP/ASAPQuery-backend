@@ -2761,7 +2761,7 @@ impl PhysicalCompiler {
             }
             precompute_sinks.sort();
             let installed = crate::physical::executable_binding::InstalledPostAsapDag {
-                document: super::executable_binding::PostAsapDagDocument::from_executable(
+                document: super::executable_binding::OwnedPostAsapDag::from_executable(
                     query_id.clone(),
                     &compiled.dag,
                 )
@@ -2830,12 +2830,12 @@ impl PhysicalCompiler {
                     query_id: query_id.clone(),
                     reason: "installed post-ASAP DAG has no query-plan entry".into(),
                 })?;
-            installed
-                .validate_query_plan(entry)
-                .map_err(|reason| CompileError::Query {
+            super::executable_binding::validate_query_plan(installed, entry).map_err(|reason| {
+                CompileError::Query {
                     query_id: query_id.clone(),
                     reason,
-                })?;
+                }
+            })?;
         }
         let summary_catalog = super::summary_catalog::SummaryCatalog::from_materializations(
             envelope.plan_id,
@@ -4402,8 +4402,7 @@ mod tests {
             .get(&entry.query_id)
             .expect("compiled query retains its Planner DAG and backend placement");
         installed.validate().expect("typed DAG document");
-        installed
-            .validate_query_plan(entry)
+        crate::physical::executable_binding::validate_query_plan(installed, entry)
             .expect("query node bindings");
         assert_eq!(installed.binding.query_plan_sink, entry.root);
         assert!(installed.binding.nodes.values().any(|placement| matches!(
