@@ -112,6 +112,7 @@ fn sketch_agg_l4(
             input: planner_types::post_asap::SummaryUpdate {
                 item: None,
                 weight: planner_types::post_asap::SummaryInputExpr::Column(ColumnRef::SampleValue),
+                weight_domain: Default::default(),
             },
             reduction: Reduction::by(vec![]),
             grouping: GroupingStrategy::default(),
