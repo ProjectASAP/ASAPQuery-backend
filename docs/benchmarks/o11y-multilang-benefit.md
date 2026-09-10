@@ -22,7 +22,31 @@ python3 tools/o11y-multilang/audit_coverage.py \
   --dry-run-command 'cargo test -p control_plane clickhouse'
 ```
 
-The full runner will require `--prometheus`, `--victoriametrics`, `--clickhouse-url`, `--metrics`, `--snapshot`, `--compiler`, `--data-plane`, `--trials`, `--repetitions`, `--cpu-affinity`, and a new output directory. Its manifest records binary hashes and exact commands. Per-query rows use this schema:
+The checked-in fresh-process runner provisions isolated stores, reloads the raw
+fixture, alternates requests, and records process CPU ticks and RSS around the
+query interval.  The observed three-trial result is in
+`tools/o11y-multilang/final-fresh-trials`: all five engines completed 405/405
+requests.  Both ASAP language listeners used exact fallback for 405/405; the
+27-query corpus therefore demonstrates fallback overhead, not acceleration.
+Median latency was 2.39 ms for VM and 5.04 ms through the MetricsQL fallback,
+and 56.72 ms for ClickHouse and 59.19 ms through the SQL fallback.
+
+The SQL oracle is valid for 27/27 rows.  The MetricsQL frontend accepts 12/27,
+the early planner accepts 7/27, and the production compiler and publication
+validator accept q03 and q16 (2/27).  Requests using each published sidecar
+still routed to exact fallback with an empty SummaryStore.  These failures stay
+in the denominator.  Direct VM differs strictly from Prometheus for nine query
+IDs; three are label-name retention and six are range/increase/subquery numeric
+semantics, so no cross-language semantic claim is made for those rows.
+
+The independent synthetic supported-SQL evidence runs the real ClickHouse
+reader, BackfillService, SummaryStore, and a published shared DAG containing
+Filter, Project, global Sort, and Limit.  It passed differential correctness in
+three fresh ClickHouse trials.  It executes one query per trial through the
+accelerator object, so it is lifecycle correctness evidence and is not reported
+as a latency benefit estimate.
+
+Per-query rows use this schema:
 
 ```json
 {"id":"q01","language":"metricsql|clickhouse_sql","mode":"baseline|asap","trial":1,"repetition":0,"stage":"parser|canonical|planner|publication|validator|executor|adapter|fallback","status":"warm|exact_fallback|failed","typed_reason":null,"http_status":200,"latency_ns":0,"cpu_ns":0,"response_sha256":"...","comparable":true,"mismatch":null}

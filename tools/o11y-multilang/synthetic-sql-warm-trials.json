@@ -1,0 +1,49 @@
+{
+  "scope": "synthetic supported subset; fixture DAG is SummaryScan -> exact readout -> Filter -> Project -> global Sort -> Limit; ClickHouseReader -> BackfillService -> SummaryStore; accelerator result is differentially asserted against native ClickHouse",
+  "query_only_repetitions_per_trial": 1,
+  "limitation": "test invokes accelerator directly; HTTP warm header is separately covered by server tests, so this is lifecycle correctness evidence rather than a latency benefit estimate",
+  "trials": [
+    {
+      "trial": 0,
+      "status": "pass",
+      "wall_seconds": 14.154936579056084,
+      "before": {
+        "cpu_ticks": 575,
+        "rss_pages": 192529
+      },
+      "after": {
+        "cpu_ticks": 853,
+        "rss_pages": 164779
+      },
+      "test_tail": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1063 filtered out; finished in 0.14s\n\nult` that must be used\n   --> data_plane/src/precompute_engine/operators/dd_sketch_accumulator.rs:180:9\n    |\n180 |         self.inner.apply_delta(&delta);\n    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    |\n    = note: this `Result` may be an `Err` variant, which should be handled\n    = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default\nhelp: use `let _ = ...` to ignore the resulting value\n    |\n180 |         let _ = self.inner.apply_delta(&delta);\n    |         +++++++\n\n"
+    },
+    {
+      "trial": 1,
+      "status": "pass",
+      "wall_seconds": 0.641534034977667,
+      "before": {
+        "cpu_ticks": 568,
+        "rss_pages": 199041
+      },
+      "after": {
+        "cpu_ticks": 576,
+        "rss_pages": 189388
+      },
+      "test_tail": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1063 filtered out; finished in 0.14s\n\nult` that must be used\n   --> data_plane/src/precompute_engine/operators/dd_sketch_accumulator.rs:180:9\n    |\n180 |         self.inner.apply_delta(&delta);\n    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    |\n    = note: this `Result` may be an `Err` variant, which should be handled\n    = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default\nhelp: use `let _ = ...` to ignore the resulting value\n    |\n180 |         let _ = self.inner.apply_delta(&delta);\n    |         +++++++\n\n"
+    },
+    {
+      "trial": 2,
+      "status": "pass",
+      "wall_seconds": 0.6295235099969432,
+      "before": {
+        "cpu_ticks": 564,
+        "rss_pages": 197497
+      },
+      "after": {
+        "cpu_ticks": 575,
+        "rss_pages": 188818
+      },
+      "test_tail": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1063 filtered out; finished in 0.13s\n\nult` that must be used\n   --> data_plane/src/precompute_engine/operators/dd_sketch_accumulator.rs:180:9\n    |\n180 |         self.inner.apply_delta(&delta);\n    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    |\n    = note: this `Result` may be an `Err` variant, which should be handled\n    = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default\nhelp: use `let _ = ...` to ignore the resulting value\n    |\n180 |         let _ = self.inner.apply_delta(&delta);\n    |         +++++++\n\n"
+    }
+  ]
+}
