@@ -649,6 +649,7 @@ mod tests {
                 accuracy: planner_types::types::AccuracyTarget::Exact,
                 queries: vec![control_plane::clickhouse::ClickHouseSqlWorkloadEntry {
                     sql: sql.into(),
+                    planning_sql: None,
                     start_ms,
                     end_ms,
                     cumulative: true,
