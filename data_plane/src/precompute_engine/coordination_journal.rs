@@ -220,6 +220,14 @@ impl SummaryCoordinationJournal {
         Ok(self.lock()?.staged.clone())
     }
 
+    pub fn watermarks(&self) -> io::Result<Vec<SummaryWatermarkBarrier>> {
+        Ok(self.lock()?.watermarks.clone())
+    }
+
+    pub fn is_published(&self, key: &AtomicPublicationKey) -> io::Result<bool> {
+        Ok(self.lock()?.published.contains(key))
+    }
+
     fn mutate<T>(
         &self,
         update: impl FnOnce(&mut JournalDocument) -> io::Result<T>,
