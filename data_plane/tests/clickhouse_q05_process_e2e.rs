@@ -72,17 +72,28 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
         return;
     };
     let client = reqwest::Client::new();
-    let end_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
+    let end_ms = std::env::var("CLICKHOUSE_BENCH_END_MS")
+        .ok()
+        .map(|value| value.parse::<u64>().expect("valid benchmark end timestamp"))
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        });
     let start_ms = end_ms - 43_200_000;
+    let input_path = std::env::var("CLICKHOUSE_BENCH_INPUT").ok();
+    let metric = std::env::var("CLICKHOUSE_BENCH_METRIC")
+        .unwrap_or_else(|_| "cache_refresh_lag_seconds".into());
+    let clickhouse_pid = std::env::var("CLICKHOUSE_PID")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok());
+    let clickhouse_initial = clickhouse_pid.map(process_snapshot);
     let experiment_started = std::time::Instant::now();
     let setup = [
         "CREATE DATABASE IF NOT EXISTS asap_q05_e2e".to_string(),
         "DROP TABLE IF EXISTS asap_q05_e2e.q05_samples".to_string(),
-        "CREATE TABLE asap_q05_e2e.q05_samples(metric String, labels String, ts_ms Int64, value Float64) ENGINE=Memory".to_string(),
-        format!("INSERT INTO asap_q05_e2e.q05_samples VALUES ('cache_refresh_lag_seconds','cache_refresh_lag_seconds',{},7),('cache_refresh_lag_seconds','cache_refresh_lag_seconds',{},11)", start_ms + 1_000, start_ms + 2_000),
+        "CREATE TABLE asap_q05_e2e.q05_samples(metric String, labels String, ts_ms Int64, value Float64) ENGINE=MergeTree ORDER BY ts_ms".to_string(),
     ];
     for sql in setup {
         let response = clickhouse_auth(client.post(&clickhouse))
@@ -96,6 +107,42 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
             response.text().await.unwrap()
         );
     }
+    let rows = if let Some(path) = &input_path {
+        std::fs::read_to_string(path).expect("read benchmark JSONEachRow input")
+    } else {
+        [start_ms + 1_000, start_ms + 2_000]
+            .into_iter()
+            .zip([7.0, 11.0])
+            .map(|(ts_ms, value)| serde_json::json!({"metric": metric, "labels": metric, "ts_ms": ts_ms, "value": value}).to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut series = std::collections::BTreeSet::new();
+    let mut input_samples = 0_u64;
+    for line in rows.lines().filter(|line| !line.is_empty()) {
+        let row: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(row["metric"].as_str(), Some(metric.as_str()));
+        series.insert(row["labels"].as_str().unwrap().to_owned());
+        input_samples += 1;
+    }
+    assert_eq!(
+        series.len(),
+        1,
+        "scalar max probe requires one original series"
+    );
+    let inserted = clickhouse_auth(client.post(&clickhouse))
+        .body(format!(
+            "INSERT INTO asap_q05_e2e.q05_samples FORMAT JSONEachRow\n{rows}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        inserted.status().is_success(),
+        "{}",
+        inserted.text().await.unwrap()
+    );
+    drop(rows);
 
     let sql = format!(
         "SELECT max(value) AS value FROM q05_samples WHERE ts_ms>={start_ms} AND ts_ms<{end_ms}"
@@ -112,7 +159,7 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
         43_200,
         WindowKind::Tumbling,
         String::new(),
-        "cache_refresh_lag_seconds".into(),
+        metric.clone(),
         None,
         Some("q05_samples".into()),
         Some("value".into()),
@@ -309,6 +356,8 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
     );
     let build_elapsed_ns = experiment_started.elapsed().as_nanos();
     let post_build = process_snapshot(child.0.id());
+    let clickhouse_post_build = clickhouse_pid.map(process_snapshot);
+    let first_warm_started = std::time::Instant::now();
     let warm = client
         .post(format!("http://127.0.0.1:{sql_port}/"))
         .body(sql.clone())
@@ -322,9 +371,12 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
         warm.headers()
     );
     let warm_value: f64 = warm.text().await.unwrap().trim().parse().unwrap();
+    let first_warm_ns = first_warm_started.elapsed().as_nanos();
+    let first_exact_started = std::time::Instant::now();
     let exact_value: f64 = clickhouse_auth(client.post(&clickhouse))
         .body(format!("SELECT max(value) FROM asap_q05_e2e.q05_samples WHERE ts_ms>={start_ms} AND ts_ms<{end_ms} FORMAT TabSeparated"))
         .send().await.unwrap().text().await.unwrap().trim().parse().unwrap();
+    let first_exact_ns = first_exact_started.elapsed().as_nanos();
     assert_eq!(warm_value, exact_value);
 
     if let Ok(output) = std::env::var("CLICKHOUSE_BENCH_OUTPUT") {
@@ -349,9 +401,6 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
                 .unwrap();
         }
         let pre_query = process_snapshot(child.0.id());
-        let clickhouse_pid = std::env::var("CLICKHOUSE_PID")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok());
         let clickhouse_pre_query = clickhouse_pid.map(process_snapshot);
         let query_started = std::time::Instant::now();
         let mut requests = Vec::new();
@@ -361,6 +410,8 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
             } else {
                 ["exact", "warm"]
             } {
+                let backend_before = process_snapshot(child.0.id());
+                let clickhouse_before = clickhouse_pid.map(process_snapshot);
                 let started = std::time::Instant::now();
                 let response = if route == "warm" {
                     client
@@ -383,22 +434,41 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_owned);
                 let body = response.text().await.unwrap();
-                requests.push(serde_json::json!({"iteration":iteration,"route":route,"elapsed_ns":started.elapsed().as_nanos(),"status":status,"execution":execution,"body":body}));
+                let elapsed_ns = started.elapsed().as_nanos();
+                assert_eq!(status, 200, "{route} request failed: {body}");
+                assert_eq!(body.trim().parse::<f64>().unwrap(), exact_value);
+                if route == "warm" {
+                    assert_eq!(execution.as_deref(), Some("warm"));
+                }
+                let backend_after = process_snapshot(child.0.id());
+                let clickhouse_after = clickhouse_pid.map(process_snapshot);
+                requests.push(serde_json::json!({"iteration":iteration,"route":route,"elapsed_ns":elapsed_ns,"status":status,"execution":execution,"body":body,
+                    "backend_before":backend_before,"backend_after":backend_after,
+                    "clickhouse_before":clickhouse_before,"clickhouse_after":clickhouse_after}));
             }
         }
+        let query_elapsed_ns = query_started.elapsed().as_nanos();
         let post_query = process_snapshot(child.0.id());
         let clickhouse_post_query = clickhouse_pid.map(process_snapshot);
         let clickhouse_storage_bytes = std::env::var("CLICKHOUSE_STORAGE")
             .ok()
             .map(|path| directory_bytes(std::path::Path::new(&path)));
+        let table_stats = clickhouse_auth(client.post(&clickhouse))
+            .body("SELECT sum(rows) AS rows, sum(bytes_on_disk) AS bytes_on_disk, sum(data_compressed_bytes) AS compressed_bytes FROM system.parts WHERE active AND database='asap_q05_e2e' AND table='q05_samples' FORMAT JSONEachRow")
+            .send().await.unwrap().text().await.unwrap();
+        let table_stats: serde_json::Value = serde_json::from_str(&table_stats).unwrap();
         let artifact = serde_json::json!({
             "schema_version": 1,
             "git_head": std::process::Command::new("git").args(["rev-parse", "HEAD"]).output().ok().and_then(|value| String::from_utf8(value.stdout).ok()).map(|value| value.trim().to_owned()),
             "clock_ticks_per_second": std::process::Command::new("getconf").arg("CLK_TCK").output().ok().and_then(|value| String::from_utf8(value.stdout).ok()).and_then(|value| value.trim().parse::<u64>().ok()),
             "query": sql,
+            "input": {"path":input_path,"metric":metric,"samples":input_samples,"series":series,"start_ms":start_ms,"end_ms":end_ms},
+            "planning_scope": "Planner chooses query DAG against a predeclared MinMax catalog; materialization sizing/selection is not measured",
             "classification_required": "warm",
-            "build_phase": {"elapsed_ns":build_elapsed_ns,"backend":post_build,"backend_output_bytes":directory_bytes(output_dir.path())},
-            "query_phase": {"elapsed_ns":query_started.elapsed().as_nanos(),"backend_before":pre_query,"backend_after":post_query,"backend_output_bytes":directory_bytes(output_dir.path()),"clickhouse_before":clickhouse_pre_query,"clickhouse_after":clickhouse_post_query,"clickhouse_storage_bytes":clickhouse_storage_bytes},
+            "build_phase": {"elapsed_ns":build_elapsed_ns,"backend":post_build,"backend_output_bytes":directory_bytes(output_dir.path()),"clickhouse_before":clickhouse_initial,"clickhouse_after":clickhouse_post_build},
+            "first_query": {"warm_elapsed_ns":first_warm_ns,"exact_elapsed_ns":first_exact_ns},
+            "query_phase": {"elapsed_ns":query_elapsed_ns,"backend_before":pre_query,"backend_after":post_query,"backend_output_bytes":directory_bytes(output_dir.path()),"clickhouse_before":clickhouse_pre_query,"clickhouse_after":clickhouse_post_query,"clickhouse_storage_bytes":clickhouse_storage_bytes},
+            "clickhouse_table": table_stats,
             "requests": requests,
             "limitations": ["single q05 max workload", "CPU uses Linux scheduler ticks", "RSS is whole-process", "ClickHouse server is externally managed"],
         });
