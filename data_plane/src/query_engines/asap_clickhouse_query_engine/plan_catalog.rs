@@ -82,6 +82,7 @@ impl<P> SqlPlanEntry<P> {
 #[derive(Debug, Clone)]
 pub struct SqlPlanCatalogGeneration<P> {
     pub sds: SummaryCatalogReference,
+    pub catalog: Arc<SummaryCatalog>,
     entries: BTreeMap<SqlQueryFingerprint, Arc<SqlPlanEntry<P>>>,
 }
 
@@ -108,6 +109,7 @@ impl<P> SqlPlanCatalogGeneration<P> {
         }
         Ok(Self {
             sds: sds_reference,
+            catalog: Arc::new(sds.clone()),
             entries: indexed,
         })
     }

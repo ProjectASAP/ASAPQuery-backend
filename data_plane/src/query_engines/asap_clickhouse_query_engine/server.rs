@@ -24,6 +24,7 @@ struct ServerState {
     fallback: Arc<dyn ClickHouseExactBackend>,
     accelerator: Arc<dyn ClickHouseAccelerator>,
     publisher: Option<Arc<CatalogClickHouseAccelerator>>,
+    publication_token: Option<Arc<str>>,
 }
 
 /// The SQL-language boundary for accelerated execution.
@@ -82,6 +83,7 @@ impl ClickHouseHttpServer {
             fallback,
             accelerator,
             publisher: None,
+            publication_token: None,
         };
         Router::new()
             .route("/", get(query_get).post(query_post))
@@ -95,10 +97,19 @@ impl ClickHouseHttpServer {
         fallback: Arc<dyn ClickHouseExactBackend>,
         accelerator: Arc<CatalogClickHouseAccelerator>,
     ) -> Router {
+        Self::router_with_catalog_token(fallback, accelerator, None)
+    }
+
+    pub fn router_with_catalog_token(
+        fallback: Arc<dyn ClickHouseExactBackend>,
+        accelerator: Arc<CatalogClickHouseAccelerator>,
+        publication_token: Option<String>,
+    ) -> Router {
         let state = ServerState {
             fallback,
             accelerator: accelerator.clone(),
             publisher: Some(accelerator),
+            publication_token: publication_token.map(Arc::from),
         };
         Router::new()
             .route("/", get(query_get).post(query_post))
@@ -132,8 +143,9 @@ impl ClickHouseHttpServer {
     pub async fn run_with_catalog(
         self,
         accelerator: Arc<CatalogClickHouseAccelerator>,
+        publication_token: Option<String>,
     ) -> Result<(), std::io::Error> {
-        let app = Self::router_with_catalog(self.fallback, accelerator);
+        let app = Self::router_with_catalog_token(self.fallback, accelerator, publication_token);
         let listener = TcpListener::bind(&self.listen_address).await?;
         axum::serve(listener, app).await
     }
@@ -147,8 +159,12 @@ struct ActivatePlanRequest {
 
 async fn stage_plan(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Json(bundle): Json<ClickHousePlanBundle>,
 ) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let Some(publisher) = state.publisher else {
         return (
             StatusCode::NOT_FOUND,
@@ -164,8 +180,12 @@ async fn stage_plan(
 
 async fn activate_plan(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Json(request): Json<ActivatePlanRequest>,
 ) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let Some(publisher) = state.publisher else {
         return (
             StatusCode::NOT_FOUND,
@@ -177,6 +197,17 @@ async fn activate_plan(
         Ok(ack) => Json(ack).into_response(),
         Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
     }
+}
+
+fn authorized(state: &ServerState, headers: &HeaderMap) -> bool {
+    let Some(expected) = state.publication_token.as_deref() else {
+        return true;
+    };
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|provided| provided.as_bytes() == expected.as_bytes())
 }
 
 #[cfg(test)]
@@ -377,7 +408,25 @@ mod tests {
         let accelerator = Arc::new(CatalogClickHouseAccelerator::empty(Arc::new(
             crate::storage_engines::sketch_db::index::SketchStore::new(),
         )));
-        let app = ClickHouseHttpServer::router_with_catalog(fallback, accelerator);
+        let app = ClickHouseHttpServer::router_with_catalog_token(
+            fallback,
+            accelerator,
+            Some("publish-secret".into()),
+        );
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/clickhouse-plan/stage")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&bundle).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
         let staged = app
             .clone()
@@ -386,6 +435,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/clickhouse-plan/stage")
                     .header("content-type", "application/json")
+                    .header("authorization", "Bearer publish-secret")
                     .body(axum::body::Body::from(serde_json::to_vec(&bundle).unwrap()))
                     .unwrap(),
             )
@@ -404,6 +454,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/v1/clickhouse-plan/activate")
                     .header("content-type", "application/json")
+                    .header("authorization", "Bearer publish-secret")
                     .body(axum::body::Body::from(r#"{"plan_id":19,"plan_version":4}"#))
                     .unwrap(),
             )

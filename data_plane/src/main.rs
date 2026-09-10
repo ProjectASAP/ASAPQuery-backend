@@ -115,6 +115,10 @@ struct Args {
     #[arg(long, env = "ASAP_CLICKHOUSE_PLAN_BUNDLE")]
     clickhouse_plan_bundle: Option<String>,
 
+    /// Bearer token required by ClickHouse SQL plan stage/activate endpoints.
+    #[arg(long, env = "ASAP_CLICKHOUSE_PLAN_TOKEN")]
+    clickhouse_plan_token: Option<String>,
+
     /// Deprecated/no-op: the backend's only HTTP listener is the
     /// PromQL query surface (`--http-port` / `--query-port`). The
     /// old PRW ingest port was deleted in PR #100; this flag is
@@ -1351,6 +1355,7 @@ async fn main() -> Result<()> {
         None
     };
 
+    let clickhouse_plan_token = args.clickhouse_plan_token.clone();
     let clickhouse_server_handle = args.clickhouse_http_port.map(|port| {
         let fallback = Arc::new(
             data_plane::query_engines::asap_clickhouse_query_engine::ClickHouseHttpFallback::new(
@@ -1366,7 +1371,11 @@ async fn main() -> Result<()> {
         info!("Starting ClickHouse-compatible HTTP proxy on port {port}");
         tokio::spawn(async move {
             let result = match clickhouse_accelerator {
-                Some(accelerator) => clickhouse_server.run_with_catalog(accelerator).await,
+                Some(accelerator) => {
+                    clickhouse_server
+                        .run_with_catalog(accelerator, clickhouse_plan_token)
+                        .await
+                }
                 None => clickhouse_server.run().await,
             };
             if let Err(error) = result {

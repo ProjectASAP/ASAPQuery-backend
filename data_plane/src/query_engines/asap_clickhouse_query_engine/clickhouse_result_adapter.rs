@@ -1,8 +1,13 @@
 use super::fallback::ClickHouseRawResponse;
 use arrow::{
-    json::LineDelimitedWriter, record_batch::RecordBatch, util::display::array_value_to_string,
+    array::{Float64Array, StringArray, TimestampMillisecondArray},
+    datatypes::{DataType, Field, Schema},
+    json::LineDelimitedWriter,
+    record_batch::RecordBatch,
+    util::display::array_value_to_string,
 };
 use axum::response::{IntoResponse, Response};
+use std::{collections::BTreeMap, sync::Arc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickHouseFormat {
@@ -21,6 +26,56 @@ pub enum ClickHouseResultError {
 
 pub struct ClickHouseQueryResult {
     pub batches: Vec<RecordBatch>,
+}
+
+pub fn from_series_rows(
+    rows: Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)>,
+) -> Result<ClickHouseQueryResult, ClickHouseResultError> {
+    let mut label_names = rows
+        .iter()
+        .flat_map(|(labels, _)| labels.keys().cloned())
+        .collect::<Vec<_>>();
+    label_names.sort();
+    label_names.dedup();
+    let flattened = rows
+        .iter()
+        .flat_map(|(labels, points)| points.iter().map(move |point| (labels, point)))
+        .collect::<Vec<_>>();
+    let mut fields = label_names
+        .iter()
+        .map(|name| Field::new(name, DataType::Utf8, true))
+        .collect::<Vec<_>>();
+    fields.push(Field::new(
+        "timestamp",
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+        false,
+    ));
+    fields.push(Field::new("value", DataType::Float64, false));
+    let mut columns = label_names
+        .iter()
+        .map(|name| {
+            Arc::new(StringArray::from(
+                flattened
+                    .iter()
+                    .map(|(labels, _)| labels.get(name).map(String::as_str))
+                    .collect::<Vec<_>>(),
+            )) as arrow::array::ArrayRef
+        })
+        .collect::<Vec<_>>();
+    columns.push(Arc::new(TimestampMillisecondArray::from(
+        flattened.iter().map(|(_, (ts, _))| *ts).collect::<Vec<_>>(),
+    )));
+    columns.push(Arc::new(Float64Array::from(
+        flattened
+            .iter()
+            .map(|(_, (_, value))| *value)
+            .collect::<Vec<_>>(),
+    )));
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|error| ClickHouseResultError::Arrow(error.to_string()))?;
+    Ok(ClickHouseQueryResult {
+        batches: vec![batch],
+    })
 }
 
 impl ClickHouseQueryResult {

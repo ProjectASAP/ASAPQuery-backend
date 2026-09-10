@@ -11,7 +11,7 @@ use axum::{
     body::Bytes,
     http::{HeaderMap, HeaderValue, StatusCode},
 };
-use control_plane::physical::post_asap::{PhysicalExpr, PostAsapPlan};
+use control_plane::query_plan::QueryPlanEntry;
 
 use super::{
     clickhouse_result_adapter::ClickHouseFormat,
@@ -34,6 +34,8 @@ pub struct SqlRuntimePlan {
     pub end_ms: u64,
     pub cumulative: bool,
     pub materializations: BTreeSet<PolicyFingerprint>,
+    /// Control-plane compiled and materialization-bound executable DAG.
+    pub executable: QueryPlanEntry,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -88,6 +90,17 @@ impl CatalogClickHouseAccelerator {
     ) -> Result<super::plan_catalog::SqlPlanCatalogAck, super::plan_catalog::SqlPlanCatalogError>
     {
         let _publication = self.publication.write().unwrap();
+        for plan in &bundle.plans {
+            crate::query_engines::asap_query_engine::catalog_resolver::validate_entry(
+                Some(&bundle.sds),
+                &plan.runtime.executable,
+                bundle.sds.plan_id,
+                bundle.sds.plan_version,
+            )
+            .map_err(|error| {
+                super::plan_catalog::SqlPlanCatalogError::InvalidSds(error.to_string())
+            })?;
+        }
         let entries = bundle.plans.into_iter().map(|plan| SqlPlanEntry {
             sql_template: plan.sql,
             plan: plan.runtime,
@@ -151,12 +164,9 @@ fn requested_format(request: &ClickHouseQueryRequest) -> Result<ClickHouseFormat
 #[async_trait]
 impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
     async fn execute(&self, request: &ClickHouseQueryRequest) -> ClickHouseAccelerationOutcome {
-        let (entry, binder) = {
+        let (entry, generation) = {
             let _publication = self.publication.read().unwrap();
-            (
-                self.catalog.lookup(&request.sql),
-                self.binder.read().unwrap().clone(),
-            )
+            (self.catalog.lookup(&request.sql), self.catalog.active())
         };
         let Some(entry) = entry else {
             return ClickHouseAccelerationOutcome::Fallback(
@@ -171,31 +181,18 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                 )
             }
         };
-        let Some(binder) = binder else {
+        let Some(generation) = generation else {
             return ClickHouseAccelerationOutcome::Fallback(
                 ClickHouseAccelerationFallback::CatalogMiss,
             );
         };
-        let planned = match binder.bind(&request.sql).await {
-            Ok(planned) => planned,
-            Err(error) => {
-                return ClickHouseAccelerationOutcome::Fallback(
-                    ClickHouseAccelerationFallback::Planning(error.to_string()),
-                )
-            }
-        };
-        let PhysicalExpr::Committed(PostAsapPlan::Summary(node)) = planned.physical else {
-            return ClickHouseAccelerationOutcome::Fallback(
-                ClickHouseAccelerationFallback::Execution("unsupported physical placement".into()),
-            );
-        };
         match execute_sql_dag(
             self.store.as_ref(),
-            node.as_ref(),
+            &entry.plan.executable,
+            generation.catalog.as_ref(),
             entry.plan.start_ms,
             entry.plan.end_ms,
             entry.plan.cumulative,
-            entry.plan.materializations.clone(),
         ) {
             ClickHouseDagOutcome::Accelerated(result) => match result.encode(format) {
                 Ok(body) => {
@@ -230,5 +227,158 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                 ClickHouseAccelerationFallback::Execution(format!("{error:?}")),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        precompute_engine::operators::SumAccumulator,
+        storage_engines::sketch_db::index::{AggKind, Capability, SketchInstanceMetadata},
+    };
+    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    use axum::http::Method;
+    use control_plane::query_plan::{
+        ExactReadout, FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping,
+        QueryNodeId, QueryPlanNode,
+    };
+
+    fn fixture(end_ms: u64) -> (CatalogClickHouseAccelerator, ClickHouseQueryRequest) {
+        let config = PrecomputeMaterialization::new(
+            AggregationType::Sum,
+            String::new(),
+            Default::default(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            1,
+            1,
+            WindowKind::Tumbling,
+            String::new(),
+            "requests".into(),
+            None,
+            None,
+            None,
+        );
+        let sds = SummaryCatalog::from_materializations(41, 1, &[config]).unwrap();
+        let materialization = *sds.materializations.keys().next().unwrap();
+        let read = QueryNodeId(0);
+        let root = QueryNodeId(1);
+        let executable = QueryPlanEntry {
+            query_id: "sql-sum".into(),
+            canonical_promql: "SELECT sum(value) FROM requests".into(),
+            root,
+            nodes: [
+                (
+                    read,
+                    QueryPlanNode::ReadMaterialization {
+                        binding: MaterializationBinding {
+                            materialization,
+                            output_grouping: PhysicalGrouping::Reduce(Vec::new()),
+                            window_ms: 1_000,
+                            readout_lookback_ms: None,
+                        },
+                    },
+                ),
+                (
+                    root,
+                    QueryPlanNode::ExactReadout {
+                        input: read,
+                        readout: ExactReadout::Sum,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            instant: InstantExecution {
+                lookback_ms: 2_000,
+                full_history: false,
+                cumulative_readout: true,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        let descriptors = SdsDescriptorReferences {
+            summaries: sds.summary_descriptors.keys().cloned().collect(),
+            data: sds.data_descriptors.keys().cloned().collect(),
+        };
+        let bundle = ClickHousePlanBundle {
+            sds: sds.clone(),
+            tables: HashMap::new(),
+            accuracy: planner_types::types::AccuracyTarget::Exact,
+            plans: vec![ClickHousePublishedPlan {
+                sql: "SELECT sum(value) FROM requests".into(),
+                runtime: SqlRuntimePlan {
+                    start_ms: 0,
+                    end_ms,
+                    cumulative: true,
+                    materializations: BTreeSet::from([materialization.fingerprint()]),
+                    executable,
+                },
+                descriptors,
+            }],
+        };
+        let store = Arc::new(SketchStore::new());
+        store.install_summary_catalog(Arc::new(sds)).unwrap();
+        store.register(SketchInstanceMetadata {
+            sid: 7,
+            metric_name: "requests".into(),
+            group_by_keys: BTreeSet::new(),
+            capability: Some(Capability::ExactAgg(AggregationType::Sum)),
+            agg_kind: AggKind::ExactAgg {
+                agg_type: AggregationType::Sum,
+                parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: None,
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: materialization.fingerprint(),
+        });
+        store.append_precompute(
+            7,
+            Default::default(),
+            (0, 1_000),
+            Box::new(SumAccumulator::with_sum(2.0)),
+        );
+        store.append_precompute(
+            7,
+            Default::default(),
+            (1_000, 2_000),
+            Box::new(SumAccumulator::with_sum(3.0)),
+        );
+        let accelerator = CatalogClickHouseAccelerator::from_bundle(bundle, store).unwrap();
+        let request = ClickHouseQueryRequest {
+            method: Method::GET,
+            sql: "SELECT sum(value) FROM requests".into(),
+            body: Bytes::new(),
+            parameters: Default::default(),
+            headers: HeaderMap::new(),
+        };
+        (accelerator, request)
+    }
+
+    #[tokio::test]
+    async fn catalog_hit_executes_bound_summary_store_dag_and_encodes_typed_result() {
+        let (accelerator, request) = fixture(2_000);
+        let ClickHouseAccelerationOutcome::Accelerated(response) =
+            accelerator.execute(&request).await
+        else {
+            panic!("expected accelerated response")
+        };
+        assert_eq!(response.body, "1970-01-01T00:00:02\t5.0\n");
+    }
+
+    #[tokio::test]
+    async fn incomplete_summary_store_coverage_falls_back() {
+        let (accelerator, request) = fixture(3_000);
+        assert!(matches!(
+            accelerator.execute(&request).await,
+            ClickHouseAccelerationOutcome::Fallback(
+                ClickHouseAccelerationFallback::IncompleteCoverage
+            )
+        ));
     }
 }

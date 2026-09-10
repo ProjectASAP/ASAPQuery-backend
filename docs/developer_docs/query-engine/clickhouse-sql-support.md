@@ -26,6 +26,8 @@ SQL-plan descriptor foreign keys before returning a `staged` ACK. Then POST
 `/api/v1/clickhouse-plan/activate`. Activation switches the SQL plan generation
 and its schema binder together and returns an `active` ACK. These endpoints are
 served only on the independent ClickHouse listener.
+Set `ASAP_CLICKHOUSE_PLAN_TOKEN` (or `--clickhouse-plan-token`) to require
+`Authorization: Bearer <token>` on both publication operations.
 
 The executable subset is intentionally narrower than ClickHouse SQL. Joins,
 window functions, partitioned ranking, unsupported scalar functions, missing
@@ -121,13 +123,14 @@ Planning produces two separately owned outputs:
 1. Required summaries are published through the existing SDS lifecycle.
 2. Query DAG templates are stored in a runtime query-plan catalog.
 
-The catalog may record a query fingerprint, parameter slots, output contract,
-and `SummaryNode` root. It references SDS descriptors without extending them.
+The catalog records a query fingerprint, output contract, and the existing
+serializable, compiler-bound `QueryPlanEntry` physical DAG. It references SDS
+descriptors without extending them.
 Publication validates every descriptor reference against the candidate SDS
 snapshot before atomically activating the catalog generation.
 
-Serving time may parse and canonicalize request text and bind runtime values. It
-must not independently select summary families or sketch parameters.
+Serving looks up the published executable by fingerprint. It does not rerun
+planning, select summary families, or search for replacement materializations.
 
 ## Execution and fallback
 
