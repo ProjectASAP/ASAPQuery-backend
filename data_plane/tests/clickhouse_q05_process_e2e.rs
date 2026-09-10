@@ -121,6 +121,7 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
             accuracy: planner_types::types::AccuracyTarget::Exact,
             queries: vec![control_plane::clickhouse::ClickHouseSqlWorkloadEntry {
                 sql: sql.clone(),
+                planning_sql: None,
                 start_ms,
                 end_ms,
                 cumulative: true,
