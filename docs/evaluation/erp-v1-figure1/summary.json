@@ -1,0 +1,8 @@
+{
+  "host": "localhost",
+  "records": 72,
+  "plotted_points": 54,
+  "median_absolute_percentage_error": 11.546293545996496,
+  "spearman_rank_correlation": 0.9835334476843911,
+  "commands": "scripts/run_erp_v1_figure1.sh"
+}
