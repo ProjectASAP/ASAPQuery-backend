@@ -26,6 +26,8 @@ pub fn bind_metricsql(
 ) -> Result<MetricsQlBinding, MetricsQlBindingError> {
     let canonical = asap_frontend_metricsql::lower_metricsql(query, accuracy.clone())
         .map_err(|error| MetricsQlBindingError::Unsupported(error.to_string()))?;
+    control_plane::physical::compiler::validate_metricsql_acceleration_shape(&canonical)
+        .map_err(|reason| MetricsQlBindingError::Unsupported(reason.into()))?;
     let physical = bind_query_expr(&canonical, accuracy)
         .map_err(|error| MetricsQlBindingError::Physical(error.to_string()))?;
     Ok(MetricsQlBinding {
@@ -79,5 +81,17 @@ mod tests {
             bind_metricsql("sum(foo, bar)", accuracy()),
             Err(MetricsQlBindingError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn empirically_non_equivalent_nested_rollups_fail_closed() {
+        for query in ["sum(rate(foo[5s]))", "sum(increase(foo[5s]))"] {
+            assert!(matches!(
+                bind_metricsql(query, accuracy()),
+                Err(MetricsQlBindingError::Unsupported(_))
+            ));
+        }
+        bind_metricsql("sum(sum_over_time(foo[5s]))", accuracy())
+            .expect("nested sum rollup is represented exactly after complete ingestion");
     }
 }

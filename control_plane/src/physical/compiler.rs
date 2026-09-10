@@ -18,7 +18,7 @@ use planner_types::post_asap::{
     SketchQuery, SummaryExpr, SummaryFamilyType, SummaryMaintenanceLifecycle,
     SummaryMaintenanceMode, SummaryNode, SummaryWindowFramework,
 };
-use planner_types::pre_asap::QueryExpr;
+use planner_types::pre_asap::{AggIntent, QueryExpr, Reduction};
 use planner_types::workload::{
     AccuracyRequirement, DataArrival, DataWorkload, DurationMs, Evidence, EvidenceSource,
     Predictability, Query, QueryLanguage, QueryRecurrence, QueryRequirements, QueryTimeScope,
@@ -2050,6 +2050,41 @@ fn preserve_invalid_exact_fallback_roots(
     Ok(())
 }
 
+/// Reject MetricsQL shapes whose VictoriaMetrics series-reduction semantics
+/// are not represented faithfully by the current canonical executor.
+pub fn validate_metricsql_acceleration_shape(expr: &QueryExpr) -> Result<(), &'static str> {
+    let QueryExpr::Aggregate {
+        reduction: Reduction::Reduce(_),
+        measures: outer_measures,
+        child,
+        ..
+    } = expr
+    else {
+        return Ok(());
+    };
+    let QueryExpr::Aggregate {
+        reduction: Reduction::PerEntity,
+        measures: inner_measures,
+        child: inner_child,
+        ..
+    } = child.as_ref()
+    else {
+        return Ok(());
+    };
+    if outer_measures.len() == 1
+        && matches!(outer_measures[0], AggIntent::Sum { .. })
+        && inner_measures.len() == 1
+        && matches!(inner_child.as_ref(), QueryExpr::TimeRange { .. })
+    {
+        return match inner_measures[0] {
+            AggIntent::Rate => Err("nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve"),
+            AggIntent::Increase => Err("nested sum(increase(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve"),
+            _ => Ok(()),
+        };
+    }
+    Ok(())
+}
+
 impl PhysicalCompiler {
     pub fn compile(
         &self,
@@ -2064,6 +2099,20 @@ impl PhysicalCompiler {
         request: PlanningRequest,
         environment: DeploymentEnvironment,
     ) -> Result<PhysicalPlan, CompileError> {
+        for query in &request.queries {
+            let expr = asap_frontend_metricsql::lower_metricsql(
+                &query.query_string,
+                query.accuracy.clone(),
+            )
+            .map_err(|error| CompileError::Query {
+                query_id: query.query_id.clone(),
+                reason: format!("frontend.metricsql.lowering: {error}"),
+            })?;
+            validate_metricsql_acceleration_shape(&expr).map_err(|reason| CompileError::Query {
+                query_id: query.query_id.clone(),
+                reason: format!("frontend.metricsql.unsupported: {reason}"),
+            })?;
+        }
         self.compile_language(request, environment, true)
     }
 
@@ -4359,6 +4408,31 @@ mod tests {
             .unwrap();
         assert_eq!(entry.query_id, "vm-q");
         assert_eq!(entry.language, crate::query_plan::QueryLanguage::MetricsQl);
+    }
+
+    #[test]
+    fn metricsql_non_equivalent_counter_rollups_fail_closed_before_publication() {
+        for (query, stage) in [
+            ("sum(rate(m[5s]))", "rate"),
+            ("sum(increase(m[5s]))", "increase"),
+        ] {
+            let mut workload = request("vm-q", query);
+            let accuracy = workload.queries[0].accuracy.clone();
+            let canonical =
+                asap_frontend_metricsql::lower_metricsql(query, accuracy.clone()).unwrap();
+            workload.queries[0].post_asap = crate::planner_selection::select_summary(
+                &canonical,
+                &crate::physical::post_asap::cost_model::ForcedFamilyCostModel::new(
+                    accuracy,
+                    planner_types::post_asap::SketchAlgorithm::Kll,
+                ),
+            )
+            .unwrap();
+            let error = PhysicalCompiler
+                .compile_metricsql(workload, environment(10_000))
+                .unwrap_err();
+            assert!(error.to_string().contains(stage), "{error}");
+        }
     }
 
     #[test]
