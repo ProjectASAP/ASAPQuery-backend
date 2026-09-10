@@ -45,6 +45,18 @@ impl CatalogClickHouseAccelerator {
         accelerator
     }
 
+    /// Build the production mixed-DAG runtime with its required exact subtree
+    /// backend. Keeping both dependencies in one constructor prevents a
+    /// listener from enabling acceleration while leaving `ExternalExact`
+    /// nodes unexecutable.
+    pub fn with_active_physical_plan_and_exact_backend(
+        store: Arc<SketchStore>,
+        active: crate::storage_engines::types::HotReloadActivePhysicalPlan,
+        exact_backend: Arc<dyn ClickHouseExactBackend>,
+    ) -> Self {
+        Self::with_active_physical_plan(store, active).with_exact_backend(exact_backend)
+    }
+
     pub fn with_exact_backend(mut self, exact_backend: Arc<dyn ClickHouseExactBackend>) -> Self {
         self.exact_backend = Some(exact_backend);
         self
@@ -864,7 +876,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn real_clickhouse_external_leaf_matches_exact_query_in_mixed_dag() {
+    async fn real_clickhouse_runtime_differential_uses_production_mixed_constructor() {
         let Ok(base_url) = std::env::var("CLICKHOUSE_URL") else {
             return;
         };
@@ -894,11 +906,11 @@ mod tests {
             base_url,
             "default".into(),
         ));
-        let accelerator = CatalogClickHouseAccelerator::with_active_physical_plan(
+        let accelerator = CatalogClickHouseAccelerator::with_active_physical_plan_and_exact_backend(
             accelerator.store.clone(),
             crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active),
-        )
-        .with_exact_backend(exact_backend.clone());
+            exact_backend.clone(),
+        );
         let ClickHouseAccelerationOutcome::Accelerated(response) =
             accelerator.execute(&request).await
         else {

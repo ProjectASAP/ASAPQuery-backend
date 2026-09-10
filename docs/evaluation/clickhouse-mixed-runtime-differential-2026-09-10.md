@@ -1,4 +1,4 @@
-# ClickHouse mixed differential E2E — 2026-09-10
+# ClickHouse mixed runtime differential — 2026-09-10
 
 Base: `origin/main` at `791f7d7b0feab3827e7e6f5100e65ef29aec68de`.
 The real ClickHouse server was `http://127.0.0.1:18123`; credentials came from
@@ -13,7 +13,7 @@ ClickHouse query:
 1970-01-01T00:00:02	0.5
 ```
 
-The mixed execution used these nodes in the installed shared `QueryPlanEntry`:
+The mixed runtime test used these nodes in a shared `QueryPlanEntry` fixture:
 
 ```text
 SummaryStore ReadMaterialization -> ExactReadout --+
@@ -21,12 +21,14 @@ SummaryStore ReadMaterialization -> ExactReadout --+
 ClickHouse ExternalExact --------------------------+
 ```
 
-The production startup path initially failed this acceptance condition.
+The production startup path initially could not execute that graph.
 `main.rs` gave the HTTP server a `ClickHouseHttpFallback`, but did not give the
 same exact backend to `CatalogClickHouseAccelerator`. Every reachable
 `ExternalExact` node therefore returned `endpoint unavailable`, causing the
 whole request to fall back. The corrected startup wiring shares that backend
-with the accelerator.
+with the accelerator. Production and the runtime differential now use the same
+constructor, which requires both the active physical-plan handle and exact
+backend. This is focused construction coverage for the missing wiring.
 
 The real backfill lifecycle test also exposed two fixture errors: the backfill
 materialization omitted the fixture's `pane_origin_ms`, and the readout fixture
@@ -39,7 +41,7 @@ makes the test exercise the persisted SummaryStore data.
 | Route | Evidence | Result |
 |---|---|---|
 | warm summary | `catalog_hit_executes_bound_summary_store_dag_and_encodes_typed_result` | pass; SummaryStore result `50.0` |
-| hybrid | `real_clickhouse_external_leaf_matches_exact_query_in_mixed_dag` | pass; real ExternalExact + local Join/Project equals full exact query |
+| hybrid runtime | `real_clickhouse_runtime_differential_uses_production_mixed_constructor` | pass; real ExternalExact + local Join/Project equals full exact query |
 | incomplete coverage | `incomplete_summary_store_coverage_falls_back` | pass; explicit `IncompleteCoverage` |
 | full exact fallback | `clickhouse_differential_e2e` | pass; proxy bytes and status equal ClickHouse for four queries |
 | ClickHouse backfill to warm | `real_clickhouse_reader_enters_backfill_service_lifecycle` | pass; reader populates the same SummaryStore read by the SQL DAG |
@@ -76,3 +78,14 @@ cargo check -p data_plane --bin data_plane
 
 All commands passed. Raw logs from this run are in
 `/tmp/asap-clickhouse-mixed-e2e-20260910/` on the evaluation host.
+
+## Scope limitation
+
+The real-ClickHouse mixed test is a runtime differential in the accelerator
+module. It builds a validated physical-plan fixture, replaces its query entry
+with a mixed `QueryPlanEntry`, and invokes `CatalogClickHouseAccelerator`; it
+does not compile that mixed plan through the control-plane endpoint, publish it
+over HTTP, or launch the `data_plane` binary. The production-wiring regression
+is covered by sharing the required constructor with `main.rs`, plus successful
+binary compilation. A full compile/publish/process differential remains
+follow-up work.

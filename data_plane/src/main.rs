@@ -1392,11 +1392,11 @@ async fn main() -> Result<()> {
             ),
         );
         let accelerator = Arc::new(
-            data_plane::query_engines::asap_clickhouse_query_engine::accelerator::CatalogClickHouseAccelerator::with_active_physical_plan(
+            data_plane::query_engines::asap_clickhouse_query_engine::accelerator::CatalogClickHouseAccelerator::with_active_physical_plan_and_exact_backend(
                 sketch_index.clone(),
                 active_physical_plan.clone(),
-            )
-            .with_exact_backend(fallback.clone()),
+                fallback.clone(),
+            ),
         );
         let clickhouse_server =
             data_plane::query_engines::asap_clickhouse_query_engine::ClickHouseHttpServer {
