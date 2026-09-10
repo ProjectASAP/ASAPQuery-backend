@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "1d50d437e7e6a10f3ee4499090d0e899340ec95a";
+pub const PLANNER_REVISION: &str = "582186c0f2be83e710060524cd247a2e996c7d4c";
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 
 #[derive(Debug, Clone)]
@@ -3315,6 +3315,16 @@ fn collect_selected_materializations(
     node: &Rc<SummaryNode>,
     composable: bool,
 ) -> Result<Vec<SelectedMaterialization>, String> {
+    let executable = planner_types::post_asap::compile_executable_dag(node)
+        .map_err(|error| format!("invalid executable subDAG: {error}"))?;
+    if let Some(edge) = executable.edges.iter().find(|edge| {
+        edge.grouping == planner_types::post_asap::GroupingEdgeCompatibility::Incompatible
+    }) {
+        return Err(format!(
+            "executable subDAG contains incompatible grouping edge {} -> {} ({:?})",
+            edge.producer, edge.consumer, edge.role
+        ));
+    }
     fn walk(
         node: &Rc<SummaryNode>,
         readout: Option<&SketchQuery>,
