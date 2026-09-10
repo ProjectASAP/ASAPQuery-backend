@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "582186c0f2be83e710060524cd247a2e996c7d4c";
+pub const PLANNER_REVISION: &str = "4cbdaf82c4dea3cc374f4652f9e596d2b8050663";
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 
 #[derive(Debug, Clone)]
@@ -3772,15 +3772,18 @@ mod tests {
                 ..
             }
         )));
-        assert!(plan
+        let heaps = plan
             .precompute_plan
             .materializations
             .iter()
-            .any(|materialization| {
+            .filter(|materialization| {
                 materialization.aggregation_type
                     == asap_types::AggregationType::CountMinSketchWithHeap
                     && materialization.parameters["weight_mode"] == "counter_delta"
-            }));
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(heaps.len(), 1, "unpartitioned TopK owns one global CMS");
+        assert!(heaps[0].grouping_labels.labels.is_empty());
         assert!(plan
             .precompute_plan
             .materializations
