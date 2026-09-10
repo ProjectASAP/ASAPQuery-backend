@@ -158,7 +158,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!(
         "{}",
-        serde_json::to_string_pretty(&json!({"purpose":"calibration_only", "candidates":results}))?
+        serde_json::to_string_pretty(&json!({
+            "purpose":"calibration_only",
+            "compiler_identity": {
+                "backend_revision": control_plane::physical::compiler::BACKEND_REVISION,
+                "planner_revision": control_plane::physical::compiler::PLANNER_REVISION
+            },
+            "candidates":results
+        }))?
     );
     Ok(())
 }
