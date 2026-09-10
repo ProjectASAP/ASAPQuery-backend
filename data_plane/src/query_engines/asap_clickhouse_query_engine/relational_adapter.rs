@@ -1,6 +1,10 @@
 //! ClickHouse row semantics for planner-owned relational wrappers.
 
-use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
+use std::{
+    cmp::Ordering,
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use arrow::{
     array::{
@@ -44,6 +48,17 @@ enum Cell {
     Utf8(String),
     Bool(bool),
     Timestamp(i64),
+}
+
+fn join_key(value: &Cell) -> String {
+    match value {
+        Cell::Null => "null".into(),
+        Cell::Int64(value) => format!("i:{value}"),
+        Cell::Float64(value) => format!("f:{:016x}", value.to_bits()),
+        Cell::Utf8(value) => format!("s:{value}"),
+        Cell::Bool(value) => format!("b:{value}"),
+        Cell::Timestamp(value) => format!("t:{value}"),
+    }
 }
 
 #[derive(Debug)]
@@ -108,9 +123,46 @@ impl ClickHouseRelationalAdapter {
             }
             _ => None,
         };
+        let QueryExpr::Compare {
+            left: key_left,
+            op: CompareOpKind::Eq,
+            right: key_right,
+        } = pred.0.as_ref()
+        else {
+            return Err(ClickHouseRelationalError::Unsupported(
+                "join predicate is not equality".into(),
+            ));
+        };
+        let (QueryExpr::Column(left_key), QueryExpr::Column(right_key)) =
+            (key_left.as_ref(), key_right.as_ref())
+        else {
+            return Err(ClickHouseRelationalError::Unsupported(
+                "join keys are not columns".into(),
+            ));
+        };
+        let right_local_key = right_key.checked_sub(left.fields.len()).ok_or_else(|| {
+            ClickHouseRelationalError::Invalid("right join key points into left input".into())
+        })?;
+        let mut right_index: HashMap<String, Vec<&Vec<Cell>>> = HashMap::new();
+        for row in &right.rows {
+            let key =
+                row.get(right_local_key)
+                    .ok_or(ClickHouseRelationalError::ColumnOutOfRange(
+                        right_local_key,
+                        row.len(),
+                    ))?;
+            right_index.entry(join_key(key)).or_default().push(row);
+        }
         let mut rows = Vec::new();
         for left_row in &left.rows {
-            for right_row in &right.rows {
+            let key =
+                left_row
+                    .get(*left_key)
+                    .ok_or(ClickHouseRelationalError::ColumnOutOfRange(
+                        *left_key,
+                        left_row.len(),
+                    ))?;
+            for right_row in right_index.get(&join_key(key)).into_iter().flatten() {
                 let mut joined = Vec::with_capacity(left_row.len() + right_row.len());
                 joined.extend(left_row.iter().cloned());
                 joined.extend(right_row.iter().cloned());
