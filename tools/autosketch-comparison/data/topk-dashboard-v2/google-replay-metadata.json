@@ -1,0 +1,14 @@
+{
+  "input": "/mydata/datasets/google-cluster-data-2019/cell-a/instance_usage-000000000000.parquet.gz",
+  "rows": 1971,
+  "selected_start_pane": 77774,
+  "selected_panes": 220,
+  "selected_keys": 683,
+  "keys": 44806,
+  "pane_seconds": 30,
+  "minimum_start_time_us": 300000000,
+  "maximum_start_time_us": 2678998000000,
+  "panes_including_gaps": 220,
+  "nonempty_panes": 194,
+  "mapping": "collection IDs sorted numerically and replaced by dense zero-based IDs"
+}

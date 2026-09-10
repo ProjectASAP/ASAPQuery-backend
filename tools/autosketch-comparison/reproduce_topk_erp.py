@@ -52,8 +52,8 @@ def main():
     catalog_path.write_text(json.dumps(combined, indent=2) + "\n")
     run("synthetic.json", ["--erp-catalog", str(catalog_path), "--seed", "42"])
     run("google.json", ["--erp-catalog", str(catalog_path), "--input-tsv", str(args.google_replay)])
-    provenance = {"commands": commands, "platform": platform.platform(),
-                  "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+    provenance = {"reproduction_commands": commands, "platform": platform.platform(),
+                  "evaluation_binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                   "google_replay_sha256": hashlib.sha256(args.google_replay.read_bytes()).hexdigest(),
                   "sketchlib_revision": subprocess.check_output(["git", "-C", "../asap_sketchlib", "rev-parse", "HEAD"], text=True).strip(),
                   "planner_revision": "a9651cc", "backend_revision": args.revision,

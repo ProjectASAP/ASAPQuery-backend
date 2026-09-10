@@ -18,7 +18,7 @@ Reproduce from this backend worktree after building the release example:
 python3 tools/autosketch-comparison/reproduce_topk_erp.py \
   --output /tmp/topk-erp-fresh \
   --google-replay tools/autosketch-comparison/data/topk-dashboard-v2/google-replay.tsv \
-  --revision f40ddf1234964e1285e0e0839d1567f256352fa5
+  --revision 1c8e2ad8e800a93adf00e86112ad7bd67a806d24
 python3 tools/autosketch-comparison/summarize_topk_erp.py /tmp/topk-erp-fresh
 ```
 

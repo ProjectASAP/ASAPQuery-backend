@@ -816,6 +816,9 @@ mod tests {
         assert_eq!(local.maintenance_updates, shared.maintenance_updates * 4);
         assert!(shared.timing.merge_seconds > 0.0);
         let exact = exact(&d, 120, 3);
+        // Only the latest 120 panes are retained, not the union of all query
+        // histories; replay keys are u32 rather than machine-sized integers.
+        assert_eq!(exact.logical_payload_bytes, 120 * 100 * 4);
         for row in [&shared, &local, &exact] {
             assert_eq!(row.query_samples.len(), 12);
             assert_eq!(row.query_samples.first().unwrap()["end_pane"], 121);

@@ -1,0 +1,1990 @@
+{
+  "artifact": {
+    "schema_version": 1,
+    "producer_version": "backend-topk-window-adapter/1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+    "records": [
+      {
+        "id": "synthetic-0",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 3584.0,
+          "update_cpu_seconds": 5.893475319278948e-7,
+          "merge_cpu_seconds": 0.00001257055414012739,
+          "query_cpu_seconds": 2.0767916666666664e-6
+        }
+      },
+      {
+        "id": "synthetic-1",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 4096.0,
+          "update_cpu_seconds": 6.060660611060189e-7,
+          "merge_cpu_seconds": 0.000026319197452229297,
+          "query_cpu_seconds": 4.829104166666667e-6
+        }
+      },
+      {
+        "id": "synthetic-2",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 5120.0,
+          "update_cpu_seconds": 6.361688970363581e-7,
+          "merge_cpu_seconds": 0.000052380300424628456,
+          "query_cpu_seconds": 0.000012885875000000001
+        }
+      },
+      {
+        "id": "synthetic-3",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 6656.0,
+          "update_cpu_seconds": 5.8464e-7,
+          "merge_cpu_seconds": 0.000012997601910828027,
+          "query_cpu_seconds": 2.0920833333333336e-6
+        }
+      },
+      {
+        "id": "synthetic-4",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 5.965711811793462e-7,
+          "merge_cpu_seconds": 0.000027124611464968157,
+          "query_cpu_seconds": 4.868104166666667e-6
+        }
+      },
+      {
+        "id": "synthetic-5",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 6.174532930033609e-7,
+          "merge_cpu_seconds": 0.00005254645222929936,
+          "query_cpu_seconds": 0.000013083395833333333
+        }
+      },
+      {
+        "id": "synthetic-6",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 12800.0,
+          "update_cpu_seconds": 5.802561393217231e-7,
+          "merge_cpu_seconds": 0.000013249066878980892,
+          "query_cpu_seconds": 2.138375e-6
+        }
+      },
+      {
+        "id": "synthetic-7",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 13312.0,
+          "update_cpu_seconds": 5.892023941338222e-7,
+          "merge_cpu_seconds": 0.000027415988322717622,
+          "query_cpu_seconds": 5.0532083333333335e-6
+        }
+      },
+      {
+        "id": "synthetic-8",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 14336.0,
+          "update_cpu_seconds": 6.030003776351971e-7,
+          "merge_cpu_seconds": 0.000053173130573248415,
+          "query_cpu_seconds": 0.000013474979166666666
+        }
+      },
+      {
+        "id": "synthetic-9",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 25088.0,
+          "update_cpu_seconds": 5.778472160097769e-7,
+          "merge_cpu_seconds": 0.0000144674957537155,
+          "query_cpu_seconds": 2.2023958333333336e-6
+        }
+      },
+      {
+        "id": "synthetic-10",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 25600.0,
+          "update_cpu_seconds": 5.828180910479683e-7,
+          "merge_cpu_seconds": 0.000028322437367303606,
+          "query_cpu_seconds": 5.258875e-6
+        }
+      },
+      {
+        "id": "synthetic-11",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 26624.0,
+          "update_cpu_seconds": 5.953238350137488e-7,
+          "merge_cpu_seconds": 0.000055352101910828024,
+          "query_cpu_seconds": 0.000013768541666666667
+        }
+      },
+      {
+        "id": "synthetic-12",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 5632.0,
+          "update_cpu_seconds": 7.061594311029636e-7,
+          "merge_cpu_seconds": 0.00001594994373673036,
+          "query_cpu_seconds": 2.1788541666666666e-6
+        }
+      },
+      {
+        "id": "synthetic-13",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 6144.0,
+          "update_cpu_seconds": 7.19829851512374e-7,
+          "merge_cpu_seconds": 0.000031494228237791934,
+          "query_cpu_seconds": 4.7803541666666666e-6
+        }
+      },
+      {
+        "id": "synthetic-14",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 7.493641209899175e-7,
+          "merge_cpu_seconds": 0.00006301336518046708,
+          "query_cpu_seconds": 0.00001350425
+        }
+      },
+      {
+        "id": "synthetic-15",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 10752.0,
+          "update_cpu_seconds": 6.95359564314085e-7,
+          "merge_cpu_seconds": 0.0000154037898089172,
+          "query_cpu_seconds": 2.1188125e-6
+        }
+      },
+      {
+        "id": "synthetic-16",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 11264.0,
+          "update_cpu_seconds": 7.077772435074853e-7,
+          "merge_cpu_seconds": 0.00003168872186836518,
+          "query_cpu_seconds": 5.033458333333333e-6
+        }
+      },
+      {
+        "id": "synthetic-17",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 12288.0,
+          "update_cpu_seconds": 7.298659419492821e-7,
+          "merge_cpu_seconds": 0.00006287335774946921,
+          "query_cpu_seconds": 0.000013485020833333333
+        }
+      },
+      {
+        "id": "synthetic-18",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 20992.0,
+          "update_cpu_seconds": 6.913867668805377e-7,
+          "merge_cpu_seconds": 0.000015970764331210192,
+          "query_cpu_seconds": 2.1587916666666666e-6
+        }
+      },
+      {
+        "id": "synthetic-19",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 21504.0,
+          "update_cpu_seconds": 6.992287974335472e-7,
+          "merge_cpu_seconds": 0.00003228739384288747,
+          "query_cpu_seconds": 5.279854166666666e-6
+        }
+      },
+      {
+        "id": "synthetic-20",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 22528.0,
+          "update_cpu_seconds": 7.134724472960586e-7,
+          "merge_cpu_seconds": 0.00006317039065817408,
+          "query_cpu_seconds": 0.000013739729166666668
+        }
+      },
+      {
+        "id": "synthetic-21",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 41472.0,
+          "update_cpu_seconds": 6.894797616865261e-7,
+          "merge_cpu_seconds": 0.00001705336093418259,
+          "query_cpu_seconds": 2.2493125000000002e-6
+        }
+      },
+      {
+        "id": "synthetic-22",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 41984.0,
+          "update_cpu_seconds": 6.932725334555453e-7,
+          "merge_cpu_seconds": 0.000033493499999999994,
+          "query_cpu_seconds": 5.4753541666666675e-6
+        }
+      },
+      {
+        "id": "synthetic-23",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 43008.0,
+          "update_cpu_seconds": 7.021336895814238e-7,
+          "merge_cpu_seconds": 0.00006364885350318471,
+          "query_cpu_seconds": 0.000014014333333333334
+        }
+      },
+      {
+        "id": "synthetic-24",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 7680.0,
+          "update_cpu_seconds": 8.137480439963338e-7,
+          "merge_cpu_seconds": 0.00001763963375796178,
+          "query_cpu_seconds": 2.111e-6
+        }
+      },
+      {
+        "id": "synthetic-25",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 8.311110235258172e-7,
+          "merge_cpu_seconds": 0.00003660263694267516,
+          "query_cpu_seconds": 5.305812499999999e-6
+        }
+      },
+      {
+        "id": "synthetic-26",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 9216.0,
+          "update_cpu_seconds": 8.611902242590895e-7,
+          "merge_cpu_seconds": 0.00007197627600849257,
+          "query_cpu_seconds": 0.000012888520833333333
+        }
+      },
+      {
+        "id": "synthetic-27",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 14848.0,
+          "update_cpu_seconds": 8.067780232202872e-7,
+          "merge_cpu_seconds": 0.000018086811040339705,
+          "query_cpu_seconds": 2.2063541666666667e-6
+        }
+      },
+      {
+        "id": "synthetic-28",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 15360.0,
+          "update_cpu_seconds": 8.193019767797128e-7,
+          "merge_cpu_seconds": 0.00003726702441613588,
+          "query_cpu_seconds": 5.5388125e-6
+        }
+      },
+      {
+        "id": "synthetic-29",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 16384.0,
+          "update_cpu_seconds": 8.405290351359609e-7,
+          "merge_cpu_seconds": 0.00007236068789808916,
+          "query_cpu_seconds": 0.0000133316875
+        }
+      },
+      {
+        "id": "synthetic-30",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 29184.0,
+          "update_cpu_seconds": 8.037296052551176e-7,
+          "merge_cpu_seconds": 0.000019077565817409765,
+          "query_cpu_seconds": 2.301645833333333e-6
+        }
+      },
+      {
+        "id": "synthetic-31",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 29696.0,
+          "update_cpu_seconds": 8.099351934005499e-7,
+          "merge_cpu_seconds": 0.00003779247346072187,
+          "query_cpu_seconds": 5.5340416666666675e-6
+        }
+      },
+      {
+        "id": "synthetic-32",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 30720.0,
+          "update_cpu_seconds": 8.2343912923923e-7,
+          "merge_cpu_seconds": 0.00007290488004246285,
+          "query_cpu_seconds": 0.0000138720625
+        }
+      },
+      {
+        "id": "synthetic-33",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 57856.0,
+          "update_cpu_seconds": 8.024653809960282e-7,
+          "merge_cpu_seconds": 0.000020565734607218684,
+          "query_cpu_seconds": 2.398333333333333e-6
+        }
+      },
+      {
+        "id": "synthetic-34",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 58368.0,
+          "update_cpu_seconds": 8.050015368163764e-7,
+          "merge_cpu_seconds": 0.00003948813906581741,
+          "query_cpu_seconds": 5.824124999999999e-6
+        }
+      },
+      {
+        "id": "synthetic-35",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 59392.0,
+          "update_cpu_seconds": 8.12606867705469e-7,
+          "merge_cpu_seconds": 0.00007498957324840764,
+          "query_cpu_seconds": 0.000014543583333333332
+        }
+      },
+      {
+        "id": "synthetic-36",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 3584.0,
+          "update_cpu_seconds": 7.498876437519095e-7,
+          "merge_cpu_seconds": 0.000016260178343949045,
+          "query_cpu_seconds": 2.2094375e-6
+        }
+      },
+      {
+        "id": "synthetic-37",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 4096.0,
+          "update_cpu_seconds": 7.561542719217843e-7,
+          "merge_cpu_seconds": 0.00003408538959660297,
+          "query_cpu_seconds": 5.506729166666667e-6
+        }
+      },
+      {
+        "id": "synthetic-38",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 5120.0,
+          "update_cpu_seconds": 7.683686312251757e-7,
+          "merge_cpu_seconds": 0.00006784727919320595,
+          "query_cpu_seconds": 0.000012926
+        }
+      },
+      {
+        "id": "synthetic-39",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 6656.0,
+          "update_cpu_seconds": 7.498859486709441e-7,
+          "merge_cpu_seconds": 0.00001650122186836518,
+          "query_cpu_seconds": 2.2391458333333333e-6
+        }
+      },
+      {
+        "id": "synthetic-40",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 7.544633651084632e-7,
+          "merge_cpu_seconds": 0.000034331209129511675,
+          "query_cpu_seconds": 5.650895833333334e-6
+        }
+      },
+      {
+        "id": "synthetic-41",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 7.644445053467765e-7,
+          "merge_cpu_seconds": 0.00006810894904458598,
+          "query_cpu_seconds": 0.000013245833333333333
+        }
+      },
+      {
+        "id": "synthetic-42",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 12800.0,
+          "update_cpu_seconds": 7.481065084020776e-7,
+          "merge_cpu_seconds": 0.000016828267515923566,
+          "query_cpu_seconds": 2.2758541666666667e-6
+        }
+      },
+      {
+        "id": "synthetic-43",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 13312.0,
+          "update_cpu_seconds": 7.513047436602505e-7,
+          "merge_cpu_seconds": 0.00003472006050955414,
+          "query_cpu_seconds": 5.972083333333333e-6
+        }
+      },
+      {
+        "id": "synthetic-44",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 14336.0,
+          "update_cpu_seconds": 7.58896151542927e-7,
+          "merge_cpu_seconds": 0.00006869919957537156,
+          "query_cpu_seconds": 0.000013664770833333336
+        }
+      },
+      {
+        "id": "synthetic-45",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 25088.0,
+          "update_cpu_seconds": 7.471281130461351e-7,
+          "merge_cpu_seconds": 0.00001768011464968153,
+          "query_cpu_seconds": 2.3168958333333335e-6
+        }
+      },
+      {
+        "id": "synthetic-46",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 25600.0,
+          "update_cpu_seconds": 7.492603275282615e-7,
+          "merge_cpu_seconds": 0.000035527089171974526,
+          "query_cpu_seconds": 5.956708333333334e-6
+        }
+      },
+      {
+        "id": "synthetic-47",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 26624.0,
+          "update_cpu_seconds": 7.563586403910786e-7,
+          "merge_cpu_seconds": 0.00006945726539278131,
+          "query_cpu_seconds": 0.000014101729166666667
+        }
+      },
+      {
+        "id": "synthetic-48",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 5632.0,
+          "update_cpu_seconds": 9.235059498930645e-7,
+          "merge_cpu_seconds": 0.0000196696889596603,
+          "query_cpu_seconds": 2.2173541666666663e-6
+        }
+      },
+      {
+        "id": "synthetic-49",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 6144.0,
+          "update_cpu_seconds": 9.299611989000917e-7,
+          "merge_cpu_seconds": 0.00004075833227176221,
+          "query_cpu_seconds": 5.515354166666666e-6
+        }
+      },
+      {
+        "id": "synthetic-50",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 9.395790241368775e-7,
+          "merge_cpu_seconds": 0.0000812268566878981,
+          "query_cpu_seconds": 0.000013272062499999999
+        }
+      },
+      {
+        "id": "synthetic-51",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 10752.0,
+          "update_cpu_seconds": 9.232003715245952e-7,
+          "merge_cpu_seconds": 0.00001991569851380043,
+          "query_cpu_seconds": 2.27775e-6
+        }
+      },
+      {
+        "id": "synthetic-52",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 11264.0,
+          "update_cpu_seconds": 9.270082425908952e-7,
+          "merge_cpu_seconds": 0.00004102477388535032,
+          "query_cpu_seconds": 5.664208333333334e-6
+        }
+      },
+      {
+        "id": "synthetic-53",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 12288.0,
+          "update_cpu_seconds": 9.379224827375497e-7,
+          "merge_cpu_seconds": 0.00008143032908704884,
+          "query_cpu_seconds": 0.000013598354166666666
+        }
+      },
+      {
+        "id": "synthetic-54",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 20992.0,
+          "update_cpu_seconds": 9.214606202260923e-7,
+          "merge_cpu_seconds": 0.000020553266454352443,
+          "query_cpu_seconds": 2.3275e-6
+        }
+      },
+      {
+        "id": "synthetic-55",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 21504.0,
+          "update_cpu_seconds": 9.248567986556676e-7,
+          "merge_cpu_seconds": 0.00004164796072186837,
+          "query_cpu_seconds": 5.918541666666666e-6
+        }
+      },
+      {
+        "id": "synthetic-56",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 22528.0,
+          "update_cpu_seconds": 9.319989599755577e-7,
+          "merge_cpu_seconds": 0.00008197253503184714,
+          "query_cpu_seconds": 0.0000140730625
+        }
+      },
+      {
+        "id": "synthetic-57",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 41472.0,
+          "update_cpu_seconds": 9.195883709135351e-7,
+          "merge_cpu_seconds": 0.000022046713375796175,
+          "query_cpu_seconds": 2.3724166666666666e-6
+        }
+      },
+      {
+        "id": "synthetic-58",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 41984.0,
+          "update_cpu_seconds": 9.208424399633364e-7,
+          "merge_cpu_seconds": 0.00004270767834394905,
+          "query_cpu_seconds": 5.705708333333334e-6
+        }
+      },
+      {
+        "id": "synthetic-59",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 43008.0,
+          "update_cpu_seconds": 9.269965169569202e-7,
+          "merge_cpu_seconds": 0.0000831487940552017,
+          "query_cpu_seconds": 0.000014400916666666665
+        }
+      },
+      {
+        "id": "synthetic-60",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 7680.0,
+          "update_cpu_seconds": 1.1114916987473266e-6,
+          "merge_cpu_seconds": 0.000023275311040339704,
+          "query_cpu_seconds": 2.2296666666666666e-6
+        }
+      },
+      {
+        "id": "synthetic-61",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 1.1168838906202262e-6,
+          "merge_cpu_seconds": 0.000048075533970276005,
+          "query_cpu_seconds": 5.530979166666667e-6
+        }
+      },
+      {
+        "id": "synthetic-62",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 9216.0,
+          "update_cpu_seconds": 1.1259280788267644e-6,
+          "merge_cpu_seconds": 0.00009563413375796178,
+          "query_cpu_seconds": 0.000013564354166666666
+        }
+      },
+      {
+        "id": "synthetic-63",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 14848.0,
+          "update_cpu_seconds": 1.1091977011915672e-6,
+          "merge_cpu_seconds": 0.0000237800042462845,
+          "query_cpu_seconds": 2.277145833333333e-6
+        }
+      },
+      {
+        "id": "synthetic-64",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 15360.0,
+          "update_cpu_seconds": 1.1156208958142378e-6,
+          "merge_cpu_seconds": 0.000048492348195329085,
+          "query_cpu_seconds": 5.721520833333333e-6
+        }
+      },
+      {
+        "id": "synthetic-65",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 16384.0,
+          "update_cpu_seconds": 1.1212455820348306e-6,
+          "merge_cpu_seconds": 0.00009589930891719743,
+          "query_cpu_seconds": 0.000013863916666666665
+        }
+      },
+      {
+        "id": "synthetic-66",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 29184.0,
+          "update_cpu_seconds": 1.107685296669722e-6,
+          "merge_cpu_seconds": 0.000024803766454352442,
+          "query_cpu_seconds": 2.3652708333333333e-6
+        }
+      },
+      {
+        "id": "synthetic-67",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 29696.0,
+          "update_cpu_seconds": 1.1102621393217232e-6,
+          "merge_cpu_seconds": 0.000049150319532908707,
+          "query_cpu_seconds": 5.986166666666667e-6
+        }
+      },
+      {
+        "id": "synthetic-68",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 30720.0,
+          "update_cpu_seconds": 1.116553038802322e-6,
+          "merge_cpu_seconds": 0.00009711987473460722,
+          "query_cpu_seconds": 0.000014467583333333333
+        }
+      },
+      {
+        "id": "synthetic-69",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 57856.0,
+          "update_cpu_seconds": 1.1031870284142987e-6,
+          "merge_cpu_seconds": 0.00003005078662420382,
+          "query_cpu_seconds": 2.5486875000000002e-6
+        }
+      },
+      {
+        "id": "synthetic-70",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 58368.0,
+          "update_cpu_seconds": 1.105160490681332e-6,
+          "merge_cpu_seconds": 0.000053766966029723994,
+          "query_cpu_seconds": 6.2117499999999994e-6
+        }
+      },
+      {
+        "id": "synthetic-71",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 59392.0,
+          "update_cpu_seconds": 1.109839435991445e-6,
+          "merge_cpu_seconds": 0.00010160391825902337,
+          "query_cpu_seconds": 0.000015075291666666668
+        }
+      }
+    ]
+  },
+  "shapes": {
+    "synthetic": {
+      "cardinality": 99570,
+      "events_per_pane": 4545.833333333333,
+      "rank_mass": [
+        0.00003666361136571952,
+        0.0003134738771769019,
+        0.0027222731439046745,
+        0.023118240146654444
+      ]
+    }
+  },
+  "generation_seconds": 120.692113337,
+  "provenance": {
+    "args": {
+      "backend_revision": "1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+      "build_erp": true,
+      "calibration_panes": 120,
+      "cardinality": 100000,
+      "distribution": "Uniform",
+      "erp_catalog": null,
+      "input_tsv": null,
+      "memory_budget_bytes": 131072,
+      "min_recall_at_10": 0.8,
+      "output": "tools/autosketch-comparison/data/topk-dashboard-v2/uniform-profile.json",
+      "panes": 220,
+      "refresh_seconds": 30,
+      "refreshes": 100,
+      "seed": 2000,
+      "total_events": 1000000,
+      "total_memory_budget_bytes": 16777216,
+      "trials": 3,
+      "zipf_exponent": 1.1
+    },
+    "held_out_used": false,
+    "scope": "window-conditioned extension of sketch-bench ERP v1; generated by backend adapter",
+    "timing": "wall seconds per operation, not hardware CPU counters"
+  }
+}

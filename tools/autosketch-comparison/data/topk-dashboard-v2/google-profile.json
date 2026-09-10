@@ -1,0 +1,1990 @@
+{
+  "artifact": {
+    "schema_version": 1,
+    "producer_version": "backend-topk-window-adapter/1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+    "records": [
+      {
+        "id": "custom-calibration-0",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 3584.0,
+          "update_cpu_seconds": 1.065090909090909e-6,
+          "merge_cpu_seconds": 9.758357749469214e-6,
+          "query_cpu_seconds": 2.5483541666666666e-6
+        }
+      },
+      {
+        "id": "custom-calibration-1",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 4096.0,
+          "update_cpu_seconds": 8.660054545454545e-7,
+          "merge_cpu_seconds": 0.00001567803609341826,
+          "query_cpu_seconds": 4.547583333333334e-6
+        }
+      },
+      {
+        "id": "custom-calibration-2",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.4,
+          "recall_loss_120": 0.30000000000000004,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.5
+        },
+        "resources": {
+          "memory_bytes": 5120.0,
+          "update_cpu_seconds": 8.479836363636363e-7,
+          "merge_cpu_seconds": 0.000027585924628450104,
+          "query_cpu_seconds": 0.000010049145833333334
+        }
+      },
+      {
+        "id": "custom-calibration-3",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 6656.0,
+          "update_cpu_seconds": 7.197572727272728e-7,
+          "merge_cpu_seconds": 7.694791932059448e-6,
+          "query_cpu_seconds": 1.7961249999999999e-6
+        }
+      },
+      {
+        "id": "custom-calibration-4",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 7.396172727272727e-7,
+          "merge_cpu_seconds": 0.00001466289702760085,
+          "query_cpu_seconds": 4.09475e-6
+        }
+      },
+      {
+        "id": "custom-calibration-5",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 8.29670303030303e-7,
+          "merge_cpu_seconds": 0.000027539072186836517,
+          "query_cpu_seconds": 9.991479166666667e-6
+        }
+      },
+      {
+        "id": "custom-calibration-6",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 12800.0,
+          "update_cpu_seconds": 7.346506060606061e-7,
+          "merge_cpu_seconds": 8.022659235668791e-6,
+          "query_cpu_seconds": 1.7859791666666663e-6
+        }
+      },
+      {
+        "id": "custom-calibration-7",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 13312.0,
+          "update_cpu_seconds": 7.909509090909092e-7,
+          "merge_cpu_seconds": 0.000015020737791932061,
+          "query_cpu_seconds": 4.1278541666666665e-6
+        }
+      },
+      {
+        "id": "custom-calibration-8",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 14336.0,
+          "update_cpu_seconds": 8.962866666666666e-7,
+          "merge_cpu_seconds": 0.000027926216560509556,
+          "query_cpu_seconds": 0.00001016145833333333
+        }
+      },
+      {
+        "id": "custom-calibration-9",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 25088.0,
+          "update_cpu_seconds": 1.0701290909090908e-6,
+          "merge_cpu_seconds": 8.781480891719745e-6,
+          "query_cpu_seconds": 1.7957708333333333e-6
+        }
+      },
+      {
+        "id": "custom-calibration-10",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 25600.0,
+          "update_cpu_seconds": 1.131630303030303e-6,
+          "merge_cpu_seconds": 0.000015693728237791932,
+          "query_cpu_seconds": 4.056979166666667e-6
+        }
+      },
+      {
+        "id": "custom-calibration-11",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 26624.0,
+          "update_cpu_seconds": 1.3844724242424242e-6,
+          "merge_cpu_seconds": 0.000028509027600849253,
+          "query_cpu_seconds": 0.000010195083333333332
+        }
+      },
+      {
+        "id": "custom-calibration-12",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 5632.0,
+          "update_cpu_seconds": 8.209481818181819e-7,
+          "merge_cpu_seconds": 9.009654989384288e-6,
+          "query_cpu_seconds": 1.7833333333333331e-6
+        }
+      },
+      {
+        "id": "custom-calibration-13",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 6144.0,
+          "update_cpu_seconds": 8.479266666666666e-7,
+          "merge_cpu_seconds": 0.00001713888747346072,
+          "query_cpu_seconds": 4.009625000000001e-6
+        }
+      },
+      {
+        "id": "custom-calibration-14",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 8.802427272727273e-7,
+          "merge_cpu_seconds": 0.000031999287685774945,
+          "query_cpu_seconds": 0.000010121729166666668
+        }
+      },
+      {
+        "id": "custom-calibration-15",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 10752.0,
+          "update_cpu_seconds": 8.429936363636364e-7,
+          "merge_cpu_seconds": 9.214222929936306e-6,
+          "query_cpu_seconds": 1.7960416666666668e-6
+        }
+      },
+      {
+        "id": "custom-calibration-16",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 11264.0,
+          "update_cpu_seconds": 8.655493939393939e-7,
+          "merge_cpu_seconds": 0.00001725480785562633,
+          "query_cpu_seconds": 3.978000000000001e-6
+        }
+      },
+      {
+        "id": "custom-calibration-17",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 12288.0,
+          "update_cpu_seconds": 9.022845454545455e-7,
+          "merge_cpu_seconds": 0.00003219954670912951,
+          "query_cpu_seconds": 9.839208333333332e-6
+        }
+      },
+      {
+        "id": "custom-calibration-18",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 20992.0,
+          "update_cpu_seconds": 8.880669696969697e-7,
+          "merge_cpu_seconds": 9.879809978768578e-6,
+          "query_cpu_seconds": 1.7930208333333332e-6
+        }
+      },
+      {
+        "id": "custom-calibration-19",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 21504.0,
+          "update_cpu_seconds": 9.097772727272729e-7,
+          "merge_cpu_seconds": 0.00001792015817409766,
+          "query_cpu_seconds": 4.1350625e-6
+        }
+      },
+      {
+        "id": "custom-calibration-20",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 22528.0,
+          "update_cpu_seconds": 9.555439393939394e-7,
+          "merge_cpu_seconds": 0.00003276062951167728,
+          "query_cpu_seconds": 9.922833333333333e-6
+        }
+      },
+      {
+        "id": "custom-calibration-21",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 41472.0,
+          "update_cpu_seconds": 1.5829157575757577e-6,
+          "merge_cpu_seconds": 0.00001102827070063694,
+          "query_cpu_seconds": 1.8103541666666668e-6
+        }
+      },
+      {
+        "id": "custom-calibration-22",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 41984.0,
+          "update_cpu_seconds": 1.522690606060606e-6,
+          "merge_cpu_seconds": 0.00001896455838641189,
+          "query_cpu_seconds": 4.3753750000000004e-6
+        }
+      },
+      {
+        "id": "custom-calibration-23",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 43008.0,
+          "update_cpu_seconds": 1.2988381818181818e-6,
+          "merge_cpu_seconds": 0.00003382390021231422,
+          "query_cpu_seconds": 0.000010057791666666667
+        }
+      },
+      {
+        "id": "custom-calibration-24",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 7680.0,
+          "update_cpu_seconds": 9.41490606060606e-7,
+          "merge_cpu_seconds": 0.000010430451167728238,
+          "query_cpu_seconds": 1.7973333333333333e-6
+        }
+      },
+      {
+        "id": "custom-calibration-25",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 9.636409090909091e-7,
+          "merge_cpu_seconds": 0.000019599875796178346,
+          "query_cpu_seconds": 4.036229166666667e-6
+        }
+      },
+      {
+        "id": "custom-calibration-26",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 9216.0,
+          "update_cpu_seconds": 1.0056639393939393e-6,
+          "merge_cpu_seconds": 0.000036533558386411894,
+          "query_cpu_seconds": 0.000010088062500000002
+        }
+      },
+      {
+        "id": "custom-calibration-27",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 14848.0,
+          "update_cpu_seconds": 9.656321212121213e-7,
+          "merge_cpu_seconds": 0.000010797714437367304,
+          "query_cpu_seconds": 1.7931666666666666e-6
+        }
+      },
+      {
+        "id": "custom-calibration-28",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 15360.0,
+          "update_cpu_seconds": 9.966793939393939e-7,
+          "merge_cpu_seconds": 0.00001987038322717622,
+          "query_cpu_seconds": 4.1479375e-6
+        }
+      },
+      {
+        "id": "custom-calibration-29",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 16384.0,
+          "update_cpu_seconds": 1.0269681818181817e-6,
+          "merge_cpu_seconds": 0.000036841884288747345,
+          "query_cpu_seconds": 9.945479166666667e-6
+        }
+      },
+      {
+        "id": "custom-calibration-30",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 29184.0,
+          "update_cpu_seconds": 1.0287042424242423e-6,
+          "merge_cpu_seconds": 0.000011628898089171976,
+          "query_cpu_seconds": 1.8022500000000002e-6
+        }
+      },
+      {
+        "id": "custom-calibration-31",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 29696.0,
+          "update_cpu_seconds": 1.053902424242424e-6,
+          "merge_cpu_seconds": 0.000020796951167728238,
+          "query_cpu_seconds": 4.2038125e-6
+        }
+      },
+      {
+        "id": "custom-calibration-32",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 30720.0,
+          "update_cpu_seconds": 1.2513939393939395e-6,
+          "merge_cpu_seconds": 0.00003891228025477707,
+          "query_cpu_seconds": 0.000010974479166666667
+        }
+      },
+      {
+        "id": "custom-calibration-33",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 57856.0,
+          "update_cpu_seconds": 1.871588484848485e-6,
+          "merge_cpu_seconds": 0.000013382970276008493,
+          "query_cpu_seconds": 1.8285000000000002e-6
+        }
+      },
+      {
+        "id": "custom-calibration-34",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 58368.0,
+          "update_cpu_seconds": 1.7766866666666666e-6,
+          "merge_cpu_seconds": 0.000022200422505307854,
+          "query_cpu_seconds": 4.1665625e-6
+        }
+      },
+      {
+        "id": "custom-calibration-35",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 59392.0,
+          "update_cpu_seconds": 1.718662121212121e-6,
+          "merge_cpu_seconds": 0.000039140801486199574,
+          "query_cpu_seconds": 0.000010150291666666667
+        }
+      },
+      {
+        "id": "custom-calibration-36",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.4,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.4
+        },
+        "resources": {
+          "memory_bytes": 3584.0,
+          "update_cpu_seconds": 8.93431212121212e-7,
+          "merge_cpu_seconds": 9.470864118895966e-6,
+          "query_cpu_seconds": 1.8448958333333332e-6
+        }
+      },
+      {
+        "id": "custom-calibration-37",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.4,
+          "recall_loss_120": 0.30000000000000004,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 4096.0,
+          "update_cpu_seconds": 9.204654545454546e-7,
+          "merge_cpu_seconds": 0.000017932676220806795,
+          "query_cpu_seconds": 4.222875000000001e-6
+        }
+      },
+      {
+        "id": "custom-calibration-38",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.5,
+          "recall_loss_120": 0.30000000000000004,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.4
+        },
+        "resources": {
+          "memory_bytes": 5120.0,
+          "update_cpu_seconds": 9.573909090909092e-7,
+          "merge_cpu_seconds": 0.000034142592356687904,
+          "query_cpu_seconds": 0.000010108687500000001
+        }
+      },
+      {
+        "id": "custom-calibration-39",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 6656.0,
+          "update_cpu_seconds": 8.928227272727273e-7,
+          "merge_cpu_seconds": 9.57849787685775e-6,
+          "query_cpu_seconds": 1.8075416666666666e-6
+        }
+      },
+      {
+        "id": "custom-calibration-40",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 9.234857575757576e-7,
+          "merge_cpu_seconds": 0.00001808818683651805,
+          "query_cpu_seconds": 4.3021875e-6
+        }
+      },
+      {
+        "id": "custom-calibration-41",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 9.594215151515152e-7,
+          "merge_cpu_seconds": 0.000034075516985138,
+          "query_cpu_seconds": 9.960458333333334e-6
+        }
+      },
+      {
+        "id": "custom-calibration-42",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 12800.0,
+          "update_cpu_seconds": 9.163921212121212e-7,
+          "merge_cpu_seconds": 9.888665605095541e-6,
+          "query_cpu_seconds": 1.8171666666666667e-6
+        }
+      },
+      {
+        "id": "custom-calibration-43",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 13312.0,
+          "update_cpu_seconds": 9.436709090909092e-7,
+          "merge_cpu_seconds": 0.00001837109447983015,
+          "query_cpu_seconds": 4.350854166666667e-6
+        }
+      },
+      {
+        "id": "custom-calibration-44",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 14336.0,
+          "update_cpu_seconds": 9.794133333333334e-7,
+          "merge_cpu_seconds": 0.000034277215498938434,
+          "query_cpu_seconds": 0.0000100169375
+        }
+      },
+      {
+        "id": "custom-calibration-45",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 25088.0,
+          "update_cpu_seconds": 9.681754545454545e-7,
+          "merge_cpu_seconds": 0.000010540922505307857,
+          "query_cpu_seconds": 1.8187291666666666e-6
+        }
+      },
+      {
+        "id": "custom-calibration-46",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 25600.0,
+          "update_cpu_seconds": 9.898351515151516e-7,
+          "merge_cpu_seconds": 0.000018983330148619957,
+          "query_cpu_seconds": 4.282270833333334e-6
+        }
+      },
+      {
+        "id": "custom-calibration-47",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 26624.0,
+          "update_cpu_seconds": 1.048340606060606e-6,
+          "merge_cpu_seconds": 0.00003482467303609342,
+          "query_cpu_seconds": 0.000010062833333333333
+        }
+      },
+      {
+        "id": "custom-calibration-48",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.4
+        },
+        "resources": {
+          "memory_bytes": 5632.0,
+          "update_cpu_seconds": 1.0540145454545453e-6,
+          "merge_cpu_seconds": 0.000011153389596602971,
+          "query_cpu_seconds": 1.8388958333333334e-6
+        }
+      },
+      {
+        "id": "custom-calibration-49",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.4
+        },
+        "resources": {
+          "memory_bytes": 6144.0,
+          "update_cpu_seconds": 1.0745663636363637e-6,
+          "merge_cpu_seconds": 0.0000209695,
+          "query_cpu_seconds": 4.101708333333333e-6
+        }
+      },
+      {
+        "id": "custom-calibration-50",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 1.116320909090909e-6,
+          "merge_cpu_seconds": 0.00003952703078556263,
+          "query_cpu_seconds": 0.000010259812499999999
+        }
+      },
+      {
+        "id": "custom-calibration-51",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 10752.0,
+          "update_cpu_seconds": 1.0680866666666667e-6,
+          "merge_cpu_seconds": 0.000011311154989384288,
+          "query_cpu_seconds": 1.8045833333333336e-6
+        }
+      },
+      {
+        "id": "custom-calibration-52",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 11264.0,
+          "update_cpu_seconds": 1.0977172727272725e-6,
+          "merge_cpu_seconds": 0.0000210624076433121,
+          "query_cpu_seconds": 4.252458333333333e-6
+        }
+      },
+      {
+        "id": "custom-calibration-53",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 12288.0,
+          "update_cpu_seconds": 1.1420136363636363e-6,
+          "merge_cpu_seconds": 0.00003950588428874735,
+          "query_cpu_seconds": 0.000010019749999999998
+        }
+      },
+      {
+        "id": "custom-calibration-54",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 20992.0,
+          "update_cpu_seconds": 1.1175548484848484e-6,
+          "merge_cpu_seconds": 0.000011839337579617836,
+          "query_cpu_seconds": 1.8127291666666665e-6
+        }
+      },
+      {
+        "id": "custom-calibration-55",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 21504.0,
+          "update_cpu_seconds": 1.1269642424242422e-6,
+          "merge_cpu_seconds": 0.000021528983014862,
+          "query_cpu_seconds": 4.308145833333334e-6
+        }
+      },
+      {
+        "id": "custom-calibration-56",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 22528.0,
+          "update_cpu_seconds": 1.171838787878788e-6,
+          "merge_cpu_seconds": 0.00003989156900212315,
+          "query_cpu_seconds": 0.000010077375
+        }
+      },
+      {
+        "id": "custom-calibration-57",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 41472.0,
+          "update_cpu_seconds": 1.2487239393939393e-6,
+          "merge_cpu_seconds": 0.000012942667728237791,
+          "query_cpu_seconds": 1.8041250000000003e-6
+        }
+      },
+      {
+        "id": "custom-calibration-58",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 41984.0,
+          "update_cpu_seconds": 1.21388e-6,
+          "merge_cpu_seconds": 0.000022619678343949044,
+          "query_cpu_seconds": 4.251937499999999e-6
+        }
+      },
+      {
+        "id": "custom-calibration-59",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 43008.0,
+          "update_cpu_seconds": 1.2728421212121213e-6,
+          "merge_cpu_seconds": 0.000040958522292993634,
+          "query_cpu_seconds": 0.0000102433125
+        }
+      },
+      {
+        "id": "custom-calibration-60",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 7680.0,
+          "update_cpu_seconds": 1.2457106060606062e-6,
+          "merge_cpu_seconds": 0.000012814417197452228,
+          "query_cpu_seconds": 1.8560208333333333e-6
+        }
+      },
+      {
+        "id": "custom-calibration-61",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 1.2575081818181817e-6,
+          "merge_cpu_seconds": 0.00002394900106157113,
+          "query_cpu_seconds": 4.181833333333334e-6
+        }
+      },
+      {
+        "id": "custom-calibration-62",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 9216.0,
+          "update_cpu_seconds": 1.2963996969696968e-6,
+          "merge_cpu_seconds": 0.00004530632377919321,
+          "query_cpu_seconds": 0.000010332208333333332
+        }
+      },
+      {
+        "id": "custom-calibration-63",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 14848.0,
+          "update_cpu_seconds": 1.257201212121212e-6,
+          "merge_cpu_seconds": 0.000013139746284501064,
+          "query_cpu_seconds": 1.8092499999999999e-6
+        }
+      },
+      {
+        "id": "custom-calibration-64",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 15360.0,
+          "update_cpu_seconds": 1.2824081818181819e-6,
+          "merge_cpu_seconds": 0.000024062716560509555,
+          "query_cpu_seconds": 4.206416666666667e-6
+        }
+      },
+      {
+        "id": "custom-calibration-65",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 16384.0,
+          "update_cpu_seconds": 1.3243363636363634e-6,
+          "merge_cpu_seconds": 0.00004516064968152866,
+          "query_cpu_seconds": 0.000010169916666666667
+        }
+      },
+      {
+        "id": "custom-calibration-66",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 29184.0,
+          "update_cpu_seconds": 1.34377e-6,
+          "merge_cpu_seconds": 0.0000138113949044586,
+          "query_cpu_seconds": 1.839125e-6
+        }
+      },
+      {
+        "id": "custom-calibration-67",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 29696.0,
+          "update_cpu_seconds": 1.3313360606060606e-6,
+          "merge_cpu_seconds": 0.000024737211252653927,
+          "query_cpu_seconds": 4.150374999999999e-6
+        }
+      },
+      {
+        "id": "custom-calibration-68",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 30720.0,
+          "update_cpu_seconds": 1.3723542424242422e-6,
+          "merge_cpu_seconds": 0.00005087939596602972,
+          "query_cpu_seconds": 0.000011095666666666664
+        }
+      },
+      {
+        "id": "custom-calibration-69",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 57856.0,
+          "update_cpu_seconds": 2.4592575757575755e-6,
+          "merge_cpu_seconds": 0.000015480243099787687,
+          "query_cpu_seconds": 1.8432291666666665e-6
+        }
+      },
+      {
+        "id": "custom-calibration-70",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 58368.0,
+          "update_cpu_seconds": 2.200552424242424e-6,
+          "merge_cpu_seconds": 0.000026211785562632698,
+          "query_cpu_seconds": 4.170333333333333e-6
+        }
+      },
+      {
+        "id": "custom-calibration-71",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 59392.0,
+          "update_cpu_seconds": 2.2787236363636364e-6,
+          "merge_cpu_seconds": 0.000046563269639065824,
+          "query_cpu_seconds": 0.0000101925625
+        }
+      }
+    ]
+  },
+  "shapes": {
+    "custom-calibration": {
+      "cardinality": 479,
+      "events_per_pane": 9.166666666666666,
+      "rank_mass": [
+        0.03090909090909091,
+        0.14545454545454545,
+        0.5436363636363636,
+        1.0
+      ]
+    }
+  },
+  "generation_seconds": 1.887113613,
+  "provenance": {
+    "args": {
+      "backend_revision": "1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+      "build_erp": true,
+      "calibration_panes": 120,
+      "cardinality": 683,
+      "distribution": "Zipf",
+      "erp_catalog": null,
+      "input_tsv": "tools/autosketch-comparison/data/topk-dashboard-v2/google-replay.tsv",
+      "memory_budget_bytes": 131072,
+      "min_recall_at_10": 0.8,
+      "output": "tools/autosketch-comparison/data/topk-dashboard-v2/google-profile.json",
+      "panes": 220,
+      "refresh_seconds": 30,
+      "refreshes": 100,
+      "seed": 42,
+      "total_events": 1971,
+      "total_memory_budget_bytes": 16777216,
+      "trials": 3,
+      "zipf_exponent": 1.1
+    },
+    "held_out_used": false,
+    "scope": "window-conditioned extension of sketch-bench ERP v1; generated by backend adapter",
+    "timing": "wall seconds per operation, not hardware CPU counters"
+  }
+}

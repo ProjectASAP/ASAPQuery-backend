@@ -349,5 +349,18 @@ mod tests {
         );
         a.total_memory_budget_bytes = bytes(large) * 120 - 1;
         assert!(select(&catalog, &data, &a, true).is_err());
+        a.total_memory_budget_bytes = bytes(large) * 120;
+        let out_of_distribution = vec![(0..1000).collect::<Vec<_>>(); 120];
+        assert!(select(&catalog, &out_of_distribution, &a, true).is_err());
+        catalog
+            .shapes
+            .insert("duplicate".into(), catalog.shapes["test"].clone());
+        let mut duplicate = record("duplicate", large, 0.);
+        duplicate.distribution = serde_json::json!({"profile":"duplicate"});
+        catalog.artifact.records.push(duplicate);
+        assert!(
+            select(&catalog, &data, &a, true).is_err(),
+            "equally close profiles must be rejected as ambiguous"
+        );
     }
 }
