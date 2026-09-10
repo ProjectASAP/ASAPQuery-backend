@@ -20,6 +20,12 @@ class ContractTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    root=pathlib.Path(d); script=root/'arm.py'; script.write_text("import json; print(json.dumps({'contract':{},'selected_plan':{},'metrics':{'state_bytes':0,'max_error':0}}))")
    with self.assertRaisesRegex(ValueError,'identical evaluation contract'): R.run_arm({'name':'exact','command':['python3',str(script)]},{'x':1},[],root)
+ def test_failed_arm_keeps_resources_and_stderr(self):
+  with tempfile.TemporaryDirectory() as d:
+   row=R.run_arm({'name':'planner_erp','command':['python3','-c','import sys; print("bad", file=sys.stderr); sys.exit(3)']},
+                 {'memory_budget_bytes':1,'accuracy':{'metric':'max_error','upper_bound':0}},[],pathlib.Path(d))
+   self.assertEqual((row['status'],row['exit_code']),('failed',3))
+   self.assertIn('bad',row['stderr']); self.assertIn('peak_rss_kb',row['measured_resources'])
  def test_rejects_out_of_space_over_budget_or_inaccurate_selection(self):
   contract={'memory_budget_bytes':100,'accuracy':{'metric':'max_error','upper_bound':0.01}}
   base={'contract':contract,'selected_plan':{},'selected_candidates':[{'id':'a'}],
