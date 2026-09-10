@@ -28,7 +28,10 @@ def main():
             fields = line.rsplit(None, 2)
             if len(fields) != 3 or fields[0] != args.series:
                 continue
-            timestamp_ms = int(Decimal(fields[2]) * 1000)
+            timestamp = Decimal(fields[2]) * 1000
+            if timestamp != timestamp.to_integral_value():
+                raise ValueError("the ClickHouse probe requires integral millisecond timestamps")
+            timestamp_ms = int(timestamp)
             value = float(fields[1])
             output.write(json.dumps({"metric": metric, "labels": args.series,
                                      "ts_ms": timestamp_ms, "value": value},
