@@ -19,5 +19,15 @@ class ContractTests(unittest.TestCase):
  def test_rejects_arm_contract_drift(self):
   with tempfile.TemporaryDirectory() as d:
    root=pathlib.Path(d); script=root/'arm.py'; script.write_text("import json; print(json.dumps({'contract':{},'selected_plan':{},'metrics':{'state_bytes':0,'max_error':0}}))")
-   with self.assertRaisesRegex(ValueError,'identical evaluation contract'): R.run_arm({'name':'exact','command':['python3',str(script)]},{'x':1},root)
+   with self.assertRaisesRegex(ValueError,'identical evaluation contract'): R.run_arm({'name':'exact','command':['python3',str(script)]},{'x':1},[],root)
+ def test_rejects_out_of_space_over_budget_or_inaccurate_selection(self):
+  contract={'memory_budget_bytes':100,'accuracy':{'metric':'max_error','upper_bound':0.01}}
+  base={'contract':contract,'selected_plan':{},'selected_candidates':[{'id':'a'}],
+        'metrics':{'state_bytes':10,'max_error':0.0}}
+  R.validate_result('planner_erp',base,contract,[{'id':'a'}])
+  for field,value,pattern in [('candidate',None,'outside'),('state_bytes',101,'memory'),('max_error',0.02,'accuracy')]:
+   row=json.loads(json.dumps(base))
+   if field=='candidate': row['selected_candidates']=[{'id':'b'}]
+   else: row['metrics'][field]=value
+   with self.assertRaisesRegex(ValueError,pattern): R.validate_result('planner_erp',row,contract,[{'id':'a'}])
 if __name__=='__main__': unittest.main()

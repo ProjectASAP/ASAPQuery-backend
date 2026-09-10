@@ -11,8 +11,10 @@
 The manifest pins a dataset SHA-256 and one candidate space, memory budget,
 accuracy requirement, and window workload. Each arm runs in a separate process.
 The runner measures wall time, user/system CPU, and peak RSS with GNU `time`;
-the arm reports its selected plan, retained state bytes, measured error, and any
-additional metrics. A successful arm must echo the exact contract from
+the arm reports its selected plan, selected candidate records, retained state
+bytes, measured error, and any additional metrics. The runner checks that every
+selected candidate belongs to the common space and that non-exact arms meet the
+total memory and accuracy bounds. A successful arm must echo the exact contract from
 `ASAP_FIGURE1_CONTRACT_JSON`; the dataset path is supplied in
 `ASAP_FIGURE1_DATASET`. Contract drift aborts the experiment rather than
 producing a comparison.
@@ -30,6 +32,7 @@ Each command must print one JSON object:
 {
   "contract": {"the exact object supplied in ASAP_FIGURE1_CONTRACT_JSON": true},
   "selected_plan": {"family": "cms", "width": 1024, "depth": 5},
+  "selected_candidates": [{"family": "cms", "width": 1024, "depth": 5}],
   "metrics": {"state_bytes": 40960, "max_error": 0.007},
   "provenance": {"revision": "..."}
 }
