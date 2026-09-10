@@ -376,26 +376,6 @@ impl BackendClient {
         storage_routing: Option<serde_json::Value>,
         adaptation_evidence: &[crate::physical::compiler::RuntimeAdaptationEvidence],
     ) -> std::result::Result<(), BackendPostError> {
-        self.post_physical_plan_with_sidecar(
-            precompute_plan,
-            transmission_plan,
-            query_plan,
-            storage_routing,
-            adaptation_evidence,
-            None,
-        )
-        .await
-    }
-
-    pub async fn post_physical_plan_with_sidecar(
-        &self,
-        precompute_plan: &crate::physical::compiler::PrecomputePlan,
-        transmission_plan: &crate::physical::compiler::TransmissionPlan,
-        query_plan: &crate::query_plan::QueryPlan,
-        storage_routing: Option<serde_json::Value>,
-        adaptation_evidence: &[crate::physical::compiler::RuntimeAdaptationEvidence],
-        clickhouse_sql: Option<serde_json::Value>,
-    ) -> std::result::Result<(), BackendPostError> {
         // Compatibility replanner has no Planner-selected query/collector DAG.
         // Still publish the actual catalog and bind every provided projection.
         let catalog = crate::physical::summary_catalog::SummaryCatalog::from_materializations(
@@ -427,7 +407,6 @@ impl BackendClient {
             "precompute_plan": precompute_plan,
             "transmission_plan": transmission_plan,
             "query_plan": query_plan,
-            "clickhouse_sql": clickhouse_sql,
             "storage_routing": storage_routing,
             "adaptation_evidence": adaptation_evidence,
             }))

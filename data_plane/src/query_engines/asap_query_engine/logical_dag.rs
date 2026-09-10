@@ -859,6 +859,7 @@ mod topk_tests {
             language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "summary-rate-topk".into(),
             canonical_query: "topk(2, rate(requests_total[5m]))".into(),
+            fixed_evaluation: None,
             root,
             nodes: BTreeMap::from([
                 (
@@ -987,6 +988,7 @@ mod topk_tests {
             language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "candidate-topk".into(),
             canonical_query: "topk(1, rate(requests_total[5m]))".into(),
+            fixed_evaluation: None,
             root,
             nodes: BTreeMap::from([
                 (

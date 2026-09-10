@@ -143,6 +143,7 @@ mod tests {
             language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "up".into(),
+            fixed_evaluation: None,
             root,
             nodes,
             instant: InstantExecution {

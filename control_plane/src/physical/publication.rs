@@ -12,11 +12,6 @@ pub struct PhysicalPlanPublication {
     pub collector_plans: Vec<CollectorPlan>,
     pub transmission_plan: TransmissionPlan,
     pub query_plan: QueryPlan,
-    /// Optional language-specific catalog installed with this physical snapshot.
-    /// It is deliberately opaque here so SQL metadata cannot change SDS or
-    /// PromQL plan semantics.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clickhouse_sql: Option<serde_json::Value>,
 }
 impl PhysicalPlanPublication {
     /// Validate every plan against the shared catalog snapshot.
@@ -100,7 +95,6 @@ impl PhysicalPlan {
             collector_plans: self.collector_plans.clone(),
             transmission_plan: self.transmission_plan.clone(),
             query_plan: self.query_plan.clone(),
-            clickhouse_sql: None,
         };
         artifact.validate()?;
         Ok(artifact)

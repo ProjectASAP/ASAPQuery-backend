@@ -803,7 +803,6 @@ mod tests {
             },
             runtime_config: Arc::new(streaming),
             query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
-            clickhouse_sql: None,
             storage_routing: Arc::new(BackendStorageRouting::empty()),
         };
         HotReloadStreamingConfig::from_active(HotReloadActivePhysicalPlan::new(active))

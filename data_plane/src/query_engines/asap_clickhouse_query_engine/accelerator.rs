@@ -1,25 +1,16 @@
 //! Catalog-backed ClickHouse acceleration boundary.
 
-use std::{
-    collections::{BTreeSet, HashMap},
-    sync::{Arc, Mutex, RwLock},
-};
-
-use asap_types::{summary_catalog::SummaryCatalog, PolicyFingerprint};
 use async_trait::async_trait;
 use axum::{
     body::Bytes,
     http::{HeaderMap, HeaderValue, StatusCode},
 };
-use control_plane::query_plan::ExecutableQueryPlan;
+use std::sync::Arc;
 
 use super::{
     clickhouse_result_adapter::ClickHouseFormat,
     execution::{execute_sql_dag, ClickHouseDagFallback, ClickHouseDagOutcome},
     fallback::ClickHouseRawResponse,
-    plan_catalog::{
-        SdsDescriptorReferences, SqlPlanCatalog, SqlPlanCatalogGeneration, SqlPlanEntry,
-    },
     request::ClickHouseQueryRequest,
     server::{
         ClickHouseAccelerationFallback, ClickHouseAccelerationOutcome, ClickHouseAccelerator,
@@ -28,86 +19,7 @@ use super::{
 };
 use crate::storage_engines::sketch_db::index::SketchStore;
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct SqlRuntimePlan {
-    pub start_ms: u64,
-    pub end_ms: u64,
-    pub cumulative: bool,
-    pub materializations: BTreeSet<PolicyFingerprint>,
-    /// Control-plane compiled and materialization-bound executable DAG.
-    pub executable: ExecutableQueryPlan,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct ClickHousePublishedPlan {
-    pub sql: String,
-    pub runtime: SqlRuntimePlan,
-    pub descriptors: SdsDescriptorReferences,
-}
-
-/// Independently published ClickHouse planning bundle. SDS remains the
-/// descriptor authority; SQL DAG metadata lives in this separate catalog.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct ClickHousePlanBundle {
-    pub sds: SummaryCatalog,
-    pub tables: HashMap<String, planner_types::pre_asap::Schema>,
-    pub accuracy: planner_types::types::AccuracyTarget,
-    pub plans: Vec<ClickHousePublishedPlan>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ClickHouseActiveGeneration {
-    pub catalog: Arc<SqlPlanCatalogGeneration<SqlRuntimePlan>>,
-    pub binder: ClickHouseSqlBinder,
-}
-
-pub fn build_active_generation(
-    bundle: ClickHousePlanBundle,
-    physical_sds: &SummaryCatalog,
-) -> Result<ClickHouseActiveGeneration, super::plan_catalog::SqlPlanCatalogError> {
-    if bundle
-        .sds
-        .reference()
-        .map_err(|e| super::plan_catalog::SqlPlanCatalogError::InvalidSds(e.to_string()))?
-        != physical_sds
-            .reference()
-            .map_err(|e| super::plan_catalog::SqlPlanCatalogError::InvalidSds(e.to_string()))?
-    {
-        return Err(super::plan_catalog::SqlPlanCatalogError::InvalidSds(
-            "SQL sidecar SDS differs from physical publication SDS".into(),
-        ));
-    }
-    for plan in &bundle.plans {
-        crate::query_engines::asap_query_engine::catalog_resolver::validate_payload(
-            Some(physical_sds),
-            &plan.runtime.executable,
-            physical_sds.plan_id,
-            physical_sds.plan_version,
-        )
-        .map_err(|e| super::plan_catalog::SqlPlanCatalogError::InvalidSds(e.to_string()))?;
-    }
-    let entries = bundle.plans.into_iter().map(|plan| SqlPlanEntry {
-        sql_template: plan.sql,
-        plan: plan.runtime,
-        descriptors: plan.descriptors,
-    });
-    let generation = SqlPlanCatalogGeneration::build(physical_sds, entries)?;
-    Ok(ClickHouseActiveGeneration {
-        catalog: Arc::new(generation),
-        binder: ClickHouseSqlBinder::new(
-            control_plane::clickhouse::ClickHouseSqlCatalog {
-                tables: bundle.tables,
-            },
-            bundle.accuracy,
-        ),
-    })
-}
-
 pub struct CatalogClickHouseAccelerator {
-    pub catalog: Arc<SqlPlanCatalog<SqlRuntimePlan>>,
-    binder: RwLock<Option<ClickHouseSqlBinder>>,
-    staged_binder: Mutex<Option<(u64, u64, ClickHouseSqlBinder)>>,
-    publication: RwLock<()>,
     pub store: Arc<SketchStore>,
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
 }
@@ -115,10 +27,6 @@ pub struct CatalogClickHouseAccelerator {
 impl CatalogClickHouseAccelerator {
     pub fn empty(store: Arc<SketchStore>) -> Self {
         Self {
-            catalog: Arc::new(SqlPlanCatalog::default()),
-            binder: RwLock::new(None),
-            staged_binder: Mutex::new(None),
-            publication: RwLock::new(()),
             store,
             active_physical_plan: None,
         }
@@ -131,78 +39,6 @@ impl CatalogClickHouseAccelerator {
         let mut accelerator = Self::empty(store);
         accelerator.active_physical_plan = Some(active);
         accelerator
-    }
-
-    pub fn from_bundle(
-        bundle: ClickHousePlanBundle,
-        store: Arc<SketchStore>,
-    ) -> Result<Self, super::plan_catalog::SqlPlanCatalogError> {
-        let accelerator = Self::empty(store);
-        let staged = accelerator.stage_bundle(bundle)?;
-        accelerator.activate(staged.plan_id, staged.plan_version)?;
-        Ok(accelerator)
-    }
-
-    pub fn stage_bundle(
-        &self,
-        bundle: ClickHousePlanBundle,
-    ) -> Result<super::plan_catalog::SqlPlanCatalogAck, super::plan_catalog::SqlPlanCatalogError>
-    {
-        let _publication = self.publication.write().unwrap();
-        for plan in &bundle.plans {
-            crate::query_engines::asap_query_engine::catalog_resolver::validate_payload(
-                Some(&bundle.sds),
-                &plan.runtime.executable,
-                bundle.sds.plan_id,
-                bundle.sds.plan_version,
-            )
-            .map_err(|error| {
-                super::plan_catalog::SqlPlanCatalogError::InvalidSds(error.to_string())
-            })?;
-        }
-        let entries = bundle.plans.into_iter().map(|plan| SqlPlanEntry {
-            sql_template: plan.sql,
-            plan: plan.runtime,
-            descriptors: plan.descriptors,
-        });
-        let generation = SqlPlanCatalogGeneration::build(&bundle.sds, entries)?;
-        let plan_id = generation.sds.plan_id;
-        let plan_version = generation.sds.plan_version;
-        let binder = ClickHouseSqlBinder::new(
-            control_plane::clickhouse::ClickHouseSqlCatalog {
-                tables: bundle.tables,
-            },
-            bundle.accuracy,
-        );
-        let ack = self.catalog.stage(generation)?;
-        *self.staged_binder.lock().unwrap() = Some((plan_id, plan_version, binder));
-        Ok(ack)
-    }
-
-    pub fn activate(
-        &self,
-        plan_id: u64,
-        plan_version: u64,
-    ) -> Result<super::plan_catalog::SqlPlanCatalogAck, super::plan_catalog::SqlPlanCatalogError>
-    {
-        let _publication = self.publication.write().unwrap();
-        let mut staged = self.staged_binder.lock().unwrap();
-        let Some((staged_id, staged_version, _)) = staged.as_ref() else {
-            return Err(super::plan_catalog::SqlPlanCatalogError::NotStaged {
-                plan_id,
-                plan_version,
-            });
-        };
-        if (*staged_id, *staged_version) != (plan_id, plan_version) {
-            return Err(super::plan_catalog::SqlPlanCatalogError::NotStaged {
-                plan_id,
-                plan_version,
-            });
-        }
-        let ack = self.catalog.activate(plan_id, plan_version)?;
-        let (_, _, binder) = staged.take().expect("staged binder checked above");
-        *self.binder.write().unwrap() = Some(binder);
-        Ok(ack)
     }
 }
 
@@ -223,17 +59,22 @@ fn requested_format(request: &ClickHouseQueryRequest) -> Result<ClickHouseFormat
 #[async_trait]
 impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
     async fn execute(&self, request: &ClickHouseQueryRequest) -> ClickHouseAccelerationOutcome {
-        let physical = self.active_physical_plan.as_ref().map(|h| h.snapshot());
-        let sidecar = physical.as_ref().and_then(|p| p.clickhouse_sql.clone());
-        let binder = sidecar
-            .as_ref()
-            .map(|s| s.binder.clone())
-            .or_else(|| self.binder.read().unwrap().clone());
-        let Some(binder) = binder else {
+        let Some(physical) = self.active_physical_plan.as_ref().map(|h| h.snapshot()) else {
             return ClickHouseAccelerationOutcome::Fallback(
                 ClickHouseAccelerationFallback::CatalogMiss,
             );
         };
+        let Some(context) = physical.query_plan.clickhouse_context.as_ref() else {
+            return ClickHouseAccelerationOutcome::Fallback(
+                ClickHouseAccelerationFallback::CatalogMiss,
+            );
+        };
+        let binder = ClickHouseSqlBinder::new(
+            control_plane::clickhouse::ClickHouseSqlCatalog {
+                tables: context.tables.clone(),
+            },
+            context.accuracy.clone(),
+        );
         let canonical_sql = match binder.canonical_identity(&request.sql).await {
             Ok(canonical) => canonical,
             Err(error) => {
@@ -242,16 +83,7 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                 )
             }
         };
-        let (entry, generation) = if let Some(sidecar) = sidecar {
-            (
-                sidecar.catalog.lookup(&canonical_sql),
-                Some(sidecar.catalog.clone()),
-            )
-        } else {
-            let _publication = self.publication.read().unwrap();
-            (self.catalog.lookup(&canonical_sql), self.catalog.active())
-        };
-        let Some(entry) = entry else {
+        let Ok(entry) = physical.query_plan.lookup_clickhouse(&canonical_sql) else {
             return ClickHouseAccelerationOutcome::Fallback(
                 ClickHouseAccelerationFallback::CatalogMiss,
             );
@@ -264,18 +96,25 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                 )
             }
         };
-        let Some(generation) = generation else {
+        let Some(catalog) = physical.summary_catalog.as_ref() else {
             return ClickHouseAccelerationOutcome::Fallback(
                 ClickHouseAccelerationFallback::CatalogMiss,
             );
         };
+        let Some(range) = entry.fixed_evaluation else {
+            return ClickHouseAccelerationOutcome::Fallback(
+                ClickHouseAccelerationFallback::Execution(
+                    "ClickHouse plan is missing its fixed evaluation range".into(),
+                ),
+            );
+        };
         match execute_sql_dag(
             self.store.as_ref(),
-            &entry.plan.executable,
-            generation.catalog.as_ref(),
-            entry.plan.start_ms,
-            entry.plan.end_ms,
-            entry.plan.cumulative,
+            &entry.executable(),
+            catalog.as_ref(),
+            range.start_ms,
+            range.end_ms,
+            range.cumulative,
         ) {
             ClickHouseDagOutcome::Accelerated(result) => match result.encode(format) {
                 Ok(body) => {
@@ -320,11 +159,13 @@ mod tests {
         precompute_engine::operators::SumAccumulator,
         storage_engines::sketch_db::index::{AggKind, Capability, SketchInstanceMetadata},
     };
+    use asap_types::summary_catalog::SummaryCatalog;
     use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
     use axum::http::Method;
     use control_plane::query_plan::{
-        ExactReadout, FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping,
-        QueryNodeId, QueryPlanNode,
+        ClickHousePlanningContext, ExactReadout, ExecutableQueryPlan, FallbackPolicy,
+        FixedEvaluationRange, InstantExecution, MaterializationBinding, PhysicalGrouping,
+        QueryLanguage, QueryNodeId, QueryPlan, QueryPlanEntry, QueryPlanNode,
     };
     use planner_types::{
         post_asap::{SummaryFamilyType, SummaryField, SummarySchema, ValueOperation},
@@ -333,7 +174,10 @@ mod tests {
             QueryExpr, ScalarValue, Schema, SortKey,
         },
     };
-    use std::rc::Rc;
+    use std::{
+        collections::{BTreeMap, BTreeSet, HashMap},
+        rc::Rc,
+    };
 
     fn relation_schema(names: &[(&str, DataType)]) -> SummarySchema {
         SummarySchema {
@@ -360,7 +204,7 @@ mod tests {
         store: Arc<SketchStore>,
         seed: bool,
     ) -> (CatalogClickHouseAccelerator, ClickHouseQueryRequest) {
-        let config = PrecomputeMaterialization::new(
+        let mut config = PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
             Default::default(),
@@ -377,7 +221,8 @@ mod tests {
             None,
             None,
         );
-        let sds = SummaryCatalog::from_materializations(41, 1, &[config]).unwrap();
+        config.pane_origin_ms = Some(0);
+        let sds = SummaryCatalog::from_materializations(41, 1, &[config.clone()]).unwrap();
         let materialization = *sds.materializations.keys().next().unwrap();
         let read = QueryNodeId(0);
         let readout = QueryNodeId(1);
@@ -402,6 +247,7 @@ mod tests {
                         binding: MaterializationBinding {
                             materialization,
                             output_grouping: PhysicalGrouping::Reduce(Vec::new()),
+                            item_labels: Vec::new(),
                             window_ms: 1_000,
                             pane_origin_ms: Some(0),
                             readout_lookback_ms: None,
@@ -493,10 +339,6 @@ mod tests {
             },
             fallback: FallbackPolicy::ExactBackend,
         };
-        let descriptors = SdsDescriptorReferences {
-            summaries: sds.summary_descriptors.keys().cloned().collect(),
-            data: sds.data_descriptors.keys().cloned().collect(),
-        };
         let table_schema = Schema::with_time_index(
             vec![
                 Column::new("timestamp", DataType::Timestamp, false),
@@ -515,23 +357,32 @@ mod tests {
         )
         .await
         .unwrap();
-        let bundle = ClickHousePlanBundle {
-            sds: sds.clone(),
-            tables,
-            accuracy: planner_types::types::AccuracyTarget::Exact,
-            plans: vec![ClickHousePublishedPlan {
-                sql: canonical_sql,
-                runtime: SqlRuntimePlan {
-                    start_ms: 0,
-                    end_ms,
-                    cumulative: true,
-                    materializations: BTreeSet::from([materialization.fingerprint()]),
-                    executable,
-                },
-                descriptors,
-            }],
+        let entry = QueryPlanEntry {
+            query_id: "SELECT sum(value) FROM requests".into(),
+            canonical_query: canonical_sql.clone(),
+            language: QueryLanguage::ClickHouseSql,
+            fixed_evaluation: Some(FixedEvaluationRange {
+                start_ms: 0,
+                end_ms,
+                cumulative: true,
+            }),
+            root: executable.root,
+            nodes: executable.nodes,
+            instant: executable.instant,
+            fallback: executable.fallback,
         };
-        store.install_summary_catalog(Arc::new(sds)).unwrap();
+        let query_plan = QueryPlan {
+            plan_id: 41,
+            plan_version: 1,
+            clickhouse_context: Some(ClickHousePlanningContext {
+                tables,
+                accuracy: planner_types::types::AccuracyTarget::Exact,
+            }),
+            entries: BTreeMap::from([(format!("clickhouse:{canonical_sql}"), entry)]),
+        };
+        store
+            .install_summary_catalog(Arc::new(sds.clone()))
+            .unwrap();
         store.register(SketchInstanceMetadata {
             sid: 7,
             metric_name: "requests".into(),
@@ -562,7 +413,47 @@ mod tests {
                 Box::new(SumAccumulator::with_sum(3.0)),
             );
         }
-        let accelerator = CatalogClickHouseAccelerator::from_bundle(bundle, store).unwrap();
+        let envelope = control_plane::physical::compiler::PlanEnvelope {
+            plan_id: 41,
+            plan_version: 1,
+            generated_at_unix_ms: 0,
+            activation_unix_ms: 0,
+            expiry_unix_ms: None,
+            backend_compat: control_plane::physical::compiler::BACKEND_COMPAT.into(),
+            planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
+            capability_snapshot_id: "clickhouse-test".into(),
+        };
+        let mut precompute = control_plane::physical::compiler::PrecomputePlan::build(
+            envelope.clone(),
+            vec![config],
+            &["fixture".into()],
+        )
+        .unwrap();
+        precompute.summary_catalog = Some(sds.reference().unwrap());
+        let mut transmission = control_plane::physical::compiler::TransmissionPlan::build(
+            envelope.clone(),
+            &precompute,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        transmission.summary_catalog = Some(sds.reference().unwrap());
+        let active = crate::drivers::query::servers::http::build_active_physical_plan(
+            crate::drivers::query::servers::http::PhysicalPlanInstallRequest {
+                summary_catalog: sds,
+                collector_plans: vec![],
+                precompute_plan: precompute,
+                transmission_plan: transmission,
+                query_plan,
+                storage_routing: None,
+                adaptation_evidence: vec![],
+            },
+            Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
+        )
+        .unwrap();
+        let accelerator = CatalogClickHouseAccelerator::with_active_physical_plan(
+            store,
+            crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active),
+        );
         let request = ClickHouseQueryRequest {
             method: Method::GET,
             sql: "SELECT sum(value) FROM requests".into(),

@@ -110,15 +110,6 @@ struct Args {
     #[arg(long, env = "ASAP_CLICKHOUSE_DATABASE", default_value = "default")]
     clickhouse_database: String,
 
-    /// JSON bundle containing the independently published SQL plan catalog,
-    /// its SDS snapshot reference, and ClickHouse table schemas.
-    #[arg(long, env = "ASAP_CLICKHOUSE_PLAN_BUNDLE")]
-    clickhouse_plan_bundle: Option<String>,
-
-    /// Bearer token required by ClickHouse SQL plan stage/activate endpoints.
-    #[arg(long, env = "ASAP_CLICKHOUSE_PLAN_TOKEN")]
-    clickhouse_plan_token: Option<String>,
-
     /// Enable ClickHouse as a source for queued backfill jobs whose source URL
     /// is `clickhouse://configured`.
     #[arg(long, env = "ASAP_CLICKHOUSE_BACKFILL_TABLE")]
@@ -576,7 +567,6 @@ async fn main() -> Result<()> {
                 precompute_plan: plan.precompute_plan,
                 transmission_plan: plan.transmission_plan,
                 query_plan: plan.query_plan,
-                clickhouse_sql: None,
                 storage_routing: None,
                 adaptation_evidence: Vec::new(),
             },
@@ -790,7 +780,6 @@ async fn main() -> Result<()> {
             transmission_plan: initial_transmission_plan,
             runtime_config: streaming_config.clone(),
             query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
-            clickhouse_sql: None,
             storage_routing: Arc::new(
                 data_plane::storage_engines::types::BackendStorageRouting::empty(),
             ),
@@ -1179,7 +1168,6 @@ async fn main() -> Result<()> {
             transmission_plan: current.transmission_plan.clone(),
             runtime_config: current.runtime_config.clone(),
             query_plan: current.query_plan.clone(),
-            clickhouse_sql: current.clickhouse_sql.clone(),
             storage_routing: Arc::new(bootstrap_routing),
         });
     }
@@ -1402,13 +1390,6 @@ async fn main() -> Result<()> {
                 active_physical_plan.clone(),
             ),
         );
-        if let Some(path) = args.clickhouse_plan_bundle.as_ref() {
-            let bytes = fs::read(path)?;
-            let bundle: data_plane::query_engines::asap_clickhouse_query_engine::accelerator::ClickHousePlanBundle =
-            serde_json::from_slice(&bytes)?;
-            let staged = accelerator.stage_bundle(bundle)?;
-            accelerator.activate(staged.plan_id, staged.plan_version)?;
-        }
         Some(accelerator)
     } else {
         None

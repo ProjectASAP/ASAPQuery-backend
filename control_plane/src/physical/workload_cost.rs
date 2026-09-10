@@ -119,7 +119,7 @@ pub fn manifest(
         {
             return Err(invalid("mixed horizons or unknown recurrence"));
         }
-        let canonical = crate::query_plan::canonical_promql(&query.query_string)?;
+        let canonical = crate::query_plan::canonical_query(&query.query_string)?;
         if workload
             .insert(
                 query.query_id.clone(),

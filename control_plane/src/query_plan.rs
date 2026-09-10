@@ -22,7 +22,24 @@ use asap_types::{sds::SummaryDefinitionId, PolicyFingerprint};
 pub struct QueryPlan {
     pub plan_id: u64,
     pub plan_version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clickhouse_context: Option<ClickHousePlanningContext>,
     pub entries: BTreeMap<String, QueryPlanEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClickHousePlanningContext {
+    pub tables: std::collections::HashMap<String, planner_types::pre_asap::Schema>,
+    pub accuracy: planner_types::types::AccuracyTarget,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FixedEvaluationRange {
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub cumulative: bool,
 }
 
 impl QueryPlan {
@@ -30,6 +47,7 @@ impl QueryPlan {
         Self {
             plan_id: 0,
             plan_version: 0,
+            clickhouse_context: None,
             entries: BTreeMap::new(),
         }
     }
@@ -48,6 +66,10 @@ impl QueryPlan {
             .get(identity)
             .filter(|entry| entry.language == language)
             .ok_or_else(|| QueryPlanError::QueryNotPlanned(identity.into()))
+    }
+
+    pub fn lookup_clickhouse(&self, canonical_sql: &str) -> Result<&QueryPlanEntry, QueryPlanError> {
+        self.lookup_canonical(QueryLanguage::ClickHouseSql, canonical_sql)
     }
 
     /// Validate semantic bindings against the authoritative snapshot before use.
@@ -136,6 +158,32 @@ impl QueryPlan {
                     entry.canonical_query
                 )));
             }
+            match entry.language {
+                QueryLanguage::PromQl | QueryLanguage::MetricsQl
+                    if entry.fixed_evaluation.is_some() => {
+                    return Err(QueryPlanError::Invalid(
+                        "PromQL query entry carries a ClickHouse fixed evaluation range".into(),
+                    ));
+                }
+                QueryLanguage::ClickHouseSql => {
+                    if self.clickhouse_context.is_none() {
+                        return Err(QueryPlanError::Invalid(
+                            "ClickHouse query entry has no planning context".into(),
+                        ));
+                    }
+                    let Some(range) = entry.fixed_evaluation else {
+                        return Err(QueryPlanError::Invalid(
+                            "ClickHouse query entry has no fixed evaluation range".into(),
+                        ));
+                    };
+                    if range.end_ms <= range.start_ms {
+                        return Err(QueryPlanError::Invalid(
+                            "ClickHouse query entry has an empty evaluation range".into(),
+                        ));
+                    }
+                }
+                QueryLanguage::PromQl | QueryLanguage::MetricsQl => {}
+            }
             entry.validate(available)?;
         }
         Ok(())
@@ -148,6 +196,7 @@ pub enum QueryLanguage {
     #[default]
     PromQl,
     MetricsQl,
+    ClickHouseSql,
 }
 
 /// Stable identity inside one query entry. Edges are IDs so common
@@ -164,6 +213,8 @@ pub struct QueryPlanEntry {
     pub query_id: String,
     #[serde(alias = "canonical_promql")]
     pub canonical_query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_evaluation: Option<FixedEvaluationRange>,
     pub root: QueryNodeId,
     pub nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
     pub instant: InstantExecution,
@@ -299,6 +350,7 @@ impl QueryPlanEntry {
             language: QueryLanguage::PromQl,
             query_id,
             canonical_query,
+            fixed_evaluation: None,
             root,
             nodes: compiler.nodes,
             instant,
@@ -364,6 +416,7 @@ impl QueryPlanEntry {
             language: QueryLanguage::PromQl,
             query_id,
             canonical_query,
+            fixed_evaluation: None,
             root,
             nodes: compiler.nodes,
             instant,
@@ -1328,7 +1381,7 @@ pub enum QueryPlanError {
     Invalid(String),
 }
 
-pub fn canonical_promql(query: &str) -> Result<String, QueryPlanError> {
+pub fn canonical_query(query: &str) -> Result<String, QueryPlanError> {
     promql_parser::parser::parse(query.trim())
         .map(|expr| expr.to_string())
         .map_err(|error| QueryPlanError::InvalidPromql(error.to_string()))
@@ -1341,8 +1394,8 @@ mod tests {
     #[test]
     fn canonical_identity_ignores_formatting() {
         assert_eq!(
-            canonical_promql("sum by (service) ( rate(http_requests_total[5m]) )").unwrap(),
-            canonical_promql("sum by(service)(rate(http_requests_total[5m]))").unwrap()
+            canonical_query("sum by (service) ( rate(http_requests_total[5m]) )").unwrap(),
+            canonical_query("sum by(service)(rate(http_requests_total[5m]))").unwrap()
         );
     }
 
@@ -1385,6 +1438,7 @@ mod tests {
             language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "up".into(),
+            fixed_evaluation: None,
             root: QueryNodeId(0),
             nodes,
             instant: InstantExecution {
@@ -1410,6 +1464,7 @@ mod tests {
             language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "topk(2, rate(m[5m]))".into(),
+            fixed_evaluation: None,
             root: QueryNodeId(2),
             nodes: BTreeMap::from([
                 (QueryNodeId(0), leaf.clone()),
@@ -1480,6 +1535,7 @@ mod catalog_binding_tests {
             language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "sum_over_time(m[1m])".into(),
+            fixed_evaluation: None,
             root: QueryNodeId(1),
             nodes: BTreeMap::from([(
                 QueryNodeId(1),
@@ -1505,6 +1561,7 @@ mod catalog_binding_tests {
             QueryPlan {
                 plan_id: 7,
                 plan_version: 2,
+                clickhouse_context: None,
                 entries: BTreeMap::from([(entry.canonical_query.clone(), entry)]),
             },
             catalog,
@@ -1537,12 +1594,10 @@ mod catalog_binding_tests {
             decoded
                 .lookup("sum_over_time(m[1m])")
                 .unwrap()
-                .canonical_promql,
+                .canonical_query,
             "sum_over_time(m[1m])"
         );
-        assert!(String::from_utf8(wire)
-            .unwrap()
-            .contains("canonical_promql"));
+        assert!(String::from_utf8(wire).unwrap().contains("canonical_query"));
         assert_eq!(binding(&mut decoded).window_ms, 10_000);
         assert_eq!(binding(&mut decoded).readout_lookback_ms, Some(60_000));
     }

@@ -31,7 +31,7 @@ use thiserror::Error;
 use crate::physical::colored_dag::emitter::{AggregationInput, BackendAggregation};
 use crate::physical::post_asap::cost_model::{ControlPlaneCostModel, ExactCompositionCostEvidence};
 use crate::query_plan::{
-    canonical_promql, FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping,
+    canonical_query, FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping,
     QueryPlan, QueryPlanEntry,
 };
 use crate::types_v2::AccuracyTarget;
@@ -1831,7 +1831,7 @@ impl BackendLocalPlanningSnapshot {
             canonical_roots.push(Rc::new(parsed));
             let mut cost = self.implementation.implementation_cost.clone();
             cost.workload_fingerprint =
-                canonical_promql(&query_string).map_err(CompileError::QueryPlan)?;
+                canonical_query(&query_string).map_err(CompileError::QueryPlan)?;
             cost.horizon_seconds = self.implementation.horizon_seconds;
             let query_id = format!("compat-query-{index}");
             if let Some(evidence) = self.implementation.topk_evidence.get(&query_string) {
@@ -2622,6 +2622,7 @@ impl PhysicalCompiler {
         let query_plan = QueryPlan {
             plan_id,
             plan_version: envelope.plan_version,
+            clickhouse_context: None,
             entries: query_entries,
         };
         for materialization in &mut precompute_plan.materializations {
