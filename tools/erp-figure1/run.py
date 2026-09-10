@@ -40,7 +40,32 @@ def validate_manifest(manifest, root):
     return path, actual, constraints
 
 
-def run_arm(arm, expected_contract, cwd, dataset_path=None):
+def validate_result(name, result, expected_contract, candidate_space):
+    if result.get("contract") != expected_contract:
+        raise ValueError(f"{name} did not execute the identical evaluation contract")
+    missing = REQUIRED_METRICS - set(result.get("metrics", {}))
+    if missing or "selected_plan" not in result or "selected_candidates" not in result:
+        raise ValueError(f"{name} result missing selection/metrics: {sorted(missing)}")
+    selected = result["selected_candidates"]
+    if not isinstance(selected, list) or (name != "exact" and not selected):
+        raise ValueError(f"{name} must report selected candidate records")
+    legal = {canonical(candidate) for candidate in candidate_space}
+    if any(canonical(candidate) not in legal for candidate in selected):
+        raise ValueError(f"{name} selected a candidate outside the common space")
+    metrics = result["metrics"]
+    state_bytes, error = metrics["state_bytes"], metrics["max_error"]
+    if not isinstance(state_bytes, int) or state_bytes < 0 or not isinstance(error, (int, float)):
+        raise ValueError(f"{name} reported invalid state/error metrics")
+    if name != "exact" and state_bytes > expected_contract["memory_budget_bytes"]:
+        raise ValueError(f"{name} exceeded the common memory budget")
+    accuracy = expected_contract["accuracy"]
+    if accuracy.get("metric") != "max_error" or "upper_bound" not in accuracy:
+        raise ValueError("accuracy contract must define max_error upper_bound")
+    if error > accuracy["upper_bound"]:
+        raise ValueError(f"{name} violated the common accuracy constraint")
+
+
+def run_arm(arm, expected_contract, candidate_space, cwd, dataset_path=None):
     with tempfile.NamedTemporaryFile(prefix="asap-figure1-time-", delete=False) as timing:
         timing_path = timing.name
     argv = ["/usr/bin/time", "-f", '{"user_seconds":%U,"system_seconds":%S,"peak_rss_kb":%M}', "-o", timing_path, "--"] + arm["command"]
@@ -61,11 +86,7 @@ def run_arm(arm, expected_contract, cwd, dataset_path=None):
         record.update({"status": "failed", "stderr": proc.stderr})
         return record
     result = json.loads(proc.stdout)
-    if result.get("contract") != expected_contract:
-        raise ValueError(f"{arm['name']} did not execute the identical evaluation contract")
-    missing = REQUIRED_METRICS - set(result.get("metrics", {}))
-    if missing or "selected_plan" not in result:
-        raise ValueError(f"{arm['name']} result missing selected_plan/metrics: {sorted(missing)}")
+    validate_result(arm["name"], result, expected_contract, candidate_space)
     record.update({"status": "completed", "selected_plan": result["selected_plan"],
                    "metrics": result["metrics"], "provenance": result.get("provenance", {})})
     return record
@@ -89,7 +110,9 @@ def main():
               "dataset": {"path": str(dataset_path), "sha256": dataset_sha}, "contract": contract,
               "host": {"uname": list(os.uname())}, "arms": []}
     for arm in manifest["arms"]:
-        report["arms"].append(run_arm(arm, contract, root, dataset_path))
+        report["arms"].append(
+            run_arm(arm, contract, constraints["candidate_space"], root, dataset_path)
+        )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "x") as sink:
         json.dump(report, sink, indent=2); sink.write("\n")
