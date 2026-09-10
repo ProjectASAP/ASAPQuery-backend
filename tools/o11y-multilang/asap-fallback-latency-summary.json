@@ -1,0 +1,44 @@
+{
+  "source": "tools/o11y-multilang/asap-fallback-latency-raw.json",
+  "engines": {
+    "asap_clickhouse": {
+      "attempted": 135,
+      "ok": 135,
+      "p50_ms": 50.559448,
+      "p95_ms": 535.675225,
+      "mean_ms": 129.6243583111111
+    },
+    "asap_metricsql": {
+      "attempted": 135,
+      "ok": 135,
+      "p50_ms": 4.930898,
+      "p95_ms": 5.409833,
+      "mean_ms": 4.881538318518518
+    },
+    "clickhouse": {
+      "attempted": 135,
+      "ok": 135,
+      "p50_ms": 51.011424,
+      "p95_ms": 531.587688,
+      "mean_ms": 128.60059171111112
+    },
+    "prometheus": {
+      "attempted": 135,
+      "ok": 135,
+      "p50_ms": 3.555412,
+      "p95_ms": 10.285528,
+      "mean_ms": 5.314136977777778
+    },
+    "victoriametrics": {
+      "attempted": 135,
+      "ok": 135,
+      "p50_ms": 2.326472,
+      "p95_ms": 2.639321,
+      "mean_ms": 2.320617118518519,
+      "prometheus_differential": {
+        "valid": 90,
+        "total": 135
+      }
+    }
+  }
+}
