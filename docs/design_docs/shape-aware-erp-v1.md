@@ -2,15 +2,25 @@
 
 The backend obtains an observed shape from the live runtime-samples feedback
 path and asks ASAPPlanner for the nearest compatible benchmark profile. A
-runtime record carries `erp_observed_shape` with cardinality, optional fitted
-Zipf exponent, observed event count, and burst ratio. The planning request
+runtime record carries `erp_observed_shape.observation` using Planner's shared
+`ErpShapeObservation`: cardinality, observed event count, candidate fits and an
+optional dataset fingerprint. The wrapper also reports burst ratio. The planning request
 selects the ring via `observed_shape_source`.
 
-The edge observer counts sampled keys in a bounded map, fits the slope of the
-log-rank/log-frequency curve, and records per-interval traffic. Exceeding the
-cardinality cap is an error; it is never reported as a smaller cardinality.
-Uniform and Zipf shapes do not cross-match. Profiles with too few benchmark
-events or excessive log-cardinality/skew distance are misses.
+The observer retains both uniform and fitted Zipf hypotheses, with total-variation
+distance against the observed rank masses and a sample-count-adjusted fit score.
+The score is a heuristic fit quality, not a statistical confidence interval or
+sketch-error guarantee. Unnamed and mixed distributions are not forced into one
+family. Planner jointly matches admissible hypotheses against ERP records.
+Custom data first matches its fingerprint when available, otherwise it can use
+the same bounded shape matching as synthetic data.
+
+Key count, key length and occupied interval count are bounded. Sparse interval
+IDs do not allocate a dense vector. Any overflow or cap violation permanently
+invalidates that observation window; callers must start a fresh observer rather
+than publishing a biased partial snapshot. Profiles with too few benchmark
+events, poor fit, ambiguous confidence, or excessive cardinality/parameter
+distance are misses.
 
 On a hit, empirical parameters and measured atomic costs are used. On a miss,
 malformed evidence, or drift, Hybrid mode retains the theoretical parameters;
