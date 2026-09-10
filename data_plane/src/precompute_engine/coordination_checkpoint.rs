@@ -24,7 +24,7 @@ pub struct StagedSummaryInput {
     pub instance_id: SummaryInstanceId,
     pub coordinates: SummaryInstanceCoordinates,
     pub input_lineage: Vec<u8>,
-    /// Durable SummaryStore payload; the journal never duplicates state bytes.
+    /// Durable SummaryStore payload; the checkpoint store never duplicates state bytes.
     pub state_reference: SummaryStateReference,
 }
 
@@ -83,7 +83,7 @@ impl AtomicPublicationKey {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct JournalDocument {
+struct CheckpointDocument {
     schema_version: u32,
     revision: u64,
     staged: Vec<StagedSummaryInput>,
@@ -91,7 +91,7 @@ struct JournalDocument {
     published: Vec<AtomicPublicationKey>,
 }
 
-impl Default for JournalDocument {
+impl Default for CheckpointDocument {
     fn default() -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
@@ -103,17 +103,17 @@ impl Default for JournalDocument {
     }
 }
 
-/// A small crash-safe snapshot journal. Mutations become visible in memory
+/// A small crash-safe checkpoint snapshot store. Mutations become visible in memory
 /// only after the replacement file has been flushed and atomically renamed.
-pub struct SummaryCoordinationJournal {
+pub struct SummaryCoordinationCheckpointStore {
     path: PathBuf,
-    /// Held for the journal lifetime; prevents two processes from replacing
+    /// Held for the checkpoint store lifetime; prevents two processes from replacing
     /// the same snapshot concurrently.
     _lock_file: File,
-    document: Mutex<JournalDocument>,
+    document: Mutex<CheckpointDocument>,
 }
 
-impl SummaryCoordinationJournal {
+impl SummaryCoordinationCheckpointStore {
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -127,13 +127,14 @@ impl SummaryCoordinationJournal {
         lock_file.try_lock_exclusive().map_err(|error| {
             io::Error::new(
                 io::ErrorKind::WouldBlock,
-                format!("coordination journal already has a writer: {error}"),
+                format!("coordination checkpoint store already has a writer: {error}"),
             )
         })?;
         let document = match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice::<JournalDocument>(&bytes)
-                .map_err(|error| invalid(format!("invalid coordination journal: {error}")))?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => JournalDocument::default(),
+            Ok(bytes) => serde_json::from_slice::<CheckpointDocument>(&bytes).map_err(|error| {
+                invalid(format!("invalid coordination checkpoint store: {error}"))
+            })?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => CheckpointDocument::default(),
             Err(error) => return Err(error),
         };
         validate_document(&document)?;
@@ -220,9 +221,17 @@ impl SummaryCoordinationJournal {
         Ok(self.lock()?.staged.clone())
     }
 
+    pub fn watermarks(&self) -> io::Result<Vec<SummaryWatermarkBarrier>> {
+        Ok(self.lock()?.watermarks.clone())
+    }
+
+    pub fn is_published(&self, key: &AtomicPublicationKey) -> io::Result<bool> {
+        Ok(self.lock()?.published.contains(key))
+    }
+
     fn mutate<T>(
         &self,
-        update: impl FnOnce(&mut JournalDocument) -> io::Result<T>,
+        update: impl FnOnce(&mut CheckpointDocument) -> io::Result<T>,
     ) -> io::Result<T> {
         let mut guard = self.lock()?;
         let mut next = guard.clone();
@@ -230,22 +239,22 @@ impl SummaryCoordinationJournal {
         next.revision = next
             .revision
             .checked_add(1)
-            .ok_or_else(|| invalid("coordination journal revision overflow"))?;
+            .ok_or_else(|| invalid("coordination checkpoint store revision overflow"))?;
         persist_atomically(&self.path, &next)?;
         *guard = next;
         Ok(result)
     }
 
-    fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, JournalDocument>> {
+    fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, CheckpointDocument>> {
         self.document
             .lock()
-            .map_err(|_| io::Error::other("coordination journal lock poisoned"))
+            .map_err(|_| io::Error::other("coordination checkpoint store lock poisoned"))
     }
 }
 
-fn validate_document(document: &JournalDocument) -> io::Result<()> {
+fn validate_document(document: &CheckpointDocument) -> io::Result<()> {
     if document.schema_version != SCHEMA_VERSION {
-        return Err(invalid("unsupported coordination journal schema"));
+        return Err(invalid("unsupported coordination checkpoint store schema"));
     }
     let mut staged_ids = std::collections::BTreeSet::new();
     for input in &document.staged {
@@ -297,7 +306,7 @@ fn validate_state_reference(reference: &SummaryStateReference) -> io::Result<()>
     }
 }
 
-fn persist_atomically(path: &Path, document: &JournalDocument) -> io::Result<()> {
+fn persist_atomically(path: &Path, document: &CheckpointDocument) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
     let tmp = path.with_extension("tmp");
@@ -377,11 +386,11 @@ mod tests {
     fn restart_recovers_staging_and_idempotence() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("coordination.json");
-        let journal = SummaryCoordinationJournal::open(&path).unwrap();
-        assert!(journal.stage_if_absent(staged(1)).unwrap());
-        assert!(!journal.stage_if_absent(staged(1)).unwrap());
-        drop(journal);
-        let recovered = SummaryCoordinationJournal::open(&path).unwrap();
+        let checkpoint_store = SummaryCoordinationCheckpointStore::open(&path).unwrap();
+        assert!(checkpoint_store.stage_if_absent(staged(1)).unwrap());
+        assert!(!checkpoint_store.stage_if_absent(staged(1)).unwrap());
+        drop(checkpoint_store);
+        let recovered = SummaryCoordinationCheckpointStore::open(&path).unwrap();
         assert_eq!(recovered.staged().unwrap(), vec![staged(1)]);
         assert!(!recovered.stage_if_absent(staged(1)).unwrap());
     }
@@ -389,38 +398,50 @@ mod tests {
     #[test]
     fn epochs_are_distinct_and_instance_id_equivocation_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = SummaryCoordinationJournal::open(dir.path().join("journal.json")).unwrap();
-        assert!(journal.stage_if_absent(staged(1)).unwrap());
-        assert!(journal.stage_if_absent(staged(2)).unwrap());
+        let checkpoint_store =
+            SummaryCoordinationCheckpointStore::open(dir.path().join("checkpoint.json")).unwrap();
+        assert!(checkpoint_store.stage_if_absent(staged(1)).unwrap());
+        assert!(checkpoint_store.stage_if_absent(staged(2)).unwrap());
         let mut conflicting = staged(1);
         conflicting
             .coordinates
             .group_values
             .insert("job".into(), "other".into());
-        assert!(journal.stage_if_absent(conflicting).is_err());
+        assert!(checkpoint_store.stage_if_absent(conflicting).is_err());
     }
 
     #[test]
     fn watermark_rejects_regression_but_new_epoch_starts_fresh() {
         let dir = tempfile::tempdir().unwrap();
-        let journal = SummaryCoordinationJournal::open(dir.path().join("journal.json")).unwrap();
+        let checkpoint_store =
+            SummaryCoordinationCheckpointStore::open(dir.path().join("checkpoint.json")).unwrap();
         let barrier = |epoch, sequence, watermark_ms| SummaryWatermarkBarrier {
             catalog_generation: generation(),
             source: source(epoch),
             sequence,
             watermark_ms,
         };
-        assert!(journal.advance_watermark(barrier(1, 2, 20)).unwrap());
-        assert!(!journal.advance_watermark(barrier(1, 2, 20)).unwrap());
-        assert!(journal.advance_watermark(barrier(1, 2, 21)).is_err());
-        assert!(journal.advance_watermark(barrier(1, 1, 30)).is_err());
-        assert!(journal.advance_watermark(barrier(2, 1, 5)).unwrap());
+        assert!(checkpoint_store
+            .advance_watermark(barrier(1, 2, 20))
+            .unwrap());
+        assert!(!checkpoint_store
+            .advance_watermark(barrier(1, 2, 20))
+            .unwrap());
+        assert!(checkpoint_store
+            .advance_watermark(barrier(1, 2, 21))
+            .is_err());
+        assert!(checkpoint_store
+            .advance_watermark(barrier(1, 1, 30))
+            .is_err());
+        assert!(checkpoint_store
+            .advance_watermark(barrier(2, 1, 5))
+            .unwrap());
     }
 
     #[test]
     fn publication_key_is_durable_and_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("journal.json");
+        let path = dir.path().join("checkpoint.json");
         let key = AtomicPublicationKey {
             catalog_generation: generation(),
             dag_id: "dag".into(),
@@ -430,20 +451,20 @@ mod tests {
             output_lineage: vec![1],
             state_reference: state_reference("output-state".into()),
         };
-        let journal = SummaryCoordinationJournal::open(&path).unwrap();
-        assert!(journal.publish_if_absent(key.clone()).unwrap());
-        drop(journal);
-        let recovered = SummaryCoordinationJournal::open(&path).unwrap();
+        let checkpoint_store = SummaryCoordinationCheckpointStore::open(&path).unwrap();
+        assert!(checkpoint_store.publish_if_absent(key.clone()).unwrap());
+        drop(checkpoint_store);
+        let recovered = SummaryCoordinationCheckpointStore::open(&path).unwrap();
         assert!(!recovered.publish_if_absent(key.clone()).unwrap());
         assert!(
-            SummaryCoordinationJournal::open(&path).is_err(),
+            SummaryCoordinationCheckpointStore::open(&path).is_err(),
             "writer lock remains held"
         );
         let mut conflicting = key.clone();
         conflicting.output_lineage = vec![2];
         assert!(recovered.publish_if_absent(conflicting).is_err());
         drop(recovered);
-        assert!(!SummaryCoordinationJournal::open(&path)
+        assert!(!SummaryCoordinationCheckpointStore::open(&path)
             .unwrap()
             .publish_if_absent(key)
             .unwrap());
@@ -452,17 +473,17 @@ mod tests {
     #[test]
     fn corrupt_or_unknown_wire_data_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("journal.json");
+        let path = dir.path().join("checkpoint.json");
         fs::write(&path, br#"{"schema_version":1,"revision":0,"staged":[],"watermarks":[],"published":[],"unknown":true}"#).unwrap();
-        assert!(SummaryCoordinationJournal::open(path).is_err());
+        assert!(SummaryCoordinationCheckpointStore::open(path).is_err());
     }
 
     #[test]
     fn duplicate_primary_keys_on_disk_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("journal.json");
+        let path = dir.path().join("checkpoint.json");
         let duplicate = staged(1);
-        let document = JournalDocument {
+        let document = CheckpointDocument {
             schema_version: SCHEMA_VERSION,
             revision: 1,
             staged: vec![duplicate.clone(), duplicate],
@@ -470,6 +491,6 @@ mod tests {
             published: Vec::new(),
         };
         fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
-        assert!(SummaryCoordinationJournal::open(path).is_err());
+        assert!(SummaryCoordinationCheckpointStore::open(path).is_err());
     }
 }
