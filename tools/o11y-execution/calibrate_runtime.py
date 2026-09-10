@@ -130,7 +130,7 @@ def measure(args, artifact, corpus, snapshot, folder):
             query_phase = phase(folder, "query-" + qid, before, after, time.perf_counter_ns() - start)
             raw = folder / f"queries-{qid}.json"
             runner.write_json(raw, records)
-            validate_candidate_topk_execution(candidate, records)
+            validate_candidate_topk_execution(artifact, records)
             routes = {record["execution"] for record in records}
             correct = all(record["comparison"]["equal"] and record["exact"]["http_status"] == 200 for record in records)
             row["queries"][qid] = {"cpu_ns": query_phase["cpu_ns"], "evaluations": len(records),
