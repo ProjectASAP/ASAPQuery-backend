@@ -81,6 +81,12 @@ ASAPPlanner, compiles matching SummaryCatalog/PrecomputePlan/QueryPlan views, an
 installs the resulting immutable snapshot before accepting traffic. It does
 not create or wait for a CollectorPlan.
 
+`implementation.max_retained_summary_bytes` limits the estimated total encoded
+summary footprint across every retained pane and partition. It defaults to 2
+GiB for older snapshots and is clamped to `--persistence-memory-limit-mb` at
+startup. Candidates that exceed the effective budget are marked unavailable
+before any physical plan is installed.
+
 A complete canonical input is checked in at
 `docs/examples/asapquery-planning-snapshot.json`.
 

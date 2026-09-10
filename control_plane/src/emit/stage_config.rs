@@ -2990,6 +2990,9 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
     if let Some(mode) = agg.heap_update_mode {
         if let Some(obj) = parameters.as_object_mut() {
             obj.insert("weight_mode".into(), JsonValue::String(mode.into()));
+            if mode == "counter_delta" {
+                obj.insert("weight_scale".into(), json!(1_000_000));
+            }
         }
     }
     // PromQL range selectors are (start, end]. Encode the boundary convention
@@ -3025,7 +3028,7 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
         "labels": {
             "grouping": agg.grouping,
             "rollup": Vec::<String>::new(),
-            "aggregated": Vec::<String>::new(),
+            "aggregated": agg.item_label.iter().cloned().collect::<Vec<_>>(),
         },
         "parameters": parameters,
         "windowSize": window_size,

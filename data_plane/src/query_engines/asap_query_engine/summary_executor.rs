@@ -1329,6 +1329,7 @@ mod tests {
     #[test]
     fn pane_only_reads_require_the_planned_evaluation_phase() {
         let binding = control_plane::query_plan::MaterializationBinding {
+            item_labels: Vec::new(),
             materialization: asap_types::PolicyFingerprint(7).into(),
             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
             window_ms: 60_000,
@@ -1339,6 +1340,7 @@ mod tests {
         assert!(validate_binding_phase(&binding, 68_000).is_err());
 
         let legacy = control_plane::query_plan::MaterializationBinding {
+            item_labels: Vec::new(),
             pane_origin_ms: None,
             ..binding
         };

@@ -474,13 +474,20 @@ async fn main() -> Result<()> {
 
     let startup_artifact = if let Some(path) = args.planning_snapshot.as_ref() {
         let bytes = fs::read(path)?;
-        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        let mut snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_slice(&bytes).map_err(|error| {
                 format!(
                     "failed to decode planning snapshot {}: {error}",
                     path.display()
                 )
             })?;
+        let runtime_memory_budget = u64::try_from(args.persistence_memory_limit_mb)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(1024 * 1024);
+        snapshot.implementation.max_retained_summary_bytes = snapshot
+            .implementation
+            .max_retained_summary_bytes
+            .min(runtime_memory_budget);
         let plan = snapshot
             .compile()
             .map_err(|error| format!("startup planning failed for {}: {error}", path.display()))?;
@@ -1368,19 +1375,21 @@ async fn spawn_memory_diagnostics(
         // it correctly reads ~0 once everything has been flushed to disk.
         // On its own it badly misrepresents the store's footprint — the
         // per-sid registry + intern caches stay resident and are not
-        // flushable. Report all three: evictable payload, the structural
-        // resident estimate, and the process RSS ground truth.
+        // flushable. Report evictable payload, structural overhead, their
+        // total store estimate, and process RSS ground truth separately.
         let payload_bytes = sketch_index.approx_memory_bytes();
         let resident_bytes = sketch_index.approx_resident_bytes();
+        let structural_bytes = resident_bytes.saturating_sub(payload_bytes);
         let rss_bytes = process_resident_bytes();
         info!(
             "[MEMORY_DIAG] SketchStore: {} instance(s), {} sid(s) with state, \
              payload={:.2} KB (evictable, flusher gauge), \
-             registry+intern\u{2248}{:.2} MB (resident, not flushable), \
+             registry+intern\u{2248}{:.2} MB (structural), total-store\u{2248}{:.2} MB, \
              process RSS={:.1} MB",
             instance_count,
             series_count,
             payload_bytes as f64 / 1024.0,
+            structural_bytes as f64 / (1024.0 * 1024.0),
             resident_bytes as f64 / (1024.0 * 1024.0),
             rss_bytes as f64 / (1024.0 * 1024.0),
         );

@@ -627,16 +627,28 @@ pub struct CmsHeapAccumulatorUpdater {
     col_num: usize,
     heap_size: usize,
     weight: TopkWeight,
+    weight_scale: f64,
 }
 
 impl CmsHeapAccumulatorUpdater {
     pub fn new(row_num: usize, col_num: usize, heap_size: usize, weight: TopkWeight) -> Self {
+        Self::with_weight_scale(row_num, col_num, heap_size, weight, 1.0)
+    }
+
+    pub fn with_weight_scale(
+        row_num: usize,
+        col_num: usize,
+        heap_size: usize,
+        weight: TopkWeight,
+        weight_scale: f64,
+    ) -> Self {
         Self {
             acc: CountMinSketchWithHeapAccumulator::new(row_num, col_num, heap_size),
             row_num,
             col_num,
             heap_size,
             weight,
+            weight_scale,
         }
     }
 }
@@ -656,7 +668,7 @@ impl AccumulatorUpdater for CmsHeapAccumulatorUpdater {
             // Σ value: feed the datapoint value. sketchlib's CMS-heap
             // `update(key, w)` adds `w.round()` occurrences of `key`, so the
             // heap value accumulates the (rounded) summed metric value.
-            TopkWeight::Value => value,
+            TopkWeight::Value => value * self.weight_scale,
             // Σ count: one occurrence per event, regardless of value.
             TopkWeight::Count => 1.0,
         };
@@ -752,16 +764,28 @@ pub struct CountSketchWithHeapAccumulatorUpdater {
     col_num: usize,
     heap_size: usize,
     weight: TopkWeight,
+    weight_scale: f64,
 }
 
 impl CountSketchWithHeapAccumulatorUpdater {
     pub fn new(row_num: usize, col_num: usize, heap_size: usize, weight: TopkWeight) -> Self {
+        Self::with_weight_scale(row_num, col_num, heap_size, weight, 1.0)
+    }
+
+    pub fn with_weight_scale(
+        row_num: usize,
+        col_num: usize,
+        heap_size: usize,
+        weight: TopkWeight,
+        weight_scale: f64,
+    ) -> Self {
         Self {
             acc: CountSketchWithHeapAccumulator::new(row_num, col_num, heap_size),
             row_num,
             col_num,
             heap_size,
             weight,
+            weight_scale,
         }
     }
 }
@@ -776,7 +800,7 @@ impl AccumulatorUpdater for CountSketchWithHeapAccumulatorUpdater {
 
     fn update_keyed(&mut self, key: &KeyByLabelValues, value: f64, _timestamp_ms: i64) {
         let weighted = match self.weight {
-            TopkWeight::Value => value,
+            TopkWeight::Value => value * self.weight_scale,
             TopkWeight::Count => 1.0,
         };
         self.acc.inner.update(&key.to_semicolon_str(), weighted);
@@ -898,6 +922,15 @@ fn topk_weight_param(config: &AggregationConfig) -> TopkWeight {
         // "value" / "sum" / unset / anything else → value-weighted default.
         _ => TopkWeight::Value,
     }
+}
+
+fn topk_weight_scale_param(config: &AggregationConfig) -> f64 {
+    config
+        .parameters
+        .get("weight_scale")
+        .and_then(|value| value.as_f64())
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .unwrap_or(1.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1086,11 +1119,12 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             if kind.algorithm() == &SketchAlgorithm::CmsWithHeap =>
         {
             let (row_num, col_num, heap_size) = cms_heap_dims(kind.params());
-            Box::new(CmsHeapAccumulatorUpdater::new(
+            Box::new(CmsHeapAccumulatorUpdater::with_weight_scale(
                 row_num,
                 col_num,
                 heap_size,
                 topk_weight_param(config),
+                topk_weight_scale_param(config),
             ))
         }
 
@@ -1101,11 +1135,12 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             if kind.algorithm() == &SketchAlgorithm::CountSketchWithHeap =>
         {
             let (row_num, col_num, heap_size) = cms_heap_dims(kind.params());
-            Box::new(CountSketchWithHeapAccumulatorUpdater::new(
+            Box::new(CountSketchWithHeapAccumulatorUpdater::with_weight_scale(
                 row_num,
                 col_num,
                 heap_size,
                 topk_weight_param(config),
+                topk_weight_scale_param(config),
             ))
         }
 
@@ -1549,6 +1584,23 @@ mod tests {
             ranked.iter().take(2).map(|(h, _)| h.as_str()).collect();
         let recall = got.intersection(&truth).count() as f64 / truth.len() as f64;
         assert_eq!(recall, 1.0, "value-weighted top-2 recall must be 1.0");
+    }
+
+    #[test]
+    fn counter_delta_scale_preserves_sub_unit_membership_weights() {
+        let mut config = topk_config(
+            AggregationType::CountMinSketchWithHeap,
+            Some("counter_delta"),
+        );
+        config
+            .parameters
+            .insert("weight_scale".into(), serde_json::json!(1_000_000));
+        let mut updater = create_accumulator_updater(&config);
+        updater.update_keyed(&host_key("payment"), 0.004, 1_000);
+        updater.update_keyed(&host_key("order"), 0.002, 1_000);
+        let ranked = ranked_topk(&*updater.take_accumulator());
+        assert_eq!(ranked[0], ("payment".into(), 4_000.0));
+        assert_eq!(ranked[1], ("order".into(), 2_000.0));
     }
 
     #[test]

@@ -122,8 +122,14 @@ pub fn execute_query_plan_instant(
 #[derive(Clone)]
 enum PhysicalQueryOutput {
     Scalar(f64),
-    State(Vec<(BTreeMap<String, String>, GroupState)>),
-    Value(Vec<(BTreeMap<String, String>, SummaryValue)>),
+    State {
+        groups: Vec<(BTreeMap<String, String>, GroupState)>,
+        item_labels: Vec<String>,
+    },
+    Value(
+        Vec<(BTreeMap<String, String>, SummaryValue)>,
+        Option<(u64, u64)>,
+    ),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -159,41 +165,52 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                 binary_values(operator, lhs, rhs)
             }
             QueryPlanNode::ReduceSum { grouping, .. } => {
-                let [PhysicalQueryOutput::Value(values)] = inputs else {
+                let [PhysicalQueryOutput::Value(values, coverage)] = inputs else {
                     return Err(PhysicalNodeError::ExpectedState);
                 };
-                reduce_sum_values(grouping, values)
+                reduce_sum_values(grouping, values, *coverage)
             }
             QueryPlanNode::ReadMaterialization { binding } => {
                 let groups = self
                     .context
                     .read_bound_materialization(binding)
                     .map_err(PhysicalNodeError::Store)?;
-                Ok(PhysicalQueryOutput::State(groups))
+                Ok(PhysicalQueryOutput::State {
+                    groups,
+                    item_labels: binding.item_labels.clone(),
+                })
             }
             QueryPlanNode::SummaryEstimate { query, .. } => {
-                let [PhysicalQueryOutput::State(groups)] = inputs else {
+                let [PhysicalQueryOutput::State {
+                    groups,
+                    item_labels,
+                }] = inputs
+                else {
                     return Err(PhysicalNodeError::ExpectedState);
                 };
                 let query: planner_types::post_asap::SketchQuery = query.clone().into();
-                groups
-                    .iter()
-                    .map(|(key, state)| {
-                        self.context
-                            .readout_bound(state, &query)
-                            .map(|value| (key.clone(), value))
-                            .map_err(PhysicalNodeError::Store)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(PhysicalQueryOutput::Value)
+                let mut values = Vec::new();
+                let mut coverage = None;
+                for (key, state) in groups {
+                    let value = self
+                        .context
+                        .readout_bound(state, &query)
+                        .map_err(PhysicalNodeError::Store)?;
+                    let (rows, row_coverage) = expand_item_readout(key, value, item_labels)?;
+                    fold_coverage(&mut coverage, row_coverage);
+                    values.extend(rows);
+                }
+                Ok(PhysicalQueryOutput::Value(values, coverage))
             }
             QueryPlanNode::ExactReadout { readout, .. } => {
-                let [PhysicalQueryOutput::State(groups)] = inputs else {
+                let [PhysicalQueryOutput::State { groups, .. }] = inputs else {
                     return Err(PhysicalNodeError::ExpectedState);
                 };
-                groups
+                let mut coverage = None;
+                let values = groups
                     .iter()
                     .map(|(key, state)| {
+                        fold_coverage(&mut coverage, state.exact_coverage());
                         state
                             .exact_value_for(
                                 *readout,
@@ -212,16 +229,30 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                             })
                             .ok_or(PhysicalNodeError::ExpectedState)
                     })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(PhysicalQueryOutput::Value)
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(PhysicalQueryOutput::Value(values, coverage))
             }
             QueryPlanNode::SummaryMerge { .. } => {
                 let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<GroupState>> =
                     BTreeMap::new();
+                let mut merged_item_labels: Option<Vec<String>> = None;
                 for input in inputs {
-                    let PhysicalQueryOutput::State(groups) = input else {
+                    let PhysicalQueryOutput::State {
+                        groups,
+                        item_labels,
+                    } = input
+                    else {
                         return Err(PhysicalNodeError::ExpectedState);
                     };
+                    if merged_item_labels
+                        .as_ref()
+                        .is_some_and(|labels| labels != item_labels)
+                    {
+                        return Err(PhysicalNodeError::Fallback(
+                            "merged summaries disagree on item labels".into(),
+                        ));
+                    }
+                    merged_item_labels.get_or_insert_with(|| item_labels.clone());
                     for (key, state) in groups {
                         by_group.entry(key.clone()).or_default().push(state.clone());
                     }
@@ -238,7 +269,10 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                             .map_err(PhysicalNodeError::Store)
                     })
                     .collect::<Result<Vec<_>, _>>()
-                    .map(PhysicalQueryOutput::State)
+                    .map(|groups| PhysicalQueryOutput::State {
+                        groups,
+                        item_labels: merged_item_labels.unwrap_or_default(),
+                    })
             }
             QueryPlanNode::Logical { .. } | QueryPlanNode::CandidateTopK { .. } => {
                 Err(PhysicalNodeError::Fallback(
@@ -250,6 +284,56 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
             }
         }
     }
+}
+
+fn expand_item_rows(
+    group_key: &BTreeMap<String, String>,
+    value: SummaryValue,
+    item_labels: &[String],
+) -> Result<Vec<(BTreeMap<String, String>, SummaryValue)>, PhysicalNodeError> {
+    let SummaryValue::TopK(ranked_per_ts, coverage) = value else {
+        return Ok(vec![(group_key.clone(), value)]);
+    };
+    let [item_label] = item_labels else {
+        if item_labels.is_empty() {
+            return Ok(vec![(
+                group_key.clone(),
+                SummaryValue::TopK(ranked_per_ts, coverage),
+            )]);
+        }
+        return Err(PhysicalNodeError::Fallback(
+            "multi-label keyed sketch readout is unsupported".into(),
+        ));
+    };
+    let mut by_item: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
+    for (timestamp, items) in ranked_per_ts {
+        for (item, value) in items {
+            by_item.entry(item).or_default().push((timestamp, value));
+        }
+    }
+    Ok(by_item
+        .into_iter()
+        .map(|(item, points)| {
+            let mut labels = group_key.clone();
+            labels.insert(item_label.clone(), item);
+            (labels, SummaryValue::Points(points, coverage))
+        })
+        .collect())
+}
+
+fn expand_item_readout(
+    group_key: &BTreeMap<String, String>,
+    value: SummaryValue,
+    item_labels: &[String],
+) -> Result<
+    (
+        Vec<(BTreeMap<String, String>, SummaryValue)>,
+        Option<(u64, u64)>,
+    ),
+    PhysicalNodeError,
+> {
+    let coverage = value.coverage();
+    Ok((expand_item_rows(group_key, value, item_labels)?, coverage))
 }
 
 fn arithmetic(operator: &planner_types::pre_asap::ArithmeticOpKind, left: f64, right: f64) -> f64 {
@@ -304,31 +388,51 @@ fn binary_values(
                     )
                 })
                 .collect(),
+            None,
         )
     }
     match (lhs, rhs) {
         (PhysicalQueryOutput::Scalar(a), PhysicalQueryOutput::Scalar(b)) => {
             Ok(PhysicalQueryOutput::Scalar(arithmetic(operator, *a, *b)))
         }
-        (PhysicalQueryOutput::Value(values), PhysicalQueryOutput::Scalar(scalar)) => Ok(points(
-            flatten(values)?
-                .into_iter()
-                .map(|(key, (value, coverage))| {
-                    (key, (arithmetic(operator, value, *scalar), coverage))
-                })
-                .collect(),
-        )),
-        (PhysicalQueryOutput::Scalar(scalar), PhysicalQueryOutput::Value(values)) => Ok(points(
-            flatten(values)?
-                .into_iter()
-                .map(|(key, (value, coverage))| {
-                    (key, (arithmetic(operator, *scalar, value), coverage))
-                })
-                .collect(),
-        )),
-        (PhysicalQueryOutput::Value(left), PhysicalQueryOutput::Value(right)) => {
+        (PhysicalQueryOutput::Value(values, coverage), PhysicalQueryOutput::Scalar(scalar)) => {
+            Ok({
+                let mut output = points(
+                    flatten(values)?
+                        .into_iter()
+                        .map(|(key, (value, coverage))| {
+                            (key, (arithmetic(operator, value, *scalar), coverage))
+                        })
+                        .collect(),
+                );
+                if let PhysicalQueryOutput::Value(_, out_coverage) = &mut output {
+                    *out_coverage = *coverage;
+                }
+                output
+            })
+        }
+        (PhysicalQueryOutput::Scalar(scalar), PhysicalQueryOutput::Value(values, coverage)) => {
+            Ok({
+                let mut output = points(
+                    flatten(values)?
+                        .into_iter()
+                        .map(|(key, (value, coverage))| {
+                            (key, (arithmetic(operator, *scalar, value), coverage))
+                        })
+                        .collect(),
+                );
+                if let PhysicalQueryOutput::Value(_, out_coverage) = &mut output {
+                    *out_coverage = *coverage;
+                }
+                output
+            })
+        }
+        (
+            PhysicalQueryOutput::Value(left, left_coverage),
+            PhysicalQueryOutput::Value(right, right_coverage),
+        ) => {
             let right = flatten(right)?;
-            Ok(points(
+            let mut output = points(
                 flatten(left)?
                     .into_iter()
                     .filter_map(|(key, (left, coverage))| {
@@ -342,7 +446,11 @@ fn binary_values(
                         ))
                     })
                     .collect(),
-            ))
+            );
+            if let PhysicalQueryOutput::Value(_, coverage) = &mut output {
+                *coverage = intersect_coverage(*left_coverage, *right_coverage);
+            }
+            Ok(output)
         }
         _ => Err(PhysicalNodeError::ExpectedState),
     }
@@ -357,9 +465,10 @@ fn intersect_coverage(left: Option<(u64, u64)>, right: Option<(u64, u64)>) -> Op
 fn reduce_sum_values(
     grouping: &control_plane::query_plan::PhysicalGrouping,
     values: &[(BTreeMap<String, String>, SummaryValue)],
+    coverage: Option<(u64, u64)>,
 ) -> Result<PhysicalQueryOutput, PhysicalNodeError> {
     let control_plane::query_plan::PhysicalGrouping::Reduce(keys) = grouping else {
-        return Ok(PhysicalQueryOutput::Value(values.to_vec()));
+        return Ok(PhysicalQueryOutput::Value(values.to_vec(), coverage));
     };
     let mut groups = BTreeMap::new();
     for (labels, value) in values {
@@ -391,6 +500,7 @@ fn reduce_sum_values(
                 )
             })
             .collect(),
+        coverage,
     ))
 }
 
@@ -416,16 +526,14 @@ fn execute_physical_query_plan(
         PhysicalQueryOutput::Scalar(_) => Err(LoweringSkip::ExecuteFailed(
             "scalar-only query is not a warm vector result".into(),
         )),
-        PhysicalQueryOutput::Value(values) => {
-            let mut coverage = None;
+        PhysicalQueryOutput::Value(values, coverage) => {
             let mut series = Vec::new();
             for (group_key, value) in &values {
-                fold_coverage(&mut coverage, value.coverage());
                 series.extend(summary_value_to_series(group_key, value));
             }
             Ok(PostAsapReadoutOutcome { series, coverage })
         }
-        PhysicalQueryOutput::State(groups) => {
+        PhysicalQueryOutput::State { groups, .. } => {
             let mut coverage = None;
             let mut series = Vec::new();
             for (group_key, state) in &groups {
@@ -560,13 +668,16 @@ mod tests {
     use planner_types::pre_asap::ArithmeticOpKind;
 
     fn exact_points(metric: &str, service: &str, value: f64) -> PhysicalQueryOutput {
-        PhysicalQueryOutput::Value(vec![(
-            BTreeMap::from([
-                ("__name__".into(), metric.into()),
-                ("service".into(), service.into()),
-            ]),
-            SummaryValue::Points(vec![(2000, value)], Some((1000, 2000))),
-        )])
+        PhysicalQueryOutput::Value(
+            vec![(
+                BTreeMap::from([
+                    ("__name__".into(), metric.into()),
+                    ("service".into(), service.into()),
+                ]),
+                SummaryValue::Points(vec![(2000, value)], Some((1000, 2000))),
+            )],
+            Some((1000, 2000)),
+        )
     }
 
     // Arithmetic follows default vector matching, not positional row pairing.
@@ -574,7 +685,7 @@ mod tests {
     fn exact_binary_matches_labels_and_preserves_scalar_orientation() {
         let left = exact_points("sum", "api", 24.0);
         let right = exact_points("count", "api", 3.0);
-        let PhysicalQueryOutput::Value(result) =
+        let PhysicalQueryOutput::Value(result, _) =
             binary_values(&ArithmeticOpKind::Div, &left, &right).unwrap()
         else {
             panic!("expected vector")
@@ -588,7 +699,7 @@ mod tests {
         };
         assert_eq!(points, &vec![(2000, 8.0)]);
         assert_eq!(*coverage, Some((1000, 2000)));
-        let PhysicalQueryOutput::Value(result) = binary_values(
+        let PhysicalQueryOutput::Value(result, _) = binary_values(
             &ArithmeticOpKind::Div,
             &PhysicalQueryOutput::Scalar(48.0),
             &left,
@@ -600,7 +711,7 @@ mod tests {
             panic!("expected points")
         };
         assert_eq!(points, &vec![(2000, 2.0)]);
-        let PhysicalQueryOutput::Value(result) = binary_values(
+        let PhysicalQueryOutput::Value(result, _) = binary_values(
             &ArithmeticOpKind::Div,
             &left,
             &exact_points("count", "worker", 3.0),
@@ -616,13 +727,13 @@ mod tests {
     fn exact_binary_handles_zero_and_rejects_ambiguous_matches() {
         assert!(arithmetic(&ArithmeticOpKind::Div, 1.0, 0.0).is_infinite());
         assert!(arithmetic(&ArithmeticOpKind::Div, 0.0, 0.0).is_nan());
-        let PhysicalQueryOutput::Value(mut values) = exact_points("a", "api", 1.0) else {
+        let PhysicalQueryOutput::Value(mut values, coverage) = exact_points("a", "api", 1.0) else {
             unreachable!()
         };
         values.push(values[0].clone());
         assert!(binary_values(
             &ArithmeticOpKind::Add,
-            &PhysicalQueryOutput::Value(values),
+            &PhysicalQueryOutput::Value(values, coverage),
             &PhysicalQueryOutput::Scalar(1.0)
         )
         .is_err());
@@ -648,9 +759,10 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let PhysicalQueryOutput::Value(result) = reduce_sum_values(
+        let PhysicalQueryOutput::Value(result, _) = reduce_sum_values(
             &control_plane::query_plan::PhysicalGrouping::Reduce(vec!["service".into()]),
             &values,
+            Some((1000, 2000)),
         )
         .unwrap() else {
             panic!("expected vector")
@@ -775,6 +887,7 @@ mod tests {
             control_plane::query_plan::FallbackPolicy::ExactBackend,
             |_node, _family| {
                 Ok(control_plane::query_plan::MaterializationBinding {
+                    item_labels: Vec::new(),
                     materialization: asap_types::PolicyFingerprint(123).into(),
                     output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                     window_ms: 60_000,
@@ -928,6 +1041,7 @@ mod tests {
                     control_plane::query_plan::QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: control_plane::query_plan::MaterializationBinding {
+                            item_labels: Vec::new(),
                             materialization: policy.into(),
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 10_000,
@@ -1021,6 +1135,7 @@ mod tests {
                     control_plane::query_plan::QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: control_plane::query_plan::MaterializationBinding {
+                            item_labels: Vec::new(),
                             materialization: policy.into(),
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 60_000,
@@ -1049,5 +1164,35 @@ mod tests {
             execute_query_plan_readout(&idx, &entry, 0, 59_999, true).is_err(),
             "a partial trailing counter pane needs Prometheus boundary samples"
         );
+    }
+
+    #[test]
+    fn global_heap_items_keep_the_inner_aggregate_label_for_candidate_join() {
+        let value = SummaryValue::TopK(
+            vec![(60_000, vec![("payment".into(), 9.0), ("order".into(), 7.0)])],
+            Some((0, 60_000)),
+        );
+        let rows = expand_item_rows(&BTreeMap::new(), value, &["job".into()]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0.get("job").map(String::as_str), Some("order"));
+        assert_eq!(rows[1].0.get("job").map(String::as_str), Some("payment"));
+        assert!(rows.iter().all(|(labels, value)| {
+            !labels.contains_key("item") && matches!(value, SummaryValue::Points(_, _))
+        }));
+    }
+
+    #[test]
+    fn empty_global_heap_keeps_complete_coverage_at_actual_evaluation_phase() {
+        const EVALUATION_MS: u64 = 1_788_891_296_000;
+        let coverage = Some((EVALUATION_MS - 3_600_000 + 60_000, EVALUATION_MS));
+        let (rows, retained_coverage) = expand_item_readout(
+            &BTreeMap::new(),
+            SummaryValue::TopK(vec![(EVALUATION_MS as i64, vec![])], coverage),
+            &["job".into()],
+        )
+        .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(retained_coverage, coverage);
+        assert_eq!((EVALUATION_MS - 56_000) % 60_000, 0);
     }
 }

@@ -866,6 +866,119 @@ mod tests {
         )
     }
 
+    #[test]
+    fn global_topk_cms_routes_once_while_counters_remain_per_series() {
+        use asap_types::enums::WindowKind;
+        use asap_types::{AggregationConfig, AggregationType, KeyByLabelNames};
+
+        let config =
+            |aggregation_type, grouping: Vec<String>, aggregated: Vec<String>| AggregationConfig {
+                aggregation_type,
+                aggregation_sub_type: String::new(),
+                parameters: match aggregation_type {
+                    AggregationType::CountMinSketchWithHeap => HashMap::from([
+                        ("width".into(), serde_json::json!(128)),
+                        ("depth".into(), serde_json::json!(5)),
+                        ("heap_size".into(), serde_json::json!(2)),
+                    ]),
+                    _ => HashMap::new(),
+                },
+                grouping_labels: KeyByLabelNames::new(grouping),
+                aggregated_labels: KeyByLabelNames::new(aggregated),
+                rollup_labels: KeyByLabelNames::empty(),
+                original_yaml: String::new(),
+                window_size: 60,
+                slide_interval: 60,
+                window_type: WindowKind::Tumbling,
+                pane_origin_ms: Some(0),
+                spatial_filter: String::new(),
+                spatial_filter_normalized: String::new(),
+                metric: "cpu_seconds_total".into(),
+                num_aggregates_to_retain: Some(80),
+                table_name: None,
+                value_column: None,
+            };
+        let cms = config(
+            AggregationType::CountMinSketchWithHeap,
+            vec![],
+            vec!["job".into()],
+        );
+        let counter = config(AggregationType::Increase, vec!["job".into()], vec![]);
+        let cms_fp = cms.policy_fingerprint();
+        let counter_fp = counter.policy_fingerprint();
+        let streaming =
+            StreamingConfig::new(HashMap::from([(cms_fp.0, cms), (counter_fp.0, counter)]));
+        let hot_reload = physical_config(streaming);
+        let physical_plan = hot_reload.physical_plan_snapshot().unwrap();
+        let (sender, _worker) = mpsc::channel(8);
+        let ingest = Arc::new(IngestState {
+            router: SeriesRouter::new(vec![sender]),
+            samples_ingested: AtomicU64::new(0),
+            samples_blocked_by_schema_barrier: AtomicU64::new(0),
+            hot_reload_config: hot_reload,
+            pass_raw_samples: false,
+            sketch_snapshots: dashmap::DashMap::new(),
+            series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
+            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            observability: IngestObservability::default(),
+        });
+        let request = WriteRequest {
+            timeseries: ["api", "order", "payment", "user", "webapp"]
+                .into_iter()
+                .flat_map(|job| {
+                    ["a", "b"].into_iter().map(move |instance| TimeSeries {
+                        labels: vec![
+                            Label {
+                                name: "__name__".into(),
+                                value: "cpu_seconds_total".into(),
+                            },
+                            Label {
+                                name: "job".into(),
+                                value: job.into(),
+                            },
+                            Label {
+                                name: "instance".into(),
+                                value: instance.into(),
+                            },
+                        ],
+                        samples: vec![Sample {
+                            value: 1.0,
+                            timestamp: 1_000,
+                        }],
+                        exemplars: Vec::new(),
+                        histograms: Vec::new(),
+                    })
+                })
+                .collect(),
+        };
+        let samples = canonicalize_request(&request, &PrometheusRemoteWriteConfig::default())
+            .expect("canonical samples");
+        let messages = route_messages(&samples, &ingest, &physical_plan);
+        let mut cms_buckets = 0;
+        let mut counter_buckets = 0;
+        let mut cms_samples = 0;
+        for message in messages {
+            let WorkerMessage::GroupSamples {
+                policy_fp, samples, ..
+            } = message
+            else {
+                panic!("route emits only group samples")
+            };
+            if policy_fp == cms_fp {
+                cms_buckets += 1;
+                cms_samples += samples.len();
+            } else if policy_fp == counter_fp {
+                counter_buckets += 1;
+            }
+        }
+        assert_eq!(cms_buckets, 1, "Reduce([]) has one global CMS SID");
+        assert_eq!(cms_samples, 10, "global CMS receives every source series");
+        assert_eq!(
+            counter_buckets, 10,
+            "reset-aware counters remain series scoped"
+        );
+    }
+
     fn one_sample(value: f64) -> Vec<u8> {
         compressed(WriteRequest {
             timeseries: vec![TimeSeries {
