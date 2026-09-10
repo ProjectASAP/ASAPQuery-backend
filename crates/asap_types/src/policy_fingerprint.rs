@@ -114,6 +114,10 @@ impl PolicyFingerprint {
         }
         buf.push(0);
 
+        if let Some(partitioning) = cfg.partitioning {
+            buf.extend_from_slice(format!("partition:{partitioning:?}\0").as_bytes());
+        }
+
         // 5. grouping_labels (already sorted at construction per
         //    KeyByLabelNames invariant; encode as `,`-joined list)
         for l in &cfg.grouping_labels.labels {
