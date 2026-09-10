@@ -123,7 +123,8 @@ impl SummaryCatalog {
                     crate::utils::normalize_spatial_filter(&config.spatial_filter),
                     config.grouping_labels.labels.clone(),
                     "asap.timestamped-observations.v2",
-                );
+                )
+                .with_partitioning(config.partitioning);
                 Ok((
                     config.policy_fingerprint(),
                     summary,

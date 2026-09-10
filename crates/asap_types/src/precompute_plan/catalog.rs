@@ -86,7 +86,8 @@ impl PrecomputePlan {
                 .map_or(ValueProjectionIdentity::SampleValue, |name| {
                     ValueProjectionIdentity::Column { name: name.clone() }
                 });
-            if data.source != expected_source
+            if data.partitioning != config.partitioning
+                || data.source != expected_source
                 || data.value_projection != expected_projection
                 || data.population_filter_canonical
                     != crate::utils::normalize_spatial_filter(&config.spatial_filter)
