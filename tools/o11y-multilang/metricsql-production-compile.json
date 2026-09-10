@@ -1,0 +1,199 @@
+{
+  "queries": [
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: function `sort_desc`",
+        "status": "not_reached"
+      },
+      "id": "q01"
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+        "status": "not_reached"
+      },
+      "id": "q02"
+    },
+    {
+      "compile": {
+        "status": "pass"
+      },
+      "id": "q03",
+      "publication": {
+        "reason": null,
+        "status": "pass"
+      }
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: offset and @ modifiers",
+        "status": "not_reached"
+      },
+      "id": "q04"
+    },
+    {
+      "compile": {
+        "reason": "query compat-query-0: lifecycle planning failed: no complete executor-feasible window implementation evidence",
+        "status": "typed_fallback"
+      },
+      "id": "q05"
+    },
+    {
+      "compile": {
+        "reason": "query compat-query-0: lifecycle planning failed: no complete executor-feasible window implementation evidence",
+        "status": "typed_fallback"
+      },
+      "id": "q06"
+    },
+    {
+      "compile": {
+        "reason": "ASAPPlanner produced no legal summary candidate for the target",
+        "status": "typed_fallback"
+      },
+      "id": "q07"
+    },
+    {
+      "compile": {
+        "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+        "status": "not_reached"
+      },
+      "id": "q08"
+    },
+    {
+      "compile": {
+        "reason": "query compat-query-0: instantaneous sample selection is not a temporal accumulator readout",
+        "status": "typed_fallback"
+      },
+      "id": "q09"
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: subquery step or inherited step",
+        "status": "not_reached"
+      },
+      "id": "q10"
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+        "status": "not_reached"
+      },
+      "id": "q11"
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+        "status": "not_reached"
+      },
+      "id": "q12"
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: subquery step or inherited step",
+        "status": "not_reached"
+      },
+      "id": "q13"
+    },
+    {
+      "compile": {
+        "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+        "status": "not_reached"
+      },
+      "id": "q14"
+    },
+    {
+      "compile": {
+        "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+        "status": "not_reached"
+      },
+      "id": "q15"
+    },
+    {
+      "compile": {
+        "status": "pass"
+      },
+      "id": "q16",
+      "publication": {
+        "reason": null,
+        "status": "pass"
+      }
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+        "status": "not_reached"
+      },
+      "id": "q17"
+    },
+    {
+      "compile": {
+        "reason": "ASAPPlanner produced no legal summary candidate for the target",
+        "status": "typed_fallback"
+      },
+      "id": "q18"
+    },
+    {
+      "compile": {
+        "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+        "status": "not_reached"
+      },
+      "id": "q19"
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: offset and @ modifiers",
+        "status": "not_reached"
+      },
+      "id": "q20"
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: function `histogram_quantile`",
+        "status": "not_reached"
+      },
+      "id": "q21"
+    },
+    {
+      "compile": {
+        "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+        "status": "not_reached"
+      },
+      "id": "q22"
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+        "status": "not_reached"
+      },
+      "id": "q23"
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: subquery step or inherited step",
+        "status": "not_reached"
+      },
+      "id": "q24"
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+        "status": "not_reached"
+      },
+      "id": "q25"
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+        "status": "not_reached"
+      },
+      "id": "q26"
+    },
+    {
+      "compile": {
+        "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+        "status": "not_reached"
+      },
+      "id": "q27"
+    }
+  ]
+}

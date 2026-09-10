@@ -5,7 +5,9 @@
     "exact_sql_differential": "27/27",
     "metricsql_parser_pass": 12,
     "metricsql_planner_pass": 7,
-    "sql_acceleration_frontend_pass": 0
+    "sql_acceleration_frontend_pass": 0,
+    "metricsql_compiler_pass": 2,
+    "metricsql_publication_serialization_pass": 2
   },
   "queries": [
     {
@@ -38,6 +40,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: function `sort_desc`",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -100,6 +106,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -148,7 +158,8 @@
             "status": "pass"
           },
           "publication": {
-            "status": "pending_compiler_fixture"
+            "reason": null,
+            "status": "pass"
           },
           "validator": {
             "status": "not_reached"
@@ -161,6 +172,9 @@
           },
           "fallback": {
             "status": "coverage_dependent"
+          },
+          "compiler": {
+            "status": "pass"
           }
         },
         "clickhouse_sql": {
@@ -224,6 +238,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: offset and @ modifiers",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -270,7 +288,7 @@
             "status": "pass"
           },
           "publication": {
-            "status": "pending_compiler_fixture"
+            "status": "not_reached"
           },
           "validator": {
             "status": "not_reached"
@@ -283,6 +301,10 @@
           },
           "fallback": {
             "status": "coverage_dependent"
+          },
+          "compiler": {
+            "reason": "query compat-query-0: lifecycle planning failed: no complete executor-feasible window implementation evidence",
+            "status": "typed_fallback"
           }
         },
         "clickhouse_sql": {
@@ -329,7 +351,7 @@
             "status": "pass"
           },
           "publication": {
-            "status": "pending_compiler_fixture"
+            "status": "not_reached"
           },
           "validator": {
             "status": "not_reached"
@@ -342,6 +364,10 @@
           },
           "fallback": {
             "status": "coverage_dependent"
+          },
+          "compiler": {
+            "reason": "query compat-query-0: lifecycle planning failed: no complete executor-feasible window implementation evidence",
+            "status": "typed_fallback"
           }
         },
         "clickhouse_sql": {
@@ -386,7 +412,7 @@
             "status": "pass"
           },
           "publication": {
-            "status": "pending_compiler_fixture"
+            "status": "not_reached"
           },
           "validator": {
             "status": "not_reached"
@@ -399,6 +425,10 @@
           },
           "fallback": {
             "status": "coverage_dependent"
+          },
+          "compiler": {
+            "reason": "ASAPPlanner produced no legal summary candidate for the target",
+            "status": "typed_fallback"
           }
         },
         "clickhouse_sql": {
@@ -460,6 +490,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -506,7 +540,7 @@
             "status": "pass"
           },
           "publication": {
-            "status": "pending_compiler_fixture"
+            "status": "not_reached"
           },
           "validator": {
             "status": "not_reached"
@@ -519,6 +553,10 @@
           },
           "fallback": {
             "status": "coverage_dependent"
+          },
+          "compiler": {
+            "reason": "query compat-query-0: instantaneous sample selection is not a temporal accumulator readout",
+            "status": "typed_fallback"
           }
         },
         "clickhouse_sql": {
@@ -581,6 +619,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: subquery step or inherited step",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -642,6 +684,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -702,6 +748,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -765,6 +815,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: subquery step or inherited step",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -826,6 +880,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -886,6 +944,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -934,7 +996,8 @@
             "status": "pass"
           },
           "publication": {
-            "status": "pending_compiler_fixture"
+            "reason": null,
+            "status": "pass"
           },
           "validator": {
             "status": "not_reached"
@@ -947,6 +1010,9 @@
           },
           "fallback": {
             "status": "coverage_dependent"
+          },
+          "compiler": {
+            "status": "pass"
           }
         },
         "clickhouse_sql": {
@@ -1009,6 +1075,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -1056,7 +1126,7 @@
             "status": "pass"
           },
           "publication": {
-            "status": "pending_compiler_fixture"
+            "status": "not_reached"
           },
           "validator": {
             "status": "not_reached"
@@ -1069,6 +1139,10 @@
           },
           "fallback": {
             "status": "coverage_dependent"
+          },
+          "compiler": {
+            "reason": "ASAPPlanner produced no legal summary candidate for the target",
+            "status": "typed_fallback"
           }
         },
         "clickhouse_sql": {
@@ -1130,6 +1204,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -1192,6 +1270,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: offset and @ modifiers",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -1253,6 +1335,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: function `histogram_quantile`",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -1314,6 +1400,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -1375,6 +1465,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -1439,6 +1533,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: subquery step or inherited step",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -1503,6 +1601,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -1564,6 +1666,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
@@ -1626,6 +1732,10 @@
           },
           "fallback": {
             "status": "required"
+          },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
           }
         },
         "clickhouse_sql": {
