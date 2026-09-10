@@ -119,6 +119,45 @@ struct Args {
     #[arg(long, env = "ASAP_CLICKHOUSE_PLAN_TOKEN")]
     clickhouse_plan_token: Option<String>,
 
+    /// Enable ClickHouse as a source for queued backfill jobs whose source URL
+    /// is `clickhouse://configured`.
+    #[arg(long, env = "ASAP_CLICKHOUSE_BACKFILL_TABLE")]
+    clickhouse_backfill_table: Option<String>,
+    #[arg(
+        long,
+        env = "ASAP_CLICKHOUSE_BACKFILL_DATABASE",
+        default_value = "default"
+    )]
+    clickhouse_backfill_database: String,
+    #[arg(
+        long,
+        env = "ASAP_CLICKHOUSE_BACKFILL_METRIC_COLUMN",
+        default_value = "metric"
+    )]
+    clickhouse_backfill_metric_column: String,
+    #[arg(
+        long,
+        env = "ASAP_CLICKHOUSE_BACKFILL_LABELS_COLUMN",
+        default_value = "labels"
+    )]
+    clickhouse_backfill_labels_column: String,
+    #[arg(
+        long,
+        env = "ASAP_CLICKHOUSE_BACKFILL_TIMESTAMP_COLUMN",
+        default_value = "timestamp_ms"
+    )]
+    clickhouse_backfill_timestamp_column: String,
+    #[arg(
+        long,
+        env = "ASAP_CLICKHOUSE_BACKFILL_VALUE_COLUMN",
+        default_value = "value"
+    )]
+    clickhouse_backfill_value_column: String,
+    #[arg(long, env = "ASAP_CLICKHOUSE_USER")]
+    clickhouse_user: Option<String>,
+    #[arg(long, env = "ASAP_CLICKHOUSE_PASSWORD")]
+    clickhouse_password: Option<String>,
+
     /// Deprecated/no-op: the backend's only HTTP listener is the
     /// PromQL query surface (`--http-port` / `--query-port`). The
     /// old PRW ingest port was deleted in PR #100; this flag is
@@ -1251,10 +1290,26 @@ async fn main() -> Result<()> {
         // Schema retirement #5 — `BackfillService::new` no longer
         // takes a `SchemaRegistry`; it consults sid-level lifecycle on
         // `SketchStore` instead.
+        let reader_factory = match args.clickhouse_backfill_table.as_ref() {
+            Some(table) => data_plane::storage_engines::sketch_db::clickhouse_reader_factory(
+                data_plane::storage_engines::sketch_db::ClickHouseReaderConfig {
+                    base_url: args.clickhouse_url.clone(),
+                    database: args.clickhouse_backfill_database.clone(),
+                    table: table.clone(),
+                    metric_column: args.clickhouse_backfill_metric_column.clone(),
+                    labels_column: args.clickhouse_backfill_labels_column.clone(),
+                    timestamp_ms_column: args.clickhouse_backfill_timestamp_column.clone(),
+                    value_column: args.clickhouse_backfill_value_column.clone(),
+                    user: args.clickhouse_user.clone(),
+                    password: args.clickhouse_password.clone(),
+                },
+            ),
+            None => data_plane::storage_engines::sketch_db::default_reader_factory(),
+        };
         let service = data_plane::storage_engines::sketch_db::BackfillService::new(
             backfill_registry.clone(),
             hot_reload_config.clone(),
-            data_plane::storage_engines::sketch_db::default_reader_factory(),
+            reader_factory,
             data_plane::storage_engines::sketch_db::BackfillServiceConfig::default(),
         )
         // M2.3.6e — replayed batches land in SketchStore (the only

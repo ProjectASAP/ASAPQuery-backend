@@ -46,6 +46,28 @@ pub enum ClickHouseAccelerationFallback {
     UnsupportedFormat(String),
 }
 
+impl ClickHouseAccelerationFallback {
+    pub fn stage(&self) -> &'static str {
+        match self {
+            Self::CatalogMiss => "publication",
+            Self::Planning(_) => "planner",
+            Self::Execution(_) => "executor",
+            Self::IncompleteCoverage => "validator",
+            Self::UnsupportedFormat(_) => "adapter",
+        }
+    }
+
+    pub fn reason_code(&self) -> &'static str {
+        match self {
+            Self::CatalogMiss => "catalog_miss",
+            Self::Planning(_) => "planning_failed",
+            Self::Execution(_) => "execution_failed",
+            Self::IncompleteCoverage => "incomplete_coverage",
+            Self::UnsupportedFormat(_) => "unsupported_format",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum ClickHouseAccelerationOutcome {
     Accelerated(ClickHouseRawResponse),
@@ -518,10 +540,13 @@ async fn query_post(
 }
 
 async fn execute_or_fallback(state: &ServerState, request: &ClickHouseQueryRequest) -> Response {
-    if let ClickHouseAccelerationOutcome::Accelerated(response) =
-        state.accelerator.execute(request).await
-    {
-        return raw_response(response);
+    match state.accelerator.execute(request).await {
+        ClickHouseAccelerationOutcome::Accelerated(response) => return raw_response(response),
+        ClickHouseAccelerationOutcome::Fallback(reason) => tracing::info!(
+            failure_stage = reason.stage(),
+            failure_reason = reason.reason_code(),
+            "ClickHouse acceleration routed to exact fallback"
+        ),
     }
     match state.fallback.execute(request).await {
         Ok(v) => raw_response(v),

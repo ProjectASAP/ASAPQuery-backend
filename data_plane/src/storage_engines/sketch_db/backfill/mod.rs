@@ -1451,7 +1451,7 @@ pub mod service;
 pub mod window_builder;
 pub mod worker;
 
-pub use clickhouse_reader::{ClickHouseReader, ClickHouseReaderConfig};
+pub use clickhouse_reader::{clickhouse_reader_factory, ClickHouseReader, ClickHouseReaderConfig};
 pub use processor::BackfillWindowProcessor;
 pub use prometheus_reader::PrometheusReader;
 pub use raw_sample_reader::{

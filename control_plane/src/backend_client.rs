@@ -101,6 +101,45 @@ pub struct BackendClient {
 }
 
 impl BackendClient {
+    /// Publish one compiler-produced ClickHouse SQL catalog generation and
+    /// activate it only after the backend acknowledges staging.
+    pub async fn publish_clickhouse_plan<T: serde::Serialize>(
+        endpoint: &str,
+        token: Option<&str>,
+        bundle: &T,
+        plan_id: u64,
+        plan_version: u64,
+    ) -> Result<()> {
+        let http = Client::builder().timeout(Duration::from_secs(10)).build()?;
+        let base = endpoint.trim_end_matches('/');
+        let authorize = |request: reqwest::RequestBuilder| match token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        };
+        let staged = authorize(http.post(format!("{base}/api/v1/clickhouse-plan/stage")))
+            .json(bundle)
+            .send()
+            .await
+            .context("stage ClickHouse SQL plan")?;
+        if !staged.status().is_success() {
+            anyhow::bail!(
+                "ClickHouse SQL stage rejected: {}",
+                staged.text().await.unwrap_or_default()
+            );
+        }
+        let active = authorize(http.post(format!("{base}/api/v1/clickhouse-plan/activate")))
+            .json(&serde_json::json!({"plan_id": plan_id, "plan_version": plan_version}))
+            .send()
+            .await
+            .context("activate ClickHouse SQL plan")?;
+        if !active.status().is_success() {
+            anyhow::bail!(
+                "ClickHouse SQL activation rejected: {}",
+                active.text().await.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
     /// Construct a client pointing at the backend's plan-push endpoint.
     /// `endpoint` should be the full URL, e.g.
     /// `http://backend.svc:8088/api/v1/streaming-config`.
@@ -838,5 +877,49 @@ mod tests {
         assert!(result.is_err(), "expected error on 500, got {result:?}");
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("500"), "error msg should mention 500: {msg}");
+    }
+
+    #[tokio::test]
+    async fn clickhouse_publication_stages_then_activates_with_bearer_auth() {
+        use axum::{http::HeaderMap, routing::post, Json, Router};
+        let calls = StdArc::new(Mutex::new(Vec::new()));
+        let stage_calls = calls.clone();
+        let activate_calls = calls.clone();
+        let app = Router::new()
+            .route(
+                "/api/v1/clickhouse-plan/stage",
+                post(move |headers: HeaderMap| {
+                    let calls = stage_calls.clone();
+                    async move {
+                        assert_eq!(headers["authorization"], "Bearer secret");
+                        calls.lock().unwrap().push("stage");
+                        Json(serde_json::json!({"phase":"staged"}))
+                    }
+                }),
+            )
+            .route(
+                "/api/v1/clickhouse-plan/activate",
+                post(move |headers: HeaderMap| {
+                    let calls = activate_calls.clone();
+                    async move {
+                        assert_eq!(headers["authorization"], "Bearer secret");
+                        calls.lock().unwrap().push("activate");
+                        Json(serde_json::json!({"phase":"active"}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        BackendClient::publish_clickhouse_plan(
+            &format!("http://{address}"),
+            Some("secret"),
+            &serde_json::json!({"bundle": true}),
+            7,
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec!["stage", "activate"]);
     }
 }

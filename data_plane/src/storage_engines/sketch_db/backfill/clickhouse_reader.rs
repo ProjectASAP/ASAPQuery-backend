@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use super::raw_sample_reader::{LabelFilter, RawSample, RawSampleReader, RawSampleReaderError};
+use super::{BackfillSource, ReaderFactory};
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct ClickHouseReaderConfig {
@@ -78,6 +80,20 @@ impl ClickHouseReader {
             metric = c.metric_column,
         )
     }
+}
+
+/// Adds ClickHouse to the existing backfill lifecycle without extending the
+/// shared `BackfillSource` enum. Jobs opt in with the reserved
+/// `Prometheus { url: "clickhouse://configured" }` source marker; all other
+/// sources retain the default factory behavior.
+pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactory {
+    let fallback = super::service::default_reader_factory();
+    Arc::new(move |source| match source {
+        BackfillSource::Prometheus { url } if url == "clickhouse://configured" => {
+            Ok(Arc::new(ClickHouseReader::new(config.clone())?) as Arc<dyn RawSampleReader>)
+        }
+        source => fallback(source),
+    })
 }
 
 #[async_trait]
@@ -168,5 +184,15 @@ mod tests {
         let sql = reader.sql();
         assert!(sql.contains("metric = {metric:String}"));
         assert!(sql.contains("FORMAT JSONEachRow"));
+    }
+
+    #[test]
+    fn configured_source_marker_enters_clickhouse_backfill_lifecycle() {
+        let factory = clickhouse_reader_factory(config("samples"));
+        let reader = factory(&BackfillSource::Prometheus {
+            url: "clickhouse://configured".into(),
+        })
+        .unwrap();
+        assert_eq!(reader.source_name(), "ClickHouseReader");
     }
 }
