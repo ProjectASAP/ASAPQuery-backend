@@ -4659,6 +4659,9 @@ mod tests {
             cpu_weight: 1.0,
             byte_second_weight: 1e-9,
             mode: super::super::erp::ErpAccuracyMode::Hybrid,
+            observed_shape: None,
+            observed_shape_source: None,
+            shape_match: None,
             runtime: super::super::erp::ErpRuntimeCapabilities {
                 allowed_algorithms: vec![SketchAlgorithm::Hll],
                 max_memory_bytes: None,
@@ -4705,6 +4708,9 @@ mod tests {
             cpu_weight: 1.0,
             byte_second_weight: 1e-9,
             mode: ErpAccuracyMode::Hybrid,
+            observed_shape: None,
+            observed_shape_source: None,
+            shape_match: None,
             runtime: ErpRuntimeCapabilities {
                 allowed_algorithms: vec![SketchAlgorithm::Kll],
                 max_memory_bytes: None,

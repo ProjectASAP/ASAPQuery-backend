@@ -39,7 +39,7 @@ chrono      = { version = "0.4",  features = ["serde"] }
 # alias this repo doesn't reference. Dropping this private-fork pin in
 # favor of the public 0.10 release is a reasonable follow-up but is out
 # of scope for the ASAPController -> ASAPPlanner pin migration.
-promql-parser  = { git = "https://github.com/ProjectASAP/promql-parser", rev = "c51beafb361af4cc95ed62ae377862c660ceb757" }
+promql-parser  = { git = "https://github.com/ProjectASAP/promql-parser", rev = "628e1e99a5887527d2e38d25e672116edc56da6c" }
 prost          = "0.13"
 bytes          = "1"
 zstd           = "0.13"
@@ -91,8 +91,8 @@ asap_types.workspace = true
 # scaffolding, unaware that `data_plane`'s `summary_executor.rs` in *this*
 # repo is a real one. Vendored locally instead of chased upstream -- see
 # `data_plane/src/query_engines/asap_query_engine/summary_exec.rs`.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3dda28032c2a2badb64bf5358e0f40fef9918227" }
-asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3dda28032c2a2badb64bf5358e0f40fef9918227" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "628e1e99a5887527d2e38d25e672116edc56da6c" }
+asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "628e1e99a5887527d2e38d25e672116edc56da6c" }
 
 # L1 adoption (design-target-architecture.md Part B): the PromQL front
 # end itself, replacing control_plane's own query_parser/promql.rs.
@@ -100,9 +100,9 @@ asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev =
 # `planner-types`/`asap-aware-mapping` above -- these three MUST move
 # together (two revs of the same upstream repo's types in one workspace
 # resolve to distinct Rust types that won't unify).
-asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3dda28032c2a2badb64bf5358e0f40fef9918227" }
-asap-frontend-metricsql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3dda28032c2a2badb64bf5358e0f40fef9918227" }
-asap-frontend-sql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "3dda28032c2a2badb64bf5358e0f40fef9918227" }
+asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "628e1e99a5887527d2e38d25e672116edc56da6c" }
+asap-frontend-metricsql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "628e1e99a5887527d2e38d25e672116edc56da6c" }
+asap-frontend-sql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "628e1e99a5887527d2e38d25e672116edc56da6c" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
