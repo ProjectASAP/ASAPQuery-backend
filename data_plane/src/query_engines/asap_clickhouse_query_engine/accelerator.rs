@@ -9,8 +9,11 @@ use std::sync::Arc;
 
 use super::{
     clickhouse_result_adapter::ClickHouseFormat,
-    execution::{execute_sql_dag, ClickHouseDagFallback, ClickHouseDagOutcome},
-    fallback::ClickHouseRawResponse,
+    execution::{
+        execute_sql_dag_with_external, ClickHouseDagFallback, ClickHouseDagOutcome,
+        PreparedSqlLeaves,
+    },
+    fallback::{ClickHouseExactBackend, ClickHouseRawResponse},
     request::ClickHouseQueryRequest,
     server::{
         ClickHouseAccelerationFallback, ClickHouseAccelerationOutcome, ClickHouseAccelerator,
@@ -21,6 +24,7 @@ use crate::storage_engines::sketch_db::index::SketchStore;
 pub struct CatalogClickHouseAccelerator {
     pub store: Arc<SketchStore>,
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
+    exact_backend: Option<Arc<dyn ClickHouseExactBackend>>,
 }
 
 impl CatalogClickHouseAccelerator {
@@ -28,6 +32,7 @@ impl CatalogClickHouseAccelerator {
         Self {
             store,
             active_physical_plan: None,
+            exact_backend: None,
         }
     }
 
@@ -38,6 +43,71 @@ impl CatalogClickHouseAccelerator {
         let mut accelerator = Self::empty(store);
         accelerator.active_physical_plan = Some(active);
         accelerator
+    }
+
+    pub fn with_exact_backend(mut self, exact_backend: Arc<dyn ClickHouseExactBackend>) -> Self {
+        self.exact_backend = Some(exact_backend);
+        self
+    }
+
+    async fn prepare_external_sql(
+        &self,
+        entry: &control_plane::query_plan::QueryPlanEntry,
+        start_ms: u64,
+        end_ms: u64,
+    ) -> Result<PreparedSqlLeaves, String> {
+        let mut prepared = PreparedSqlLeaves::new();
+        let external = entry
+            .nodes
+            .iter()
+            .filter_map(|(id, node)| match node {
+                control_plane::query_plan::QueryPlanNode::ExternalSqlLeaf { query } => {
+                    Some((*id, query))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if external.is_empty() {
+            return Ok(prepared);
+        }
+        let backend = self
+            .exact_backend
+            .as_ref()
+            .ok_or_else(|| "ClickHouse exact subtree endpoint unavailable".to_owned())?;
+        for (id, bound) in external {
+            let mut parameters = bound.parameters.clone();
+            if let Some(name) = &bound.start_parameter {
+                parameters.insert(format!("param_{name}"), start_ms.to_string());
+            }
+            if let Some(name) = &bound.end_parameter {
+                parameters.insert(format!("param_{name}"), end_ms.to_string());
+            }
+            parameters.insert("default_format".into(), "JSONCompact".into());
+            let request = ClickHouseQueryRequest {
+                method: axum::http::Method::POST,
+                sql: bound.sql.clone(),
+                body: Bytes::from(bound.sql.clone()),
+                parameters,
+                headers: HeaderMap::new(),
+            };
+            let response = backend
+                .execute(&request)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !response.status.is_success() {
+                return Err(format!(
+                    "ClickHouse external subtree returned HTTP {}",
+                    response.status
+                ));
+            }
+            let relation = super::relational_adapter::ClickHouseRelation::from_json_compact(
+                &bound.output_schema,
+                &response.body,
+            )
+            .map_err(|error| error.to_string())?;
+            prepared.insert(id, relation);
+        }
+        Ok(prepared)
     }
 }
 
@@ -109,10 +179,22 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                 ),
             );
         };
-        match execute_sql_dag(
+        let prepared = match self
+            .prepare_external_sql(entry, range.start_ms, range.end_ms)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return ClickHouseAccelerationOutcome::Fallback(
+                    ClickHouseAccelerationFallback::Execution(error),
+                )
+            }
+        };
+        match execute_sql_dag_with_external(
             self.store.as_ref(),
             entry,
             catalog.as_ref(),
+            &prepared,
             range.start_ms,
             range.end_ms,
             range.cumulative,
@@ -179,6 +261,35 @@ mod tests {
         collections::{BTreeMap, BTreeSet, HashMap},
         rc::Rc,
     };
+
+    struct FixedExactSubtree;
+
+    #[async_trait]
+    impl ClickHouseExactBackend for FixedExactSubtree {
+        async fn execute(
+            &self,
+            request: &ClickHouseQueryRequest,
+        ) -> Result<ClickHouseRawResponse, super::super::fallback::ClickHouseFallbackError>
+        {
+            assert_eq!(request.sql, "SELECT 2000 AS timestamp, 10.0 AS divisor");
+            assert_eq!(request.parameters.get("param_from"), Some(&"0".into()));
+            assert_eq!(request.parameters.get("param_to"), Some(&"2000".into()));
+            Ok(ClickHouseRawResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: Bytes::from_static(
+                    br#"{"meta":[{"name":"timestamp","type":"Int64"},{"name":"divisor","type":"Float64"}],"data":[[2000,10.0]],"rows":1}"#,
+                ),
+            })
+        }
+
+        async fn ping(
+            &self,
+        ) -> Result<ClickHouseRawResponse, super::super::fallback::ClickHouseFallbackError>
+        {
+            unreachable!()
+        }
+    }
 
     fn relation_schema(names: &[(&str, DataType)]) -> SummarySchema {
         SummarySchema {
@@ -496,6 +607,119 @@ mod tests {
                 ClickHouseAccelerationFallback::IncompleteCoverage
             )
         ));
+    }
+
+    #[tokio::test]
+    async fn prepared_clickhouse_leaf_joins_summary_and_feeds_project() {
+        use control_plane::query_plan::BoundClickHouseQuery;
+
+        let (accelerator, _) = fixture(2_000).await;
+        let physical = accelerator
+            .active_physical_plan
+            .as_ref()
+            .unwrap()
+            .snapshot();
+        let mut entry = physical.query_plan.entries.values().next().unwrap().clone();
+        let left = QueryNodeId(1);
+        let external = QueryNodeId(6);
+        let join = QueryNodeId(7);
+        let project = QueryNodeId(8);
+        let left_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("value", DataType::Float64),
+        ]);
+        let right_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("divisor", DataType::Float64),
+        ]);
+        let joined_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("value", DataType::Float64),
+            ("timestamp", DataType::Timestamp),
+            ("divisor", DataType::Float64),
+        ]);
+        let output_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("ratio", DataType::Float64),
+        ]);
+        entry
+            .nodes
+            .retain(|id, _| *id == QueryNodeId(0) || *id == left);
+        entry.nodes.insert(
+            external,
+            QueryPlanNode::ExternalSqlLeaf {
+                query: BoundClickHouseQuery {
+                    sql: "SELECT 2000 AS timestamp, 10.0 AS divisor".into(),
+                    parameters: BTreeMap::new(),
+                    start_parameter: Some("from".into()),
+                    end_parameter: Some("to".into()),
+                    output_schema: right_schema.clone(),
+                },
+            },
+        );
+        entry.nodes.insert(
+            join,
+            QueryPlanNode::RelationalJoin {
+                inputs: [left, external],
+                join_kind: planner_types::pre_asap::JoinKind::Inner,
+                pred: serde_json::to_value(Predicate(Rc::new(QueryExpr::Compare {
+                    left: Rc::new(QueryExpr::Column(0)),
+                    op: CompareOpKind::Eq,
+                    right: Rc::new(QueryExpr::Column(2)),
+                })))
+                .unwrap(),
+                left_schema,
+                right_schema,
+                output_schema: joined_schema.clone(),
+            },
+        );
+        entry.nodes.insert(
+            project,
+            QueryPlanNode::Relational {
+                input: join,
+                operation: serde_json::to_value(ValueOperation::Project {
+                    cols: vec![
+                        ProjectItem {
+                            alias: Some("timestamp".into()),
+                            expr: QueryExpr::Column(0),
+                        },
+                        ProjectItem {
+                            alias: Some("ratio".into()),
+                            expr: QueryExpr::Arithmetic {
+                                op: ArithmeticOpKind::Div,
+                                left: Rc::new(QueryExpr::Column(1)),
+                                right: Rc::new(QueryExpr::Column(3)),
+                            },
+                        },
+                    ],
+                    qualifier: None,
+                })
+                .unwrap(),
+                input_schema: joined_schema,
+                output_schema,
+            },
+        );
+        entry.root = project;
+        let accelerator = accelerator.with_exact_backend(Arc::new(FixedExactSubtree));
+        let prepared = accelerator
+            .prepare_external_sql(&entry, 0, 2_000)
+            .await
+            .unwrap();
+        let ClickHouseDagOutcome::Accelerated(result) = execute_sql_dag_with_external(
+            accelerator.store.as_ref(),
+            &entry,
+            physical.summary_catalog.as_ref().unwrap(),
+            &prepared,
+            0,
+            2_000,
+            true,
+        ) else {
+            panic!("mixed DAG should execute")
+        };
+        assert_eq!(
+            String::from_utf8(result.encode(ClickHouseFormat::TabSeparated).unwrap()).unwrap(),
+            "1970-01-01T00:00:02\t0.5\n"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -46,7 +46,44 @@ enum Cell {
     Timestamp(i64),
 }
 
-#[derive(Debug)]
+fn cells_equal(left: &Cell, right: &Cell) -> bool {
+    match (left, right) {
+        (Cell::Null, _) | (_, Cell::Null) => false,
+        (Cell::Int64(left), Cell::Int64(right)) => left == right,
+        (Cell::Float64(left), Cell::Float64(right)) => left.to_bits() == right.to_bits(),
+        (Cell::Utf8(left), Cell::Utf8(right)) => left == right,
+        (Cell::Bool(left), Cell::Bool(right)) => left == right,
+        (Cell::Timestamp(left), Cell::Timestamp(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn json_cell(
+    value: &serde_json::Value,
+    dtype: &DataType,
+    nullable: bool,
+) -> Result<Cell, ClickHouseRelationalError> {
+    if value.is_null() && nullable {
+        return Ok(Cell::Null);
+    }
+    let invalid = || {
+        ClickHouseRelationalError::Invalid(format!(
+            "external value {value} does not match {dtype:?}"
+        ))
+    };
+    match dtype {
+        DataType::Int64 => value.as_i64().map(Cell::Int64).ok_or_else(invalid),
+        DataType::Float64 => value.as_f64().map(Cell::Float64).ok_or_else(invalid),
+        DataType::Utf8 => value
+            .as_str()
+            .map(|value| Cell::Utf8(value.into()))
+            .ok_or_else(invalid),
+        DataType::Bool => value.as_bool().map(Cell::Bool).ok_or_else(invalid),
+        DataType::Timestamp => value.as_i64().map(Cell::Timestamp).ok_or_else(invalid),
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct ClickHouseRelation {
     rows: Vec<Vec<Cell>>,
     fields: Vec<(String, DataType, bool)>,
@@ -54,6 +91,73 @@ pub struct ClickHouseRelation {
 }
 
 impl ClickHouseRelation {
+    pub fn from_json_compact(
+        schema: &SummarySchema,
+        body: &[u8],
+    ) -> Result<Self, ClickHouseRelationalError> {
+        let document: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?;
+        let meta = document
+            .get("meta")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                ClickHouseRelationalError::Invalid(
+                    "ClickHouse JSONCompact response has no typed metadata".into(),
+                )
+            })?;
+        let data = document
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                ClickHouseRelationalError::Invalid(
+                    "ClickHouse JSONCompact response has no data rows".into(),
+                )
+            })?;
+        let fields = fields_from_schema(schema);
+        if meta.len() != fields.len()
+            || meta
+                .iter()
+                .zip(&fields)
+                .any(|(actual, (name, dtype, nullable))| {
+                    actual.get("name").and_then(serde_json::Value::as_str) != Some(name)
+                        || !clickhouse_type_matches(
+                            actual.get("type").and_then(serde_json::Value::as_str),
+                            dtype,
+                            *nullable,
+                        )
+                })
+        {
+            return Err(ClickHouseRelationalError::Invalid(
+                "ClickHouse external metadata differs from its planned schema".into(),
+            ));
+        }
+        let mut rows = Vec::with_capacity(data.len());
+        for encoded in data {
+            let encoded = encoded.as_array().ok_or_else(|| {
+                ClickHouseRelationalError::Invalid(
+                    "ClickHouse JSONCompact row is not an array".into(),
+                )
+            })?;
+            if encoded.len() != fields.len() {
+                return Err(ClickHouseRelationalError::Invalid(
+                    "ClickHouse external row differs from its planned schema".into(),
+                ));
+            }
+            rows.push(
+                encoded
+                    .iter()
+                    .zip(&fields)
+                    .map(|(value, (_, dtype, nullable))| json_cell(value, dtype, *nullable))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(Self {
+            rows,
+            fields,
+            coverage: None,
+        })
+    }
+
     pub fn from_series_rows(
         schema: &SummarySchema,
         series: Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)>,
@@ -90,9 +194,94 @@ impl ClickHouseRelation {
     }
 }
 
+fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: bool) -> bool {
+    let Some(mut actual) = actual else {
+        return false;
+    };
+    if nullable {
+        let Some(inner) = actual
+            .strip_prefix("Nullable(")
+            .and_then(|value| value.strip_suffix(')'))
+        else {
+            return false;
+        };
+        actual = inner;
+    } else if actual.starts_with("Nullable(") {
+        return false;
+    }
+    match expected {
+        DataType::Int64 => actual == "Int64",
+        DataType::Float64 => actual == "Float64",
+        DataType::Utf8 => actual == "String",
+        DataType::Bool => actual == "Bool",
+        DataType::Timestamp => actual == "Int64" || actual.starts_with("DateTime64("),
+    }
+}
+
 pub struct ClickHouseRelationalAdapter;
 
 impl ClickHouseRelationalAdapter {
+    pub fn apply_inner_equi_join(
+        &self,
+        pred: &planner_types::pre_asap::Predicate,
+        output_schema: &SummarySchema,
+        left: ClickHouseRelation,
+        right: ClickHouseRelation,
+    ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
+        let coverage = match (left.coverage, right.coverage) {
+            (Some((ls, le)), Some((rs, re))) => {
+                (ls.max(rs) <= le.min(re)).then_some((ls.max(rs), le.min(re)))
+            }
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            (None, None) => None,
+        };
+        let QueryExpr::Compare {
+            left: key_left,
+            op: CompareOpKind::Eq,
+            right: key_right,
+        } = pred.0.as_ref()
+        else {
+            return Err(ClickHouseRelationalError::Unsupported(
+                "join predicate is not equality".into(),
+            ));
+        };
+        let (QueryExpr::Column(left_key), QueryExpr::Column(right_key)) =
+            (key_left.as_ref(), key_right.as_ref())
+        else {
+            return Err(ClickHouseRelationalError::Unsupported(
+                "join keys are not columns".into(),
+            ));
+        };
+        let right_local_key = right_key.checked_sub(left.fields.len()).ok_or_else(|| {
+            ClickHouseRelationalError::Invalid("right join key points into left input".into())
+        })?;
+        let mut rows = Vec::new();
+        for left_row in &left.rows {
+            let left_value =
+                left_row
+                    .get(*left_key)
+                    .ok_or(ClickHouseRelationalError::ColumnOutOfRange(
+                        *left_key,
+                        left_row.len(),
+                    ))?;
+            for right_row in &right.rows {
+                let right_value = right_row.get(right_local_key).ok_or(
+                    ClickHouseRelationalError::ColumnOutOfRange(right_local_key, right_row.len()),
+                )?;
+                if cells_equal(left_value, right_value) {
+                    let mut joined = left_row.clone();
+                    joined.extend(right_row.iter().cloned());
+                    rows.push(joined);
+                }
+            }
+        }
+        Ok(ClickHouseRelation {
+            rows,
+            fields: fields_from_schema(output_schema),
+            coverage,
+        })
+    }
+
     pub fn apply_filter(
         &self,
         pred: &planner_types::pre_asap::Predicate,

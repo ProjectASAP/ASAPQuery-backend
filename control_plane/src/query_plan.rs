@@ -286,6 +286,37 @@ pub struct InstantExecution {
 }
 
 impl QueryPlanEntry {
+    /// Bind a planner-selected exact cut. Callers must supply the node ID from
+    /// the compiled canonical DAG; this method never infers a SQL cut.
+    pub fn bind_external_sql_leaf(
+        &mut self,
+        node_id: QueryNodeId,
+        query: BoundClickHouseQuery,
+    ) -> Result<(), QueryPlanError> {
+        if self.language != QueryLanguage::ClickHouseSql {
+            return Err(QueryPlanError::Invalid(
+                "cannot bind a SQL leaf into a non-ClickHouse plan".into(),
+            ));
+        }
+        query.validate()?;
+        match self.nodes.get(&node_id) {
+            Some(QueryPlanNode::ExactFallback { .. }) => {}
+            Some(_) => {
+                return Err(QueryPlanError::Invalid(
+                    "external SQL binding must replace a planner exact-fallback cut".into(),
+                ))
+            }
+            None => {
+                return Err(QueryPlanError::Invalid(
+                    "external SQL cut node is absent".into(),
+                ))
+            }
+        }
+        self.nodes
+            .insert(node_id, QueryPlanNode::ExternalSqlLeaf { query });
+        Ok(())
+    }
+
     /// Materializations this executable DAG reads, in stable node order.
     /// Serving uses this set for readiness accounting; it never performs a
     /// catalog candidate search to reconstruct dependencies.
@@ -429,6 +460,67 @@ impl QueryPlanEntry {
             )));
         }
         for (id, node) in &self.nodes {
+            if let QueryPlanNode::ExternalSqlLeaf { query } = node {
+                if self.language != QueryLanguage::ClickHouseSql {
+                    return Err(QueryPlanError::Invalid(
+                        "external SQL leaf is only valid in a ClickHouse query plan".into(),
+                    ));
+                }
+                query.validate()?;
+            }
+            if let QueryPlanNode::RelationalJoin {
+                join_kind,
+                pred,
+                left_schema,
+                right_schema,
+                output_schema,
+                ..
+            } = node
+            {
+                if self.language != QueryLanguage::ClickHouseSql {
+                    return Err(QueryPlanError::Invalid(
+                        "relational SQL join is only valid in a ClickHouse query plan".into(),
+                    ));
+                }
+                if !matches!(join_kind, planner_types::pre_asap::JoinKind::Inner) {
+                    return Err(QueryPlanError::Invalid(
+                        "only inner external SQL joins are executable".into(),
+                    ));
+                }
+                let predicate: planner_types::pre_asap::Predicate =
+                    serde_json::from_value(pred.clone()).map_err(|error| {
+                        QueryPlanError::Invalid(format!("invalid join predicate: {error}"))
+                    })?;
+                let planner_types::pre_asap::QueryExpr::Compare {
+                    left,
+                    op: planner_types::pre_asap::CompareOpKind::Eq,
+                    right,
+                } = predicate.0.as_ref()
+                else {
+                    return Err(QueryPlanError::Invalid(
+                        "external SQL join requires an equality predicate".into(),
+                    ));
+                };
+                let (
+                    planner_types::pre_asap::QueryExpr::Column(left),
+                    planner_types::pre_asap::QueryExpr::Column(right),
+                ) = (left.as_ref(), right.as_ref())
+                else {
+                    return Err(QueryPlanError::Invalid(
+                        "external SQL join keys must be columns".into(),
+                    ));
+                };
+                if *left >= left_schema.fields.len()
+                    || *right < left_schema.fields.len()
+                    || *right - left_schema.fields.len() >= right_schema.fields.len()
+                    || output_schema.fields.len()
+                        != left_schema.fields.len() + right_schema.fields.len()
+                {
+                    return Err(QueryPlanError::Invalid(
+                        "external SQL join schema or key bounds are invalid".into(),
+                    ));
+                }
+            }
             if let QueryPlanNode::Logical { operator, inputs } = node {
                 operator.validate(inputs.len())?;
             }
@@ -522,6 +614,52 @@ pub struct MaterializationBinding {
     pub readout_lookback_ms: Option<u64>,
 }
 
+/// A planner-verified ClickHouse subtree boundary. The SQL must produce the
+/// declared relation when evaluated over the bound request interval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BoundClickHouseQuery {
+    pub sql: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_parameter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_parameter: Option<String>,
+    pub output_schema: planner_types::post_asap::SummarySchema,
+}
+
+impl BoundClickHouseQuery {
+    fn validate(&self) -> Result<(), QueryPlanError> {
+        if self.sql.trim().is_empty() {
+            return Err(QueryPlanError::Invalid(
+                "ClickHouse external subtree has empty SQL".into(),
+            ));
+        }
+        if self.output_schema.fields.is_empty() {
+            return Err(QueryPlanError::Invalid(
+                "ClickHouse external subtree has empty output schema".into(),
+            ));
+        }
+        for name in [&self.start_parameter, &self.end_parameter]
+            .into_iter()
+            .flatten()
+        {
+            if name.is_empty() || self.parameters.contains_key(name) {
+                return Err(QueryPlanError::Invalid(
+                    "ClickHouse time parameter is empty or shadows a static parameter".into(),
+                ));
+            }
+        }
+        if self.start_parameter.is_some() && self.start_parameter == self.end_parameter {
+            return Err(QueryPlanError::Invalid(
+                "ClickHouse start and end parameters must differ".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "mode", content = "keys", rename_all = "snake_case")]
 pub enum PhysicalGrouping {
@@ -532,6 +670,19 @@ pub enum PhysicalGrouping {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    /// Zero-input SQL-private exact subtree. Only ClickHouse query entries may
+    /// carry this node; relational parents consume its typed relation.
+    ExternalSqlLeaf {
+        query: BoundClickHouseQuery,
+    },
+    RelationalJoin {
+        inputs: [QueryNodeId; 2],
+        join_kind: planner_types::pre_asap::JoinKind,
+        pred: serde_json::Value,
+        left_schema: planner_types::post_asap::SummarySchema,
+        right_schema: planner_types::post_asap::SummarySchema,
+        output_schema: planner_types::post_asap::SummarySchema,
+    },
     Relational {
         input: QueryNodeId,
         /// Serialized planner-owned operation. Keeping the wire form here makes
@@ -586,10 +737,11 @@ pub enum QueryPlanNode {
 impl QueryPlanNode {
     pub fn inputs(&self) -> &[QueryNodeId] {
         match self {
-            Self::Scalar { .. } | Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => {
-                &[]
-            }
-            Self::Binary { inputs, .. } => inputs,
+            Self::Scalar { .. }
+            | Self::ReadMaterialization { .. }
+            | Self::ExternalSqlLeaf { .. }
+            | Self::ExactFallback { .. } => &[],
+            Self::Binary { inputs, .. } | Self::RelationalJoin { inputs, .. } => inputs,
             Self::ReduceSum { input, .. }
             | Self::Relational { input, .. }
             | Self::SummaryEstimate { input, .. }
@@ -688,7 +840,8 @@ where
                     }
                 }
                 QueryPlanNode::CandidateTopK { inputs, .. }
-                | QueryPlanNode::Binary { inputs, .. } => {
+                | QueryPlanNode::Binary { inputs, .. }
+                | QueryPlanNode::RelationalJoin { inputs, .. } => {
                     for input in inputs {
                         *input = remap[input];
                     }
@@ -699,6 +852,7 @@ where
                 | QueryPlanNode::Relational { input, .. } => *input = remap[input],
                 QueryPlanNode::Scalar { .. }
                 | QueryPlanNode::ReadMaterialization { .. }
+                | QueryPlanNode::ExternalSqlLeaf { .. }
                 | QueryPlanNode::ExactFallback { .. } => {}
             }
             self.nodes.insert(remap[&local], physical);
@@ -1690,5 +1844,75 @@ mod catalog_binding_tests {
         as_rate_plan(counter_plan)
             .validate_against_catalog(&counter_catalog)
             .unwrap();
+    }
+
+    #[test]
+    fn planner_must_bind_external_sql_at_an_explicit_fallback_cut() {
+        let cut = QueryNodeId(0);
+        let schema = planner_types::post_asap::SummarySchema {
+            fields: vec![planner_types::post_asap::SummaryField {
+                name: "value".into(),
+                dtype: planner_types::post_asap::SummaryFamilyType::Plain(
+                    planner_types::pre_asap::DataType::Float64,
+                ),
+                nullable: false,
+            }],
+            time_index: None,
+        };
+        let mut entry = QueryPlanEntry {
+            language: QueryLanguage::ClickHouseSql,
+            query_id: "mixed".into(),
+            canonical_query: "mixed".into(),
+            fixed_evaluation: Some(FixedEvaluationRange {
+                start_ms: 1,
+                end_ms: 2,
+                cumulative: false,
+            }),
+            root: cut,
+            nodes: BTreeMap::from([(
+                cut,
+                QueryPlanNode::ExactFallback {
+                    reason: "planner exact cut".into(),
+                },
+            )]),
+            instant: InstantExecution {
+                lookback_ms: 1,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        entry
+            .bind_external_sql_leaf(
+                cut,
+                BoundClickHouseQuery {
+                    sql: "SELECT value FROM exact_source".into(),
+                    parameters: BTreeMap::new(),
+                    start_parameter: Some("from".into()),
+                    end_parameter: Some("to".into()),
+                    output_schema: schema,
+                },
+            )
+            .unwrap();
+        entry.validate(&BTreeSet::new()).unwrap();
+        assert!(matches!(
+            entry.nodes[&cut],
+            QueryPlanNode::ExternalSqlLeaf { .. }
+        ));
+        assert!(entry
+            .bind_external_sql_leaf(
+                cut,
+                BoundClickHouseQuery {
+                    sql: "SELECT 2".into(),
+                    parameters: BTreeMap::new(),
+                    start_parameter: None,
+                    end_parameter: None,
+                    output_schema: planner_types::post_asap::SummarySchema {
+                        fields: vec![],
+                        time_index: None,
+                    },
+                }
+            )
+            .is_err());
     }
 }
