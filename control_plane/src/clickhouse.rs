@@ -303,7 +303,28 @@ mod tests {
             10,
             ("variant", serde_json::json!(1)),
         );
-        let configs = vec![sum_60.clone(), count_60.clone(), sum_300, other];
+        let dd_2 = materialization(
+            AggregationType::DDSketch,
+            "requests",
+            60,
+            10,
+            ("relativeAccuracy", serde_json::json!(0.02)),
+        );
+        let dd_5 = materialization(
+            AggregationType::DDSketch,
+            "requests",
+            60,
+            10,
+            ("relativeAccuracy", serde_json::json!(0.05)),
+        );
+        let configs = vec![
+            sum_60.clone(),
+            count_60.clone(),
+            sum_300,
+            other,
+            dd_2.clone(),
+            dd_5,
+        ];
         let sum_family = sum_60.accumulator_spec().unwrap().family;
         let count_family = count_60.accumulator_spec().unwrap().family;
         assert_eq!(
@@ -311,6 +332,13 @@ mod tests {
                 .unwrap()
                 .policy_fingerprint(),
             sum_60.policy_fingerprint()
+        );
+        let dd_family = dd_2.accumulator_spec().unwrap().family;
+        assert_eq!(
+            select_materialization(&configs, "requests", "", &dd_family, 60)
+                .unwrap()
+                .policy_fingerprint(),
+            dd_2.policy_fingerprint()
         );
         assert_eq!(
             select_materialization(&configs, "requests", "", &count_family, 60)
