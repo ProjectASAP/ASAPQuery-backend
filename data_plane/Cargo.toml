@@ -123,6 +123,7 @@ asap-precompute-rs = { path = "../../ASAPCollector/asap-precompute-rs" }
 moka = { version = "0.12", features = ["sync"] }
 memmap2 = "0.9"
 crc32fast = "1.4"
+fs2 = "0.4"
 # NOTE: the `asap-gorilla` path-dep + the `s3` (rust-s3) / `lru`
 # crates were dropped when the superseded GORILLA1 read side
 # (`gorilla_object_store`: GorillaS3Store + decode_block + the
