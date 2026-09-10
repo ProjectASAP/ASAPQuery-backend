@@ -9,10 +9,13 @@ use std::{
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MaterializationCommitKey {
     pub plan_id: u64,
+    pub plan_version: u64,
     pub node_id: u32,
     pub window_start_ms: i64,
     pub window_end_ms: i64,
-    pub input_lineage: String,
+    /// Collision-free producer lineage bytes. Callers should include source
+    /// identity and immutable input payload identity, not a lossy hash.
+    pub input_lineage: Vec<u8>,
 }
 
 pub trait PrecomputeOperatorRegistry<V> {
@@ -246,10 +249,11 @@ mod tests {
     fn key(node_id: u32) -> MaterializationCommitKey {
         MaterializationCommitKey {
             plan_id: 7,
+            plan_version: 1,
             node_id,
             window_start_ms: 10,
             window_end_ms: 20,
-            input_lineage: "checkpoint:3".into(),
+            input_lineage: b"checkpoint:3".to_vec(),
         }
     }
 
