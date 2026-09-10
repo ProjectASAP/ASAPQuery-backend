@@ -1,10 +1,9 @@
-# ERP analytical versus empirical cost: Figure 1 v1
+# Supplemental sketch cost-model diagnostic
 
 These are ASAPQuery-backend evaluation artifacts produced on 2026-09-10 by
 the sketch-bench `scripts/run_erp_v1_figure1.sh` runner at commit `013a70b`.
-They are stored here because Figure 1 evaluates the backend/planner cost-model
-decision, while sketch-bench is only the measurement producer. They are not
-smoke-test output.
+They are stored here as supporting measurements for ERP. They are neither
+smoke-test output nor Figure 1.
 
 ## Workload and query
 
@@ -28,10 +27,11 @@ JSONL records: 54 atomic cost records and 18 accuracy records.
 
 ## Models
 
-The analytical baseline sees only algorithmic work: update/query proportional
+This diagnostic's simplified analytical model sees only algorithmic work: update/query proportional
 to CMS rows and merge proportional to rows times columns. One coefficient per
 operation is calibrated at the smallest steady uniform point. It has no
-distribution or burst input. The empirical model is the measured update,
+distribution or burst input. It is not ASAPPlanner's analytical cost model and
+must not be reported as that baseline. The empirical model is the measured update,
 merge, and query CPU per operation stored in ERP.
 
 ## Result
@@ -43,7 +43,7 @@ query. The merge result is the important v1 discrepancy: asymptotic counter
 count alone poorly predicts the fixed and cache-sensitive merge cost, which is
 then multiplied by every pane merge in a sliding-window plan.
 
-This figure validates the narrower Section 2 claim: an analytical model is a
+This diagnostic validates the narrower claim that an analytical model is a
 useful fallback and often preserves broad ordering, while measured atomic ERP
 costs materially improve quantitative window-cost estimates. It does not yet
 claim an end-to-end planner speedup or accuracy improvement over AutoSketch;
@@ -51,8 +51,8 @@ those require the shared multi-query workload experiment.
 
 Artifacts:
 
-- `docs/evaluation/erp-v1-figure1/raw.jsonl`: immutable benchmark records with configs, workload, samples,
+- `docs/evaluation/erp-cost-model-supplement/raw.jsonl`: immutable benchmark records with configs, workload, samples,
   CPU/wall/memory, and accuracy;
-- `docs/evaluation/erp-v1-figure1/figure1-points.csv`: every plotted analytical/measured point;
-- `docs/evaluation/erp-v1-figure1/figure1-analytical-vs-empirical.png`: Figure 1 v1;
-- `docs/evaluation/erp-v1-figure1/summary.json`: aggregate result and execution provenance.
+- `docs/evaluation/erp-cost-model-supplement/cost-model-points.csv`: every plotted analytical/measured point;
+- `docs/evaluation/erp-cost-model-supplement/cost-model-analytical-vs-empirical.png`: plotted diagnostic;
+- `docs/evaluation/erp-cost-model-supplement/summary.json`: aggregate result and execution provenance.
