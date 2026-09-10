@@ -192,6 +192,15 @@ impl ThreeStageWalker {
                     planner_types::post_asap::ExecutionTiming::MaintenanceTime => child_stage,
                 }
             }
+            SummaryExpr::CandidateTopK {
+                candidates, values, ..
+            } => {
+                for child in [candidates, values] {
+                    let (cid, _) = self.visit_l4node(child)?;
+                    self.dag.edges.push((id, cid));
+                }
+                StageId::Backend
+            }
 
             // ── SummaryAgg: always edge per design.md §6 batched-queries
             // table — true for both approximate sketches (the old

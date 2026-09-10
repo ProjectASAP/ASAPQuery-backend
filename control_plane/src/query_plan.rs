@@ -250,6 +250,28 @@ impl QueryPlanEntry {
             if matches!(node, QueryPlanNode::Scalar { value } if !value.is_finite()) {
                 return Err(QueryPlanError::Invalid("non-finite scalar constant".into()));
             }
+            if let QueryPlanNode::CandidateTopK {
+                k, completeness, ..
+            } = node
+            {
+                if *k == 0 {
+                    return Err(QueryPlanError::Invalid(
+                        "CandidateTopK requires k > 0".into(),
+                    ));
+                }
+                if matches!(
+                    completeness,
+                    CandidateCompleteness::Certified { guarantee }
+                        if guarantee.metric
+                            != planner_types::post_asap::ErrorMetric::TopKMembership
+                            || guarantee.bound.evaluate().is_none()
+                            || guarantee.failure_probability.evaluate().is_none()
+                ) {
+                    return Err(QueryPlanError::Invalid(
+                        "invalid CandidateTopK completeness certificate".into(),
+                    ));
+                }
+            }
             for input in node.inputs() {
                 if !self.nodes.contains_key(input) {
                     return Err(QueryPlanError::Invalid(format!(
@@ -383,6 +405,15 @@ pub enum QueryPlanNode {
     SummaryMerge {
         inputs: Vec<QueryNodeId>,
     },
+    /// Use an approximate heap only as a membership sidecar, then rerank the
+    /// matching exact counter readouts. `inputs[0]` is candidate membership;
+    /// `inputs[1]` is the authoritative exact value vector.
+    CandidateTopK {
+        inputs: [QueryNodeId; 2],
+        k: u64,
+        grouping: logical::Grouping,
+        completeness: CandidateCompleteness,
+    },
     ExactFallback {
         reason: String,
     },
@@ -399,9 +430,12 @@ impl QueryPlanNode {
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
             Self::SummaryMerge { inputs } | Self::Logical { inputs, .. } => inputs,
+            Self::CandidateTopK { inputs, .. } => inputs,
         }
     }
 }
+
+pub use planner_types::post_asap::CandidateCompleteness;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -481,10 +515,24 @@ where
             remap.insert(*local, global);
         }
         for (local, mut physical) in nodes {
-            if let QueryPlanNode::Logical { inputs, .. } = &mut physical {
-                for input in inputs {
-                    *input = remap[input];
+            match &mut physical {
+                QueryPlanNode::Logical { inputs, .. } | QueryPlanNode::SummaryMerge { inputs } => {
+                    for input in inputs {
+                        *input = remap[input];
+                    }
                 }
+                QueryPlanNode::CandidateTopK { inputs, .. }
+                | QueryPlanNode::Binary { inputs, .. } => {
+                    for input in inputs {
+                        *input = remap[input];
+                    }
+                }
+                QueryPlanNode::SummaryEstimate { input, .. }
+                | QueryPlanNode::ExactReadout { input, .. }
+                | QueryPlanNode::ReduceSum { input, .. } => *input = remap[input],
+                QueryPlanNode::Scalar { .. }
+                | QueryPlanNode::ReadMaterialization { .. }
+                | QueryPlanNode::ExactFallback { .. } => {}
             }
             self.nodes.insert(remap[&local], physical);
         }
@@ -669,6 +717,41 @@ where
             SummaryExpr::ValueOperation { .. } => QueryPlanNode::ExactFallback {
                 reason: "unsupported post-ASAP value operation".into(),
             },
+            SummaryExpr::CandidateTopK {
+                candidates,
+                values,
+                k,
+                grouping,
+                completeness,
+            } => {
+                let labels = grouping
+                    .keys()
+                    .iter()
+                    .map(|&column| {
+                        values
+                            .schema
+                            .fields
+                            .get(column)
+                            .map(|field| field.name.clone())
+                            .ok_or_else(|| {
+                                QueryPlanError::Invalid(
+                                    "unresolved CandidateTopK grouping column".into(),
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                QueryPlanNode::CandidateTopK {
+                    inputs: [self.lower(candidates)?, self.lower(values)?],
+                    k: u64::try_from(*k).map_err(|_| {
+                        QueryPlanError::Invalid("CandidateTopK k exceeds u64".into())
+                    })?,
+                    grouping: logical::Grouping {
+                        labels,
+                        without: grouping.is_without(),
+                    },
+                    completeness: completeness.clone(),
+                }
+            }
             SummaryExpr::BinaryOp { lhs, rhs, operator } if self.logical_source.is_some() => {
                 let operator = logical::binary_operator(operator)?;
                 QueryPlanNode::Logical {
@@ -1055,6 +1138,53 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("cycle"));
+    }
+
+    #[test]
+    fn candidate_topk_rejects_invalid_completeness_contract() {
+        let leaf = QueryPlanNode::ExactFallback {
+            reason: "prepared".into(),
+        };
+        let entry = QueryPlanEntry {
+            query_id: "q".into(),
+            canonical_promql: "topk(2, rate(m[5m]))".into(),
+            root: QueryNodeId(2),
+            nodes: BTreeMap::from([
+                (QueryNodeId(0), leaf.clone()),
+                (QueryNodeId(1), leaf),
+                (
+                    QueryNodeId(2),
+                    QueryPlanNode::CandidateTopK {
+                        inputs: [QueryNodeId(0), QueryNodeId(1)],
+                        k: 2,
+                        grouping: logical::Grouping {
+                            labels: vec![],
+                            without: false,
+                        },
+                        completeness: CandidateCompleteness::Certified {
+                            guarantee: planner_types::post_asap::ResultGuarantee {
+                                metric: planner_types::post_asap::ErrorMetric::Frequency,
+                                bound: planner_types::post_asap::BoundExpr::Unknown {
+                                    statistic: "membership margin".into(),
+                                },
+                                failure_probability:
+                                    planner_types::post_asap::ProbabilityExpr::Unknown {
+                                        statistic: "membership confidence".into(),
+                                    },
+                                provenance: vec![],
+                            },
+                        },
+                    },
+                ),
+            ]),
+            instant: InstantExecution {
+                lookback_ms: 300_000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        assert!(entry.validate(&BTreeSet::new()).is_err());
     }
 }
 

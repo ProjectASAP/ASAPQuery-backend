@@ -32,6 +32,17 @@ fn planner_forest(queries: &[control_plane::physical::compiler::PlanningQuery]) 
                 vec![lhs, rhs],
                 json!({"operator_debug":format!("{operator:?}")}),
             ),
+            SummaryExpr::CandidateTopK {
+                candidates,
+                values,
+                k,
+                grouping,
+                completeness,
+            } => (
+                "CandidateTopK",
+                vec![candidates, values],
+                json!({"k":k,"grouping_debug":format!("{grouping:?}"),"completeness_debug":format!("{completeness:?}")}),
+            ),
             SummaryExpr::ValueOperation {
                 child,
                 operation,

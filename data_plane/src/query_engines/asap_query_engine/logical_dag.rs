@@ -7,7 +7,9 @@ use crate::storage_engines::types::KeyByLabelValues;
 use control_plane::query_plan::logical::{
     Aggregation, BinaryOperation, Grouping, LogicalOperator, TemporalOperation,
 };
-use control_plane::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
+use control_plane::query_plan::{
+    CandidateCompleteness, QueryNodeId, QueryPlanEntry, QueryPlanNode,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 type Labels = BTreeMap<String, String>;
@@ -111,6 +113,7 @@ where
         stats: ExecutionStats::default(),
         memo: BTreeMap::new(),
         active: BTreeSet::new(),
+        warnings: Vec::new(),
     };
     let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
     let evaluated = evaluator.eval(entry.root, at_signed)?;
@@ -121,22 +124,23 @@ where
         return Err(miss("scalar root requires native response adapter"));
     }
     let result = vector(evaluated)?;
-    Ok((
-        QueryResult::vector(
-            result
-                .into_iter()
-                .map(|(labels, value)| {
-                    InstantVectorElement::new(
-                        KeyByLabelValues::new_with_labels(labels.values().cloned().collect()),
-                        value,
-                    )
-                    .with_label_keys_override(labels.into_keys().collect())
-                })
-                .collect(),
-            at,
-        ),
-        evaluator.stats,
-    ))
+    let mut output = QueryResult::vector(
+        result
+            .into_iter()
+            .map(|(labels, value)| {
+                InstantVectorElement::new(
+                    KeyByLabelValues::new_with_labels(labels.values().cloned().collect()),
+                    value,
+                )
+                .with_label_keys_override(labels.into_keys().collect())
+            })
+            .collect(),
+        at,
+    );
+    if let QueryResult::Vector(vector) = &mut output {
+        vector.warnings.append(&mut evaluator.warnings);
+    }
+    Ok((output, evaluator.stats))
 }
 
 struct Evaluator<'a, F> {
@@ -146,6 +150,7 @@ struct Evaluator<'a, F> {
     callback: F,
     memo: BTreeMap<(QueryNodeId, i64), Value>,
     active: BTreeSet<(QueryNodeId, i64)>,
+    warnings: Vec<String>,
 }
 impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'_, F> {
     fn eval(&mut self, id: QueryNodeId, at: i64) -> Result<Value, EngineError> {
@@ -189,6 +194,21 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                     ));
                 }
                 self.logical(operator, &inputs, at)?
+            }
+            QueryPlanNode::CandidateTopK {
+                inputs,
+                k,
+                grouping,
+                completeness,
+            } => {
+                let candidates = vector(self.eval(inputs[0], at)?)?;
+                let values = vector(self.eval(inputs[1], at)?)?;
+                let (selected, warning) =
+                    candidate_topk(k, &grouping, candidates, values, &completeness)?;
+                if let Some(warning) = warning {
+                    self.warnings.push(warning);
+                }
+                Value::Vector(selected)
             }
             _ => {
                 self.stats.summary_readout_evaluations += 1;
@@ -370,6 +390,47 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             }
         }
     }
+}
+
+fn candidate_topk(
+    k: u64,
+    grouping: &Grouping,
+    candidates: Vector,
+    values: Vector,
+    completeness: &CandidateCompleteness,
+) -> Result<(Vector, Option<String>), EngineError> {
+    let identity = |labels: &Labels| {
+        let mut labels = labels.clone();
+        labels.remove("__name__");
+        labels
+    };
+    let candidate_ids: BTreeSet<_> = candidates
+        .iter()
+        .map(|(labels, _)| identity(labels))
+        .collect();
+    let value_ids: BTreeSet<_> = values.iter().map(|(labels, _)| identity(labels)).collect();
+    let dangling = candidate_ids
+        .iter()
+        .any(|candidate| !value_ids.contains(candidate));
+    if dangling && matches!(completeness, CandidateCompleteness::Certified { .. }) {
+        return Err(miss("certified TopK candidate has no exact counter value"));
+    }
+    let matched = values
+        .into_iter()
+        .filter(|(labels, _)| candidate_ids.contains(&identity(labels)))
+        .collect();
+    let selected = topk_selection(k, grouping, matched);
+    let warning = match completeness {
+        CandidateCompleteness::Certified { .. } => None,
+        CandidateCompleteness::BestEffort { guarantee } => Some(match guarantee {
+            Some(guarantee) => format!(
+                "ASAP TopK candidate membership is approximate: {:?}",
+                guarantee.metric
+            ),
+            None => "ASAP TopK candidate membership is approximate and uncertified".into(),
+        }),
+    };
+    Ok((selected, warning))
 }
 
 fn aggregate(operation: Aggregation, grouping: &Grouping, values: Vector) -> Vector {
@@ -867,5 +928,166 @@ mod topk_tests {
         );
         assert_eq!(stats.summary_readout_evaluations, 1);
         assert_eq!(stats.remote_branch_evaluations, 0);
+    }
+
+    fn topk_membership_guarantee() -> planner_types::post_asap::ResultGuarantee {
+        use planner_types::post_asap::{BoundExpr, ErrorMetric, ProbabilityExpr, ResultGuarantee};
+        ResultGuarantee {
+            metric: ErrorMetric::TopKMembership,
+            bound: BoundExpr::Zero,
+            failure_probability: ProbabilityExpr::Constant { value: 0.01 },
+            provenance: vec![],
+        }
+    }
+
+    #[test]
+    fn candidate_sidecar_intersects_then_reranks_exact_values() {
+        let candidates = vec![
+            (labels(&[("pod", "b")]), 99.0),
+            (labels(&[("pod", "c")]), 50.0),
+        ];
+        let exact = vec![
+            (labels(&[("pod", "a")]), 10.0),
+            (labels(&[("pod", "b")]), 8.0),
+            (labels(&[("pod", "c")]), 9.0),
+        ];
+        let (selected, warning) = candidate_topk(
+            2,
+            &Grouping {
+                labels: vec![],
+                without: false,
+            },
+            candidates,
+            exact,
+            &CandidateCompleteness::Certified {
+                guarantee: topk_membership_guarantee(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|row| row.0["pod"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "b"]
+        );
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn installed_candidate_sidecar_reads_both_summary_inputs() {
+        let candidate_id = QueryNodeId(0);
+        let value_id = QueryNodeId(1);
+        let root = QueryNodeId(2);
+        let entry = QueryPlanEntry {
+            query_id: "candidate-topk".into(),
+            canonical_promql: "topk(1, rate(requests_total[5m]))".into(),
+            root,
+            nodes: BTreeMap::from([
+                (
+                    candidate_id,
+                    QueryPlanNode::ExactFallback {
+                        reason: "prepared sketch readout".into(),
+                    },
+                ),
+                (
+                    value_id,
+                    QueryPlanNode::ExactFallback {
+                        reason: "prepared exact counter readout".into(),
+                    },
+                ),
+                (
+                    root,
+                    QueryPlanNode::CandidateTopK {
+                        inputs: [candidate_id, value_id],
+                        k: 1,
+                        grouping: Grouping {
+                            labels: vec![],
+                            without: false,
+                        },
+                        completeness: CandidateCompleteness::Certified {
+                            guarantee: topk_membership_guarantee(),
+                        },
+                    },
+                ),
+            ]),
+            instant: InstantExecution {
+                lookback_ms: 300_000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        let at = 300_000_i64;
+        let leaves = BTreeMap::from([
+            (
+                (candidate_id, at),
+                PreparedLeaf {
+                    value: Value::Vector(vec![(labels(&[("pod", "b")]), 100.0)]),
+                    remote: false,
+                    remote_evaluations: 0,
+                    remote_rpcs: 0,
+                },
+            ),
+            (
+                (value_id, at),
+                PreparedLeaf {
+                    value: Value::Vector(vec![
+                        (labels(&[("pod", "a")]), 2.0),
+                        (labels(&[("pod", "b")]), 1.0),
+                    ]),
+                    remote: false,
+                    remote_evaluations: 0,
+                    remote_rpcs: 0,
+                },
+            ),
+        ]);
+        let (result, stats) = execute_installed(&entry, &leaves, at as u64, |_, _| {
+            panic!("both inputs are prepared")
+        })
+        .unwrap();
+        let QueryResult::Vector(result) = result else {
+            panic!("vector expected")
+        };
+        assert_eq!(result.values.len(), 1);
+        assert_eq!(result.values[0].value, 1.0, "exact value is authoritative");
+        assert_eq!(result.values[0].labels.labels, vec!["b"]);
+        assert_eq!(stats.summary_readout_evaluations, 2);
+        assert!(result.warnings.is_empty());
+    }
+
+    #[test]
+    fn uncertified_candidate_sidecar_warns_or_falls_back_explicitly() {
+        let candidates = vec![(labels(&[("pod", "a")]), 1.0)];
+        let exact = vec![(labels(&[("pod", "a")]), 2.0)];
+        let (_, warning) = candidate_topk(
+            1,
+            &Grouping {
+                labels: vec![],
+                without: false,
+            },
+            candidates.clone(),
+            exact.clone(),
+            &CandidateCompleteness::BestEffort { guarantee: None },
+        )
+        .unwrap();
+        assert!(warning.unwrap().contains("approximate"));
+        // Exact queries never lower an uncertified CandidateTopK. The Planner
+        // emits its ordinary exact fallback instead; this runtime node is only
+        // valid for certified or explicitly approximate plans.
+        let certified = CandidateCompleteness::Certified {
+            guarantee: topk_membership_guarantee(),
+        };
+        assert!(candidate_topk(
+            1,
+            &Grouping {
+                labels: vec![],
+                without: false
+            },
+            vec![(labels(&[("pod", "missing")]), 1.0)],
+            exact,
+            &certified,
+        )
+        .is_err());
     }
 }
