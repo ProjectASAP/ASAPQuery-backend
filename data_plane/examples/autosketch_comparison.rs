@@ -20,6 +20,10 @@ struct Args {
     output: std::path::PathBuf,
     #[arg(long, default_value_t = 10000)]
     events: usize,
+    /// Optional `pane_index<TAB>dense_key_index` trace. The first half is
+    /// calibration and the second half is held out from configuration search.
+    #[arg(long)]
+    input_tsv: Option<std::path::PathBuf>,
     #[arg(long, default_value_t = 1000)]
     cardinality: usize,
     #[arg(long, default_value_t = 10)]
@@ -169,6 +173,27 @@ fn stream(events: usize, cardinality: usize, zipf: f64, seed: u64) -> Vec<usize>
             cumulative.partition_point(|v| *v <= u).min(cardinality - 1)
         })
         .collect()
+}
+
+fn trace_split(path: &std::path::Path) -> Result<(Vec<usize>, Vec<usize>, usize), String> {
+    let contents = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let mut values = Vec::new();
+    let mut max_key = 0;
+    for (line, row) in contents.lines().enumerate() {
+        let (_, key) = row
+            .split_once('\t')
+            .ok_or_else(|| format!("invalid trace TSV at line {}", line + 1))?;
+        let key: usize = key
+            .parse()
+            .map_err(|error| format!("line {}: {error}", line + 1))?;
+        max_key = max_key.max(key);
+        values.push(key);
+    }
+    if values.len() < 2 {
+        return Err("trace needs at least two events".into());
+    }
+    let held_out = values.split_off(values.len() / 2);
+    Ok((values, held_out, max_key + 1))
 }
 
 #[derive(Debug, Serialize)]
@@ -441,7 +466,12 @@ fn erp_select(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    let trace = args.input_tsv.as_deref().map(trace_split).transpose()?;
+    if let Some((calibration, _, cardinality)) = &trace {
+        args.events = calibration.len();
+        args.cardinality = *cardinality;
+    }
     if args.events == 0
         || args.cardinality == 0
         || args.runs == 0
@@ -463,9 +493,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for run in 0..args.runs {
         let calibration_seed = args.seed.wrapping_add(run.wrapping_mul(2));
         let test_seed = calibration_seed.wrapping_add(1);
-        let calibration = stream(args.events, args.cardinality, args.zipf, calibration_seed);
-        let distribution = serde_json::json!({"generator":"splitmix64-truncated-zipf-v1",
-            "events":args.events,"cardinality":args.cardinality,"zipf":args.zipf,"seed":calibration_seed});
+        let calibration = trace.as_ref().map_or_else(
+            || stream(args.events, args.cardinality, args.zipf, calibration_seed),
+            |(calibration, _, _)| calibration.clone(),
+        );
+        let distribution = args.input_tsv.as_ref().map_or_else(
+            || serde_json::json!({"generator":"splitmix64-truncated-zipf-v1",
+                "events":args.events,"cardinality":args.cardinality,"zipf":args.zipf,"seed":calibration_seed}),
+            |path| serde_json::json!({"external":{"dataset":path.file_name().and_then(|name| name.to_str()).unwrap_or("trace.tsv"),
+                "split":"first_half_calibration"}}),
+        );
         let start = Instant::now();
         let mut candidates = candidate_grid(&args.sketches, args.query, args.memory_budget_bytes);
         Rng(calibration_seed).shuffle(&mut candidates);
@@ -495,7 +532,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "same-table ERP must match the finite-grid oracle"
         );
         // Test data is generated only after all configuration decisions are made.
-        let held_out = stream(args.events, args.cardinality, args.zipf, test_seed);
+        let held_out = trace.as_ref().map_or_else(
+            || stream(args.events, args.cardinality, args.zipf, test_seed),
+            |(_, held_out, _)| held_out.clone(),
+        );
         let mut outcomes = Vec::new();
         for (name, selected) in [
             ("autosketch_adapted", adapted.selected),
@@ -533,6 +573,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trace_calibration_and_held_out_halves_do_not_overlap() {
+        let path =
+            std::env::temp_dir().join(format!("autosketch-trace-split-{}.tsv", std::process::id()));
+        std::fs::write(&path, "0\t0\n0\t1\n1\t2\n1\t3\n").unwrap();
+        let (calibration, held_out, cardinality) = trace_split(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(calibration, vec![0, 1]);
+        assert_eq!(held_out, vec![2, 3]);
+        assert_eq!(cardinality, 4);
+    }
     #[test]
     fn hard_budget_prunes_before_benchmark_and_empty_budget_fails_closed() {
         for budget in [0, 511, 512, 2048] {
