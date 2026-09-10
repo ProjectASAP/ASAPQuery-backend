@@ -1,7 +1,7 @@
 //! Keyed, watermark-gated staging for multi-source maintenance DAG nodes.
 
-use super::coordination_journal::{
-    AtomicPublicationKey, StagedSummaryInput, SummaryCoordinationJournal,
+use super::coordination_checkpoint::{
+    AtomicPublicationKey, StagedSummaryInput, SummaryCoordinationCheckpointStore,
 };
 use asap_types::sds::{
     CatalogGeneration, HalfOpenTimeRange, SummaryInstanceCoordinates, SummaryInstanceId,
@@ -43,21 +43,24 @@ pub struct ReadyInputBatch {
     pub inputs: Vec<StagedSummaryInput>,
 }
 
-/// Serializes stage/barrier/readiness transitions around the durable journal.
+/// Serializes stage/barrier/readiness transitions around the durable checkpoint store.
 /// This is coordination, not operator execution: family-specific joins consume
 /// a `ReadyInputBatch` through the typed maintenance operator registry.
 pub struct MultiSourceCoordinator {
     spec: MultiSourceNodeSpec,
-    journal: SummaryCoordinationJournal,
+    checkpoint_store: SummaryCoordinationCheckpointStore,
     transition: Mutex<()>,
 }
 
 impl MultiSourceCoordinator {
-    pub fn new(spec: MultiSourceNodeSpec, journal: SummaryCoordinationJournal) -> io::Result<Self> {
+    pub fn new(
+        spec: MultiSourceNodeSpec,
+        checkpoint_store: SummaryCoordinationCheckpointStore,
+    ) -> io::Result<Self> {
         validate_spec(&spec)?;
         Ok(Self {
             spec,
-            journal,
+            checkpoint_store,
             transition: Mutex::new(()),
         })
     }
@@ -69,12 +72,12 @@ impl MultiSourceCoordinator {
             .map_err(|_| io::Error::other("multi-source coordinator lock poisoned"))?;
         self.validate_input(&input)?;
         let already_staged = self
-            .journal
+            .checkpoint_store
             .staged()?
             .iter()
             .any(|existing| same_input_identity(existing, &input));
         if !already_staged
-            && self.journal.watermarks()?.iter().any(|barrier| {
+            && self.checkpoint_store.watermarks()?.iter().any(|barrier| {
                 barrier.catalog_generation == input.catalog_generation
                     && barrier.source == input.source
                     && barrier.watermark_ms >= input.coordinates.time_range.end_ms
@@ -84,7 +87,7 @@ impl MultiSourceCoordinator {
                 "new input arrived after its source epoch completed the window",
             ));
         }
-        self.journal.stage_if_absent(input)
+        self.checkpoint_store.stage_if_absent(input)
     }
 
     pub fn advance_watermark(&self, barrier: SummaryWatermarkBarrier) -> io::Result<bool> {
@@ -101,7 +104,7 @@ impl MultiSourceCoordinator {
                 "watermark does not belong to this maintenance node",
             ));
         }
-        self.journal.advance_watermark(barrier)
+        self.checkpoint_store.advance_watermark(barrier)
     }
 
     pub fn ready_batches(&self) -> io::Result<Vec<ReadyInputBatch>> {
@@ -109,8 +112,8 @@ impl MultiSourceCoordinator {
             .transition
             .lock()
             .map_err(|_| io::Error::other("multi-source coordinator lock poisoned"))?;
-        let staged = self.journal.staged()?;
-        let watermarks = self.journal.watermarks()?;
+        let staged = self.checkpoint_store.staged()?;
+        let watermarks = self.checkpoint_store.watermarks()?;
         let mut buckets =
             BTreeMap::<(i64, i64, Vec<(String, String)>), Vec<StagedSummaryInput>>::new();
         for input in staged.into_iter().filter(|input| {
@@ -400,7 +403,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let coordinator = MultiSourceCoordinator::new(
             spec(),
-            SummaryCoordinationJournal::open(dir.path().join("j.json")).unwrap(),
+            SummaryCoordinationCheckpointStore::open(dir.path().join("checkpoint.json")).unwrap(),
         )
         .unwrap();
         coordinator.stage(input("left", 1, "0", 1)).unwrap();
@@ -434,18 +437,22 @@ mod tests {
     #[test]
     fn restart_preserves_readiness_and_publication_identity() {
         let dir = tempdir().unwrap();
-        let path = dir.path().join("j.json");
-        let coordinator =
-            MultiSourceCoordinator::new(spec(), SummaryCoordinationJournal::open(&path).unwrap())
-                .unwrap();
+        let path = dir.path().join("checkpoint.json");
+        let coordinator = MultiSourceCoordinator::new(
+            spec(),
+            SummaryCoordinationCheckpointStore::open(&path).unwrap(),
+        )
+        .unwrap();
         coordinator.stage(input("left", 1, "0", 1)).unwrap();
         coordinator.stage(input("right", 2, "1", 1)).unwrap();
         coordinator.advance_watermark(barrier("0", 1, 10)).unwrap();
         coordinator.advance_watermark(barrier("1", 1, 10)).unwrap();
         drop(coordinator);
-        let recovered =
-            MultiSourceCoordinator::new(spec(), SummaryCoordinationJournal::open(path).unwrap())
-                .unwrap();
+        let recovered = MultiSourceCoordinator::new(
+            spec(),
+            SummaryCoordinationCheckpointStore::open(path).unwrap(),
+        )
+        .unwrap();
         assert_eq!(recovered.ready_batches().unwrap().len(), 1);
     }
 
@@ -454,7 +461,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let coordinator = MultiSourceCoordinator::new(
             spec(),
-            SummaryCoordinationJournal::open(dir.path().join("j.json")).unwrap(),
+            SummaryCoordinationCheckpointStore::open(dir.path().join("checkpoint.json")).unwrap(),
         )
         .unwrap();
         let left = input("left", 1, "0", 1);
@@ -472,7 +479,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let coordinator = MultiSourceCoordinator::new(
             spec(),
-            SummaryCoordinationJournal::open(dir.path().join("j.json")).unwrap(),
+            SummaryCoordinationCheckpointStore::open(dir.path().join("checkpoint.json")).unwrap(),
         )
         .unwrap();
         coordinator.stage(input("left", 1, "0", 2)).unwrap();
@@ -490,7 +497,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let coordinator = MultiSourceCoordinator::new(
             spec(),
-            SummaryCoordinationJournal::open(dir.path().join("j.json")).unwrap(),
+            SummaryCoordinationCheckpointStore::open(dir.path().join("checkpoint.json")).unwrap(),
         )
         .unwrap();
         coordinator.stage(input("left", 1, "0", 1)).unwrap();

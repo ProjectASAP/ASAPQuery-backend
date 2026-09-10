@@ -1,6 +1,6 @@
 pub mod accumulator_factory;
 pub mod config;
-pub mod coordination_journal;
+pub mod coordination_checkpoint;
 mod engine;
 pub mod frame_lineage;
 pub mod group_key;
