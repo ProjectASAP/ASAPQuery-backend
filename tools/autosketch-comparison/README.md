@@ -8,7 +8,7 @@ ASAPPlanner, recurring-window, or native AutoSketch benchmark.
 
 - Actual `asap_sketchlib::CountMinSketch` and `CountSketch` implementations,
   plus `asap_sketchlib::BloomFilter` and `CountingBloomFilter` for the paper's
-  distinct operator (asap_sketchlib PR #94).
+  distinct operator (asap_sketchlib PR #138).
 - Up to 56 configurations per family: widths 64 through 4096 in powers of two,
   depths 1 through 8. All methods see the same budget- and legality-filtered grid.
   Portable Count Sketch requires `depth * (log2(width) + 1) <= 64`; CMS supports
