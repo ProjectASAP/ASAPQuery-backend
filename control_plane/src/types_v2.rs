@@ -29,19 +29,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-// ── QueryLanguage ─────────────────────────────────────────────────────────────
-
-/// Source language the raw query string is written in. Drives which L1
-/// parser the control plane dispatches to.
-///
-/// The control plane consumes `PromQL` only (see `query_parser/promql.rs`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum QueryLanguage {
-    /// Prometheus query language. Parsed via `promql-parser`.
-    #[serde(rename = "prom_ql", alias = "prom_q_l")]
-    PromQL,
-}
+pub use asap_types::QueryLanguage;
 
 // ── AccuracyTarget ────────────────────────────────────────────────────────────
 
@@ -207,7 +195,7 @@ mod tests {
 
     #[test]
     fn query_language_serde_roundtrip() {
-        let variant = QueryLanguage::PromQL;
+        let variant = QueryLanguage::PromQl;
         let json = serde_json::to_string(&variant).unwrap();
         let back: QueryLanguage = serde_json::from_str(&json).unwrap();
         assert_eq!(variant, back, "round-trip failed for {variant:?}");

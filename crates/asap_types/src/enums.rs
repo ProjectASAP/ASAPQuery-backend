@@ -77,11 +77,25 @@ impl FromStr for Statistic {
     }
 }
 
-#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq)]
-#[allow(non_camel_case_types)]
+#[derive(
+    clap::ValueEnum,
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum QueryLanguage {
-    #[value(alias = "PROMQL")]
-    promql,
+    #[default]
+    #[value(alias = "PROMQL", alias = "promql")]
+    PromQl,
+    MetricsQl,
+    ClickHouseSql,
 }
 
 /// Policy for cleaning up old aggregates from the store.

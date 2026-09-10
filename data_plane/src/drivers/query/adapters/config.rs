@@ -55,7 +55,7 @@ impl AdapterConfig {
 
         Self::new(
             QueryProtocol::PrometheusHttp,
-            QueryLanguage::promql,
+            QueryLanguage::PromQl,
             fallback,
         )
     }
@@ -67,7 +67,7 @@ impl AdapterConfig {
         use crate::drivers::query::fallback::VictoriaMetricsHttpFallback;
         Self::new(
             QueryProtocol::PrometheusHttp,
-            QueryLanguage::promql,
+            QueryLanguage::PromQl,
             Some(Arc::new(VictoriaMetricsHttpFallback::new(fallback_url))),
         )
     }

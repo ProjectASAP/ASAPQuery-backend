@@ -764,7 +764,7 @@ mod tests {
         }"#;
         let spec: QuerySpec = serde_json::from_str(json).unwrap();
         assert_eq!(spec.id.as_ref().unwrap().as_str(), "q-001");
-        assert_eq!(spec.language, Some(QueryLanguage::PromQL));
+        assert_eq!(spec.language, Some(QueryLanguage::PromQl));
         assert_eq!(spec.accuracy, Some(AccuracyTarget::Epsilon(0.02)));
         assert_eq!(spec.dollars, Some(0.001));
         assert_eq!(spec.deployment_model.as_deref(), Some("asaplifecycle"));
