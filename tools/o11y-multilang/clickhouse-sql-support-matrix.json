@@ -2,7 +2,7 @@
   "queries": [
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 13,
       "exact_sql": "oracle_valid",
@@ -13,7 +13,7 @@
     },
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 14,
       "exact_sql": "oracle_valid",
@@ -24,7 +24,7 @@
     },
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 14,
       "exact_sql": "oracle_valid",
@@ -77,7 +77,7 @@
     },
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 5,
       "exact_sql": "oracle_valid",
@@ -108,7 +108,7 @@
     },
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 7,
       "exact_sql": "oracle_valid",
@@ -139,7 +139,7 @@
     },
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 5,
       "exact_sql": "oracle_valid",
@@ -150,7 +150,7 @@
     },
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 5,
       "exact_sql": "oracle_valid",
@@ -161,7 +161,7 @@
     },
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 14,
       "exact_sql": "oracle_valid",
@@ -172,7 +172,7 @@
     },
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 14,
       "exact_sql": "oracle_valid",
@@ -183,7 +183,7 @@
     },
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 6,
       "exact_sql": "oracle_valid",
@@ -194,7 +194,7 @@
     },
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 5,
       "exact_sql": "oracle_valid",
@@ -225,7 +225,7 @@
     },
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 5,
       "exact_sql": "oracle_valid",
@@ -267,7 +267,7 @@
     },
     {
       "backend_bind": "pass",
-      "backend_execute": "shared_executor_operator_covered; corpus_process_e2e_pending",
+      "backend_execute": "not_verified",
       "compiler": "pass",
       "dag_nodes": 7,
       "exact_sql": "oracle_valid",
