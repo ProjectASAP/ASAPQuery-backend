@@ -6,22 +6,13 @@
 use std::collections::BTreeMap;
 
 use crate::sds::{
-    DataDescriptor, DataDescriptorId, SummaryDefinitionId, SummaryDescriptor, SummaryDescriptorId,
+    CatalogGeneration, DataDescriptor, DataDescriptorId, DataSourceIdentity, SummaryDefinitionId,
+    SummaryDescriptor, SummaryDescriptorId, ValueProjectionIdentity,
 };
 use crate::PolicyFingerprint;
 use serde::{Deserialize, Serialize};
 
-pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 1;
-
-/// Identifies one immutable catalog snapshot without duplicating descriptors.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct SummaryCatalogReference {
-    pub schema_version: u32,
-    pub plan_id: u64,
-    pub plan_version: u64,
-    pub snapshot_sha256: String,
-}
+pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 2;
 
 /// Stable materialization identity binds operator and population descriptors.
 /// Concrete intervals, groups and completeness belong to runtime instances.
@@ -65,7 +56,7 @@ pub enum SummaryCatalogError {
     ReferenceMismatch,
 }
 
-impl SummaryCatalogReference {
+impl CatalogGeneration {
     /// Validate an untrusted wire reference against the installed immutable
     /// snapshot and its enclosing plan generation.
     pub fn validate_snapshot(
@@ -83,13 +74,13 @@ impl SummaryCatalogReference {
 }
 
 impl SummaryCatalog {
-    pub fn reference(&self) -> Result<SummaryCatalogReference, SummaryCatalogError> {
+    pub fn reference(&self) -> Result<CatalogGeneration, SummaryCatalogError> {
         use sha2::{Digest, Sha256};
         self.validate()?;
         // BTreeMap tables and typed descriptor fields serialize deterministically.
         let bytes = serde_json::to_vec(self)
             .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
-        Ok(SummaryCatalogReference {
+        Ok(CatalogGeneration {
             schema_version: self.schema_version,
             plan_id: self.plan_id,
             plan_version: self.plan_version,
@@ -107,10 +98,26 @@ impl SummaryCatalog {
             .map(|config| {
                 let summary = SummaryDescriptor::from_config(config)
                     .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
-                let data = DataDescriptor::new(
-                    config.metric.clone(),
+                let source = config.table_name.as_ref().map_or_else(
+                    || DataSourceIdentity::TimeSeries {
+                        metric: config.metric.clone(),
+                    },
+                    |table_ref| DataSourceIdentity::Table {
+                        table_ref: table_ref.clone(),
+                    },
+                );
+                let value_projection = config
+                    .value_column
+                    .as_ref()
+                    .map_or(ValueProjectionIdentity::SampleValue, |name| {
+                        ValueProjectionIdentity::Column { name: name.clone() }
+                    });
+                let data = DataDescriptor::new_typed(
+                    source,
+                    value_projection,
                     crate::utils::normalize_spatial_filter(&config.spatial_filter),
                     config.grouping_labels.labels.clone(),
+                    "asap.timestamped-observations.v2",
                 );
                 Ok((
                     config.policy_fingerprint(),

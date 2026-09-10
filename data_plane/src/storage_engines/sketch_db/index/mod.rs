@@ -724,7 +724,10 @@ impl SketchStore {
                 return;
             }
         };
-        let metric_name = instance.data_descriptor.metric_name.clone();
+        let metric_name = instance
+            .data_descriptor
+            .time_series_metric()
+            .map(str::to_owned);
         // Fixed lock order: instances → policy_to_series_ids → metric_to_series_ids.
         let mut instances = self.instances.write().unwrap();
         let mut policy_idx = self.policy_to_series_ids.write().unwrap();
@@ -733,7 +736,9 @@ impl SketchStore {
         if !policy_fp.is_unset() {
             policy_idx.entry(policy_fp).or_default().insert(sid);
         }
-        metric_idx.entry(metric_name).or_default().insert(sid);
+        if let Some(metric_name) = metric_name {
+            metric_idx.entry(metric_name).or_default().insert(sid);
+        }
     }
 
     /// Install one authoritative catalog snapshot for future registrations.
@@ -844,7 +849,7 @@ impl SketchStore {
             schema_version: reference.schema_version,
             plan_id: reference.plan_id,
             plan_version: reference.plan_version,
-            snapshot_digest: reference.snapshot_sha256,
+            snapshot_sha256: reference.snapshot_sha256,
         };
         let instances = self.instances.read().unwrap();
         let durable = self.persistence_read.read().unwrap().clone();

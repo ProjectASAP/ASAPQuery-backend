@@ -73,7 +73,8 @@ pub struct CatalogGeneration {
     pub schema_version: u32,
     pub plan_id: u64,
     pub plan_version: u64,
-    pub snapshot_digest: String,
+    #[serde(alias = "snapshot_digest")]
+    pub snapshot_sha256: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,7 +169,7 @@ impl SummaryInstance {
             ));
         }
         if self.catalog_generation.schema_version == 0
-            || self.catalog_generation.snapshot_digest.is_empty()
+            || self.catalog_generation.snapshot_sha256.is_empty()
         {
             return Err(SdsError(
                 "summary instance has invalid catalog generation".into(),
@@ -570,16 +571,40 @@ impl FidelityGuarantee {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub enum DataSourceIdentity {
+    TimeSeries { metric: String },
+    Table { table_ref: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueProjectionIdentity {
+    SampleValue,
+    Column { name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataDescriptor {
     pub id: DataDescriptorId,
-    pub metric_name: String,
+    pub source: DataSourceIdentity,
+    pub value_projection: ValueProjectionIdentity,
     pub population_filter_canonical: String,
     pub group_by_keys: BTreeSet<String>,
-    /// Versioned contract for value projection, timestamp interpretation and
+    /// Versioned contract for timestamp interpretation and
     /// missing/duplicate/invalid observation handling.
     pub observation_semantics: String,
 }
 impl DataDescriptor {
+    pub fn time_series_metric(&self) -> Option<&str> {
+        match &self.source {
+            DataSourceIdentity::TimeSeries { metric } => Some(metric),
+            DataSourceIdentity::Table { .. } => None,
+        }
+    }
+
     pub fn new(
         metric: impl Into<String>,
         filter: impl Into<String>,
@@ -599,19 +624,39 @@ impl DataDescriptor {
         group_by: impl IntoIterator<Item = String>,
         observation_semantics: impl Into<String>,
     ) -> Self {
-        let metric_name = metric.into();
+        let source = DataSourceIdentity::TimeSeries {
+            metric: metric.into(),
+        };
+        Self::new_typed(
+            source,
+            ValueProjectionIdentity::SampleValue,
+            filter,
+            group_by,
+            observation_semantics,
+        )
+    }
+
+    pub fn new_typed(
+        source: DataSourceIdentity,
+        value_projection: ValueProjectionIdentity,
+        filter: impl Into<String>,
+        group_by: impl IntoIterator<Item = String>,
+        observation_semantics: impl Into<String>,
+    ) -> Self {
         let population_filter_canonical = filter.into();
         let group_by_keys = group_by.into_iter().collect();
         let observation_semantics = observation_semantics.into();
         let id = data_descriptor_id(
-            &metric_name,
+            &source,
+            &value_projection,
             &population_filter_canonical,
             &group_by_keys,
             &observation_semantics,
         );
         Self {
             id,
-            metric_name,
+            source,
+            value_projection,
             population_filter_canonical,
             group_by_keys,
             observation_semantics,
@@ -623,7 +668,8 @@ impl DataDescriptor {
     pub fn validate(&self) -> Result<(), SdsError> {
         if self.id
             != data_descriptor_id(
-                &self.metric_name,
+                &self.source,
+                &self.value_projection,
                 &self.population_filter_canonical,
                 &self.group_by_keys,
                 &self.observation_semantics,
@@ -635,16 +681,21 @@ impl DataDescriptor {
     }
 }
 fn data_descriptor_id(
-    metric: &str,
+    source: &DataSourceIdentity,
+    value_projection: &ValueProjectionIdentity,
     filter: &str,
     group_by: &BTreeSet<String>,
     observation_semantics: &str,
 ) -> DataDescriptorId {
-    // Preserve the existing v1 length-framed data identity, now normalizing the
-    // grouping set at the shared contract boundary.
+    // Length framing keeps distinct typed sources, projections, predicates,
+    // and grouping keys collision-free in the content identity.
+    let source = canonical(&serde_json::to_value(source).expect("data source serializes"));
+    let projection =
+        canonical(&serde_json::to_value(value_projection).expect("value projection serializes"));
     let mut key = format!(
-        "data:v1|{}:{metric}|{}:{filter}",
-        metric.len(),
+        "data:v2|{}:{source}|{}:{projection}|{}:{filter}",
+        source.len(),
+        projection.len(),
         filter.len()
     );
     for name in group_by {
@@ -684,7 +735,7 @@ mod tests {
                 schema_version: 1,
                 plan_id: 1,
                 plan_version: 2,
-                snapshot_digest: "abc".into(),
+                snapshot_sha256: "abc".into(),
             },
             placement: SummaryPlacement {
                 producer_id: "producer".into(),
@@ -825,6 +876,53 @@ mod tests {
             DataDescriptor::new_with_semantics("cpu", "", [], "samples.v2").id
         );
     }
+
+    #[test]
+    fn source_and_value_projection_are_part_of_data_identity() {
+        let metric = DataDescriptor::new("events", "", []);
+        let table_value = DataDescriptor::new_typed(
+            DataSourceIdentity::Table {
+                table_ref: "events".into(),
+            },
+            ValueProjectionIdentity::Column {
+                name: "value".into(),
+            },
+            "",
+            [],
+            "asap.timestamped-observations.v2",
+        );
+        let table_cost = DataDescriptor::new_typed(
+            DataSourceIdentity::Table {
+                table_ref: "events".into(),
+            },
+            ValueProjectionIdentity::Column {
+                name: "cost".into(),
+            },
+            "",
+            [],
+            "asap.timestamped-observations.v2",
+        );
+        assert_ne!(metric.id, table_value.id);
+        assert_ne!(table_value.id, table_cost.id);
+        assert_eq!(metric.time_series_metric(), Some("events"));
+        assert_eq!(table_value.time_series_metric(), None);
+    }
+
+    #[test]
+    fn catalog_generation_accepts_legacy_digest_name() {
+        let generation: CatalogGeneration = serde_json::from_value(json!({
+            "schema_version": 1,
+            "plan_id": 2,
+            "plan_version": 3,
+            "snapshot_digest": "abc"
+        }))
+        .unwrap();
+        assert_eq!(generation.snapshot_sha256, "abc");
+        assert!(serde_json::to_value(generation)
+            .unwrap()
+            .get("snapshot_digest")
+            .is_none());
+    }
     #[test]
     fn wire_roundtrip_and_tampered_id_validation() {
         let original = descriptor(
@@ -842,7 +940,9 @@ mod tests {
         decoded.state_schema_version = 2;
         assert!(decoded.validate().is_err());
         let mut data = DataDescriptor::new("cpu", "", []);
-        data.metric_name = "other".into();
+        data.source = DataSourceIdentity::TimeSeries {
+            metric: "other".into(),
+        };
         assert!(data.validate().is_err());
     }
     #[test]
