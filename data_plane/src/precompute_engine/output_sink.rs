@@ -28,6 +28,18 @@ pub trait OutputSink: Send + Sync {
         &self,
         outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Publish an explicit source-partition event-time barrier after every
+    /// preceding window from that partition has reached this sink.
+    fn advance_summary_watermark(
+        &self,
+        _barrier: &asap_types::sds::SummaryWatermarkBarrier,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "output sink does not support summary watermark barriers",
+        )))
+    }
 }
 
 fn consume_in_order<T>(items: Vec<T>, mut persist: impl FnMut(&T) -> bool) -> usize {
@@ -267,6 +279,45 @@ mod tests {
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct EmitOnlySink;
+
+    impl OutputSink for EmitOnlySink {
+        fn emit_batch(
+            &self,
+            _outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn watermark_support_must_be_explicit() {
+        let completion_source = asap_types::sds::SummarySourcePartition {
+            producer_id: "producer".into(),
+            partition_id: "partition".into(),
+            producer_epoch: 1,
+        };
+        let barrier = asap_types::sds::SummaryWatermarkBarrier {
+            catalog_generation: asap_types::sds::CatalogGeneration {
+                schema_version: 1,
+                plan_id: 1,
+                plan_version: 1,
+                snapshot_sha256: "snapshot".into(),
+            },
+            source: completion_source,
+            sequence: 1,
+            watermark_ms: 10,
+        };
+        let err = EmitOnlySink
+            .advance_summary_watermark(&barrier)
+            .expect_err("sink must reject an unsupported barrier");
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::Unsupported)
+        );
+    }
 
     fn sum_agg_config(_id: u64, metric: &str, grouping_keys: &[&str]) -> AggregationConfig {
         // `_id` is unused after PR 5 — identity is content-addressed
