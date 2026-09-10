@@ -39,71 +39,16 @@
 //! * KLL — Karnin, Lang, Liberty, FOCS 2016
 //! * DDSketch — Masson, Rim, Lee, VLDB 2019
 
-use serde::{Deserialize, Serialize};
-
 use crate::types::SketchParams;
+pub use asap_types::{AccuracyKind, AccuracyProfile};
 
-/// How to interpret [`AccuracyProfile::epsilon`]. Same snake_case
-/// serialisation as the backend's `AccuracyKind` so JSON records
-/// produced here can be cross-compared with backend output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AccuracyKind {
-    Exact,
-    AdditiveFrequency,
-    RelativeCardinality,
-    RankQuantile,
-    RelativeQuantile,
-    TopK,
+/// Planner-specific derivation over Planner-owned sketch parameters.
+pub trait PlannerAccuracyProfile {
+    fn derive(params: &SketchParams) -> Self;
 }
 
-impl AccuracyKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            AccuracyKind::Exact => "exact",
-            AccuracyKind::AdditiveFrequency => "additive_frequency",
-            AccuracyKind::RelativeCardinality => "relative_cardinality",
-            AccuracyKind::RankQuantile => "rank_quantile",
-            AccuracyKind::RelativeQuantile => "relative_quantile",
-            AccuracyKind::TopK => "top_k",
-        }
-    }
-}
-
-/// Theoretical accuracy bound for one `SketchParams`.
-/// Serialises identically to the backend's `AccuracyProfile` so a
-/// control-plane-produced JSON record can be diffed against a
-/// backend-produced one byte-for-byte.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct AccuracyProfile {
-    pub epsilon: f64,
-    pub delta: f64,
-    pub kind: AccuracyKind,
-}
-
-impl AccuracyProfile {
-    /// Exact (ε = δ = 0).
-    pub fn exact() -> Self {
-        Self {
-            epsilon: 0.0,
-            delta: 0.0,
-            kind: AccuracyKind::Exact,
-        }
-    }
-
-    /// One-line summary for ops dashboards / logs. Byte-equal to
-    /// the backend's `AccuracyProfile::summary`.
-    pub fn summary(&self) -> String {
-        format!(
-            "accuracy: ε={}, δ={}, kind={}",
-            self.epsilon,
-            self.delta,
-            self.kind.as_str()
-        )
-    }
-
-    /// Derive the theoretical bound for a given `SketchParams`.
-    pub fn derive(params: &SketchParams) -> Self {
+impl PlannerAccuracyProfile for AccuracyProfile {
+    fn derive(params: &SketchParams) -> Self {
         match params {
             SketchParams::CountMinSketch { rows, cols, .. } => {
                 let cols = (*cols).max(1) as f64;

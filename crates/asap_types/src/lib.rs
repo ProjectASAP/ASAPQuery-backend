@@ -1,4 +1,5 @@
 pub mod accumulator_spec;
+pub mod accuracy;
 pub mod aggregation_config;
 pub mod aggregation_type;
 pub mod enums;
@@ -15,6 +16,7 @@ pub mod traits;
 pub mod utils;
 
 pub use accumulator_spec::{AccumulatorSpec, AccumulatorSpecError, SampleUpdateRule};
+pub use accuracy::{AccuracyKind, AccuracyProfile};
 pub use aggregation_config::*;
 pub use aggregation_type::AggregationType;
 pub use enums::*;

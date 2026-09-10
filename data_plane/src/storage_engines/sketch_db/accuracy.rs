@@ -42,83 +42,18 @@
 //!
 // See `docs/design_docs/summary-storage.md` for backend storage guarantees.
 
-use serde::{Deserialize, Serialize};
-
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::AggregationType;
+pub use asap_types::{AccuracyKind, AccuracyProfile};
+use serde::{Deserialize, Serialize};
 
-/// How to interpret [`AccuracyProfile::epsilon`].
-///
-/// The kind drives the user-facing rendering ("±ε counts" vs
-/// "±ε relative" vs "rank error ±ε·N" etc). It does NOT alter
-/// the numerical ε; callers / UI layers format based on `kind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AccuracyKind {
-    /// ε = δ = 0. Answer is the true value.
-    Exact,
-    /// Additive frequency error, scaled by the stream's total N:
-    /// `|f̂(x) - f(x)| ≤ ε · N` with probability ≥ `1 - δ`.
-    /// Applies to CountMinSketch, CountSketch.
-    AdditiveFrequency,
-    /// Relative cardinality error: `|ĉ - c| / c ≤ ε` with
-    /// probability ≥ `1 - δ`. Applies to HLL.
-    RelativeCardinality,
-    /// Rank-based quantile error: the returned quantile's RANK
-    /// position differs from the true rank by at most `ε · N`.
-    /// Applies to KLL.
-    RankQuantile,
-    /// Relative quantile error: the returned quantile value is
-    /// within `ε · q_true` of the true quantile, where `q_true`
-    /// is the true value. Applies to DDSketch.
-    RelativeQuantile,
-    /// Top-K retention + additive-estimate error. An item
-    /// whose true frequency is ≥ `ε · N` is guaranteed to be in
-    /// the returned top-K set; each returned count is within
-    /// `ε · N` of the true count. Applies to CMS-with-heap and
-    /// SpaceSaving-family heavy-hitter sketches.
-    TopK,
+/// Backend-specific derivation over the installed aggregation config.
+pub trait BackendAccuracyProfile {
+    fn derive(config: &AggregationConfig) -> Self;
+    fn derive_sketch_only(config: &AggregationConfig) -> Self;
 }
 
-/// Theoretical accuracy bound for an [`AggSchema`](super::AggSchema).
-/// Attached to every schema; surfaced via HTTP endpoints and
-/// (in a follow-up) the `QueryResult` that ASAPQueryEngine returns.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct AccuracyProfile {
-    pub epsilon: f64,
-    pub delta: f64,
-    pub kind: AccuracyKind,
-}
-
-impl AccuracyProfile {
-    /// ε = δ = 0. Used by exact aggregates (Sum, Min, Max, Increase).
-    pub fn exact() -> Self {
-        Self {
-            epsilon: 0.0,
-            delta: 0.0,
-            kind: AccuracyKind::Exact,
-        }
-    }
-
-    /// Human-readable one-liner. Surfaced in Prometheus-style
-    /// `infos` arrays so Grafana 11+ shows it inline without a
-    /// custom panel.
-    pub fn summary(&self) -> String {
-        format!(
-            "accuracy: ε={}, δ={}, kind={}",
-            self.epsilon,
-            self.delta,
-            match self.kind {
-                AccuracyKind::Exact => "exact",
-                AccuracyKind::AdditiveFrequency => "additive_frequency",
-                AccuracyKind::RelativeCardinality => "relative_cardinality",
-                AccuracyKind::RankQuantile => "rank_quantile",
-                AccuracyKind::RelativeQuantile => "relative_quantile",
-                AccuracyKind::TopK => "top_k",
-            }
-        )
-    }
-
+impl BackendAccuracyProfile for AccuracyProfile {
     /// Derive an [`AccuracyProfile`] from a pinned
     /// [`AggregationConfig`]. Reads `aggregation_type` and any
     /// necessary entries in `parameters`; falls back to exact for
@@ -134,7 +69,7 @@ impl AccuracyProfile {
     /// ε_st`; the random parts compose in quadrature but the staleness part is
     /// adversarial, so linear addition is the honest envelope). δ is
     /// unchanged (staleness is not probabilistic).
-    pub fn derive(config: &AggregationConfig) -> Self {
+    fn derive(config: &AggregationConfig) -> Self {
         let mut profile = Self::derive_sketch_only(config);
         let eps_st = config
             .parameters

@@ -126,7 +126,7 @@ use crate::storage_engines::types::{
 /// to the archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum QueryShape {
+pub enum QueryOperatorShape {
     /// `count(<metric>{...})` — series count after label predicates.
     /// Cold archive serves exactly via postings index; ASAP tier has
     /// no compatible aggregation (a CMS doesn't track per-series
@@ -176,7 +176,7 @@ pub enum QueryShape {
     Other,
 }
 
-impl QueryShape {
+impl QueryOperatorShape {
     /// Stable string tag used in YAML / JSON. Mirrors the control plane's
     /// `config::stage_config::emit_backend_storage_routing` shape
     /// vocabulary — the wire form is the canonical PromQL function
@@ -184,22 +184,22 @@ impl QueryShape {
     /// canonical name, e.g. `rate_post_hoc`).
     pub fn as_str(self) -> &'static str {
         match self {
-            QueryShape::Count => "count",
-            QueryShape::Topk => "topk",
-            QueryShape::RatePostHoc => "rate_post_hoc",
-            QueryShape::Quantile => "quantile",
-            QueryShape::Sum => "sum",
-            QueryShape::LastOverTime => "last_over_time",
-            QueryShape::HistogramQuantile => "histogram_quantile",
-            QueryShape::Delta => "delta",
-            QueryShape::Deriv => "deriv",
-            QueryShape::Absent => "absent",
-            QueryShape::Other => "other",
+            QueryOperatorShape::Count => "count",
+            QueryOperatorShape::Topk => "topk",
+            QueryOperatorShape::RatePostHoc => "rate_post_hoc",
+            QueryOperatorShape::Quantile => "quantile",
+            QueryOperatorShape::Sum => "sum",
+            QueryOperatorShape::LastOverTime => "last_over_time",
+            QueryOperatorShape::HistogramQuantile => "histogram_quantile",
+            QueryOperatorShape::Delta => "delta",
+            QueryOperatorShape::Deriv => "deriv",
+            QueryOperatorShape::Absent => "absent",
+            QueryOperatorShape::Other => "other",
         }
     }
 }
 
-/// Classify a parsed PromQL expression into a [`QueryShape`]. Walks
+/// Classify a parsed PromQL expression into a [`QueryOperatorShape`]. Walks
 /// the AST and returns the first shape that matches any node — so
 /// `topk(5, sum by (zone) (rate(http_requests_total[5m])))` is
 /// classified as `Topk` (the outermost shape wins).
@@ -207,7 +207,7 @@ impl QueryShape {
 /// `RatePostHoc` is conservative: any `rate(...)` call surfaces as
 /// `RatePostHoc`. The routing-table consumer can decide whether to
 /// honour that or fall through to the default target.
-pub fn classify_query_shape(expr: &promql_parser::parser::Expr) -> QueryShape {
+pub fn classify_query_shape(expr: &promql_parser::parser::Expr) -> QueryOperatorShape {
     use promql_parser::parser::Expr;
     match expr {
         // Aggregations are the outermost shape — `topk(...)` wins
@@ -219,20 +219,20 @@ pub fn classify_query_shape(expr: &promql_parser::parser::Expr) -> QueryShape {
         Expr::Aggregate(agg) => {
             let op = agg.op.to_string().to_lowercase();
             if op == "topk" || op == "bottomk" {
-                QueryShape::Topk
+                QueryOperatorShape::Topk
             } else if op == "count" || op == "count_values" {
-                QueryShape::Count
+                QueryOperatorShape::Count
             } else if op == "quantile" {
-                QueryShape::Quantile
+                QueryOperatorShape::Quantile
             } else if op == "sum" {
                 // `sum by (...) (...)` — recurse on the inner
                 // expression; if the inner is a `rate(...)` the
                 // post-hoc rate path wins.
                 let inner = classify_query_shape(&agg.expr);
-                if matches!(inner, QueryShape::RatePostHoc) {
-                    QueryShape::RatePostHoc
+                if matches!(inner, QueryOperatorShape::RatePostHoc) {
+                    QueryOperatorShape::RatePostHoc
                 } else {
-                    QueryShape::Sum
+                    QueryOperatorShape::Sum
                 }
             } else {
                 // min/max/avg/group/stddev/stdvar/...
@@ -242,25 +242,25 @@ pub fn classify_query_shape(expr: &promql_parser::parser::Expr) -> QueryShape {
         Expr::Call(call) => {
             let name = call.func.name.to_lowercase();
             if name == "rate" || name == "irate" {
-                QueryShape::RatePostHoc
+                QueryOperatorShape::RatePostHoc
             } else if name == "quantile_over_time" {
-                QueryShape::Quantile
+                QueryOperatorShape::Quantile
             } else if name == "sum_over_time" {
-                QueryShape::Sum
+                QueryOperatorShape::Sum
             } else if name == "count_over_time" {
-                QueryShape::Count
+                QueryOperatorShape::Count
             } else if name == "last_over_time" {
-                QueryShape::LastOverTime
+                QueryOperatorShape::LastOverTime
             } else if name == "histogram_quantile" {
-                QueryShape::HistogramQuantile
+                QueryOperatorShape::HistogramQuantile
             } else if name == "delta" || name == "increase" {
-                QueryShape::Delta
+                QueryOperatorShape::Delta
             } else if name == "deriv" {
-                QueryShape::Deriv
+                QueryOperatorShape::Deriv
             } else if name == "absent" || name == "absent_over_time" {
-                QueryShape::Absent
+                QueryOperatorShape::Absent
             } else {
-                QueryShape::Other
+                QueryOperatorShape::Other
             }
         }
         Expr::Paren(p) => classify_query_shape(&p.expr),
@@ -270,7 +270,7 @@ pub fn classify_query_shape(expr: &promql_parser::parser::Expr) -> QueryShape {
             // `rate(...)` on either side is enough to mark
             // RatePostHoc.
             let l = classify_query_shape(&bin.lhs);
-            if !matches!(l, QueryShape::Other) {
+            if !matches!(l, QueryOperatorShape::Other) {
                 l
             } else {
                 classify_query_shape(&bin.rhs)
@@ -278,7 +278,7 @@ pub fn classify_query_shape(expr: &promql_parser::parser::Expr) -> QueryShape {
         }
         Expr::Subquery(sq) => classify_query_shape(&sq.expr),
         // Bare vector / matrix selectors — no function applied.
-        _ => QueryShape::Other,
+        _ => QueryOperatorShape::Other,
     }
 }
 
@@ -295,7 +295,7 @@ struct RoutingTargetYaml {
     /// other targets didn't claim. When `Some(list)`, the target
     /// only fires when the incoming query's shape is in `list`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    applies_to_query_shape: Option<Vec<QueryShape>>,
+    applies_to_query_shape: Option<Vec<QueryOperatorShape>>,
 }
 
 /// One row in the v7 multi-target form.
@@ -348,7 +348,7 @@ pub struct RoutingTarget {
     /// Optional list of query shapes this target claims. `None` =
     /// default (always fires); `Some(list)` = this target only fires
     /// when the query's classified shape is in `list`.
-    pub applies_to_query_shape: Option<Vec<QueryShape>>,
+    pub applies_to_query_shape: Option<Vec<QueryOperatorShape>>,
 }
 
 impl RoutingTarget {
@@ -362,7 +362,7 @@ impl RoutingTarget {
     }
 
     /// Build a target that only applies to the listed shapes.
-    pub fn for_shapes(backend: StorageBackend, shapes: Vec<QueryShape>) -> Self {
+    pub fn for_shapes(backend: StorageBackend, shapes: Vec<QueryOperatorShape>) -> Self {
         Self {
             backend,
             applies_to_query_shape: Some(shapes),
@@ -559,7 +559,7 @@ impl BackendStorageRouting {
     /// * `thanos_query` → `GorillaObjectStore` storage, served by
     ///   `ThanosQueryEngine`.
     ///
-    /// Unknown query-shape strings are mapped to [`QueryShape::Other`]
+    /// Unknown query-shape strings are mapped to [`QueryOperatorShape::Other`]
     /// rather than failing the parse — the control plane's vocabulary may
     /// drift forward of the backend's. Empty `targets` arrays are
     /// rejected (same contract as `from_yaml_str`).
@@ -732,7 +732,11 @@ impl BackendStorageRouting {
     ///      first target with `applies_to_query_shape: None`
     ///      (the default slot).
     ///   3. If even that's missing, use the first target.
-    pub fn lookup_with_shape(&self, metric_name: &str, shape: QueryShape) -> StorageBackend {
+    pub fn lookup_with_shape(
+        &self,
+        metric_name: &str,
+        shape: QueryOperatorShape,
+    ) -> StorageBackend {
         match self.metrics.get(metric_name) {
             Some(targets) => {
                 // Pass 1: explicit shape match.
@@ -833,24 +837,24 @@ fn parse_engine_string(s: &str) -> Result<StorageBackend> {
 }
 
 /// Map a JSON `applies_to_query_shape` string into a backend
-/// `QueryShape`. Unknown shapes are mapped to [`QueryShape::Other`] —
+/// `QueryOperatorShape`. Unknown shapes are mapped to [`QueryOperatorShape::Other`] —
 /// the control plane's vocabulary may emit shape names a backend revision
 /// doesn't yet understand, and `Other` is the safe fall-through (the
 /// archive's claim list typically includes `Other` so unknowns still
 /// route to the archive).
-fn parse_query_shape_string(s: &str) -> QueryShape {
+fn parse_query_shape_string(s: &str) -> QueryOperatorShape {
     match s {
-        "count" => QueryShape::Count,
-        "topk" => QueryShape::Topk,
-        "rate_post_hoc" | "rate" | "irate" => QueryShape::RatePostHoc,
-        "quantile" | "quantile_over_time" => QueryShape::Quantile,
-        "sum" | "sum_over_time" => QueryShape::Sum,
-        "last_over_time" => QueryShape::LastOverTime,
-        "histogram_quantile" => QueryShape::HistogramQuantile,
-        "delta" | "increase" => QueryShape::Delta,
-        "deriv" => QueryShape::Deriv,
-        "absent" | "absent_over_time" => QueryShape::Absent,
-        _ => QueryShape::Other,
+        "count" => QueryOperatorShape::Count,
+        "topk" => QueryOperatorShape::Topk,
+        "rate_post_hoc" | "rate" | "irate" => QueryOperatorShape::RatePostHoc,
+        "quantile" | "quantile_over_time" => QueryOperatorShape::Quantile,
+        "sum" | "sum_over_time" => QueryOperatorShape::Sum,
+        "last_over_time" => QueryOperatorShape::LastOverTime,
+        "histogram_quantile" => QueryOperatorShape::HistogramQuantile,
+        "delta" | "increase" => QueryOperatorShape::Delta,
+        "deriv" => QueryOperatorShape::Deriv,
+        "absent" | "absent_over_time" => QueryOperatorShape::Absent,
+        _ => QueryOperatorShape::Other,
     }
 }
 
@@ -1114,7 +1118,7 @@ mod tests {
         assert_eq!(r.lookup("anything"), StorageBackend::SketchStore);
         assert_eq!(r.lookup("http_requests_total"), StorageBackend::SketchStore);
         assert_eq!(
-            r.lookup_with_shape("anything", QueryShape::Count),
+            r.lookup_with_shape("anything", QueryOperatorShape::Count),
             StorageBackend::SketchStore
         );
     }
@@ -1194,39 +1198,45 @@ routes:
 
         // Count + topk + rate_post_hoc → archive.
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::Count),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::Count),
             StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::Topk),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::Topk),
             StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::RatePostHoc),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::RatePostHoc),
             StorageBackend::GorillaObjectStore,
         );
 
         // Quantile + sum_over_time + everything else → warm.
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::Quantile),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::Quantile),
             StorageBackend::SketchStore,
         );
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::Sum),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::Sum),
             StorageBackend::SketchStore,
         );
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::Other),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::Other),
             StorageBackend::SketchStore,
         );
 
         // Single-target metrics keep v6.1 semantics regardless of shape.
         assert_eq!(
-            r.lookup_with_shape("http_freshness_probe_warm", QueryShape::LastOverTime),
+            r.lookup_with_shape(
+                "http_freshness_probe_warm",
+                QueryOperatorShape::LastOverTime
+            ),
             StorageBackend::SketchStore,
         );
         assert_eq!(
-            r.lookup_with_shape("http_freshness_probe_archive", QueryShape::LastOverTime),
+            r.lookup_with_shape(
+                "http_freshness_probe_archive",
+                QueryOperatorShape::LastOverTime
+            ),
             StorageBackend::GorillaObjectStore,
         );
     }
@@ -1241,11 +1251,11 @@ metrics:
 "#;
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         for shape in [
-            QueryShape::Count,
-            QueryShape::Topk,
-            QueryShape::Quantile,
-            QueryShape::Sum,
-            QueryShape::Other,
+            QueryOperatorShape::Count,
+            QueryOperatorShape::Topk,
+            QueryOperatorShape::Quantile,
+            QueryOperatorShape::Sum,
+            QueryOperatorShape::Other,
         ] {
             assert_eq!(
                 r.lookup_with_shape("audit_events", shape),
@@ -1273,12 +1283,12 @@ routes:
         let r = BackendStorageRouting::from_yaml_str(yaml).expect("parse");
         // Default slot (warm) wins for non-count shapes.
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::Quantile),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::Quantile),
             StorageBackend::SketchStore,
         );
         // Count → archive.
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::Count),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::Count),
             StorageBackend::GorillaObjectStore,
         );
         // The `metrics:` entry was overridden by the multi-target
@@ -1308,16 +1318,19 @@ routes:
             vec![
                 RoutingTarget::for_shapes(
                     StorageBackend::GorillaObjectStore,
-                    vec![QueryShape::Count],
+                    vec![QueryOperatorShape::Count],
                 ),
-                RoutingTarget::for_shapes(StorageBackend::SketchStore, vec![QueryShape::Topk]),
+                RoutingTarget::for_shapes(
+                    StorageBackend::SketchStore,
+                    vec![QueryOperatorShape::Topk],
+                ),
             ],
         );
         let r = BackendStorageRouting::new(StorageBackend::SketchStore, metrics);
         // No filter matches `Quantile`; must return the first target's
         // backend.
         assert_eq!(
-            r.lookup_with_shape("x", QueryShape::Quantile),
+            r.lookup_with_shape("x", QueryOperatorShape::Quantile),
             StorageBackend::GorillaObjectStore,
         );
     }
@@ -1331,19 +1344,19 @@ routes:
     #[test]
     fn classifies_count_aggregate_as_count() {
         let e = parse("count(http_requests_total{service=\"payments\"})");
-        assert_eq!(classify_query_shape(&e), QueryShape::Count);
+        assert_eq!(classify_query_shape(&e), QueryOperatorShape::Count);
     }
 
     #[test]
     fn classifies_topk_as_topk() {
         let e = parse("topk(5, sum by (zone) (rate(http_requests_total[5m])))");
-        assert_eq!(classify_query_shape(&e), QueryShape::Topk);
+        assert_eq!(classify_query_shape(&e), QueryOperatorShape::Topk);
     }
 
     #[test]
     fn classifies_rate_call_as_rate_post_hoc() {
         let e = parse("rate(http_requests_total[5m])");
-        assert_eq!(classify_query_shape(&e), QueryShape::RatePostHoc);
+        assert_eq!(classify_query_shape(&e), QueryOperatorShape::RatePostHoc);
     }
 
     #[test]
@@ -1351,37 +1364,37 @@ routes:
         // `sum by (zone) (rate(...))` — the inner rate makes this
         // post-hoc, the outer sum doesn't change that.
         let e = parse("sum by (zone) (rate(http_requests_total[5m]))");
-        assert_eq!(classify_query_shape(&e), QueryShape::RatePostHoc);
+        assert_eq!(classify_query_shape(&e), QueryOperatorShape::RatePostHoc);
     }
 
     #[test]
     fn classifies_quantile_over_time_as_quantile() {
         let e = parse("quantile_over_time(0.99, http_requests_total_latency_ms[1m])");
-        assert_eq!(classify_query_shape(&e), QueryShape::Quantile);
+        assert_eq!(classify_query_shape(&e), QueryOperatorShape::Quantile);
     }
 
     #[test]
     fn classifies_sum_by_as_sum() {
         let e = parse("sum by (zone) (http_requests_total)");
-        assert_eq!(classify_query_shape(&e), QueryShape::Sum);
+        assert_eq!(classify_query_shape(&e), QueryOperatorShape::Sum);
     }
 
     #[test]
     fn classifies_sum_over_time_as_sum() {
         let e = parse("sum_over_time(http_requests_total[1m])");
-        assert_eq!(classify_query_shape(&e), QueryShape::Sum);
+        assert_eq!(classify_query_shape(&e), QueryOperatorShape::Sum);
     }
 
     #[test]
     fn classifies_last_over_time_as_last_over_time() {
         let e = parse("last_over_time(http_freshness_probe_warm[10s])");
-        assert_eq!(classify_query_shape(&e), QueryShape::LastOverTime);
+        assert_eq!(classify_query_shape(&e), QueryOperatorShape::LastOverTime);
     }
 
     #[test]
     fn classifies_bare_selector_as_other() {
         let e = parse("http_requests_total");
-        assert_eq!(classify_query_shape(&e), QueryShape::Other);
+        assert_eq!(classify_query_shape(&e), QueryOperatorShape::Other);
     }
 
     // ── Phase α: from_json_payload + replace + hot-reload tests ────────
@@ -1430,29 +1443,29 @@ routes:
         // http_requests_total: histogram_quantile / delta / etc → archive,
         // quantile / sum / topk → warm.
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::HistogramQuantile),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::HistogramQuantile),
             StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::Delta),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::Delta),
             StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::Count),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::Count),
             StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::Quantile),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::Quantile),
             StorageBackend::SketchStore,
         );
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::Topk),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::Topk),
             StorageBackend::SketchStore,
         );
         // LastOverTime not in the archive's filter list → falls
         // through to the default (warm) slot.
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::LastOverTime),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::LastOverTime),
             StorageBackend::SketchStore,
         );
     }
@@ -1476,13 +1489,13 @@ routes:
         });
         let r = BackendStorageRouting::from_json_payload(&value).expect("parse");
         // count still routes to archive; the unknown shape was mapped
-        // to QueryShape::Other (silently — forward-compat).
+        // to QueryOperatorShape::Other (silently — forward-compat).
         assert_eq!(
-            r.lookup_with_shape("x", QueryShape::Count),
+            r.lookup_with_shape("x", QueryOperatorShape::Count),
             StorageBackend::GorillaObjectStore,
         );
         assert_eq!(
-            r.lookup_with_shape("x", QueryShape::Other),
+            r.lookup_with_shape("x", QueryOperatorShape::Other),
             StorageBackend::GorillaObjectStore,
         );
     }
@@ -1594,7 +1607,7 @@ routes:
         // Old metric is gone; new metrics are visible.
         assert_eq!(r.lookup("old_metric"), StorageBackend::SketchStore);
         assert_eq!(
-            r.lookup_with_shape("http_requests_total", QueryShape::HistogramQuantile),
+            r.lookup_with_shape("http_requests_total", QueryOperatorShape::HistogramQuantile),
             StorageBackend::GorillaObjectStore,
         );
     }
@@ -1610,7 +1623,7 @@ routes:
         let snap = hr.snapshot();
         assert_eq!(snap.len(), 2);
         assert_eq!(
-            snap.lookup_with_shape("http_requests_total", QueryShape::Delta),
+            snap.lookup_with_shape("http_requests_total", QueryOperatorShape::Delta),
             StorageBackend::GorillaObjectStore,
         );
     }
@@ -1663,19 +1676,22 @@ routes:
     fn classifies_histogram_quantile_correctly() {
         let e =
             parse("histogram_quantile(0.99, sum by (le) (rate(http_request_duration_bucket[5m])))");
-        assert_eq!(classify_query_shape(&e), QueryShape::HistogramQuantile);
+        assert_eq!(
+            classify_query_shape(&e),
+            QueryOperatorShape::HistogramQuantile
+        );
     }
 
     #[test]
     fn classifies_delta_correctly() {
         let e = parse("delta(http_requests_total[5m])");
-        assert_eq!(classify_query_shape(&e), QueryShape::Delta);
+        assert_eq!(classify_query_shape(&e), QueryOperatorShape::Delta);
     }
 
     #[test]
     fn classifies_absent_correctly() {
         let e = parse("absent(http_requests_total{job=\"x\"})");
-        assert_eq!(classify_query_shape(&e), QueryShape::Absent);
+        assert_eq!(classify_query_shape(&e), QueryOperatorShape::Absent);
     }
 
     // ── Per-tenant routing tests (follow-up to PR #333) ───────────────
