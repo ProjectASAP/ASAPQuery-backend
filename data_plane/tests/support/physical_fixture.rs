@@ -100,7 +100,7 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
             }
         }
         for (query, readout, lookback_ms, output_grouping) in queries {
-            let canonical = canonical_query(&query).unwrap();
+            let canonical = canonical_promql(&query).unwrap();
             query_plan.entries.insert(
                 canonical.clone(),
                 QueryPlanEntry {

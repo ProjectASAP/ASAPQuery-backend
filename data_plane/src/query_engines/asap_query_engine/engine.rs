@@ -3764,11 +3764,12 @@ mod range_stitch_tests {
         let mut plan = snapshot.compile().unwrap();
         let identity = asap_frontend_metricsql::canonical_metricsql("1 + 2").unwrap();
         plan.query_plan.entries.insert(
-            identity.clone(),
+            control_plane::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity),
             QueryPlanEntry {
                 language: QueryLanguage::MetricsQl,
                 query_id: "vm-scalar".into(),
                 canonical_query: identity.clone(),
+                fixed_evaluation: None,
                 root: QueryNodeId(2),
                 nodes: std::collections::BTreeMap::from([
                     (QueryNodeId(0), QueryPlanNode::Scalar { value: 1.0 }),

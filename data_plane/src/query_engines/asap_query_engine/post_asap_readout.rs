@@ -894,7 +894,7 @@ mod tests {
         register_hll(&idx, 2, "worker", &["b", "c"]);
         let node = plan_promql_to_post_asap(&idx, "count(unique_users)", accuracy())
             .expect("compile-stage fixture");
-        let canonical = control_plane::query_plan::canonical_query("count(unique_users)").unwrap();
+        let canonical = control_plane::query_plan::canonical_promql("count(unique_users)").unwrap();
         let entry = control_plane::query_plan::QueryPlanEntry::compile_bound(
             "q-cardinality".into(),
             canonical,

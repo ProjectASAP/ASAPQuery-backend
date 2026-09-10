@@ -185,7 +185,7 @@ pub async fn compile_clickhouse_workload(
             instant: executable.instant,
             fallback: executable.fallback,
         };
-        let identity = format!("clickhouse:{}", planned.canonical_sql);
+        let identity = QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &planned.canonical_sql);
         if entries.insert(identity.clone(), entry).is_some() {
             return Err(ClickHousePlanningError::Lower(format!(
                 "duplicate canonical SQL query identity `{identity}`"

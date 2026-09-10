@@ -15,7 +15,6 @@ use super::{
     server::{
         ClickHouseAccelerationFallback, ClickHouseAccelerationOutcome, ClickHouseAccelerator,
     },
-    sql_binder::ClickHouseSqlBinder,
 };
 use crate::storage_engines::sketch_db::index::SketchStore;
 
@@ -69,13 +68,15 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                 ClickHouseAccelerationFallback::CatalogMiss,
             );
         };
-        let binder = ClickHouseSqlBinder::new(
-            control_plane::clickhouse::ClickHouseSqlCatalog {
+        let canonical_sql = match control_plane::clickhouse::canonicalize_clickhouse_sql(
+            &request.sql,
+            &control_plane::clickhouse::ClickHouseSqlCatalog {
                 tables: context.tables.clone(),
             },
             context.accuracy.clone(),
-        );
-        let canonical_sql = match binder.canonical_identity(&request.sql).await {
+        )
+        .await
+        {
             Ok(canonical) => canonical,
             Err(error) => {
                 return ClickHouseAccelerationOutcome::Fallback(
@@ -378,7 +379,10 @@ mod tests {
                 tables,
                 accuracy: planner_types::types::AccuracyTarget::Exact,
             }),
-            entries: BTreeMap::from([(format!("clickhouse:{canonical_sql}"), entry)]),
+            entries: BTreeMap::from([(
+                QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &canonical_sql),
+                entry,
+            )]),
         };
         store
             .install_summary_catalog(Arc::new(sds.clone()))

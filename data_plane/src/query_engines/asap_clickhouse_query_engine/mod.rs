@@ -4,7 +4,6 @@ pub mod fallback;
 pub mod relational_adapter;
 pub mod request;
 pub mod server;
-pub mod sql_binder;
 
 pub use fallback::{ClickHouseExactBackend, ClickHouseHttpFallback};
 pub use server::{

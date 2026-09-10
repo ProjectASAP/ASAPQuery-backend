@@ -7145,6 +7145,11 @@ mod catalog_install_tests {
         let handle = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active);
         let before = handle.snapshot();
         let mut candidate = request();
+        candidate.query_plan.clickhouse_context =
+            Some(control_plane::query_plan::ClickHousePlanningContext {
+                tables: Default::default(),
+                accuracy: planner_types::types::AccuracyTarget::Exact,
+            });
         let (_, mut entry) = candidate
             .query_plan
             .entries

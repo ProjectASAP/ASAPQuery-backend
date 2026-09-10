@@ -62,13 +62,25 @@ impl QueryPlan {
         language: QueryLanguage,
         identity: &str,
     ) -> Result<&QueryPlanEntry, QueryPlanError> {
+        let key = Self::catalog_key(language, identity);
         self.entries
-            .get(identity)
+            .get(&key)
             .filter(|entry| entry.language == language)
             .ok_or_else(|| QueryPlanError::QueryNotPlanned(identity.into()))
     }
 
-    pub fn lookup_clickhouse(&self, canonical_sql: &str) -> Result<&QueryPlanEntry, QueryPlanError> {
+    pub fn catalog_key(language: QueryLanguage, identity: &str) -> String {
+        match language {
+            QueryLanguage::PromQl => identity.to_owned(),
+            QueryLanguage::MetricsQl => format!("metricsql:{identity}"),
+            QueryLanguage::ClickHouseSql => format!("clickhouse:{identity}"),
+        }
+    }
+
+    pub fn lookup_clickhouse(
+        &self,
+        canonical_sql: &str,
+    ) -> Result<&QueryPlanEntry, QueryPlanError> {
         self.lookup_canonical(QueryLanguage::ClickHouseSql, canonical_sql)
     }
 
@@ -152,7 +164,8 @@ impl QueryPlan {
             ));
         }
         for (identity, entry) in &self.entries {
-            if identity != &entry.canonical_query {
+            let expected = Self::catalog_key(entry.language, &entry.canonical_query);
+            if identity != &expected {
                 return Err(QueryPlanError::Invalid(format!(
                     "query map key `{identity}` differs from entry identity `{}`",
                     entry.canonical_query
@@ -160,7 +173,8 @@ impl QueryPlan {
             }
             match entry.language {
                 QueryLanguage::PromQl | QueryLanguage::MetricsQl
-                    if entry.fixed_evaluation.is_some() => {
+                    if entry.fixed_evaluation.is_some() =>
+                {
                     return Err(QueryPlanError::Invalid(
                         "PromQL query entry carries a ClickHouse fixed evaluation range".into(),
                     ));
@@ -1381,7 +1395,7 @@ pub enum QueryPlanError {
     Invalid(String),
 }
 
-pub fn canonical_query(query: &str) -> Result<String, QueryPlanError> {
+pub fn canonical_promql(query: &str) -> Result<String, QueryPlanError> {
     promql_parser::parser::parse(query.trim())
         .map(|expr| expr.to_string())
         .map_err(|error| QueryPlanError::InvalidPromql(error.to_string()))
@@ -1394,8 +1408,8 @@ mod tests {
     #[test]
     fn canonical_identity_ignores_formatting() {
         assert_eq!(
-            canonical_query("sum by (service) ( rate(http_requests_total[5m]) )").unwrap(),
-            canonical_query("sum by(service)(rate(http_requests_total[5m]))").unwrap()
+            canonical_promql("sum by (service) ( rate(http_requests_total[5m]) )").unwrap(),
+            canonical_promql("sum by(service)(rate(http_requests_total[5m]))").unwrap()
         );
     }
 
@@ -1405,6 +1419,7 @@ mod tests {
             language: crate::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: canonical_promql("up").unwrap(),
+            fixed_evaluation: None,
             root: QueryNodeId(0),
             nodes: BTreeMap::from([(
                 QueryNodeId(0),
@@ -1423,6 +1438,67 @@ mod tests {
         assert_eq!(before, serde_json::to_value(&entry).unwrap());
         assert!(before.get("canonical_query").is_some());
         assert!(before.get("executable").is_none());
+    }
+
+    #[test]
+    fn language_catalog_keys_keep_equal_query_text_distinct() {
+        let base = QueryPlanEntry {
+            language: QueryLanguage::PromQl,
+            query_id: "prom".into(),
+            canonical_query: "shared".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(0),
+            nodes: BTreeMap::from([(
+                QueryNodeId(0),
+                QueryPlanNode::ExactFallback {
+                    reason: "fixture".into(),
+                },
+            )]),
+            instant: InstantExecution {
+                lookback_ms: 1,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        let mut metricsql = base.clone();
+        metricsql.language = QueryLanguage::MetricsQl;
+        metricsql.query_id = "metrics".into();
+        let mut clickhouse = base.clone();
+        clickhouse.language = QueryLanguage::ClickHouseSql;
+        clickhouse.query_id = "sql".into();
+        clickhouse.fixed_evaluation = Some(FixedEvaluationRange {
+            start_ms: 1,
+            end_ms: 2,
+            cumulative: true,
+        });
+        let plan = QueryPlan {
+            plan_id: 0,
+            plan_version: 0,
+            clickhouse_context: Some(ClickHousePlanningContext {
+                tables: Default::default(),
+                accuracy: planner_types::types::AccuracyTarget::Exact,
+            }),
+            entries: [base, metricsql, clickhouse]
+                .into_iter()
+                .map(|entry| (QueryPlan::catalog_key(entry.language, "shared"), entry))
+                .collect(),
+        };
+
+        assert_eq!(plan.entries.len(), 3);
+        assert_eq!(
+            plan.lookup_canonical(QueryLanguage::PromQl, "shared")
+                .unwrap()
+                .query_id,
+            "prom"
+        );
+        assert_eq!(
+            plan.lookup_canonical(QueryLanguage::MetricsQl, "shared")
+                .unwrap()
+                .query_id,
+            "metrics"
+        );
+        assert_eq!(plan.lookup_clickhouse("shared").unwrap().query_id, "sql");
     }
 
     #[test]
