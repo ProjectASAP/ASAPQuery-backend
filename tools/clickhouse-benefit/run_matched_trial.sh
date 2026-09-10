@@ -22,6 +22,10 @@ if ! docker inspect "$server" >/dev/null 2>&1; then
     docker run -d --name "$server" --cpuset-cpus=60,61 --cpus=2 --memory=4g \
         -p 127.0.0.1:28123:8123 -e CLICKHOUSE_USER -e CLICKHOUSE_PASSWORD "$image"
 else
+    expected_image=$(docker image inspect "$image" --format '{{.Id}}')
+    [[ $(docker inspect "$server" --format '{{.Image}}') == "$expected_image" ]]
+    [[ $(docker inspect "$server" --format '{{.HostConfig.CpusetCpus}}/{{.HostConfig.NanoCpus}}/{{.HostConfig.Memory}}') == '60,61/2000000000/4294967296' ]]
+    [[ $(docker inspect "$server" --format '{{with index .HostConfig.PortBindings "8123/tcp"}}{{(index . 0).HostIp}}:{{(index . 0).HostPort}}{{end}}') == '127.0.0.1:28123' ]]
     docker restart "$server"
 fi
 budget=$(docker inspect "$server" --format '{{.HostConfig.CpusetCpus}}/{{.HostConfig.NanoCpus}}/{{.HostConfig.Memory}}')
@@ -34,6 +38,11 @@ for _ in $(seq 1 100); do
 done
 curl --silent --fail http://127.0.0.1:28123/ping >/dev/null
 server_pid=$(docker inspect "$server" --format '{{.State.Pid}}')
+settings=$(curl --silent --show-error --fail --user "$CLICKHOUSE_USER:$CLICKHOUSE_PASSWORD" \
+    --data-binary "SELECT name,value FROM system.settings WHERE name IN ('max_threads','use_query_cache') ORDER BY name FORMAT TSV" \
+    http://127.0.0.1:28123/)
+[[ "$settings" == $'max_threads\tauto(2)\nuse_query_cache\t0' ]]
+printf '%s\n' "$settings" > "$output.clickhouse-settings.tsv"
 
 docker run --name "$backend" --user "$(id -u):$(id -g)" \
     --network host --pid host --cpuset-cpus=60,61 --cpus=2 --memory=4g \
