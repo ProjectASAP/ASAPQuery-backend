@@ -8,6 +8,7 @@ pub mod operators;
 pub mod output_sink;
 pub mod series_buffer;
 pub mod series_router;
+pub mod subdag_scheduler;
 pub mod window_manager;
 pub mod worker;
 

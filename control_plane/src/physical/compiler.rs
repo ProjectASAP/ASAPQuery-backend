@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "1d50d437e7e6a10f3ee4499090d0e899340ec95a";
+pub const PLANNER_REVISION: &str = "0deceda3e776216c5542d638d958b159f22e27ce";
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 
 #[derive(Debug, Clone)]
@@ -1957,6 +1957,45 @@ fn preserve_native_unsafe_raw_roots(queries: &mut [PlanningQuery]) -> Result<(),
     Ok(())
 }
 
+/// Canonicalize Planner candidates that have no backend-maintained state at
+/// the physical compiler boundary. Their selected post-ASAP shape may be
+/// intentionally unsupported (and therefore invalid as an executable
+/// maintenance DAG), but the original query remains a valid exact plan.
+fn preserve_invalid_exact_fallback_roots(
+    queries: &mut [PlanningQuery],
+    composable: bool,
+) -> Result<(), CompileError> {
+    for query in queries {
+        let selected =
+            collect_selected_materializations(&query.post_asap, composable).map_err(|reason| {
+                CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason,
+                }
+            })?;
+        let invalid_executable =
+            selected.is_empty() && validate_executable_subdag(&query.post_asap).is_err();
+        if invalid_executable && !matches!(query.post_asap.expr, SummaryExpr::KeepPreAsap(_)) {
+            let parsed = crate::query_parser::parse_query_expr_canonical(
+                &query.query_string,
+                query.accuracy.clone(),
+            )
+            .map_err(|error| CompileError::Query {
+                query_id: query.query_id.clone(),
+                reason: error.to_string(),
+            })?;
+            query.post_asap =
+                crate::planner_selection::keep_pre_asap(&parsed).map_err(|error| {
+                    CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: error.to_string(),
+                    }
+                })?;
+        }
+    }
+    Ok(())
+}
+
 impl PhysicalCompiler {
     pub fn compile(
         &self,
@@ -1996,6 +2035,8 @@ impl PhysicalCompiler {
                 return Err(CompileError::Snapshot("original workload and planning queries must have identical order and query text".into()));
             }
         }
+
+        preserve_invalid_exact_fallback_roots(&mut request.queries, request.hybrid_execution)?;
 
         if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite
             && !request.hybrid_execution
@@ -3211,6 +3252,20 @@ struct SelectedMaterialization {
     parameters: Value,
 }
 
+fn validate_executable_subdag(node: &Rc<SummaryNode>) -> Result<(), String> {
+    let executable = planner_types::post_asap::compile_executable_dag(node)
+        .map_err(|error| format!("invalid executable subDAG: {error}"))?;
+    if let Some(edge) = executable.edges.iter().find(|edge| {
+        edge.grouping == planner_types::post_asap::GroupingEdgeCompatibility::Incompatible
+    }) {
+        return Err(format!(
+            "executable subDAG contains incompatible grouping edge {} -> {} ({:?})",
+            edge.producer.0, edge.consumer.0, edge.role
+        ));
+    }
+    Ok(())
+}
+
 fn physical_aggregation(
     query: &PlanningQuery,
     selected: &SelectedMaterialization,
@@ -3490,6 +3545,9 @@ fn collect_selected_materializations(
             !has_unsafe_raw_entity_leaf(node, &BTreeSet::from([state.node_identity]), false)
         });
     }
+    if !selected.is_empty() {
+        validate_executable_subdag(node)?;
+    }
     Ok(selected)
 }
 
@@ -3762,15 +3820,18 @@ mod tests {
                 ..
             }
         )));
-        assert!(plan
+        let heaps = plan
             .precompute_plan
             .materializations
             .iter()
-            .any(|materialization| {
+            .filter(|materialization| {
                 materialization.aggregation_type
                     == asap_types::AggregationType::CountMinSketchWithHeap
                     && materialization.parameters["weight_mode"] == "counter_delta"
-            }));
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(heaps.len(), 1, "unpartitioned TopK owns one global CMS");
+        assert!(heaps[0].grouping_labels.labels.is_empty());
         assert!(plan
             .precompute_plan
             .materializations
@@ -4341,6 +4402,58 @@ mod tests {
                     ..
                 }
             ))));
+    }
+
+    #[test]
+    fn invalid_unselected_candidate_is_canonicalized_to_exact_fallback() {
+        let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-planning-snapshot.json"
+        ))
+        .unwrap();
+        let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+        entry.query =
+            Query("sum by (service) (sum_over_time(m[1m]) / count_over_time(m[1m]))".into());
+        entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+        let (mut request, _) = snapshot.planning_request().unwrap();
+        assert!(!matches!(
+            request.queries[0].post_asap.expr,
+            SummaryExpr::KeepPreAsap(_)
+        ));
+
+        preserve_invalid_exact_fallback_roots(&mut request.queries, true).unwrap();
+
+        assert!(matches!(
+            request.queries[0].post_asap.expr,
+            SummaryExpr::KeepPreAsap(_)
+        ));
+    }
+
+    #[test]
+    fn selected_maintenance_dependency_still_requires_a_valid_executable_dag() {
+        let mut request = request("invalid-dependency", "sum(sum_over_time(m[1m]))");
+        let selected = request.queries[0].post_asap.clone();
+        request.queries[0].post_asap = Rc::new(SummaryNode {
+            expr: SummaryExpr::BinaryOp {
+                lhs: selected.clone(),
+                rhs: selected.clone(),
+                operator: planner_types::post_asap::BinaryOperator {
+                    kind: planner_types::pre_asap::BinaryOpKind::Arithmetic(
+                        planner_types::pre_asap::ArithmeticOpKind::Add,
+                    ),
+                    vector_match: None,
+                },
+            },
+            schema: selected.schema.clone(),
+            guarantee: None,
+        });
+        request.hybrid_execution = true;
+        let mut environment = environment(10_000);
+        environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        environment.collector_ids.clear();
+
+        let error = PhysicalCompiler.compile(request, environment).unwrap_err();
+
+        assert!(error.to_string().contains("invalid executable subDAG"));
     }
 
     // Grouping must not move through non-additive arithmetic during physical
