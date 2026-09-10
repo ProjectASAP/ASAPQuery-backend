@@ -16,8 +16,7 @@ def temporal(metric: str, intent: str, window_ms: int, by: str | None = None) ->
     inner_cols = f"metric, labels, {by}" if by else "metric, labels"
     inner = (
         f"SELECT {inner_cols}, asap_{intent}(value, ts_ms, {window_ms}) AS v "
-        f"FROM raw_samples WHERE metric='{metric}' "
-        f"AND ts_ms>{EVAL}-{window_ms} AND ts_ms<={EVAL} GROUP BY {keys}"
+        f"FROM raw_samples WHERE metric='{metric}' GROUP BY {keys}"
     )
     if by:
         return f"SELECT {by}, sum(v) AS value FROM ({inner}) GROUP BY {by}"
@@ -43,7 +42,7 @@ def ratio(left: str, right: str, intent: str, window_ms: int, by: str | None = N
 def max_window(metric: str, window_ms: int) -> str:
     return (
         "SELECT labels, max(value) AS value FROM raw_samples "
-        f"WHERE metric='{metric}' AND ts_ms>{EVAL}-{window_ms} AND ts_ms<={EVAL} "
+        f"WHERE metric='{metric}' AND ts_ms>{{start_ms}} AND ts_ms<={{end_ms}} "
         "GROUP BY labels ORDER BY labels"
     )
 
@@ -89,8 +88,34 @@ def transform(document: dict) -> dict:
         planning_sql, status = table[query["id"]]
         query["clickhouse_planning_sql"] = planning_sql or None
         query["clickhouse_planning_status"] = status
+        query["clickhouse_summary_requirements"] = requirements(query["id"])
         assert query["clickhouse_sql"] == exact_before
     return document
+
+
+def requirements(query_id: str) -> list[dict]:
+    specs = {
+        "q01": [("backend_http_5xx_total", "increase", 21600, ["labels", "job"]), ("backend_http_requests_total", "increase", 21600, ["labels", "job"])],
+        "q02": [("backend_http_5xx_total", "increase", 21600, ["labels", "job"]), ("backend_http_requests_total", "increase", 21600, ["labels", "job"])],
+        "q03": [("payment_service_http_5xx_total", "increase", 3600, ["labels"]), ("payment_service_http_requests_total", "increase", 3600, ["labels"])],
+        "q05": [("cache_refresh_lag_seconds", "max", 43200, ["labels"])],
+        "q06": [("user_service_cache_refresh_lag_seconds", "max", 43200, ["labels"])],
+        "q08": [("backend_process_cpu_seconds_total", "increase", 3600, ["labels"])],
+        "q11": [("backend_process_cpu_seconds_total", "increase", 3600, ["labels", "job"])],
+        "q14": [("backend_http_requests_total", "increase", 300, ["labels"])],
+        "q15": [("backend_http_requests_total", "increase", 300, ["labels", "job"]),],
+        "q16": [("backend_http_5xx_total", "increase", 3600, ["labels"]), ("backend_http_requests_total", "increase", 3600, ["labels"])],
+        "q17": [("backend_http_5xx_total", "increase", 21600, ["labels", "job"]), ("backend_http_requests_total", "increase", 21600, ["labels", "job"])],
+        "q18": [("backend_http_5xx_total", "increase", 86400, ["labels", "job"])],
+        "q19": [("order_service_http_requests_total", "increase", 300, ["labels"])],
+        "q22": [("order_service_http_requests_total", "increase", 300, ["labels"])],
+        "q23": [("backend_retry_backlog_depth", "max", 21600, ["labels"])],
+        "q26": [("backend_process_cpu_seconds_total", "increase", 21600, ["labels", "job"])],
+    }
+    return [
+        {"metric": metric, "aggregation": aggregation, "window_seconds": window, "group_by": group_by}
+        for metric, aggregation, window, group_by in specs.get(query_id, [])
+    ]
 
 
 def main() -> None:

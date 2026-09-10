@@ -74,7 +74,9 @@ async fn main() {
                 Ok(_) => json!({"parser_canonical":"pass","planner":"pass"}),
                 Err(e) => json!({"status":"typed_fallback","reason":e.to_string()}),
             },
-            (Some(_), None) => json!({"status":"typed_fallback","reason":row.clickhouse_planning_status}),
+            (Some(_), None) => {
+                json!({"status":"typed_fallback","reason":row.clickhouse_planning_status})
+            }
             (None, _) => json!({"status":"missing_mapping"}),
         };
         rows.push(json!({"id":row.id,"metricsql":{"parser_canonical":mcanon,"planner":mplan},"clickhouse_sql":sql}));

@@ -15,8 +15,28 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT * FROM (SELECT a.job, a.value/b.value AS value FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>{eval_ms}-21600000 AND ts_ms<={eval_ms} GROUP BY metric, labels, job) GROUP BY job) a INNER JOIN (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>{eval_ms}-21600000 AND ts_ms<={eval_ms} GROUP BY metric, labels, job) GROUP BY job) b ON a.job=b.job) ORDER BY value DESC, job",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT * FROM (SELECT a.job, a.value/b.value AS value FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' GROUP BY metric, labels, job) GROUP BY job) a INNER JOIN (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' GROUP BY metric, labels, job) GROUP BY job) b ON a.job=b.job) ORDER BY value DESC, job",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "backend_http_5xx_total",
+          "aggregation": "increase",
+          "window_seconds": 21600,
+          "group_by": [
+            "labels",
+            "job"
+          ]
+        },
+        {
+          "metric": "backend_http_requests_total",
+          "aggregation": "increase",
+          "window_seconds": 21600,
+          "group_by": [
+            "labels",
+            "job"
+          ]
+        }
+      ]
     },
     {
       "id": "q02",
@@ -30,8 +50,28 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT * FROM (SELECT a.job, a.value/b.value AS value FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>{eval_ms}-21600000 AND ts_ms<={eval_ms} GROUP BY metric, labels, job) GROUP BY job) a INNER JOIN (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>{eval_ms}-21600000 AND ts_ms<={eval_ms} GROUP BY metric, labels, job) GROUP BY job) b ON a.job=b.job) ORDER BY value DESC, job LIMIT 1",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT * FROM (SELECT a.job, a.value/b.value AS value FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' GROUP BY metric, labels, job) GROUP BY job) a INNER JOIN (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' GROUP BY metric, labels, job) GROUP BY job) b ON a.job=b.job) ORDER BY value DESC, job LIMIT 1",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "backend_http_5xx_total",
+          "aggregation": "increase",
+          "window_seconds": 21600,
+          "group_by": [
+            "labels",
+            "job"
+          ]
+        },
+        {
+          "metric": "backend_http_requests_total",
+          "aggregation": "increase",
+          "window_seconds": 21600,
+          "group_by": [
+            "labels",
+            "job"
+          ]
+        }
+      ]
     },
     {
       "id": "q03",
@@ -45,8 +85,26 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT a.value/b.value AS value FROM (SELECT 1 AS k, value FROM (SELECT sum(v) AS value FROM (SELECT metric, labels, asap_increase(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='payment_service_http_5xx_total' AND ts_ms>{eval_ms}-3600000 AND ts_ms<={eval_ms} GROUP BY metric, labels))) a INNER JOIN (SELECT 1 AS k, value FROM (SELECT sum(v) AS value FROM (SELECT metric, labels, asap_increase(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='payment_service_http_requests_total' AND ts_ms>{eval_ms}-3600000 AND ts_ms<={eval_ms} GROUP BY metric, labels))) b ON a.k=b.k",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT a.value/b.value AS value FROM (SELECT 1 AS k, value FROM (SELECT sum(v) AS value FROM (SELECT metric, labels, asap_increase(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='payment_service_http_5xx_total' GROUP BY metric, labels))) a INNER JOIN (SELECT 1 AS k, value FROM (SELECT sum(v) AS value FROM (SELECT metric, labels, asap_increase(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='payment_service_http_requests_total' GROUP BY metric, labels))) b ON a.k=b.k",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "payment_service_http_5xx_total",
+          "aggregation": "increase",
+          "window_seconds": 3600,
+          "group_by": [
+            "labels"
+          ]
+        },
+        {
+          "metric": "payment_service_http_requests_total",
+          "aggregation": "increase",
+          "window_seconds": 3600,
+          "group_by": [
+            "labels"
+          ]
+        }
+      ]
     },
     {
       "id": "q04",
@@ -62,7 +120,8 @@
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
       "clickhouse_planning_sql": null,
-      "clickhouse_planning_status": "typed_unsupported: offset windows are not represented in SQL runtime bindings"
+      "clickhouse_planning_status": "typed_unsupported: offset windows are not represented in SQL runtime bindings",
+      "clickhouse_summary_requirements": []
     },
     {
       "id": "q05",
@@ -74,8 +133,18 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='cache_refresh_lag_seconds' AND ts_ms>{eval_ms}-43200000 AND ts_ms<={eval_ms} GROUP BY labels ORDER BY labels",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='cache_refresh_lag_seconds' AND ts_ms>{start_ms} AND ts_ms<={end_ms} GROUP BY labels ORDER BY labels",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "cache_refresh_lag_seconds",
+          "aggregation": "max",
+          "window_seconds": 43200,
+          "group_by": [
+            "labels"
+          ]
+        }
+      ]
     },
     {
       "id": "q06",
@@ -87,8 +156,18 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>{eval_ms}-43200000 AND ts_ms<={eval_ms} GROUP BY labels ORDER BY labels",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>{start_ms} AND ts_ms<={end_ms} GROUP BY labels ORDER BY labels",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "user_service_cache_refresh_lag_seconds",
+          "aggregation": "max",
+          "window_seconds": 43200,
+          "group_by": [
+            "labels"
+          ]
+        }
+      ]
     },
     {
       "id": "q07",
@@ -99,7 +178,8 @@
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
       "clickhouse_planning_sql": null,
-      "clickhouse_planning_status": "typed_unsupported: instant-vector last-sample selection is not a summary aggregate"
+      "clickhouse_planning_status": "typed_unsupported: instant-vector last-sample selection is not a summary aggregate",
+      "clickhouse_summary_requirements": []
     },
     {
       "id": "q08",
@@ -112,8 +192,18 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT sum(v) AS value FROM (SELECT metric, labels, asap_rate(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>{eval_ms}-3600000 AND ts_ms<={eval_ms} GROUP BY metric, labels)",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT sum(v) AS value FROM (SELECT metric, labels, asap_rate(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' GROUP BY metric, labels)",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "backend_process_cpu_seconds_total",
+          "aggregation": "increase",
+          "window_seconds": 3600,
+          "group_by": [
+            "labels"
+          ]
+        }
+      ]
     },
     {
       "id": "q09",
@@ -126,7 +216,8 @@
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
       "clickhouse_planning_sql": null,
-      "clickhouse_planning_status": "typed_unsupported: instant-vector last-sample selection is not a summary aggregate"
+      "clickhouse_planning_status": "typed_unsupported: instant-vector last-sample selection is not a summary aggregate",
+      "clickhouse_summary_requirements": []
     },
     {
       "id": "q10",
@@ -141,7 +232,8 @@
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
       "clickhouse_planning_sql": null,
-      "clickhouse_planning_status": "typed_unsupported: PromQL subquery evaluation grid is not represented by the SQL DAG"
+      "clickhouse_planning_status": "typed_unsupported: PromQL subquery evaluation grid is not represented by the SQL DAG",
+      "clickhouse_summary_requirements": []
     },
     {
       "id": "q11",
@@ -154,8 +246,19 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT * FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_rate(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>{eval_ms}-3600000 AND ts_ms<={eval_ms} GROUP BY metric, labels, job) GROUP BY job) ORDER BY value DESC, job LIMIT 2",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT * FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_rate(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' GROUP BY metric, labels, job) GROUP BY job) ORDER BY value DESC, job LIMIT 2",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "backend_process_cpu_seconds_total",
+          "aggregation": "increase",
+          "window_seconds": 3600,
+          "group_by": [
+            "labels",
+            "job"
+          ]
+        }
+      ]
     },
     {
       "id": "q12",
@@ -168,7 +271,8 @@
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
       "clickhouse_planning_sql": null,
-      "clickhouse_planning_status": "typed_unsupported: instant-vector last-sample selection is not a summary aggregate"
+      "clickhouse_planning_status": "typed_unsupported: instant-vector last-sample selection is not a summary aggregate",
+      "clickhouse_summary_requirements": []
     },
     {
       "id": "q13",
@@ -184,7 +288,8 @@
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
       "clickhouse_planning_sql": null,
-      "clickhouse_planning_status": "typed_unsupported: PromQL subquery evaluation grid is not represented by the SQL DAG"
+      "clickhouse_planning_status": "typed_unsupported: PromQL subquery evaluation grid is not represented by the SQL DAG",
+      "clickhouse_summary_requirements": []
     },
     {
       "id": "q14",
@@ -197,8 +302,18 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT sum(v) AS value FROM (SELECT metric, labels, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>{eval_ms}-300000 AND ts_ms<={eval_ms} GROUP BY metric, labels)",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT sum(v) AS value FROM (SELECT metric, labels, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' GROUP BY metric, labels)",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "backend_http_requests_total",
+          "aggregation": "increase",
+          "window_seconds": 300,
+          "group_by": [
+            "labels"
+          ]
+        }
+      ]
     },
     {
       "id": "q15",
@@ -210,8 +325,19 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>{eval_ms}-300000 AND ts_ms<={eval_ms} GROUP BY metric, labels, job) GROUP BY job",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' GROUP BY metric, labels, job) GROUP BY job",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "backend_http_requests_total",
+          "aggregation": "increase",
+          "window_seconds": 300,
+          "group_by": [
+            "labels",
+            "job"
+          ]
+        }
+      ]
     },
     {
       "id": "q16",
@@ -225,8 +351,26 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT a.value/b.value AS value FROM (SELECT 1 AS k, value FROM (SELECT sum(v) AS value FROM (SELECT metric, labels, asap_increase(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>{eval_ms}-3600000 AND ts_ms<={eval_ms} GROUP BY metric, labels))) a INNER JOIN (SELECT 1 AS k, value FROM (SELECT sum(v) AS value FROM (SELECT metric, labels, asap_increase(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>{eval_ms}-3600000 AND ts_ms<={eval_ms} GROUP BY metric, labels))) b ON a.k=b.k",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT a.value/b.value AS value FROM (SELECT 1 AS k, value FROM (SELECT sum(v) AS value FROM (SELECT metric, labels, asap_increase(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' GROUP BY metric, labels))) a INNER JOIN (SELECT 1 AS k, value FROM (SELECT sum(v) AS value FROM (SELECT metric, labels, asap_increase(value, ts_ms, 3600000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' GROUP BY metric, labels))) b ON a.k=b.k",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "backend_http_5xx_total",
+          "aggregation": "increase",
+          "window_seconds": 3600,
+          "group_by": [
+            "labels"
+          ]
+        },
+        {
+          "metric": "backend_http_requests_total",
+          "aggregation": "increase",
+          "window_seconds": 3600,
+          "group_by": [
+            "labels"
+          ]
+        }
+      ]
     },
     {
       "id": "q17",
@@ -240,8 +384,28 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT * FROM (SELECT a.job, a.value/b.value AS value FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>{eval_ms}-21600000 AND ts_ms<={eval_ms} GROUP BY metric, labels, job) GROUP BY job) a INNER JOIN (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>{eval_ms}-21600000 AND ts_ms<={eval_ms} GROUP BY metric, labels, job) GROUP BY job) b ON a.job=b.job) ORDER BY value DESC, job LIMIT 1",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT * FROM (SELECT a.job, a.value/b.value AS value FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' GROUP BY metric, labels, job) GROUP BY job) a INNER JOIN (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_http_requests_total' GROUP BY metric, labels, job) GROUP BY job) b ON a.job=b.job) ORDER BY value DESC, job LIMIT 1",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "backend_http_5xx_total",
+          "aggregation": "increase",
+          "window_seconds": 21600,
+          "group_by": [
+            "labels",
+            "job"
+          ]
+        },
+        {
+          "metric": "backend_http_requests_total",
+          "aggregation": "increase",
+          "window_seconds": 21600,
+          "group_by": [
+            "labels",
+            "job"
+          ]
+        }
+      ]
     },
     {
       "id": "q18",
@@ -254,8 +418,19 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT * FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 86400000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>{eval_ms}-86400000 AND ts_ms<={eval_ms} GROUP BY metric, labels, job) GROUP BY job) WHERE value>0",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT * FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_increase(value, ts_ms, 86400000) AS v FROM raw_samples WHERE metric='backend_http_5xx_total' GROUP BY metric, labels, job) GROUP BY job) WHERE value>0",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "backend_http_5xx_total",
+          "aggregation": "increase",
+          "window_seconds": 86400,
+          "group_by": [
+            "labels",
+            "job"
+          ]
+        }
+      ]
     },
     {
       "id": "q19",
@@ -268,8 +443,18 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT sum(v) AS value FROM (SELECT metric, labels, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='order_service_http_requests_total' AND ts_ms>{eval_ms}-300000 AND ts_ms<={eval_ms} GROUP BY metric, labels)",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT sum(v) AS value FROM (SELECT metric, labels, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='order_service_http_requests_total' GROUP BY metric, labels)",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "order_service_http_requests_total",
+          "aggregation": "increase",
+          "window_seconds": 300,
+          "group_by": [
+            "labels"
+          ]
+        }
+      ]
     },
     {
       "id": "q20",
@@ -284,7 +469,8 @@
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
       "clickhouse_planning_sql": null,
-      "clickhouse_planning_status": "typed_unsupported: offset windows are not represented in SQL runtime bindings"
+      "clickhouse_planning_status": "typed_unsupported: offset windows are not represented in SQL runtime bindings",
+      "clickhouse_summary_requirements": []
     },
     {
       "id": "q21",
@@ -298,7 +484,8 @@
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
       "clickhouse_planning_sql": null,
-      "clickhouse_planning_status": "typed_unsupported: classic-histogram interpolation has no canonical SQL DAG operator"
+      "clickhouse_planning_status": "typed_unsupported: classic-histogram interpolation has no canonical SQL DAG operator",
+      "clickhouse_summary_requirements": []
     },
     {
       "id": "q22",
@@ -311,8 +498,18 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT sum(v) AS value FROM (SELECT metric, labels, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='order_service_http_requests_total' AND ts_ms>{eval_ms}-300000 AND ts_ms<={eval_ms} GROUP BY metric, labels)",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT sum(v) AS value FROM (SELECT metric, labels, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='order_service_http_requests_total' GROUP BY metric, labels)",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "order_service_http_requests_total",
+          "aggregation": "increase",
+          "window_seconds": 300,
+          "group_by": [
+            "labels"
+          ]
+        }
+      ]
     },
     {
       "id": "q23",
@@ -325,8 +522,18 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT * FROM (SELECT labels, max(value) AS value FROM raw_samples WHERE metric='backend_retry_backlog_depth' AND ts_ms>{eval_ms}-21600000 AND ts_ms<={eval_ms} GROUP BY labels ORDER BY labels) ORDER BY value DESC, labels LIMIT 2",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT * FROM (SELECT labels, max(value) AS value FROM raw_samples WHERE metric='backend_retry_backlog_depth' AND ts_ms>{start_ms} AND ts_ms<={end_ms} GROUP BY labels ORDER BY labels) ORDER BY value DESC, labels LIMIT 2",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "backend_retry_backlog_depth",
+          "aggregation": "max",
+          "window_seconds": 21600,
+          "group_by": [
+            "labels"
+          ]
+        }
+      ]
     },
     {
       "id": "q24",
@@ -343,7 +550,8 @@
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
       "clickhouse_planning_sql": null,
-      "clickhouse_planning_status": "typed_unsupported: PromQL subquery evaluation grid is not represented by the SQL DAG"
+      "clickhouse_planning_status": "typed_unsupported: PromQL subquery evaluation grid is not represented by the SQL DAG",
+      "clickhouse_summary_requirements": []
     },
     {
       "id": "q25",
@@ -360,7 +568,8 @@
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
       "clickhouse_planning_sql": null,
-      "clickhouse_planning_status": "typed_unsupported: vector/scalar label semantics are not represented by relational joins"
+      "clickhouse_planning_status": "typed_unsupported: vector/scalar label semantics are not represented by relational joins",
+      "clickhouse_summary_requirements": []
     },
     {
       "id": "q26",
@@ -373,8 +582,19 @@
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
-      "clickhouse_planning_sql": "SELECT * FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_rate(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>{eval_ms}-21600000 AND ts_ms<={eval_ms} GROUP BY metric, labels, job) GROUP BY job) ORDER BY value DESC, job LIMIT 1",
-      "clickhouse_planning_status": "supported"
+      "clickhouse_planning_sql": "SELECT * FROM (SELECT job, sum(v) AS value FROM (SELECT metric, labels, job, asap_rate(value, ts_ms, 21600000) AS v FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' GROUP BY metric, labels, job) GROUP BY job) ORDER BY value DESC, job LIMIT 1",
+      "clickhouse_planning_status": "supported",
+      "clickhouse_summary_requirements": [
+        {
+          "metric": "backend_process_cpu_seconds_total",
+          "aggregation": "increase",
+          "window_seconds": 21600,
+          "group_by": [
+            "labels",
+            "job"
+          ]
+        }
+      ]
     },
     {
       "id": "q27",
@@ -389,7 +609,8 @@
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid",
       "clickhouse_planning_sql": null,
-      "clickhouse_planning_status": "typed_unsupported: PromQL subquery evaluation grid and last-sample selection are not represented"
+      "clickhouse_planning_status": "typed_unsupported: PromQL subquery evaluation grid and last-sample selection are not represented",
+      "clickhouse_summary_requirements": []
     }
   ],
   "source_sha256": "72c334fab18674746a2cef7c926e81d06a13dc9f11858d080460a99aa5b31ecf"
