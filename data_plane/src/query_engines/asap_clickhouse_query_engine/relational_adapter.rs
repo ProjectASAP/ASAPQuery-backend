@@ -101,6 +101,11 @@ fn parse_clickhouse_timestamp(value: &serde_json::Value, clickhouse_type: &str) 
     }
     let (scale, timezone) = if clickhouse_type == "DateTime" {
         (0, "UTC")
+    } else if let Some(timezone) = clickhouse_type
+        .strip_prefix("DateTime(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        (0, timezone.trim().trim_matches('\''))
     } else {
         let args = clickhouse_type
             .strip_prefix("DateTime64(")?
@@ -278,7 +283,12 @@ fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: 
         DataType::Float64 => actual == "Float64",
         DataType::Utf8 => actual == "String",
         DataType::Bool => actual == "Bool",
-        DataType::Timestamp => actual == "Int64" || actual.starts_with("DateTime64("),
+        DataType::Timestamp => {
+            actual == "Int64"
+                || actual == "DateTime"
+                || actual.starts_with("DateTime(")
+                || actual.starts_with("DateTime64(")
+        }
     }
 }
 
