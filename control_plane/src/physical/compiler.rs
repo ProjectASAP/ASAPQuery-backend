@@ -3576,7 +3576,7 @@ pub(crate) fn aggregation_config_for_materialization(
     asap_types::PrecomputeMaterialization::from_yaml_data(
         &yaml,
         None,
-        asap_types::QueryLanguage::promql,
+        asap_types::QueryLanguage::PromQl,
     )
     .context("build materialization from physical aggregation")
 }

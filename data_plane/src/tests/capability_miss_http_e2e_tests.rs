@@ -174,7 +174,7 @@ async fn start_backend(control_plane_url: String, hot_reload: HotReloadStreaming
     // test and stay out of the hot-vs-cold routing question.
     let adapter_config = AdapterConfig::new(
         crate::storage_engines::types::enums::QueryProtocol::PrometheusHttp,
-        crate::storage_engines::types::QueryLanguage::promql,
+        crate::storage_engines::types::QueryLanguage::PromQl,
         None,
     );
     let config = HttpServerConfig {
