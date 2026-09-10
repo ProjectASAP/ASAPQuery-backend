@@ -117,7 +117,9 @@ pub trait FallbackClient: Send + Sync {
 }
 
 mod prometheus;
+mod victoriametrics;
 
 pub mod metrics;
 
 pub use prometheus::PrometheusHttpFallback;
+pub use victoriametrics::VictoriaMetricsHttpFallback;

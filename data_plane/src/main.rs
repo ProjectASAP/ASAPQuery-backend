@@ -86,6 +86,14 @@ struct Args {
     #[arg(long, alias = "query-port", default_value = "8088")]
     http_port: u16,
 
+    /// Independent VictoriaMetrics-compatible MetricsQL query listener.
+    #[arg(long)]
+    victoriametrics_http_port: Option<u16>,
+
+    /// VictoriaMetrics base URL used for exact MetricsQL fallback.
+    #[arg(long, default_value = "http://localhost:8428")]
+    victoriametrics_url: String,
+
     /// Deprecated/no-op: the backend's only HTTP listener is the
     /// PromQL query surface (`--http-port` / `--query-port`). The
     /// old PRW ingest port was deleted in PR #100; this flag is
@@ -1292,6 +1300,18 @@ async fn main() -> Result<()> {
 
     info!("Starting HTTP server on port {}", args.http_port);
 
+    let victoria_server = args.victoriametrics_http_port.map(|port| {
+        use data_plane::drivers::query::adapters::VictoriaMetricsHttpAdapter;
+        let config = AdapterConfig::victoriametrics_metricsql(args.victoriametrics_url.clone());
+        info!("Starting VictoriaMetrics MetricsQL listener on port {port}");
+        server
+            .clone()
+            .with_query_listener(port, config.clone())
+            .with_protocol_adapter(Arc::new(VictoriaMetricsHttpAdapter::new(config)))
+    });
+
+    let victoria_task = victoria_server.map(|server| tokio::spawn(server.run()));
+
     // Wait for shutdown signal
     tokio::select! {
         result = server.run() => {
@@ -1302,6 +1322,10 @@ async fn main() -> Result<()> {
         _ = signal::ctrl_c() => {
             info!("Shutdown signal received");
         }
+    }
+
+    if let Some(task) = victoria_task {
+        task.abort();
     }
 
     // Cleanup - gracefully shutdown background tasks

@@ -59,4 +59,16 @@ impl AdapterConfig {
             fallback,
         )
     }
+
+    /// Configuration used by the independent VictoriaMetrics listener. The
+    /// wire protocol is Prometheus-compatible; MetricsQL binding is handled at
+    /// the query-language boundary.
+    pub fn victoriametrics_metricsql(fallback_url: String) -> Self {
+        use crate::drivers::query::fallback::VictoriaMetricsHttpFallback;
+        Self::new(
+            QueryProtocol::PrometheusHttp,
+            QueryLanguage::promql,
+            Some(Arc::new(VictoriaMetricsHttpFallback::new(fallback_url))),
+        )
+    }
 }

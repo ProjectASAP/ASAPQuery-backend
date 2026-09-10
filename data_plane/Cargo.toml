@@ -38,7 +38,8 @@ control_plane = { path = "../control_plane" }
 # reduction: Reduction, .. }`) are `pre_asap` types, in the same crate now
 # (not a separate `asap-ir` import). Query serving consumes the compiled
 # QueryPlan; these types are used at physical-plan compilation boundaries.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "0deceda3e776216c5542d638d958b159f22e27ce" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "4ce032623d4fa9a5df6055104e848c40940b52c1" }
+asap-frontend-metricsql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "4ce032623d4fa9a5df6055104e848c40940b52c1" }
 
 # Shared external (workspace)
 serde.workspace = true
@@ -129,7 +130,7 @@ crc32fast = "1.4"
 # none of them.
 
 [dev-dependencies]
-asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "0deceda3e776216c5542d638d958b159f22e27ce" }
+asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "4ce032623d4fa9a5df6055104e848c40940b52c1" }
 tempfile = "3.20.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio-tungstenite = "0.21"

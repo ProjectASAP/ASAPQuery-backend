@@ -2,6 +2,7 @@ pub mod config;
 pub mod factory;
 pub mod prometheus_http;
 pub mod traits;
+pub mod victoriametrics_http;
 
 // Re-export main types
 pub use config::AdapterConfig;
@@ -11,3 +12,4 @@ pub use traits::{
     AdapterError, HttpProtocolAdapter, ParsedQueryRequest, ParsedRangeQueryRequest,
     QueryExecutionResult, QueryRequestAdapter, QueryResponseAdapter,
 };
+pub use victoriametrics_http::VictoriaMetricsHttpAdapter;

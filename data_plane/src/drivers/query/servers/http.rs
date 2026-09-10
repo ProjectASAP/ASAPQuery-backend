@@ -132,6 +132,7 @@ pub struct HttpServerConfig {
 #[derive(Clone)]
 pub struct HttpServer {
     config: HttpServerConfig,
+    adapter_override: Option<Arc<dyn HttpProtocolAdapter>>,
     query_engine: Arc<ASAPQueryEngine>,
     /// Phase-5/6 capability router. Built from `query_engine` at
     /// construction time (`ASAPQueryEngine` registered as the ASAP-tier
@@ -238,6 +239,7 @@ impl HttpServer {
         let query_router = Arc::new(router);
         Self {
             config,
+            adapter_override: None,
             query_engine,
             query_router,
             sketch_index,
@@ -251,6 +253,22 @@ impl HttpServer {
             physical_plan_lifecycle: None,
             remote_write: None,
         }
+    }
+
+    /// Use a language-specific protocol adapter without extending the shared
+    /// protocol enum. This keeps VictoriaMetrics transport policy at its own
+    /// listener boundary.
+    pub fn with_protocol_adapter(mut self, adapter: Arc<dyn HttpProtocolAdapter>) -> Self {
+        self.adapter_override = Some(adapter);
+        self
+    }
+
+    /// Clone the fully configured query service onto another query listener.
+    pub fn with_query_listener(mut self, port: u16, adapter_config: AdapterConfig) -> Self {
+        self.config.port = port;
+        self.config.adapter_config = adapter_config;
+        self.remote_write = None;
+        self
     }
 
     /// Enable Prometheus Remote Write v1 on the same public HTTP listener.
@@ -395,7 +413,10 @@ impl HttpServer {
         srv_metrics::register_all();
 
         // Create adapter using factory
-        let adapter = create_http_adapter(self.config.adapter_config.clone());
+        let adapter = self
+            .adapter_override
+            .clone()
+            .unwrap_or_else(|| create_http_adapter(self.config.adapter_config.clone()));
 
         let query_endpoint = adapter.get_query_endpoint();
         let runtime_info_path = adapter.get_runtime_info_path();
@@ -507,7 +528,10 @@ impl HttpServer {
     /// the regular `start()` method.
     pub async fn start_test_server(&self) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
         // Create adapter using factory
-        let adapter = create_http_adapter(self.config.adapter_config.clone());
+        let adapter = self
+            .adapter_override
+            .clone()
+            .unwrap_or_else(|| create_http_adapter(self.config.adapter_config.clone()));
 
         let query_endpoint = adapter.get_query_endpoint();
         let runtime_info_path = adapter.get_runtime_info_path();
