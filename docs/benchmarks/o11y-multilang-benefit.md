@@ -9,8 +9,15 @@ The command below starts with an empty output directory. It deterministically ge
 ```bash
 CARGO_TARGET_DIR=/path/to/target python3 tools/o11y-multilang/reproduce.py \
   --backend-source "$PWD" \
-  --output-dir tools/o11y-multilang/repro-fresh \
+  --output-dir /tmp/o11y-repro-fresh \
   --trials 1 --repetitions 3 --seed 20260910
+```
+
+The command never changes tracked evidence. After review, promote only the designated JSON artifacts explicitly:
+
+```bash
+cp /tmp/o11y-repro-fresh/{manifest,source-provenance,frontend-planner,metricsql-production,stage-pre-runtime,stage-coverage,trial-0-raw,trial-0-comparisons,trial-0-latency-summary}.json \
+  tools/o11y-multilang/repro-fresh/
 ```
 
 The seed randomizes query order independently for each repetition. Engine order alternates. Each trial creates new storage and process state and removes it afterward. Container images are launched by immutable digest and the manifest also records their actual image IDs. Resource snapshots are totals for the mixed alternating query phase and cannot be attributed to native or ASAP mode independently. The manifest records the clean source HEAD, binary hash, generated-input hashes, lifecycle and ingest duration, and process CPU ticks, RSS/HWM, and storage at start, after ingest, and after queries.
