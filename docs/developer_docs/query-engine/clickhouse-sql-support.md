@@ -2,6 +2,28 @@
 
 Status: implementation design
 
+## Current implementation
+
+The backend now has an independent ClickHouse HTTP listener and exact
+fallback, an ASAPPlanner SQL entry point, a generation-aware SQL plan catalog,
+SDS foreign-key validation and staged/active ACKs, and a shared relational DAG
+execution path. `Project`, `Filter`, global `Sort`, and `Limit` execute above
+summary readout; unsupported scalar expressions and relational shapes fail
+closed to ClickHouse. SQL results are encoded as typed `JSON`, `JSONEachRow`,
+or `TabSeparated` responses.
+
+At startup, `--clickhouse-plan-bundle` (or
+`ASAP_CLICKHOUSE_PLAN_BUNDLE`) installs the independently published table
+schemas, SDS snapshot reference, SQL templates, execution windows, and allowed
+materialization fingerprints. Omitting the bundle keeps the listener in exact
+proxy mode. Historical ClickHouse rows can be replayed through
+`ClickHouseReader` into the existing isolated backfill worker.
+
+The executable subset is intentionally narrower than ClickHouse SQL. Joins,
+window functions, partitioned ranking, unsupported scalar functions, missing
+plans, missing materializations, and incomplete coverage route to exact
+ClickHouse without changing PromQL behavior or SDS semantics.
+
 ## Goals and invariants
 
 ASAPQuery-backend exposes a ClickHouse-compatible HTTP endpoint, uses
@@ -148,4 +170,3 @@ Existing PromQL tests must pass unchanged. ClickHouse coverage includes protocol
 and forwarding tests, SQL frontend-to-`SummaryNode` tests, SDS reference
 validation, shared-executor parity, time-boundary and type tests, Grafana smoke
 tests, and a real-ClickHouse differential end-to-end test.
-
