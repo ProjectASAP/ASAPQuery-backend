@@ -120,6 +120,7 @@ pub struct ASAPQueryEngine {
     /// path. The QueryPlan and SummaryCatalog must come from the same snapshot.
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
     exact_subquery_endpoint: Option<String>,
+    metricsql_exact_subquery_endpoint: Option<String>,
     exact_subquery_client: reqwest::Client,
 }
 
@@ -210,6 +211,7 @@ impl ASAPQueryEngine {
             archive_engine: None,
             active_physical_plan: None,
             exact_subquery_endpoint: None,
+            metricsql_exact_subquery_endpoint: None,
             exact_subquery_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
@@ -219,6 +221,11 @@ impl ASAPQueryEngine {
 
     pub fn with_exact_subquery_endpoint(mut self, endpoint: String) -> Self {
         self.exact_subquery_endpoint = Some(endpoint);
+        self
+    }
+
+    pub fn with_metricsql_exact_subquery_endpoint(mut self, endpoint: String) -> Self {
+        self.metricsql_exact_subquery_endpoint = Some(endpoint);
         self
     }
     async fn prepare_logical(
@@ -279,6 +286,7 @@ impl ASAPQueryEngine {
             entry,
             times,
             self.exact_subquery_endpoint.as_deref(),
+            self.metricsql_exact_subquery_endpoint.as_deref(),
             &self.exact_subquery_client,
             prepared,
         )

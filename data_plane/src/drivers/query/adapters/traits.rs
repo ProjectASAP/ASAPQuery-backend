@@ -137,6 +137,9 @@ pub trait QueryResponseAdapter: Send + Sync {
 /// Note: Fallback logic is handled separately via FallbackClient
 #[async_trait]
 pub trait HttpProtocolAdapter: QueryRequestAdapter + QueryResponseAdapter + Send + Sync {
+    /// Query language accepted at this listener boundary.
+    fn query_language(&self) -> asap_types::QueryLanguage;
+
     /// Get a descriptive name for this adapter (for logging/debugging)
     fn adapter_name(&self) -> &'static str;
 

@@ -811,7 +811,8 @@ async fn main() -> Result<()> {
         // / ghost / unknown.
         .with_sketch_index(sketch_index.clone())
         .with_active_physical_plan(active_physical_plan.clone())
-        .with_exact_subquery_endpoint(args.prometheus_server.clone());
+        .with_exact_subquery_endpoint(args.prometheus_server.clone())
+        .with_metricsql_exact_subquery_endpoint(args.victoriametrics_url.clone());
         if let Some(control_plane_endpoint) = args.control_plane_endpoint.as_ref() {
             info!(
                 "Capability-miss notifications enabled → {}",

@@ -5,7 +5,7 @@ use control_plane::query_plan::{
     logical::LogicalOperator, ExternalExactInput, ExternalExactRequest, QueryLanguage, QueryNodeId,
     QueryPlanEntry, QueryPlanNode,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 const MAX_CANDIDATE_VALUES: usize = 10_000;
 const MAX_CANDIDATE_QUERY_BYTES: usize = 1_048_576;
@@ -285,28 +285,35 @@ pub(super) async fn prepare(
     endpoint: Option<&str>,
     client: &reqwest::Client,
 ) -> Result<PreparedLeaves, EngineError> {
-    prepare_external(entry, times, endpoint, client, PreparedLeaves::new()).await
+    prepare_external(entry, times, endpoint, None, client, PreparedLeaves::new()).await
 }
 
 pub(super) async fn prepare_external(
     entry: &QueryPlanEntry,
     times: &[u64],
-    endpoint: Option<&str>,
+    prometheus_endpoint: Option<&str>,
+    metricsql_endpoint: Option<&str>,
     client: &reqwest::Client,
     mut prepared: PreparedLeaves,
 ) -> Result<PreparedLeaves, EngineError> {
     // Equivalent exact cuts at the same time share one actual remote request.
-    let mut remote_cache = BTreeMap::<(String, i64), Value>::new();
+    let mut remote_cache = HashMap::<(QueryLanguage, String, i64), Value>::new();
     for ((id, at), leaf) in leaves(entry, times)? {
         u64::try_from(at).map_err(|_| miss("subquery predates epoch"))?;
-        let (query, candidate_input) = match &leaf {
-            ExactLeaf::Legacy(LogicalOperator::ExactSubquery { query }) => (query.clone(), None),
+        let (language, query, candidate_input) = match &leaf {
+            ExactLeaf::Legacy(LogicalOperator::ExactSubquery { query }) => {
+                (QueryLanguage::PromQl, query.clone(), None)
+            }
             ExactLeaf::Legacy(LogicalOperator::CandidateExactSubquery { query, item_label }) => (
+                QueryLanguage::PromQl,
                 query.clone(),
                 Some((entry.nodes[&id].inputs()[0], item_label.as_str())),
             ),
             ExactLeaf::External(request) => {
-                if request.language != QueryLanguage::PromQl {
+                if !matches!(
+                    request.language,
+                    QueryLanguage::PromQl | QueryLanguage::MetricsQl
+                ) {
                     return Err(miss(format!(
                         "external exact language {:?} has no installed adapter",
                         request.language
@@ -319,13 +326,18 @@ pub(super) async fn prepare_external(
                     }
                     _ => return Err(miss("unsupported external exact input contract")),
                 };
-                (request.expression.clone(), candidate)
+                (request.language, request.expression.clone(), candidate)
             }
             _ => return Err(miss("prepared leaf is not an exact subtree")),
         };
         let (query, candidate_filtered) = if let Some((candidate_input, item_label)) =
             candidate_input
         {
+            if language == QueryLanguage::MetricsQl {
+                return Err(miss(
+                    "candidate-filtered MetricsQL exact subqueries are not implemented",
+                ));
+            }
             let candidate = prepared
                 .get(&(candidate_input, at))
                 .ok_or_else(|| miss("candidate membership was not prepared"))?;
@@ -373,12 +385,20 @@ pub(super) async fn prepare_external(
         } else {
             (query, false)
         };
-        let key = (query.clone(), at);
+        let key = (language, query.clone(), at);
         let cached = remote_cache.contains_key(&key);
         let value = if let Some(value) = remote_cache.get(&key) {
             value.clone()
         } else {
-            let endpoint = endpoint.ok_or_else(|| miss("Prometheus exact endpoint unavailable"))?;
+            let endpoint = match language {
+                QueryLanguage::PromQl => prometheus_endpoint
+                    .ok_or_else(|| miss("Prometheus exact endpoint unavailable"))?,
+                QueryLanguage::MetricsQl => metricsql_endpoint
+                    .ok_or_else(|| miss("VictoriaMetrics exact endpoint unavailable"))?,
+                QueryLanguage::ClickHouseSql => {
+                    return Err(miss("ClickHouse exact subquery needs its SQL adapter"))
+                }
+            };
             let url = format!("{}/api/v1/query", endpoint.trim_end_matches('/'));
             let time = format!("{:.3}", at as f64 / 1000.0);
             // Candidate sets can be large enough to exceed proxy URL limits;
@@ -446,6 +466,59 @@ mod tests {
         assert!(matches!(parse_result(&serde_json::json!({"status":"success","data":{"resultType":"scalar","result":[1,"2"]}}),1000).unwrap(),Value::Scalar(2.0)));
         assert!(parse_result(&serde_json::json!({"status":"success","warnings":["partial"],"data":{"resultType":"scalar","result":[1,"2"]}}),1000).is_err());
         assert!(parse_result(&serde_json::json!({"status":"success","data":{"resultType":"scalar","result":[2,"2"]}}),1000).is_err());
+    }
+
+    #[tokio::test]
+    async fn metricsql_external_leaf_uses_victoriametrics_endpoint() {
+        let app =
+            axum::Router::new().route(
+                "/api/v1/query",
+                axum::routing::get(
+                    |axum::extract::Query(params): axum::extract::Query<
+                        BTreeMap<String, String>,
+                    >| async move {
+                        assert_eq!(params["query"], "sum(rate(m[5m]))");
+                        axum::Json(serde_json::json!({
+                            "status":"success",
+                            "data":{"resultType":"scalar","result":[1,"7"]}
+                        }))
+                    },
+                ),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut planned = entry(BTreeMap::from([(
+            QueryNodeId(0),
+            QueryPlanNode::ExternalExact {
+                request: ExternalExactRequest {
+                    language: QueryLanguage::MetricsQl,
+                    expression: "sum(rate(m[5m]))".into(),
+                    output: control_plane::query_plan::ExternalExactOutput::InstantVector,
+                    parameters: BTreeMap::new(),
+                    start_parameter: None,
+                    end_parameter: None,
+                    input_contracts: vec![],
+                },
+                inputs: vec![],
+            },
+        )]));
+        planned.language = QueryLanguage::MetricsQl;
+        let prepared = prepare_external(
+            &planned,
+            &[1_000],
+            Some("http://127.0.0.1:9"),
+            Some(&format!("http://{address}")),
+            &reqwest::Client::new(),
+            PreparedLeaves::new(),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            prepared[&(QueryNodeId(0), 1_000)].value,
+            Value::Scalar(7.0)
+        ));
+        server.abort();
     }
 
     fn candidate_entry(query: &str) -> QueryPlanEntry {
@@ -550,6 +623,7 @@ mod tests {
             &entry,
             &[1_000],
             None,
+            None,
             &reqwest::Client::new(),
             candidate_rows(Vec::new()),
         )
@@ -582,6 +656,7 @@ mod tests {
         let prepared = prepare_external(
             &entry,
             &[1_000],
+            None,
             None,
             &reqwest::Client::new(),
             candidate_rows(Vec::new()),
@@ -631,6 +706,7 @@ mod tests {
             &entry,
             &[1_000],
             Some(&format!("http://{address}")),
+            None,
             &reqwest::Client::new(),
             candidate_rows(candidates),
         )
@@ -663,6 +739,7 @@ mod tests {
             &candidate_entry("sum by (job) (rate(m[5m]))"),
             &[1_000],
             Some(&format!("http://{address}")),
+            None,
             &reqwest::Client::new(),
             candidate_rows(["api".into()]),
         )

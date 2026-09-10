@@ -236,6 +236,13 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                             }
                         }),
                     );
+                    let (execution, detail) = if prepared.is_empty() {
+                        ("warm", "asap")
+                    } else {
+                        ("hybrid", "hybrid")
+                    };
+                    headers.insert("x-asap-execution", HeaderValue::from_static(execution));
+                    headers.insert("x-asap-execution-detail", HeaderValue::from_static(detail));
                     ClickHouseAccelerationOutcome::Accelerated(ClickHouseRawResponse {
                         status: StatusCode::OK,
                         headers,
