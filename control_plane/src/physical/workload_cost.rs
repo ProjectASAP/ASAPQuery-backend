@@ -58,6 +58,10 @@ pub struct WorkloadQuote {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkloadCostEvidence {
+    #[serde(default)]
+    pub backend_revision: String,
+    #[serde(default)]
+    pub planner_revision: String,
     pub data_snapshot_id: String,
     pub model_version: String,
     pub observed_at_unix_ms: u64,
@@ -335,6 +339,17 @@ pub(crate) fn exact_source_metrics(
 
 impl WorkloadCostEvidence {
     fn validate(&self, env: &DeploymentEnvironment) -> Result<(), CompileError> {
+        if self.backend_revision != super::compiler::BACKEND_REVISION
+            || self.planner_revision != super::compiler::PLANNER_REVISION
+        {
+            return Err(invalid(format!(
+                "cost evidence compiler mismatch: measured backend/planner {}/{}; running {}/{}",
+                self.backend_revision,
+                self.planner_revision,
+                super::compiler::BACKEND_REVISION,
+                super::compiler::PLANNER_REVISION
+            )));
+        }
         if self.data_snapshot_id.trim().is_empty()
             || self.model_version.trim().is_empty()
             || self.valid_for_ms == 0
@@ -689,6 +704,8 @@ mod tests {
             })
             .collect();
         let evidence = WorkloadCostEvidence {
+            backend_revision: crate::physical::compiler::BACKEND_REVISION.into(),
+            planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
             data_snapshot_id: "fixture-data-v1".into(),
             model_version: "test-only-unit-costs".into(),
             observed_at_unix_ms: env.observed_at_unix_ms,
@@ -779,6 +796,8 @@ mod tests {
                 .collect();
             assert_eq!(sources, expected, "{query}");
             let mut evidence = WorkloadCostEvidence {
+                backend_revision: crate::physical::compiler::BACKEND_REVISION.into(),
+                planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
                 data_snapshot_id: "test-data".into(),
                 model_version: "test-model".into(),
                 observed_at_unix_ms: env.observed_at_unix_ms,
@@ -875,6 +894,14 @@ mod tests {
         let (_, _, mut evidence) = quoted();
         evidence.observed_at_unix_ms = env.observed_at_unix_ms + 1;
         assert!(select(candidates, env, &evidence).is_err());
+    }
+
+    #[test]
+    fn evidence_from_a_different_compiler_build_is_rejected_before_matching_quotes() {
+        let (candidates, env, mut evidence) = quoted();
+        evidence.backend_revision = "stale-backend-build".into();
+        let error = select(candidates, env, &evidence).unwrap_err().to_string();
+        assert!(error.contains("cost evidence compiler mismatch"), "{error}");
     }
 
     #[test]

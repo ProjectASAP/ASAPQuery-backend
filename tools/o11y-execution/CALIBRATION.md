@@ -39,6 +39,9 @@ compares its complete quotes and installs the selected artifact.
 
 Measurement JSON uses this structure (numbers below describe fields, not quotes):
 
+- `compiler_identity`: the exact backend and pinned Planner revisions used to
+  export and execute the candidate. Candidate export, measurement, and cost
+  evidence must agree; a stale binary fails before quote matching.
 - `units`: `cpu_ns`; `data_snapshot_id`: `sha256:` followed by the input file hash.
 - `candidates`: one record per measured `plan_id`, with the exact `manifest`,
   `executable`, and matching `horizon_seconds`.

@@ -270,9 +270,10 @@ def main():
     sample_count = runner.validate_sample_file(args.metrics)
     corpus, snapshot = json.loads(args.queries.read_text()), json.loads(args.snapshot.read_text())
     runner.validate_workload(snapshot, corpus)
-    result = {"units": "cpu_ns", "data_snapshot_id": "sha256:" + hashlib.sha256(args.metrics.read_bytes()).hexdigest(),
+    candidate_document = json.loads(args.candidates.read_text())
+    result = {"units": "cpu_ns", "compiler_identity": candidate_document.get("compiler_identity"), "data_snapshot_id": "sha256:" + hashlib.sha256(args.metrics.read_bytes()).hexdigest(),
               "scope": "accelerated finite-input calibration; measured wall residency is not full logical-horizon residency", "validated_sample_count": sample_count, "candidates": []}
-    candidates = json.loads(args.candidates.read_text())["candidates"]
+    candidates = candidate_document["candidates"]
     for candidate in candidates:
         if "manifest" in candidate and "install_request" in candidate:
             validate_candidate_topk_artifact(candidate)

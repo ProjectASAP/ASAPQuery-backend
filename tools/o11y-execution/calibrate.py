@@ -26,6 +26,9 @@ def digest(path):
 
 
 def calibrate(candidates, measurements, data_snapshot_id, observed_at_unix_ms, valid_for_ms):
+    identity = candidates.get("compiler_identity")
+    if not identity or measurements.get("compiler_identity") != identity:
+        raise ValueError("candidate and measurement compiler identities differ or are missing")
     if measurements.get("units") != "cpu_ns" or measurements.get("data_snapshot_id") != data_snapshot_id:
         raise ValueError("measurement units or data identity mismatch")
     by_id = {}
@@ -84,7 +87,7 @@ def calibrate(candidates, measurements, data_snapshot_id, observed_at_unix_ms, v
         attribution.append({"plan_id": pid, "allocation": allocation,
                             "resources": measured.get("resources"),
                             "scope": "backend plus any exact fallback service; complete inclusive CPU; memory/storage reported separately"})
-    return ({"data_snapshot_id": data_snapshot_id, "model_version": "measured-inclusive-cpu-ns-v1",
+    return ({**identity, "data_snapshot_id": data_snapshot_id, "model_version": "measured-inclusive-cpu-ns-v1",
              "observed_at_unix_ms": observed_at_unix_ms, "valid_for_ms": valid_for_ms, "quotes": quotes},
             {"attribution": attribution, "unavailable": unavailable})
 

@@ -38,6 +38,7 @@ use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
 pub const PLANNER_REVISION: &str = "0deceda3e776216c5542d638d958b159f22e27ce";
+pub const BACKEND_REVISION: &str = env!("ASAPQUERY_BACKEND_REVISION");
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 /// Matches the data plane's default persistence memory limit. A backend-local
 /// summary candidate must fit its complete retained state inside this budget.

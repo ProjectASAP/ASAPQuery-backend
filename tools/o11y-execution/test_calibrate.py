@@ -11,8 +11,9 @@ class CalibrationTests(unittest.TestCase):
                              "state:x:update": {"unit": "horizon", "multiplicity": 1},
                              "query:q:0": {"unit": "query_evaluation", "multiplicity": 6},
                              "result:q": {"unit": "query_evaluation", "multiplicity": 6}}}
-        self.candidates = {"candidates": [{"manifest": self.manifest}]}
-        self.measurements = {"units": "cpu_ns", "data_snapshot_id": "d", "candidates": [{
+        identity = {"backend_revision": "backend-a", "planner_revision": "planner-a"}
+        self.candidates = {"compiler_identity": identity, "candidates": [{"manifest": self.manifest}]}
+        self.measurements = {"compiler_identity": identity, "units": "cpu_ns", "data_snapshot_id": "d", "candidates": [{
             "plan_id": 1, "manifest": copy.deepcopy(self.manifest), "executable": True,
             "horizon_seconds": 60,
             "horizon_phases": {key: {"cpu_ns": 10, "raw_measurement_file": key + ".json"}
@@ -53,6 +54,13 @@ class CalibrationTests(unittest.TestCase):
         # Any change in calibrated candidate identity invalidates the quote.
         self.measurements["candidates"][0]["manifest"]["horizon_seconds"] = 30
         with self.assertRaises(ValueError):
+            self.run_provider()
+
+    def test_stale_compiler_measurement_is_rejected(self):
+        self.measurements["compiler_identity"] = {
+            "backend_revision": "backend-old", "planner_revision": "planner-a"
+        }
+        with self.assertRaisesRegex(ValueError, "compiler identities differ"):
             self.run_provider()
 
     def test_shared_profile_preserves_measured_cpu_units(self):
