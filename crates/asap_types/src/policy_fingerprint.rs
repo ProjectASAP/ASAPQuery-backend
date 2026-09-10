@@ -175,6 +175,14 @@ impl PolicyFingerprint {
 
         // 10. spatial_filter_normalized — canonicalized predicate
         buf.extend_from_slice(cfg.spatial_filter_normalized.as_bytes());
+        if let Some(table) = &cfg.table_name {
+            buf.extend_from_slice(b"\0sql-source-v1\0");
+            buf.extend_from_slice(table.as_bytes());
+            buf.push(0);
+            if let Some(column) = &cfg.value_column {
+                buf.extend_from_slice(column.as_bytes());
+            }
+        }
         if let Some(population) = &cfg.table_population {
             let canonical = population.canonical();
             if !canonical.is_empty() {

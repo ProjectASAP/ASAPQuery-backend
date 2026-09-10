@@ -78,6 +78,26 @@ typed `ClickHouse { database, table }` source. Backfill populates the same
 SummaryStore instances used by other ingest sources; it does not introduce a
 second storage or catalog lifecycle.
 
+SQL materializations can carry a shared `TablePopulation` conjunction of typed
+column/literal comparisons. Its canonical identity is stored in the catalog and
+included in the materialization fingerprint together with table and value-column
+identity. These predicates do not use the PromQL label-filter normalizer. The
+reader takes its value projection and population from the installed materialization,
+binds literal values as ClickHouse parameters, and accepts either encoded series
+labels or a `Map(String,String)` label column. The requested database/table must
+match the deployment and installed source respectively.
+SQL fingerprints now include the explicit table/value source, so existing SQL
+materializations must be republished and rebuilt; their old state is not reused
+under the new identity. Legacy PromQL fingerprints remain unchanged.
+
+SQL timestamp comparisons retain their exact integer-millisecond inclusivity.
+For example, `t <= 1999` and `t < 2000` identify the same half-open interval;
+`t <= 2000` does not. A source range differing from the installed fixed evaluation
+is rejected. Whole-second panes cannot yet cover an arbitrary inclusive boundary
+fragment; those queries require exact fallback until the compiler can compose
+boundary exact reads with summary interiors. Backfill still buffers a requested
+window and has not demonstrated bounded memory at large window/cardinality scale.
+
 ## Verification
 
 Focused tests cover language-isolated lookup, atomic install rejection for an

@@ -26,14 +26,14 @@
 //!
 //! The service doesn't know how to talk to Prometheus / S3
 //! — those are network-backed and deployment-specific. Instead, the
-//! caller provides a [`ReaderFactory`] that takes a `BackfillSource`
+//! caller provides a [`ReaderFactory`] that takes a `BackfillSource` and the
+//! installed materialization's population and projection contract,
 //! and returns an `Arc<dyn RawSampleReader>`. When no factory is
 //! registered for a given source variant, the job fails with a clear
 //! "no reader configured" message (better than hanging in Queued).
 //!
-//! Phase 5e-v1 doesn't ship a real PrometheusReader — that's Phase
-//! 5h. Tests use `MockRawSampleReader`. Production deployments can
-//! register a factory once the HTTP readers exist.
+//! Production factories implement Prometheus and ClickHouse. Tests can
+//! substitute `MockRawSampleReader` without changing the worker lifecycle.
 //!
 //! ## Time-disjoint enforcement
 //!
@@ -68,6 +68,7 @@ use crate::storage_engines::types::HotReloadStreamingConfig;
 pub type ReaderFactory = Arc<
     dyn Fn(
             &BackfillSource,
+            &asap_types::PrecomputeMaterialization,
         ) -> Result<Arc<dyn RawSampleReader>, Box<dyn std::error::Error + Send + Sync>>
         + Send
         + Sync,
@@ -199,11 +200,23 @@ impl BackfillService {
                 "BackfillService picking up queued job"
             );
 
+            let snapshot = self.config_source.snapshot();
+            let Some(materialization) = snapshot.get_aggregation_config(job.agg_id) else {
+                self.registry
+                    .mark_failed(job.job_id, "backfill materialization is not installed");
+                continue;
+            };
+            if materialization.table_population.is_some()
+                && !matches!(job.source, BackfillSource::ClickHouse { .. })
+            {
+                self.registry.mark_failed(
+                    job.job_id,
+                    "typed table population requires a ClickHouse reader",
+                );
+                continue;
+            }
             if let BackfillSource::ClickHouse { database, table } = &job.source {
-                let snapshot = self.config_source.snapshot();
-                let configured_table = snapshot
-                    .get_aggregation_config(job.agg_id)
-                    .and_then(|config| config.table_name.as_deref());
+                let configured_table = materialization.table_name.as_deref();
                 let qualified_table = format!("{database}.{table}");
                 if configured_table != Some(table.as_str())
                     && configured_table != Some(qualified_table.as_str())
@@ -215,7 +228,7 @@ impl BackfillService {
                     continue;
                 }
             }
-            let reader = match (self.reader_factory)(&job.source) {
+            let reader = match (self.reader_factory)(&job.source, materialization) {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!("reader factory failed: {e}");
@@ -241,13 +254,7 @@ impl BackfillService {
             }
             let worker = BackfillWorker::new(self.registry.clone());
 
-            let filter = LabelFilter::for_metric(
-                self.config_source
-                    .snapshot()
-                    .get_aggregation_config(job.agg_id)
-                    .map(|c| c.metric.clone())
-                    .unwrap_or_default(),
-            );
+            let filter = LabelFilter::for_metric(materialization.metric.clone());
             match worker
                 .run_job(job.job_id, &filter, reader.as_ref(), &processor)
                 .await
@@ -306,7 +313,7 @@ impl Drop for BackfillServiceHandle {
 /// in `main.rs` when no real readers are wired yet: posted jobs
 /// get picked up, attempted, and fail fast with a clear reason.
 pub fn noop_reader_factory() -> ReaderFactory {
-    Arc::new(|source| {
+    Arc::new(|source, _materialization| {
         Err(format!("no RawSampleReader registered for source variant {source:?}").into())
     })
 }
@@ -322,7 +329,7 @@ pub fn noop_reader_factory() -> ReaderFactory {
 /// `BackfillJob::error_message` so the control plane / operator sees
 /// exactly which reader is missing.
 pub fn default_reader_factory() -> ReaderFactory {
-    Arc::new(|source| match source {
+    Arc::new(|source, _materialization| match source {
         BackfillSource::Prometheus { url } => {
             let reader = super::prometheus_reader::PrometheusReader::new(url.clone());
             Ok(Arc::new(reader) as Arc<dyn RawSampleReader>)
@@ -411,7 +418,7 @@ mod tests {
         let service = BackfillService::new(
             registry.clone(),
             hot,
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 called.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Ok(Arc::new(MockRawSampleReader::new(vec![])))
             }),
@@ -445,7 +452,7 @@ mod tests {
 
         // Factory returns a fresh mock reader per call — seeded with a
         // handful of samples that cover the job's range.
-        let reader_factory: ReaderFactory = Arc::new(|_src| {
+        let reader_factory: ReaderFactory = Arc::new(|_src, _materialization| {
             Ok(Arc::new(MockRawSampleReader::new(vec![
                 RawSample {
                     labels: "latency".into(),
@@ -527,7 +534,7 @@ mod tests {
         // Factory records the order in which it's invoked.
         let invocations: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let invocations_clone = invocations.clone();
-        let reader_factory: ReaderFactory = Arc::new(move |src| {
+        let reader_factory: ReaderFactory = Arc::new(move |src, _materialization| {
             invocations_clone.lock().unwrap().push(format!("{src:?}"));
             Ok(Arc::new(MockRawSampleReader::new(vec![])) as Arc<dyn RawSampleReader>)
         });

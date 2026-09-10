@@ -300,6 +300,18 @@ mod tests {
         errors.table_population.as_mut().unwrap().predicates[0].value =
             ScalarValue::Utf8("errors".into());
         assert_ne!(requests.policy_fingerprint(), errors.policy_fingerprint());
+        let mut other_table = requests.clone();
+        other_table.table_name = Some("other_samples".into());
+        assert_ne!(
+            requests.policy_fingerprint(),
+            other_table.policy_fingerprint()
+        );
+        let mut other_value = requests.clone();
+        other_value.value_column = Some("other_value".into());
+        assert_ne!(
+            requests.policy_fingerprint(),
+            other_value.policy_fingerprint()
+        );
         let catalog = SummaryCatalog::from_materializations(1, 1, &[requests, errors]).unwrap();
         assert_eq!(catalog.data_descriptors.len(), 2);
         assert_eq!(catalog.materializations.len(), 2);

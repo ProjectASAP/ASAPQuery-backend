@@ -21,6 +21,8 @@ impl TablePopulation {
     pub fn validate(&self) -> Result<(), String> {
         for predicate in &self.predicates {
             if predicate.column.is_empty()
+                || !predicate.column.as_bytes()[0].is_ascii_alphabetic()
+                    && !predicate.column.starts_with('_')
                 || !predicate
                     .column
                     .bytes()
