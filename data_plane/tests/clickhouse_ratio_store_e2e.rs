@@ -24,7 +24,7 @@ use planner_types::pre_asap::{Column, DataType, Schema};
 
 #[tokio::test]
 async fn compiled_ratio_bundle_executes_two_real_store_summaries() {
-    let configs = ["errors_total", "requests_total"].map(|metric| {
+    let mut configs = ["errors_total", "requests_total"].map(|metric| {
         let mut config = PrecomputeMaterialization::new(
             AggregationType::Increase,
             String::new(),
@@ -45,6 +45,8 @@ async fn compiled_ratio_bundle_executes_two_real_store_summaries() {
         config.pane_origin_ms = Some(0);
         config
     });
+    configs[1].slide_interval = 150;
+    configs[1].window_type = WindowKind::Sliding;
     let sds = SummaryCatalog::from_materializations(76, 1, &configs).unwrap();
     let envelope = PlanEnvelope {
         plan_id: 76,
@@ -120,17 +122,27 @@ async fn compiled_ratio_bundle_executes_two_real_store_summaries() {
             expires_at_ms: None,
             policy_fp: config.policy_fingerprint(),
         });
-        store.append_precompute(
-            sid,
-            group.clone(),
-            (0, 300_000),
-            Box::new(IncreaseAccumulator::new(
-                Measurement::new(0.0),
-                0,
-                Measurement::new(end_value),
-                300_000,
-            )),
-        );
+        let panes = if sid == 11 {
+            vec![(0, 300_000, 0.0, end_value)]
+        } else {
+            vec![
+                (0, 150_000, 0.0, 150.0),
+                (150_000, 300_000, 150.0, end_value),
+            ]
+        };
+        for (start, end, first, last) in panes {
+            store.append_precompute(
+                sid,
+                group.clone(),
+                (start, end),
+                Box::new(IncreaseAccumulator::new(
+                    Measurement::new(first),
+                    start as i64,
+                    Measurement::new(last),
+                    end as i64,
+                )),
+            );
+        }
     }
 
     let ClickHouseDagOutcome::Accelerated(result) =
@@ -157,4 +169,55 @@ async fn compiled_ratio_bundle_executes_two_real_store_summaries() {
             .value(0),
         0.2
     );
+
+    let incomplete = SketchStore::new();
+    incomplete
+        .install_summary_catalog(std::sync::Arc::new(sds.clone()))
+        .unwrap();
+    for (sid, config) in [(21, &configs[0]), (22, &configs[1])] {
+        incomplete.register(SketchInstanceMetadata {
+            sid,
+            metric_name: config.metric.clone(),
+            group_by_keys: BTreeSet::from(["labels".into()]),
+            capability: Some(Capability::ExactAgg(AggregationType::Increase)),
+            agg_kind: AggKind::ExactAgg {
+                agg_type: AggregationType::Increase,
+                parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: None,
+            first_seen_unix_ms: 0,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: config.policy_fingerprint(),
+        });
+    }
+    incomplete.append_precompute(
+        21,
+        group.clone(),
+        (0, 300_000),
+        Box::new(IncreaseAccumulator::new(
+            Measurement::new(0.0),
+            0,
+            Measurement::new(60.0),
+            300_000,
+        )),
+    );
+    incomplete.append_precompute(
+        22,
+        group,
+        (150_000, 300_000),
+        Box::new(IncreaseAccumulator::new(
+            Measurement::new(150.0),
+            150_000,
+            Measurement::new(300.0),
+            300_000,
+        )),
+    );
+    assert!(matches!(
+        execute_sql_dag(&incomplete, &plan, &sds, 0, 300_000, true),
+        ClickHouseDagOutcome::Fallback(
+            data_plane::query_engines::asap_clickhouse_query_engine::execution::ClickHouseDagFallback::IncompleteCoverage { .. }
+        )
+    ));
 }

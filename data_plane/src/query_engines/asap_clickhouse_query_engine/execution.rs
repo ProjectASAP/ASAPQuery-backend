@@ -113,7 +113,28 @@ fn execute_relation_subtree(
             let executable = reachable_entry(entry, root)?;
             let outcome =
                 execute_query_plan_payload_readout(index, &executable, t0_ms, t1_ms, is_cumulative)
-                    .map_err(|error| format!("{error:?}"))?;
+                    .map_err(|error| format!("incomplete leaf coverage: {error:?}"))?;
+            for binding in executable.materialization_bindings() {
+                let origin = binding
+                    .pane_origin_ms
+                    .ok_or_else(|| "incomplete leaf coverage: missing pane origin".to_owned())?;
+                let start = i64::try_from(t0_ms)
+                    .map_err(|_| "incomplete leaf coverage: start exceeds i64".to_owned())?;
+                let end = i64::try_from(t1_ms)
+                    .map_err(|_| "incomplete leaf coverage: end exceeds i64".to_owned())?;
+                let pane = i64::try_from(binding.window_ms)
+                    .map_err(|_| "incomplete leaf coverage: pane exceeds i64".to_owned())?;
+                if pane <= 0
+                    || (start - origin).rem_euclid(pane) != 0
+                    || (end - origin).rem_euclid(pane) != 0
+                    || !complete_pane_coverage(outcome.coverage, (t0_ms, t1_ms), binding.window_ms)
+                {
+                    return Err(format!(
+                        "incomplete leaf coverage: requested ({t0_ms}, {t1_ms}), observed {:?}, pane {} origin {}",
+                        outcome.coverage, binding.window_ms, origin
+                    ));
+                }
+            }
             ClickHouseRelation::from_series_rows(expected_schema, outcome.series, outcome.coverage)
                 .map_err(|error| error.to_string())
         }
@@ -179,6 +200,12 @@ pub fn execute_sql_dag(
             is_cumulative,
         ) {
             Ok(relation) => relation,
+            Err(error) if error.contains("incomplete leaf coverage") => {
+                return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::IncompleteCoverage {
+                    requested: (t0_ms, t1_ms),
+                    observed: None,
+                })
+            }
             Err(error) => {
                 return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
                     error,
