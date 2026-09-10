@@ -9,7 +9,6 @@ use axum::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -211,23 +210,35 @@ impl Drop for AbortOnDrop {
     }
 }
 
-async fn log_ingest_throughput(state: Arc<crate::precompute_engine::ingest_handler::IngestState>) {
+async fn log_ingest_throughput() {
     let mut interval = tokio::time::interval(INGEST_DIAG_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     interval.tick().await;
     let mut last = Instant::now();
+    let mut previous = crate::precompute_engine::metrics::throughput_totals();
     loop {
         interval.tick().await;
         let now = Instant::now();
         let elapsed = now.duration_since(last);
         last = now;
-        let samples = state.samples_ingested.swap(0, Ordering::Relaxed);
+        // Keep all counters monotonic. Observers derive interval deltas from
+        // loads, so logging and /metrics scraping cannot alter one another.
+        let current = crate::precompute_engine::metrics::throughput_totals();
+        let delta = current.since(previous);
+        previous = current;
         let secs = elapsed.as_secs_f64();
         debug!(
-            "[INGEST_DIAG] samples_ingested: {} in {:.1}s ({:.1} samples/sec)",
-            samples,
-            secs,
-            samples as f64 / secs,
+            accepted_samples = delta.accepted_samples,
+            processed_updates = delta.processed_updates,
+            materialized_outputs = delta.materialized_outputs,
+            elapsed_seconds = secs,
+            accepted_per_second = delta.accepted_samples as f64 / secs,
+            processed_per_second = delta.processed_updates as f64 / secs,
+            materialized_per_second = delta.materialized_outputs as f64 / secs,
+            cumulative_accepted = current.accepted_samples,
+            cumulative_processed = current.processed_updates,
+            cumulative_materialized = current.materialized_outputs,
+            "precompute throughput interval"
         );
     }
 }
@@ -568,9 +579,10 @@ impl HttpServer {
 
         // Bind first so a listener failure cannot leave an orphaned task.
         // Keep the guard alive through serve so cancellation also aborts it.
-        let _ingest_ticker = self.remote_write.as_ref().map(|receiver| {
-            AbortOnDrop(tokio::spawn(log_ingest_throughput(receiver.ingest_state())))
-        });
+        let _ingest_ticker = self
+            .remote_write
+            .as_ref()
+            .map(|_| AbortOnDrop(tokio::spawn(log_ingest_throughput())));
 
         axum::serve(listener, app).await?;
         Ok(())
@@ -7160,18 +7172,21 @@ mod logical_provenance_tests {
         let task_counter = counter.clone();
         let guard = AbortOnDrop(tokio::spawn(async move {
             loop {
-                task_counter.fetch_add(1, Ordering::SeqCst);
+                task_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }));
 
-        while counter.load(Ordering::SeqCst) == 0 {
+        while counter.load(std::sync::atomic::Ordering::SeqCst) == 0 {
             tokio::task::yield_now().await;
         }
         drop(guard);
-        let count_at_drop = counter.load(Ordering::SeqCst);
+        let count_at_drop = counter.load(std::sync::atomic::Ordering::SeqCst);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(counter.load(Ordering::SeqCst), count_at_drop);
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            count_at_drop
+        );
     }
 }
 
