@@ -824,7 +824,7 @@ impl SketchStore {
         };
         let instances = self.instances.read().unwrap();
         let mut reported = BTreeMap::new();
-        for (sid, binding) in instances.iter() {
+        for (series_id, binding) in instances.iter() {
             let summary_definition_id = SummaryDefinitionId::from(binding.metadata.policy_fp);
             if binding.metadata.policy_fp.is_unset()
                 || !catalog
@@ -842,60 +842,83 @@ impl SketchStore {
                         summary_definition_id.as_u64()
                     )
                 })?;
-            let instance_id = SummaryInstanceId::new(format!(
-                "summary-instance:v1:{}:{}:{}",
-                generation.plan_version,
-                summary_definition_id.as_u64(),
-                sid
-            ))
-            .map_err(|error| error.to_string())?;
-            let coverage = self.in_memory_coverage_bounds(*sid);
-            let (time_range, status) = match coverage {
-                Some((start, end)) if start < end => (
-                    HalfOpenTimeRange {
-                        start_ms: start as i64,
-                        end_ms: end as i64,
-                    },
-                    match binding.metadata.status() {
-                        AggStatus::Active => SummaryInstanceStatus::Ready,
-                        AggStatus::Retired | AggStatus::Expired => SummaryInstanceStatus::Retiring,
-                    },
-                ),
-                _ => (
-                    HalfOpenTimeRange {
-                        start_ms: binding.metadata.first_seen_unix_ms,
-                        end_ms: binding.metadata.first_seen_unix_ms.saturating_add(1),
-                    },
-                    SummaryInstanceStatus::MissingPayload,
-                ),
+            let Some(store) = self
+                .series
+                .get(series_id)
+                .map(|entry| Arc::clone(entry.value()))
+            else {
+                // A catalog definition or registered materialized series is not
+                // itself a SummaryInstance. Inventory contains only concrete
+                // pane/group payloads that the storage engine can reference.
+                continue;
             };
-            let instance = SummaryInstance {
-                instance_id: instance_id.clone(),
-                summary_definition_id,
-                summary_descriptor_id: binding.summary_descriptor.id().clone(),
-                data_descriptor_id: binding.data_descriptor.id().clone(),
-                time_range,
-                group_values: BTreeMap::new(),
-                catalog_generation: generation.clone(),
-                placement: SummaryPlacement {
-                    producer_id: producer_id.into(),
-                    storage_node_id: storage_node_id.into(),
-                },
-                state_reference: SummaryStateReference {
-                    store: "summary-store".into(),
-                    key: format!("sid:{sid}"),
-                    state_schema_version: binding.summary_descriptor.state_schema_version,
-                    generation: generation.plan_version,
-                    sequence: coverage.map_or(0, |(_, end)| end),
-                    checksum: None,
-                },
-                status,
-                completeness: InstanceCompleteness::Unknown,
-                lifecycle: InstanceLifecycle::Persistent,
-                observed_at_ms,
+            let store = store.read().map_err(|_| "summary series lock poisoned")?;
+            let status = match binding.metadata.status() {
+                AggStatus::Active => SummaryInstanceStatus::Ready,
+                AggStatus::Retired | AggStatus::Expired => SummaryInstanceStatus::Retiring,
             };
-            instance.validate().map_err(|error| error.to_string())?;
-            reported.insert(instance_id, instance);
+            let mut record = |window: TimestampRange, label_id: u32| -> Result<(), String> {
+                let start_ms = i64::try_from(window.0)
+                    .map_err(|_| "summary instance start exceeds signed timestamp range")?;
+                let end_ms = i64::try_from(window.1)
+                    .map_err(|_| "summary instance end exceeds signed timestamp range")?;
+                let group_values = store.intern.resolve(label_id).cloned().ok_or_else(|| {
+                    "summary instance has an unresolved group identity".to_string()
+                })?;
+                let group_bytes =
+                    serde_json::to_vec(&group_values).map_err(|error| error.to_string())?;
+                let group_fingerprint = xxhash_rust::xxh64::xxh64(&group_bytes, 0);
+                let instance_id = SummaryInstanceId::new(format!(
+                    "summary-instance:v1:{}:{}:{}:{}",
+                    summary_definition_id.as_u64(),
+                    window.0,
+                    window.1,
+                    group_fingerprint
+                ))
+                .map_err(|error| error.to_string())?;
+                let instance = SummaryInstance {
+                    instance_id: instance_id.clone(),
+                    summary_definition_id,
+                    summary_descriptor_id: binding.summary_descriptor.id().clone(),
+                    data_descriptor_id: binding.data_descriptor.id().clone(),
+                    time_range: HalfOpenTimeRange { start_ms, end_ms },
+                    group_values,
+                    catalog_generation: generation.clone(),
+                    placement: SummaryPlacement {
+                        producer_id: producer_id.into(),
+                        storage_node_id: storage_node_id.into(),
+                    },
+                    state_reference: SummaryStateReference {
+                        store: "summary-store".into(),
+                        key: format!(
+                            "series:{series_id}:pane:{}-{}:group:{group_fingerprint:016x}",
+                            window.0, window.1
+                        ),
+                        state_schema_version: binding.summary_descriptor.state_schema_version,
+                        generation: generation.plan_version,
+                        sequence: window.1,
+                        checksum: None,
+                    },
+                    status: status.clone(),
+                    // The current payload row does not distinguish a normal
+                    // pane close from a late standalone correction. Report the
+                    // concrete instance without inventing a completeness proof.
+                    completeness: InstanceCompleteness::Unknown,
+                    lifecycle: InstanceLifecycle::Persistent,
+                    observed_at_ms,
+                };
+                instance.validate().map_err(|error| error.to_string())?;
+                reported.insert(instance_id, instance);
+                Ok(())
+            };
+            for (window, label_id, _) in store.current_epoch.iter_entries() {
+                record(window, label_id)?;
+            }
+            for epoch in store.sealed_epochs.values() {
+                for (window, label_id, _) in &epoch.entries {
+                    record(*window, *label_id)?;
+                }
+            }
         }
         let inventory = ObservedSummaryInventory {
             schema_version: 1,
@@ -906,31 +929,6 @@ impl SketchStore {
         };
         inventory.validate().map_err(|error| error.to_string())?;
         Ok(inventory)
-    }
-
-    fn in_memory_coverage_bounds(&self, sid: u64) -> Option<(u64, u64)> {
-        let store = self.series.get(&sid)?.clone();
-        let guard = store.read().ok()?;
-        let mut min_start = u64::MAX;
-        let mut max_end = 0;
-        let mut entries: Vec<(TimestampRange, LabelValuesId, &AggPayload)> = Vec::new();
-        guard
-            .current_epoch
-            .range_query_into(0, u64::MAX, &mut entries);
-        for (range, _, _) in &entries {
-            min_start = min_start.min(range.0);
-            max_end = max_end.max(range.1);
-        }
-        entries.clear();
-        for epoch in guard.sealed_epochs.values() {
-            epoch.range_query_into(0, u64::MAX, &mut entries);
-            for (range, _, _) in &entries {
-                min_start = min_start.min(range.0);
-                max_end = max_end.max(range.1);
-            }
-            entries.clear();
-        }
-        (min_start != u64::MAX).then_some((min_start, max_end))
     }
 
     /// Borrow-style metadata accessor (P2-2). Runs `f(&meta)` while
@@ -2927,6 +2925,18 @@ mod tests {
             .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
             .unwrap();
         store.register(meta_with_policy(41, fingerprint));
+        store.append_sample(
+            41,
+            BTreeMap::from([("job".to_string(), "api".to_string())]),
+            (0, 10_000),
+            sample(1),
+        );
+        store.append_sample(
+            41,
+            BTreeMap::from([("job".to_string(), "worker".to_string())]),
+            (10_000, 20_000),
+            sample(2),
+        );
 
         let producers = BTreeMap::from([(
             SummaryDefinitionId::from(fingerprint),
@@ -2936,9 +2946,32 @@ mod tests {
             .observed_summary_inventory("backend-a", "store-a", &producers, 1, 100)
             .unwrap();
         inventory.validate().unwrap();
+        assert_eq!(inventory.instances.len(), 2);
         let instance = inventory.instances.values().next().unwrap();
         assert_eq!(instance.summary_definition_id.fingerprint(), fingerprint);
-        assert_eq!(instance.status, SummaryInstanceStatus::MissingPayload);
+        assert_eq!(instance.status, SummaryInstanceStatus::Ready);
+        assert_eq!(instance.completeness, InstanceCompleteness::Unknown);
+        assert!(!instance.group_values.is_empty());
+        assert!(inventory
+            .instances
+            .values()
+            .all(|instance| instance.time_range.start_ms < instance.time_range.end_ms));
+        assert_eq!(
+            inventory
+                .instances
+                .values()
+                .map(|instance| instance.state_reference.key.as_str())
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2
+        );
+        let next_inventory = store
+            .observed_summary_inventory("backend-a", "store-a", &producers, 2, 200)
+            .unwrap();
+        assert_eq!(
+            inventory.instances.keys().collect::<Vec<_>>(),
+            next_inventory.instances.keys().collect::<Vec<_>>()
+        );
         let catalog_identity =
             &plan.summary_catalog.materializations[&instance.summary_definition_id];
         assert_eq!(
@@ -2949,6 +2982,30 @@ mod tests {
             instance.data_descriptor_id,
             catalog_identity.data_descriptor_id
         );
+    }
+
+    #[test]
+    fn registered_series_without_payload_is_not_a_summary_instance() {
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let store = SketchStore::new();
+        store
+            .install_summary_catalog(Arc::new(plan.summary_catalog))
+            .unwrap();
+        store.register(meta_with_policy(42, fingerprint));
+        let producers = BTreeMap::from([(
+            SummaryDefinitionId::from(fingerprint),
+            "producer-a".to_string(),
+        )]);
+        let inventory = store
+            .observed_summary_inventory("backend-a", "store-a", &producers, 1, 100)
+            .unwrap();
+        assert!(inventory.instances.is_empty());
     }
 
     fn sample(b: u8) -> SketchSampleState {
