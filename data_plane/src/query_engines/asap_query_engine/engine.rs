@@ -237,11 +237,11 @@ impl ASAPQueryEngine {
         // installed membership subtree once, then use that vector to build the
         // Prometheus selector. Keeping the result as a prepared leaf also means
         // CandidateTopK reuses the same membership readout during composition.
-        let dependencies = super::exact_subqueries::candidate_dependencies(entry, times)?;
+        let dependencies = super::exact_subqueries::external_dependencies(entry, times)?;
         let mut prepared = super::logical_dag::PreparedLeaves::new();
         let unique_inputs = dependencies
             .into_iter()
-            .map(|(_, input, at, _)| (input, at))
+            .map(|(_, input, at)| (input, at))
             .collect::<std::collections::BTreeSet<_>>();
         for (input, at) in unique_inputs {
             let evaluation_ms = u64::try_from(at).map_err(|_| {
@@ -275,7 +275,7 @@ impl ASAPQueryEngine {
                 },
             );
         }
-        super::exact_subqueries::prepare_with_candidates(
+        super::exact_subqueries::prepare_external(
             entry,
             times,
             self.exact_subquery_endpoint.as_deref(),

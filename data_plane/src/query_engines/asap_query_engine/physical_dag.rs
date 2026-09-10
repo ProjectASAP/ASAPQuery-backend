@@ -21,6 +21,22 @@ pub trait QueryNodeRuntime {
     ) -> Result<Self::Output, Self::Error>;
 }
 
+/// Async counterpart used when ordinary DAG leaves perform external exact
+/// reads. Keeping I/O in the node adapter lets the graph scheduler preserve
+/// the same dependency ordering and memoization as local summary nodes.
+#[async_trait::async_trait]
+pub trait AsyncQueryNodeRuntime {
+    type Output: Clone + Send;
+    type Error;
+
+    async fn execute_node(
+        &self,
+        id: QueryNodeId,
+        node: &QueryPlanNode,
+        inputs: &[Self::Output],
+    ) -> Result<Self::Output, Self::Error>;
+}
+
 #[derive(Debug, Error)]
 pub enum DagExecutionError<E> {
     #[error("invalid physical query graph: {0}")]
@@ -71,6 +87,53 @@ pub fn execute_from<R: QueryNodeRuntime>(
                     node_id: id.0,
                     source,
                 })?;
+        outputs.insert(id, output);
+    }
+    outputs.remove(&root).ok_or_else(|| {
+        DagExecutionError::InvalidGraph(format!("root {} produced no output", root.0))
+    })
+}
+
+pub async fn execute_async<R: AsyncQueryNodeRuntime + Sync>(
+    entry: &QueryPlanEntry,
+    runtime: &R,
+) -> Result<R::Output, DagExecutionError<R::Error>> {
+    execute_from_async(entry, entry.root, runtime).await
+}
+
+pub async fn execute_from_async<R: AsyncQueryNodeRuntime + Sync>(
+    entry: &QueryPlanEntry,
+    root: QueryNodeId,
+    runtime: &R,
+) -> Result<R::Output, DagExecutionError<R::Error>> {
+    let order = entry
+        .topological_order_from(root)
+        .map_err(|error| DagExecutionError::InvalidGraph(error.to_string()))?;
+    let mut outputs = BTreeMap::<QueryNodeId, R::Output>::new();
+    for id in order {
+        let node = entry
+            .nodes
+            .get(&id)
+            .ok_or_else(|| DagExecutionError::InvalidGraph(format!("missing node {}", id.0)))?;
+        let inputs = node
+            .inputs()
+            .iter()
+            .map(|input| {
+                outputs.get(input).cloned().ok_or_else(|| {
+                    DagExecutionError::InvalidGraph(format!(
+                        "node {} ran before input {}",
+                        id.0, input.0
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let output = runtime
+            .execute_node(id, node, &inputs)
+            .await
+            .map_err(|source| DagExecutionError::Node {
+                node_id: id.0,
+                source,
+            })?;
         outputs.insert(id, output);
     }
     outputs.remove(&root).ok_or_else(|| {
@@ -157,5 +220,78 @@ mod tests {
         let runtime = CountingRuntime(RefCell::new(BTreeMap::new()));
         assert_eq!(execute(&entry, &runtime).unwrap(), 5);
         assert!(runtime.0.borrow().values().all(|count| *count == 1));
+    }
+
+    struct AsyncCountingRuntime(tokio::sync::Mutex<BTreeMap<QueryNodeId, usize>>);
+
+    #[async_trait::async_trait]
+    impl AsyncQueryNodeRuntime for AsyncCountingRuntime {
+        type Output = usize;
+        type Error = std::convert::Infallible;
+
+        async fn execute_node(
+            &self,
+            id: QueryNodeId,
+            _node: &QueryPlanNode,
+            inputs: &[usize],
+        ) -> Result<usize, Self::Error> {
+            *self.0.lock().await.entry(id).or_default() += 1;
+            Ok(1 + inputs.iter().sum::<usize>())
+        }
+    }
+
+    #[tokio::test]
+    async fn async_runtime_preserves_shared_dependency_memoization() {
+        let shared = QueryNodeId(0);
+        let left = QueryNodeId(1);
+        let right = QueryNodeId(2);
+        let root = QueryNodeId(3);
+        let nodes = [
+            (
+                shared,
+                QueryPlanNode::ExactFallback {
+                    reason: "leaf".into(),
+                },
+            ),
+            (
+                left,
+                QueryPlanNode::SummaryEstimate {
+                    input: shared,
+                    query: QueryReadout::Cardinality,
+                },
+            ),
+            (
+                right,
+                QueryPlanNode::SummaryEstimate {
+                    input: shared,
+                    query: QueryReadout::Cardinality,
+                },
+            ),
+            (
+                root,
+                QueryPlanNode::SummaryMerge {
+                    inputs: vec![left, right],
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let entry = QueryPlanEntry {
+            language: control_plane::query_plan::QueryLanguage::PromQl,
+            query_id: "q".into(),
+            canonical_query: "up".into(),
+            fixed_evaluation: None,
+            root,
+            nodes,
+            instant: InstantExecution {
+                lookback_ms: 0,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::Reject,
+        };
+        let runtime = AsyncCountingRuntime(tokio::sync::Mutex::new(BTreeMap::new()));
+        assert_eq!(execute_async(&entry, &runtime).await.unwrap(), 5);
+        assert!(runtime.0.lock().await.values().all(|count| *count == 1));
     }
 }

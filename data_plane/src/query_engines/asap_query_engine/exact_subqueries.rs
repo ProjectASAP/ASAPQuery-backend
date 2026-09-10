@@ -2,7 +2,8 @@
 use super::logical_dag::{PreparedLeaf, PreparedLeaves, Value};
 use crate::query_engines::EngineError;
 use control_plane::query_plan::{
-    logical::LogicalOperator, QueryNodeId, QueryPlanEntry, QueryPlanNode,
+    logical::LogicalOperator, ExternalExactInput, ExternalExactRequest, QueryLanguage, QueryNodeId,
+    QueryPlanEntry, QueryPlanNode,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,10 +15,16 @@ fn miss(message: impl Into<String>) -> EngineError {
 }
 
 /// Traverse only the installed graph, including epoch-aligned nested subquery grids.
+#[derive(Debug, Clone)]
+enum ExactLeaf {
+    Legacy(LogicalOperator),
+    External(ExternalExactRequest),
+}
+
 fn leaves(
     entry: &QueryPlanEntry,
     times: &[u64],
-) -> Result<BTreeMap<(QueryNodeId, i64), LogicalOperator>, EngineError> {
+) -> Result<BTreeMap<(QueryNodeId, i64), ExactLeaf>, EngineError> {
     let mut pending = Vec::new();
     for at in times {
         pending.push((
@@ -45,7 +52,7 @@ fn leaves(
                 }
                 LogicalOperator::ExactSubquery { .. }
                 | LogicalOperator::CandidateExactSubquery { .. } => {
-                    result.insert((id, at), operator.clone());
+                    result.insert((id, at), ExactLeaf::Legacy(operator.clone()));
                 }
                 LogicalOperator::Subquery {
                     range_ms,
@@ -83,6 +90,10 @@ fn leaves(
             QueryPlanNode::CandidateTopK { inputs, .. } => {
                 pending.extend(inputs.iter().map(|input| (*input, at)));
             }
+            QueryPlanNode::ExternalExact { request, inputs } => {
+                pending.extend(inputs.iter().map(|input| (*input, at)));
+                result.insert((id, at), ExactLeaf::External(request.clone()));
+            }
             // Existing bound summary subtrees are read by the synchronous callback.
             _ => {}
         }
@@ -90,18 +101,28 @@ fn leaves(
     Ok(result)
 }
 
-pub(super) fn candidate_dependencies(
+pub(super) fn external_dependencies(
     entry: &QueryPlanEntry,
     times: &[u64],
-) -> Result<Vec<(QueryNodeId, QueryNodeId, i64, String)>, EngineError> {
+) -> Result<Vec<(QueryNodeId, QueryNodeId, i64)>, EngineError> {
     let mut result = Vec::new();
-    for ((id, at), operator) in leaves(entry, times)? {
-        if let LogicalOperator::CandidateExactSubquery { item_label, .. } = operator {
+    for ((id, at), leaf) in leaves(entry, times)? {
+        if matches!(leaf, ExactLeaf::External(_)) {
+            result.extend(
+                entry.nodes[&id]
+                    .inputs()
+                    .iter()
+                    .map(|input| (id, *input, at)),
+            );
+        } else if matches!(
+            leaf,
+            ExactLeaf::Legacy(LogicalOperator::CandidateExactSubquery { .. })
+        ) {
             let input = *entry.nodes[&id]
                 .inputs()
                 .first()
                 .ok_or_else(|| miss("candidate exact subtree has no membership input"))?;
-            result.push((id, input, at, item_label));
+            result.push((id, input, at));
         }
     }
     Ok(result)
@@ -264,10 +285,10 @@ pub(super) async fn prepare(
     endpoint: Option<&str>,
     client: &reqwest::Client,
 ) -> Result<PreparedLeaves, EngineError> {
-    prepare_with_candidates(entry, times, endpoint, client, PreparedLeaves::new()).await
+    prepare_external(entry, times, endpoint, client, PreparedLeaves::new()).await
 }
 
-pub(super) async fn prepare_with_candidates(
+pub(super) async fn prepare_external(
     entry: &QueryPlanEntry,
     times: &[u64],
     endpoint: Option<&str>,
@@ -276,58 +297,81 @@ pub(super) async fn prepare_with_candidates(
 ) -> Result<PreparedLeaves, EngineError> {
     // Equivalent exact cuts at the same time share one actual remote request.
     let mut remote_cache = BTreeMap::<(String, i64), Value>::new();
-    for ((id, at), operator) in leaves(entry, times)? {
+    for ((id, at), leaf) in leaves(entry, times)? {
         u64::try_from(at).map_err(|_| miss("subquery predates epoch"))?;
-        let (query, candidate_filtered) = match &operator {
-            LogicalOperator::ExactSubquery { query } => (query.clone(), false),
-            LogicalOperator::CandidateExactSubquery { query, item_label } => {
-                let candidate_input = entry.nodes[&id].inputs()[0];
-                let candidate = prepared
-                    .get(&(candidate_input, at))
-                    .ok_or_else(|| miss("candidate membership was not prepared"))?;
-                let Value::Vector(rows) = &candidate.value else {
-                    return Err(miss("candidate membership is not an instant vector"));
-                };
-                let mut values = rows
-                    .iter()
-                    .map(|(labels, _)| {
-                        labels.get(item_label).cloned().ok_or_else(|| {
-                            miss(format!(
-                                "candidate membership is missing item label {item_label}"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                values.sort();
-                values.dedup();
-                if values.is_empty() {
-                    prepared.insert(
-                        (id, at),
-                        PreparedLeaf {
-                            value: Value::Vector(Vec::new()),
-                            remote: true,
-                            remote_evaluations: 0,
-                            remote_rpcs: 0,
-                        },
-                    );
-                    continue;
-                }
-                if values.len() > MAX_CANDIDATE_VALUES {
+        let (query, candidate_input) = match &leaf {
+            ExactLeaf::Legacy(LogicalOperator::ExactSubquery { query }) => (query.clone(), None),
+            ExactLeaf::Legacy(LogicalOperator::CandidateExactSubquery { query, item_label }) => (
+                query.clone(),
+                Some((entry.nodes[&id].inputs()[0], item_label.as_str())),
+            ),
+            ExactLeaf::External(request) => {
+                if request.language != QueryLanguage::PromQl {
                     return Err(miss(format!(
-                        "candidate set has {} values, exceeding limit {MAX_CANDIDATE_VALUES}",
-                        values.len()
+                        "external exact language {:?} has no installed adapter",
+                        request.language
                     )));
                 }
-                let restricted = inject_candidate_matcher(query, item_label, &values)?;
-                if restricted.len() > MAX_CANDIDATE_QUERY_BYTES {
-                    return Err(miss(format!(
+                let candidate = match request.input_contracts.as_slice() {
+                    [] => None,
+                    [ExternalExactInput::CandidateMembership { item_label }] => {
+                        Some((entry.nodes[&id].inputs()[0], item_label.as_str()))
+                    }
+                    _ => return Err(miss("unsupported external exact input contract")),
+                };
+                (request.expression.clone(), candidate)
+            }
+            _ => return Err(miss("prepared leaf is not an exact subtree")),
+        };
+        let (query, candidate_filtered) = if let Some((candidate_input, item_label)) =
+            candidate_input
+        {
+            let candidate = prepared
+                .get(&(candidate_input, at))
+                .ok_or_else(|| miss("candidate membership was not prepared"))?;
+            let Value::Vector(rows) = &candidate.value else {
+                return Err(miss("candidate membership is not an instant vector"));
+            };
+            let mut values = rows
+                .iter()
+                .map(|(labels, _)| {
+                    labels.get(item_label).cloned().ok_or_else(|| {
+                        miss(format!(
+                            "candidate membership is missing item label {item_label}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            values.sort();
+            values.dedup();
+            if values.is_empty() {
+                prepared.insert(
+                    (id, at),
+                    PreparedLeaf {
+                        value: Value::Vector(Vec::new()),
+                        remote: true,
+                        remote_evaluations: 0,
+                        remote_rpcs: 0,
+                    },
+                );
+                continue;
+            }
+            if values.len() > MAX_CANDIDATE_VALUES {
+                return Err(miss(format!(
+                    "candidate set has {} values, exceeding limit {MAX_CANDIDATE_VALUES}",
+                    values.len()
+                )));
+            }
+            let restricted = inject_candidate_matcher(&query, item_label, &values)?;
+            if restricted.len() > MAX_CANDIDATE_QUERY_BYTES {
+                return Err(miss(format!(
                         "candidate-filtered exact query has {} bytes, exceeding limit {MAX_CANDIDATE_QUERY_BYTES}",
                         restricted.len()
                     )));
-                }
-                (restricted, true)
             }
-            _ => return Err(miss("prepared leaf is not an exact subtree")),
+            (restricted, true)
+        } else {
+            (query, false)
         };
         let key = (query.clone(), at);
         let cached = remote_cache.contains_key(&key);
@@ -408,10 +452,14 @@ mod tests {
         entry(BTreeMap::from([
             (
                 QueryNodeId(0),
-                QueryPlanNode::Logical {
-                    operator: LogicalOperator::CandidateExactSubquery {
-                        query: query.into(),
-                        item_label: "job".into(),
+                QueryPlanNode::ExternalExact {
+                    request: ExternalExactRequest {
+                        language: QueryLanguage::PromQl,
+                        expression: query.into(),
+                        output: control_plane::query_plan::ExternalExactOutput::InstantVector,
+                        input_contracts: vec![ExternalExactInput::CandidateMembership {
+                            item_label: "job".into(),
+                        }],
                     },
                     inputs: vec![QueryNodeId(1)],
                 },
@@ -495,7 +543,7 @@ mod tests {
     #[tokio::test]
     async fn empty_candidate_set_returns_empty_exact_leaf_without_rpc() {
         let entry = candidate_entry("sum by (job) (rate(m[5m]))");
-        let prepared = prepare_with_candidates(
+        let prepared = prepare_external(
             &entry,
             &[1_000],
             None,
@@ -526,12 +574,9 @@ mod tests {
             },
         );
         entry.root = QueryNodeId(2);
-        let dependencies = candidate_dependencies(&entry, &[1_000]).unwrap();
-        assert_eq!(
-            dependencies,
-            vec![(QueryNodeId(0), QueryNodeId(1), 1_000, "job".into())]
-        );
-        let prepared = prepare_with_candidates(
+        let dependencies = external_dependencies(&entry, &[1_000]).unwrap();
+        assert_eq!(dependencies, vec![(QueryNodeId(0), QueryNodeId(1), 1_000)]);
+        let prepared = prepare_external(
             &entry,
             &[1_000],
             None,
@@ -579,7 +624,7 @@ mod tests {
         let entry = candidate_entry("sum by (job) (rate(m{job!=\"blocked\"}[5m]))");
         let candidates = (0..1_000).map(|index| format!("job-{index}"));
 
-        let prepared = prepare_with_candidates(
+        let prepared = prepare_external(
             &entry,
             &[1_000],
             Some(&format!("http://{address}")),
@@ -611,7 +656,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let result = prepare_with_candidates(
+        let result = prepare_external(
             &candidate_entry("sum by (job) (rate(m[5m]))"),
             &[1_000],
             Some(&format!("http://{address}")),
