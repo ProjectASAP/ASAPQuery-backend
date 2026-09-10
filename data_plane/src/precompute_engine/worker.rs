@@ -84,6 +84,37 @@ struct PaneWallClock {
 }
 
 impl GroupState {
+    fn stores_full_windows(&self) -> bool {
+        matches!(
+            self.config.window_layout,
+            asap_types::WindowMaterializationLayout::FullWindow
+        )
+    }
+
+    fn bucket_starts_for(&self, timestamp_ms: i64) -> Vec<i64> {
+        if self.stores_full_windows() {
+            self.window_manager.window_starts_containing(timestamp_ms)
+        } else {
+            vec![self.window_manager.pane_start_for(timestamp_ms)]
+        }
+    }
+
+    fn closed_buckets(&self, previous_ms: i64, current_ms: i64) -> Vec<i64> {
+        if self.stores_full_windows() {
+            self.window_manager.closed_windows(previous_ms, current_ms)
+        } else {
+            self.window_manager.closed_panes(previous_ms, current_ms)
+        }
+    }
+
+    fn bucket_bounds(&self, start_ms: i64) -> (i64, i64) {
+        if self.stores_full_windows() {
+            self.window_manager.window_bounds(start_ms)
+        } else {
+            self.window_manager.pane_bounds(start_ms)
+        }
+    }
+
     fn touch_pane(&mut self, pane_start_ms: i64, now_ms: i64) {
         self.pane_wall_clock
             .entry(pane_start_ms)
@@ -365,10 +396,11 @@ impl Worker {
             let cfg = snap.get_aggregation_config(policy_fp.as_u64())?;
             let config = Arc::new(cfg.clone());
             let gs = GroupState {
-                window_manager: WindowManager::with_origin(
+                window_manager: WindowManager::with_layout(
                     config.window_size,
                     config.slide_interval,
                     config.pane_origin_ms,
+                    &config.window_layout,
                 ),
                 config,
                 policy_fp,
@@ -459,74 +491,13 @@ impl Worker {
 
         let mut emit_batch: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)> = Vec::new();
 
-        // Route each sample to its pane
+        // The selected physical layout owns update fanout. Pane and rollup
+        // layouts update one non-overlapping base pane; FullWindow updates
+        // every overlapping semantic window that contains the sample.
         for (series_key, ts, val) in &samples {
             let too_late = previous_event_time != i64::MIN
                 && pane_timestamp(*ts)
                     < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
-            let pane_start = state.window_manager.pane_start_for(pane_timestamp(*ts));
-            let pane_end = pane_start + state.window_manager.slide_interval_ms();
-            let pane_closed = !state.active_panes.contains_key(&pane_start)
-                && previous_closure_watermark >= pane_end;
-
-            if too_late || pane_closed {
-                let window_start = pane_start;
-                let window_end = pane_end;
-                match late_data_policy {
-                    LateDataPolicy::Drop => {
-                        record_late_input("drop", "raw_sample");
-                        debug!(
-                            "Worker {} dropping late sample for sid={} (group={}): \
-                             ts={} observed_event_time={} pane=[{}, {})",
-                            worker_id,
-                            sid,
-                            group_key,
-                            ts,
-                            previous_event_time,
-                            pane_start,
-                            pane_end
-                        );
-                        continue;
-                    }
-                    LateDataPolicy::ForwardToStore => {
-                        // A late cumulative sample cannot be converted to a
-                        // derivative without its time-adjacent neighbours.
-                        // Never feed the raw counter value into a membership
-                        // heap; the authoritative ExactCounter branch remains
-                        // responsible for the visible result.
-                        if matches!(
-                            state.config.sample_update_rule(),
-                            SampleUpdateRule::CounterDelta { .. }
-                        ) {
-                            record_late_input("drop", "counter_delta_membership");
-                            continue;
-                        }
-                        record_late_input("append_correction", "raw_sample");
-                        let mut updater = create_accumulator_updater(&state.config);
-                        apply_sample(&mut *updater, series_key, *val, *ts, &state.config);
-                        let key = build_group_key_label_values(group_key);
-                        let output = precomputed_output_for_group(
-                            window_start as u64,
-                            window_end as u64,
-                            key,
-                            PolicyFingerprint::from_config(&state.config),
-                            group_key,
-                        );
-                        emit_batch.push((output, updater.take_accumulator()));
-                        debug!(
-                            "Forwarding late sample to store for evicted pane [{}, {})",
-                            pane_start, pane_end
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            // Normal path: route sample to its single pane accumulator.
-            // Refresh the pane's wall-clock last-touch time so the fallback
-            // only closes an idle pane, not a long-running bulk ingest whose
-            // records share one event timestamp.
-            state.touch_pane(pane_start, now_ms);
             let value = if let SampleUpdateRule::CounterDelta { .. } =
                 state.config.sample_update_rule()
             {
@@ -539,11 +510,75 @@ impl Worker {
             } else {
                 *val
             };
-            let updater = state
-                .active_panes
-                .entry(pane_start)
-                .or_insert_with(|| create_accumulator_updater(&state.config));
-            apply_sample(&mut **updater, series_key, value, *ts, &state.config);
+            for bucket_start in state.bucket_starts_for(pane_timestamp(*ts)) {
+                let (_, bucket_end) = state.bucket_bounds(bucket_start);
+                let bucket_closed = !state.active_panes.contains_key(&bucket_start)
+                    && previous_closure_watermark >= bucket_end;
+
+                if too_late || bucket_closed {
+                    let window_start = bucket_start;
+                    let window_end = bucket_end;
+                    match late_data_policy {
+                        LateDataPolicy::Drop => {
+                            record_late_input("drop", "raw_sample");
+                            debug!(
+                                "Worker {} dropping late sample for sid={} (group={}): \
+                             ts={} observed_event_time={} pane=[{}, {})",
+                                worker_id,
+                                sid,
+                                group_key,
+                                ts,
+                                previous_event_time,
+                                bucket_start,
+                                bucket_end
+                            );
+                            continue;
+                        }
+                        LateDataPolicy::ForwardToStore => {
+                            // A late cumulative sample cannot be converted to a
+                            // derivative without its time-adjacent neighbours.
+                            // Never feed the raw counter value into a membership
+                            // heap; the authoritative ExactCounter branch remains
+                            // responsible for the visible result.
+                            if matches!(
+                                state.config.sample_update_rule(),
+                                SampleUpdateRule::CounterDelta { .. }
+                            ) {
+                                record_late_input("drop", "counter_delta_membership");
+                                continue;
+                            }
+                            record_late_input("append_correction", "raw_sample");
+                            let mut updater = create_accumulator_updater(&state.config);
+                            apply_sample(&mut *updater, series_key, *val, *ts, &state.config);
+                            let key = build_group_key_label_values(group_key);
+                            let output = precomputed_output_for_group(
+                                window_start as u64,
+                                window_end as u64,
+                                key,
+                                PolicyFingerprint::from_config(&state.config),
+                                group_key,
+                            );
+                            emit_batch.push((output, updater.take_accumulator()));
+                            debug!(
+                                "Forwarding late sample to store for evicted pane [{}, {})",
+                                bucket_start, bucket_end
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                // Normal path: route sample to its single pane accumulator.
+                // Refresh the pane's wall-clock last-touch time so the fallback
+                // only closes an idle pane, not a long-running bulk ingest whose
+                // records share one event timestamp.
+                state.touch_pane(bucket_start, now_ms);
+                let updater = state
+                    .active_panes
+                    .entry(bucket_start)
+                    .or_insert_with(|| create_accumulator_updater(&state.config));
+                apply_sample(&mut **updater, series_key, value, *ts, &state.config);
+            }
         }
 
         // Check for closed windows
@@ -552,12 +587,10 @@ impl Worker {
         } else {
             previous_closure_watermark
         };
-        let closed = state
-            .window_manager
-            .closed_panes(closure_scan_start, event_watermark);
+        let closed = state.closed_buckets(closure_scan_start, event_watermark);
 
         for window_start in &closed {
-            let (_, window_end) = state.window_manager.pane_bounds(*window_start);
+            let (_, window_end) = state.bucket_bounds(*window_start);
             let pane_starts = [*window_start];
 
             if let Some(accumulator) = merge_panes_for_window(&mut state.active_panes, &pane_starts)
@@ -650,12 +683,20 @@ impl Worker {
         // Late-arrival check against the existing watermark.
         let too_late = previous_event_time != i64::MIN
             && timestamp_ms < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
-        let pane_start = state.window_manager.pane_start_for(timestamp_ms);
-        let pane_end = pane_start + state.window_manager.slide_interval_ms();
-        let pane_closed =
-            !state.sketch_panes.contains_key(&pane_start) && previous_closure_watermark >= pane_end;
+        // A pre-built accumulator is already a materialized interval, not a
+        // point sample. Never duplicate its state across overlapping windows.
+        // Full-window producers stamp the corresponding slide boundary.
+        let bucket_starts = if state.stores_full_windows() {
+            vec![state.window_manager.window_start_for(timestamp_ms)]
+        } else {
+            state.bucket_starts_for(timestamp_ms)
+        };
+        let any_bucket_closed = bucket_starts.iter().any(|start| {
+            let (_, end) = state.bucket_bounds(*start);
+            !state.sketch_panes.contains_key(start) && previous_closure_watermark >= end
+        });
 
-        if too_late || pane_closed {
+        if too_late || any_bucket_closed {
             match late_data_policy {
                 LateDataPolicy::Drop => {
                     record_late_input("drop", "prebuilt_sketch");
@@ -666,22 +707,18 @@ impl Worker {
                 }
                 LateDataPolicy::ForwardToStore => {
                     record_late_input("append_correction", "prebuilt_sketch");
-                    let window_start = pane_start;
-                    let window_end = pane_end;
-                    let key = build_group_key_label_values(group_key);
-                    let output = precomputed_output_for_group(
-                        window_start as u64,
-                        window_end as u64,
-                        key,
-                        PolicyFingerprint::from_config(&state.config),
-                        group_key,
-                    );
-                    emit_batch.push((output, incoming));
-                    debug!(
-                        "Forwarding late accumulator input to store for evicted pane [{}, {})",
-                        pane_start,
-                        pane_start + state.window_manager.slide_interval_ms()
-                    );
+                    for window_start in bucket_starts {
+                        let (_, window_end) = state.bucket_bounds(window_start);
+                        let key = build_group_key_label_values(group_key);
+                        let output = precomputed_output_for_group(
+                            window_start as u64,
+                            window_end as u64,
+                            key,
+                            PolicyFingerprint::from_config(&state.config),
+                            group_key,
+                        );
+                        emit_batch.push((output, incoming.clone_boxed_core()));
+                    }
                     self.output_sink.emit_batch(emit_batch)?;
                 }
             }
@@ -690,27 +727,27 @@ impl Worker {
 
         // Refresh the pane's wall-clock last-touch time so an active sketch
         // stream with a fixed event timestamp is not force-closed mid-ingest.
-        state.touch_pane(pane_start, now_ms);
-
-        // Merge into the sketch pane covering this timestamp.
-        match state.sketch_panes.remove(&pane_start) {
-            Some(existing) => {
-                let merged = existing
-                    .merge_with(incoming.as_ref())
-                    .map_err(|e| format!("merge_with failed for pane {pane_start}: {e}"))?;
-                state.sketch_panes.insert(pane_start, merged);
-            }
-            None => {
-                state.sketch_panes.insert(pane_start, incoming);
+        for bucket_start in bucket_starts {
+            state.touch_pane(bucket_start, now_ms);
+            match state.sketch_panes.remove(&bucket_start) {
+                Some(existing) => {
+                    let merged = existing
+                        .merge_with(incoming.as_ref())
+                        .map_err(|e| format!("merge_with failed for bucket {bucket_start}: {e}"))?;
+                    state.sketch_panes.insert(bucket_start, merged);
+                }
+                None => {
+                    state
+                        .sketch_panes
+                        .insert(bucket_start, incoming.clone_boxed_core());
+                }
             }
         }
 
         // Check for closed windows and emit merged outputs.
-        let closed = state
-            .window_manager
-            .closed_panes(previous_closure_watermark, event_watermark);
+        let closed = state.closed_buckets(previous_closure_watermark, event_watermark);
         for window_start in &closed {
-            let (_, window_end) = state.window_manager.pane_bounds(*window_start);
+            let (_, window_end) = state.bucket_bounds(*window_start);
             let pane_starts = [*window_start];
 
             // Emit from the raw-sample pane map (in case both sources are
@@ -912,12 +949,10 @@ impl Worker {
                 }
             }
 
-            let closed = state
-                .window_manager
-                .closed_panes(state.closure_watermark_ms, effective_wm);
+            let closed = state.closed_buckets(state.closure_watermark_ms, effective_wm);
 
             for window_start in &closed {
-                let (_, window_end) = state.window_manager.pane_bounds(*window_start);
+                let (_, window_end) = state.bucket_bounds(*window_start);
                 let pane_starts = [*window_start];
 
                 if let Some(accumulator) =
@@ -1011,15 +1046,13 @@ impl Worker {
                 (None, Some(b)) => b,
                 (None, None) => continue, // no open panes
             };
-            let force_wm = max_pane.saturating_add(state.window_manager.slide_interval_ms());
+            let (_, force_wm) = state.bucket_bounds(max_pane);
 
             let group_key = state.group_key.clone();
-            let closed = state
-                .window_manager
-                .closed_panes(state.closure_watermark_ms, force_wm);
+            let closed = state.closed_buckets(state.closure_watermark_ms, force_wm);
 
             for window_start in &closed {
-                let (_, window_end) = state.window_manager.pane_bounds(*window_start);
+                let (_, window_end) = state.bucket_bounds(*window_start);
                 let pane_starts = [*window_start];
 
                 if let Some(accumulator) =
@@ -2043,6 +2076,56 @@ mod tests {
                 (sum_acc.sum - 42.0).abs() < 1e-10,
                 "pane should have sum=42, got {}",
                 sum_acc.sum
+            );
+        }
+    }
+
+    #[test]
+    fn full_window_layout_materializes_each_overlapping_slide() {
+        let mut config = make_agg_config(
+            2,
+            "cpu",
+            AggregationType::SingleSubpopulation,
+            "Sum",
+            30,
+            10,
+            vec![],
+        );
+        config.window_layout = asap_types::WindowMaterializationLayout::FullWindow;
+        let policy = config.policy_fingerprint();
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker(
+            HashMap::from([(policy.as_u64(), config)]),
+            sink.clone(),
+            false,
+            0,
+            LateDataPolicy::Drop,
+        );
+
+        worker
+            .process_group_samples(2, policy, "", group_samples("cpu", vec![(15_000, 42.0)]))
+            .unwrap();
+        worker
+            .process_group_samples(2, policy, "", group_samples("cpu", vec![(45_000, 0.0)]))
+            .unwrap();
+
+        let captured = sink.drain();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(
+            captured
+                .iter()
+                .map(|(output, _)| output.start_timestamp)
+                .collect::<Vec<_>>(),
+            vec![0, 10_000]
+        );
+        for (_, accumulator) in captured {
+            assert_eq!(
+                accumulator
+                    .as_any()
+                    .downcast_ref::<SumAccumulator>()
+                    .unwrap()
+                    .sum,
+                42.0
             );
         }
     }
