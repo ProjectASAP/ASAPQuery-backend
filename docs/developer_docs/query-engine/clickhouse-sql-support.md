@@ -74,7 +74,7 @@ pane coverage, and execution errors fail closed to exact ClickHouse. The proxy
 preserves the upstream status, safe headers, and response body.
 
 ClickHouse can also provide samples to the queued backfill service through the
-explicit `clickhouse://configured` source marker. Backfill populates the same
+typed `ClickHouse { database, table }` source. Backfill populates the same
 SummaryStore instances used by other ingest sources; it does not introduce a
 second storage or catalog lifecycle.
 
