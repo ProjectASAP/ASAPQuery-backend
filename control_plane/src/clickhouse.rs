@@ -193,32 +193,13 @@ fn bind_selected_node(
         crate::physical::compiler::materialization_leaf_contract(node)
             .map_err(crate::query_plan::QueryPlanError::Invalid)?;
     let expected = crate::physical::compiler::physical_materialization_family(family);
-    let mut matches = request
-        .precompute_plan
-        .materializations
-        .iter()
-        .filter(|candidate| {
-            candidate.metric == metric
-                && candidate.spatial_filter_normalized == spatial_filter
-                && candidate
-                    .accumulator_spec()
-                    .ok()
-                    .is_some_and(|spec| spec.family == expected)
-                && source_window
-                    .unwrap_or((query.end_ms.saturating_sub(query.start_ms)) / 1000)
-                    .checked_mul(1000)
-                    .is_some_and(|window| window % candidate.window_size.saturating_mul(1000) == 0)
-        });
-    let selected = matches.next().ok_or_else(|| {
-        crate::query_plan::QueryPlanError::Invalid(format!(
-            "no precompute materialization matches {metric}/{family:?}"
-        ))
-    })?;
-    if matches.next().is_some() {
-        return Err(crate::query_plan::QueryPlanError::Invalid(format!(
-            "ambiguous precompute materializations match {metric}/{family:?}"
-        )));
-    }
+    let selected = select_materialization(
+        &request.precompute_plan.materializations,
+        &metric,
+        &spatial_filter,
+        &expected,
+        source_window.unwrap_or((query.end_ms.saturating_sub(query.start_ms)) / 1000),
+    )?;
     Ok(MaterializationBinding {
         materialization: selected.policy_fingerprint().into(),
         output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.labels.clone()),
@@ -226,4 +207,125 @@ fn bind_selected_node(
         pane_origin_ms: selected.pane_origin_ms,
         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1000)),
     })
+}
+
+fn select_materialization<'a>(
+    materializations: &'a [asap_types::PrecomputeMaterialization],
+    metric: &str,
+    spatial_filter: &str,
+    expected: &planner_types::post_asap::SummaryFamilyType,
+    semantic_window_seconds: u64,
+) -> Result<&'a asap_types::PrecomputeMaterialization, crate::query_plan::QueryPlanError> {
+    let mut matches = materializations.iter().filter(|candidate| {
+        candidate.metric == metric
+            && candidate.spatial_filter_normalized == spatial_filter
+            && candidate
+                .accumulator_spec()
+                .ok()
+                .is_some_and(|spec| spec.family == *expected)
+            && semantic_window_seconds
+                .checked_mul(1000)
+                .is_some_and(|window| window % candidate.window_size.saturating_mul(1000) == 0)
+    });
+    let selected = matches.next().ok_or_else(|| {
+        crate::query_plan::QueryPlanError::Invalid(format!(
+            "no precompute materialization matches {metric}/{expected:?}"
+        ))
+    })?;
+    if matches.next().is_some() {
+        return Err(crate::query_plan::QueryPlanError::Invalid(format!(
+            "ambiguous precompute materializations match {metric}/{expected:?}"
+        )));
+    }
+    Ok(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+
+    fn materialization(
+        agg: AggregationType,
+        metric: &str,
+        window: u64,
+        slide: u64,
+        parameter: (&str, serde_json::Value),
+    ) -> PrecomputeMaterialization {
+        let mut value = PrecomputeMaterialization::new(
+            agg,
+            String::new(),
+            std::collections::HashMap::from([(parameter.0.into(), parameter.1)]),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            window,
+            slide,
+            WindowKind::Tumbling,
+            String::new(),
+            metric.into(),
+            None,
+            None,
+            None,
+        );
+        value.pane_origin_ms = Some(0);
+        value
+    }
+
+    #[test]
+    fn selected_nodes_bind_unique_family_parameters_source_and_window() {
+        let sum_60 = materialization(
+            AggregationType::Sum,
+            "requests",
+            60,
+            10,
+            ("variant", serde_json::json!(1)),
+        );
+        let count_60 = materialization(
+            AggregationType::MinMax,
+            "requests",
+            60,
+            10,
+            ("variant", serde_json::json!(2)),
+        );
+        let sum_300 = materialization(
+            AggregationType::Sum,
+            "requests",
+            300,
+            30,
+            ("variant", serde_json::json!(3)),
+        );
+        let other = materialization(
+            AggregationType::Sum,
+            "latency",
+            60,
+            10,
+            ("variant", serde_json::json!(1)),
+        );
+        let configs = vec![sum_60.clone(), count_60.clone(), sum_300, other];
+        let sum_family = sum_60.accumulator_spec().unwrap().family;
+        let count_family = count_60.accumulator_spec().unwrap().family;
+        assert_eq!(
+            select_materialization(&configs, "requests", "", &sum_family, 60)
+                .unwrap()
+                .policy_fingerprint(),
+            sum_60.policy_fingerprint()
+        );
+        assert_eq!(
+            select_materialization(&configs, "requests", "", &count_family, 60)
+                .unwrap()
+                .policy_fingerprint(),
+            count_60.policy_fingerprint()
+        );
+        assert!(select_materialization(&configs, "missing", "", &sum_family, 60).is_err());
+        let mut ambiguous = configs.clone();
+        ambiguous.push(sum_60);
+        assert!(
+            select_materialization(&ambiguous, "requests", "", &sum_family, 60)
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+    }
 }

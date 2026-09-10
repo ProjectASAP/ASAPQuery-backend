@@ -283,6 +283,14 @@ mod tests {
     }
 
     async fn fixture(end_ms: u64) -> (CatalogClickHouseAccelerator, ClickHouseQueryRequest) {
+        fixture_with_store(end_ms, Arc::new(SketchStore::new()), true).await
+    }
+
+    async fn fixture_with_store(
+        end_ms: u64,
+        store: Arc<SketchStore>,
+        seed: bool,
+    ) -> (CatalogClickHouseAccelerator, ClickHouseQueryRequest) {
         let config = PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
@@ -454,7 +462,6 @@ mod tests {
                 descriptors,
             }],
         };
-        let store = Arc::new(SketchStore::new());
         store.install_summary_catalog(Arc::new(sds)).unwrap();
         store.register(SketchInstanceMetadata {
             sid: 7,
@@ -472,18 +479,20 @@ mod tests {
             expires_at_ms: None,
             policy_fp: materialization.fingerprint(),
         });
-        store.append_precompute(
-            7,
-            Default::default(),
-            (0, 1_000),
-            Box::new(SumAccumulator::with_sum(2.0)),
-        );
-        store.append_precompute(
-            7,
-            Default::default(),
-            (1_000, 2_000),
-            Box::new(SumAccumulator::with_sum(3.0)),
-        );
+        if seed {
+            store.append_precompute(
+                7,
+                Default::default(),
+                (0, 1_000),
+                Box::new(SumAccumulator::with_sum(2.0)),
+            );
+            store.append_precompute(
+                7,
+                Default::default(),
+                (1_000, 2_000),
+                Box::new(SumAccumulator::with_sum(3.0)),
+            );
+        }
         let accelerator = CatalogClickHouseAccelerator::from_bundle(bundle, store).unwrap();
         let request = ClickHouseQueryRequest {
             method: Method::GET,
@@ -515,5 +524,130 @@ mod tests {
                 ClickHouseAccelerationFallback::IncompleteCoverage
             )
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_clickhouse_reader_enters_backfill_service_lifecycle() {
+        let Ok(base_url) = std::env::var("CLICKHOUSE_URL") else {
+            return;
+        };
+        let user = std::env::var("CLICKHOUSE_USER").ok();
+        let password = std::env::var("CLICKHOUSE_PASSWORD").ok();
+        let client = reqwest::Client::new();
+        for sql in [
+            "CREATE DATABASE IF NOT EXISTS asap_e2e",
+            "DROP TABLE IF EXISTS asap_e2e.samples",
+            "CREATE TABLE asap_e2e.samples(metric String, labels String, timestamp_ms Int64, value Float64) ENGINE=Memory",
+            "INSERT INTO asap_e2e.samples VALUES ('requests','requests',100,2),('requests','requests',1100,3)",
+        ] {
+            let mut request = client.post(&base_url).body(sql);
+            if let Some(user) = &user { request = request.basic_auth(user, password.as_ref()); }
+            assert!(request.send().await.unwrap().status().is_success());
+        }
+        let cfg = PrecomputeMaterialization::new(
+            AggregationType::Sum,
+            String::new(),
+            Default::default(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            1,
+            1,
+            WindowKind::Tumbling,
+            String::new(),
+            "requests".into(),
+            None,
+            None,
+            None,
+        );
+        let hot = crate::storage_engines::types::HotReloadStreamingConfig::from_arc(Arc::new(
+            crate::storage_engines::types::StreamingConfig::new(HashMap::from([(
+                cfg.policy_fp_u64(),
+                cfg.clone(),
+            )])),
+        ));
+        let registry =
+            Arc::new(crate::storage_engines::sketch_db::backfill::BackfillRegistry::new());
+        let reader = crate::storage_engines::sketch_db::backfill::ClickHouseReaderConfig {
+            base_url,
+            database: "asap_e2e".into(),
+            table: "samples".into(),
+            metric_column: "metric".into(),
+            labels_column: "labels".into(),
+            timestamp_ms_column: "timestamp_ms".into(),
+            value_column: "value".into(),
+            user,
+            password,
+        };
+        let store = Arc::new(SketchStore::new());
+        let service = crate::storage_engines::sketch_db::backfill::BackfillService::new(
+            registry.clone(),
+            hot,
+            crate::storage_engines::sketch_db::backfill::clickhouse_reader_factory(reader),
+            crate::storage_engines::sketch_db::backfill::BackfillServiceConfig {
+                poll_interval: std::time::Duration::from_millis(10),
+            },
+        )
+        .with_sketch_index(store.clone())
+        .with_series_resolver(Arc::new(
+            crate::drivers::ingest::series_resolver::SeriesIdResolver::new(),
+        ));
+        let handle = service.spawn();
+        let job = registry.create(
+            cfg.policy_fp_u64(),
+            (0, 2_000),
+            crate::storage_engines::sketch_db::backfill::BackfillSource::Prometheus {
+                url: "clickhouse://configured".into(),
+            },
+            2,
+        );
+        for _ in 0..200 {
+            if registry
+                .get(job)
+                .is_some_and(|job| job.status.is_terminal())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        handle.shutdown().await;
+        assert_eq!(
+            registry.get(job).unwrap().status,
+            crate::storage_engines::sketch_db::backfill::BackfillStatus::Complete
+        );
+        assert!(!store.sids_for_policy(cfg.policy_fingerprint()).is_empty());
+        let (accelerator, request) = fixture_with_store(2_000, store, false).await;
+        let ClickHouseAccelerationOutcome::Accelerated(response) =
+            accelerator.execute(&request).await
+        else {
+            panic!("published SQL DAG did not read ClickHouse-backfilled SummaryStore state")
+        };
+        assert_eq!(response.body, "1970-01-01T00:00:02\t50.0\n");
+        let mut exact = client.post(std::env::var("CLICKHOUSE_URL").unwrap()).body(
+            "SELECT sum(value) * 10 FROM asap_e2e.samples WHERE metric='requests' FORMAT TabSeparated",
+        );
+        if let Some(user) = std::env::var("CLICKHOUSE_USER").ok() {
+            exact = exact.basic_auth(user, std::env::var("CLICKHOUSE_PASSWORD").ok());
+        }
+        let exact_value: f64 = exact
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let accelerated_value: f64 = std::str::from_utf8(&response.body)
+            .unwrap()
+            .trim()
+            .split('\t')
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(accelerated_value, exact_value);
     }
 }
