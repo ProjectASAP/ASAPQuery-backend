@@ -7,7 +7,9 @@ use planner_types::{
     pre_asap::AggIntent,
     types::AccuracyTarget,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+#[path = "topk_dashboard/erp.rs"]
+mod erp;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     hint::black_box,
@@ -31,6 +33,14 @@ struct Args {
     backend_revision: String,
     #[arg(long)]
     input_tsv: Option<std::path::PathBuf>,
+    /// Offline measured ERP catalog; required for comparisons.
+    #[arg(long)]
+    erp_catalog: Option<std::path::PathBuf>,
+    /// Produce window-specific ERP evidence instead of running the comparison.
+    #[arg(long)]
+    build_erp: bool,
+    #[arg(long, default_value_t = 16_777_216)]
+    total_memory_budget_bytes: usize,
     #[arg(long, default_value_t = 10_000_000)]
     total_events: usize,
     #[arg(long, default_value_t = 100_000)]
@@ -57,13 +67,13 @@ struct Args {
     seed: u64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 enum Family {
     Cms,
     CountSketch,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 struct Config {
     family: Family,
     rows: usize,
@@ -181,14 +191,12 @@ fn candidates(a: &Args) -> Vec<Config> {
         .flat_map(|family| {
             [3, 5, 7].into_iter().flat_map(move |rows| {
                 [128, 256, 512, 1024].into_iter().flat_map(move |cols| {
-                    [16, 32, 64, 128, 256, 512, 1024]
-                        .into_iter()
-                        .map(move |heap| Config {
-                            family,
-                            rows,
-                            cols,
-                            heap,
-                        })
+                    [16, 32, 64].into_iter().map(move |heap| Config {
+                        family,
+                        rows,
+                        cols,
+                        heap,
+                    })
                 })
             })
         })
@@ -196,17 +204,10 @@ fn candidates(a: &Args) -> Vec<Config> {
         .collect()
 }
 
-fn pane_counts(pane: &[u32]) -> HashMap<u32, u32> {
-    let mut h = HashMap::new();
-    for &k in pane {
-        *h.entry(k).or_insert(0) += 1;
-    }
-    h
-}
 fn build_pane(pane: &[u32], c: Config) -> Sketch {
     let mut s = Sketch::new(c);
-    for (k, n) in pane_counts(pane) {
-        s.update(&format!("key-{k}"), n as f64);
+    for k in pane {
+        s.update(&format!("key-{k}"), 1.0);
     }
     s
 }
@@ -232,9 +233,19 @@ fn recall(pred: &[(String, f64)], truth: &[(u32, u64)]) -> f64 {
         .filter_map(|(x, _)| x.strip_prefix("key-")?.parse::<u32>().ok())
         .collect();
     if truth.is_empty() {
-        1.0
+        f64::from(pred.is_empty())
     } else {
-        truth.iter().filter(|(k, _)| p.contains(k)).count() as f64 / truth.len().min(K) as f64
+        let boundary = truth[truth.len().min(K) - 1].1;
+        let strict = truth.iter().filter(|(_, count)| *count > boundary).count();
+        let strict_hits = truth
+            .iter()
+            .filter(|(key, count)| *count > boundary && p.contains(key))
+            .count();
+        let tie_hits = truth
+            .iter()
+            .filter(|(key, count)| *count == boundary && p.contains(key))
+            .count();
+        (strict_hits + tie_hits.min(truth.len().min(K) - strict)) as f64 / truth.len().min(K) as f64
     }
 }
 
@@ -277,14 +288,37 @@ fn calibration_score(
     window: usize,
     c: Config,
 ) -> Result<f64, Box<dyn std::error::Error>> {
-    let end = data.len();
-    let start = end.saturating_sub(window);
-    let states: Vec<_> = data[start..end].iter().map(|p| build_pane(p, c)).collect();
-    let mut merged = states[0].clone();
-    for s in &states[1..] {
-        merged.merge(s)?;
+    let states: Vec<_> = data.iter().map(|p| build_pane(p, c)).collect();
+    let ends: std::collections::BTreeSet<_> = (0..5)
+        .map(|i| window + (data.len() - window) * i / 4)
+        .collect();
+    let mut worst = 1.0_f64;
+    for end in ends {
+        let mut merged = states[end - window].clone();
+        for s in &states[end - window + 1..end] {
+            merged.merge(s)?;
+        }
+        worst = worst.min(recall(&merged.topk(), &exact_topk(data, end, window)));
     }
-    Ok(recall(&merged.topk(), &exact_topk(data, end, end - start)))
+    Ok(worst)
+}
+
+fn lhs(seed: u64, family: Family) -> Vec<Config> {
+    let mut rng = Rng(seed);
+    let mut axes = [vec![3, 5, 7], vec![128, 256, 512, 1024], vec![16, 32, 64]];
+    for axis in &mut axes {
+        for i in (1..axis.len()).rev() {
+            axis.swap(i, rng.next() as usize % (i + 1));
+        }
+    }
+    (0..3)
+        .map(|i| Config {
+            family,
+            rows: axes[0][i],
+            cols: axes[1][i],
+            heap: axes[2][i],
+        })
+        .collect()
 }
 
 fn autosketch(
@@ -292,24 +326,34 @@ fn autosketch(
     window: usize,
     a: &Args,
     offset: usize,
-) -> Result<(Config, Duration), Box<dyn std::error::Error>> {
+) -> Result<(Config, Duration, usize, f64), Box<dyn std::error::Error>> {
     let grid = candidates(a);
     let began = Instant::now();
     let mut frontier = VecDeque::new();
-    for i in 0..8 {
-        frontier.push_back((offset + i * 7) % grid.len());
+    for family in [Family::Cms, Family::CountSketch] {
+        for c in lhs(a.seed + offset as u64, family) {
+            if grid.contains(&c) {
+                frontier.push_back((c, None));
+            }
+        }
     }
     let mut seen = HashSet::new();
+    let mut scores = HashMap::new();
     let mut best = None;
-    while let Some(i) = frontier.pop_front() {
-        if seen.len() >= 16 {
-            break;
-        }
-        if !seen.insert(i) {
+    while let Some((c, initial)) = frontier.pop_front() {
+        if !seen.insert((c, initial)) {
             continue;
         }
-        let c = grid[i];
-        let score = calibration_score(data, window, c)?;
+        if best.is_some_and(|b: Config| erp::bytes(c) > erp::bytes(b)) {
+            continue;
+        }
+        let score = if let Some(score) = scores.get(&c) {
+            *score
+        } else {
+            let score = calibration_score(data, window, c)?;
+            scores.insert(c, score);
+            score
+        };
         let feasible = score >= a.min_recall_at_10;
         if feasible
             && best.is_none_or(|b: Config| {
@@ -318,36 +362,57 @@ fn autosketch(
         {
             best = Some(c)
         }
-        let next = if feasible {
-            i.checked_sub(1)
-        } else {
-            (i + 1 < grid.len()).then_some(i + 1)
-        };
-        if let Some(j) = next {
-            frontier.push_back(j)
+        if initial.is_some_and(|direction| direction != feasible) {
+            continue;
         }
-    }
-    let mut best_observed = 0.0_f64;
-    if best.is_none() {
-        let mut by_resource = grid.clone();
-        by_resource.sort_by_key(|c| c.rows * c.cols * 8 + c.heap * 32);
-        for c in by_resource.into_iter().rev() {
-            let score = calibration_score(data, window, c)?;
-            best_observed = best_observed.max(score);
-            if score >= a.min_recall_at_10 {
-                best = Some(c);
-                break;
+        // Adjacent values in ONE numeric dimension; family is categorical.
+        for axis in 0..3 {
+            let values: &[usize] = match axis {
+                0 => &[3, 5, 7],
+                1 => &[128, 256, 512, 1024],
+                _ => &[16, 32, 64],
+            };
+            let value = match axis {
+                0 => c.rows,
+                1 => c.cols,
+                _ => c.heap,
+            };
+            let pos = values.iter().position(|x| *x == value).unwrap();
+            let next = if feasible {
+                pos.checked_sub(1)
+            } else {
+                (pos + 1 < values.len()).then_some(pos + 1)
+            };
+            if let Some(pos) = next {
+                let mut n = c;
+                match axis {
+                    0 => n.rows = values[pos],
+                    1 => n.cols = values[pos],
+                    _ => n.heap = values[pos],
+                };
+                if grid.contains(&n) {
+                    frontier.push_back((n, Some(initial.unwrap_or(feasible))));
+                }
             }
         }
     }
-    Ok((
-        best.ok_or_else(|| {
-            format!(
-                "AutoSketch found no feasible config for {window} panes; best recall={best_observed}"
-            )
-        })?,
-        began.elapsed(),
-    ))
+    let best_observed = scores.values().copied().fold(0.0_f64, f64::max);
+    // Algorithm 4 returns the highest-accuracy visited point if none pass.
+    // The output records its calibration score so it cannot be mistaken for a
+    // feasible selection or hidden by terminating the whole experiment.
+    let chosen = best
+        .or_else(|| {
+            scores
+                .iter()
+                .max_by(|(a, x), (b, y)| {
+                    x.total_cmp(y)
+                        .then_with(|| erp::bytes(**b).cmp(&erp::bytes(**a)))
+                })
+                .map(|(c, _)| *c)
+        })
+        .ok_or("AutoSketch has no admissible initial candidates")?;
+    let score = *scores.get(&chosen).unwrap_or(&best_observed);
+    Ok((chosen, began.elapsed(), scores.len(), score))
 }
 
 #[derive(Default, Serialize)]
@@ -370,6 +435,7 @@ struct Row {
     mean_ndcg_at_10: f64,
     accuracy_violations: usize,
     configs: Vec<Config>,
+    query_samples: Vec<serde_json::Value>,
 }
 
 fn run_sketch(
@@ -388,6 +454,7 @@ fn run_sketch(
     let mut ndcg_sum = 0.0;
     let mut violations = 0;
     let mut updates = 0u64;
+    let mut samples = Vec::new();
     let mut stores: Vec<VecDeque<Sketch>> = (0..if shared { 1 } else { 4 })
         .map(|_| VecDeque::new())
         .collect();
@@ -407,7 +474,7 @@ fn run_sketch(
             }
             timing.eviction_seconds += t.elapsed().as_secs_f64();
         }
-        if p + 1 < start || p + 1 >= start + refreshes {
+        if p < start {
             continue;
         }
         for (q, &window) in WINDOWS.iter().enumerate() {
@@ -418,10 +485,12 @@ fn run_sketch(
             for s in refs.iter().skip(1) {
                 merged.merge(s)?;
             }
-            timing.merge_seconds += t.elapsed().as_secs_f64();
+            let merge_seconds = t.elapsed().as_secs_f64();
+            timing.merge_seconds += merge_seconds;
             let t = Instant::now();
             let pred = black_box(merged.topk());
-            timing.topk_readout_seconds += t.elapsed().as_secs_f64();
+            let readout_seconds = t.elapsed().as_secs_f64();
+            timing.topk_readout_seconds += readout_seconds;
             let t = Instant::now();
             let truth = exact_topk(data, p + 1, window);
             timing.exact_query_seconds += t.elapsed().as_secs_f64();
@@ -432,6 +501,7 @@ fn run_sketch(
             if r < min_recall {
                 violations += 1;
             }
+            samples.push(serde_json::json!({"end_pane":p+1,"window_panes":window,"recall":r,"precision":precision(&pred,&truth),"merge_seconds":merge_seconds,"readout_seconds":readout_seconds}));
         }
     }
     let queries = refreshes * 4;
@@ -454,29 +524,52 @@ fn run_sketch(
         mean_ndcg_at_10: ndcg_sum / queries as f64,
         accuracy_violations: violations,
         configs,
+        query_samples: samples,
     })
 }
 
 fn exact(data: &[Vec<u32>], start: usize, refreshes: usize) -> Row {
     let plan = Instant::now();
-    let _layout = WINDOWS;
+    let layout: Vec<_> = WINDOWS.iter().map(|w| (*w, K)).collect();
+    black_box(&layout);
     let planning = plan.elapsed().as_secs_f64();
     let mut t = Timing::default();
-    for p in start..start + refreshes {
-        for &w in &WINDOWS {
+    let mut retained = VecDeque::new();
+    let mut peak_bytes = 0;
+    let mut samples = Vec::new();
+    for p in 0..start + refreshes {
+        let update = Instant::now();
+        retained.push_back(data[p].clone());
+        t.update_seconds += update.elapsed().as_secs_f64();
+        let eviction = Instant::now();
+        while retained.len() > WINDOWS[3] {
+            retained.pop_front();
+        }
+        t.eviction_seconds += eviction.elapsed().as_secs_f64();
+        peak_bytes = peak_bytes.max(
+            retained
+                .iter()
+                .map(|p| p.len() * std::mem::size_of::<u32>())
+                .sum::<usize>(),
+        );
+        if p < start {
+            continue;
+        }
+        let retained = retained.make_contiguous();
+        for &(w, _) in &layout {
             let q = Instant::now();
-            black_box(exact_topk(data, p + 1, w));
-            t.exact_query_seconds += q.elapsed().as_secs_f64();
+            black_box(exact_topk(retained, retained.len(), w));
+            let elapsed = q.elapsed().as_secs_f64();
+            t.exact_query_seconds += elapsed;
+            samples
+                .push(serde_json::json!({"end_pane":p+1,"window_panes":w,"query_seconds":elapsed}));
         }
     }
     Row {
-        method: "exact_production".into(),
+        method: "exact_hash_scan".into(),
         planning_seconds: planning,
         timing: t,
-        logical_payload_bytes: data[start - WINDOWS[3] + 1..start + refreshes]
-            .iter()
-            .map(|x| x.len() * 8)
-            .sum(),
+        logical_payload_bytes: peak_bytes,
         maintenance_updates: data
             .iter()
             .take(start + refreshes)
@@ -487,6 +580,7 @@ fn exact(data: &[Vec<u32>], start: usize, refreshes: usize) -> Row {
         mean_ndcg_at_10: 1.0,
         accuracy_violations: 0,
         configs: vec![],
+        query_samples: samples,
     }
 }
 
@@ -509,24 +603,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("invalid calibration/refresh geometry".into());
     }
+    if a.refresh_seconds != 30
+        || a.cardinality == 0
+        || !a.min_recall_at_10.is_finite()
+        || !(0.0..=1.0).contains(&a.min_recall_at_10)
+    {
+        return Err("invalid workload parameters".into());
+    }
+    if a.build_erp {
+        let catalog = erp::build(&a, replayed.as_ref())?;
+        let out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&a.output)?;
+        serde_json::to_writer_pretty(out, &catalog)?;
+        return Ok(());
+    }
+    let load_started = Instant::now();
+    let catalog: erp::Catalog =
+        serde_json::from_reader(std::fs::File::open(a.erp_catalog.as_ref().ok_or(
+            "--erp-catalog is required; generate measured evidence using --build-erp",
+        )?)?)?;
+    let catalog_load_seconds = load_started.elapsed().as_secs_f64();
     let mut trials = Vec::new();
     for trial in 0..a.trials {
         let data = replayed.clone().unwrap_or_else(|| synthetic(&a, trial));
         let cal = &data[..a.calibration_panes];
         let mut auto_configs = Vec::new();
         let mut auto_plan = 0.0;
+        let mut searches = Vec::new();
         for (i, &w) in WINDOWS.iter().enumerate() {
-            let (c, t) = autosketch(cal, w, &a, i + trial)?;
+            let (c, t, evaluated, score) = autosketch(cal, w, &a, i + trial)?;
             auto_configs.push(c);
             auto_plan += t.as_secs_f64();
+            searches.push(serde_json::json!({"window_panes":w,"planning_seconds":t.as_secs_f64(),"evaluated_candidates":evaluated,"minimum_calibration_recall":score,"calibration_feasible":score>=a.min_recall_at_10,"config":c}));
         }
-        let erp_start = Instant::now();
-        let erp_config = candidates(&a)
-            .into_iter()
-            .filter(|c| c.family == Family::Cms && c.rows >= 5 && c.cols >= 512 && c.heap >= 32)
-            .min_by_key(|c| c.rows * c.cols * 8 + c.heap * 32)
-            .ok_or("no ERP candidate")?;
-        let erp_plan = erp_start.elapsed().as_secs_f64();
+        if auto_configs
+            .iter()
+            .zip(WINDOWS)
+            .map(|(c, w)| erp::bytes(*c) * w)
+            .sum::<usize>()
+            > a.total_memory_budget_bytes
+        {
+            return Err("AutoSketch exceeds total memory budget".into());
+        }
+        let full_started = Instant::now();
+        let erp_shared = erp::select(&catalog, cal, &a, true);
+        let erp_local = erp::select(&catalog, cal, &a, false);
+        let (mut erp_full, full_shared) = match (&erp_shared, &erp_local) {
+            (Ok(s), Ok(l)) if l.retained_bytes < s.retained_bytes => (Ok(l.clone()), false),
+            (Ok(s), _) => (Ok(s.clone()), true),
+            (_, Ok(l)) => (Ok(l.clone()), false),
+            _ => (Err("no feasible ERP layout".to_owned()), false),
+        };
+        if let Ok(d) = &mut erp_full {
+            d.planning_seconds = full_started.elapsed().as_secs_f64();
+        }
         let analytical_start = Instant::now();
         let intent = AggIntent::TopK {
             k: K,
@@ -544,15 +676,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } => Config {
                     family: Family::Cms,
                     rows: depth as usize,
-                    cols: width as usize,
-                    heap: heap_size.max(K as u32) as usize,
+                    cols: (width as usize).next_power_of_two(),
+                    heap: (heap_size.max(K as u32) as usize).next_power_of_two(),
                 },
                 other => {
                     return Err(format!("unexpected analytical Top-K params: {other:?}").into())
                 }
             };
         let analytical_plan = analytical_start.elapsed().as_secs_f64();
-        let rows = vec![
+        let mut rows = vec![
             run_sketch(
                 "autosketch_per_query",
                 &data,
@@ -561,26 +693,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 auto_configs,
                 false,
                 auto_plan,
-                a.min_recall_at_10,
-            )?,
-            run_sketch(
-                "asapplanner_erp_no_sharing",
-                &data,
-                a.calibration_panes,
-                a.refreshes,
-                vec![erp_config; 4],
-                false,
-                erp_plan,
-                a.min_recall_at_10,
-            )?,
-            run_sketch(
-                "asapplanner_erp",
-                &data,
-                a.calibration_panes,
-                a.refreshes,
-                vec![erp_config],
-                true,
-                erp_plan,
                 a.min_recall_at_10,
             )?,
             run_sketch(
@@ -595,7 +707,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?,
             exact(&data, a.calibration_panes, a.refreshes),
         ];
-        trials.push(serde_json::json!({"trial":trial,"rows":rows}));
+        let mut decisions = Vec::new();
+        for (name, shared, decision) in [
+            ("asapplanner_erp", full_shared, erp_full),
+            (
+                "asapplanner_erp_no_sharing",
+                false,
+                erp_local.map_err(|e| e.to_string()),
+            ),
+        ] {
+            match decision {
+                Ok(d) => {
+                    rows.push(run_sketch(
+                        name,
+                        &data,
+                        a.calibration_panes,
+                        a.refreshes,
+                        d.configs.clone(),
+                        shared,
+                        d.planning_seconds + catalog_load_seconds,
+                        a.min_recall_at_10,
+                    )?);
+                    decisions
+                        .push(serde_json::json!({"method":name,"selection":d,"shared":shared}));
+                }
+                Err(error) => {
+                    let mut fallback = exact(&data, a.calibration_panes, a.refreshes);
+                    fallback.method = format!("{name}_exact_fallback");
+                    rows.push(fallback);
+                    decisions.push(serde_json::json!({"method":name,"fallback_reason":error.to_string(),"reason":"theoretical additive bound does not certify Recall@10; exact fallback"}));
+                }
+            }
+        }
+        trials.push(serde_json::json!({"trial":trial,"rows":rows,"erp_decisions":decisions,"autosketch_searches":searches}));
         eprintln!("trial {trial} complete");
     }
     let out = std::fs::OpenOptions::new()
@@ -604,7 +748,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open(&a.output)?;
     serde_json::to_writer_pretty(
         out,
-        &serde_json::json!({"schema_version":1,"query":"topk(10, count_over_time(events[window]))","windows_minutes":[1,5,15,60],"dashboard_refresh_seconds":a.refresh_seconds,"args":a,"trials":trials}),
+        &serde_json::json!({"schema_version":2,"query":"topk(10, count_over_time(events[window]))","windows_minutes":[1,5,15,60],"dashboard_refresh_seconds":a.refresh_seconds,"args":a,"trials":trials,"erp_generation_seconds":catalog.generation_seconds,"catalog_load_seconds":catalog_load_seconds,"memory_metric":"logical retained counters + heap entry proxy (32 bytes); excludes allocator and string overhead","timing_metric":"wall seconds; merge includes heap reconciliation"}),
     )?;
     Ok(())
 }
@@ -612,12 +756,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // A tied boundary cannot replace a strictly heavier mandatory key.
+    #[test]
+    fn ties_do_not_hide_missing_heavy_keys() {
+        let mut truth = vec![(0, 100)];
+        truth.extend((1..20).map(|k| (k, 1)));
+        let pred: Vec<_> = (1..=10).map(|k| (format!("key-{k}"), 1.)).collect();
+        assert_eq!(recall(&pred, &truth), 0.9);
+    }
+    // LHS samples each discrete dimension without replacement, within each family.
+    #[test]
+    fn lhs_covers_both_families_with_distinct_dimensions() {
+        for family in [Family::Cms, Family::CountSketch] {
+            let points = lhs(42, family);
+            assert_eq!(
+                points.iter().map(|p| p.rows).collect::<HashSet<_>>().len(),
+                3
+            );
+            assert_eq!(
+                points.iter().map(|p| p.cols).collect::<HashSet<_>>().len(),
+                3
+            );
+            assert_eq!(
+                points.iter().map(|p| p.heap).collect::<HashSet<_>>().len(),
+                3
+            );
+            assert!(points.iter().all(|p| p.family == family));
+        }
+    }
     #[test]
     fn dashboard_advances_and_sharing_reduces_updates() {
         let a = Args {
             output: "x".into(),
             backend_revision: "test".into(),
             input_tsv: None,
+            erp_catalog: None,
+            build_erp: false,
+            total_memory_budget_bytes: 16_777_216,
             total_events: 22000,
             cardinality: 100,
             panes: 220,
@@ -642,5 +817,11 @@ mod tests {
         let local = run_sketch("local", &d, 120, 3, vec![c; 4], false, 0.0, 0.5).unwrap();
         assert_eq!(local.maintenance_updates, shared.maintenance_updates * 4);
         assert!(shared.timing.merge_seconds > 0.0);
+        let exact = exact(&d, 120, 3);
+        for row in [&shared, &local, &exact] {
+            assert_eq!(row.query_samples.len(), 12);
+            assert_eq!(row.query_samples.first().unwrap()["end_pane"], 121);
+            assert_eq!(row.query_samples.last().unwrap()["end_pane"], 123);
+        }
     }
 }
