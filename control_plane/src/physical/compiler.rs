@@ -39,6 +39,17 @@ use planner_types::pre_asap::Source;
 
 pub const PLANNER_REVISION: &str = "0deceda3e776216c5542d638d958b159f22e27ce";
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
+/// Matches the data plane's default persistence memory limit. A backend-local
+/// summary candidate must fit its complete retained state inside this budget.
+pub const DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+fn default_retained_summary_memory_budget_bytes() -> u64 {
+    DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES
+}
+
+fn is_default_retained_summary_memory_budget_bytes(value: &u64) -> bool {
+    *value == DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES
+}
 
 #[derive(Debug, Clone)]
 pub struct PlanningQuery {
@@ -144,6 +155,9 @@ pub struct PlanningRequest {
     /// evaluated. This extends physical retention only; it never changes the
     /// PromQL range selector used for readout.
     pub query_staleness_margin_ms: u64,
+    /// Maximum aggregate encoded footprint of every retained summary pane.
+    /// `None` uses the backend's default persistence-memory limit.
+    pub retained_summary_memory_budget_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -209,6 +223,14 @@ pub struct BackendLocalImplementation {
     pub source_sample_interval_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub query_staleness_margin_ms: u64,
+    /// Admission budget for all retained panes and estimated partitions.
+    /// Missing legacy snapshots inherit the backend default.
+    #[serde(
+        default = "default_retained_summary_memory_budget_bytes",
+        alias = "maxRetainedSummaryBytes",
+        skip_serializing_if = "is_default_retained_summary_memory_budget_bytes"
+    )]
+    pub max_retained_summary_bytes: u64,
     /// Certificates keyed by exact registered PromQL; converted to root IDs
     /// before workload selection so one query cannot borrow another's evidence.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -1875,6 +1897,9 @@ impl BackendLocalPlanningSnapshot {
                 planner_revision: PLANNER_REVISION.into(),
                 source_sample_interval_ms: self.implementation.source_sample_interval_ms,
                 query_staleness_margin_ms: self.implementation.query_staleness_margin_ms,
+                retained_summary_memory_budget_bytes: Some(
+                    self.implementation.max_retained_summary_bytes,
+                ),
             },
             self.environment,
         ))
@@ -2513,6 +2538,7 @@ impl PhysicalCompiler {
                         output_grouping: PhysicalGrouping::Reduce(
                             materialization.grouping_labels.labels.clone(),
                         ),
+                        item_labels: materialization.aggregated_labels.labels.clone(),
                         window_ms: pane_ms,
                         pane_origin_ms: materialization.pane_origin_ms,
                     })
@@ -2577,6 +2603,21 @@ impl PhysicalCompiler {
                 ));
             }
         }
+        validate_retained_summary_footprint(
+            &precompute_plan.materializations,
+            request
+                .query_workload
+                .as_ref()
+                .and_then(|workload| workload.data_workload.as_ref())
+                .and_then(|data| {
+                    data.input_cardinality
+                        .value_at(environment.observed_at_unix_ms)
+                })
+                .copied(),
+            request
+                .retained_summary_memory_budget_bytes
+                .unwrap_or(DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES),
+        )?;
         query_plan.validate(&materialization_fingerprints)?;
         let summary_catalog = super::summary_catalog::SummaryCatalog::from_materializations(
             envelope.plan_id,
@@ -3014,6 +3055,97 @@ fn retained_window_count(lookback_ms: u64, staleness_margin_ms: u64, pane_ms: u6
         .saturating_add(1)
 }
 
+/// Estimate the encoded bytes retained by one physical state. Sketch matrix
+/// cells use two words here, covering the counter plus observed serialization
+/// overhead. Heap and exact-state estimates include container slack.
+fn retained_state_bytes(materialization: &asap_types::PrecomputeMaterialization) -> u128 {
+    use asap_types::AggregationType as A;
+
+    let parameter = |names: &[&str], fallback: u64| {
+        names
+            .iter()
+            .find_map(|name| {
+                materialization
+                    .parameters
+                    .get(*name)
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(fallback) as u128
+    };
+    match materialization.aggregation_type {
+        A::CountMinSketch | A::CountSketch => {
+            parameter(&["width", "w", "col_num", "col"], 1)
+                * parameter(&["depth", "d", "row_num", "row"], 1)
+                * 16
+        }
+        A::CountMinSketchWithHeap | A::CountSketchWithHeap => {
+            parameter(&["width", "w", "col_num", "col"], 1)
+                * parameter(&["depth", "d", "row_num", "row"], 1)
+                * 16
+                + parameter(&["heap_size"], 1) * 256
+        }
+        A::DatasketchesKLL => parameter(&["k"], 200) * 32,
+        A::HydraKLL => parameter(&["k"], 200) * parameter(&["col", "cols"], 1) * 32,
+        A::HLL => 1u128 << parameter(&["precision", "p"], 14).min(24),
+        A::DDSketch => 64 * 1024,
+        A::Sum
+        | A::Increase
+        | A::MinMax
+        | A::MultipleSum
+        | A::MultipleIncrease
+        | A::MultipleMinMax
+        | A::SingleSubpopulation
+        | A::MultipleSubpopulation => 256,
+    }
+}
+
+fn retained_partition_count(
+    materialization: &asap_types::PrecomputeMaterialization,
+    input_cardinality: Option<u64>,
+) -> u128 {
+    use asap_types::AggregationType as A;
+
+    // Reset-aware and min/max state remains source-series scoped even with an
+    // empty output grouping. Grouped states have at most one partition per
+    // input series. Other empty groupings are the Reduce([]) global singleton.
+    if matches!(
+        materialization.aggregation_type,
+        A::Increase | A::MultipleIncrease | A::MinMax | A::MultipleMinMax
+    ) || !materialization.grouping_labels.labels.is_empty()
+    {
+        u128::from(input_cardinality.unwrap_or(1).max(1))
+    } else {
+        1
+    }
+}
+
+fn validate_retained_summary_footprint(
+    materializations: &[asap_types::PrecomputeMaterialization],
+    input_cardinality: Option<u64>,
+    budget_bytes: u64,
+) -> Result<(), CompileError> {
+    let estimated_bytes = materializations
+        .iter()
+        .fold(0u128, |total, materialization| {
+            total.saturating_add(
+                retained_state_bytes(materialization)
+                    .saturating_mul(u128::from(
+                        materialization.num_aggregates_to_retain.unwrap_or(1),
+                    ))
+                    .saturating_mul(retained_partition_count(materialization, input_cardinality)),
+            )
+        });
+    if estimated_bytes > u128::from(budget_bytes) {
+        return Err(CompileError::Query {
+            query_id: "retained-summary-footprint".into(),
+            reason: format!(
+                "estimated retained summary footprint {estimated_bytes} bytes exceeds budget {budget_bytes} bytes across panes and partitions"
+            ),
+        });
+    }
+    Ok(())
+}
+
 struct PlannerPhysicalSelection {
     window_implementation_id: String,
     lifecycle: CollectorLifecycle,
@@ -3275,6 +3407,7 @@ struct SelectedMaterialization {
     window_secs: Option<u64>,
     spatial_filter: String,
     group_by: Option<Vec<String>>,
+    item_label: Option<String>,
     family: SummaryFamilyType,
     algorithm: String,
     parameters: Value,
@@ -3310,7 +3443,7 @@ fn physical_aggregation(
             .group_by
             .clone()
             .unwrap_or_else(|| query.group_by.clone()),
-        item_label: None,
+        item_label: selected.item_label.clone(),
         heap_update_mode: selected.parameters.get("weight_mode").and_then(|mode| {
             match mode.as_str() {
                 Some("count") => Some("count"),
@@ -3537,8 +3670,22 @@ fn collect_selected_materializations(
             } => {
                 if let Some(readout) = readout {
                     let mut parameters = sketch_params_json(kind.params());
+                    let mut item_label = None;
                     if matches!(readout, SketchQuery::TopK { .. }) {
                         use planner_types::post_asap::SummaryInputExpr;
+                        item_label = match &input.item {
+                            Some(SummaryInputExpr::Column(
+                                planner_types::pre_asap::ColumnRef::Named(label),
+                            )) => Some(label.clone()),
+                            Some(SummaryInputExpr::Column(
+                                planner_types::pre_asap::ColumnRef::Qualified { name, .. },
+                            )) => Some(name.clone()),
+                            // Legacy/direct TopK plans did not carry an item
+                            // projection. Keep their generic item-key behavior;
+                            // typed Planner plans name the inner aggregate
+                            // identity explicitly through SummaryUpdate.item.
+                            _ => None,
+                        };
                         let mode = match &input.weight {
                             SummaryInputExpr::Constant(value) if *value == 1.0 => "count",
                             SummaryInputExpr::Column(
@@ -3557,6 +3704,12 @@ fn collect_selected_materializations(
                             _ => return Err("unsupported TopK SummaryUpdate weight".into()),
                         };
                         parameters["weight_mode"] = mode.into();
+                        if mode == "counter_delta" {
+                            // CMS/CountSketch heap implementations quantize
+                            // weights to integer counters. Preserve sub-unit
+                            // counter increments used by CPU metrics.
+                            parameters["weight_scale"] = 1_000_000.into();
+                        }
                     }
                     let (metric, window_secs, spatial_filter) =
                         match materialization_leaf_contract(node) {
@@ -3571,6 +3724,7 @@ fn collect_selected_materializations(
                         window_secs,
                         spatial_filter,
                         group_by: grouping.clone(),
+                        item_label,
                         family: SummaryFamilyType::Sketch(
                             kind.clone(),
                             planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance,
@@ -3597,6 +3751,7 @@ fn collect_selected_materializations(
                     window_secs,
                     spatial_filter,
                     group_by: grouping.clone(),
+                    item_label: None,
                     family: SummaryFamilyType::ExactAggregate(kind.clone(), params.clone()),
                     algorithm: format!("{kind:?}").to_ascii_lowercase(),
                     parameters: Value::Object(Default::default()),
@@ -3906,17 +4061,112 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(heaps.len(), 1, "unpartitioned TopK owns one global CMS");
         assert!(heaps[0].grouping_labels.labels.is_empty());
-        assert!(plan
+        assert_eq!(heaps[0].aggregated_labels.labels, vec!["job"]);
+        assert_eq!(heaps[0].parameters["weight_scale"], 1_000_000);
+        assert_eq!(retained_partition_count(heaps[0], Some(5)), 1);
+        let crate::query_plan::QueryPlanNode::ReadMaterialization { binding } =
+            &entry.nodes[&candidate_read]
+        else {
+            unreachable!()
+        };
+        assert!(matches!(
+            binding.output_grouping,
+            crate::query_plan::PhysicalGrouping::Reduce(ref labels) if labels.is_empty()
+        ));
+        assert_eq!(binding.item_labels, vec!["job"]);
+        let counter = plan
             .precompute_plan
             .materializations
             .iter()
-            .any(|materialization| {
+            .find(|materialization| {
                 matches!(
                     materialization.aggregation_type,
                     asap_types::AggregationType::Increase
                         | asap_types::AggregationType::MultipleIncrease
                 )
-            }));
+            })
+            .expect("reset-aware exact counter");
+        assert_eq!(retained_partition_count(counter, Some(5)), 5);
+    }
+
+    #[test]
+    fn retained_footprint_rejects_eval_sized_cms_across_all_panes() {
+        let evidence = TopKMembershipEvidence {
+            selected_lower_bound: 101.0,
+            excluded_upper_bound: 100.0,
+            interval_failure_probability: 0.001,
+            observed_at_unix_ms: 9_500,
+            source: "unit-fixture".into(),
+        };
+        let plan = PhysicalCompiler
+            .compile(
+                request_with_evidence(
+                    "topk-rate",
+                    "topk(2, sum by (job) (rate(m[1m])))",
+                    Some(evidence),
+                )
+                .unwrap(),
+                environment(10_000),
+            )
+            .unwrap();
+        let mut materializations = plan.precompute_plan.materializations;
+        let cms = materializations
+            .iter_mut()
+            .find(|materialization| {
+                materialization.aggregation_type
+                    == asap_types::AggregationType::CountMinSketchWithHeap
+            })
+            .unwrap();
+        cms.parameters.remove("width");
+        cms.parameters.remove("depth");
+        cms.parameters.insert("w".into(), json!(524_288));
+        cms.parameters.insert("d".into(), json!(7));
+        cms.num_aggregates_to_retain = Some(80);
+
+        let error = validate_retained_summary_footprint(
+            &materializations,
+            Some(5),
+            DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds budget"));
+
+        let cms = materializations
+            .iter_mut()
+            .find(|materialization| {
+                materialization.aggregation_type
+                    == asap_types::AggregationType::CountMinSketchWithHeap
+            })
+            .unwrap();
+        cms.parameters.insert("w".into(), json!(4_096));
+        validate_retained_summary_footprint(
+            &materializations,
+            Some(5),
+            DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES,
+        )
+        .unwrap();
+
+        let mut request = request("bounded", "sum(sum_over_time(m[1m]))");
+        request.retained_summary_memory_budget_bytes = Some(1);
+        let error = PhysicalCompiler
+            .compile(request, environment(10_000))
+            .unwrap_err();
+        assert!(error.to_string().contains("retained summary footprint"));
+    }
+
+    #[test]
+    fn legacy_backend_snapshot_gets_explicit_retained_memory_default_and_alias() {
+        let source = include_str!("../../../docs/examples/asapquery-planning-snapshot.json");
+        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(source).unwrap();
+        assert_eq!(
+            snapshot.implementation.max_retained_summary_bytes,
+            DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES
+        );
+
+        let mut value: Value = serde_json::from_str(source).unwrap();
+        value["implementation"]["maxRetainedSummaryBytes"] = json!(123_456);
+        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(value).unwrap();
+        assert_eq!(snapshot.implementation.max_retained_summary_bytes, 123_456);
     }
 
     fn environment(now: u64) -> DeploymentEnvironment {
@@ -4004,6 +4254,7 @@ mod tests {
             planner_revision: PLANNER_REVISION.into(),
             source_sample_interval_ms: None,
             query_staleness_margin_ms: 0,
+            retained_summary_memory_budget_bytes: None,
         })
     }
 
@@ -5176,6 +5427,7 @@ mod tests {
                 implementation_cost: template.window_implementations[0].cost.clone(),
                 source_sample_interval_ms: None,
                 query_staleness_margin_ms: 0,
+                max_retained_summary_bytes: DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES,
                 topk_evidence: HashMap::new(),
                 exact_composition_costs: HashMap::new(),
                 erp: None,

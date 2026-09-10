@@ -365,6 +365,9 @@ pub struct MaterializationBinding {
     pub materialization: SummaryDefinitionId,
     /// Query operator grouping applied while folding those SIDs.
     pub output_grouping: PhysicalGrouping,
+    /// Labels whose values form an item identity inside a keyed sketch.
+    #[serde(default, alias = "itemLabels", skip_serializing_if = "Vec::is_empty")]
+    pub item_labels: Vec<String>,
     pub window_ms: u64,
     /// Unix millisecond timestamp on the materialized pane-boundary grid.
     /// Legacy plans deserialize this as unknown and fall back at read time.
@@ -1235,6 +1238,7 @@ mod catalog_binding_tests {
                 QueryNodeId(1),
                 QueryPlanNode::ReadMaterialization {
                     binding: MaterializationBinding {
+                        item_labels: Vec::new(),
                         materialization: config.policy_fingerprint().into(),
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 10_000,

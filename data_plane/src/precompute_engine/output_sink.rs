@@ -30,6 +30,16 @@ pub trait OutputSink: Send + Sync {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
+fn consume_in_order<T>(items: Vec<T>, mut persist: impl FnMut(&T) -> bool) -> usize {
+    let mut failed = 0;
+    for item in items {
+        if !persist(&item) {
+            failed += 1;
+        }
+    }
+    failed
+}
+
 /// Phase 5 M2.3.6 — successor to the M2.3.4 `DualWriteSink`. Writes
 /// precomputes to `SketchStore` only; the legacy `SketchStore`
 /// agg_id-keyed write path is retired.
@@ -42,7 +52,8 @@ pub trait OutputSink: Send + Sync {
 /// the previously-existing `StoreOutputSink` shape.
 ///
 /// Per-batch overhead: one streaming-config snapshot read + per-row
-/// agg-id lookup, sid hash, and `Box<dyn AggregateCore>` clone.
+/// agg-id lookup and sid hash. Completed accumulators are consumed in order,
+/// so a catch-up batch releases each pane as soon as it is serialized.
 pub struct SketchStoreSink {
     sketch_index: Arc<SketchStore>,
     hot_reload: HotReloadStreamingConfig,
@@ -158,16 +169,14 @@ impl OutputSink for SketchStoreSink {
             return Ok(());
         }
         let _span = debug_span!("sketch_index_insert", batch_size = outputs.len()).entered();
-        let mut failed = 0;
-        for (output, accumulator) in &outputs {
-            if !self.append_to_index(output, accumulator.as_ref()) {
-                failed += 1;
-            }
-        }
+        let output_count = outputs.len();
+        let failed = consume_in_order(outputs, |(output, accumulator)| {
+            self.append_to_index(output, accumulator.as_ref())
+        });
         if failed > 0 {
             return Err(format!(
                 "SketchStore rejected {failed} of {} completed outputs",
-                outputs.len()
+                output_count
             )
             .into());
         }
@@ -257,6 +266,7 @@ mod tests {
     use asap_types::AggregationType;
     use asap_types::KeyByLabelNames;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn sum_agg_config(_id: u64, metric: &str, grouping_keys: &[&str]) -> AggregationConfig {
         // `_id` is unused after PR 5 — identity is content-addressed
@@ -449,5 +459,28 @@ mod tests {
             1,
             "UNSET skip is not a policy miss"
         );
+    }
+
+    #[test]
+    fn consuming_batch_releases_each_item_after_it_is_persisted() {
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+
+        let live = Arc::new(AtomicUsize::new(3));
+        let probes = (0..3).map(|_| DropProbe(live.clone())).collect::<Vec<_>>();
+        let mut observed = Vec::new();
+        assert_eq!(
+            consume_in_order(probes, |_| {
+                observed.push(live.load(Ordering::SeqCst));
+                true
+            }),
+            0
+        );
+        assert_eq!(observed, vec![3, 2, 1]);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
     }
 }

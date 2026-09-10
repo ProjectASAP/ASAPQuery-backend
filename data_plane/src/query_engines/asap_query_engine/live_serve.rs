@@ -463,6 +463,7 @@ mod tests {
                     control_plane::query_plan::QueryNodeId(1),
                     control_plane::query_plan::QueryPlanNode::ReadMaterialization {
                         binding: control_plane::query_plan::MaterializationBinding {
+                            item_labels: Vec::new(),
                             materialization: policy.into(),
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 1_000,

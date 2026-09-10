@@ -413,6 +413,7 @@ mod tests {
                 QueryNodeId(3),
                 QueryPlanNode::ReadMaterialization {
                     binding: MaterializationBinding {
+                        item_labels: Vec::new(),
                         materialization: MATERIALIZATION.into(),
                         output_grouping: PhysicalGrouping::Reduce(vec!["job".into()]),
                         window_ms: AT,
