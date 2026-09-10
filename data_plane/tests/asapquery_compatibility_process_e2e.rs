@@ -476,7 +476,7 @@ async fn run_shared_dashboard(multi_pane: bool) {
     typed.workload_cost_evidence = Some(
         control_plane::physical::workload_cost::WorkloadCostEvidence {
             backend_revision: control_plane::physical::compiler::BACKEND_REVISION.into(),
-            planner_revision: planner_types::PLANNER_REVISION.into(),
+            planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
             data_snapshot_id: "process-fixture-v1".into(),
             model_version: "test-only-unit-costs".into(),
             observed_at_unix_ms: environment.observed_at_unix_ms,
