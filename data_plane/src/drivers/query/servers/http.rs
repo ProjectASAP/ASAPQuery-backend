@@ -109,6 +109,16 @@ fn extract_tenant(headers: &axum::http::HeaderMap) -> String {
 /// Copy only request context that is safe and meaningful for the configured
 /// Prometheus fallback. Hop-by-hop and client-controlled transport headers are
 /// intentionally excluded.
+fn requires_tenant_scoped_metricsql_fallback(
+    adapter_name: &str,
+    headers: &HashMap<String, String>,
+) -> bool {
+    adapter_name == "VictoriaMetrics HTTP / MetricsQL"
+        && headers
+            .get("x-asap-tenant")
+            .is_some_and(|tenant| !tenant.trim().is_empty())
+}
+
 fn extract_fallback_headers(headers: &HeaderMap) -> HashMap<String, String> {
     const FORWARDED: [&str; 3] = ["authorization", "x-scope-orgid", "x-asap-tenant"];
     FORWARDED
@@ -722,6 +732,20 @@ async fn process_query_request(
     }
 
     let language_identity = state.adapter.canonical_plan_identity(&parsed_request.query);
+    // Published summary catalogs are currently global. A VM cluster tenant
+    // must never read that global catalog until planning publishes an
+    // explicitly tenant-scoped sidecar, so tenant routes fail closed to VM.
+    if requires_tenant_scoped_metricsql_fallback(state.adapter.adapter_name(), &headers) {
+        if let Some(fallback) = &state.fallback {
+            return match fallback
+                .execute_query_with_headers(parsed_request, headers)
+                .await
+            {
+                Ok(response) => response.into_response(),
+                Err(status) => status.into_response(),
+            };
+        }
+    }
     if state.adapter.adapter_name() == "VictoriaMetrics HTTP / MetricsQL"
         && language_identity.is_err()
     {
@@ -2264,6 +2288,18 @@ async fn process_range_query_request(
     let step_ms = (parsed_request.step * 1000.0) as u64;
 
     let language_identity = state.adapter.canonical_plan_identity(&parsed_request.query);
+    if requires_tenant_scoped_metricsql_fallback(state.adapter.adapter_name(), &forwarding_headers)
+    {
+        if let Some(fallback) = &state.fallback {
+            return match fallback
+                .execute_range_query_with_headers(parsed_request, forwarding_headers)
+                .await
+            {
+                Ok(response) => response.into_response(),
+                Err(status) => status.into_response(),
+            };
+        }
+    }
     if state.adapter.adapter_name() == "VictoriaMetrics HTTP / MetricsQL"
         && language_identity.is_err()
     {
@@ -2711,9 +2747,10 @@ mod tests {
                 query_plan: Arc::new(control_plane::query_plan::QueryPlan {
                     plan_id: 7,
                     plan_version: 1,
-                    clickhouse_context: None,
                     entries: Default::default(),
                 }),
+                metricsql_plan: None,
+                clickhouse_sql: None,
                 storage_routing: Arc::new(
                     crate::storage_engines::types::BackendStorageRouting::empty(),
                 ),
@@ -2857,6 +2894,27 @@ mod tests {
         )
         .with_protocol_adapter(Arc::new(VictoriaMetricsHttpAdapter::new(adapter_config)));
         server.start_test_server().await.unwrap()
+    }
+
+    #[test]
+    fn victoriametrics_instant_and_range_fail_closed_for_each_tenant() {
+        for tenant in ["tenant-a", "tenant-b"] {
+            let headers = HashMap::from([("x-asap-tenant".to_string(), tenant.to_string())]);
+            assert!(
+                requires_tenant_scoped_metricsql_fallback(
+                    "VictoriaMetrics HTTP / MetricsQL",
+                    &headers
+                ),
+                "instant tenant {tenant} must bypass global catalog"
+            );
+            assert!(
+                requires_tenant_scoped_metricsql_fallback(
+                    "VictoriaMetrics HTTP / MetricsQL",
+                    &headers
+                ),
+                "range tenant {tenant} must bypass global catalog"
+            );
+        }
     }
 
     #[tokio::test]
@@ -6006,6 +6064,10 @@ pub struct PhysicalPlanInstallRequest {
     pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
     pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
     pub query_plan: control_plane::query_plan::QueryPlan,
+    #[serde(default)]
+    pub metricsql_plan: Option<control_plane::query_plan::MetricsQlPlanCatalog>,
+    #[serde(default)]
+    pub clickhouse_sql: Option<serde_json::Value>,
     pub storage_routing: Option<serde_json::Value>,
     #[serde(default)]
     pub adaptation_evidence: Vec<control_plane::physical::compiler::RuntimeAdaptationEvidence>,
@@ -6084,6 +6146,46 @@ pub fn build_active_physical_plan(
         .query_plan
         .validate(&typed_fps)
         .map_err(|error| format!("QueryPlan validation error: {error}"))?;
+    let metricsql_plan = request
+        .metricsql_plan
+        .map(|catalog| {
+            if (catalog.plan_id, catalog.plan_version) != (envelope.plan_id, envelope.plan_version)
+            {
+                return Err("MetricsQL catalog belongs to another physical generation".to_string());
+            }
+            for (identity, entry) in &catalog.entries {
+                if identity != &entry.canonical_metricsql {
+                    return Err("MetricsQL catalog key differs from canonical identity".into());
+                }
+                for binding in entry.executable.materialization_bindings() {
+                    let materialization = request.precompute_plan.materializations.iter()
+                        .find(|config| config.policy_fingerprint() == binding.materialization.fingerprint())
+                        .ok_or_else(|| "MetricsQL binding has no precompute definition".to_string())?;
+                    if binding.window_ms != materialization.slide_interval.saturating_mul(1_000) {
+                        return Err("MetricsQL physical pane duration differs from installed precompute definition".into());
+                    }
+                    if binding.pane_origin_ms != materialization.pane_origin_ms {
+                        return Err("MetricsQL physical pane origin differs from installed precompute definition".into());
+                    }
+                }
+                crate::query_engines::asap_query_engine::catalog_resolver::validate_payload(
+                    Some(&request.summary_catalog),
+                    &entry.executable,
+                    envelope.plan_id,
+                    envelope.plan_version,
+                )
+                .map_err(|error| format!("MetricsQL executable validation error: {error}"))?;
+            }
+            Ok(Arc::new(catalog))
+        })
+        .transpose()?;
+    let clickhouse_sql = request.clickhouse_sql.map(|value| {
+        let bundle = serde_json::from_value(value)
+            .map_err(|error| format!("ClickHouse SQL sidecar decode error: {error}"))?;
+        crate::query_engines::asap_clickhouse_query_engine::accelerator::build_active_generation(
+            bundle, &request.summary_catalog,
+        ).map(Arc::new).map_err(|error| format!("ClickHouse SQL sidecar validation error: {error}"))
+    }).transpose()?;
     let storage_routing = match request.storage_routing.as_ref() {
         Some(value) => Arc::new(
             crate::storage_engines::types::BackendStorageRouting::from_json_payload(value)
@@ -6098,6 +6200,8 @@ pub fn build_active_physical_plan(
         transmission_plan: request.transmission_plan,
         runtime_config: Arc::new(runtime_config),
         query_plan: Arc::new(request.query_plan),
+        metricsql_plan,
+        clickhouse_sql,
         storage_routing,
     })
 }
@@ -6177,17 +6281,15 @@ async fn handle_post_physical_plan(
     let plan_id = active.plan_id();
     let materialization_count = active.precompute_plan.materializations.len();
     let metricsql_query_count = active
-        .query_plan
-        .entries
-        .values()
-        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::MetricsQl)
-        .count();
+        .metricsql_plan
+        .as_ref()
+        .map(|catalog| catalog.entries.len())
+        .unwrap_or(0);
     let clickhouse_plan_count = active
-        .query_plan
-        .entries
-        .values()
-        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::ClickHouseSql)
-        .count();
+        .clickhouse_sql
+        .as_ref()
+        .map(|generation| generation.catalog.len())
+        .unwrap_or(0);
     let plan_version = active.plan_version();
     let now = unix_time_ms();
     if let Err(error) = lifecycle.stage(active, now) {
@@ -6248,11 +6350,10 @@ async fn handle_activate_physical_plan(
     };
     let activated = active_handle.snapshot();
     let clickhouse_plan_count = activated
-        .query_plan
-        .entries
-        .values()
-        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::ClickHouseSql)
-        .count();
+        .clickhouse_sql
+        .as_ref()
+        .map(|generation| generation.catalog.len())
+        .unwrap_or(0);
     if let Some(catalog) = activated.summary_catalog.as_ref() {
         if let Err(error) = state
             .sketch_index
@@ -7126,6 +7227,8 @@ mod catalog_install_tests {
             precompute_plan: plan.precompute_plan,
             transmission_plan: plan.transmission_plan,
             query_plan: plan.query_plan,
+            metricsql_plan: plan.metricsql_plan,
+            clickhouse_sql: None,
             storage_routing: None,
             adaptation_evidence: vec![],
         }
@@ -7145,44 +7248,10 @@ mod catalog_install_tests {
         let handle = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active);
         let before = handle.snapshot();
         let mut candidate = request();
-        candidate.query_plan.clickhouse_context =
-            Some(control_plane::query_plan::ClickHousePlanningContext {
-                tables: Default::default(),
-                accuracy: planner_types::types::AccuracyTarget::Exact,
-            });
-        let (_, mut entry) = candidate
-            .query_plan
-            .entries
-            .pop_first()
-            .expect("fixture has a query entry");
-        entry.language = control_plane::query_plan::QueryLanguage::ClickHouseSql;
-        entry.fixed_evaluation = Some(control_plane::query_plan::FixedEvaluationRange {
-            start_ms: 0,
-            end_ms: 1_000,
-            cumulative: true,
-        });
-        let canonical = entry.canonical_query.clone();
-        let binding = entry
-            .nodes
-            .values_mut()
-            .find_map(|node| match node {
-                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
-                    Some(binding)
-                }
-                _ => None,
-            })
-            .expect("fixture query reads a materialization");
-        binding.pane_origin_ms = Some(999);
-        candidate
-            .query_plan
-            .entries
-            .insert(format!("clickhouse:{canonical}"), entry);
-
-        let error = install(candidate).expect_err("invalid SQL binding must fail staging");
-        assert!(error.contains("pane origin"), "{error}");
-        let after = handle.snapshot();
-        assert_eq!(after.plan_id(), before.plan_id());
-        assert_eq!(after.plan_version(), before.plan_version());
+        candidate.clickhouse_sql = Some(serde_json::json!({"invalid": true}));
+        let error = install(candidate).expect_err("invalid SQL sidecar must fail staging");
+        assert!(error.contains("ClickHouse SQL sidecar"), "{error}");
+        assert!(Arc::ptr_eq(&before, &handle.snapshot()));
     }
 
     // Installing transports the exact supplied snapshot, rather than rebuilding it.
@@ -7252,19 +7321,36 @@ mod catalog_install_tests {
     #[test]
     fn catalog_install_applies_pane_origin_validation_to_metricsql_entries() {
         let mut request = request();
-        let entry = request.query_plan.entries.values_mut().next().unwrap();
-        entry.language = control_plane::query_plan::QueryLanguage::MetricsQl;
-        let binding = entry
-            .nodes
-            .values_mut()
-            .find_map(|node| match node {
-                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
-                    Some(binding)
-                }
-                _ => None,
-            })
-            .expect("demo has maintained summaries");
-        binding.pane_origin_ms = Some(1);
+        let (_, entry) = request.query_plan.entries.iter().next().unwrap();
+        let identity = "sum(rate(foo[5m]))".to_string();
+        let mut executable = entry.executable();
+        let binding = executable
+            .materialization_bindings()
+            .into_iter()
+            .next()
+            .unwrap()
+            .clone();
+        for node in executable.nodes.values_mut() {
+            if let control_plane::query_plan::QueryPlanNode::ReadMaterialization {
+                binding: candidate,
+            } = node
+            {
+                *candidate = binding.clone();
+                candidate.pane_origin_ms = Some(1);
+            }
+        }
+        request.metricsql_plan = Some(control_plane::query_plan::MetricsQlPlanCatalog {
+            plan_id: request.query_plan.plan_id,
+            plan_version: request.query_plan.plan_version,
+            entries: std::collections::BTreeMap::from([(
+                identity.clone(),
+                control_plane::query_plan::MetricsQlPlanEntry {
+                    query_id: "vm".into(),
+                    canonical_metricsql: identity,
+                    executable,
+                },
+            )]),
+        });
         assert!(install(request).unwrap_err().contains("pane origin"));
     }
 }

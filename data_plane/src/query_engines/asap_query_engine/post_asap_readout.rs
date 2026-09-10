@@ -82,17 +82,27 @@ pub fn execute_post_asap_readout(
 /// Installed QueryPlan materialization resolution occurs before this legacy test helper.
 pub fn execute_query_plan_readout(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &dyn control_plane::query_plan::ExecutablePlanView,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    execute_physical_query_payload(index, entry, entry.root, t0_ms, t1_ms, is_cumulative)
+    execute_physical_query_payload(index, entry, entry.root(), t0_ms, t1_ms, is_cumulative)
+}
+
+pub fn execute_query_plan_payload_readout(
+    index: &SketchStore,
+    entry: &control_plane::query_plan::ExecutableQueryPlan,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    execute_query_plan_readout(index, entry, t0_ms, t1_ms, is_cumulative)
 }
 
 pub fn execute_query_plan_from_readout(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &dyn control_plane::query_plan::ExecutablePlanView,
     root: control_plane::query_plan::QueryNodeId,
     t0_ms: u64,
     t1_ms: u64,
@@ -103,13 +113,13 @@ pub fn execute_query_plan_from_readout(
 
 pub fn execute_query_plan_instant(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &dyn control_plane::query_plan::ExecutablePlanView,
     now_ms: u64,
 ) -> Result<(PostAsapReadoutOutcome, u64), LoweringSkip> {
-    let t0_ms = if entry.instant.full_history {
+    let t0_ms = if entry.instant().full_history {
         0
     } else {
-        now_ms.saturating_sub(entry.instant.lookback_ms)
+        now_ms.saturating_sub(entry.instant().lookback_ms)
     };
     if entry
         .materialization_bindings()
@@ -125,7 +135,7 @@ pub fn execute_query_plan_instant(
         entry,
         t0_ms,
         now_ms,
-        entry.instant.cumulative_readout,
+        entry.instant().cumulative_readout,
     )?;
     Ok((outcome, t0_ms))
 }
@@ -517,17 +527,17 @@ fn reduce_sum_values(
 
 fn execute_physical_query_plan(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &dyn control_plane::query_plan::ExecutablePlanView,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    execute_physical_query_payload(index, entry, entry.root, t0_ms, t1_ms, is_cumulative)
+    execute_physical_query_payload(index, entry, entry.root(), t0_ms, t1_ms, is_cumulative)
 }
 
 fn execute_physical_query_payload(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &dyn control_plane::query_plan::ExecutablePlanView,
     root: control_plane::query_plan::QueryNodeId,
     t0_ms: u64,
     t1_ms: u64,
@@ -1048,10 +1058,8 @@ mod tests {
         }
 
         let entry = control_plane::query_plan::QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "q-rate".into(),
-            canonical_query: "rate(requests_total[1m])".into(),
-            fixed_evaluation: None,
+            canonical_promql: "rate(requests_total[1m])".into(),
             root: control_plane::query_plan::QueryNodeId(0),
             nodes: BTreeMap::from([
                 (
@@ -1144,10 +1152,8 @@ mod tests {
         idx.append_precompute(7, BTreeMap::new(), (0, 60_000), Box::new(accumulator));
 
         let entry = control_plane::query_plan::QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "q-rate".into(),
-            canonical_query: "rate(requests_total[1m])".into(),
-            fixed_evaluation: None,
+            canonical_promql: "rate(requests_total[1m])".into(),
             root: control_plane::query_plan::QueryNodeId(0),
             nodes: BTreeMap::from([
                 (

@@ -2,7 +2,7 @@
 use super::logical_dag::{PreparedLeaf, PreparedLeaves, Value};
 use crate::query_engines::EngineError;
 use control_plane::query_plan::{
-    logical::LogicalOperator, QueryNodeId, QueryPlanEntry, QueryPlanNode,
+    logical::LogicalOperator, ExecutablePlanView, QueryNodeId, QueryPlanEntry, QueryPlanNode,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -15,13 +15,13 @@ fn miss(message: impl Into<String>) -> EngineError {
 
 /// Traverse only the installed graph, including epoch-aligned nested subquery grids.
 fn leaves(
-    entry: &QueryPlanEntry,
+    entry: &dyn ExecutablePlanView,
     times: &[u64],
 ) -> Result<BTreeMap<(QueryNodeId, i64), LogicalOperator>, EngineError> {
     let mut pending = Vec::new();
     for at in times {
         pending.push((
-            entry.root,
+            entry.root(),
             i64::try_from(*at).map_err(|_| miss("timestamp overflow"))?,
         ));
     }
@@ -35,7 +35,7 @@ fn leaves(
             return Err(miss("installed execution grid exceeds budget"));
         }
         let node = entry
-            .nodes
+            .nodes()
             .get(&id)
             .ok_or_else(|| miss("missing installed node"))?;
         match node {
@@ -91,13 +91,13 @@ fn leaves(
 }
 
 pub(super) fn candidate_dependencies(
-    entry: &QueryPlanEntry,
+    entry: &dyn ExecutablePlanView,
     times: &[u64],
 ) -> Result<Vec<(QueryNodeId, QueryNodeId, i64, String)>, EngineError> {
     let mut result = Vec::new();
     for ((id, at), operator) in leaves(entry, times)? {
         if let LogicalOperator::CandidateExactSubquery { item_label, .. } = operator {
-            let input = *entry.nodes[&id]
+            let input = *entry.nodes()[&id]
                 .inputs()
                 .first()
                 .ok_or_else(|| miss("candidate exact subtree has no membership input"))?;
@@ -259,7 +259,7 @@ fn parse_result(body: &serde_json::Value, at: i64) -> Result<Value, EngineError>
 
 #[cfg(test)]
 pub(super) async fn prepare(
-    entry: &QueryPlanEntry,
+    entry: &dyn ExecutablePlanView,
     times: &[u64],
     endpoint: Option<&str>,
     client: &reqwest::Client,
@@ -268,7 +268,7 @@ pub(super) async fn prepare(
 }
 
 pub(super) async fn prepare_with_candidates(
-    entry: &QueryPlanEntry,
+    entry: &dyn ExecutablePlanView,
     times: &[u64],
     endpoint: Option<&str>,
     client: &reqwest::Client,
@@ -281,7 +281,7 @@ pub(super) async fn prepare_with_candidates(
         let (query, candidate_filtered) = match &operator {
             LogicalOperator::ExactSubquery { query } => (query.clone(), false),
             LogicalOperator::CandidateExactSubquery { query, item_label } => {
-                let candidate_input = entry.nodes[&id].inputs()[0];
+                let candidate_input = entry.nodes()[&id].inputs()[0];
                 let candidate = prepared
                     .get(&(candidate_input, at))
                     .ok_or_else(|| miss("candidate membership was not prepared"))?;
@@ -383,10 +383,8 @@ mod tests {
     use control_plane::query_plan::{FallbackPolicy, InstantExecution};
     fn entry(nodes: BTreeMap<QueryNodeId, QueryPlanNode>) -> QueryPlanEntry {
         QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "remote-cut".into(),
-            canonical_query: "a / b".into(),
-            fixed_evaluation: None,
+            canonical_promql: "a / b".into(),
             root: QueryNodeId(0),
             nodes,
             instant: InstantExecution {

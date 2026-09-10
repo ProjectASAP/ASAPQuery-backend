@@ -160,7 +160,7 @@ pub fn serve_instant_from_summary_executor(
 
 pub fn serve_from_query_plan(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &dyn control_plane::query_plan::ExecutablePlanView,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
@@ -181,7 +181,7 @@ pub fn serve_from_query_plan(
 /// timestamps never leak into the public range response.
 pub fn serve_range_steps_from_query_plan(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &dyn control_plane::query_plan::ExecutablePlanView,
     start_ms: u64,
     end_ms: u64,
     step_ms: u64,
@@ -263,7 +263,7 @@ fn coverage_covers_closed_windows(
 
 pub fn serve_instant_from_query_plan(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &dyn control_plane::query_plan::ExecutablePlanView,
     now_ms: u64,
 ) -> Result<(ASAPTierResult, u64), LoweringSkip> {
     if !summary_executor_live_enabled() {
@@ -448,10 +448,8 @@ mod tests {
             );
         }
         let entry = control_plane::query_plan::QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "q-sum".into(),
-            canonical_query: "sum_over_time(bytes[1s])".into(),
-            fixed_evaluation: None,
+            canonical_promql: "sum_over_time(bytes[1s])".into(),
             root: control_plane::query_plan::QueryNodeId(0),
             nodes: BTreeMap::from([
                 (

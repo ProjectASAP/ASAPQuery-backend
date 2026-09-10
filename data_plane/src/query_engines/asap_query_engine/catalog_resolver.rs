@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use asap_types::sds::{SummaryDefinitionId, SummaryDescriptor, SummaryOperator};
 use asap_types::summary_catalog::SummaryCatalog;
 use asap_types::AggregationType;
-use control_plane::query_plan::{ExactReadout, QueryPlanEntry, QueryPlanNode, QueryReadout};
+use control_plane::query_plan::{ExactReadout, ExecutablePlanView, QueryPlanNode, QueryReadout};
 
 use crate::query_engines::EngineError;
 
@@ -108,9 +108,10 @@ impl ResolvedMaterialization<'_> {
 
 /// Capability matching follows installed state edges, including merges; it
 /// never searches the catalog for a replacement materialization.
+#[cfg(test)]
 pub(crate) fn validate_entry(
     catalog: Option<&SummaryCatalog>,
-    entry: &QueryPlanEntry,
+    entry: &control_plane::query_plan::QueryPlanEntry,
     plan_id: u64,
     plan_version: u64,
 ) -> Result<(), EngineError> {
@@ -119,7 +120,7 @@ pub(crate) fn validate_entry(
 
 pub(crate) fn validate_payload(
     catalog: Option<&SummaryCatalog>,
-    entry: &QueryPlanEntry,
+    entry: &dyn ExecutablePlanView,
     plan_id: u64,
     plan_version: u64,
 ) -> Result<(), EngineError> {
@@ -133,7 +134,7 @@ pub(crate) fn validate_payload(
     let mut states = BTreeMap::new();
     let mut resolved = BTreeMap::new();
     for id in entry.topological_order().map_err(|e| miss(e.to_string()))? {
-        let node = &entry.nodes[&id];
+        let node = &entry.nodes()[&id];
         let state_ids = match node {
             QueryPlanNode::ReadMaterialization { binding } => {
                 if !resolved.contains_key(&binding.materialization) {

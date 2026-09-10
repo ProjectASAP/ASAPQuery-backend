@@ -163,6 +163,84 @@ pub struct ExecutableQueryPlan {
     pub fallback: FallbackPolicy,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsQlPlanEntry {
+    pub query_id: String,
+    pub canonical_metricsql: String,
+    pub executable: ExecutableQueryPlan,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsQlPlanCatalog {
+    pub plan_id: u64,
+    pub plan_version: u64,
+    pub entries: BTreeMap<String, MetricsQlPlanEntry>,
+}
+
+impl MetricsQlPlanCatalog {
+    pub fn lookup(&self, identity: &str) -> Option<&MetricsQlPlanEntry> {
+        self.entries
+            .get(identity)
+            .filter(|entry| entry.canonical_metricsql == identity)
+    }
+}
+
+pub trait ExecutablePlanView: Sync {
+    fn root(&self) -> QueryNodeId;
+    fn nodes(&self) -> &BTreeMap<QueryNodeId, QueryPlanNode>;
+    fn instant(&self) -> &InstantExecution;
+    fn fallback(&self) -> &FallbackPolicy;
+    fn topological_order_from(
+        &self,
+        root: QueryNodeId,
+    ) -> Result<Vec<QueryNodeId>, QueryPlanError> {
+        topological_order(root, self.nodes())
+    }
+    fn topological_order(&self) -> Result<Vec<QueryNodeId>, QueryPlanError> {
+        self.topological_order_from(self.root())
+    }
+    fn materialization_bindings(&self) -> Vec<&MaterializationBinding> {
+        self.nodes()
+            .values()
+            .filter_map(|node| match node {
+                QueryPlanNode::ReadMaterialization { binding } => Some(binding),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl ExecutablePlanView for QueryPlanEntry {
+    fn root(&self) -> QueryNodeId {
+        self.root
+    }
+    fn nodes(&self) -> &BTreeMap<QueryNodeId, QueryPlanNode> {
+        &self.nodes
+    }
+    fn instant(&self) -> &InstantExecution {
+        &self.instant
+    }
+    fn fallback(&self) -> &FallbackPolicy {
+        &self.fallback
+    }
+}
+impl ExecutablePlanView for ExecutableQueryPlan {
+    fn root(&self) -> QueryNodeId {
+        self.root
+    }
+    fn nodes(&self) -> &BTreeMap<QueryNodeId, QueryPlanNode> {
+        &self.nodes
+    }
+    fn instant(&self) -> &InstantExecution {
+        &self.instant
+    }
+    fn fallback(&self) -> &FallbackPolicy {
+        &self.fallback
+    }
+}
+
 impl QueryPlanEntry {
     pub fn executable(&self) -> ExecutableQueryPlan {
         ExecutableQueryPlan {
@@ -185,17 +263,65 @@ impl ExecutableQueryPlan {
             .collect()
     }
 
-    /// Internal compatibility view for the existing executor. The supplied
-    /// identity is never serialized into the PromQL plan catalog.
-    pub fn execution_view(&self, query_id: String, source: String) -> QueryPlanEntry {
-        QueryPlanEntry {
-            query_id,
-            canonical_promql: source,
-            root: self.root,
-            nodes: self.nodes.clone(),
-            instant: self.instant.clone(),
-            fallback: self.fallback.clone(),
+    pub fn topological_order_from(
+        &self,
+        root: QueryNodeId,
+    ) -> Result<Vec<QueryNodeId>, QueryPlanError> {
+        topological_order(root, &self.nodes)
+    }
+    pub fn topological_order(&self) -> Result<Vec<QueryNodeId>, QueryPlanError> {
+        topological_order(self.root, &self.nodes)
+    }
+}
+
+fn topological_order(
+    root: QueryNodeId,
+    nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
+) -> Result<Vec<QueryNodeId>, QueryPlanError> {
+    fn visit(
+        id: QueryNodeId,
+        nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
+        visiting: &mut BTreeSet<QueryNodeId>,
+        visited: &mut BTreeSet<QueryNodeId>,
+        out: &mut Vec<QueryNodeId>,
+    ) -> Result<(), QueryPlanError> {
+        if visited.contains(&id) {
+            return Ok(());
         }
+        if !visiting.insert(id) {
+            return Err(QueryPlanError::Invalid(format!(
+                "cycle detected at query node {}",
+                id.0
+            )));
+        }
+        let node = nodes
+            .get(&id)
+            .ok_or_else(|| QueryPlanError::Invalid(format!("missing query node {}", id.0)))?;
+        for input in node.inputs() {
+            visit(*input, nodes, visiting, visited, out)?;
+        }
+        visiting.remove(&id);
+        visited.insert(id);
+        out.push(id);
+        Ok(())
+    }
+    let mut out = Vec::new();
+    visit(
+        root,
+        nodes,
+        &mut BTreeSet::new(),
+        &mut BTreeSet::new(),
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+impl QueryPlanEntry {
+    pub fn topological_order_from(
+        &self,
+        root: QueryNodeId,
+    ) -> Result<Vec<QueryNodeId>, QueryPlanError> {
+        topological_order(root, &self.nodes)
     }
 }
 
@@ -241,11 +367,41 @@ impl QueryPlanEntry {
             seen: BTreeMap::new(),
             bind: &mut bind,
             logical_source: None,
+            preserve_relational: false,
         };
         let root = compiler.lower(root)?;
         Ok(Self {
             query_id,
             canonical_promql,
+            root,
+            nodes: compiler.nodes,
+            instant,
+            fallback,
+        })
+    }
+
+    pub fn compile_bound_relational<F>(
+        root: &Rc<SummaryNode>,
+        instant: InstantExecution,
+        fallback: FallbackPolicy,
+        mut bind: F,
+    ) -> Result<ExecutableQueryPlan, QueryPlanError>
+    where
+        F: FnMut(
+            &SummaryNode,
+            &SummaryFamilyType,
+        ) -> Result<MaterializationBinding, QueryPlanError>,
+    {
+        let mut compiler = DagCompiler {
+            next_id: 0,
+            nodes: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            bind: &mut bind,
+            logical_source: None,
+            preserve_relational: true,
+        };
+        let root = compiler.lower(root)?;
+        Ok(ExecutableQueryPlan {
             root,
             nodes: compiler.nodes,
             instant,
@@ -275,6 +431,7 @@ impl QueryPlanEntry {
             seen: BTreeMap::new(),
             bind: &mut bind,
             logical_source: Some(canonical_promql.clone()),
+            preserve_relational: false,
         };
         let root = compiler.lower(root)?;
         let mut entry = Self {
@@ -441,6 +598,12 @@ pub enum PhysicalGrouping {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    Relational {
+        input: QueryNodeId,
+        operation: serde_json::Value,
+        input_schema: planner_types::post_asap::SummarySchema,
+        output_schema: planner_types::post_asap::SummarySchema,
+    },
     Logical {
         operator: logical::LogicalOperator,
         inputs: Vec<QueryNodeId>,
@@ -492,6 +655,7 @@ impl QueryPlanNode {
             }
             Self::Binary { inputs, .. } => inputs,
             Self::ReduceSum { input, .. }
+            | Self::Relational { input, .. }
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
             Self::SummaryMerge { inputs } | Self::Logical { inputs, .. } => inputs,
@@ -556,6 +720,7 @@ struct DagCompiler<'a, F> {
     seen: BTreeMap<usize, QueryNodeId>,
     bind: &'a mut F,
     logical_source: Option<String>,
+    preserve_relational: bool,
 }
 
 impl<F> DagCompiler<'_, F>
@@ -594,7 +759,8 @@ where
                 }
                 QueryPlanNode::SummaryEstimate { input, .. }
                 | QueryPlanNode::ExactReadout { input, .. }
-                | QueryPlanNode::ReduceSum { input, .. } => *input = remap[input],
+                | QueryPlanNode::ReduceSum { input, .. }
+                | QueryPlanNode::Relational { input, .. } => *input = remap[input],
                 QueryPlanNode::Scalar { .. }
                 | QueryPlanNode::ReadMaterialization { .. }
                 | QueryPlanNode::ExactFallback { .. } => {}
@@ -645,6 +811,28 @@ where
         }
 
         let physical = match &node.expr {
+            SummaryExpr::ValueOperation {
+                child, operation, ..
+            } if self.preserve_relational
+                && matches!(
+                    operation,
+                    planner_types::post_asap::ValueOperation::Project { .. }
+                        | planner_types::post_asap::ValueOperation::Filter { .. }
+                        | planner_types::post_asap::ValueOperation::Sort { .. }
+                        | planner_types::post_asap::ValueOperation::Limit { .. }
+                ) =>
+            {
+                QueryPlanNode::Relational {
+                    input: self.lower(child)?,
+                    operation: serde_json::to_value(operation).map_err(|error| {
+                        QueryPlanError::UnsupportedNode(format!(
+                            "cannot serialize relational operation: {error}"
+                        ))
+                    })?,
+                    input_schema: child.schema.clone(),
+                    output_schema: node.schema.clone(),
+                }
+            }
             SummaryExpr::ValueOperation {
                 child,
                 operation:
@@ -1199,7 +1387,17 @@ mod tests {
         let before = serde_json::to_value(&entry).unwrap();
         let _payload = entry.executable();
         assert_eq!(before, serde_json::to_value(&entry).unwrap());
-        assert!(before.get("canonical_promql").is_some());
+        assert_eq!(
+            before,
+            serde_json::json!({
+                "query_id": "q",
+                "canonical_promql": "up",
+                "root": 0,
+                "nodes": {"0": {"op": "exact_fallback", "reason": "fixture"}},
+                "instant": {"lookback_ms": 1, "full_history": false, "cumulative_readout": false},
+                "fallback": "exact_backend"
+            })
+        );
         assert!(before.get("executable").is_none());
     }
 

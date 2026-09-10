@@ -241,7 +241,6 @@ async fn push_documents_coupled(
     let query_plan = crate::query_plan::QueryPlan {
         plan_id: precompute_plan.envelope.plan_id,
         plan_version: precompute_plan.envelope.plan_version,
-        clickhouse_context: None,
         entries: Default::default(),
     };
     let transmission_plan = match crate::physical::compiler::TransmissionPlan::build(

@@ -8,7 +8,7 @@ use control_plane::query_plan::logical::{
     Aggregation, BinaryOperation, Grouping, LogicalOperator, TemporalOperation,
 };
 use control_plane::query_plan::{
-    CandidateCompleteness, QueryNodeId, QueryPlanEntry, QueryPlanNode,
+    CandidateCompleteness, ExecutablePlanView, QueryNodeId, QueryPlanEntry, QueryPlanNode,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -86,7 +86,7 @@ pub(crate) struct PreparedLeaf {
 pub(crate) type PreparedLeaves = BTreeMap<(QueryNodeId, i64), PreparedLeaf>;
 
 pub(crate) fn execute_installed<F>(
-    entry: &QueryPlanEntry,
+    entry: &dyn ExecutablePlanView,
     leaves: &PreparedLeaves,
     at: u64,
     callback: F,
@@ -98,7 +98,7 @@ where
 }
 
 fn execute_values<F>(
-    entry: &QueryPlanEntry,
+    entry: &dyn ExecutablePlanView,
     leaves: &PreparedLeaves,
     at: u64,
     callback: F,
@@ -116,7 +116,7 @@ where
         warnings: Vec::new(),
     };
     let at_signed = i64::try_from(at).map_err(|_| miss("evaluation timestamp overflow"))?;
-    let evaluated = evaluator.eval(entry.root, at_signed)?;
+    let evaluated = evaluator.eval(entry.root(), at_signed)?;
     if matches!(evaluated, Value::Scalar(_)) {
         // QueryResult currently models vectors/matrices only. Preserve a scalar
         // root's HTTP type by routing it to native, while scalar intermediates
@@ -144,7 +144,7 @@ where
 }
 
 struct Evaluator<'a, F> {
-    entry: &'a QueryPlanEntry,
+    entry: &'a dyn ExecutablePlanView,
     leaves: &'a PreparedLeaves,
     stats: ExecutionStats,
     callback: F,
@@ -178,7 +178,7 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
         }
         let node = self
             .entry
-            .nodes
+            .nodes()
             .get(&id)
             .ok_or_else(|| miss("missing installed node"))?
             .clone();
@@ -802,7 +802,7 @@ mod topk_tests {
         .unwrap();
         control_plane::query_plan::logical::finalize_residuals(&mut entry).unwrap();
         let leaf = entry
-            .nodes
+            .nodes()
             .iter()
             .find_map(|(id, node)| {
                 matches!(
@@ -856,10 +856,8 @@ mod topk_tests {
         let summary = QueryNodeId(0);
         let root = QueryNodeId(1);
         let entry = QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "summary-rate-topk".into(),
-            canonical_query: "topk(2, rate(requests_total[5m]))".into(),
-            fixed_evaluation: None,
+            canonical_promql: "topk(2, rate(requests_total[5m]))".into(),
             root,
             nodes: BTreeMap::from([
                 (
@@ -985,10 +983,8 @@ mod topk_tests {
         let value_id = QueryNodeId(1);
         let root = QueryNodeId(2);
         let entry = QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "candidate-topk".into(),
-            canonical_query: "topk(1, rate(requests_total[5m]))".into(),
-            fixed_evaluation: None,
+            canonical_promql: "topk(1, rate(requests_total[5m]))".into(),
             root,
             nodes: BTreeMap::from([
                 (

@@ -5,14 +5,14 @@ use super::{
 };
 use crate::{
     query_engines::asap_query_engine::{
-        catalog_resolver::validate_payload, post_asap_readout::execute_query_plan_from_readout,
+        catalog_resolver::validate_payload, post_asap_readout::execute_query_plan_payload_readout,
     },
     storage_engines::sketch_db::index::SketchStore,
 };
 use asap_types::summary_catalog::SummaryCatalog;
-use control_plane::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
+use control_plane::query_plan::{ExecutableQueryPlan, QueryNodeId, QueryPlanNode};
 use planner_types::post_asap::ValueOperation;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClickHouseDagFallback {
@@ -44,7 +44,7 @@ fn complete_pane_coverage(
 /// summary selection, or materialization candidate search.
 pub fn execute_sql_dag(
     index: &SketchStore,
-    entry: &QueryPlanEntry,
+    entry: &ExecutableQueryPlan,
     sds: &SummaryCatalog,
     t0_ms: u64,
     t1_ms: u64,
@@ -75,12 +75,14 @@ pub fn execute_sql_dag(
             _ => break,
         }
     }
-    if let Err(detail) = validate_reachable(entry, base_root) {
-        return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(detail));
-    }
+    let executable = match reachable_entry(entry, base_root) {
+        Ok(entry) => entry,
+        Err(detail) => {
+            return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(detail))
+        }
+    };
     let outcome =
-        match execute_query_plan_from_readout(index, entry, base_root, t0_ms, t1_ms, is_cumulative)
-        {
+        match execute_query_plan_payload_readout(index, &executable, t0_ms, t1_ms, is_cumulative) {
             Ok(outcome) => outcome,
             Err(error) => {
                 let detail = format!("{error:?}");
@@ -179,7 +181,10 @@ pub fn execute_sql_dag(
     }
 }
 
-fn validate_reachable(entry: &QueryPlanEntry, root: QueryNodeId) -> Result<(), String> {
+fn reachable_entry(
+    entry: &ExecutableQueryPlan,
+    root: QueryNodeId,
+) -> Result<ExecutableQueryPlan, String> {
     let mut pending = vec![root];
     let mut reachable = BTreeSet::new();
     while let Some(id) = pending.pop() {
@@ -192,7 +197,15 @@ fn validate_reachable(entry: &QueryPlanEntry, root: QueryNodeId) -> Result<(), S
             .ok_or_else(|| format!("published DAG references missing node {}", id.0))?;
         pending.extend(node.inputs());
     }
-    Ok(())
+    let nodes = reachable
+        .into_iter()
+        .map(|id| (id, entry.nodes[&id].clone()))
+        .collect::<BTreeMap<_, _>>();
+    Ok(ExecutableQueryPlan {
+        root,
+        nodes,
+        ..entry.clone()
+    })
 }
 
 #[cfg(test)]

@@ -6,7 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use control_plane::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
+#[cfg(test)]
+use control_plane::query_plan::QueryPlanEntry;
+use control_plane::query_plan::{ExecutablePlanView, QueryNodeId, QueryPlanNode};
 use thiserror::Error;
 
 pub trait QueryNodeRuntime {
@@ -32,14 +34,14 @@ pub enum DagExecutionError<E> {
 /// Execute each reachable node exactly once. A diamond-shaped DAG therefore
 /// performs one store read for the shared leaf, not one read per parent path.
 pub fn execute<R: QueryNodeRuntime>(
-    entry: &QueryPlanEntry,
+    entry: &dyn ExecutablePlanView,
     runtime: &R,
 ) -> Result<R::Output, DagExecutionError<R::Error>> {
-    execute_from(entry, entry.root, runtime)
+    execute_from(entry, entry.root(), runtime)
 }
 
 pub fn execute_from<R: QueryNodeRuntime>(
-    entry: &QueryPlanEntry,
+    entry: &dyn ExecutablePlanView,
     root: QueryNodeId,
     runtime: &R,
 ) -> Result<R::Output, DagExecutionError<R::Error>> {
@@ -49,7 +51,7 @@ pub fn execute_from<R: QueryNodeRuntime>(
     let mut outputs = BTreeMap::<QueryNodeId, R::Output>::new();
     for id in order {
         let node = entry
-            .nodes
+            .nodes()
             .get(&id)
             .ok_or_else(|| DagExecutionError::InvalidGraph(format!("missing node {}", id.0)))?;
         let inputs = node
@@ -141,10 +143,8 @@ mod tests {
         .into_iter()
         .collect();
         let entry = QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
-            canonical_query: "up".into(),
-            fixed_evaluation: None,
+            canonical_promql: "up".into(),
             root,
             nodes,
             instant: InstantExecution {

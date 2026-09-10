@@ -425,10 +425,8 @@ impl QueryPlanEntry {
         };
         let root = lower.lower(&expr)?;
         let entry = Self {
-            language: super::QueryLanguage::PromQl,
             query_id,
-            canonical_query,
-            fixed_evaluation: None,
+            canonical_promql: canonical_query,
             root,
             nodes: lower.nodes,
             instant,
@@ -451,7 +449,7 @@ impl QueryPlanEntry {
         }
         Self::compile_logical(
             self.query_id.clone(),
-            self.canonical_query.clone(),
+            self.canonical_promql.clone(),
             self.instant,
             self.fallback,
         )
@@ -1382,7 +1380,7 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
             _ => {}
         }
     }
-    let expr = parser::parse(&entry.canonical_query).map_err(|e| invalid(e.to_string()))?;
+    let expr = parser::parse(&entry.canonical_promql).map_err(|e| invalid(e.to_string()))?;
     let mut expressions = Vec::new();
     gather(&expr, &mut expressions);
     let mut witnesses = BTreeMap::new();

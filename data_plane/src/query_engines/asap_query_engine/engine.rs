@@ -1,8 +1,34 @@
 use crate::storage_engines::types::StreamingConfig;
+use control_plane::query_plan::ExecutablePlanView;
 use std::sync::Arc;
 
 use asap_types::query_requirements::QueryRequirements;
 use asap_types::KeyByLabelNames;
+
+struct RootedPlan<'a> {
+    base: &'a dyn control_plane::query_plan::ExecutablePlanView,
+    root: control_plane::query_plan::QueryNodeId,
+    instant: control_plane::query_plan::InstantExecution,
+}
+impl control_plane::query_plan::ExecutablePlanView for RootedPlan<'_> {
+    fn root(&self) -> control_plane::query_plan::QueryNodeId {
+        self.root
+    }
+    fn nodes(
+        &self,
+    ) -> &std::collections::BTreeMap<
+        control_plane::query_plan::QueryNodeId,
+        control_plane::query_plan::QueryPlanNode,
+    > {
+        self.base.nodes()
+    }
+    fn instant(&self) -> &control_plane::query_plan::InstantExecution {
+        &self.instant
+    }
+    fn fallback(&self) -> &control_plane::query_plan::FallbackPolicy {
+        self.base.fallback()
+    }
+}
 
 #[derive(Clone)]
 struct QueryReadinessRequirement {
@@ -11,7 +37,7 @@ struct QueryReadinessRequirement {
 }
 
 fn readiness_requirement(
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &dyn control_plane::query_plan::ExecutablePlanView,
 ) -> QueryReadinessRequirement {
     let bindings = entry.materialization_bindings();
     let mut materializations = bindings
@@ -136,15 +162,17 @@ impl ASAPQueryEngine {
                 "no active physical plan",
             )
         })?;
-        let planned = physical
-            .query_plan
-            .lookup_canonical(
-                control_plane::query_plan::QueryLanguage::MetricsQl,
-                identity,
-            )
-            .map_err(|error| {
-                crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
+        let sidecar = physical
+            .metricsql_plan
+            .as_ref()
+            .and_then(|catalog| catalog.lookup(identity))
+            .ok_or_else(|| {
+                crate::query_engines::EngineError::capability_miss(
+                    "metricsql_plan",
+                    "query not planned",
+                )
             })?;
+        let planned = &sidecar.executable;
         let leaves = self.prepare_logical(&physical, planned, &[now_ms]).await?;
         let (mut result, mut stats) =
             self.execute_logical_entry(&physical, planned, &leaves, now_ms)?;
@@ -168,15 +196,17 @@ impl ASAPQueryEngine {
                 "no active physical plan",
             )
         })?;
-        let planned = physical
-            .query_plan
-            .lookup_canonical(
-                control_plane::query_plan::QueryLanguage::MetricsQl,
-                identity,
-            )
-            .map_err(|error| {
-                crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
+        let sidecar = physical
+            .metricsql_plan
+            .as_ref()
+            .and_then(|catalog| catalog.lookup(identity))
+            .ok_or_else(|| {
+                crate::query_engines::EngineError::capability_miss(
+                    "metricsql_plan",
+                    "query not planned",
+                )
             })?;
+        let planned = &sidecar.executable;
         self.execute_logical_range(&physical, planned, start_ms, end_ms, step_ms)
             .await
     }
@@ -224,10 +254,10 @@ impl ASAPQueryEngine {
     async fn prepare_logical(
         &self,
         physical: &crate::storage_engines::types::ActivePhysicalPlan,
-        entry: &control_plane::query_plan::QueryPlanEntry,
+        entry: &dyn control_plane::query_plan::ExecutablePlanView,
         times: &[u64],
     ) -> Result<super::logical_dag::PreparedLeaves, crate::query_engines::EngineError> {
-        super::catalog_resolver::validate_entry(
+        super::catalog_resolver::validate_payload(
             physical.summary_catalog.as_deref(),
             entry,
             physical.query_plan.plan_id,
@@ -250,15 +280,17 @@ impl ASAPQueryEngine {
                     "candidate evaluation predates epoch",
                 )
             })?;
-            let mut subtree = entry.clone();
-            subtree.root = input;
-            let reachable = subtree.topological_order().map_err(|error| {
+            let subtree = RootedPlan {
+                base: entry,
+                root: input,
+                instant: entry.instant().clone(),
+            };
+            subtree.topological_order().map_err(|error| {
                 crate::query_engines::EngineError::capability_miss(
                     "installed_logical_dag",
                     error.to_string(),
                 )
             })?;
-            subtree.nodes.retain(|id, _| reachable.contains(id));
             let (result, _) = self.execute_logical_entry(
                 physical,
                 &subtree,
@@ -288,7 +320,7 @@ impl ASAPQueryEngine {
     fn execute_logical_entry(
         &self,
         physical: &crate::storage_engines::types::ActivePhysicalPlan,
-        entry: &control_plane::query_plan::QueryPlanEntry,
+        entry: &dyn control_plane::query_plan::ExecutablePlanView,
         leaves: &super::logical_dag::PreparedLeaves,
         at: u64,
     ) -> Result<
@@ -300,16 +332,17 @@ impl ASAPQueryEngine {
     > {
         use crate::query_engines::EngineError;
         super::logical_dag::execute_installed(entry, leaves, at, |root, evaluation_ms| {
-            let mut subtree = entry.clone();
-            subtree.root = root;
-            let reachable = subtree.topological_order().map_err(|e| {
+            let reachable = entry.topological_order_from(root).map_err(|e| {
                 EngineError::capability_miss("installed_logical_dag", e.to_string())
             })?;
-            subtree.nodes.retain(|id, _| reachable.contains(id));
-            let bindings: Vec<_> = subtree
-                .materialization_bindings()
-                .into_iter()
-                .cloned()
+            let bindings: Vec<_> = reachable
+                .iter()
+                .filter_map(|id| match &entry.nodes()[id] {
+                    control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                        Some(binding.clone())
+                    }
+                    _ => None,
+                })
                 .collect();
             let windows: std::collections::BTreeSet<Option<u64>> =
                 bindings.iter().map(|b| b.readout_lookback_ms).collect();
@@ -319,13 +352,20 @@ impl ASAPQueryEngine {
                     "bound subtree requires one explicit positive window",
                 ));
             }
-            subtree.instant.lookback_ms = windows
+            let lookback_ms = windows
                 .first()
                 .copied()
                 .flatten()
                 .expect("explicit semantic lookback checked");
-            subtree.instant.full_history = false;
-            subtree.instant.cumulative_readout = true;
+            let subtree = RootedPlan {
+                base: entry,
+                root,
+                instant: control_plane::query_plan::InstantExecution {
+                    lookback_ms,
+                    full_history: false,
+                    cumulative_readout: true,
+                },
+            };
             let requirement = readiness_requirement(&subtree);
             let index = self.sketch_index.as_ref().ok_or_else(|| {
                 EngineError::capability_miss("installed_logical_dag", "summary store unavailable")
@@ -401,7 +441,7 @@ impl ASAPQueryEngine {
     async fn execute_logical_range(
         &self,
         physical: &crate::storage_engines::types::ActivePhysicalPlan,
-        entry: &control_plane::query_plan::QueryPlanEntry,
+        entry: &dyn control_plane::query_plan::ExecutablePlanView,
         start: u64,
         end: u64,
         step: u64,
@@ -673,7 +713,7 @@ impl ASAPQueryEngine {
     {
         if let Some(physical) = self.physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
-                if entry.nodes.values().any(|node| {
+                if entry.nodes().values().any(|node| {
                     matches!(
                         node,
                         control_plane::query_plan::QueryPlanNode::Logical { .. }
@@ -697,7 +737,7 @@ impl ASAPQueryEngine {
         let planned = match physical_plan.as_ref() {
             Some(physical_plan) => match physical_plan.query_plan.lookup(query) {
                 Ok(query_entry) => {
-                    super::catalog_resolver::validate_entry(
+                    super::catalog_resolver::validate_payload(
                         physical_plan.summary_catalog.as_deref(), query_entry,
                         physical_plan.query_plan.plan_id, physical_plan.query_plan.plan_version,
                     )?;
@@ -3753,8 +3793,8 @@ mod range_stitch_tests {
     #[tokio::test]
     async fn active_metricsql_entry_reaches_the_shared_dag_executor() {
         use control_plane::query_plan::{
-            FallbackPolicy, InstantExecution, QueryLanguage, QueryNodeId, QueryPlanEntry,
-            QueryPlanNode,
+            ExecutableQueryPlan, FallbackPolicy, InstantExecution, MetricsQlPlanCatalog,
+            MetricsQlPlanEntry, QueryNodeId, QueryPlanNode,
         };
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_str(include_str!(
@@ -3763,33 +3803,38 @@ mod range_stitch_tests {
             .unwrap();
         let mut plan = snapshot.compile().unwrap();
         let identity = asap_frontend_metricsql::canonical_metricsql("1 + 2").unwrap();
-        plan.query_plan.entries.insert(
-            control_plane::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity),
-            QueryPlanEntry {
-                language: QueryLanguage::MetricsQl,
-                query_id: "vm-scalar".into(),
-                canonical_query: identity.clone(),
-                fixed_evaluation: None,
-                root: QueryNodeId(2),
-                nodes: std::collections::BTreeMap::from([
-                    (QueryNodeId(0), QueryPlanNode::Scalar { value: 1.0 }),
-                    (QueryNodeId(1), QueryPlanNode::Scalar { value: 2.0 }),
-                    (
-                        QueryNodeId(2),
-                        QueryPlanNode::Binary {
-                            inputs: [QueryNodeId(0), QueryNodeId(1)],
-                            operator: planner_types::pre_asap::ArithmeticOpKind::Add,
-                        },
-                    ),
-                ]),
-                instant: InstantExecution {
-                    lookback_ms: 1,
-                    full_history: false,
-                    cumulative_readout: false,
-                },
-                fallback: FallbackPolicy::ExactBackend,
+        let executable = ExecutableQueryPlan {
+            root: QueryNodeId(2),
+            nodes: std::collections::BTreeMap::from([
+                (QueryNodeId(0), QueryPlanNode::Scalar { value: 1.0 }),
+                (QueryNodeId(1), QueryPlanNode::Scalar { value: 2.0 }),
+                (
+                    QueryNodeId(2),
+                    QueryPlanNode::Binary {
+                        inputs: [QueryNodeId(0), QueryNodeId(1)],
+                        operator: planner_types::pre_asap::ArithmeticOpKind::Add,
+                    },
+                ),
+            ]),
+            instant: InstantExecution {
+                lookback_ms: 1,
+                full_history: false,
+                cumulative_readout: false,
             },
-        );
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        plan.metricsql_plan = Some(MetricsQlPlanCatalog {
+            plan_id: plan.query_plan.plan_id,
+            plan_version: plan.query_plan.plan_version,
+            entries: std::collections::BTreeMap::from([(
+                identity.clone(),
+                MetricsQlPlanEntry {
+                    query_id: "vm-scalar".into(),
+                    canonical_metricsql: identity.clone(),
+                    executable,
+                },
+            )]),
+        });
         let mut active = crate::drivers::query::servers::http::build_active_physical_plan(
             crate::drivers::query::servers::http::PhysicalPlanInstallRequest {
                 summary_catalog: plan.summary_catalog,
@@ -3797,6 +3842,8 @@ mod range_stitch_tests {
                 precompute_plan: plan.precompute_plan,
                 transmission_plan: plan.transmission_plan,
                 query_plan: plan.query_plan,
+                metricsql_plan: plan.metricsql_plan,
+                clickhouse_sql: None,
                 storage_routing: None,
                 adaptation_evidence: vec![],
             },
