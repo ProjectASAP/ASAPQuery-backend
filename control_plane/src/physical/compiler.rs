@@ -2805,6 +2805,7 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 inner: right,
                 ..
             }
+            | SummaryExpr::RelationalJoin { left, right, .. }
             | SummaryExpr::SummarySubtract { left, right }
             | SummaryExpr::BinaryOp {
                 lhs: left,
@@ -2952,6 +2953,7 @@ fn requires_exact_erp_fallback(
                 walk(inner, out);
             }
             SummaryExpr::SummarySubtract { left, right }
+            | SummaryExpr::RelationalJoin { left, right, .. }
             | SummaryExpr::BinaryOp {
                 lhs: left,
                 rhs: right,
@@ -3765,6 +3767,10 @@ fn collect_selected_materializations(
             }
             SummaryExpr::ValueOperation { child, .. } => {
                 walk(child, readout, composable, grouping.clone(), selected)?;
+            }
+            SummaryExpr::RelationalJoin { left, right, .. } => {
+                walk(left, readout, composable, grouping.clone(), selected)?;
+                walk(right, readout, composable, grouping.clone(), selected)?;
             }
             SummaryExpr::BinaryOp { lhs, rhs, .. }
                 if composable || crate::query_plan::exact_value_executable(node) =>

@@ -535,6 +535,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ratio_sql_compiles_two_rate_summaries_and_relational_join() {
+        let schema = Schema::with_time_index(
+            vec![
+                Column::new("metric", DataType::Utf8, false),
+                Column::new("labels", DataType::Utf8, false),
+                Column::new("ts_ms", DataType::Timestamp, false),
+                Column::new("value", DataType::Float64, false),
+            ],
+            2,
+            vec![vec![2, 1]],
+        );
+        let configs = ["errors_total", "requests_total"].map(|metric| {
+            let mut config = PrecomputeMaterialization::new(
+                AggregationType::Increase,
+                String::new(),
+                Default::default(),
+                KeyByLabelNames::new(vec!["labels".into()]),
+                KeyByLabelNames::empty(),
+                KeyByLabelNames::empty(),
+                String::new(),
+                300,
+                300,
+                WindowKind::Tumbling,
+                String::new(),
+                metric.into(),
+                None,
+                Some("raw_samples".into()),
+                Some("value".into()),
+            );
+            config.pane_origin_ms = Some(0);
+            config
+        });
+        let sds = SummaryCatalog::from_materializations(75, 1, &configs).unwrap();
+        let envelope = crate::physical::compiler::PlanEnvelope {
+            plan_id: 75,
+            plan_version: 1,
+            generated_at_unix_ms: 0,
+            activation_unix_ms: 0,
+            expiry_unix_ms: None,
+            backend_compat: "test".into(),
+            planner_revision: "test".into(),
+            capability_snapshot_id: "test".into(),
+        };
+        let mut precompute =
+            PrecomputePlan::build_backend_local(envelope.clone(), configs.to_vec()).unwrap();
+        precompute.summary_catalog = Some(sds.reference().unwrap());
+        let mut transmission =
+            TransmissionPlan::build(envelope, &precompute, &Default::default()).unwrap();
+        transmission.summary_catalog = precompute.summary_catalog.clone();
+        let sql = "SELECT a.labels, a.v / b.v AS ratio FROM \
+            (SELECT labels, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='errors_total' GROUP BY labels) a \
+            INNER JOIN \
+            (SELECT labels, asap_rate(value, ts_ms, 300000) AS v FROM raw_samples WHERE metric='requests_total' GROUP BY labels) b \
+            ON a.labels=b.labels";
+        let bundle = compile_clickhouse_workload(&ClickHouseSqlWorkload {
+            sds,
+            precompute_plan: precompute,
+            transmission_plan: transmission,
+            tables: HashMap::from([("raw_samples".into(), schema)]),
+            accuracy: AccuracyTarget::Exact,
+            queries: vec![ClickHouseSqlWorkloadEntry {
+                sql: sql.into(),
+                start_ms: 0,
+                end_ms: 300_000,
+                cumulative: true,
+            }],
+        })
+        .await
+        .expect("ratio SQL must compile");
+        let plan: crate::query_plan::ExecutableQueryPlan =
+            serde_json::from_value(bundle.plans[0]["runtime"]["executable"].clone()).unwrap();
+        assert!(plan.nodes.values().any(|node| matches!(
+            node,
+            crate::query_plan::QueryPlanNode::RelationalJoin { .. }
+        )));
+        assert_eq!(plan.materialization_bindings().len(), 2);
+    }
+
+    #[tokio::test]
     async fn q05_max_over_time_sql_compiles_to_publishable_summary_dag() {
         let schema = Schema::with_time_index(
             vec![

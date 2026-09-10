@@ -244,6 +244,7 @@ pub fn execute<E: SummaryExecutor>(
         }
 
         SummaryExpr::SummaryJoin { .. } => Err(ExecError::NotYetSupported("SummaryJoin")),
+        SummaryExpr::RelationalJoin { .. } => Err(ExecError::NotYetSupported("RelationalJoin")),
         // CandidateTopK is lowered to the deployed QueryPlan DAG, where both
         // row inputs retain labels for intersection and exact reranking. This
         // legacy generic adapter exposes opaque GroupKey values and cannot

@@ -1287,6 +1287,10 @@ pub fn materialization_candidate_keys(
                 visit(original, lhs, keys)?;
                 visit(original, rhs, keys)?;
             }
+            SummaryExpr::RelationalJoin { left, right, .. } => {
+                visit(original, left, keys)?;
+                visit(original, right, keys)?;
+            }
             SummaryExpr::CandidateTopK {
                 candidates, values, ..
             } => {

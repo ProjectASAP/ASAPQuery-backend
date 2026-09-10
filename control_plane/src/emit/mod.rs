@@ -326,6 +326,7 @@ fn extract_from_node(node: &Rc<SummaryNode>) -> Option<SketchAlgorithm> {
         // Not surfaced by any `Bind*` path yet (gated on rules that
         // haven't landed — see `deployment_expr.rs`'s module docs).
         SummaryExpr::BinaryOp { .. }
+        | SummaryExpr::RelationalJoin { .. }
         | SummaryExpr::SummaryJoin { .. }
         | SummaryExpr::SummarySubtract { .. }
         | SummaryExpr::SummaryDelete { .. }

@@ -598,6 +598,14 @@ pub enum PhysicalGrouping {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    RelationalJoin {
+        inputs: [QueryNodeId; 2],
+        join_kind: planner_types::pre_asap::JoinKind,
+        pred: serde_json::Value,
+        left_schema: planner_types::post_asap::SummarySchema,
+        right_schema: planner_types::post_asap::SummarySchema,
+        output_schema: planner_types::post_asap::SummarySchema,
+    },
     Relational {
         input: QueryNodeId,
         operation: serde_json::Value,
@@ -653,7 +661,7 @@ impl QueryPlanNode {
             Self::Scalar { .. } | Self::ReadMaterialization { .. } | Self::ExactFallback { .. } => {
                 &[]
             }
-            Self::Binary { inputs, .. } => inputs,
+            Self::Binary { inputs, .. } | Self::RelationalJoin { inputs, .. } => inputs,
             Self::ReduceSum { input, .. }
             | Self::Relational { input, .. }
             | Self::SummaryEstimate { input, .. }
@@ -752,7 +760,8 @@ where
                     }
                 }
                 QueryPlanNode::CandidateTopK { inputs, .. }
-                | QueryPlanNode::Binary { inputs, .. } => {
+                | QueryPlanNode::Binary { inputs, .. }
+                | QueryPlanNode::RelationalJoin { inputs, .. } => {
                     for input in inputs {
                         *input = remap[input];
                     }
@@ -811,6 +820,26 @@ where
         }
 
         let physical = match &node.expr {
+            SummaryExpr::RelationalJoin {
+                left,
+                right,
+                kind,
+                pred,
+            } if self.preserve_relational => QueryPlanNode::RelationalJoin {
+                inputs: [self.lower(left)?, self.lower(right)?],
+                join_kind: kind.clone(),
+                pred: serde_json::to_value(pred).map_err(|error| {
+                    QueryPlanError::Invalid(format!(
+                        "cannot serialize relational join predicate: {error}"
+                    ))
+                })?,
+                left_schema: left.schema.clone(),
+                right_schema: right.schema.clone(),
+                output_schema: node.schema.clone(),
+            },
+            SummaryExpr::RelationalJoin { .. } => QueryPlanNode::ExactFallback {
+                reason: "read-time relational join requires the relational compiler".into(),
+            },
             SummaryExpr::ValueOperation {
                 child, operation, ..
             } if self.preserve_relational
