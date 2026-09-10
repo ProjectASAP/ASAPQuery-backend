@@ -365,63 +365,6 @@ impl BackendClient {
         }
     }
 
-    /// Publish the backend-facing portions of one PhysicalPlan in a single
-    /// request, preventing independently retried documents from mixing
-    /// generations at the backend.
-    pub async fn post_physical_plan_typed(
-        &self,
-        precompute_plan: &crate::physical::compiler::PrecomputePlan,
-        transmission_plan: &crate::physical::compiler::TransmissionPlan,
-        query_plan: &crate::query_plan::QueryPlan,
-        storage_routing: Option<serde_json::Value>,
-        adaptation_evidence: &[crate::physical::compiler::RuntimeAdaptationEvidence],
-    ) -> std::result::Result<(), BackendPostError> {
-        // Compatibility replanner has no Planner-selected query/collector DAG.
-        // Still publish the actual catalog and bind every provided projection.
-        let catalog = crate::physical::summary_catalog::SummaryCatalog::from_materializations(
-            precompute_plan.envelope.plan_id,
-            precompute_plan.envelope.plan_version,
-            &precompute_plan.materializations,
-        )
-        .map_err(|error| BackendPostError::Permanent(error.into()))?;
-        let mut precompute_plan = precompute_plan.clone();
-        precompute_plan
-            .bind_catalog(&catalog)
-            .map_err(|error| BackendPostError::Permanent(error.into()))?;
-        let mut transmission_plan = transmission_plan.clone();
-        transmission_plan.summary_catalog = Some(
-            catalog
-                .reference()
-                .map_err(|error| BackendPostError::Permanent(error.into()))?,
-        );
-        query_plan
-            .validate_against_catalog(&catalog)
-            .map_err(|error| BackendPostError::Permanent(error.into()))?;
-        let url = derive_physical_plan_url(&self.endpoint);
-        let response = self
-            .http
-            .post(&url)
-            .json(&serde_json::json!({
-            "summary_catalog": catalog,
-            "collector_plans": [],
-            "precompute_plan": precompute_plan,
-            "transmission_plan": transmission_plan,
-            "query_plan": query_plan,
-            "storage_routing": storage_routing,
-            "adaptation_evidence": adaptation_evidence,
-            }))
-            .send()
-            .await
-            .map_err(classify_reqwest_error)?;
-        let status = response.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            let body = response.text().await.unwrap_or_default();
-            Err(classify_http_status(status, body, "PhysicalPlan POST"))
-        }
-    }
-
     pub async fn discard_staged_physical_plan(
         &self,
         plan_id: u64,
