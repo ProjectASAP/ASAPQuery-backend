@@ -1,8 +1,10 @@
+use crate::precompute_engine::group_key::GroupKey;
 use crate::storage_engines::types::AggregateCore;
 use asap_types::PolicyFingerprint;
 use futures::future::try_join_all;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use xxhash_rust::xxh64::xxh64;
@@ -48,7 +50,7 @@ pub enum WorkerMessage {
         /// Grouping label values joined by semicolons (e.g. "constant").
         /// Empty string if the aggregation has no grouping labels. Used
         /// at emit time to render the output's `KeyByLabelValues`.
-        group_key: String,
+        group_key: Arc<GroupKey>,
         /// Each entry: (series_key, timestamp_ms, value).
         /// series_key is needed for keyed (MultipleSubpopulation) accumulators
         /// to extract the aggregated-label key.
@@ -75,7 +77,7 @@ pub enum WorkerMessage {
         /// Grouping label values joined by semicolons, matching the
         /// format produced by `IngestState::extract_group_key_for`.
         /// Used at emit time to render the output's `KeyByLabelValues`.
-        group_key: String,
+        group_key: Arc<GroupKey>,
         /// Wall-clock timestamp the sketch refers to (millis since epoch).
         /// Used to place the sketch into the correct pane.
         timestamp_ms: i64,

@@ -456,6 +456,45 @@ fn bench_reconcile_per_batch(c: &mut Criterion) {
     g.finish();
 }
 
+fn bench_group_key_projection(c: &mut Criterion) {
+    use data_plane::precompute_engine::group_key::intern_pairs;
+
+    let cardinality = 100_000usize;
+    let labels = (0..cardinality)
+        .map(|index| (format!("region;{index}"), format!("service={index}")))
+        .collect::<Vec<_>>();
+    let mut group = c.benchmark_group("group_key_projection");
+    group.throughput(Throughput::Elements(cardinality as u64));
+    group.bench_function("cold_high_cardinality", |b| {
+        b.iter(|| {
+            for (region, service) in &labels {
+                black_box(intern_pairs([
+                    ("region", region.as_str()),
+                    ("service", service.as_str()),
+                ]));
+            }
+        });
+    });
+    // Warm the bounded interner, then measure shared-DAG reuse.
+    for (region, service) in &labels {
+        black_box(intern_pairs([
+            ("region", region.as_str()),
+            ("service", service.as_str()),
+        ]));
+    }
+    group.bench_function("warm_shared_projection", |b| {
+        b.iter(|| {
+            for (region, service) in &labels {
+                black_box(intern_pairs([
+                    ("region", region.as_str()),
+                    ("service", service.as_str()),
+                ]));
+            }
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_append_sample,
@@ -463,5 +502,6 @@ criterion_group!(
     bench_query_range,
     bench_query_precomputes_by_agg,
     bench_reconcile_per_batch,
+    bench_group_key_projection,
 );
 criterion_main!(benches);
