@@ -14,9 +14,9 @@ use asap_aware_mapping::{
     SummaryMaintenanceLifecycleCapabilities, SummaryMaintenanceLifecycleCostInputs, WorkloadDemand,
 };
 use planner_types::post_asap::{
-    CompositionOperator, EvaluationSchedule, OutputRepresentation, SketchAlgorithm, SketchParams,
-    SketchQuery, SummaryExpr, SummaryFamilyType, SummaryMaintenanceLifecycle,
-    SummaryMaintenanceMode, SummaryNode, SummaryWindowFramework,
+    CompositionOperator, EvaluationSchedule, ExecutableDagCompilation, OutputRepresentation,
+    PostAsapNodeId, SketchAlgorithm, SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType,
+    SummaryMaintenanceLifecycle, SummaryMaintenanceMode, SummaryNode, SummaryWindowFramework,
 };
 use planner_types::pre_asap::QueryExpr;
 use planner_types::workload::{
@@ -1920,7 +1920,7 @@ impl BackendLocalPlanningSnapshot {
 /// unless the selected DAG explicitly authorizes pooling the source entities.
 fn has_unsafe_raw_entity_leaf(
     node: &Rc<SummaryNode>,
-    selected: &BTreeSet<usize>,
+    selected: &[Rc<SummaryNode>],
     pooling: bool,
 ) -> bool {
     use planner_types::post_asap::ExactKind;
@@ -1932,7 +1932,7 @@ fn has_unsafe_raw_entity_leaf(
             family,
             ..
         } => {
-            if selected.contains(&(Rc::as_ptr(node) as usize)) {
+            if selected.iter().any(|selected| Rc::ptr_eq(selected, node)) {
                 let preserves_series_state = matches!(
                     family,
                     SummaryFamilyType::ExactAggregate(
@@ -1982,11 +1982,14 @@ fn preserve_native_unsafe_raw_roots(queries: &mut [PlanningQuery]) -> Result<(),
                     reason,
                 }
             })?;
-        let unsafe_entities = has_unsafe_raw_entity_leaf(
-            &query.post_asap,
-            &selected.iter().map(|state| state.node_identity).collect(),
-            false,
-        );
+        if selected.is_empty() {
+            continue;
+        }
+        let selected_nodes = selected
+            .iter()
+            .map(|state| Rc::clone(&state.node))
+            .collect::<Vec<_>>();
+        let unsafe_entities = has_unsafe_raw_entity_leaf(&query.post_asap, &selected_nodes, false);
         if unsafe_entities {
             let parsed = crate::query_parser::parse_query_expr_canonical(
                 &query.query_string,
@@ -2130,7 +2133,9 @@ impl PhysicalCompiler {
         // materializations, then consumed by QueryPlan lowering. The key is
         // the planner DAG node identity across the workload; serving never scans
         // downstream components to rediscover this decision.
-        let mut node_bindings = HashMap::<usize, asap_types::PolicyFingerprint>::new();
+        let mut executable_dags = vec![None::<ExecutableDagCompilation>; request.queries.len()];
+        let mut node_bindings =
+            BTreeMap::<(usize, PostAsapNodeId), asap_types::PolicyFingerprint>::new();
         let consumers = materialization_consumers(
             &request.queries,
             environment.target,
@@ -2139,7 +2144,7 @@ impl PhysicalCompiler {
         let mut lifecycle_estimates =
             BTreeMap::<asap_types::PolicyFingerprint, MaterializationLifecycleEstimate>::new();
 
-        for query in &request.queries {
+        for (query_index, query) in request.queries.iter().enumerate() {
             let evidence = request.evidence.get(&query.query_id);
             if let Some(e) = evidence {
                 validate_evidence(&query.query_id, e, &environment)?;
@@ -2197,6 +2202,13 @@ impl PhysicalCompiler {
             if selected.is_empty() {
                 continue;
             }
+            let executable =
+                planner_types::post_asap::compile_executable_dag_with_node_ids(&query.post_asap)
+                    .map_err(|error| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: format!("invalid executable subDAG: {error}"),
+                    })?;
+            executable_dags[query_index] = Some(executable);
             validate_lifecycle_input(&query.query_id, &query.lifecycle)?;
             if environment.target == PhysicalDeploymentTarget::DistributedCollectors
                 && selected.iter().any(|state| {
@@ -2367,7 +2379,17 @@ impl PhysicalCompiler {
                         expected_updates: planner_selection.expected_updates,
                         lifecycle_cost: planner_selection.lifecycle_cost,
                     });
-                let binding_key = selected.node_identity;
+                let node_id = executable_dags[query_index]
+                    .as_ref()
+                    .expect("selected query has a compiled executable DAG")
+                    .node_ids
+                    .node_id(&selected.node)
+                    .ok_or_else(|| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: "selected materialization is absent from the compiled Planner DAG"
+                            .into(),
+                    })?;
+                let binding_key = (query_index, node_id);
                 if let Some(existing) = node_bindings.insert(binding_key, materialization) {
                     if existing != materialization {
                         return Err(CompileError::Query {
@@ -2506,7 +2528,7 @@ impl PhysicalCompiler {
             .map(asap_types::PrecomputeMaterialization::policy_fingerprint)
             .collect();
         let mut query_entries = BTreeMap::new();
-        for query in &request.queries {
+        for (query_index, query) in request.queries.iter().enumerate() {
             let canonical = if metricsql {
                 asap_frontend_metricsql::canonical_metricsql(&query.query_string).map_err(
                     |error| CompileError::Query {
@@ -2517,14 +2539,28 @@ impl PhysicalCompiler {
             } else {
                 canonical_promql(&query.query_string)?
             };
-            let binding = |node: &SummaryNode, node_family: &SummaryFamilyType| -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
+            let binding = |node: &Rc<SummaryNode>, node_family: &SummaryFamilyType| -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
                     summary_agg_metric(node).ok_or_else(|| {
                         crate::query_plan::QueryPlanError::Invalid(
                             "materialized node has no unique time-series source".into(),
                         )
                     })?;
+                    let node_id = executable_dags[query_index]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            crate::query_plan::QueryPlanError::Invalid(
+                                "materialized query has no compiled executable DAG".into(),
+                            )
+                        })?
+                        .node_ids
+                        .node_id(node)
+                        .ok_or_else(|| {
+                            crate::query_plan::QueryPlanError::Invalid(
+                                "query materialization is absent from the compiled Planner DAG".into(),
+                            )
+                        })?;
                     let fingerprint = node_bindings
-                        .get(&(node as *const SummaryNode as usize))
+                        .get(&(query_index, node_id))
                         .copied()
                         .ok_or_else(|| {
                             crate::query_plan::QueryPlanError::Invalid(format!(
@@ -3469,7 +3505,6 @@ pub(crate) fn materialization_leaf_contract(
 
 struct SelectedMaterialization {
     node: Rc<SummaryNode>,
-    node_identity: usize,
     metric: String,
     window_secs: Option<u64>,
     spatial_filter: String,
@@ -3791,7 +3826,6 @@ fn collect_selected_materializations(
                         };
                     selected.push(SelectedMaterialization {
                         node: Rc::clone(node),
-                        node_identity: Rc::as_ptr(node) as usize,
                         metric,
                         window_secs,
                         spatial_filter,
@@ -3818,7 +3852,6 @@ fn collect_selected_materializations(
                     };
                 selected.push(SelectedMaterialization {
                     node: Rc::clone(node),
-                    node_identity: Rc::as_ptr(node) as usize,
                     metric,
                     window_secs,
                     spatial_filter,
@@ -3842,9 +3875,8 @@ fn collect_selected_materializations(
     let mut selected = Vec::new();
     walk(node, None, composable, None, &mut selected)?;
     if composable {
-        selected.retain(|state| {
-            !has_unsafe_raw_entity_leaf(node, &BTreeSet::from([state.node_identity]), false)
-        });
+        selected
+            .retain(|state| !has_unsafe_raw_entity_leaf(node, &[Rc::clone(&state.node)], false));
     }
     if !selected.is_empty() {
         validate_executable_subdag(node)?;
