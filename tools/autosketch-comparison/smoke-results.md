@@ -1,5 +1,33 @@
 # First fixed-CMS smoke evaluation
 
+## Follow-up: hard budget and family selection
+
+Revision `3a74574118d4bd75b4c6ec174318bcc21b492675` adds a counter-payload memory
+cap and CMS/Count Sketch selection. These are also debug smoke runs, not a
+performance comparison. All three methods share the filtered candidate grid.
+
+| Input / candidates | Budget | Runs | Selected family (all methods) | Held-out passes (each method) |
+| --- | --- | --- | --- | --- |
+| Uniform / CMS + Count Sketch | 4096 B | 10 | Count Sketch, 10/10 | 7/10 |
+| Zipf(1.2) / CMS + Count Sketch | 4096 B | 10 | CMS, 10/10 | 8/10 |
+| Uniform / CMS + Count Sketch | 511 B | 1 | None; no candidate measured | N/A |
+| Zipf(1.2) / Count Sketch only | 4096 B | 2 | None; calibration accuracy infeasible | N/A |
+
+The 4-KiB runs choose the same configuration as the grid oracle in every run.
+Uniform's mean selected counter payload is 972.8 B; Zipf's is 3123.2 B. Worst
+held-out errors are 0.0104 and 0.0108 respectively, exceeding epsilon 0.01 in
+the failed runs. These failures remain visible: broader candidates and a memory
+cap do not fix calibration generalization.
+
+Local artifacts: `/tmp/asap-family-budget4096.json`,
+`/tmp/asap-family-zipf-budget4096.json`, `/tmp/asap-family-budget511.json`, and
+`/tmp/asap-cs-only-budget4096.json`. Reproduce with the README commands (without
+`--release`) and the indicated budget/family/run settings. Ten Rust tests and
+two Python tests pass, including budget boundaries, family choice in either
+direction, Count Sketch hash limits and exact single-key checks.
+
+## Original CMS-only run
+
 Runner revision: `a0680e3d21cf2fc72717d0a6982b71b939107b5a`.
 These are debug-build correctness/exploration runs, not performance results or
 a non-inferiority claim. The whole Planner, query frontend, window execution,
