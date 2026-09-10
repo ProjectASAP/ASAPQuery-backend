@@ -87,6 +87,12 @@ pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactor
     let fallback = super::service::default_reader_factory();
     Arc::new(move |source| match source {
         BackfillSource::ClickHouse { database, table } => {
+            if database != &config.database {
+                return Err(RawSampleReaderError::Other {
+                    reason: "ClickHouse source database differs from the deployment database".into(),
+                }
+                .into());
+            }
             let mut source_config = config.clone();
             source_config.database = database.clone();
             source_config.table = table.clone();
@@ -190,11 +196,16 @@ mod tests {
     fn typed_source_enters_clickhouse_backfill_lifecycle() {
         let factory = clickhouse_reader_factory(config("samples"));
         let reader = factory(&BackfillSource::ClickHouse {
-            database: "another_database".into(),
+            database: "metrics".into(),
             table: "another_table".into(),
         })
         .unwrap();
         assert_eq!(reader.source_name(), "ClickHouseReader");
+        assert!(factory(&BackfillSource::ClickHouse {
+            database: "another_database".into(),
+            table: "samples".into(),
+        })
+        .is_err());
         assert!(factory(&BackfillSource::ClickHouse {
             database: "default".into(),
             table: "samples; DROP TABLE x".into(),

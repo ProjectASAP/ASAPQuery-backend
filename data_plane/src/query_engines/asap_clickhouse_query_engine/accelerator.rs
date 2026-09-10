@@ -441,8 +441,8 @@ mod tests {
             String::new(),
             "requests".into(),
             None,
-            None,
-            None,
+            Some("asap_e2e.samples".into()),
+            Some("value".into()),
         );
         config.pane_origin_ms = Some(0);
         let sds = SummaryCatalog::from_materializations(41, 1, &[config.clone()]).unwrap();
