@@ -143,6 +143,8 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
         inserted.text().await.unwrap()
     );
     drop(rows);
+    let source_load_elapsed_ns = experiment_started.elapsed().as_nanos();
+    let clickhouse_post_load = clickhouse_pid.map(process_snapshot);
 
     let sql = format!(
         "SELECT max(value) AS value FROM q05_samples WHERE ts_ms>={start_ms} AND ts_ms<{end_ms}"
@@ -314,6 +316,9 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
         response.text().await.unwrap()
     );
     let agg_id = config.policy_fp_u64();
+    let backfill_started = std::time::Instant::now();
+    let backend_pre_backfill = process_snapshot(child.0.id());
+    let clickhouse_pre_backfill = clickhouse_pid.map(process_snapshot);
     let response: serde_json::Value = client
         .post(format!("{base}/api/v1/db/backfill"))
         .json(
@@ -355,6 +360,7 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
         "backfill did not complete before poll deadline: {last_backfill_status}"
     );
     let build_elapsed_ns = experiment_started.elapsed().as_nanos();
+    let backfill_elapsed_ns = backfill_started.elapsed().as_nanos();
     let post_build = process_snapshot(child.0.id());
     let clickhouse_post_build = clickhouse_pid.map(process_snapshot);
     let first_warm_started = std::time::Instant::now();
@@ -471,6 +477,8 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
             "planning_scope": "Planner chooses query DAG against a predeclared MinMax catalog; materialization sizing/selection is not measured",
             "classification_required": "warm",
             "build_phase": {"elapsed_ns":build_elapsed_ns,"backend":post_build,"backend_output_bytes":directory_bytes(output_dir.path()),"clickhouse_before":clickhouse_initial,"clickhouse_after":clickhouse_post_build},
+            "source_load_phase": {"elapsed_ns":source_load_elapsed_ns,"clickhouse_before":clickhouse_initial,"clickhouse_after":clickhouse_post_load},
+            "backfill_phase": {"elapsed_ns":backfill_elapsed_ns,"backend_before":backend_pre_backfill,"backend_after":post_build,"clickhouse_before":clickhouse_pre_backfill,"clickhouse_after":clickhouse_post_build},
             "first_query": {"warm_elapsed_ns":first_warm_ns,"exact_elapsed_ns":first_exact_ns},
             "query_phase": {"elapsed_ns":query_elapsed_ns,"backend_before":pre_query,"backend_after":post_query,"backend_output_bytes":directory_bytes(output_dir.path()),"clickhouse_before":clickhouse_pre_query,"clickhouse_after":clickhouse_post_query,"clickhouse_storage_bytes":clickhouse_storage_bytes},
             "clickhouse_table": table_stats,

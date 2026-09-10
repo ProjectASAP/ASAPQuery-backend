@@ -35,6 +35,8 @@ def main():
                "input": data.get("input"), "planning_scope": data.get("planning_scope"),
                "routes": routes, "latency_speedup": routes["exact"]["median_ms"] / routes["warm"]["median_ms"],
                "first_query": data.get("first_query"), "build_phase": data["build_phase"],
+               "source_load_phase": data.get("source_load_phase"),
+               "backfill_phase": data.get("backfill_phase"),
                "query_phase": data["query_phase"],
                "clickhouse_table": data.get("clickhouse_table"),
                "limitations": data["limitations"] + ["CPU counters include server background work and have scheduler-tick precision"]}

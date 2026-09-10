@@ -55,3 +55,9 @@ Remaining acceptance gaps are canonical SQL population/producer binding,
 automatic catalog construction from selected materialization candidates,
 recorded candidate costs, and grouped/multi-series workload execution. Increasing
 the scalar probe's input size does not resolve those gaps.
+
+Per-process warm-query memory must not be interpreted as total deployment
+memory savings: ClickHouse remains available as the historical/exact backend.
+Likewise the summary's size is additional state when raw ClickHouse data is
+retained. A whole-deployment cost comparison must include both processes and
+the summary build/update work.
