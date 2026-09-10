@@ -240,9 +240,11 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                     .collect::<Result<Vec<_>, _>>()
                     .map(PhysicalQueryOutput::State)
             }
-            QueryPlanNode::Logical { .. } => Err(PhysicalNodeError::Fallback(
-                "logical node requires installed logical runtime".into(),
-            )),
+            QueryPlanNode::Logical { .. } | QueryPlanNode::CandidateTopK { .. } => {
+                Err(PhysicalNodeError::Fallback(
+                    "logical node requires installed logical runtime".into(),
+                ))
+            }
             QueryPlanNode::ExactFallback { reason } => {
                 Err(PhysicalNodeError::Fallback(reason.clone()))
             }

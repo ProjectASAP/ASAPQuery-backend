@@ -250,6 +250,38 @@ impl QueryPlanEntry {
             if matches!(node, QueryPlanNode::Scalar { value } if !value.is_finite()) {
                 return Err(QueryPlanError::Invalid("non-finite scalar constant".into()));
             }
+            if let QueryPlanNode::CandidateTopK {
+                k, completeness, ..
+            } = node
+            {
+                if *k == 0 {
+                    return Err(QueryPlanError::Invalid(
+                        "CandidateTopK requires k > 0".into(),
+                    ));
+                }
+                match completeness {
+                    CandidateCompleteness::Certified {
+                        evidence_id,
+                        max_failure_probability,
+                    } if evidence_id.trim().is_empty()
+                        || !max_failure_probability.is_finite()
+                        || !(0.0..=1.0).contains(max_failure_probability) =>
+                    {
+                        return Err(QueryPlanError::Invalid(
+                            "invalid CandidateTopK completeness certificate".into(),
+                        ));
+                    }
+                    CandidateCompleteness::BestEffort { reason }
+                    | CandidateCompleteness::ExactFallback { reason }
+                        if reason.trim().is_empty() =>
+                    {
+                        return Err(QueryPlanError::Invalid(
+                            "CandidateTopK fallback reason is empty".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
             for input in node.inputs() {
                 if !self.nodes.contains_key(input) {
                     return Err(QueryPlanError::Invalid(format!(
@@ -383,6 +415,15 @@ pub enum QueryPlanNode {
     SummaryMerge {
         inputs: Vec<QueryNodeId>,
     },
+    /// Use an approximate heap only as a membership sidecar, then rerank the
+    /// matching exact counter readouts. `inputs[0]` is candidate membership;
+    /// `inputs[1]` is the authoritative exact value vector.
+    CandidateTopK {
+        inputs: [QueryNodeId; 2],
+        k: u64,
+        grouping: logical::Grouping,
+        completeness: CandidateCompleteness,
+    },
     ExactFallback {
         reason: String,
     },
@@ -399,8 +440,24 @@ impl QueryPlanNode {
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
             Self::SummaryMerge { inputs } | Self::Logical { inputs, .. } => inputs,
+            Self::CandidateTopK { inputs, .. } => inputs,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CandidateCompleteness {
+    Certified {
+        evidence_id: String,
+        max_failure_probability: f64,
+    },
+    BestEffort {
+        reason: String,
+    },
+    ExactFallback {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
