@@ -207,7 +207,7 @@ mod tests {
         })
         .is_err());
         assert!(factory(&BackfillSource::ClickHouse {
-            database: "default".into(),
+            database: "metrics".into(),
             table: "samples; DROP TABLE x".into(),
         })
         .is_err());
