@@ -116,6 +116,17 @@ async fn observed_shape_selects_installed_parameters_and_executes_remote_write()
             expected_k
         );
         chosen.push(plan.precompute_plan.materializations[0].policy_fingerprint());
+        eprintln!(
+            "ERP_PLANNED {}",
+            serde_json::json!({
+                "query": QUERY, "available_profiles": policy.artifact.records,
+                "observation": policy.observed_shape,
+                "selected_parameters": plan.precompute_plan.materializations[0].parameters,
+                "materialization": chosen.last(),
+                "partitioning": plan.precompute_plan.materializations[0].partitioning,
+                "query_plan": plan.query_plan,
+            })
+        );
         let output = tempfile::tempdir().unwrap();
         let path = output.path().join("planning.json");
         std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
@@ -227,6 +238,10 @@ async fn observed_shape_selects_installed_parameters_and_executes_remote_write()
             rows.len(),
             2,
             "per-series KLL states must not pool: {result}"
+        );
+        eprintln!(
+            "ERP_WARM {}",
+            serde_json::json!({"materialization": chosen.last(), "result": result})
         );
         for (instance, offset) in [("a", 0.0), ("b", 1000.0)] {
             let row = rows

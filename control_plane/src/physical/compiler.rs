@@ -1489,8 +1489,9 @@ impl BackendLocalPlanningSnapshot {
     }
 }
 
-/// Raw accumulators do not retain arbitrary source labels. Preserve native semantics
-/// unless the selected DAG explicitly authorizes pooling the source entities.
+/// Admit per-entity raw state only when the installed partition contract and
+/// scalar input evaluator preserve source rows. Composite updates still require
+/// an executable maintenance evaluator; a partition flag cannot authorize them.
 fn has_unsafe_raw_entity_leaf(
     node: &Rc<SummaryNode>,
     selected: &[Rc<SummaryNode>],
@@ -3223,6 +3224,9 @@ fn scoped_materialization(
     node: &SummaryNode,
 ) -> anyhow::Result<asap_types::PrecomputeMaterialization> {
     let mut config = aggregation_config_for_materialization(aggregation)?;
+    if !matches!(aggregation.aggregation_input, AggregationInput::Raw) {
+        return Ok(config);
+    }
     let SummaryExpr::SummaryAgg { reduction, .. } = &node.expr else {
         anyhow::bail!("materialization lacks SummaryAgg partition contract");
     };
@@ -3343,8 +3347,9 @@ fn shared_pane_origin_ms(
 /// serialized QueryPlan retains the merge edges. Unsupported operators are
 /// intentionally not traversed: QueryPlan lowers them to an explicit exact
 /// fallback node and no unused warm state is provisioned.
-/// Raw accumulators do not retain arbitrary source labels. Preserve native semantics
-/// unless the selected DAG explicitly authorizes pooling the source entities.
+/// Admit per-entity raw state only when the installed partition contract and
+/// scalar input evaluator preserve source rows. Composite updates still require
+/// an executable maintenance evaluator; a partition flag cannot authorize them.
 fn collect_selected_materializations(
     node: &Rc<SummaryNode>,
     composable: bool,
@@ -3625,6 +3630,50 @@ fn stable_workload_plan_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_partition_must_match_the_bound_dag_reduction() {
+        let mut env = environment(10_000);
+        env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        env.collector_ids.clear();
+        let mut plan = PhysicalCompiler
+            .compile(request("scope", "sum_over_time(m[1m])"), env)
+            .unwrap();
+        let installed = plan
+            .precompute_plan
+            .executable_dags
+            .values_mut()
+            .next()
+            .unwrap();
+        let mut dag = installed.document.decode().unwrap();
+        let node = dag
+            .nodes
+            .iter_mut()
+            .find(|node| {
+                matches!(
+                    node.payload,
+                    planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg { .. }
+                )
+            })
+            .unwrap();
+        if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+            reduction, ..
+        } = &mut node.payload
+        {
+            *reduction = planner_types::pre_asap::Reduction::by(vec![]);
+        }
+        installed.document = asap_types::executable_plan::OwnedPostAsapDag::from_executable(
+            installed.document.query_id.clone(),
+            &dag,
+        )
+        .unwrap();
+        assert!(plan
+            .precompute_plan
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("partition"));
+    }
 
     #[test]
     fn raw_per_entity_state_carries_explicit_isolation() {

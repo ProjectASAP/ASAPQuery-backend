@@ -923,10 +923,21 @@ mod tests {
             vec!["job".into()],
         );
         let counter = config(AggregationType::Increase, vec!["job".into()], vec![]);
+        let mut kll = config(AggregationType::DatasketchesKLL, vec![], vec![]);
+        kll.partitioning = Some(asap_types::sds::PopulationPartitioning::PerEntity);
+        let kll_fp = kll.policy_fingerprint();
+        let mut pooled_kll = kll.clone();
+        pooled_kll.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
+        let pooled_kll_fp = pooled_kll.policy_fingerprint();
+        assert_ne!(kll_fp, pooled_kll_fp);
         let cms_fp = cms.policy_fingerprint();
         let counter_fp = counter.policy_fingerprint();
-        let streaming =
-            StreamingConfig::new(HashMap::from([(cms_fp.0, cms), (counter_fp.0, counter)]));
+        let streaming = StreamingConfig::new(HashMap::from([
+            (cms_fp.0, cms),
+            (counter_fp.0, counter),
+            (kll_fp.0, kll),
+            (pooled_kll_fp.0, pooled_kll),
+        ]));
         let hot_reload = physical_config(streaming);
         let physical_plan = hot_reload.physical_plan_snapshot().unwrap();
         let (sender, _worker) = mpsc::channel(8);
@@ -976,6 +987,8 @@ mod tests {
         let mut cms_buckets = 0;
         let mut counter_buckets = 0;
         let mut cms_samples = 0;
+        let mut kll_buckets = 0;
+        let mut pooled_kll_buckets = 0;
         for message in messages {
             let WorkerMessage::GroupSamples {
                 policy_fp, samples, ..
@@ -988,8 +1001,17 @@ mod tests {
                 cms_samples += samples.len();
             } else if policy_fp == counter_fp {
                 counter_buckets += 1;
+            } else if policy_fp == kll_fp {
+                kll_buckets += 1;
+            } else if policy_fp == pooled_kll_fp {
+                pooled_kll_buckets += 1;
             }
         }
+        assert_eq!(kll_buckets, 10, "PerEntity KLL keeps every source series");
+        assert_eq!(
+            pooled_kll_buckets, 1,
+            "Grouped empty keys intentionally pool"
+        );
         assert_eq!(cms_buckets, 1, "Reduce([]) has one global CMS SID");
         assert_eq!(cms_samples, 10, "global CMS receives every source series");
         assert_eq!(
