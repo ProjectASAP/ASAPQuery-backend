@@ -1,0 +1,5958 @@
+{
+  "artifact": {
+    "schema_version": 1,
+    "producer_version": "1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+    "records": [
+      {
+        "id": "zipf/synthetic-0",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.4,
+          "recall_loss_120": 0.5,
+          "recall_loss_2": 0.30000000000000004,
+          "recall_loss_30": 0.5
+        },
+        "resources": {
+          "memory_bytes": 3584.0,
+          "update_cpu_seconds": 5.698474427089063e-07,
+          "merge_cpu_seconds": 1.307957006369427e-05,
+          "query_cpu_seconds": 2.1263958333333334e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-1",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.4,
+          "recall_loss_120": 0.5,
+          "recall_loss_2": 0.30000000000000004,
+          "recall_loss_30": 0.5
+        },
+        "resources": {
+          "memory_bytes": 4096.0,
+          "update_cpu_seconds": 5.736230451362152e-07,
+          "merge_cpu_seconds": 2.6623300424628448e-05,
+          "query_cpu_seconds": 4.848145833333333e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-2",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.4,
+          "recall_loss_120": 0.5,
+          "recall_loss_2": 0.30000000000000004,
+          "recall_loss_30": 0.5
+        },
+        "resources": {
+          "memory_bytes": 5120.0,
+          "update_cpu_seconds": 5.772996956085994e-07,
+          "merge_cpu_seconds": 5.177467834394905e-05,
+          "query_cpu_seconds": 1.24419375e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-3",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 6656.0,
+          "update_cpu_seconds": 5.684236838020508e-07,
+          "merge_cpu_seconds": 1.3098589171974522e-05,
+          "query_cpu_seconds": 1.967270833333333e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-4",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 5.714206326770066e-07,
+          "merge_cpu_seconds": 2.689290658174098e-05,
+          "query_cpu_seconds": 4.582354166666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-5",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 5.745459626737066e-07,
+          "merge_cpu_seconds": 5.244195647558386e-05,
+          "query_cpu_seconds": 1.2041708333333334e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-6",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 12800.0,
+          "update_cpu_seconds": 5.683148142851905e-07,
+          "merge_cpu_seconds": 1.3817764331210192e-05,
+          "query_cpu_seconds": 1.929791666666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-7",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 13312.0,
+          "update_cpu_seconds": 5.70769922023002e-07,
+          "merge_cpu_seconds": 2.7494198513800424e-05,
+          "query_cpu_seconds": 4.5410625e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-8",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 14336.0,
+          "update_cpu_seconds": 5.728131716960609e-07,
+          "merge_cpu_seconds": 5.2956964968152854e-05,
+          "query_cpu_seconds": 1.1329791666666664e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-9",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 25088.0,
+          "update_cpu_seconds": 5.691973410821447e-07,
+          "merge_cpu_seconds": 1.5400876857749467e-05,
+          "query_cpu_seconds": 1.941666666666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-10",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 25600.0,
+          "update_cpu_seconds": 5.710986258081863e-07,
+          "merge_cpu_seconds": 2.869023885350318e-05,
+          "query_cpu_seconds": 4.309645833333334e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-11",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 26624.0,
+          "update_cpu_seconds": 5.726436231804348e-07,
+          "merge_cpu_seconds": 5.433722292993631e-05,
+          "query_cpu_seconds": 1.0870270833333334e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-12",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 5632.0,
+          "update_cpu_seconds": 6.83539533971327e-07,
+          "merge_cpu_seconds": 1.537746390658174e-05,
+          "query_cpu_seconds": 1.9672916666666673e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-13",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 6144.0,
+          "update_cpu_seconds": 6.874763320255687e-07,
+          "merge_cpu_seconds": 3.1619685774946924e-05,
+          "query_cpu_seconds": 4.507479166666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-14",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 6.916676069128197e-07,
+          "merge_cpu_seconds": 6.21805838641189e-05,
+          "query_cpu_seconds": 1.1835895833333334e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-15",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 10752.0,
+          "update_cpu_seconds": 6.841687114851074e-07,
+          "merge_cpu_seconds": 1.612357430997877e-05,
+          "query_cpu_seconds": 1.9787916666666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-16",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 11264.0,
+          "update_cpu_seconds": 6.875256122660996e-07,
+          "merge_cpu_seconds": 3.2112968152866247e-05,
+          "query_cpu_seconds": 4.366375e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-17",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 12288.0,
+          "update_cpu_seconds": 6.887087058629415e-07,
+          "merge_cpu_seconds": 6.25226518046709e-05,
+          "query_cpu_seconds": 1.1546833333333334e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-18",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 20992.0,
+          "update_cpu_seconds": 6.846631488407338e-07,
+          "merge_cpu_seconds": 1.70867016985138e-05,
+          "query_cpu_seconds": 1.9168125e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-19",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 21504.0,
+          "update_cpu_seconds": 6.873128381549518e-07,
+          "merge_cpu_seconds": 3.308256475583864e-05,
+          "query_cpu_seconds": 4.227666666666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-20",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 22528.0,
+          "update_cpu_seconds": 6.894425950573828e-07,
+          "merge_cpu_seconds": 6.368552123142251e-05,
+          "query_cpu_seconds": 1.1225229166666665e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-21",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 41472.0,
+          "update_cpu_seconds": 6.846739584937484e-07,
+          "merge_cpu_seconds": 1.9179409766454353e-05,
+          "query_cpu_seconds": 1.947125e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-22",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 41984.0,
+          "update_cpu_seconds": 6.882191365086349e-07,
+          "merge_cpu_seconds": 3.551780997876858e-05,
+          "query_cpu_seconds": 4.247583333333333e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-23",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 43008.0,
+          "update_cpu_seconds": 6.888111322553441e-07,
+          "merge_cpu_seconds": 6.506534819532908e-05,
+          "query_cpu_seconds": 1.0773541666666666e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-24",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 7680.0,
+          "update_cpu_seconds": 7.987099534949095e-07,
+          "merge_cpu_seconds": 1.8213332271762208e-05,
+          "query_cpu_seconds": 2.049125e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-25",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 8.000633948104962e-07,
+          "merge_cpu_seconds": 3.661803927813164e-05,
+          "query_cpu_seconds": 4.318145833333334e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-26",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 9216.0,
+          "update_cpu_seconds": 8.031641074811475e-07,
+          "merge_cpu_seconds": 7.219208917197452e-05,
+          "query_cpu_seconds": 1.216325e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-27",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 14848.0,
+          "update_cpu_seconds": 7.961737090406873e-07,
+          "merge_cpu_seconds": 1.916495753715499e-05,
+          "query_cpu_seconds": 2.215875e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-28",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 15360.0,
+          "update_cpu_seconds": 7.995750726603844e-07,
+          "merge_cpu_seconds": 3.7700348195329084e-05,
+          "query_cpu_seconds": 4.6310625e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-29",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 16384.0,
+          "update_cpu_seconds": 8.05445714870629e-07,
+          "merge_cpu_seconds": 7.299608811040339e-05,
+          "query_cpu_seconds": 1.1591416666666669e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-30",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 29184.0,
+          "update_cpu_seconds": 7.982301369486306e-07,
+          "merge_cpu_seconds": 2.098038322717622e-05,
+          "query_cpu_seconds": 2.0316250000000002e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-31",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 29696.0,
+          "update_cpu_seconds": 7.999359919456361e-07,
+          "merge_cpu_seconds": 3.97617229299363e-05,
+          "query_cpu_seconds": 4.739104166666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-32",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 30720.0,
+          "update_cpu_seconds": 8.031970692015303e-07,
+          "merge_cpu_seconds": 7.46772101910828e-05,
+          "query_cpu_seconds": 1.2064291666666666e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-33",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 57856.0,
+          "update_cpu_seconds": 7.984306756987985e-07,
+          "merge_cpu_seconds": 2.420330042462845e-05,
+          "query_cpu_seconds": 2.024375e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-34",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 58368.0,
+          "update_cpu_seconds": 8.001000919713026e-07,
+          "merge_cpu_seconds": 4.299866029723992e-05,
+          "query_cpu_seconds": 5.4359375e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-35",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 59392.0,
+          "update_cpu_seconds": 8.048312787372125e-07,
+          "merge_cpu_seconds": 8.899227919320595e-05,
+          "query_cpu_seconds": 1.2380125e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-36",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.8,
+          "recall_loss_120": 0.8,
+          "recall_loss_2": 0.7,
+          "recall_loss_30": 0.8
+        },
+        "resources": {
+          "memory_bytes": 3584.0,
+          "update_cpu_seconds": 7.257754801451986e-07,
+          "merge_cpu_seconds": 1.6377882165605094e-05,
+          "query_cpu_seconds": 2.5186249999999995e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-37",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.8,
+          "recall_loss_120": 0.8,
+          "recall_loss_2": 0.7,
+          "recall_loss_30": 0.8
+        },
+        "resources": {
+          "memory_bytes": 4096.0,
+          "update_cpu_seconds": 7.317947782299955e-07,
+          "merge_cpu_seconds": 3.4371266454352445e-05,
+          "query_cpu_seconds": 5.909500000000001e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-38",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.8,
+          "recall_loss_120": 0.8,
+          "recall_loss_2": 0.7,
+          "recall_loss_30": 0.8
+        },
+        "resources": {
+          "memory_bytes": 5120.0,
+          "update_cpu_seconds": 7.341583043669563e-07,
+          "merge_cpu_seconds": 6.737253609341825e-05,
+          "query_cpu_seconds": 1.4870145833333336e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-39",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.6,
+          "recall_loss_120": 0.7,
+          "recall_loss_2": 0.5,
+          "recall_loss_30": 0.7
+        },
+        "resources": {
+          "memory_bytes": 6656.0,
+          "update_cpu_seconds": 7.267811536440192e-07,
+          "merge_cpu_seconds": 1.67345127388535e-05,
+          "query_cpu_seconds": 2.3442708333333334e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-40",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.6,
+          "recall_loss_120": 0.7,
+          "recall_loss_2": 0.5,
+          "recall_loss_30": 0.7
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 7.31248905755387e-07,
+          "merge_cpu_seconds": 3.3988216560509556e-05,
+          "query_cpu_seconds": 5.237479166666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-41",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.6,
+          "recall_loss_120": 0.7,
+          "recall_loss_2": 0.5,
+          "recall_loss_30": 0.7
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 7.341316964274803e-07,
+          "merge_cpu_seconds": 6.6723474522293e-05,
+          "query_cpu_seconds": 1.2816375e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-42",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.5,
+          "recall_loss_120": 0.5,
+          "recall_loss_2": 0.4,
+          "recall_loss_30": 0.5
+        },
+        "resources": {
+          "memory_bytes": 12800.0,
+          "update_cpu_seconds": 7.266525153081802e-07,
+          "merge_cpu_seconds": 1.7242476645435244e-05,
+          "query_cpu_seconds": 2.211e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-43",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.5,
+          "recall_loss_120": 0.5,
+          "recall_loss_2": 0.4,
+          "recall_loss_30": 0.5
+        },
+        "resources": {
+          "memory_bytes": 13312.0,
+          "update_cpu_seconds": 7.318324430755692e-07,
+          "merge_cpu_seconds": 3.5835608280254784e-05,
+          "query_cpu_seconds": 4.916166666666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-44",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.5,
+          "recall_loss_120": 0.5,
+          "recall_loss_2": 0.4,
+          "recall_loss_30": 0.5
+        },
+        "resources": {
+          "memory_bytes": 14336.0,
+          "update_cpu_seconds": 7.351944096114595e-07,
+          "merge_cpu_seconds": 6.83209288747346e-05,
+          "query_cpu_seconds": 1.30671875e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-45",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.4,
+          "recall_loss_2": 0.19999999999999996,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 25088.0,
+          "update_cpu_seconds": 7.274707749422507e-07,
+          "merge_cpu_seconds": 1.94665923566879e-05,
+          "query_cpu_seconds": 2.189208333333333e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-46",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.30000000000000004,
+          "recall_loss_120": 0.4,
+          "recall_loss_2": 0.19999999999999996,
+          "recall_loss_30": 0.4
+        },
+        "resources": {
+          "memory_bytes": 25600.0,
+          "update_cpu_seconds": 7.319787614123859e-07,
+          "merge_cpu_seconds": 3.710749893842888e-05,
+          "query_cpu_seconds": 4.813229166666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-47",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.4,
+          "recall_loss_120": 0.4,
+          "recall_loss_2": 0.19999999999999996,
+          "recall_loss_30": 0.4
+        },
+        "resources": {
+          "memory_bytes": 26624.0,
+          "update_cpu_seconds": 7.353493166012783e-07,
+          "merge_cpu_seconds": 6.991371231422504e-05,
+          "query_cpu_seconds": 1.2771666666666667e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-48",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.5,
+          "recall_loss_120": 0.6,
+          "recall_loss_2": 0.30000000000000004,
+          "recall_loss_30": 0.6
+        },
+        "resources": {
+          "memory_bytes": 5632.0,
+          "update_cpu_seconds": 8.895283165279458e-07,
+          "merge_cpu_seconds": 1.921816348195329e-05,
+          "query_cpu_seconds": 2.102104166666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-49",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.5,
+          "recall_loss_120": 0.6,
+          "recall_loss_2": 0.4,
+          "recall_loss_30": 0.6
+        },
+        "resources": {
+          "memory_bytes": 6144.0,
+          "update_cpu_seconds": 8.949222702550753e-07,
+          "merge_cpu_seconds": 3.948925477707006e-05,
+          "query_cpu_seconds": 4.696458333333333e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-50",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.5,
+          "recall_loss_120": 0.6,
+          "recall_loss_2": 0.4,
+          "recall_loss_30": 0.6
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 8.981304134736431e-07,
+          "merge_cpu_seconds": 7.884244692144373e-05,
+          "query_cpu_seconds": 1.2528875e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-51",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.30000000000000004,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 10752.0,
+          "update_cpu_seconds": 8.9145542899571e-07,
+          "merge_cpu_seconds": 1.954025583864119e-05,
+          "query_cpu_seconds": 1.976416666666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-52",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.30000000000000004,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 11264.0,
+          "update_cpu_seconds": 8.986603507742701e-07,
+          "merge_cpu_seconds": 3.982281210191083e-05,
+          "query_cpu_seconds": 4.797208333333334e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-53",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.30000000000000004,
+          "recall_loss_120": 0.30000000000000004,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 12288.0,
+          "update_cpu_seconds": 8.993355711998435e-07,
+          "merge_cpu_seconds": 7.928672929936307e-05,
+          "query_cpu_seconds": 1.2035979166666667e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-54",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 20992.0,
+          "update_cpu_seconds": 8.904739576382014e-07,
+          "merge_cpu_seconds": 2.094628450106157e-05,
+          "query_cpu_seconds": 1.9149791666666665e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-55",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 21504.0,
+          "update_cpu_seconds": 8.953090789425439e-07,
+          "merge_cpu_seconds": 4.102898407643313e-05,
+          "query_cpu_seconds": 4.376791666666668e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-56",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 22528.0,
+          "update_cpu_seconds": 8.990501425096859e-07,
+          "merge_cpu_seconds": 8.008097027600848e-05,
+          "query_cpu_seconds": 1.1764541666666666e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-57",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 41472.0,
+          "update_cpu_seconds": 8.907589975433578e-07,
+          "merge_cpu_seconds": 2.3613926751592357e-05,
+          "query_cpu_seconds": 1.9606458333333333e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-58",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 41984.0,
+          "update_cpu_seconds": 8.94314669392195e-07,
+          "merge_cpu_seconds": 4.327835244161358e-05,
+          "query_cpu_seconds": 4.332958333333334e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-59",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 43008.0,
+          "update_cpu_seconds": 8.984919231474353e-07,
+          "merge_cpu_seconds": 8.236462845010616e-05,
+          "query_cpu_seconds": 1.13480625e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-60",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 7680.0,
+          "update_cpu_seconds": 1.0636555121671004e-06,
+          "merge_cpu_seconds": 2.2888613588110403e-05,
+          "query_cpu_seconds": 1.9682916666666665e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-61",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 1.0683784206602377e-06,
+          "merge_cpu_seconds": 4.521626963906582e-05,
+          "query_cpu_seconds": 4.579729166666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-62",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 9216.0,
+          "update_cpu_seconds": 1.0721665604566178e-06,
+          "merge_cpu_seconds": 9.085908917197452e-05,
+          "query_cpu_seconds": 1.1980854166666666e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-63",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 14848.0,
+          "update_cpu_seconds": 1.062100003422188e-06,
+          "merge_cpu_seconds": 2.2802139065817407e-05,
+          "query_cpu_seconds": 1.9254375e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-64",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 15360.0,
+          "update_cpu_seconds": 1.0676326261015168e-06,
+          "merge_cpu_seconds": 4.591692781316349e-05,
+          "query_cpu_seconds": 4.326833333333333e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-65",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.09999999999999998,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 16384.0,
+          "update_cpu_seconds": 1.072564879612315e-06,
+          "merge_cpu_seconds": 9.153557324840764e-05,
+          "query_cpu_seconds": 1.1890333333333335e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-66",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 29184.0,
+          "update_cpu_seconds": 1.0640322074334811e-06,
+          "merge_cpu_seconds": 2.4235583864118895e-05,
+          "query_cpu_seconds": 1.91625e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-67",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 29696.0,
+          "update_cpu_seconds": 1.0683985356090886e-06,
+          "merge_cpu_seconds": 4.7815364118895966e-05,
+          "query_cpu_seconds": 4.512229166666667e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-68",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 30720.0,
+          "update_cpu_seconds": 1.072692178833767e-06,
+          "merge_cpu_seconds": 9.234046072186837e-05,
+          "query_cpu_seconds": 1.1453145833333333e-05
+        }
+      },
+      {
+        "id": "zipf/synthetic-69",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 57856.0,
+          "update_cpu_seconds": 1.0639884649653505e-06,
+          "merge_cpu_seconds": 2.7423040339702758e-05,
+          "query_cpu_seconds": 1.9387083333333335e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-70",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 58368.0,
+          "update_cpu_seconds": 1.0686337022574219e-06,
+          "merge_cpu_seconds": 5.077869957537156e-05,
+          "query_cpu_seconds": 4.3484166666666664e-06
+        }
+      },
+      {
+        "id": "zipf/synthetic-71",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "zipf/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 59392.0,
+          "update_cpu_seconds": 1.0724163958249306e-06,
+          "merge_cpu_seconds": 9.590203184713375e-05,
+          "query_cpu_seconds": 1.1289333333333332e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-0",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 3584.0,
+          "update_cpu_seconds": 5.893475319278948e-07,
+          "merge_cpu_seconds": 1.257055414012739e-05,
+          "query_cpu_seconds": 2.0767916666666664e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-1",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 4096.0,
+          "update_cpu_seconds": 6.060660611060189e-07,
+          "merge_cpu_seconds": 2.6319197452229297e-05,
+          "query_cpu_seconds": 4.829104166666667e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-2",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 5120.0,
+          "update_cpu_seconds": 6.361688970363581e-07,
+          "merge_cpu_seconds": 5.2380300424628456e-05,
+          "query_cpu_seconds": 1.2885875000000001e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-3",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 6656.0,
+          "update_cpu_seconds": 5.8464e-07,
+          "merge_cpu_seconds": 1.2997601910828027e-05,
+          "query_cpu_seconds": 2.0920833333333336e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-4",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 5.965711811793462e-07,
+          "merge_cpu_seconds": 2.7124611464968157e-05,
+          "query_cpu_seconds": 4.868104166666667e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-5",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 6.174532930033609e-07,
+          "merge_cpu_seconds": 5.254645222929936e-05,
+          "query_cpu_seconds": 1.3083395833333333e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-6",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 12800.0,
+          "update_cpu_seconds": 5.802561393217231e-07,
+          "merge_cpu_seconds": 1.3249066878980892e-05,
+          "query_cpu_seconds": 2.138375e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-7",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 13312.0,
+          "update_cpu_seconds": 5.892023941338222e-07,
+          "merge_cpu_seconds": 2.7415988322717622e-05,
+          "query_cpu_seconds": 5.0532083333333335e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-8",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 14336.0,
+          "update_cpu_seconds": 6.030003776351971e-07,
+          "merge_cpu_seconds": 5.3173130573248415e-05,
+          "query_cpu_seconds": 1.3474979166666666e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-9",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 25088.0,
+          "update_cpu_seconds": 5.778472160097769e-07,
+          "merge_cpu_seconds": 1.44674957537155e-05,
+          "query_cpu_seconds": 2.2023958333333336e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-10",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 25600.0,
+          "update_cpu_seconds": 5.828180910479683e-07,
+          "merge_cpu_seconds": 2.8322437367303606e-05,
+          "query_cpu_seconds": 5.258875e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-11",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 26624.0,
+          "update_cpu_seconds": 5.953238350137488e-07,
+          "merge_cpu_seconds": 5.5352101910828024e-05,
+          "query_cpu_seconds": 1.3768541666666667e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-12",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 5632.0,
+          "update_cpu_seconds": 7.061594311029636e-07,
+          "merge_cpu_seconds": 1.594994373673036e-05,
+          "query_cpu_seconds": 2.1788541666666666e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-13",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 6144.0,
+          "update_cpu_seconds": 7.19829851512374e-07,
+          "merge_cpu_seconds": 3.1494228237791934e-05,
+          "query_cpu_seconds": 4.7803541666666666e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-14",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 7.493641209899175e-07,
+          "merge_cpu_seconds": 6.301336518046708e-05,
+          "query_cpu_seconds": 1.350425e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-15",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 10752.0,
+          "update_cpu_seconds": 6.95359564314085e-07,
+          "merge_cpu_seconds": 1.54037898089172e-05,
+          "query_cpu_seconds": 2.1188125e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-16",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 11264.0,
+          "update_cpu_seconds": 7.077772435074853e-07,
+          "merge_cpu_seconds": 3.168872186836518e-05,
+          "query_cpu_seconds": 5.033458333333333e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-17",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 12288.0,
+          "update_cpu_seconds": 7.298659419492821e-07,
+          "merge_cpu_seconds": 6.287335774946921e-05,
+          "query_cpu_seconds": 1.3485020833333333e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-18",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 20992.0,
+          "update_cpu_seconds": 6.913867668805377e-07,
+          "merge_cpu_seconds": 1.5970764331210192e-05,
+          "query_cpu_seconds": 2.1587916666666666e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-19",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 21504.0,
+          "update_cpu_seconds": 6.992287974335472e-07,
+          "merge_cpu_seconds": 3.228739384288747e-05,
+          "query_cpu_seconds": 5.279854166666666e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-20",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 22528.0,
+          "update_cpu_seconds": 7.134724472960586e-07,
+          "merge_cpu_seconds": 6.317039065817408e-05,
+          "query_cpu_seconds": 1.3739729166666668e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-21",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 41472.0,
+          "update_cpu_seconds": 6.894797616865261e-07,
+          "merge_cpu_seconds": 1.705336093418259e-05,
+          "query_cpu_seconds": 2.2493125000000002e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-22",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 41984.0,
+          "update_cpu_seconds": 6.932725334555453e-07,
+          "merge_cpu_seconds": 3.3493499999999994e-05,
+          "query_cpu_seconds": 5.4753541666666675e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-23",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 43008.0,
+          "update_cpu_seconds": 7.021336895814238e-07,
+          "merge_cpu_seconds": 6.364885350318471e-05,
+          "query_cpu_seconds": 1.4014333333333334e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-24",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 7680.0,
+          "update_cpu_seconds": 8.137480439963338e-07,
+          "merge_cpu_seconds": 1.763963375796178e-05,
+          "query_cpu_seconds": 2.111e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-25",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 8.311110235258172e-07,
+          "merge_cpu_seconds": 3.660263694267516e-05,
+          "query_cpu_seconds": 5.305812499999999e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-26",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 9216.0,
+          "update_cpu_seconds": 8.611902242590895e-07,
+          "merge_cpu_seconds": 7.197627600849257e-05,
+          "query_cpu_seconds": 1.2888520833333333e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-27",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 14848.0,
+          "update_cpu_seconds": 8.067780232202872e-07,
+          "merge_cpu_seconds": 1.8086811040339705e-05,
+          "query_cpu_seconds": 2.2063541666666667e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-28",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 15360.0,
+          "update_cpu_seconds": 8.193019767797128e-07,
+          "merge_cpu_seconds": 3.726702441613588e-05,
+          "query_cpu_seconds": 5.5388125e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-29",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 16384.0,
+          "update_cpu_seconds": 8.405290351359609e-07,
+          "merge_cpu_seconds": 7.236068789808916e-05,
+          "query_cpu_seconds": 1.33316875e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-30",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 29184.0,
+          "update_cpu_seconds": 8.037296052551176e-07,
+          "merge_cpu_seconds": 1.9077565817409765e-05,
+          "query_cpu_seconds": 2.301645833333333e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-31",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 29696.0,
+          "update_cpu_seconds": 8.099351934005499e-07,
+          "merge_cpu_seconds": 3.779247346072187e-05,
+          "query_cpu_seconds": 5.5340416666666675e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-32",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 30720.0,
+          "update_cpu_seconds": 8.2343912923923e-07,
+          "merge_cpu_seconds": 7.290488004246285e-05,
+          "query_cpu_seconds": 1.38720625e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-33",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 57856.0,
+          "update_cpu_seconds": 8.024653809960282e-07,
+          "merge_cpu_seconds": 2.0565734607218684e-05,
+          "query_cpu_seconds": 2.398333333333333e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-34",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 58368.0,
+          "update_cpu_seconds": 8.050015368163764e-07,
+          "merge_cpu_seconds": 3.948813906581741e-05,
+          "query_cpu_seconds": 5.824124999999999e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-35",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 59392.0,
+          "update_cpu_seconds": 8.12606867705469e-07,
+          "merge_cpu_seconds": 7.498957324840764e-05,
+          "query_cpu_seconds": 1.4543583333333332e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-36",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 3584.0,
+          "update_cpu_seconds": 7.498876437519095e-07,
+          "merge_cpu_seconds": 1.6260178343949045e-05,
+          "query_cpu_seconds": 2.2094375e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-37",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 4096.0,
+          "update_cpu_seconds": 7.561542719217843e-07,
+          "merge_cpu_seconds": 3.408538959660297e-05,
+          "query_cpu_seconds": 5.506729166666667e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-38",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 5120.0,
+          "update_cpu_seconds": 7.683686312251757e-07,
+          "merge_cpu_seconds": 6.784727919320595e-05,
+          "query_cpu_seconds": 1.2926e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-39",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 6656.0,
+          "update_cpu_seconds": 7.498859486709441e-07,
+          "merge_cpu_seconds": 1.650122186836518e-05,
+          "query_cpu_seconds": 2.2391458333333333e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-40",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 7.544633651084632e-07,
+          "merge_cpu_seconds": 3.4331209129511675e-05,
+          "query_cpu_seconds": 5.650895833333334e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-41",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 7.644445053467765e-07,
+          "merge_cpu_seconds": 6.810894904458598e-05,
+          "query_cpu_seconds": 1.3245833333333333e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-42",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 12800.0,
+          "update_cpu_seconds": 7.481065084020776e-07,
+          "merge_cpu_seconds": 1.6828267515923566e-05,
+          "query_cpu_seconds": 2.2758541666666667e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-43",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 13312.0,
+          "update_cpu_seconds": 7.513047436602505e-07,
+          "merge_cpu_seconds": 3.472006050955414e-05,
+          "query_cpu_seconds": 5.972083333333333e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-44",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 14336.0,
+          "update_cpu_seconds": 7.58896151542927e-07,
+          "merge_cpu_seconds": 6.869919957537156e-05,
+          "query_cpu_seconds": 1.3664770833333336e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-45",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 25088.0,
+          "update_cpu_seconds": 7.471281130461351e-07,
+          "merge_cpu_seconds": 1.768011464968153e-05,
+          "query_cpu_seconds": 2.3168958333333335e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-46",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 25600.0,
+          "update_cpu_seconds": 7.492603275282615e-07,
+          "merge_cpu_seconds": 3.5527089171974526e-05,
+          "query_cpu_seconds": 5.956708333333334e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-47",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 26624.0,
+          "update_cpu_seconds": 7.563586403910786e-07,
+          "merge_cpu_seconds": 6.945726539278131e-05,
+          "query_cpu_seconds": 1.4101729166666667e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-48",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 5632.0,
+          "update_cpu_seconds": 9.235059498930645e-07,
+          "merge_cpu_seconds": 1.96696889596603e-05,
+          "query_cpu_seconds": 2.2173541666666663e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-49",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 6144.0,
+          "update_cpu_seconds": 9.299611989000917e-07,
+          "merge_cpu_seconds": 4.075833227176221e-05,
+          "query_cpu_seconds": 5.515354166666666e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-50",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 9.395790241368775e-07,
+          "merge_cpu_seconds": 8.12268566878981e-05,
+          "query_cpu_seconds": 1.3272062499999999e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-51",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 10752.0,
+          "update_cpu_seconds": 9.232003715245952e-07,
+          "merge_cpu_seconds": 1.991569851380043e-05,
+          "query_cpu_seconds": 2.27775e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-52",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 11264.0,
+          "update_cpu_seconds": 9.270082425908952e-07,
+          "merge_cpu_seconds": 4.102477388535032e-05,
+          "query_cpu_seconds": 5.664208333333334e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-53",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 12288.0,
+          "update_cpu_seconds": 9.379224827375497e-07,
+          "merge_cpu_seconds": 8.143032908704884e-05,
+          "query_cpu_seconds": 1.3598354166666666e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-54",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 20992.0,
+          "update_cpu_seconds": 9.214606202260923e-07,
+          "merge_cpu_seconds": 2.0553266454352443e-05,
+          "query_cpu_seconds": 2.3275e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-55",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 21504.0,
+          "update_cpu_seconds": 9.248567986556676e-07,
+          "merge_cpu_seconds": 4.164796072186837e-05,
+          "query_cpu_seconds": 5.918541666666666e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-56",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 22528.0,
+          "update_cpu_seconds": 9.319989599755577e-07,
+          "merge_cpu_seconds": 8.197253503184714e-05,
+          "query_cpu_seconds": 1.40730625e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-57",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 41472.0,
+          "update_cpu_seconds": 9.195883709135351e-07,
+          "merge_cpu_seconds": 2.2046713375796175e-05,
+          "query_cpu_seconds": 2.3724166666666666e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-58",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 41984.0,
+          "update_cpu_seconds": 9.208424399633364e-07,
+          "merge_cpu_seconds": 4.270767834394905e-05,
+          "query_cpu_seconds": 5.705708333333334e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-59",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 43008.0,
+          "update_cpu_seconds": 9.269965169569202e-07,
+          "merge_cpu_seconds": 8.31487940552017e-05,
+          "query_cpu_seconds": 1.4400916666666665e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-60",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 7680.0,
+          "update_cpu_seconds": 1.1114916987473266e-06,
+          "merge_cpu_seconds": 2.3275311040339704e-05,
+          "query_cpu_seconds": 2.2296666666666666e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-61",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 1.1168838906202262e-06,
+          "merge_cpu_seconds": 4.8075533970276005e-05,
+          "query_cpu_seconds": 5.530979166666667e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-62",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 9216.0,
+          "update_cpu_seconds": 1.1259280788267644e-06,
+          "merge_cpu_seconds": 9.563413375796178e-05,
+          "query_cpu_seconds": 1.3564354166666666e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-63",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 14848.0,
+          "update_cpu_seconds": 1.1091977011915672e-06,
+          "merge_cpu_seconds": 2.37800042462845e-05,
+          "query_cpu_seconds": 2.277145833333333e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-64",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 15360.0,
+          "update_cpu_seconds": 1.1156208958142378e-06,
+          "merge_cpu_seconds": 4.8492348195329085e-05,
+          "query_cpu_seconds": 5.721520833333333e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-65",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 16384.0,
+          "update_cpu_seconds": 1.1212455820348306e-06,
+          "merge_cpu_seconds": 9.589930891719743e-05,
+          "query_cpu_seconds": 1.3863916666666665e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-66",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 29184.0,
+          "update_cpu_seconds": 1.107685296669722e-06,
+          "merge_cpu_seconds": 2.4803766454352442e-05,
+          "query_cpu_seconds": 2.3652708333333333e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-67",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 29696.0,
+          "update_cpu_seconds": 1.1102621393217232e-06,
+          "merge_cpu_seconds": 4.9150319532908707e-05,
+          "query_cpu_seconds": 5.986166666666667e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-68",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 30720.0,
+          "update_cpu_seconds": 1.116553038802322e-06,
+          "merge_cpu_seconds": 9.711987473460722e-05,
+          "query_cpu_seconds": 1.4467583333333333e-05
+        }
+      },
+      {
+        "id": "uniform/synthetic-69",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 57856.0,
+          "update_cpu_seconds": 1.1031870284142987e-06,
+          "merge_cpu_seconds": 3.005078662420382e-05,
+          "query_cpu_seconds": 2.5486875000000002e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-70",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 58368.0,
+          "update_cpu_seconds": 1.105160490681332e-06,
+          "merge_cpu_seconds": 5.3766966029723994e-05,
+          "query_cpu_seconds": 6.2117499999999994e-06
+        }
+      },
+      {
+        "id": "uniform/synthetic-71",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "uniform/synthetic"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 1.0,
+          "recall_loss_120": 1.0,
+          "recall_loss_2": 1.0,
+          "recall_loss_30": 1.0
+        },
+        "resources": {
+          "memory_bytes": 59392.0,
+          "update_cpu_seconds": 1.109839435991445e-06,
+          "merge_cpu_seconds": 0.00010160391825902337,
+          "query_cpu_seconds": 1.5075291666666668e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-0",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 3584.0,
+          "update_cpu_seconds": 1.065090909090909e-06,
+          "merge_cpu_seconds": 9.758357749469214e-06,
+          "query_cpu_seconds": 2.5483541666666666e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-1",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 4096.0,
+          "update_cpu_seconds": 8.660054545454545e-07,
+          "merge_cpu_seconds": 1.567803609341826e-05,
+          "query_cpu_seconds": 4.547583333333334e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-2",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.4,
+          "recall_loss_120": 0.30000000000000004,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.5
+        },
+        "resources": {
+          "memory_bytes": 5120.0,
+          "update_cpu_seconds": 8.479836363636363e-07,
+          "merge_cpu_seconds": 2.7585924628450104e-05,
+          "query_cpu_seconds": 1.0049145833333334e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-3",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 6656.0,
+          "update_cpu_seconds": 7.197572727272728e-07,
+          "merge_cpu_seconds": 7.694791932059448e-06,
+          "query_cpu_seconds": 1.7961249999999999e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-4",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 7.396172727272727e-07,
+          "merge_cpu_seconds": 1.466289702760085e-05,
+          "query_cpu_seconds": 4.09475e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-5",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 8.29670303030303e-07,
+          "merge_cpu_seconds": 2.7539072186836517e-05,
+          "query_cpu_seconds": 9.991479166666667e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-6",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 12800.0,
+          "update_cpu_seconds": 7.346506060606061e-07,
+          "merge_cpu_seconds": 8.022659235668791e-06,
+          "query_cpu_seconds": 1.7859791666666663e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-7",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 13312.0,
+          "update_cpu_seconds": 7.909509090909092e-07,
+          "merge_cpu_seconds": 1.5020737791932061e-05,
+          "query_cpu_seconds": 4.1278541666666665e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-8",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 14336.0,
+          "update_cpu_seconds": 8.962866666666666e-07,
+          "merge_cpu_seconds": 2.7926216560509556e-05,
+          "query_cpu_seconds": 1.016145833333333e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-9",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 25088.0,
+          "update_cpu_seconds": 1.0701290909090908e-06,
+          "merge_cpu_seconds": 8.781480891719745e-06,
+          "query_cpu_seconds": 1.7957708333333333e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-10",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 25600.0,
+          "update_cpu_seconds": 1.131630303030303e-06,
+          "merge_cpu_seconds": 1.5693728237791932e-05,
+          "query_cpu_seconds": 4.056979166666667e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-11",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 26624.0,
+          "update_cpu_seconds": 1.3844724242424242e-06,
+          "merge_cpu_seconds": 2.8509027600849253e-05,
+          "query_cpu_seconds": 1.0195083333333332e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-12",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 5632.0,
+          "update_cpu_seconds": 8.209481818181819e-07,
+          "merge_cpu_seconds": 9.009654989384288e-06,
+          "query_cpu_seconds": 1.7833333333333331e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-13",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 6144.0,
+          "update_cpu_seconds": 8.479266666666666e-07,
+          "merge_cpu_seconds": 1.713888747346072e-05,
+          "query_cpu_seconds": 4.009625000000001e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-14",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 8.802427272727273e-07,
+          "merge_cpu_seconds": 3.1999287685774945e-05,
+          "query_cpu_seconds": 1.0121729166666668e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-15",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 10752.0,
+          "update_cpu_seconds": 8.429936363636364e-07,
+          "merge_cpu_seconds": 9.214222929936306e-06,
+          "query_cpu_seconds": 1.7960416666666668e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-16",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 11264.0,
+          "update_cpu_seconds": 8.655493939393939e-07,
+          "merge_cpu_seconds": 1.725480785562633e-05,
+          "query_cpu_seconds": 3.978000000000001e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-17",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 12288.0,
+          "update_cpu_seconds": 9.022845454545455e-07,
+          "merge_cpu_seconds": 3.219954670912951e-05,
+          "query_cpu_seconds": 9.839208333333332e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-18",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 20992.0,
+          "update_cpu_seconds": 8.880669696969697e-07,
+          "merge_cpu_seconds": 9.879809978768578e-06,
+          "query_cpu_seconds": 1.7930208333333332e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-19",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 21504.0,
+          "update_cpu_seconds": 9.097772727272729e-07,
+          "merge_cpu_seconds": 1.792015817409766e-05,
+          "query_cpu_seconds": 4.1350625e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-20",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 22528.0,
+          "update_cpu_seconds": 9.555439393939394e-07,
+          "merge_cpu_seconds": 3.276062951167728e-05,
+          "query_cpu_seconds": 9.922833333333333e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-21",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 41472.0,
+          "update_cpu_seconds": 1.5829157575757577e-06,
+          "merge_cpu_seconds": 1.102827070063694e-05,
+          "query_cpu_seconds": 1.8103541666666668e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-22",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 41984.0,
+          "update_cpu_seconds": 1.522690606060606e-06,
+          "merge_cpu_seconds": 1.896455838641189e-05,
+          "query_cpu_seconds": 4.3753750000000004e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-23",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 43008.0,
+          "update_cpu_seconds": 1.2988381818181818e-06,
+          "merge_cpu_seconds": 3.382390021231422e-05,
+          "query_cpu_seconds": 1.0057791666666667e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-24",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 7680.0,
+          "update_cpu_seconds": 9.41490606060606e-07,
+          "merge_cpu_seconds": 1.0430451167728238e-05,
+          "query_cpu_seconds": 1.7973333333333333e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-25",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 9.636409090909091e-07,
+          "merge_cpu_seconds": 1.9599875796178346e-05,
+          "query_cpu_seconds": 4.036229166666667e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-26",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 9216.0,
+          "update_cpu_seconds": 1.0056639393939393e-06,
+          "merge_cpu_seconds": 3.6533558386411894e-05,
+          "query_cpu_seconds": 1.0088062500000002e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-27",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 14848.0,
+          "update_cpu_seconds": 9.656321212121213e-07,
+          "merge_cpu_seconds": 1.0797714437367304e-05,
+          "query_cpu_seconds": 1.7931666666666666e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-28",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 15360.0,
+          "update_cpu_seconds": 9.966793939393939e-07,
+          "merge_cpu_seconds": 1.987038322717622e-05,
+          "query_cpu_seconds": 4.1479375e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-29",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 16384.0,
+          "update_cpu_seconds": 1.0269681818181817e-06,
+          "merge_cpu_seconds": 3.6841884288747345e-05,
+          "query_cpu_seconds": 9.945479166666667e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-30",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 29184.0,
+          "update_cpu_seconds": 1.0287042424242423e-06,
+          "merge_cpu_seconds": 1.1628898089171976e-05,
+          "query_cpu_seconds": 1.8022500000000002e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-31",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 29696.0,
+          "update_cpu_seconds": 1.053902424242424e-06,
+          "merge_cpu_seconds": 2.0796951167728238e-05,
+          "query_cpu_seconds": 4.2038125e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-32",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 30720.0,
+          "update_cpu_seconds": 1.2513939393939395e-06,
+          "merge_cpu_seconds": 3.891228025477707e-05,
+          "query_cpu_seconds": 1.0974479166666667e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-33",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 57856.0,
+          "update_cpu_seconds": 1.871588484848485e-06,
+          "merge_cpu_seconds": 1.3382970276008493e-05,
+          "query_cpu_seconds": 1.8285000000000002e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-34",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 58368.0,
+          "update_cpu_seconds": 1.7766866666666666e-06,
+          "merge_cpu_seconds": 2.2200422505307854e-05,
+          "query_cpu_seconds": 4.1665625e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-35",
+        "sketch": "Cms",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "Cms",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 59392.0,
+          "update_cpu_seconds": 1.718662121212121e-06,
+          "merge_cpu_seconds": 3.9140801486199574e-05,
+          "query_cpu_seconds": 1.0150291666666667e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-36",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.4,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.4
+        },
+        "resources": {
+          "memory_bytes": 3584.0,
+          "update_cpu_seconds": 8.93431212121212e-07,
+          "merge_cpu_seconds": 9.470864118895966e-06,
+          "query_cpu_seconds": 1.8448958333333332e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-37",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.4,
+          "recall_loss_120": 0.30000000000000004,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 4096.0,
+          "update_cpu_seconds": 9.204654545454546e-07,
+          "merge_cpu_seconds": 1.7932676220806795e-05,
+          "query_cpu_seconds": 4.222875000000001e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-38",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.5,
+          "recall_loss_120": 0.30000000000000004,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.4
+        },
+        "resources": {
+          "memory_bytes": 5120.0,
+          "update_cpu_seconds": 9.573909090909092e-07,
+          "merge_cpu_seconds": 3.4142592356687904e-05,
+          "query_cpu_seconds": 1.0108687500000001e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-39",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 6656.0,
+          "update_cpu_seconds": 8.928227272727273e-07,
+          "merge_cpu_seconds": 9.57849787685775e-06,
+          "query_cpu_seconds": 1.8075416666666666e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-40",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 9.234857575757576e-07,
+          "merge_cpu_seconds": 1.808818683651805e-05,
+          "query_cpu_seconds": 4.3021875e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-41",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 9.594215151515152e-07,
+          "merge_cpu_seconds": 3.4075516985138e-05,
+          "query_cpu_seconds": 9.960458333333334e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-42",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 12800.0,
+          "update_cpu_seconds": 9.163921212121212e-07,
+          "merge_cpu_seconds": 9.888665605095541e-06,
+          "query_cpu_seconds": 1.8171666666666667e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-43",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 13312.0,
+          "update_cpu_seconds": 9.436709090909092e-07,
+          "merge_cpu_seconds": 1.837109447983015e-05,
+          "query_cpu_seconds": 4.350854166666667e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-44",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 14336.0,
+          "update_cpu_seconds": 9.794133333333334e-07,
+          "merge_cpu_seconds": 3.4277215498938434e-05,
+          "query_cpu_seconds": 1.00169375e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-45",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 25088.0,
+          "update_cpu_seconds": 9.681754545454545e-07,
+          "merge_cpu_seconds": 1.0540922505307857e-05,
+          "query_cpu_seconds": 1.8187291666666666e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-46",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 25600.0,
+          "update_cpu_seconds": 9.898351515151516e-07,
+          "merge_cpu_seconds": 1.8983330148619957e-05,
+          "query_cpu_seconds": 4.282270833333334e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-47",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 3
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 26624.0,
+          "update_cpu_seconds": 1.048340606060606e-06,
+          "merge_cpu_seconds": 3.482467303609342e-05,
+          "query_cpu_seconds": 1.0062833333333333e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-48",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.4
+        },
+        "resources": {
+          "memory_bytes": 5632.0,
+          "update_cpu_seconds": 1.0540145454545453e-06,
+          "merge_cpu_seconds": 1.1153389596602971e-05,
+          "query_cpu_seconds": 1.8388958333333334e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-49",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.4
+        },
+        "resources": {
+          "memory_bytes": 6144.0,
+          "update_cpu_seconds": 1.0745663636363637e-06,
+          "merge_cpu_seconds": 2.09695e-05,
+          "query_cpu_seconds": 4.101708333333333e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-50",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 7168.0,
+          "update_cpu_seconds": 1.116320909090909e-06,
+          "merge_cpu_seconds": 3.952703078556263e-05,
+          "query_cpu_seconds": 1.0259812499999999e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-51",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 10752.0,
+          "update_cpu_seconds": 1.0680866666666667e-06,
+          "merge_cpu_seconds": 1.1311154989384288e-05,
+          "query_cpu_seconds": 1.8045833333333336e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-52",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.30000000000000004
+        },
+        "resources": {
+          "memory_bytes": 11264.0,
+          "update_cpu_seconds": 1.0977172727272725e-06,
+          "merge_cpu_seconds": 2.10624076433121e-05,
+          "query_cpu_seconds": 4.252458333333333e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-53",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 12288.0,
+          "update_cpu_seconds": 1.1420136363636363e-06,
+          "merge_cpu_seconds": 3.950588428874735e-05,
+          "query_cpu_seconds": 1.0019749999999998e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-54",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 20992.0,
+          "update_cpu_seconds": 1.1175548484848484e-06,
+          "merge_cpu_seconds": 1.1839337579617836e-05,
+          "query_cpu_seconds": 1.8127291666666665e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-55",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 21504.0,
+          "update_cpu_seconds": 1.1269642424242422e-06,
+          "merge_cpu_seconds": 2.1528983014862e-05,
+          "query_cpu_seconds": 4.308145833333334e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-56",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 22528.0,
+          "update_cpu_seconds": 1.171838787878788e-06,
+          "merge_cpu_seconds": 3.989156900212315e-05,
+          "query_cpu_seconds": 1.0077375e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-57",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 41472.0,
+          "update_cpu_seconds": 1.2487239393939393e-06,
+          "merge_cpu_seconds": 1.2942667728237791e-05,
+          "query_cpu_seconds": 1.8041250000000003e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-58",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 41984.0,
+          "update_cpu_seconds": 1.21388e-06,
+          "merge_cpu_seconds": 2.2619678343949044e-05,
+          "query_cpu_seconds": 4.251937499999999e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-59",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 5
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.0,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 43008.0,
+          "update_cpu_seconds": 1.2728421212121213e-06,
+          "merge_cpu_seconds": 4.0958522292993634e-05,
+          "query_cpu_seconds": 1.02433125e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-60",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 7680.0,
+          "update_cpu_seconds": 1.2457106060606062e-06,
+          "merge_cpu_seconds": 1.2814417197452228e-05,
+          "query_cpu_seconds": 1.8560208333333333e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-61",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 8192.0,
+          "update_cpu_seconds": 1.2575081818181817e-06,
+          "merge_cpu_seconds": 2.394900106157113e-05,
+          "query_cpu_seconds": 4.181833333333334e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-62",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 128,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.19999999999999996,
+          "recall_loss_120": 0.19999999999999996,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.19999999999999996
+        },
+        "resources": {
+          "memory_bytes": 9216.0,
+          "update_cpu_seconds": 1.2963996969696968e-06,
+          "merge_cpu_seconds": 4.530632377919321e-05,
+          "query_cpu_seconds": 1.0332208333333332e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-63",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 14848.0,
+          "update_cpu_seconds": 1.257201212121212e-06,
+          "merge_cpu_seconds": 1.3139746284501064e-05,
+          "query_cpu_seconds": 1.8092499999999999e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-64",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 15360.0,
+          "update_cpu_seconds": 1.2824081818181819e-06,
+          "merge_cpu_seconds": 2.4062716560509555e-05,
+          "query_cpu_seconds": 4.206416666666667e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-65",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 256,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.09999999999999998,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.09999999999999998
+        },
+        "resources": {
+          "memory_bytes": 16384.0,
+          "update_cpu_seconds": 1.3243363636363634e-06,
+          "merge_cpu_seconds": 4.516064968152866e-05,
+          "query_cpu_seconds": 1.0169916666666667e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-66",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 29184.0,
+          "update_cpu_seconds": 1.34377e-06,
+          "merge_cpu_seconds": 1.38113949044586e-05,
+          "query_cpu_seconds": 1.839125e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-67",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 29696.0,
+          "update_cpu_seconds": 1.3313360606060606e-06,
+          "merge_cpu_seconds": 2.4737211252653927e-05,
+          "query_cpu_seconds": 4.150374999999999e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-68",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 512,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 30720.0,
+          "update_cpu_seconds": 1.3723542424242422e-06,
+          "merge_cpu_seconds": 5.087939596602972e-05,
+          "query_cpu_seconds": 1.1095666666666664e-05
+        }
+      },
+      {
+        "id": "google/custom-calibration-69",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 16,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 57856.0,
+          "update_cpu_seconds": 2.4592575757575755e-06,
+          "merge_cpu_seconds": 1.5480243099787687e-05,
+          "query_cpu_seconds": 1.8432291666666665e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-70",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 32,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 58368.0,
+          "update_cpu_seconds": 2.200552424242424e-06,
+          "merge_cpu_seconds": 2.6211785562632698e-05,
+          "query_cpu_seconds": 4.170333333333333e-06
+        }
+      },
+      {
+        "id": "google/custom-calibration-71",
+        "sketch": "CountSketch",
+        "implementation": "asap_sketchlib/portable/topk",
+        "parameters": {
+          "cols": 1024,
+          "family": "CountSketch",
+          "heap": 64,
+          "rows": 7
+        },
+        "distribution": {
+          "profile": "google/custom-calibration"
+        },
+        "trials": 3,
+        "error_metrics": {
+          "recall_loss_10": 0.0,
+          "recall_loss_120": 0.09999999999999998,
+          "recall_loss_2": 0.0,
+          "recall_loss_30": 0.0
+        },
+        "resources": {
+          "memory_bytes": 59392.0,
+          "update_cpu_seconds": 2.2787236363636364e-06,
+          "merge_cpu_seconds": 4.6563269639065824e-05,
+          "query_cpu_seconds": 1.01925625e-05
+        }
+      }
+    ]
+  },
+  "shapes": {
+    "zipf/synthetic": {
+      "cardinality": 97747,
+      "events_per_pane": 45455.0,
+      "rank_mass": [
+        0.1348359183074836,
+        0.3614683019836468,
+        0.5767029663036704,
+        0.7511401385986141
+      ]
+    },
+    "uniform/synthetic": {
+      "cardinality": 99570,
+      "events_per_pane": 4545.833333333333,
+      "rank_mass": [
+        3.666361136571952e-05,
+        0.0003134738771769019,
+        0.0027222731439046745,
+        0.023118240146654444
+      ]
+    },
+    "google/custom-calibration": {
+      "cardinality": 479,
+      "events_per_pane": 9.166666666666666,
+      "rank_mass": [
+        0.03090909090909091,
+        0.14545454545454545,
+        0.5436363636363636,
+        1.0
+      ]
+    }
+  },
+  "generation_seconds": 1130.603610159,
+  "provenance": {
+    "sources": [
+      {
+        "name": "zipf",
+        "generation_seconds": 1008.024383209,
+        "args": {
+          "backend_revision": "f40ddf1234964e1285e0e0839d1567f256352fa5",
+          "build_erp": true,
+          "calibration_panes": 120,
+          "cardinality": 100000,
+          "distribution": "Zipf",
+          "erp_catalog": null,
+          "input_tsv": null,
+          "memory_budget_bytes": 131072,
+          "min_recall_at_10": 0.8,
+          "output": "tools/autosketch-comparison/data/topk-dashboard-v2/zipf-profile.json",
+          "panes": 220,
+          "refresh_seconds": 30,
+          "refreshes": 100,
+          "seed": 1000,
+          "total_events": 10000000,
+          "total_memory_budget_bytes": 16777216,
+          "trials": 3,
+          "zipf_exponent": 1.1
+        },
+        "held_out_used": false,
+        "scope": "window-conditioned extension of sketch-bench ERP v1; generated by backend adapter",
+        "timing": "wall seconds per operation, not hardware CPU counters"
+      },
+      {
+        "name": "uniform",
+        "generation_seconds": 120.692113337,
+        "args": {
+          "backend_revision": "1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+          "build_erp": true,
+          "calibration_panes": 120,
+          "cardinality": 100000,
+          "distribution": "Uniform",
+          "erp_catalog": null,
+          "input_tsv": null,
+          "memory_budget_bytes": 131072,
+          "min_recall_at_10": 0.8,
+          "output": "tools/autosketch-comparison/data/topk-dashboard-v2/uniform-profile.json",
+          "panes": 220,
+          "refresh_seconds": 30,
+          "refreshes": 100,
+          "seed": 2000,
+          "total_events": 1000000,
+          "total_memory_budget_bytes": 16777216,
+          "trials": 3,
+          "zipf_exponent": 1.1
+        },
+        "held_out_used": false,
+        "scope": "window-conditioned extension of sketch-bench ERP v1; generated by backend adapter",
+        "timing": "wall seconds per operation, not hardware CPU counters"
+      },
+      {
+        "name": "google",
+        "generation_seconds": 1.887113613,
+        "args": {
+          "backend_revision": "1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+          "build_erp": true,
+          "calibration_panes": 120,
+          "cardinality": 683,
+          "distribution": "Zipf",
+          "erp_catalog": null,
+          "input_tsv": "tools/autosketch-comparison/data/topk-dashboard-v2/google-replay.tsv",
+          "memory_budget_bytes": 131072,
+          "min_recall_at_10": 0.8,
+          "output": "tools/autosketch-comparison/data/topk-dashboard-v2/google-profile.json",
+          "panes": 220,
+          "refresh_seconds": 30,
+          "refreshes": 100,
+          "seed": 42,
+          "total_events": 1971,
+          "total_memory_budget_bytes": 16777216,
+          "trials": 3,
+          "zipf_exponent": 1.1
+        },
+        "held_out_used": false,
+        "scope": "window-conditioned extension of sketch-bench ERP v1; generated by backend adapter",
+        "timing": "wall seconds per operation, not hardware CPU counters"
+      }
+    ]
+  }
+}

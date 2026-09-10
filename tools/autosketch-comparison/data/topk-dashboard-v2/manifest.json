@@ -1,0 +1,77 @@
+{
+  "reproduction_commands": [
+    [
+      "target/release/examples/topk_dashboard_comparison",
+      "--output",
+      "tools/autosketch-comparison/data/topk-dashboard-v2/zipf-profile.json",
+      "--backend-revision",
+      "1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+      "--trials",
+      "3",
+      "--build-erp",
+      "--seed",
+      "1000"
+    ],
+    [
+      "target/release/examples/topk_dashboard_comparison",
+      "--output",
+      "tools/autosketch-comparison/data/topk-dashboard-v2/uniform-profile.json",
+      "--backend-revision",
+      "1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+      "--trials",
+      "3",
+      "--build-erp",
+      "--distribution",
+      "uniform",
+      "--seed",
+      "2000",
+      "--total-events",
+      "1000000"
+    ],
+    [
+      "target/release/examples/topk_dashboard_comparison",
+      "--output",
+      "tools/autosketch-comparison/data/topk-dashboard-v2/google-profile.json",
+      "--backend-revision",
+      "1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+      "--trials",
+      "3",
+      "--build-erp",
+      "--input-tsv",
+      "tools/autosketch-comparison/data/topk-dashboard-v2/google-replay.tsv"
+    ],
+    [
+      "target/release/examples/topk_dashboard_comparison",
+      "--output",
+      "tools/autosketch-comparison/data/topk-dashboard-v2/synthetic.json",
+      "--backend-revision",
+      "1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+      "--trials",
+      "3",
+      "--erp-catalog",
+      "tools/autosketch-comparison/data/topk-dashboard-v2/catalog.json",
+      "--seed",
+      "42"
+    ],
+    [
+      "target/release/examples/topk_dashboard_comparison",
+      "--output",
+      "tools/autosketch-comparison/data/topk-dashboard-v2/google.json",
+      "--backend-revision",
+      "1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+      "--trials",
+      "3",
+      "--erp-catalog",
+      "tools/autosketch-comparison/data/topk-dashboard-v2/catalog.json",
+      "--input-tsv",
+      "tools/autosketch-comparison/data/topk-dashboard-v2/google-replay.tsv"
+    ]
+  ],
+  "platform": "Linux-5.15.0-177-generic-x86_64-with-glibc2.35",
+  "evaluation_binary_sha256": "edb151e5931baa788cb475309578c92e4d6b8e498b713a58b7a416d8b4d13c11",
+  "google_replay_sha256": "eeef6d72c2dce6dc4cfa851575b96d20402ebf9a3b29566e97ba1ed3d8b08feb",
+  "sketchlib_revision": "079ba44936bb74f7e0f4374936e8846266b35243",
+  "planner_revision": "a9651cc",
+  "backend_revision": "1c8e2ad8e800a93adf00e86112ad7bd67a806d24",
+  "isolation": "sequential wall-clock runs on shared host; no CPU isolation"
+}
