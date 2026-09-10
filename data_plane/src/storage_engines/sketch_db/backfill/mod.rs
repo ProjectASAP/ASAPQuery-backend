@@ -1443,6 +1443,7 @@ mod tests {
 
 // 2026-05 reorg: backfill-* and the two BackfillSource impls moved
 // into this folder as submodules.
+pub mod clickhouse_reader;
 pub mod processor;
 pub mod prometheus_reader;
 pub mod raw_sample_reader;
@@ -1450,6 +1451,7 @@ pub mod service;
 pub mod window_builder;
 pub mod worker;
 
+pub use clickhouse_reader::{ClickHouseReader, ClickHouseReaderConfig};
 pub use processor::BackfillWindowProcessor;
 pub use prometheus_reader::PrometheusReader;
 pub use raw_sample_reader::{

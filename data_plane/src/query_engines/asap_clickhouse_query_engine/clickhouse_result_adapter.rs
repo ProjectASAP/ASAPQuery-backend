@@ -1,11 +1,14 @@
 use super::fallback::ClickHouseRawResponse;
-use arrow::{record_batch::RecordBatch, util::display::array_value_to_string};
+use arrow::{
+    json::LineDelimitedWriter, record_batch::RecordBatch, util::display::array_value_to_string,
+};
 use axum::response::{IntoResponse, Response};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClickHouseFormat {
     TabSeparated,
     JsonEachRow,
+    Json,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -40,21 +43,90 @@ impl ClickHouseQueryResult {
                         output.push(b'\n');
                     }
                     ClickHouseFormat::JsonEachRow => {
-                        let mut object = serde_json::Map::new();
-                        for (column, field) in batch.schema().fields().iter().enumerate() {
-                            let value = array_value_to_string(batch.column(column).as_ref(), row)
-                                .map_err(|error| {
-                                ClickHouseResultError::Arrow(error.to_string())
-                            })?;
-                            object.insert(field.name().clone(), serde_json::Value::String(value));
-                        }
-                        serde_json::to_writer(&mut output, &object)?;
-                        output.push(b'\n');
+                        let row = batch.slice(row, 1);
+                        let mut writer = LineDelimitedWriter::new(&mut output);
+                        writer
+                            .write_batches(&[&row])
+                            .map_err(|error| ClickHouseResultError::Arrow(error.to_string()))?;
+                        writer
+                            .finish()
+                            .map_err(|error| ClickHouseResultError::Arrow(error.to_string()))?;
                     }
+                    ClickHouseFormat::Json => {}
                 }
             }
         }
+        if format == ClickHouseFormat::Json {
+            return self.encode_json_document();
+        }
         Ok(output)
+    }
+
+    fn encode_json_document(&self) -> Result<Vec<u8>, ClickHouseResultError> {
+        let schema = self.batches.first().map(RecordBatch::schema);
+        let meta = schema
+            .as_ref()
+            .map(|schema| {
+                schema
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        serde_json::json!({
+                            "name": field.name(),
+                            "type": clickhouse_type(field.data_type(), field.is_nullable()),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut rows = Vec::new();
+        for batch in &self.batches {
+            let mut encoded = Vec::new();
+            let mut writer = LineDelimitedWriter::new(&mut encoded);
+            writer
+                .write_batches(&[batch])
+                .map_err(|error| ClickHouseResultError::Arrow(error.to_string()))?;
+            writer
+                .finish()
+                .map_err(|error| ClickHouseResultError::Arrow(error.to_string()))?;
+            for line in encoded
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+            {
+                rows.push(serde_json::from_slice::<serde_json::Value>(line)?);
+            }
+        }
+        Ok(serde_json::to_vec(&serde_json::json!({
+            "meta": meta,
+            "data": rows,
+            "rows": rows.len(),
+            "statistics": {"elapsed": 0.0, "rows_read": rows.len(), "bytes_read": 0}
+        }))?)
+    }
+}
+
+fn clickhouse_type(data_type: &arrow::datatypes::DataType, nullable: bool) -> String {
+    use arrow::datatypes::DataType;
+    let base = match data_type {
+        DataType::Boolean => "Bool".into(),
+        DataType::Int8 => "Int8".into(),
+        DataType::Int16 => "Int16".into(),
+        DataType::Int32 => "Int32".into(),
+        DataType::Int64 => "Int64".into(),
+        DataType::UInt8 => "UInt8".into(),
+        DataType::UInt16 => "UInt16".into(),
+        DataType::UInt32 => "UInt32".into(),
+        DataType::UInt64 => "UInt64".into(),
+        DataType::Float32 => "Float32".into(),
+        DataType::Float64 => "Float64".into(),
+        DataType::Utf8 | DataType::LargeUtf8 => "String".into(),
+        DataType::Timestamp(_, _) => "DateTime64(3)".into(),
+        other => other.to_string(),
+    };
+    if nullable {
+        format!("Nullable({base})")
+    } else {
+        base
     }
 }
 
@@ -107,7 +179,12 @@ mod tests {
         );
         assert_eq!(
             result.encode(ClickHouseFormat::JsonEachRow).unwrap(),
-            b"{\"count\":\"7\",\"zone\":\"a\\tb\"}\n"
+            b"{\"zone\":\"a\\tb\",\"count\":7}\n"
         );
+        let document: serde_json::Value =
+            serde_json::from_slice(&result.encode(ClickHouseFormat::Json).unwrap()).unwrap();
+        assert_eq!(document["data"][0]["count"], 7);
+        assert_eq!(document["meta"][1]["type"], "Int64");
+        assert_eq!(document["rows"], 1);
     }
 }
