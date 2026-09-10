@@ -24,22 +24,7 @@ thiserror   = "1"
 tracing     = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 chrono      = { version = "0.4",  features = ["serde"] }
-# Private mirror of GreptimeTeam/promql-parser (Apache-2.0), matching
-# ASAPPlanner's frontend-promql historically -- carries local patches
-# (limitk / limit_ratio, a batch of experimental Prometheus functions)
-# upstream crates.io 0.8 doesn't have. Pinned to a commit, not the `asap`
-# branch, for the same reproducibility reason as the planner-types pin
-# below.
-#
-# ASAPPlanner's own `asap-frontend-promql` has since switched to the
-# public crates.io `promql-parser = "0.10"` release (ASAPPlanner#209) --
-# 0.10 upstreamed most of what this fork carries as patches (the
-# duplication note that used to live here is stale now that upstream
-# isn't on a floating branch at all), except the legacy `holt_winters`
-# alias this repo doesn't reference. Dropping this private-fork pin in
-# favor of the public 0.10 release is a reasonable follow-up but is out
-# of scope for the ASAPController -> ASAPPlanner pin migration.
-promql-parser  = { git = "https://github.com/ProjectASAP/promql-parser", rev = "c51beafb361af4cc95ed62ae377862c660ceb757" }
+promql-parser.workspace = true
 prost          = "0.13"
 bytes          = "1"
 zstd           = "0.13"

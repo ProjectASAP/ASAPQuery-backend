@@ -38,7 +38,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4.0", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
-promql-parser = "0.5.0"
+# One parser source for backend parsing. Member crates inherit this immutable
+# ProjectASAP revision through `workspace = true`.
+promql-parser = { git = "https://github.com/ProjectASAP/promql-parser", rev = "d7606436bde05efe19c5398fe2122faa49062f7d" }
 tokio = { version = "1.0", features = ["full"] }
 arc-swap = "1.7"
 
