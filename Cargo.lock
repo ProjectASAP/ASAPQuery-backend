@@ -374,7 +374,7 @@ dependencies = [
 [[package]]
 name = "asap-aware-mapping"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c3658#16c365852efce5cab50bb500c9024582a82edd19"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c365852efce5cab50bb500c9024582a82edd19#16c365852efce5cab50bb500c9024582a82edd19"
 dependencies = [
  "asap-types",
  "serde",
@@ -385,7 +385,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-metricsql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c3658#16c365852efce5cab50bb500c9024582a82edd19"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c365852efce5cab50bb500c9024582a82edd19#16c365852efce5cab50bb500c9024582a82edd19"
 dependencies = [
  "asap-types",
  "metricsql_parser",
@@ -395,7 +395,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c3658#16c365852efce5cab50bb500c9024582a82edd19"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c365852efce5cab50bb500c9024582a82edd19#16c365852efce5cab50bb500c9024582a82edd19"
 dependencies = [
  "asap-types",
  "promql-parser 0.10.0",
@@ -404,7 +404,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-sql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c3658#16c365852efce5cab50bb500c9024582a82edd19"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c365852efce5cab50bb500c9024582a82edd19#16c365852efce5cab50bb500c9024582a82edd19"
 dependencies = [
  "asap-sql-function-catalog",
  "asap-types",
@@ -426,12 +426,12 @@ dependencies = [
 [[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c3658#16c365852efce5cab50bb500c9024582a82edd19"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c365852efce5cab50bb500c9024582a82edd19#16c365852efce5cab50bb500c9024582a82edd19"
 
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c3658#16c365852efce5cab50bb500c9024582a82edd19"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c365852efce5cab50bb500c9024582a82edd19#16c365852efce5cab50bb500c9024582a82edd19"
 dependencies = [
  "serde",
  "serde_json",
@@ -1711,7 +1711,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2453,7 +2453,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi 0.5.2",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2801,7 +2801,7 @@ dependencies = [
 [[package]]
 name = "metricsql_common"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c3658#16c365852efce5cab50bb500c9024582a82edd19"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c365852efce5cab50bb500c9024582a82edd19#16c365852efce5cab50bb500c9024582a82edd19"
 dependencies = [
  "chrono",
 ]
@@ -2809,7 +2809,7 @@ dependencies = [
 [[package]]
 name = "metricsql_parser"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c3658#16c365852efce5cab50bb500c9024582a82edd19"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=16c365852efce5cab50bb500c9024582a82edd19#16c365852efce5cab50bb500c9024582a82edd19"
 dependencies = [
  "ahash",
  "chrono",
@@ -3904,7 +3904,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4438,7 +4438,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5260,7 +5260,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
