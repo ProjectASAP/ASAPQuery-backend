@@ -11,6 +11,7 @@ cross-repository interfaces live in
 ## Query engine
 
 - [Routing, readout, and query-engine implementation](query-engine/query-engine.md)
+- [ClickHouse SQL support](query-engine/clickhouse-sql-support.md)
 - [Catalog-backed physical-plan runtime](query-engine/catalog-physical-plan-runtime.md)
 - [Extension points](query-engine/extension-points.md)
 - [VictoriaMetrics and MetricsQL support](query-engine/victoriametrics-metricsql-support.md)
