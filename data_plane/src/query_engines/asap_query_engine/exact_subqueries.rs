@@ -1,8 +1,10 @@
 //! Fetch installed exact cuts from Prometheus before composing them with ASAP state.
 use super::logical_dag::{PreparedLeaf, PreparedLeaves, Value};
 use crate::query_engines::EngineError;
+#[cfg(test)]
+use control_plane::query_plan::QueryPlanEntry;
 use control_plane::query_plan::{
-    logical::LogicalOperator, ExecutablePlanView, QueryNodeId, QueryPlanEntry, QueryPlanNode,
+    logical::LogicalOperator, ExecutablePlanView, QueryNodeId, QueryPlanNode,
 };
 use std::collections::{BTreeMap, BTreeSet};
 

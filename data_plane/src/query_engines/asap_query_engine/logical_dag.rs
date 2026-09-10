@@ -7,8 +7,10 @@ use crate::storage_engines::types::KeyByLabelValues;
 use control_plane::query_plan::logical::{
     Aggregation, BinaryOperation, Grouping, LogicalOperator, TemporalOperation,
 };
+#[cfg(test)]
+use control_plane::query_plan::QueryPlanEntry;
 use control_plane::query_plan::{
-    CandidateCompleteness, ExecutablePlanView, QueryNodeId, QueryPlanEntry, QueryPlanNode,
+    CandidateCompleteness, ExecutablePlanView, QueryNodeId, QueryPlanNode,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
