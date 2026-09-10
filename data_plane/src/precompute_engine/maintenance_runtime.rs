@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 type SummaryState = Arc<dyn AggregateCore>;
 type PendingOutput = (
-    Option<MaterializationCommitKey>,
+    Option<(MaterializationCommitKey, u64)>,
     PrecomputedOutput,
     Box<dyn AggregateCore>,
 );
@@ -75,6 +75,8 @@ struct CommitRegistryState {
     generation: Option<(u64, u64)>,
     entries: BTreeMap<MaterializationCommitKey, CommittedState>,
     frontiers: BTreeMap<asap_types::sds::SummaryDefinitionId, (i64, u64)>,
+    pending_batch: Option<[u8; 32]>,
+    batch_has_published: bool,
 }
 
 impl CommitRegistryState {
@@ -119,31 +121,78 @@ impl CommitRegistry {
         if state.generation != generation {
             state.entries.clear();
             state.frontiers.clear();
+            state.pending_batch = None;
+            state.batch_has_published = false;
             state.generation = generation;
         }
         Ok(plan)
     }
 
-    fn advance_retention(
-        &self,
-        key: &MaterializationCommitKey,
-        horizon_ms: u64,
-    ) -> Result<(), String> {
-        if horizon_ms == 0 {
-            return Err("maintenance retry horizon must be positive".into());
-        }
+    fn begin_batch(&self, digest: [u8; 32]) -> Result<(), String> {
         let mut state = self.0.lock().map_err(|_| "commit registry poisoned")?;
-        state.validate_key(key)?;
-        let (latest, horizon) = state
-            .frontiers
-            .entry(key.summary_definition)
-            .or_insert((key.window_end_ms, horizon_ms));
-        *latest = (*latest).max(key.window_end_ms);
-        *horizon = (*horizon).max(horizon_ms);
-        let cutoff = latest.saturating_sub(i64::try_from(*horizon).unwrap_or(i64::MAX));
-        state.entries.retain(|entry, _| {
-            entry.summary_definition != key.summary_definition || entry.window_end_ms > cutoff
+        match state.pending_batch {
+            Some(pending) if pending != digest => Err(
+                "maintenance batch retry is pending; retry that batch before submitting new work"
+                    .into(),
+            ),
+            _ => {
+                if state.pending_batch.is_none() {
+                    state.batch_has_published = false;
+                }
+                state.pending_batch = Some(digest);
+                Ok(())
+            }
+        }
+    }
+
+    fn finish_batch(&self, digest: [u8; 32]) -> Result<(), String> {
+        self.complete_batch(digest, &[])
+    }
+
+    fn cancel_unpublished_batch(&self) {
+        if let Ok(mut state) = self.0.lock() {
+            if !state.batch_has_published {
+                state.entries.retain(|_, entry| entry.published);
+                state.pending_batch = None;
+            }
+        }
+    }
+
+    fn complete_batch(
+        &self,
+        digest: [u8; 32],
+        completed: &[(MaterializationCommitKey, u64)],
+    ) -> Result<(), String> {
+        let mut state = self.0.lock().map_err(|_| "commit registry poisoned")?;
+        if state.pending_batch != Some(digest) {
+            return Err("maintenance batch generation changed before completion".into());
+        }
+        for (key, horizon) in completed {
+            if *horizon == 0
+                || state
+                    .generation
+                    .is_some_and(|generation| generation != (key.plan_id, key.plan_version))
+            {
+                return Err("maintenance batch has invalid completion lifecycle".into());
+            }
+            let frontier = state
+                .frontiers
+                .entry(key.summary_definition)
+                .or_insert((key.window_end_ms, *horizon));
+            frontier.0 = frontier.0.max(key.window_end_ms);
+            frontier.1 = frontier.1.max(*horizon);
+        }
+        let frontiers = state.frontiers.clone();
+        state.entries.retain(|key, _| {
+            frontiers
+                .get(&key.summary_definition)
+                .is_none_or(|(latest, horizon)| {
+                    key.window_end_ms
+                        > latest.saturating_sub(i64::try_from(*horizon).unwrap_or(i64::MAX))
+                })
         });
+        state.pending_batch = None;
+        state.batch_has_published = false;
         Ok(())
     }
 
@@ -171,6 +220,7 @@ impl CommitRegistry {
             emit()?;
             committed.published = true;
             committed.value = None;
+            commits.batch_has_published = true;
             Ok(())
         }
     }
@@ -215,6 +265,7 @@ pub struct MaintenanceDagSink {
     inner: Arc<dyn OutputSink>,
     plans: HotReloadStreamingConfig,
     commits: CommitRegistry,
+    batch_guard: Mutex<()>,
 }
 
 impl MaintenanceDagSink {
@@ -223,17 +274,16 @@ impl MaintenanceDagSink {
             inner,
             plans,
             commits: CommitRegistry::default(),
+            batch_guard: Mutex::new(()),
         }
     }
 
     fn execute_one(
         &self,
+        plan: &crate::storage_engines::types::ActivePhysicalPlan,
         output: PrecomputedOutput,
         state: Box<dyn AggregateCore>,
     ) -> Result<Vec<PendingOutput>, String> {
-        let Some(plan) = self.commits.plan_snapshot(&self.plans)? else {
-            return Ok(vec![(None, output, state)]);
-        };
         let source_definition: asap_types::sds::SummaryDefinitionId = output.policy_fp.into();
         let source: SummaryState = Arc::from(state);
         let mut derived = Vec::new();
@@ -332,7 +382,6 @@ impl MaintenanceDagSink {
                     .saturating_mul(config.slide_interval)
                     .max(config.window_size)
                     .saturating_mul(1_000);
-                self.commits.advance_retention(&key, horizon_ms)?;
                 if self.commits.is_published(&key)? {
                     continue;
                 }
@@ -348,7 +397,7 @@ impl MaintenanceDagSink {
                 let mut target_output = output.clone();
                 target_output.policy_fp = target.into();
                 derived.push((
-                    Some(key),
+                    Some((key, horizon_ms)),
                     target_output,
                     value.as_ref().as_ref().clone_boxed_core(),
                 ));
@@ -400,31 +449,101 @@ impl OutputSink for MaintenanceDagSink {
         &self,
         outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut transformed = Vec::new();
-        for (output, state) in outputs {
-            transformed.extend(
-                self.execute_one(output, state)
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?,
+        // One bounded pending batch may be retried. Do not let another worker
+        // advance its frontier while a partially accepted batch is replayable.
+        let _guard = self
+            .batch_guard
+            .lock()
+            .map_err(|_| "maintenance batch lock poisoned")?;
+        let plan = self.commits.plan_snapshot(&self.plans)?;
+        let sinks = plan.as_ref().map_or(0, |plan| {
+            plan.precompute_plan
+                .executable_dags
+                .values()
+                .map(|dag| dag.binding.precompute_sinks.len())
+                .sum::<usize>()
+        });
+        if sinks == 0 {
+            return self.inner.emit_batch(outputs);
+        }
+        const MAX_BATCH_RECEIPTS: usize = 65_536;
+        const MAX_BATCH_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+        if outputs.len().saturating_mul(sinks) > MAX_BATCH_RECEIPTS {
+            return Err(
+                "maintenance batch exceeds bounded receipt budget; split the input batch".into(),
             );
         }
+        let mut digest = Sha256::new();
+        digest.update(b"asap-maintenance-batch-v1");
+        let mut source_bytes = 0usize;
+        for (output, state) in &outputs {
+            let bytes = state.serialize_to_bytes();
+            let group = output
+                .key
+                .as_ref()
+                .map(|key| key.serialize_to_bytes())
+                .unwrap_or_default();
+            source_bytes = source_bytes
+                .saturating_add(bytes.len())
+                .saturating_add(group.len());
+            if source_bytes.saturating_mul(sinks) > MAX_BATCH_SOURCE_BYTES {
+                return Err(
+                    "maintenance batch exceeds serialized source budget; split the input batch"
+                        .into(),
+                );
+            }
+            digest.update(output.policy_fp.0.to_be_bytes());
+            digest.update(output.start_timestamp.to_be_bytes());
+            digest.update(output.end_timestamp.to_be_bytes());
+            digest.update((group.len() as u64).to_be_bytes());
+            digest.update(group);
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+        }
+        let digest: [u8; 32] = digest.finalize().into();
+        self.commits.begin_batch(digest)?;
+        let mut transformed = Vec::new();
+        for (output, state) in outputs {
+            match self.execute_one(
+                plan.as_ref()
+                    .expect("maintenance DAG requires an active plan"),
+                output,
+                state,
+            ) {
+                Ok(outputs) => transformed.extend(outputs),
+                Err(error) => {
+                    self.commits.cancel_unpublished_batch();
+                    return Err(error.into());
+                }
+            }
+        }
         if transformed.iter().all(|(key, _, _)| key.is_none()) {
-            return self.inner.emit_batch(
+            self.inner.emit_batch(
                 transformed
                     .into_iter()
                     .map(|(_, output, state)| (output, state))
                     .collect(),
-            );
+            )?;
+            self.commits.finish_batch(digest)?;
+            return Ok(());
         }
         // The generic sink can partially accept a batch. Acknowledge each
         // maintained output independently so retries skip only accepted writes.
+        let mut completed = Vec::new();
         for (key, output, state) in transformed {
             match key {
-                Some(key) => self
-                    .commits
-                    .publish(&key, || self.inner.emit_batch(vec![(output, state)]))?,
+                Some((key, horizon)) => {
+                    self.commits
+                        .publish(&key, || self.inner.emit_batch(vec![(output, state)]))?;
+                    completed.push((key, horizon));
+                }
                 None => self.inner.emit_batch(vec![(output, state)])?,
             }
         }
+        // Publication and partial replay use the previous frontier. Advance
+        // only after the complete batch was accepted, so an early pane cannot
+        // lose its receipt merely because a later pane shares its batch.
+        self.commits.complete_batch(digest, &completed)?;
         Ok(())
     }
 }
@@ -492,16 +611,16 @@ mod tests {
         };
         for end in (10..=1_000).step_by(10) {
             let key = key(end);
-            commits.advance_retention(&key, 30).unwrap();
+            commits.begin_batch([0; 32]).unwrap();
             commits
                 .commit_if_absent(key.clone(), Arc::new(sum(2.0)))
                 .unwrap();
             commits.publish(&key, || Ok(())).unwrap();
+            commits.complete_batch([0; 32], &[(key, 30)]).unwrap();
             let state = commits.0.lock().unwrap();
             assert!(state.entries.len() <= 3);
             assert!(state.entries.values().all(|entry| entry.value.is_none()));
         }
-        assert!(commits.advance_retention(&key(970), 30).is_err());
         assert!(commits.get(&key(970)).is_err());
         assert!(commits
             .publish(&key(970), || panic!(
@@ -581,6 +700,10 @@ mod tests {
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_value(snapshot).unwrap();
         let mut bundle = snapshot.compile().unwrap();
+        let target_config = &bundle.precompute_plan.materializations[0];
+        let long_step = target_config.window_size.max(
+            target_config.slide_interval * target_config.num_aggregates_to_retain.unwrap_or(1),
+        ) * 1_000;
         let target_definition = bundle.precompute_plan.materializations[0]
             .policy_fingerprint()
             .into();
@@ -632,7 +755,11 @@ mod tests {
             query_plan: Arc::new(bundle.query_plan),
             storage_routing: Arc::new(Default::default()),
         };
-        for fail_at in [0, 1] {
+        // The long batch spans two retention horizons. Its accepted prefix
+        // must remain replayable until the same whole batch completes.
+        for (fail_at, count, step, replay_after_success) in
+            [(0, 2, 10, true), (1, 2, 10, true), (2, 5, long_step, false)]
+        {
             let downstream = Arc::new(FailOnceSink {
                 fail_at,
                 ..Default::default()
@@ -644,12 +771,12 @@ mod tests {
                 )),
             );
             let batch = || {
-                (0..2)
+                (0..count)
                     .map(|i| {
                         (
                             PrecomputedOutput::new(
-                                i * 10,
-                                (i + 1) * 10,
+                                i * step,
+                                (i + 1) * step,
                                 None,
                                 asap_types::PolicyFingerprint(1),
                             ),
@@ -658,11 +785,54 @@ mod tests {
                     })
                     .collect()
             };
+            if !replay_after_success {
+                let oversized = (0..65_537)
+                    .map(|_| {
+                        (
+                            PrecomputedOutput::new(0, step, None, asap_types::PolicyFingerprint(1)),
+                            sum(2.0).clone_boxed_core(),
+                        )
+                    })
+                    .collect();
+                assert!(sink
+                    .emit_batch(oversized)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("receipt budget"));
+                assert_eq!(downstream.attempts.load(Ordering::SeqCst), 0);
+            }
             assert!(sink.emit_batch(batch()).is_err());
+            if !replay_after_success {
+                assert!(sink
+                    .emit_batch(vec![(
+                        PrecomputedOutput::new(
+                            999_000,
+                            1_000_000,
+                            None,
+                            asap_types::PolicyFingerprint(1),
+                        ),
+                        sum(3.0).clone_boxed_core()
+                    )])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("retry is pending"));
+            }
             sink.emit_batch(batch()).unwrap();
-            sink.emit_batch(batch()).unwrap();
-            assert_eq!(downstream.accepted.load(Ordering::SeqCst), 2);
-            assert_eq!(downstream.attempts.load(Ordering::SeqCst), 3);
+            if replay_after_success {
+                sink.emit_batch(batch()).unwrap();
+            } else {
+                assert!(sink
+                    .emit_batch(batch())
+                    .unwrap_err()
+                    .to_string()
+                    .contains("retention horizon"));
+                assert!(sink.commits.0.lock().unwrap().entries.len() <= 2);
+            }
+            assert_eq!(downstream.accepted.load(Ordering::SeqCst), count as usize);
+            assert_eq!(
+                downstream.attempts.load(Ordering::SeqCst),
+                count as usize + 1
+            );
         }
     }
 

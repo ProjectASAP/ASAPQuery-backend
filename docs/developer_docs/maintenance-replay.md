@@ -11,9 +11,21 @@ remains until the materialization's event-time retry horizon expires. The
 horizon is the configured retained-state count times the slide interval, with
 a minimum of one complete materialized window. With no retained-state count,
 the horizon is one complete window. A later output advances that definition's
-event-time frontier. An output ending at or before the frontier minus the
+event-time frontier after its complete output batch is accepted. An output ending at or before the frontier minus the
 horizon is rejected; it must not be reinserted as a new write after receipt
 eviction. Sparse or out-of-order data within the horizon remains eligible.
+
+A batch may span more than the retention horizon. Its receipts remain pinned
+until every output is accepted, including across a partial downstream failure.
+The sink accepts one pending batch at a time; a failure applies backpressure to
+different batches until the original batch is retried or the plan generation
+changes. Retries use the same ordered outputs and serialized states. Receipt
+and source-volume admission budgets are checked before publication: at most
+65,536 possible derived outputs and 64 MiB of serialized source and group-key bytes multiplied
+by the possible sink count. Oversized batches must be split. These are admission
+budgets, not a measured heap-memory limit. Batch completion advances all frontiers
+together and evicts expired receipts. Replaying a completed batch after its early
+windows expired is rejected, rather than making those writes eligible again.
 
 When the sink observes a changed active plan generation, it clears old receipts
 and cached failures. Previously captured work then fails closed when it attempts
