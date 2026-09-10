@@ -141,7 +141,7 @@
     },
     {
       "clickhouse_sql": {
-        "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'ifnull'?",
+        "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'round'?",
         "status": "typed_fallback"
       },
       "id": "q10",
@@ -411,7 +411,7 @@
     },
     {
       "clickhouse_sql": {
-        "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'ifnull'?",
+        "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'round'?",
         "status": "typed_fallback"
       },
       "id": "q27",

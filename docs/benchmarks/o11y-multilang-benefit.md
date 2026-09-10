@@ -1,53 +1,45 @@
-# O11y multi-language benefit experiment
+# O11y multi-language fallback experiment
 
-This benchmark keeps all 27 source occurrences in the denominator. `tools/o11y-multilang/corpus.json` preserves each PromQL expression byte-for-byte as MetricsQL and assigns the matching ClickHouse SQL lookup. The SQL mapping reads a table produced from the same raw samples by a Prometheus-semantics loader; it must never ingest Prometheus/VM query answers. This indirection is required because native ClickHouse aggregates do not by themselves reproduce Prometheus counter reset, boundary extrapolation, staleness, subquery-grid, or histogram rules.
+This benchmark keeps all 27 source occurrences in the denominator. `corpus.json` preserves each PromQL expression byte-for-byte as MetricsQL and contains its exact ClickHouse SQL over `raw_samples(metric, labels, ts_ms, value)`. The SQL implements counter reset and boundary extrapolation, offset, subquery grids, and classic histogram interpolation rather than importing answers from another engine.
 
-## Gate order
+## Reproduce
 
-1. Validate corpus count, IDs, source hash, metric schema, evaluation timestamps, and raw-data hash.
-2. Run both official ASAPPlanner frontends. Record parser, canonicalization, planner, compiler, publication validator, executor, adapter, and fallback independently for every occurrence. Unsupported rows remain failures/fallbacks in the denominator.
-3. Start fresh Prometheus, VictoriaMetrics, and ClickHouse stores. Load identical raw samples. Build `o11y_prometheus_semantic_eval` from raw samples and verify it against Prometheus before timing.
-4. Run fresh baseline and ASAP trials with alternating request order, fixed CPU affinity, separate storage paths, finite-ingest drain, and identical evaluation timestamps.
-5. Compare full label sets, timestamps, values, warnings, response types, execution provenance, latency, CPU, RSS/HWM, storage bytes, ingest cost, and plan lifecycle cost.
-
-A run is invalid if the semantic SQL loader is absent, its oracle comparison fails, any service shares a mutable storage directory, an unsupported row disappears from results, or an ASAP success lacks typed execution provenance.
-
-## Prepared commands
+The command below starts with an empty output directory. It deterministically generates the OpenMetrics fixture, Prometheus configuration and TSDB, and physical plan; records their SHA-256 hashes; runs both production frontend/compiler auditors; provisions fresh Prometheus, VictoriaMetrics, ClickHouse, and data-plane state; then writes raw requests, structured comparisons, phase resources, and terminal-stage coverage.
 
 ```bash
-python3 tools/o11y-multilang/audit_coverage.py \
-  --corpus tools/o11y-multilang/corpus.json \
-  --output artifacts/o11y-multilang/coverage.json \
-  --dry-run-command 'cargo test -p control_plane metricsql_compilation_publishes_an_independent_sidecar_entry' \
-  --dry-run-command 'cargo test -p control_plane clickhouse'
+CARGO_TARGET_DIR=/path/to/target python3 tools/o11y-multilang/reproduce.py \
+  --backend-source "$PWD" \
+  --binary-source /path/to/backend/source \
+  --binary /path/to/data_plane \
+  --output-dir tools/o11y-multilang/repro-fresh \
+  --trials 1 --repetitions 3 --seed 20260910
 ```
 
-The checked-in fresh-process runner provisions isolated stores, reloads the raw
-fixture, alternates requests, and records process CPU ticks and RSS around the
-query interval.  The observed three-trial result is in
-`tools/o11y-multilang/final-fresh-trials`: all five engines completed 405/405
-requests.  Both ASAP language listeners used exact fallback for 405/405; the
-27-query corpus therefore demonstrates fallback overhead, not acceleration.
-Median latency was 2.39 ms for VM and 5.04 ms through the MetricsQL fallback,
-and 56.72 ms for ClickHouse and 59.19 ms through the SQL fallback.
+The seed randomizes query order independently for each repetition. Engine order alternates. Each trial creates new storage and process state and removes it afterward. The manifest records the actual backend Git HEAD, binary hash, immutable container digests, generated-input hashes, lifecycle and ingest duration, and process CPU ticks, RSS/HWM, and storage at start, after ingest, and after queries.
 
-The SQL oracle is valid for 27/27 rows.  The MetricsQL frontend accepts 12/27,
-the early planner accepts 7/27, and the production compiler and publication
-validator accept q03 and q16 (2/27).  Requests using each published sidecar
-still routed to exact fallback with an empty SummaryStore.  These failures stay
-in the denominator.  Direct VM differs strictly from Prometheus for nine query
-IDs; three are label-name retention and six are range/increase/subquery numeric
-semantics, so no cross-language semantic claim is made for those rows.
+## Observed result
 
-The independent synthetic supported-SQL evidence runs the real ClickHouse
-reader, BackfillService, SummaryStore, and a published shared DAG containing
-Filter, Project, global Sort, and Limit.  It passed differential correctness in
-three fresh ClickHouse trials.  It executes one query per trial through the
-accelerator object, so it is lifecycle correctness evidence and is not reported
-as a latency benefit estimate.
+The checked-in evidence is one fresh trial with three repetitions and 27 queries, or 81 requests per engine. All five endpoints completed 81/81 requests. Both ASAP listeners reported `exact_fallback` for 81/81, so this result measures fallback overhead and does not establish acceleration benefit.
 
-Per-query rows use this schema:
+- VictoriaMetrics median/p95: 2.43/5.18 ms; ASAP MetricsQL fallback: 4.97/5.56 ms.
+- ClickHouse median/p95: 50.31/171.98 ms; ASAP ClickHouse fallback: 59.23/178.69 ms.
+- Native ClickHouse versus ASAP ClickHouse: 81/81 structured matches.
+- Native VictoriaMetrics versus ASAP MetricsQL: 81/81 structured matches.
+- Prometheus versus VictoriaMetrics: 48/81 strict matches and 33/81 mismatches.
+- Prometheus versus ClickHouse label/value SQL oracle: 81/81 matches; timestamps and result type are reported as protocol-noncomparable.
 
-```json
-{"id":"q01","language":"metricsql|clickhouse_sql","mode":"baseline|asap","trial":1,"repetition":0,"stage":"parser|canonical|planner|publication|validator|executor|adapter|fallback","status":"warm|exact_fallback|failed","typed_reason":null,"http_status":200,"latency_ns":0,"cpu_ns":0,"response_sha256":"...","comparable":true,"mismatch":null}
-```
+The parser/canonical stage accepts 12/27 MetricsQL expressions, the early planner accepts 7/27, and the production compiler/publication validator accepts 2/27. The SQL acceleration frontend accepts 0/27 of the exact ClickHouse dialect mappings. Every row records its observed terminal fallback stage. Although q03 and q16 pass offline publication validation, the benchmark physical plan deliberately contains no corpus sidecars, so their measured requests terminate at a publication catalog miss. Binder, validator, and executor are not reached in this fallback-only experiment.
+
+A supplementary synthetic test runs ClickHouseReader → BackfillService → SummaryStore → published shared DAG with Filter, Project, global Sort, and Limit. It passed correctness in three fresh ClickHouse runs. It invokes the accelerator directly once per run, so it is lifecycle correctness evidence rather than a latency measurement and is outside the self-contained fallback result.
+
+## Evidence files
+
+- `stage-coverage.json`: per-query parser, planner, compiler, publication, terminal, adapter, and fallback result.
+- `repro-fresh/manifest.json`: hashes, immutable images, lifecycle timing, and phase resource snapshots.
+- `repro-fresh/trial-0-raw.json`: every timed response and `x-asap-execution` value.
+- `repro-fresh/trial-0-comparisons.json`: labels, value, timestamp, result type, and warnings for each required engine pair.
+- `repro-fresh/trial-0-latency-summary.json`: query-only latency summary.
+
+## Limitations
+
+This is one fresh trial and does not estimate variance across trials. CPU is process scheduler ticks rather than normalized CPU time. Container writable-layer size is an operational proxy for VM and ClickHouse storage. The production corpus has no warm executions, so it cannot quantify acceleration benefit. The synthetic warm check has one query per process and cannot fill that gap. Native-histogram exponential interpolation is outside q21, which consumes classic `_bucket` series.

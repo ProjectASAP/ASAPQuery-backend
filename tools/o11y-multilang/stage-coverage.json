@@ -5,9 +5,9 @@
     "exact_sql_differential": "27/27",
     "metricsql_parser_pass": 12,
     "metricsql_planner_pass": 7,
-    "sql_acceleration_frontend_pass": 0,
     "metricsql_compiler_pass": 2,
-    "metricsql_publication_serialization_pass": 2
+    "metricsql_publication_pass": 2,
+    "sql_acceleration_frontend_pass": 0
   },
   "queries": [
     {
@@ -26,6 +26,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: function `sort_desc`",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -36,14 +40,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: function `sort_desc`",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: function `sort_desc`"
           }
         },
         "clickhouse_sql": {
@@ -67,11 +72,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")"
           }
         }
       }
@@ -92,6 +101,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -102,14 +115,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1"
           }
         },
         "clickhouse_sql": {
@@ -133,11 +147,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")"
           }
         }
       }
@@ -157,6 +175,9 @@
           "planner": {
             "status": "pass"
           },
+          "compiler": {
+            "status": "pass"
+          },
           "publication": {
             "reason": null,
             "status": "pass"
@@ -168,13 +189,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "coverage_dependent"
-          },
-          "compiler": {
             "status": "pass"
+          },
+          "terminal": {
+            "stage": "publication",
+            "status": "exact_fallback",
+            "reason": "the benchmark physical plan does not install corpus MetricsQL sidecars"
           }
         },
         "clickhouse_sql": {
@@ -198,11 +221,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: identifier, found: )\")"
           }
         }
       }
@@ -224,6 +251,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: offset and @ modifiers",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -234,14 +265,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: offset and @ modifiers",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: offset and @ modifiers"
           }
         },
         "clickhouse_sql": {
@@ -265,11 +297,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: identifier, found: )\")"
           }
         }
       }
@@ -287,6 +323,10 @@
           "planner": {
             "status": "pass"
           },
+          "compiler": {
+            "reason": "query compat-query-0: lifecycle planning failed: no complete executor-feasible window implementation evidence",
+            "status": "typed_fallback"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -297,14 +337,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "coverage_dependent"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "query compat-query-0: lifecycle planning failed: no complete executor-feasible window implementation evidence",
-            "status": "typed_fallback"
+          "terminal": {
+            "stage": "compiler",
+            "status": "typed_fallback",
+            "reason": "query compat-query-0: lifecycle planning failed: no complete executor-feasible window implementation evidence"
           }
         },
         "clickhouse_sql": {
@@ -328,11 +369,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "physical mapping failed: ASAPPlanner produced no legal summary candidate for the target"
           }
         }
       }
@@ -350,6 +395,10 @@
           "planner": {
             "status": "pass"
           },
+          "compiler": {
+            "reason": "query compat-query-0: lifecycle planning failed: no complete executor-feasible window implementation evidence",
+            "status": "typed_fallback"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -360,14 +409,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "coverage_dependent"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "query compat-query-0: lifecycle planning failed: no complete executor-feasible window implementation evidence",
-            "status": "typed_fallback"
+          "terminal": {
+            "stage": "compiler",
+            "status": "typed_fallback",
+            "reason": "query compat-query-0: lifecycle planning failed: no complete executor-feasible window implementation evidence"
           }
         },
         "clickhouse_sql": {
@@ -391,11 +441,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "physical mapping failed: ASAPPlanner produced no legal summary candidate for the target"
           }
         }
       }
@@ -411,6 +465,10 @@
           "planner": {
             "status": "pass"
           },
+          "compiler": {
+            "reason": "ASAPPlanner produced no legal summary candidate for the target",
+            "status": "typed_fallback"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -421,14 +479,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "coverage_dependent"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "ASAPPlanner produced no legal summary candidate for the target",
-            "status": "typed_fallback"
+          "terminal": {
+            "stage": "compiler",
+            "status": "typed_fallback",
+            "reason": "ASAPPlanner produced no legal summary candidate for the target"
           }
         },
         "clickhouse_sql": {
@@ -452,11 +511,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'mapconcat'.\nDid you mean 'concat'?"
           }
         }
       }
@@ -476,6 +539,10 @@
             "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
             "status": "typed_fallback"
           },
+          "compiler": {
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -486,14 +553,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "planner",
+            "status": "typed_fallback",
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve"
           }
         },
         "clickhouse_sql": {
@@ -517,11 +585,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")"
           }
         }
       }
@@ -539,6 +611,10 @@
           "planner": {
             "status": "pass"
           },
+          "compiler": {
+            "reason": "query compat-query-0: instantaneous sample selection is not a temporal accumulator readout",
+            "status": "typed_fallback"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -549,14 +625,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "coverage_dependent"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "query compat-query-0: instantaneous sample selection is not a temporal accumulator readout",
-            "status": "typed_fallback"
+          "terminal": {
+            "stage": "compiler",
+            "status": "typed_fallback",
+            "reason": "query compat-query-0: instantaneous sample selection is not a temporal accumulator readout"
           }
         },
         "clickhouse_sql": {
@@ -580,11 +657,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: Error during planning: Error during planning: map does not support zero arguments. No function matches the given name and argument types 'map()'. You might need to add explicit type casts.\n\tCandidate functions:\n\tmap(Any, .., Any)"
           }
         }
       }
@@ -605,6 +686,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: subquery step or inherited step",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -615,14 +700,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: subquery step or inherited step",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: subquery step or inherited step"
           }
         },
         "clickhouse_sql": {
@@ -630,7 +716,7 @@
             "status": "oracle_valid"
           },
           "parser_canonical": {
-            "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'ifnull'?",
+            "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'round'?",
             "status": "typed_fallback"
           },
           "planner": {
@@ -646,11 +732,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'round'?"
           }
         }
       }
@@ -670,6 +760,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -680,14 +774,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1"
           }
         },
         "clickhouse_sql": {
@@ -711,11 +806,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: labels\")"
           }
         }
       }
@@ -734,6 +833,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -744,14 +847,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1"
           }
         },
         "clickhouse_sql": {
@@ -775,11 +879,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: This feature is not implemented: Map Access"
           }
         }
       }
@@ -801,6 +909,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: subquery step or inherited step",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -811,14 +923,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: subquery step or inherited step",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: subquery step or inherited step"
           }
         },
         "clickhouse_sql": {
@@ -842,11 +955,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")"
           }
         }
       }
@@ -866,6 +983,10 @@
             "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
             "status": "typed_fallback"
           },
+          "compiler": {
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -876,14 +997,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "planner",
+            "status": "typed_fallback",
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve"
           }
         },
         "clickhouse_sql": {
@@ -907,11 +1029,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")"
           }
         }
       }
@@ -930,6 +1056,10 @@
             "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
             "status": "typed_fallback"
           },
+          "compiler": {
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -940,14 +1070,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "planner",
+            "status": "typed_fallback",
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve"
           }
         },
         "clickhouse_sql": {
@@ -971,11 +1102,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: [\")"
           }
         }
       }
@@ -995,6 +1130,9 @@
           "planner": {
             "status": "pass"
           },
+          "compiler": {
+            "status": "pass"
+          },
           "publication": {
             "reason": null,
             "status": "pass"
@@ -1006,13 +1144,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "coverage_dependent"
-          },
-          "compiler": {
             "status": "pass"
+          },
+          "terminal": {
+            "stage": "publication",
+            "status": "exact_fallback",
+            "reason": "the benchmark physical plan does not install corpus MetricsQL sidecars"
           }
         },
         "clickhouse_sql": {
@@ -1036,11 +1176,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: identifier, found: )\")"
           }
         }
       }
@@ -1061,6 +1205,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -1071,14 +1219,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1"
           }
         },
         "clickhouse_sql": {
@@ -1102,11 +1251,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")"
           }
         }
       }
@@ -1125,6 +1278,10 @@
           "planner": {
             "status": "pass"
           },
+          "compiler": {
+            "reason": "ASAPPlanner produced no legal summary candidate for the target",
+            "status": "typed_fallback"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -1135,14 +1292,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "coverage_dependent"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "ASAPPlanner produced no legal summary candidate for the target",
-            "status": "typed_fallback"
+          "terminal": {
+            "stage": "compiler",
+            "status": "typed_fallback",
+            "reason": "ASAPPlanner produced no legal summary candidate for the target"
           }
         },
         "clickhouse_sql": {
@@ -1166,11 +1324,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: labels\")"
           }
         }
       }
@@ -1190,6 +1352,10 @@
             "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
             "status": "typed_fallback"
           },
+          "compiler": {
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -1200,14 +1366,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "planner",
+            "status": "typed_fallback",
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve"
           }
         },
         "clickhouse_sql": {
@@ -1231,11 +1398,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")"
           }
         }
       }
@@ -1256,6 +1427,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: offset and @ modifiers",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -1266,14 +1441,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: offset and @ modifiers",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: offset and @ modifiers"
           }
         },
         "clickhouse_sql": {
@@ -1297,11 +1473,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")"
           }
         }
       }
@@ -1321,6 +1501,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: function `histogram_quantile`",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -1331,14 +1515,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: function `histogram_quantile`",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: function `histogram_quantile`"
           }
         },
         "clickhouse_sql": {
@@ -1362,11 +1547,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: ), found: .1\")"
           }
         }
       }
@@ -1386,6 +1575,10 @@
             "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
             "status": "typed_fallback"
           },
+          "compiler": {
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -1396,14 +1589,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "planner",
+            "status": "typed_fallback",
+            "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve"
           }
         },
         "clickhouse_sql": {
@@ -1427,11 +1621,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")"
           }
         }
       }
@@ -1451,6 +1649,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -1461,14 +1663,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1"
           }
         },
         "clickhouse_sql": {
@@ -1492,11 +1695,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "physical mapping failed: ASAPPlanner produced no legal summary candidate for the target"
           }
         }
       }
@@ -1519,6 +1726,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: subquery step or inherited step",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -1529,14 +1740,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: subquery step or inherited step",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: subquery step or inherited step"
           }
         },
         "clickhouse_sql": {
@@ -1560,11 +1772,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")"
           }
         }
       }
@@ -1587,6 +1803,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -1597,14 +1817,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1"
           }
         },
         "clickhouse_sql": {
@@ -1628,11 +1849,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")"
           }
         }
       }
@@ -1652,6 +1877,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -1662,14 +1891,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1"
           }
         },
         "clickhouse_sql": {
@@ -1693,11 +1923,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: labels\")"
           }
         }
       }
@@ -1718,6 +1952,10 @@
           "planner": {
             "status": "not_reached"
           },
+          "compiler": {
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+            "status": "not_reached"
+          },
           "publication": {
             "status": "not_reached"
           },
@@ -1728,14 +1966,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required"
+            "status": "pass"
           },
-          "compiler": {
-            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
-            "status": "not_reached"
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1"
           }
         },
         "clickhouse_sql": {
@@ -1743,7 +1982,7 @@
             "status": "oracle_valid"
           },
           "parser_canonical": {
-            "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'ifnull'?",
+            "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'round'?",
             "status": "typed_fallback"
           },
           "planner": {
@@ -1759,11 +1998,15 @@
             "status": "not_reached"
           },
           "adapter": {
-            "status": "available"
+            "status": "pass"
           },
           "fallback": {
-            "status": "required",
-            "reason": "exact SQL is executable by ClickHouse even when ASAPPlanner rejects acceleration"
+            "status": "pass"
+          },
+          "terminal": {
+            "stage": "parser_canonical",
+            "status": "typed_fallback",
+            "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'round'?"
           }
         }
       }

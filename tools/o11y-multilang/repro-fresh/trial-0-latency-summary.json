@@ -1,0 +1,44 @@
+{
+  "source": "tools/o11y-multilang/repro-fresh/trial-0-raw.json",
+  "engines": {
+    "asap_clickhouse": {
+      "attempted": 81,
+      "ok": 81,
+      "p50_ms": 59.232694,
+      "p95_ms": 178.693758,
+      "mean_ms": 67.9593735308642
+    },
+    "asap_metricsql": {
+      "attempted": 81,
+      "ok": 81,
+      "p50_ms": 4.965602,
+      "p95_ms": 5.560061,
+      "mean_ms": 5.0764054691358025
+    },
+    "clickhouse": {
+      "attempted": 81,
+      "ok": 81,
+      "p50_ms": 50.308769,
+      "p95_ms": 171.976702,
+      "mean_ms": 62.514236518518516
+    },
+    "prometheus": {
+      "attempted": 81,
+      "ok": 81,
+      "p50_ms": 3.112512,
+      "p95_ms": 6.966838,
+      "mean_ms": 3.503685172839506
+    },
+    "victoriametrics": {
+      "attempted": 81,
+      "ok": 81,
+      "p50_ms": 2.428257,
+      "p95_ms": 5.178419,
+      "mean_ms": 2.7528297283950613,
+      "prometheus_differential": {
+        "valid": 48,
+        "total": 81
+      }
+    }
+  }
+}

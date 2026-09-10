@@ -1,0 +1,126 @@
+{
+  "schema_version": 2,
+  "backend_head": "abe19211fb08ee3b10709a35271aa1840939054b",
+  "binary_sha256": "e9c2455d873063f2cb12374798a3b6fee196d9e2829dd139e264a82fa0f843fb",
+  "fixture_sha256": "b6e05405e9dc46edd268ced39c2dff0505f71f2a3bbce2c50f1a7f4d4b7aa49b",
+  "physical_plan_sha256": "f09f08a1181965069a4317282ea4770c3d10dc3cd37185cba1fc9a8858e01bd9",
+  "images": {
+    "prom/prometheus:v2.55.1": "prom/prometheus@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3",
+    "victoriametrics/victoria-metrics:v1.126.0": "victoriametrics/victoria-metrics@sha256:26dfc4ab90cf6fedc8115269adc22d300bcd5eab82ea1ebed3c8e22b49886ce1",
+    "clickhouse/clickhouse-server:latest": "clickhouse/clickhouse-server@sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb"
+  },
+  "trials": [
+    {
+      "trial": 0,
+      "seed": 20260910,
+      "lifecycle_seconds": 19.857919584959745,
+      "ingest_seconds": 1.3336594520369545,
+      "query_seconds": 11.824963322025724,
+      "raw": "trial-0-raw.json",
+      "phases": {
+        "started": {
+          "processes": {
+            "dp": {
+              "pid": 2662034,
+              "cpu_ticks": 6,
+              "rss_pages": 14665,
+              "vm_hwm": "58660 kB"
+            },
+            "prom": {
+              "pid": 2661317,
+              "cpu_ticks": 19,
+              "rss_pages": 17739,
+              "vm_hwm": "70956 kB"
+            },
+            "vm": {
+              "pid": 2661564,
+              "cpu_ticks": 158,
+              "rss_pages": 21657,
+              "vm_hwm": "86628 kB"
+            },
+            "ch": {
+              "pid": 2661705,
+              "cpu_ticks": 88,
+              "rss_pages": 156527,
+              "vm_hwm": "626108 kB"
+            }
+          },
+          "storage_bytes": {
+            "prom": 168792,
+            "dp": 8099,
+            "vm": 81920,
+            "ch": 106496
+          }
+        },
+        "post_ingest": {
+          "processes": {
+            "dp": {
+              "pid": 2662034,
+              "cpu_ticks": 6,
+              "rss_pages": 14665,
+              "vm_hwm": "58660 kB"
+            },
+            "prom": {
+              "pid": 2661317,
+              "cpu_ticks": 19,
+              "rss_pages": 17739,
+              "vm_hwm": "70956 kB"
+            },
+            "vm": {
+              "pid": 2661564,
+              "cpu_ticks": 323,
+              "rss_pages": 39261,
+              "vm_hwm": "157044 kB"
+            },
+            "ch": {
+              "pid": 2661705,
+              "cpu_ticks": 103,
+              "rss_pages": 161239,
+              "vm_hwm": "646056 kB"
+            }
+          },
+          "storage_bytes": {
+            "prom": 168792,
+            "dp": 8099,
+            "vm": 90112,
+            "ch": 118784
+          }
+        },
+        "post_query": {
+          "processes": {
+            "dp": {
+              "pid": 2662034,
+              "cpu_ticks": 87,
+              "rss_pages": 16128,
+              "vm_hwm": "64512 kB"
+            },
+            "prom": {
+              "pid": 2661317,
+              "cpu_ticks": 46,
+              "rss_pages": 18659,
+              "vm_hwm": "74636 kB"
+            },
+            "vm": {
+              "pid": 2661564,
+              "cpu_ticks": 374,
+              "rss_pages": 45234,
+              "vm_hwm": "180936 kB"
+            },
+            "ch": {
+              "pid": 2661705,
+              "cpu_ticks": 1544,
+              "rss_pages": 195672,
+              "vm_hwm": "1015172 kB"
+            }
+          },
+          "storage_bytes": {
+            "prom": 168792,
+            "dp": 30698,
+            "vm": 172032,
+            "ch": 2957312
+          }
+        }
+      }
+    }
+  ]
+}

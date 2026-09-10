@@ -5,7 +5,7 @@ Every attempt is retained in the denominator.  The alternating order avoids
 always giving one engine the warm cache.  This runner deliberately records raw
 responses and typed transport failures; summarization is a separate step.
 """
-import argparse, json, time, urllib.parse, urllib.request
+import argparse, json, random, time, urllib.parse, urllib.request
 from pathlib import Path
 
 def request(url, params):
@@ -22,6 +22,7 @@ def request(url, params):
 def main():
     p=argparse.ArgumentParser(); p.add_argument('--corpus',type=Path,default=Path(__file__).with_name('corpus.json'))
     p.add_argument('--eval-ms',type=int,default=1788891296000); p.add_argument('--repetitions',type=int,default=5)
+    p.add_argument('--seed',type=int,default=20260910)
     p.add_argument('--prometheus',default='http://127.0.0.1:19090/api/v1/query')
     p.add_argument('--victoriametrics'); p.add_argument('--clickhouse',default='http://127.0.0.1:18123/')
     p.add_argument('--asap-metricsql'); p.add_argument('--asap-clickhouse'); p.add_argument('--output',type=Path,required=True)
@@ -29,9 +30,10 @@ def main():
     if a.victoriametrics: engines.append('victoriametrics')
     if a.asap_metricsql: engines.append('asap_metricsql')
     if a.asap_clickhouse: engines.append('asap_clickhouse')
-    runs=[]
+    runs=[]; orders=[]
     for rep in range(a.repetitions):
-      for q in rows:
+      ordered=list(rows); random.Random(a.seed+rep).shuffle(ordered); orders.append([q['id'] for q in ordered])
+      for q in ordered:
        for engine in (engines if rep%2==0 else list(reversed(engines))):
         if engine=='prometheus': url=a.prometheus; params={'query':q['promql'],'time':a.eval_ms/1000}
         elif engine=='victoriametrics': url=a.victoriametrics; params={'query':q['metricsql'],'time':a.eval_ms/1000}
@@ -42,7 +44,7 @@ def main():
         result=request(url,params); result.update({'query_id':q['id'],'engine':engine,'repetition':rep})
         runs.append(result)
     a.output.write_text(json.dumps({'schema_version':1,'eval_ms':a.eval_ms,'repetitions':a.repetitions,
-      'denominator_per_engine':len(rows)*a.repetitions,'runs':runs},indent=2)+'\n')
+      'seed':a.seed,'query_orders':orders,'denominator_per_engine':len(rows)*a.repetitions,'runs':runs},indent=2)+'\n')
     print(json.dumps({e:{'attempted':sum(x['engine']==e for x in runs),'ok':sum(x['engine']==e and x['status']=='ok' for x in runs)} for e in engines},indent=2))
 
 if __name__=='__main__': main()
