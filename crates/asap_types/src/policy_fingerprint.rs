@@ -171,6 +171,13 @@ impl PolicyFingerprint {
 
         // 10. spatial_filter_normalized — canonicalized predicate
         buf.extend_from_slice(cfg.spatial_filter_normalized.as_bytes());
+        if let Some(population) = &cfg.table_population {
+            let canonical = population.canonical();
+            if !canonical.is_empty() {
+                buf.push(0);
+                buf.extend_from_slice(canonical.as_bytes());
+            }
+        }
 
         Self(xxh64(&buf, 0))
     }

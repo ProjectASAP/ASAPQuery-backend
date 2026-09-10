@@ -120,7 +120,9 @@ impl SummaryCatalog {
                 let data = DataDescriptor::new_typed(
                     source,
                     value_projection,
-                    crate::utils::normalize_spatial_filter(&config.spatial_filter),
+                    config
+                        .population_filter_canonical()
+                        .map_err(SummaryCatalogError::Descriptor)?,
                     config.grouping_labels.labels.clone(),
                     "asap.timestamped-observations.v2",
                 );
@@ -279,6 +281,29 @@ mod tests {
     }
 
     // Content changes invalidate references even when plan/version are reused.
+    #[test]
+    fn table_populations_have_distinct_materialization_and_data_identities() {
+        use crate::table_population::{TableColumnPredicate, TablePopulation};
+        use planner_types::pre_asap::{CompareOpKind, ScalarValue};
+        let mut requests = config("raw_samples.value", "", 60);
+        requests.table_name = Some("raw_samples".into());
+        requests.value_column = Some("value".into());
+        requests.table_population = Some(TablePopulation {
+            predicates: vec![TableColumnPredicate {
+                column: "metric".into(),
+                operator: CompareOpKind::Eq,
+                value: ScalarValue::Utf8("requests".into()),
+            }],
+        });
+        let mut errors = requests.clone();
+        errors.table_population.as_mut().unwrap().predicates[0].value =
+            ScalarValue::Utf8("errors".into());
+        assert_ne!(requests.policy_fingerprint(), errors.policy_fingerprint());
+        let catalog = SummaryCatalog::from_materializations(1, 1, &[requests, errors]).unwrap();
+        assert_eq!(catalog.data_descriptors.len(), 2);
+        assert_eq!(catalog.materializations.len(), 2);
+    }
+
     #[test]
     fn snapshot_reference_is_deterministic_and_content_sensitive() {
         let a = config("requests", "", 60);

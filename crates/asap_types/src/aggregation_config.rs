@@ -126,6 +126,12 @@ pub struct PrecomputeMaterialization {
     // SQL-specific fields (optional, used when query_language=sql)
     pub table_name: Option<String>,   // SQL mode: table name
     pub value_column: Option<String>, // SQL mode: which value column to aggregate
+    #[serde(
+        default,
+        alias = "tablePopulation",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub table_population: Option<crate::table_population::TablePopulation>,
 }
 
 /// Policy-match handles for both the key and value dimensions of a
@@ -162,6 +168,20 @@ impl AggregationIdInfo {
 pub type AggregationConfig = PrecomputeMaterialization;
 
 impl PrecomputeMaterialization {
+    pub fn population_filter_canonical(&self) -> Result<String, String> {
+        if let Some(population) = &self.table_population {
+            if self.table_name.is_none() || !self.spatial_filter.is_empty() {
+                return Err(
+                    "typed table population requires a table and no PromQL label filter".into(),
+                );
+            }
+            population.validate()?;
+            Ok(population.canonical())
+        } else {
+            Ok(normalize_spatial_filter(&self.spatial_filter))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         aggregation_type: AggregationType,
@@ -209,6 +229,7 @@ impl PrecomputeMaterialization {
             num_aggregates_to_retain,
             table_name,
             value_column,
+            table_population: None,
         }
     }
 
@@ -318,6 +339,14 @@ impl PrecomputeMaterialization {
             value_column,
         );
         config.pane_origin_ms = pane_origin_ms;
+        config.table_population = data
+            .get("tablePopulation")
+            .or_else(|| data.get("table_population"))
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
+        config.population_filter_canonical()?;
         Ok(config)
     }
 
@@ -457,6 +486,16 @@ impl PrecomputeMaterialization {
             value_column,
         );
         config.pane_origin_ms = pane_origin_ms;
+        config.table_population = aggregation_data
+            .get("tablePopulation")
+            .or_else(|| aggregation_data.get("table_population"))
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(serde_yaml::from_value)
+            .transpose()?;
+        config
+            .population_filter_canonical()
+            .map_err(anyhow::Error::msg)?;
         Ok(config)
     }
 }
@@ -491,6 +530,9 @@ impl SerializableToSink for PrecomputeMaterialization {
         }
         if let Some(ref value_column) = self.value_column {
             json["valueColumn"] = serde_json::json!(value_column);
+        }
+        if let Some(ref population) = self.table_population {
+            json["tablePopulation"] = serde_json::json!(population);
         }
 
         json

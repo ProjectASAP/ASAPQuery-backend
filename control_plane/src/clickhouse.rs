@@ -215,7 +215,7 @@ fn bind_selected_node(
     request: &ClickHouseSqlWorkload,
 ) -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
     let (table_ref, value_column, source_window, spatial_filter) =
-        clickhouse_materialization_leaf_contract(node)
+        clickhouse_materialization_leaf_contract(node, query.start_ms, query.end_ms)
             .map_err(crate::query_plan::QueryPlanError::Invalid)?;
     let expected = crate::physical::compiler::physical_materialization_family(family);
     let selected = select_materialization(
@@ -238,6 +238,8 @@ fn bind_selected_node(
 
 fn clickhouse_materialization_leaf_contract(
     node: &planner_types::post_asap::SummaryNode,
+    evaluation_start_ms: u64,
+    evaluation_end_ms: u64,
 ) -> Result<(String, String, Option<u64>, String), String> {
     use planner_types::{
         post_asap::SummaryExpr,
@@ -298,6 +300,7 @@ fn clickhouse_materialization_leaf_contract(
     let mut lower_ms = None;
     let mut upper_ms = None;
     let mut leaves = Vec::new();
+    let mut population = asap_types::table_population::TablePopulation::default();
     for predicate in predicates {
         comparisons(&predicate.0, &mut leaves);
     }
@@ -324,7 +327,14 @@ fn clickhouse_materialization_leaf_contract(
                 .time_index
                 .is_some_and(|index| schema.columns[index].name == name) =>
             {
-                lower_ms = Some(*value);
+                let bound = if matches!(op, CompareOpKind::Gt) {
+                    value
+                        .checked_add(1)
+                        .ok_or("SQL exclusive lower timestamp overflows")?
+                } else {
+                    *value
+                };
+                lower_ms = Some(lower_ms.map_or(bound, |previous: i64| previous.max(bound)));
             }
             (
                 name,
@@ -334,13 +344,43 @@ fn clickhouse_materialization_leaf_contract(
                 .time_index
                 .is_some_and(|index| schema.columns[index].name == name) =>
             {
-                upper_ms = Some(*value);
+                let bound = if matches!(op, CompareOpKind::Le) {
+                    value
+                        .checked_add(1)
+                        .ok_or("SQL inclusive upper timestamp overflows")?
+                } else {
+                    *value
+                };
+                upper_ms = Some(upper_ms.map_or(bound, |previous: i64| previous.min(bound)));
+            }
+            (_, _, QueryExpr::Literal(value))
+                if !schema
+                    .time_index
+                    .is_some_and(|index| schema.columns[index].name == name) =>
+            {
+                population
+                    .predicates
+                    .push(asap_types::table_population::TableColumnPredicate {
+                        column: name.into(),
+                        operator: op.clone(),
+                        value: value.clone(),
+                    });
             }
             _ => {
                 return Err(format!(
                     "SQL population predicate on {name} needs a canonical catalog filter"
                 ))
             }
+        }
+    }
+    population.validate()?;
+    if let (Some(lower), Some(upper)) = (lower_ms, upper_ms) {
+        if u64::try_from(lower).ok() != Some(evaluation_start_ms)
+            || u64::try_from(upper).ok() != Some(evaluation_end_ms)
+        {
+            return Err(
+                "SQL source timestamp bounds differ from the fixed evaluation range".into(),
+            );
         }
     }
     let inferred_window = match (lower_ms, upper_ms) {
@@ -359,7 +399,7 @@ fn clickhouse_materialization_leaf_contract(
         table_ref.to_owned(),
         value_column,
         Some(window_secs),
-        String::new(),
+        population.canonical(),
     ))
 }
 
@@ -374,7 +414,7 @@ fn select_materialization<'a>(
     let mut matches = materializations.iter().filter(|candidate| {
         candidate.table_name.as_deref() == Some(table_ref)
             && candidate.value_column.as_deref() == Some(value_column)
-            && candidate.spatial_filter_normalized == spatial_filter
+            && candidate.population_filter_canonical().ok().as_deref() == Some(spatial_filter)
             && candidate
                 .accumulator_spec()
                 .ok()
@@ -553,7 +593,7 @@ mod tests {
                 vec![],
             )
         };
-        let request = ClickHouseSqlWorkload {
+        let mut request = ClickHouseSqlWorkload {
             sds,
             precompute_plan: precompute,
             transmission_plan: transmission,
@@ -604,5 +644,50 @@ mod tests {
                 Ok(planner_types::post_asap::ValueOperation::Project { .. })
             )
         }));
+        let original = request.queries[0].sql.clone();
+        request.queries[0].sql = original.replace("timestamp_ms < 2000", "timestamp_ms <= 1999");
+        assert!(compile_clickhouse_workload(&request).await.is_ok());
+        request.queries[0].sql = original.replace("timestamp_ms < 2000", "timestamp_ms <= 2000");
+        assert!(compile_clickhouse_workload(&request).await.is_err());
+        request.queries[0].sql = original
+            .replace("timestamp_ms >= 0", "timestamp_ms >= 1000")
+            .replace("timestamp_ms < 2000", "timestamp_ms < 3000");
+        assert!(compile_clickhouse_workload(&request).await.is_err());
+
+        request
+            .tables
+            .get_mut("telemetry")
+            .unwrap()
+            .columns
+            .push(Column::new("metric", DataType::Utf8, false));
+        request.queries[0].sql = original.replace(
+            "WHERE timestamp_ms",
+            "WHERE metric = 'requests' AND timestamp_ms",
+        );
+        assert!(
+            compile_clickhouse_workload(&request).await.is_err(),
+            "an unfiltered summary cannot satisfy a filtered query"
+        );
+        let mut config = request.precompute_plan.materializations[0].clone();
+        config.table_population = Some(asap_types::table_population::TablePopulation {
+            predicates: vec![asap_types::table_population::TableColumnPredicate {
+                column: "metric".into(),
+                operator: planner_types::pre_asap::CompareOpKind::Eq,
+                value: planner_types::pre_asap::ScalarValue::Utf8("requests".into()),
+            }],
+        });
+        request.sds = SummaryCatalog::from_materializations(71, 1, &[config.clone()]).unwrap();
+        let envelope = request.precompute_plan.envelope.clone();
+        request.precompute_plan =
+            PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
+        request.precompute_plan.summary_catalog = Some(request.sds.reference().unwrap());
+        request.transmission_plan = TransmissionPlan::build(
+            envelope,
+            &request.precompute_plan,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+        request.transmission_plan.summary_catalog = Some(request.sds.reference().unwrap());
+        assert!(compile_clickhouse_workload(&request).await.is_ok());
     }
 }
