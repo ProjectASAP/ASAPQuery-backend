@@ -993,8 +993,60 @@ where
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let candidate_input = self.lower(candidates)?;
+                let value_input = if let Some(original) = &self.logical_source {
+                    let parsed = promql_parser::parser::parse(original)
+                        .map_err(|error| QueryPlanError::Invalid(error.to_string()))?;
+                    let promql_parser::parser::Expr::Aggregate(aggregate) = parsed else {
+                        return Err(QueryPlanError::Invalid(
+                            "CandidateTopK requires a top-level PromQL aggregate".into(),
+                        ));
+                    };
+                    if aggregate.op.to_string() != "topk" {
+                        return Err(QueryPlanError::Invalid(
+                            "CandidateTopK requires a topk source expression".into(),
+                        ));
+                    }
+                    fn item_label(node: &SummaryNode) -> Option<String> {
+                        match &node.expr {
+                            SummaryExpr::SummaryEstimate { summary_input, .. } => {
+                                item_label(summary_input)
+                            }
+                            SummaryExpr::SummaryAgg { input, .. } => match &input.item {
+                                Some(planner_types::post_asap::SummaryInputExpr::Column(
+                                    planner_types::pre_asap::ColumnRef::Named(label),
+                                )) => Some(label.clone()),
+                                Some(planner_types::post_asap::SummaryInputExpr::Column(
+                                    planner_types::pre_asap::ColumnRef::Qualified { name, .. },
+                                )) => Some(name.clone()),
+                                _ => None,
+                            },
+                            _ => None,
+                        }
+                    }
+                    let item_label = item_label(candidates).ok_or_else(|| {
+                        QueryPlanError::Invalid(
+                            "CandidateTopK membership has no named item label".into(),
+                        )
+                    })?;
+                    let value_id = QueryNodeId(self.next_id);
+                    self.next_id += 1;
+                    self.nodes.insert(
+                        value_id,
+                        QueryPlanNode::Logical {
+                            operator: logical::LogicalOperator::CandidateExactSubquery {
+                                query: aggregate.expr.to_string(),
+                                item_label,
+                            },
+                            inputs: vec![candidate_input],
+                        },
+                    );
+                    value_id
+                } else {
+                    self.lower(values)?
+                };
                 QueryPlanNode::CandidateTopK {
-                    inputs: [self.lower(candidates)?, self.lower(values)?],
+                    inputs: [candidate_input, value_input],
                     k: u64::try_from(*k).map_err(|_| {
                         QueryPlanError::Invalid("CandidateTopK k exceeds u64".into())
                     })?,
