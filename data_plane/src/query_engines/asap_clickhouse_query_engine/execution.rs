@@ -1,13 +1,18 @@
 //! SQL boundary around the shared, compiler-bound physical DAG executor.
-use super::clickhouse_result_adapter::{from_series_rows, ClickHouseQueryResult};
+use super::{
+    clickhouse_result_adapter::{from_series_rows, ClickHouseQueryResult},
+    relational_adapter::{ClickHouseRelation, ClickHouseRelationalAdapter},
+};
 use crate::{
     query_engines::asap_query_engine::{
-        catalog_resolver::validate_entry, post_asap_readout::execute_query_plan_readout,
+        catalog_resolver::validate_payload, post_asap_readout::execute_query_plan_payload_readout,
     },
     storage_engines::sketch_db::index::SketchStore,
 };
 use asap_types::summary_catalog::SummaryCatalog;
-use control_plane::query_plan::QueryPlanEntry;
+use control_plane::query_plan::{ExecutableQueryPlan, QueryNodeId, QueryPlanNode};
+use planner_types::post_asap::ValueOperation;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClickHouseDagFallback {
@@ -39,32 +44,63 @@ fn complete_pane_coverage(
 /// summary selection, or materialization candidate search.
 pub fn execute_sql_dag(
     index: &SketchStore,
-    entry: &QueryPlanEntry,
+    entry: &ExecutableQueryPlan,
     sds: &SummaryCatalog,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
 ) -> ClickHouseDagOutcome {
-    if let Err(error) = validate_entry(Some(sds), entry, sds.plan_id, sds.plan_version) {
+    if let Err(error) = validate_payload(Some(sds), entry, sds.plan_id, sds.plan_version) {
         return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
             error.to_string(),
         ));
     }
-    let outcome = match execute_query_plan_readout(index, entry, t0_ms, t1_ms, is_cumulative) {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            let detail = format!("{error:?}");
-            if detail.contains("missing materialized pane")
-                || detail.contains("incomplete materialized panes")
-            {
-                return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::IncompleteCoverage {
-                    requested: (t0_ms, t1_ms),
-                    observed: None,
-                });
+    let mut base_root = entry.root;
+    let mut relational = Vec::new();
+    loop {
+        match entry.nodes.get(&base_root) {
+            Some(QueryPlanNode::Relational {
+                input,
+                operation,
+                input_schema,
+                output_schema,
+            }) => {
+                relational.push((
+                    operation.clone(),
+                    input_schema.clone(),
+                    output_schema.clone(),
+                ));
+                base_root = *input;
             }
-            return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(detail));
+            _ => break,
+        }
+    }
+    let executable = match reachable_entry(entry, base_root) {
+        Ok(entry) => entry,
+        Err(detail) => {
+            return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(detail))
         }
     };
+    let outcome =
+        match execute_query_plan_payload_readout(index, &executable, t0_ms, t1_ms, is_cumulative) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let detail = format!("{error:?}");
+                if detail.contains("missing materialized pane")
+                    || detail.contains("incomplete materialized panes")
+                {
+                    return ClickHouseDagOutcome::Fallback(
+                        ClickHouseDagFallback::IncompleteCoverage {
+                            requested: (t0_ms, t1_ms),
+                            observed: None,
+                        },
+                    );
+                }
+                return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
+                    detail,
+                ));
+            }
+        };
     let pane_ms = entry
         .materialization_bindings()
         .iter()
@@ -77,12 +113,79 @@ pub fn execute_sql_dag(
             observed: outcome.coverage,
         });
     }
-    match from_series_rows(outcome.series) {
+    if relational.is_empty() {
+        return match from_series_rows(outcome.series) {
+            Ok(result) => ClickHouseDagOutcome::Accelerated(result),
+            Err(error) => ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::ResultEncoding(
+                error.to_string(),
+            )),
+        };
+    }
+    let input_schema = &relational.last().expect("non-empty").1;
+    let mut relation = match ClickHouseRelation::from_series_rows(
+        input_schema,
+        outcome.series,
+        outcome.coverage,
+    ) {
+        Ok(relation) => relation,
+        Err(error) => {
+            return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::ResultEncoding(
+                error.to_string(),
+            ))
+        }
+    };
+    let adapter = ClickHouseRelationalAdapter;
+    for (wire_operation, _, output_schema) in relational.into_iter().rev() {
+        let operation: ValueOperation = match serde_json::from_value(wire_operation) {
+            Ok(operation) => operation,
+            Err(error) => {
+                return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
+                    format!("invalid published relational operation: {error}"),
+                ))
+            }
+        };
+        relation = match adapter.apply_operation(&operation, &output_schema, relation) {
+            Ok(relation) => relation,
+            Err(error) => {
+                return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
+                    error.to_string(),
+                ))
+            }
+        };
+    }
+    match relation.into_result() {
         Ok(result) => ClickHouseDagOutcome::Accelerated(result),
         Err(error) => {
             ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::ResultEncoding(error.to_string()))
         }
     }
+}
+
+fn reachable_entry(
+    entry: &ExecutableQueryPlan,
+    root: QueryNodeId,
+) -> Result<ExecutableQueryPlan, String> {
+    let mut pending = vec![root];
+    let mut reachable = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !reachable.insert(id) {
+            continue;
+        }
+        let node = entry
+            .nodes
+            .get(&id)
+            .ok_or_else(|| format!("published DAG references missing node {}", id.0))?;
+        pending.extend(node.inputs());
+    }
+    let nodes = reachable
+        .into_iter()
+        .map(|id| (id, entry.nodes[&id].clone()))
+        .collect::<BTreeMap<_, _>>();
+    Ok(ExecutableQueryPlan {
+        root,
+        nodes,
+        ..entry.clone()
+    })
 }
 
 #[cfg(test)]

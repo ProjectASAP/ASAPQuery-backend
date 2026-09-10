@@ -170,6 +170,86 @@ pub struct QueryPlanEntry {
     pub fallback: FallbackPolicy,
 }
 
+/// Language-neutral executable physical DAG. Language catalogs own query
+/// identity; this payload owns only execution semantics and SDS bindings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutableQueryPlan {
+    pub root: QueryNodeId,
+    pub nodes: BTreeMap<QueryNodeId, QueryPlanNode>,
+    pub instant: InstantExecution,
+    pub fallback: FallbackPolicy,
+}
+
+fn topological_order(
+    root: QueryNodeId,
+    nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
+) -> Result<Vec<QueryNodeId>, QueryPlanError> {
+    fn visit(
+        id: QueryNodeId,
+        nodes: &BTreeMap<QueryNodeId, QueryPlanNode>,
+        visiting: &mut BTreeSet<QueryNodeId>,
+        visited: &mut BTreeSet<QueryNodeId>,
+        out: &mut Vec<QueryNodeId>,
+    ) -> Result<(), QueryPlanError> {
+        if visited.contains(&id) {
+            return Ok(());
+        }
+        if !visiting.insert(id) {
+            return Err(QueryPlanError::Invalid(format!(
+                "cycle detected at query node {}",
+                id.0
+            )));
+        }
+        let node = nodes
+            .get(&id)
+            .ok_or_else(|| QueryPlanError::Invalid(format!("missing query node {}", id.0)))?;
+        for input in node.inputs() {
+            visit(*input, nodes, visiting, visited, out)?;
+        }
+        visiting.remove(&id);
+        visited.insert(id);
+        out.push(id);
+        Ok(())
+    }
+    let mut out = Vec::with_capacity(nodes.len());
+    visit(
+        root,
+        nodes,
+        &mut BTreeSet::new(),
+        &mut BTreeSet::new(),
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+impl QueryPlanEntry {
+    pub fn executable(&self) -> ExecutableQueryPlan {
+        ExecutableQueryPlan {
+            root: self.root,
+            nodes: self.nodes.clone(),
+            instant: self.instant,
+            fallback: self.fallback.clone(),
+        }
+    }
+}
+
+impl ExecutableQueryPlan {
+    pub fn materialization_bindings(&self) -> Vec<&MaterializationBinding> {
+        self.nodes
+            .values()
+            .filter_map(|node| match node {
+                QueryPlanNode::ReadMaterialization { binding } => Some(binding),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn topological_order(&self) -> Result<Vec<QueryNodeId>, QueryPlanError> {
+        topological_order(self.root, &self.nodes)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InstantExecution {
@@ -212,12 +292,42 @@ impl QueryPlanEntry {
             seen: BTreeMap::new(),
             bind: &mut bind,
             logical_source: None,
+            preserve_relational: false,
         };
         let root = compiler.lower(root)?;
         Ok(Self {
             language: QueryLanguage::PromQl,
             query_id,
             canonical_query,
+            root,
+            nodes: compiler.nodes,
+            instant,
+            fallback,
+        })
+    }
+
+    pub fn compile_bound_relational<F>(
+        root: &Rc<SummaryNode>,
+        instant: InstantExecution,
+        fallback: FallbackPolicy,
+        mut bind: F,
+    ) -> Result<ExecutableQueryPlan, QueryPlanError>
+    where
+        F: FnMut(
+            &SummaryNode,
+            &SummaryFamilyType,
+        ) -> Result<MaterializationBinding, QueryPlanError>,
+    {
+        let mut compiler = DagCompiler {
+            next_id: 0,
+            nodes: BTreeMap::new(),
+            seen: BTreeMap::new(),
+            bind: &mut bind,
+            logical_source: None,
+            preserve_relational: true,
+        };
+        let root = compiler.lower(root)?;
+        Ok(ExecutableQueryPlan {
             root,
             nodes: compiler.nodes,
             instant,
@@ -247,6 +357,7 @@ impl QueryPlanEntry {
             seen: BTreeMap::new(),
             bind: &mut bind,
             logical_source: Some(canonical_query.clone()),
+            preserve_relational: false,
         };
         let root = compiler.lower(root)?;
         let mut entry = Self {
@@ -414,6 +525,14 @@ pub enum PhysicalGrouping {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
+    Relational {
+        input: QueryNodeId,
+        /// Serialized planner-owned operation. Keeping the wire form here makes
+        /// the published catalog Send + Sync even though the planner AST uses Rc.
+        operation: serde_json::Value,
+        input_schema: planner_types::post_asap::SummarySchema,
+        output_schema: planner_types::post_asap::SummarySchema,
+    },
     Logical {
         operator: logical::LogicalOperator,
         inputs: Vec<QueryNodeId>,
@@ -465,6 +584,7 @@ impl QueryPlanNode {
             }
             Self::Binary { inputs, .. } => inputs,
             Self::ReduceSum { input, .. }
+            | Self::Relational { input, .. }
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
             Self::SummaryMerge { inputs } | Self::Logical { inputs, .. } => inputs,
@@ -529,6 +649,7 @@ struct DagCompiler<'a, F> {
     seen: BTreeMap<usize, QueryNodeId>,
     bind: &'a mut F,
     logical_source: Option<String>,
+    preserve_relational: bool,
 }
 
 impl<F> DagCompiler<'_, F>
@@ -567,7 +688,8 @@ where
                 }
                 QueryPlanNode::SummaryEstimate { input, .. }
                 | QueryPlanNode::ExactReadout { input, .. }
-                | QueryPlanNode::ReduceSum { input, .. } => *input = remap[input],
+                | QueryPlanNode::ReduceSum { input, .. }
+                | QueryPlanNode::Relational { input, .. } => *input = remap[input],
                 QueryPlanNode::Scalar { .. }
                 | QueryPlanNode::ReadMaterialization { .. }
                 | QueryPlanNode::ExactFallback { .. } => {}
@@ -618,6 +740,28 @@ where
         }
 
         let physical = match &node.expr {
+            SummaryExpr::ValueOperation {
+                child, operation, ..
+            } if self.preserve_relational
+                && matches!(
+                    operation,
+                    planner_types::post_asap::ValueOperation::Project { .. }
+                        | planner_types::post_asap::ValueOperation::Filter { .. }
+                        | planner_types::post_asap::ValueOperation::Sort { .. }
+                        | planner_types::post_asap::ValueOperation::Limit { .. }
+                ) =>
+            {
+                QueryPlanNode::Relational {
+                    input: self.lower(child)?,
+                    operation: serde_json::to_value(operation).map_err(|error| {
+                        QueryPlanError::UnsupportedNode(format!(
+                            "cannot serialize relational operation: {error}"
+                        ))
+                    })?,
+                    input_schema: child.schema.clone(),
+                    output_schema: node.schema.clone(),
+                }
+            }
             SummaryExpr::ValueOperation {
                 child,
                 operation:
@@ -1386,9 +1530,19 @@ mod catalog_binding_tests {
     #[test]
     fn catalog_binding_round_trip_preserves_pane_and_readout_windows() {
         let (plan, catalog) = fixture();
-        let mut decoded: QueryPlan =
-            serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+        let wire = serde_json::to_vec(&plan).unwrap();
+        let mut decoded: QueryPlan = serde_json::from_slice(&wire).unwrap();
         decoded.validate_against_catalog(&catalog).unwrap();
+        assert_eq!(
+            decoded
+                .lookup("sum_over_time(m[1m])")
+                .unwrap()
+                .canonical_promql,
+            "sum_over_time(m[1m])"
+        );
+        assert!(String::from_utf8(wire)
+            .unwrap()
+            .contains("canonical_promql"));
         assert_eq!(binding(&mut decoded).window_ms, 10_000);
         assert_eq!(binding(&mut decoded).readout_lookback_ms, Some(60_000));
     }

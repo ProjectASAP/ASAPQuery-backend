@@ -198,14 +198,14 @@ ClickHouse version discovery, database discovery, and table discovery.
 |---|---|
 | Independent protocol | The optional ClickHouse listener owns request parsing, result encoding, `/ping`, authentication forwarding, and exact ClickHouse fallback. It does not use PromQL request or response types. |
 | Control plane SQL frontend | `POST /api/v1/clickhouse-plan/compile-and-publish` accepts SQL workload plus table schemas. `compile_clickhouse_workload` calls ASAPPlanner's ClickHouse SQL frontend, producing canonical `QueryExpr` and the shared physical `SummaryNode` DAG. |
-| Compiler-bound catalog | The control plane compiles the selected `SummaryNode` into the existing serializable `QueryPlanEntry`. Every read leaf is bound to a catalog `MaterializationId`; the SQL catalog remains separate from SDS. |
+| Compiler-bound catalog | The control plane compiles the selected `SummaryNode` into a language-neutral executable payload. `SqlPlanEntry` owns `canonical_sql`; the unchanged PromQL `QueryPlanEntry` continues to own `canonical_promql`. Every read leaf is bound to a catalog `MaterializationId`; the SQL catalog remains separate from SDS. |
 | Two-phase publication | `BackendClient::publish_clickhouse_plan` sends the complete bundle to the ClickHouse listener's stage endpoint, waits for its ACK, and then activates the same `(plan_id, plan_version)`. Optional bearer authentication applies to both requests. |
-| Runtime execution | Fingerprint lookup returns the published `QueryPlanEntry`. Runtime never reparses SQL or reruns summary selection; it invokes the existing materialization-bound physical DAG executor. |
+| Runtime execution | Fingerprint lookup returns the published SQL entry and its executable payload. Runtime never reparses SQL or reruns summary selection; it invokes the shared materialization-bound physical DAG executor. |
 | SDS and SummaryStore | Stage and serving both validate `MaterializationBinding` through the authoritative `SummaryCatalog`. Store reads resolve the bound fingerprint to SIDs and read SummaryStore panes. Missing descriptors, SIDs, or coverage fail closed. |
 | Internal relation and ClickHouse result | Shared execution produces labeled timestamp/value rows. The ClickHouse boundary converts these rows to typed Arrow batches and encodes `TabSeparated`, `JSONEachRow`, or `JSON`. |
 | Language fallback | Every catalog miss, validation failure, coverage gap, unsupported DAG, or encoding failure returns to the ClickHouse adapter, which forwards the original SQL to exact ClickHouse. PromQL retains its existing Prometheus/Thanos fallback. |
 | Ingest and backfill | Configuring `ASAP_CLICKHOUSE_BACKFILL_TABLE` installs `ClickHouseReader` in the existing BackfillService lifecycle. Jobs opt in with `clickhouse://configured`; other source variants keep the default reader factory. |
-| Semantic invariants | No PromQL request/result type or SDS descriptor was extended. The shared `QueryPlanEntry`, resolver, executor, SummaryCatalog, and SummaryStore retain their existing meanings; ClickHouse only supplies another producer and language adapter. |
+| Semantic invariants | No PromQL request/result type or SDS descriptor was extended. `QueryPlanEntry.canonical_promql` and its serialized lookup contract remain PromQL-only; SQL identity lives only in `SqlPlanEntry`. The resolver, executor, SummaryCatalog, and SummaryStore retain their existing meanings. |
 
 The three milestones map directly to the trace: independent listener and exact
 fallback cover milestone 1; control-plane compilation, compiler binding, and
@@ -226,9 +226,9 @@ and successful activation (`200`). Exact fallback errors return `502`.
 | Operator/shape | ASAPPlanner SQL frontend | Published backend runtime |
 |---|---|---|
 | Scan, time range, aggregate summary selection | Supported when schema and summary family are known | Bound materialization read, merge, estimate, exact readout, scalar/binary value, and reduce-sum nodes are supported |
-| Top-level projection | Canonicalized and preserved above the aggregate | Only projections fully eliminated by physical compilation are supported; a remaining value-operation node makes publication fail explicitly |
-| Filter | Canonicalized when ASAPPlanner can type it | Unsupported remaining filter nodes fail publication or exact fallback |
-| Global sort/limit | Canonicalized | Only compiler-lowered supported physical nodes execute; remaining sort/limit value operations fail publication |
+| Top-level projection | Canonicalized and preserved above the aggregate | Published `Project` evaluates positional scalar expressions and produces the planner-declared typed schema |
+| Filter | Canonicalized when ASAPPlanner can type it | Published `Filter` evaluates the canonical predicate over summary readout rows |
+| Global sort/limit | Canonicalized | Published global `Sort` and `Limit` execute in the shared relation chain; partitioned sort is typed unsupported |
 | Join, window function, partitioned rank | Unsupported for acceleration | Never published; exact ClickHouse receives the original SQL |
 | DDL, metadata, system query, unsupported scalar function/cast | Outside accelerated workload planning | Catalog miss or explicit compile rejection; exact ClickHouse |
 | Missing SDS descriptor/materialization | N/A | Stage/activation validator rejection |

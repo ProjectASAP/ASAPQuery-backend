@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use control_plane::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
+use control_plane::query_plan::{ExecutableQueryPlan, QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use thiserror::Error;
 
 pub trait QueryNodeRuntime {
@@ -33,6 +33,13 @@ pub enum DagExecutionError<E> {
 /// performs one store read for the shared leaf, not one read per parent path.
 pub fn execute<R: QueryNodeRuntime>(
     entry: &QueryPlanEntry,
+    runtime: &R,
+) -> Result<R::Output, DagExecutionError<R::Error>> {
+    execute_payload(&entry.executable(), runtime)
+}
+
+pub fn execute_payload<R: QueryNodeRuntime>(
+    entry: &ExecutableQueryPlan,
     runtime: &R,
 ) -> Result<R::Output, DagExecutionError<R::Error>> {
     let order = entry

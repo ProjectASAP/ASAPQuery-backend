@@ -11,7 +11,7 @@ use axum::{
     body::Bytes,
     http::{HeaderMap, HeaderValue, StatusCode},
 };
-use control_plane::query_plan::QueryPlanEntry;
+use control_plane::query_plan::ExecutableQueryPlan;
 
 use super::{
     clickhouse_result_adapter::ClickHouseFormat,
@@ -35,7 +35,7 @@ pub struct SqlRuntimePlan {
     pub cumulative: bool,
     pub materializations: BTreeSet<PolicyFingerprint>,
     /// Control-plane compiled and materialization-bound executable DAG.
-    pub executable: QueryPlanEntry,
+    pub executable: ExecutableQueryPlan,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -91,7 +91,7 @@ impl CatalogClickHouseAccelerator {
     {
         let _publication = self.publication.write().unwrap();
         for plan in &bundle.plans {
-            crate::query_engines::asap_query_engine::catalog_resolver::validate_entry(
+            crate::query_engines::asap_query_engine::catalog_resolver::validate_payload(
                 Some(&bundle.sds),
                 &plan.runtime.executable,
                 bundle.sds.plan_id,
@@ -243,6 +243,30 @@ mod tests {
         ExactReadout, FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping,
         QueryNodeId, QueryPlanNode,
     };
+    use planner_types::{
+        post_asap::{SummaryFamilyType, SummaryField, SummarySchema, ValueOperation},
+        pre_asap::{
+            ArithmeticOpKind, CompareOpKind, DataType, GroupKeys, Predicate, ProjectItem,
+            QueryExpr, ScalarValue, SortKey,
+        },
+    };
+    use std::rc::Rc;
+
+    fn relation_schema(names: &[(&str, DataType)]) -> SummarySchema {
+        SummarySchema {
+            fields: names
+                .iter()
+                .map(|(name, dtype)| SummaryField {
+                    name: (*name).into(),
+                    dtype: SummaryFamilyType::Plain(dtype.clone()),
+                    nullable: false,
+                })
+                .collect(),
+            time_index: names
+                .iter()
+                .position(|(_, dtype)| *dtype == DataType::Timestamp),
+        }
+    }
 
     fn fixture(end_ms: u64) -> (CatalogClickHouseAccelerator, ClickHouseQueryRequest) {
         let config = PrecomputeMaterialization::new(
@@ -265,10 +289,20 @@ mod tests {
         let sds = SummaryCatalog::from_materializations(41, 1, &[config]).unwrap();
         let materialization = *sds.materializations.keys().next().unwrap();
         let read = QueryNodeId(0);
-        let root = QueryNodeId(1);
-        let executable = QueryPlanEntry {
-            query_id: "sql-sum".into(),
-            canonical_promql: "SELECT sum(value) FROM requests".into(),
+        let readout = QueryNodeId(1);
+        let input_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("value", DataType::Float64),
+        ]);
+        let projected_schema = relation_schema(&[
+            ("bucket", DataType::Timestamp),
+            ("score", DataType::Float64),
+        ]);
+        let filter = QueryNodeId(2);
+        let project = QueryNodeId(3);
+        let sort = QueryNodeId(4);
+        let root = QueryNodeId(5);
+        let executable = ExecutableQueryPlan {
             root,
             nodes: [
                 (
@@ -283,10 +317,81 @@ mod tests {
                     },
                 ),
                 (
-                    root,
+                    readout,
                     QueryPlanNode::ExactReadout {
                         input: read,
                         readout: ExactReadout::Sum,
+                    },
+                ),
+                (
+                    filter,
+                    QueryPlanNode::Relational {
+                        input: readout,
+                        operation: serde_json::to_value(ValueOperation::Filter {
+                            pred: Predicate(Rc::new(QueryExpr::Compare {
+                                left: Rc::new(QueryExpr::Column(1)),
+                                op: CompareOpKind::Gt,
+                                right: Rc::new(QueryExpr::Literal(ScalarValue::Float64(1.0))),
+                            })),
+                        })
+                        .unwrap(),
+                        input_schema: input_schema.clone(),
+                        output_schema: input_schema.clone(),
+                    },
+                ),
+                (
+                    project,
+                    QueryPlanNode::Relational {
+                        input: filter,
+                        operation: serde_json::to_value(ValueOperation::Project {
+                            cols: vec![
+                                ProjectItem {
+                                    alias: Some("bucket".into()),
+                                    expr: QueryExpr::Column(0),
+                                },
+                                ProjectItem {
+                                    alias: Some("score".into()),
+                                    expr: QueryExpr::Arithmetic {
+                                        op: ArithmeticOpKind::Mul,
+                                        left: Rc::new(QueryExpr::Column(1)),
+                                        right: Rc::new(QueryExpr::Literal(ScalarValue::Float64(
+                                            10.0,
+                                        ))),
+                                    },
+                                },
+                            ],
+                            qualifier: None,
+                        })
+                        .unwrap(),
+                        input_schema: input_schema,
+                        output_schema: projected_schema.clone(),
+                    },
+                ),
+                (
+                    sort,
+                    QueryPlanNode::Relational {
+                        input: project,
+                        operation: serde_json::to_value(ValueOperation::Sort {
+                            keys: vec![SortKey {
+                                expr: QueryExpr::Column(1),
+                                ascending: false,
+                                nulls_first: false,
+                            }],
+                            partition_by: GroupKeys::none(),
+                        })
+                        .unwrap(),
+                        input_schema: projected_schema.clone(),
+                        output_schema: projected_schema.clone(),
+                    },
+                ),
+                (
+                    root,
+                    QueryPlanNode::Relational {
+                        input: sort,
+                        operation: serde_json::to_value(ValueOperation::Limit { n: 1, offset: 0 })
+                            .unwrap(),
+                        input_schema: projected_schema.clone(),
+                        output_schema: projected_schema,
                     },
                 ),
             ]
@@ -368,7 +473,7 @@ mod tests {
         else {
             panic!("expected accelerated response")
         };
-        assert_eq!(response.body, "1970-01-01T00:00:02\t5.0\n");
+        assert_eq!(response.body, "1970-01-01T00:00:02\t50.0\n");
     }
 
     #[tokio::test]

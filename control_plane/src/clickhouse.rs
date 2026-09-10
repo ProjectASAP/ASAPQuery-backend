@@ -84,7 +84,7 @@ pub async fn compile_clickhouse_workload(
         tables: request.tables.clone(),
     };
     let mut plans = Vec::with_capacity(request.queries.len());
-    for (index, query) in request.queries.iter().enumerate() {
+    for query in &request.queries {
         let planned = plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
         let PhysicalExpr::Committed(crate::physical::post_asap::PostAsapPlan::Summary(root)) =
             planned.physical
@@ -93,9 +93,7 @@ pub async fn compile_clickhouse_workload(
                 "SQL did not produce a summary DAG".into(),
             ));
         };
-        let executable = QueryPlanEntry::compile_bound(
-            format!("clickhouse-sql-{index}"),
-            query.sql.trim().to_owned(),
+        let executable = QueryPlanEntry::compile_bound_relational(
             &root,
             InstantExecution {
                 lookback_ms: query.end_ms.saturating_sub(query.start_ms),

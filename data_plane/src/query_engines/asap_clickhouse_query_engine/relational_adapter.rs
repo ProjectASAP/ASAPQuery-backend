@@ -10,7 +10,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use planner_types::{
-    post_asap::{SummaryFamilyType, SummaryNode, ValueOperation},
+    post_asap::{SummaryFamilyType, SummaryNode, SummarySchema, ValueOperation},
     pre_asap::{ArithmeticOpKind, CompareOpKind, DataType, QueryExpr, ScalarValue, SortKey},
 };
 
@@ -54,6 +54,25 @@ pub struct ClickHouseRelation {
 }
 
 impl ClickHouseRelation {
+    pub fn from_series_rows(
+        schema: &SummarySchema,
+        series: Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)>,
+        coverage: Option<(u64, u64)>,
+    ) -> Result<Self, ClickHouseRelationalError> {
+        let fields = fields_from_schema(schema);
+        let mut rows = Vec::new();
+        for (group, points) in series {
+            for (timestamp, value) in points {
+                rows.push(row_from_value(&fields, &group, timestamp, value)?);
+            }
+        }
+        Ok(Self {
+            rows,
+            fields,
+            coverage,
+        })
+    }
+
     pub fn into_result(self) -> Result<ClickHouseQueryResult, ClickHouseRelationalError> {
         let fields = self
             .fields
@@ -72,6 +91,61 @@ impl ClickHouseRelation {
 }
 
 pub struct ClickHouseRelationalAdapter;
+
+impl ClickHouseRelationalAdapter {
+    pub fn apply_operation(
+        &self,
+        operation: &ValueOperation,
+        output_schema: &SummarySchema,
+        mut input: ClickHouseRelation,
+    ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
+        match operation {
+            ValueOperation::Project { cols, .. } => {
+                let mut rows = Vec::with_capacity(input.rows.len());
+                for row in &input.rows {
+                    rows.push(
+                        cols.iter()
+                            .map(|item| eval(&item.expr, row))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
+                }
+                input.rows = rows;
+                input.fields = fields_from_schema(output_schema);
+            }
+            ValueOperation::Filter { pred } => {
+                input.rows = input
+                    .rows
+                    .into_iter()
+                    .filter_map(|row| match eval(&pred.0, &row) {
+                        Ok(Cell::Bool(true)) => Some(Ok(row)),
+                        Ok(_) => None,
+                        Err(error) => Some(Err(error)),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
+            ValueOperation::Sort { keys, partition_by } => {
+                if partition_by.is_without() || !partition_by.is_empty() {
+                    return Err(ClickHouseRelationalError::Unsupported(
+                        "partitioned sort".into(),
+                    ));
+                }
+                for row in &input.rows {
+                    for key in keys {
+                        eval(&key.expr, row)?;
+                    }
+                }
+                input
+                    .rows
+                    .sort_by(|left, right| compare_sort_keys(left, right, keys));
+            }
+            ValueOperation::Limit { n, offset } => {
+                input.rows = input.rows.into_iter().skip(*offset).take(*n).collect();
+            }
+            other => return Err(ClickHouseRelationalError::Unsupported(format!("{other:?}"))),
+        }
+        Ok(input)
+    }
+}
 
 impl<E> RelationalAdapter<E> for ClickHouseRelationalAdapter
 where
@@ -138,56 +212,18 @@ where
         &self,
         node: &SummaryNode,
         operation: &ValueOperation,
-        mut input: Self::Relation,
+        input: Self::Relation,
     ) -> Result<Self::Relation, Self::Error> {
-        match operation {
-            ValueOperation::Project { cols, .. } => {
-                let mut rows = Vec::with_capacity(input.rows.len());
-                for row in &input.rows {
-                    rows.push(
-                        cols.iter()
-                            .map(|item| eval(&item.expr, row))
-                            .collect::<Result<Vec<_>, _>>()?,
-                    );
-                }
-                input.rows = rows;
-                input.fields = fields(node);
-            }
-            ValueOperation::Filter { pred } => {
-                let mut rows = Vec::with_capacity(input.rows.len());
-                for row in input.rows {
-                    if matches!(eval(&pred.0, &row)?, Cell::Bool(true)) {
-                        rows.push(row);
-                    }
-                }
-                input.rows = rows;
-            }
-            ValueOperation::Sort { keys, partition_by } => {
-                if partition_by.is_without() || !partition_by.is_empty() {
-                    return Err(ClickHouseRelationalError::Unsupported(
-                        "partitioned sort".into(),
-                    ));
-                }
-                for row in &input.rows {
-                    for key in keys {
-                        eval(&key.expr, row)?;
-                    }
-                }
-                input
-                    .rows
-                    .sort_by(|left, right| compare_sort_keys(left, right, keys));
-            }
-            ValueOperation::Limit { n, offset } => {
-                input.rows = input.rows.into_iter().skip(*offset).take(*n).collect();
-            }
-            other => return Err(ClickHouseRelationalError::Unsupported(format!("{other:?}"))),
-        }
-        Ok(input)
+        self.apply_operation(operation, &node.schema, input)
     }
 }
 
 fn fields(node: &SummaryNode) -> Vec<(String, DataType, bool)> {
-    node.schema
+    fields_from_schema(&node.schema)
+}
+
+fn fields_from_schema(schema: &SummarySchema) -> Vec<(String, DataType, bool)> {
+    schema
         .fields
         .iter()
         .map(|field| {
