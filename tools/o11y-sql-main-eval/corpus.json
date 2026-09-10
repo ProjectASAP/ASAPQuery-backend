@@ -1,0 +1,342 @@
+{
+  "schema_version": 1,
+  "source": "source-corpus.json",
+  "count": 27,
+  "queries": [
+    {
+      "id": "q01",
+      "promql": "sort_desc(sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+      "metricsql": "sort_desc(sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+      "clickhouse_sql": "SELECT * FROM (SELECT a.labels,a.value/b.value value FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=(({eval_ms}-0)-21600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) a INNER JOIN (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=(({eval_ms}-0)-21600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) b ON a.labels=b.labels) ORDER BY value DESC,labels",
+      "operators": [
+        "sort_desc",
+        "increase",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q02",
+      "promql": "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+      "metricsql": "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+      "clickhouse_sql": "SELECT * FROM (SELECT a.labels,a.value/b.value value FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=(({eval_ms}-0)-21600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) a INNER JOIN (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=(({eval_ms}-0)-21600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) b ON a.labels=b.labels) ORDER BY value DESC,labels LIMIT 1",
+      "operators": [
+        "topk",
+        "increase",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q03",
+      "promql": "sum(increase(payment_service_http_5xx_total[1h])) / sum(increase(payment_service_http_requests_total[1h]))",
+      "metricsql": "sum(increase(payment_service_http_5xx_total[1h])) / sum(increase(payment_service_http_requests_total[1h]))",
+      "clickhouse_sql": "SELECT a.labels,a.value/b.value value FROM (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='payment_service_http_5xx_total' AND ts_ms>=(({eval_ms}-0)-3600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) a INNER JOIN (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='payment_service_http_requests_total' AND ts_ms>=(({eval_ms}-0)-3600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) b ON a.labels=b.labels",
+      "operators": [
+        "increase",
+        "sum",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q04",
+      "promql": "sum(increase(payment_service_http_5xx_total[1h] offset 6h)) / sum(increase(payment_service_http_requests_total[1h] offset 6h))",
+      "metricsql": "sum(increase(payment_service_http_5xx_total[1h] offset 6h)) / sum(increase(payment_service_http_requests_total[1h] offset 6h))",
+      "clickhouse_sql": "SELECT a.labels,a.value/b.value value FROM (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-21600000)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-21600000)-3600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-21600000)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-21600000)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='payment_service_http_5xx_total' AND ts_ms>=(({eval_ms}-21600000)-3600000) AND ts_ms<=({eval_ms}-21600000) GROUP BY labels) WHERE n>=2))) a INNER JOIN (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-21600000)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-21600000)-3600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-21600000)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-21600000)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='payment_service_http_requests_total' AND ts_ms>=(({eval_ms}-21600000)-3600000) AND ts_ms<=({eval_ms}-21600000) GROUP BY labels) WHERE n>=2))) b ON a.labels=b.labels",
+      "operators": [
+        "increase",
+        "sum",
+        "offset",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q05",
+      "promql": "max_over_time(cache_refresh_lag_seconds[12h])",
+      "metricsql": "max_over_time(cache_refresh_lag_seconds[12h])",
+      "clickhouse_sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='cache_refresh_lag_seconds' AND ts_ms>{eval_ms}-43200000 AND ts_ms<={eval_ms} GROUP BY labels ORDER BY labels",
+      "operators": [
+        "max_over_time"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q06",
+      "promql": "max_over_time(user_service_cache_refresh_lag_seconds[12h])",
+      "metricsql": "max_over_time(user_service_cache_refresh_lag_seconds[12h])",
+      "clickhouse_sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>{eval_ms}-43200000 AND ts_ms<={eval_ms} GROUP BY labels ORDER BY labels",
+      "operators": [
+        "max_over_time"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q07",
+      "promql": "user_service_cache_refresh_lag_seconds",
+      "metricsql": "user_service_cache_refresh_lag_seconds",
+      "clickhouse_sql": "SELECT mapConcat(labels,map('__name__','user_service_cache_refresh_lag_seconds')) AS labels, argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>{eval_ms}-300000 AND ts_ms<={eval_ms} GROUP BY labels ORDER BY labels",
+      "operators": [],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q08",
+      "promql": "sum(rate(backend_process_cpu_seconds_total[1h]))",
+      "metricsql": "sum(rate(backend_process_cpu_seconds_total[1h]))",
+      "clickhouse_sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(3600000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>=(({eval_ms}-0)-3600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))",
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q09",
+      "promql": "sum(backend_process_resident_memory_bytes)",
+      "metricsql": "sum(backend_process_resident_memory_bytes)",
+      "clickhouse_sql": "SELECT map() AS labels, sum(value) AS value FROM (SELECT labels,argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms>{eval_ms}-300000 AND ts_ms<={eval_ms} GROUP BY labels)",
+      "operators": [
+        "sum"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q10",
+      "promql": "max_over_time((sum(backend_process_resident_memory_bytes))[6h:])",
+      "metricsql": "max_over_time((sum(backend_process_resident_memory_bytes))[6h:])",
+      "clickhouse_sql": "SELECT map() labels,max(value) value FROM (SELECT ts_ms,sum(value) value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms>={eval_ms}-21600000 AND ts_ms<={eval_ms} AND modulo({eval_ms}-ts_ms,60000)=0 GROUP BY ts_ms)",
+      "operators": [
+        "max_over_time",
+        "sum",
+        "subquery"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q11",
+      "promql": "topk(2, sum by (job) (rate(backend_process_cpu_seconds_total[1h])))",
+      "metricsql": "topk(2, sum by (job) (rate(backend_process_cpu_seconds_total[1h])))",
+      "clickhouse_sql": "SELECT * FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(3600000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>=(({eval_ms}-0)-3600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) ORDER BY value DESC,labels LIMIT 2",
+      "operators": [
+        "topk",
+        "rate"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q12",
+      "promql": "topk(2, sum by (job) (backend_process_resident_memory_bytes))",
+      "metricsql": "topk(2, sum by (job) (backend_process_resident_memory_bytes))",
+      "clickhouse_sql": "SELECT map('job',job) AS labels,sum(value) AS value FROM (SELECT labels['job'] AS job,labels,argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms>{eval_ms}-300000 AND ts_ms<={eval_ms} GROUP BY job,labels) GROUP BY job ORDER BY value DESC,job LIMIT 2",
+      "operators": [
+        "topk"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q13",
+      "promql": "max_over_time((sum(rate(backend_process_cpu_seconds_total[5m])))[6h:])",
+      "metricsql": "max_over_time((sum(rate(backend_process_cpu_seconds_total[5m])))[6h:])",
+      "clickhouse_sql": "SELECT map() labels,max(value) value FROM (SELECT grid_ms,sum(value) value FROM (SELECT grid_ms,labels,corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/300 value FROM (SELECT grid_ms,labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(grid_ms-300000))/1000<sampled/(n-1)*1.1,(first_ts-(grid_ms-300000))/1000,sampled/(n-1)/2) start_extra,if((grid_ms-last_ts)/1000<sampled/(n-1)*1.1,(grid_ms-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT grid_ms,labels,arraySort(x->x.1,groupArray((ts_ms,value))) samples FROM raw_samples CROSS JOIN (SELECT arrayJoin(arrayMap(x->x*60000,range(toUInt64(intDiv({eval_ms}-21600000+59999,60000)),toUInt64(intDiv({eval_ms},60000)+1)))) grid_ms) grids WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>=grid_ms-300000 AND ts_ms<=grid_ms GROUP BY grid_ms,labels) WHERE n>=2)) GROUP BY grid_ms)",
+      "operators": [
+        "rate",
+        "max_over_time",
+        "sum",
+        "subquery"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q14",
+      "promql": "sum(rate(backend_http_requests_total[5m]))",
+      "metricsql": "sum(rate(backend_http_requests_total[5m]))",
+      "clickhouse_sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-300000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=(({eval_ms}-0)-300000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))",
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q15",
+      "promql": "sum by (job) (rate(backend_http_requests_total[5m]))",
+      "metricsql": "sum by (job) (rate(backend_http_requests_total[5m]))",
+      "clickhouse_sql": "SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-300000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=(({eval_ms}-0)-300000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) GROUP BY job",
+      "operators": [
+        "rate"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q16",
+      "promql": "sum(increase(backend_http_5xx_total[60m])) / sum(increase(backend_http_requests_total[60m]))",
+      "metricsql": "sum(increase(backend_http_5xx_total[60m])) / sum(increase(backend_http_requests_total[60m]))",
+      "clickhouse_sql": "SELECT a.labels,a.value/b.value value FROM (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=(({eval_ms}-0)-3600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) a INNER JOIN (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=(({eval_ms}-0)-3600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) b ON a.labels=b.labels",
+      "operators": [
+        "increase",
+        "sum",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q17",
+      "promql": "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+      "metricsql": "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+      "clickhouse_sql": "SELECT * FROM (SELECT a.labels,a.value/b.value value FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=(({eval_ms}-0)-21600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) a INNER JOIN (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=(({eval_ms}-0)-21600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) b ON a.labels=b.labels) ORDER BY value DESC,labels LIMIT 1",
+      "operators": [
+        "topk",
+        "increase",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q18",
+      "promql": "sum by (job) (increase(backend_http_5xx_total[24h])) > 0",
+      "metricsql": "sum by (job) (increase(backend_http_5xx_total[24h])) > 0",
+      "clickhouse_sql": "SELECT * FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-86400000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-86400000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=(({eval_ms}-0)-86400000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) WHERE value>0",
+      "operators": [
+        "increase",
+        "comparison"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q19",
+      "promql": "sum(rate(order_service_http_requests_total[5m]))",
+      "metricsql": "sum(rate(order_service_http_requests_total[5m]))",
+      "clickhouse_sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-300000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_requests_total' AND ts_ms>=(({eval_ms}-0)-300000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))",
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q20",
+      "promql": "sum(rate(order_service_http_requests_total[5m] offset 1h))",
+      "metricsql": "sum(rate(order_service_http_requests_total[5m] offset 1h))",
+      "clickhouse_sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-3600000)-300000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-3600000)-300000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-3600000)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-3600000)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_requests_total' AND ts_ms>=(({eval_ms}-3600000)-300000) AND ts_ms<=({eval_ms}-3600000) GROUP BY labels) WHERE n>=2))",
+      "operators": [
+        "rate",
+        "sum",
+        "offset"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q21",
+      "promql": "histogram_quantile(0.95, sum by (le) (rate(order_service_http_request_duration_seconds_bucket[5m])))",
+      "metricsql": "histogram_quantile(0.95, sum by (le) (rate(order_service_http_request_duration_seconds_bucket[5m])))",
+      "clickhouse_sql": "SELECT map() labels,if(idx=length(buckets),buckets[idx-1].1,if(idx=1 AND buckets[idx].1<=0,buckets[idx].1,(if(idx=1,0.,buckets[idx-1].1)+(buckets[idx].1-if(idx=1,0.,buckets[idx-1].1))*(rank-if(idx=1,0.,buckets[idx-1].2))/(buckets[idx].2-if(idx=1,0.,buckets[idx-1].2))))) value FROM (SELECT buckets,0.95*buckets[length(buckets)].2 rank,arrayFirstIndex(x->x.2>=rank,buckets) idx FROM (SELECT arrayMap(i->(raw[i].1,arrayMax(arrayMap(x->x.2,arraySlice(raw,1,i)))),range(1,length(raw)+1)) buckets FROM (SELECT arraySort(x->x.1,groupArray((if(le='+Inf',inf,toFloat64(le)),value))) raw FROM (SELECT labels['le'] le,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-300000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_request_duration_seconds_bucket' AND ts_ms>=(({eval_ms}-0)-300000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2)) GROUP BY le)))) WHERE idx>0",
+      "operators": [
+        "histogram_quantile",
+        "rate"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q22",
+      "promql": "sum(rate(order_service_http_requests_total[5m]))",
+      "metricsql": "sum(rate(order_service_http_requests_total[5m]))",
+      "clickhouse_sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-300000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_requests_total' AND ts_ms>=(({eval_ms}-0)-300000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))",
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q23",
+      "promql": "topk(2, max_over_time(backend_retry_backlog_depth[6h]))",
+      "metricsql": "topk(2, max_over_time(backend_retry_backlog_depth[6h]))",
+      "clickhouse_sql": "SELECT labels,max(value) AS value FROM raw_samples WHERE metric='backend_retry_backlog_depth' AND ts_ms>{eval_ms}-21600000 AND ts_ms<={eval_ms} GROUP BY labels ORDER BY value DESC,labels LIMIT 2",
+      "operators": [
+        "topk",
+        "max_over_time"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q24",
+      "promql": "max_over_time((sum(rate(order_service_http_5xx_total[5m])) / sum(rate(order_service_http_requests_total[5m])))[6h:])",
+      "metricsql": "max_over_time((sum(rate(order_service_http_5xx_total[5m])) / sum(rate(order_service_http_requests_total[5m])))[6h:])",
+      "clickhouse_sql": "SELECT map() labels,max(a.value/b.value) value FROM (SELECT grid_ms,sum(value) value FROM (SELECT grid_ms,labels,corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/300 value FROM (SELECT grid_ms,labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(grid_ms-300000))/1000<sampled/(n-1)*1.1,(first_ts-(grid_ms-300000))/1000,sampled/(n-1)/2) start_extra,if((grid_ms-last_ts)/1000<sampled/(n-1)*1.1,(grid_ms-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT grid_ms,labels,arraySort(x->x.1,groupArray((ts_ms,value))) samples FROM raw_samples CROSS JOIN (SELECT arrayJoin(arrayMap(x->x*60000,range(toUInt64(intDiv({eval_ms}-21600000+59999,60000)),toUInt64(intDiv({eval_ms},60000)+1)))) grid_ms) grids WHERE metric='order_service_http_5xx_total' AND ts_ms>=grid_ms-300000 AND ts_ms<=grid_ms GROUP BY grid_ms,labels) WHERE n>=2)) GROUP BY grid_ms) a INNER JOIN (SELECT grid_ms,sum(value) value FROM (SELECT grid_ms,labels,corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/300 value FROM (SELECT grid_ms,labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(grid_ms-300000))/1000<sampled/(n-1)*1.1,(first_ts-(grid_ms-300000))/1000,sampled/(n-1)/2) start_extra,if((grid_ms-last_ts)/1000<sampled/(n-1)*1.1,(grid_ms-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT grid_ms,labels,arraySort(x->x.1,groupArray((ts_ms,value))) samples FROM raw_samples CROSS JOIN (SELECT arrayJoin(arrayMap(x->x*60000,range(toUInt64(intDiv({eval_ms}-21600000+59999,60000)),toUInt64(intDiv({eval_ms},60000)+1)))) grid_ms) grids WHERE metric='order_service_http_requests_total' AND ts_ms>=grid_ms-300000 AND ts_ms<=grid_ms GROUP BY grid_ms,labels) WHERE n>=2)) GROUP BY grid_ms) b ON a.grid_ms=b.grid_ms",
+      "operators": [
+        "rate",
+        "max_over_time",
+        "sum",
+        "subquery",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q25",
+      "promql": "topk(1, sum by (job) (increase(backend_http_5xx_total[24h])) / scalar(sum(increase(backend_http_5xx_total[24h]))))",
+      "metricsql": "topk(1, sum by (job) (increase(backend_http_5xx_total[24h])) / scalar(sum(increase(backend_http_5xx_total[24h]))))",
+      "clickhouse_sql": "SELECT * FROM (SELECT a.labels,a.value/b.value value FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-86400000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-86400000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=(({eval_ms}-0)-86400000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) a CROSS JOIN (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-86400000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-86400000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=(({eval_ms}-0)-86400000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) b) ORDER BY value DESC,labels LIMIT 1",
+      "operators": [
+        "topk",
+        "scalar",
+        "increase",
+        "sum",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q26",
+      "promql": "topk(1, sum by (job) (rate(backend_process_cpu_seconds_total[6h])))",
+      "metricsql": "topk(1, sum by (job) (rate(backend_process_cpu_seconds_total[6h])))",
+      "clickhouse_sql": "SELECT * FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(21600000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>=(({eval_ms}-0)-21600000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) ORDER BY value DESC,labels LIMIT 1",
+      "operators": [
+        "topk",
+        "rate"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q27",
+      "promql": "topk(3, avg_over_time((sum by (job) (backend_process_resident_memory_bytes))[6h:]))",
+      "metricsql": "topk(3, avg_over_time((sum by (job) (backend_process_resident_memory_bytes))[6h:]))",
+      "clickhouse_sql": "SELECT map('job',job) labels,avg(value) value FROM (SELECT labels['job'] job,ts_ms,sum(value) value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms+4000>={eval_ms}-21600000 AND ts_ms+4000<={eval_ms} AND modulo(ts_ms+4000,60000)=0 GROUP BY job,ts_ms) GROUP BY job ORDER BY value DESC,job LIMIT 3",
+      "operators": [
+        "topk",
+        "avg_over_time",
+        "subquery"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    }
+  ],
+  "source_sha256": "72c334fab18674746a2cef7c926e81d06a13dc9f11858d080460a99aa5b31ecf"
+}

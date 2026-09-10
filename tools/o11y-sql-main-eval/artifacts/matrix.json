@@ -1,0 +1,482 @@
+{
+  "schema_version": 1,
+  "baseline_commit": "791f7d7b0feab3827e7e6f5100e65ef29aec68de",
+  "corpus_count": 27,
+  "counts": {
+    "warm": 0,
+    "partial_hybrid": 0,
+    "exact_fallback": 27,
+    "failure": 0
+  },
+  "queries": [
+    {
+      "id": "q01",
+      "operators": [
+        "sort_desc",
+        "increase",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: .\")"
+    },
+    {
+      "id": "q02",
+      "operators": [
+        "topk",
+        "increase",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: .\")"
+    },
+    {
+      "id": "q03",
+      "operators": [
+        "increase",
+        "sum",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: identifier, found: )\")"
+    },
+    {
+      "id": "q04",
+      "operators": [
+        "increase",
+        "sum",
+        "offset",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: identifier, found: )\")"
+    },
+    {
+      "id": "q05",
+      "operators": [
+        "max_over_time"
+      ],
+      "parser_planner": "pass",
+      "publication": "failure",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL population predicate on metric needs a canonical catalog filter"
+    },
+    {
+      "id": "q06",
+      "operators": [
+        "max_over_time"
+      ],
+      "parser_planner": "pass",
+      "publication": "failure",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL population predicate on metric needs a canonical catalog filter"
+    },
+    {
+      "id": "q07",
+      "operators": [],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "Error during planning: Invalid function 'mapconcat'."
+    },
+    {
+      "id": "q08",
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: ,\")"
+    },
+    {
+      "id": "q09",
+      "operators": [
+        "sum"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "Error during planning: Error during planning: map does not support zero arguments. No function matches the given name and argument types 'map()'. You might need to add explicit type casts."
+    },
+    {
+      "id": "q10",
+      "operators": [
+        "max_over_time",
+        "sum",
+        "subquery"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "Error during planning: Invalid function 'modulo'."
+    },
+    {
+      "id": "q11",
+      "operators": [
+        "topk",
+        "rate"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: labels\")"
+    },
+    {
+      "id": "q12",
+      "operators": [
+        "topk"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "This feature is not implemented: Map Access"
+    },
+    {
+      "id": "q13",
+      "operators": [
+        "rate",
+        "max_over_time",
+        "sum",
+        "subquery"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: ,\")"
+    },
+    {
+      "id": "q14",
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: ,\")"
+    },
+    {
+      "id": "q15",
+      "operators": [
+        "rate"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: [\")"
+    },
+    {
+      "id": "q16",
+      "operators": [
+        "increase",
+        "sum",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: identifier, found: )\")"
+    },
+    {
+      "id": "q17",
+      "operators": [
+        "topk",
+        "increase",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: .\")"
+    },
+    {
+      "id": "q18",
+      "operators": [
+        "increase",
+        "comparison"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: labels\")"
+    },
+    {
+      "id": "q19",
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: ,\")"
+    },
+    {
+      "id": "q20",
+      "operators": [
+        "rate",
+        "sum",
+        "offset"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: ,\")"
+    },
+    {
+      "id": "q21",
+      "operators": [
+        "histogram_quantile",
+        "rate"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: ), found: .1\")"
+    },
+    {
+      "id": "q22",
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: ,\")"
+    },
+    {
+      "id": "q23",
+      "operators": [
+        "topk",
+        "max_over_time"
+      ],
+      "parser_planner": "pass",
+      "publication": "failure",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL population predicate on metric needs a canonical catalog filter"
+    },
+    {
+      "id": "q24",
+      "operators": [
+        "rate",
+        "max_over_time",
+        "sum",
+        "subquery",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: ,\")"
+    },
+    {
+      "id": "q25",
+      "operators": [
+        "topk",
+        "scalar",
+        "increase",
+        "sum",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: .\")"
+    },
+    {
+      "id": "q26",
+      "operators": [
+        "topk",
+        "rate"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "SQL error: ParserError(\"Expected: joined table, found: labels\")"
+    },
+    {
+      "id": "q27",
+      "operators": [
+        "topk",
+        "avg_over_time",
+        "subquery"
+      ],
+      "parser_planner": "failure",
+      "publication": "not_reached",
+      "fallback_requested": true,
+      "exact_executed": true,
+      "exact_success": true,
+      "exact_status": 200,
+      "direct_exact_status": 200,
+      "matches_direct_exact": true,
+      "classification": "exact_fallback",
+      "reason": "Error during planning: Invalid function 'modulo'."
+    }
+  ]
+}

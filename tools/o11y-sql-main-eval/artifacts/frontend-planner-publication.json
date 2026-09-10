@@ -1,0 +1,298 @@
+{
+  "baseline": "0.1.0",
+  "queries": [
+    {
+      "id": "q01",
+      "operators": [
+        "sort_desc",
+        "increase",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")",
+      "sql": "SELECT * FROM (SELECT a.labels,a.value/b.value value FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) a INNER JOIN (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) b ON a.labels=b.labels) ORDER BY value DESC,labels"
+    },
+    {
+      "id": "q02",
+      "operators": [
+        "topk",
+        "increase",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")",
+      "sql": "SELECT * FROM (SELECT a.labels,a.value/b.value value FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) a INNER JOIN (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) b ON a.labels=b.labels) ORDER BY value DESC,labels LIMIT 1"
+    },
+    {
+      "id": "q03",
+      "operators": [
+        "increase",
+        "sum",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: identifier, found: )\")",
+      "sql": "SELECT a.labels,a.value/b.value value FROM (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='payment_service_http_5xx_total' AND ts_ms>=((1788891296000-0)-3600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) a INNER JOIN (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='payment_service_http_requests_total' AND ts_ms>=((1788891296000-0)-3600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) b ON a.labels=b.labels"
+    },
+    {
+      "id": "q04",
+      "operators": [
+        "increase",
+        "sum",
+        "offset",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: identifier, found: )\")",
+      "sql": "SELECT a.labels,a.value/b.value value FROM (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-21600000)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-21600000)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-21600000)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-21600000)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='payment_service_http_5xx_total' AND ts_ms>=((1788891296000-21600000)-3600000) AND ts_ms<=(1788891296000-21600000) GROUP BY labels) WHERE n>=2))) a INNER JOIN (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-21600000)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-21600000)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-21600000)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-21600000)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='payment_service_http_requests_total' AND ts_ms>=((1788891296000-21600000)-3600000) AND ts_ms<=(1788891296000-21600000) GROUP BY labels) WHERE n>=2))) b ON a.labels=b.labels"
+    },
+    {
+      "canonical_sql": "Sort { keys: [SortKey { expr: Column(0), ascending: true, nulls_first: false }], partition_by: GroupKeys { keys: [], without: false }, child: Project { cols: [ProjectItem { alias: None, expr: Column(0) }, ProjectItem { alias: Some(\"value\"), expr: Column(1) }], qualifier: None, child: Aggregate { reduction: Reduce(GroupKeys { keys: [1], without: false }), measures: [Max { col: Some(3) }], output_names: [\"max(raw_samples.value)\"], having: None, child: Scan { source: Table { table_ref: \"raw_samples\" }, predicates: [Predicate(BoolAnd([Compare { left: Column(0), op: Eq, right: Literal(Utf8(\"cache_refresh_lag_seconds\")) }, Compare { left: Column(2), op: Gt, right: Arithmetic { op: Sub, left: Literal(Int64(1788891296000)), right: Literal(Int64(43200000)) } }, Compare { left: Column(2), op: Le, right: Literal(Int64(1788891296000)) }]))], schema: Schema { columns: [Column { name: \"metric\", dtype: Utf8, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"labels\", dtype: Utf8, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"ts_ms\", dtype: Timestamp, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"value\", dtype: Float64, nullable: false, table: Some(\"raw_samples\") }], time_index: Some(2), unique_keys: [], closed: true } } } } }",
+      "classification": "failure",
+      "id": "q05",
+      "operators": [
+        "max_over_time"
+      ],
+      "parser_planner": "pass",
+      "physical": "Committed(Summary(SummaryNode { expr: ValueOperation { child: SummaryNode { expr: ValueOperation { child: SummaryNode { expr: SummaryAgg { child: SummaryNode { expr: KeepPreAsap(Scan { source: Table { table_ref: \"raw_samples\" }, predicates: [Predicate(BoolAnd([Compare { left: Column(0), op: Eq, right: Literal(Utf8(\"cache_refresh_lag_seconds\")) }, Compare { left: Column(2), op: Gt, right: Arithmetic { op: Sub, left: Literal(Int64(1788891296000)), right: Literal(Int64(43200000)) } }, Compare { left: Column(2), op: Le, right: Literal(Int64(1788891296000)) }]))], schema: Schema { columns: [Column { name: \"metric\", dtype: Utf8, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"labels\", dtype: Utf8, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"ts_ms\", dtype: Timestamp, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"value\", dtype: Float64, nullable: false, table: Some(\"raw_samples\") }], time_index: Some(2), unique_keys: [], closed: true } }), schema: SummarySchema { fields: [SummaryField { name: \"metric\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"ts_ms\", dtype: Plain(Timestamp), nullable: false }, SummaryField { name: \"value\", dtype: Plain(Float64), nullable: false }], time_index: Some(2) }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] }) }, family: ExactAggregate(MinMax, MinMax), input: SummaryUpdate { item: None, weight: Column(Qualified { table: \"raw_samples\", name: \"value\" }), weight_domain: UnknownOrSigned }, reduction: Reduce(GroupKeys { keys: [1], without: false }), grouping: PerSubpopulationInstance }, schema: SummarySchema { fields: [SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"max(raw_samples.value)\", dtype: ExactAggregate(MinMax, MinMax), nullable: false }], time_index: None }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"ExactAggregate(MinMax)\" }, ChildGuarantee { input_index: 0, guarantee: ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] } }, CompositionStep { operator: ExactExtremum, rule: \"exact_input\" }] }) }, operation: Project { cols: [ProjectItem { alias: None, expr: Column(0) }, ProjectItem { alias: Some(\"value\"), expr: Column(1) }], qualifier: None }, timing: ReadTime }, schema: SummarySchema { fields: [SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"value\", dtype: Plain(Float64), nullable: false }], time_index: None }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"ExactAggregate(MinMax)\" }, ChildGuarantee { input_index: 0, guarantee: ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] } }, CompositionStep { operator: ExactExtremum, rule: \"exact_input\" }] }) }, operation: Sort { keys: [SortKey { expr: Column(0), ascending: true, nulls_first: false }], partition_by: GroupKeys { keys: [], without: false } }, timing: ReadTime }, schema: SummarySchema { fields: [SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"value\", dtype: Plain(Float64), nullable: false }], time_index: None }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"ExactAggregate(MinMax)\" }, ChildGuarantee { input_index: 0, guarantee: ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] } }, CompositionStep { operator: ExactExtremum, rule: \"exact_input\" }] }) }))",
+      "publication": "failure",
+      "reason": "SQL lowering failed: invalid QueryPlan: SQL population predicate on metric needs a canonical catalog filter",
+      "sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='cache_refresh_lag_seconds' AND ts_ms>1788891296000-43200000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY labels"
+    },
+    {
+      "canonical_sql": "Sort { keys: [SortKey { expr: Column(0), ascending: true, nulls_first: false }], partition_by: GroupKeys { keys: [], without: false }, child: Project { cols: [ProjectItem { alias: None, expr: Column(0) }, ProjectItem { alias: Some(\"value\"), expr: Column(1) }], qualifier: None, child: Aggregate { reduction: Reduce(GroupKeys { keys: [1], without: false }), measures: [Max { col: Some(3) }], output_names: [\"max(raw_samples.value)\"], having: None, child: Scan { source: Table { table_ref: \"raw_samples\" }, predicates: [Predicate(BoolAnd([Compare { left: Column(0), op: Eq, right: Literal(Utf8(\"user_service_cache_refresh_lag_seconds\")) }, Compare { left: Column(2), op: Gt, right: Arithmetic { op: Sub, left: Literal(Int64(1788891296000)), right: Literal(Int64(43200000)) } }, Compare { left: Column(2), op: Le, right: Literal(Int64(1788891296000)) }]))], schema: Schema { columns: [Column { name: \"metric\", dtype: Utf8, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"labels\", dtype: Utf8, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"ts_ms\", dtype: Timestamp, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"value\", dtype: Float64, nullable: false, table: Some(\"raw_samples\") }], time_index: Some(2), unique_keys: [], closed: true } } } } }",
+      "classification": "failure",
+      "id": "q06",
+      "operators": [
+        "max_over_time"
+      ],
+      "parser_planner": "pass",
+      "physical": "Committed(Summary(SummaryNode { expr: ValueOperation { child: SummaryNode { expr: ValueOperation { child: SummaryNode { expr: SummaryAgg { child: SummaryNode { expr: KeepPreAsap(Scan { source: Table { table_ref: \"raw_samples\" }, predicates: [Predicate(BoolAnd([Compare { left: Column(0), op: Eq, right: Literal(Utf8(\"user_service_cache_refresh_lag_seconds\")) }, Compare { left: Column(2), op: Gt, right: Arithmetic { op: Sub, left: Literal(Int64(1788891296000)), right: Literal(Int64(43200000)) } }, Compare { left: Column(2), op: Le, right: Literal(Int64(1788891296000)) }]))], schema: Schema { columns: [Column { name: \"metric\", dtype: Utf8, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"labels\", dtype: Utf8, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"ts_ms\", dtype: Timestamp, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"value\", dtype: Float64, nullable: false, table: Some(\"raw_samples\") }], time_index: Some(2), unique_keys: [], closed: true } }), schema: SummarySchema { fields: [SummaryField { name: \"metric\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"ts_ms\", dtype: Plain(Timestamp), nullable: false }, SummaryField { name: \"value\", dtype: Plain(Float64), nullable: false }], time_index: Some(2) }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] }) }, family: ExactAggregate(MinMax, MinMax), input: SummaryUpdate { item: None, weight: Column(Qualified { table: \"raw_samples\", name: \"value\" }), weight_domain: UnknownOrSigned }, reduction: Reduce(GroupKeys { keys: [1], without: false }), grouping: PerSubpopulationInstance }, schema: SummarySchema { fields: [SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"max(raw_samples.value)\", dtype: ExactAggregate(MinMax, MinMax), nullable: false }], time_index: None }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"ExactAggregate(MinMax)\" }, ChildGuarantee { input_index: 0, guarantee: ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] } }, CompositionStep { operator: ExactExtremum, rule: \"exact_input\" }] }) }, operation: Project { cols: [ProjectItem { alias: None, expr: Column(0) }, ProjectItem { alias: Some(\"value\"), expr: Column(1) }], qualifier: None }, timing: ReadTime }, schema: SummarySchema { fields: [SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"value\", dtype: Plain(Float64), nullable: false }], time_index: None }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"ExactAggregate(MinMax)\" }, ChildGuarantee { input_index: 0, guarantee: ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] } }, CompositionStep { operator: ExactExtremum, rule: \"exact_input\" }] }) }, operation: Sort { keys: [SortKey { expr: Column(0), ascending: true, nulls_first: false }], partition_by: GroupKeys { keys: [], without: false } }, timing: ReadTime }, schema: SummarySchema { fields: [SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"value\", dtype: Plain(Float64), nullable: false }], time_index: None }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"ExactAggregate(MinMax)\" }, ChildGuarantee { input_index: 0, guarantee: ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] } }, CompositionStep { operator: ExactExtremum, rule: \"exact_input\" }] }) }))",
+      "publication": "failure",
+      "reason": "SQL lowering failed: invalid QueryPlan: SQL population predicate on metric needs a canonical catalog filter",
+      "sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>1788891296000-43200000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY labels"
+    },
+    {
+      "id": "q07",
+      "operators": [],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'mapconcat'.\nDid you mean 'concat'?",
+      "sql": "SELECT mapConcat(labels,map('__name__','user_service_cache_refresh_lag_seconds')) AS labels, argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>1788891296000-300000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY labels"
+    },
+    {
+      "id": "q08",
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+      "sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(3600000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>=((1788891296000-0)-3600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))"
+    },
+    {
+      "id": "q09",
+      "operators": [
+        "sum"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: Error during planning: Error during planning: map does not support zero arguments. No function matches the given name and argument types 'map()'. You might need to add explicit type casts.\n\tCandidate functions:\n\tmap(Any, .., Any)",
+      "sql": "SELECT map() AS labels, sum(value) AS value FROM (SELECT labels,argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms>1788891296000-300000 AND ts_ms<=1788891296000 GROUP BY labels)"
+    },
+    {
+      "id": "q10",
+      "operators": [
+        "max_over_time",
+        "sum",
+        "subquery"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'todate'?",
+      "sql": "SELECT map() labels,max(value) value FROM (SELECT ts_ms,sum(value) value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms>=1788891296000-21600000 AND ts_ms<=1788891296000 AND modulo(1788891296000-ts_ms,60000)=0 GROUP BY ts_ms)"
+    },
+    {
+      "id": "q11",
+      "operators": [
+        "topk",
+        "rate"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: labels\")",
+      "sql": "SELECT * FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(3600000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>=((1788891296000-0)-3600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) ORDER BY value DESC,labels LIMIT 2"
+    },
+    {
+      "id": "q12",
+      "operators": [
+        "topk"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: This feature is not implemented: Map Access",
+      "sql": "SELECT map('job',job) AS labels,sum(value) AS value FROM (SELECT labels['job'] AS job,labels,argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms>1788891296000-300000 AND ts_ms<=1788891296000 GROUP BY job,labels) GROUP BY job ORDER BY value DESC,job LIMIT 2"
+    },
+    {
+      "id": "q13",
+      "operators": [
+        "rate",
+        "max_over_time",
+        "sum",
+        "subquery"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+      "sql": "SELECT map() labels,max(value) value FROM (SELECT grid_ms,sum(value) value FROM (SELECT grid_ms,labels,corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/300 value FROM (SELECT grid_ms,labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(grid_ms-300000))/1000<sampled/(n-1)*1.1,(first_ts-(grid_ms-300000))/1000,sampled/(n-1)/2) start_extra,if((grid_ms-last_ts)/1000<sampled/(n-1)*1.1,(grid_ms-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT grid_ms,labels,arraySort(x->x.1,groupArray((ts_ms,value))) samples FROM raw_samples CROSS JOIN (SELECT arrayJoin(arrayMap(x->x*60000,range(toUInt64(intDiv(1788891296000-21600000+59999,60000)),toUInt64(intDiv(1788891296000,60000)+1)))) grid_ms) grids WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>=grid_ms-300000 AND ts_ms<=grid_ms GROUP BY grid_ms,labels) WHERE n>=2)) GROUP BY grid_ms)"
+    },
+    {
+      "id": "q14",
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+      "sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-300000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=((1788891296000-0)-300000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))"
+    },
+    {
+      "id": "q15",
+      "operators": [
+        "rate"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: [\")",
+      "sql": "SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-300000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=((1788891296000-0)-300000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job"
+    },
+    {
+      "id": "q16",
+      "operators": [
+        "increase",
+        "sum",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: identifier, found: )\")",
+      "sql": "SELECT a.labels,a.value/b.value value FROM (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-3600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) a INNER JOIN (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-3600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-3600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=((1788891296000-0)-3600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) b ON a.labels=b.labels"
+    },
+    {
+      "id": "q17",
+      "operators": [
+        "topk",
+        "increase",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")",
+      "sql": "SELECT * FROM (SELECT a.labels,a.value/b.value value FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) a INNER JOIN (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_requests_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) b ON a.labels=b.labels) ORDER BY value DESC,labels LIMIT 1"
+    },
+    {
+      "id": "q18",
+      "operators": [
+        "increase",
+        "comparison"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: labels\")",
+      "sql": "SELECT * FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-86400000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-86400000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-86400000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) WHERE value>0"
+    },
+    {
+      "id": "q19",
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+      "sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-300000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_requests_total' AND ts_ms>=((1788891296000-0)-300000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))"
+    },
+    {
+      "id": "q20",
+      "operators": [
+        "rate",
+        "sum",
+        "offset"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+      "sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-3600000)-300000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-3600000)-300000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-3600000)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-3600000)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_requests_total' AND ts_ms>=((1788891296000-3600000)-300000) AND ts_ms<=(1788891296000-3600000) GROUP BY labels) WHERE n>=2))"
+    },
+    {
+      "id": "q21",
+      "operators": [
+        "histogram_quantile",
+        "rate"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: ), found: .1\")",
+      "sql": "SELECT map() labels,if(idx=length(buckets),buckets[idx-1].1,if(idx=1 AND buckets[idx].1<=0,buckets[idx].1,(if(idx=1,0.,buckets[idx-1].1)+(buckets[idx].1-if(idx=1,0.,buckets[idx-1].1))*(rank-if(idx=1,0.,buckets[idx-1].2))/(buckets[idx].2-if(idx=1,0.,buckets[idx-1].2))))) value FROM (SELECT buckets,0.95*buckets[length(buckets)].2 rank,arrayFirstIndex(x->x.2>=rank,buckets) idx FROM (SELECT arrayMap(i->(raw[i].1,arrayMax(arrayMap(x->x.2,arraySlice(raw,1,i)))),range(1,length(raw)+1)) buckets FROM (SELECT arraySort(x->x.1,groupArray((if(le='+Inf',inf,toFloat64(le)),value))) raw FROM (SELECT labels['le'] le,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-300000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_request_duration_seconds_bucket' AND ts_ms>=((1788891296000-0)-300000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2)) GROUP BY le)))) WHERE idx>0"
+    },
+    {
+      "id": "q22",
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+      "sql": "SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-300000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_requests_total' AND ts_ms>=((1788891296000-0)-300000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))"
+    },
+    {
+      "canonical_sql": "Limit { n: 2, offset: 0, child: Sort { keys: [SortKey { expr: Column(1), ascending: false, nulls_first: true }, SortKey { expr: Column(0), ascending: true, nulls_first: false }], partition_by: GroupKeys { keys: [], without: false }, child: Project { cols: [ProjectItem { alias: None, expr: Column(0) }, ProjectItem { alias: Some(\"value\"), expr: Column(1) }], qualifier: None, child: Aggregate { reduction: Reduce(GroupKeys { keys: [1], without: false }), measures: [Max { col: Some(3) }], output_names: [\"max(raw_samples.value)\"], having: None, child: Scan { source: Table { table_ref: \"raw_samples\" }, predicates: [Predicate(BoolAnd([Compare { left: Column(0), op: Eq, right: Literal(Utf8(\"backend_retry_backlog_depth\")) }, Compare { left: Column(2), op: Gt, right: Arithmetic { op: Sub, left: Literal(Int64(1788891296000)), right: Literal(Int64(21600000)) } }, Compare { left: Column(2), op: Le, right: Literal(Int64(1788891296000)) }]))], schema: Schema { columns: [Column { name: \"metric\", dtype: Utf8, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"labels\", dtype: Utf8, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"ts_ms\", dtype: Timestamp, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"value\", dtype: Float64, nullable: false, table: Some(\"raw_samples\") }], time_index: Some(2), unique_keys: [], closed: true } } } } } }",
+      "classification": "failure",
+      "id": "q23",
+      "operators": [
+        "topk",
+        "max_over_time"
+      ],
+      "parser_planner": "pass",
+      "physical": "Committed(Summary(SummaryNode { expr: ValueOperation { child: SummaryNode { expr: ValueOperation { child: SummaryNode { expr: ValueOperation { child: SummaryNode { expr: SummaryAgg { child: SummaryNode { expr: KeepPreAsap(Scan { source: Table { table_ref: \"raw_samples\" }, predicates: [Predicate(BoolAnd([Compare { left: Column(0), op: Eq, right: Literal(Utf8(\"backend_retry_backlog_depth\")) }, Compare { left: Column(2), op: Gt, right: Arithmetic { op: Sub, left: Literal(Int64(1788891296000)), right: Literal(Int64(21600000)) } }, Compare { left: Column(2), op: Le, right: Literal(Int64(1788891296000)) }]))], schema: Schema { columns: [Column { name: \"metric\", dtype: Utf8, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"labels\", dtype: Utf8, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"ts_ms\", dtype: Timestamp, nullable: false, table: Some(\"raw_samples\") }, Column { name: \"value\", dtype: Float64, nullable: false, table: Some(\"raw_samples\") }], time_index: Some(2), unique_keys: [], closed: true } }), schema: SummarySchema { fields: [SummaryField { name: \"metric\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"ts_ms\", dtype: Plain(Timestamp), nullable: false }, SummaryField { name: \"value\", dtype: Plain(Float64), nullable: false }], time_index: Some(2) }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] }) }, family: ExactAggregate(MinMax, MinMax), input: SummaryUpdate { item: None, weight: Column(Qualified { table: \"raw_samples\", name: \"value\" }), weight_domain: UnknownOrSigned }, reduction: Reduce(GroupKeys { keys: [1], without: false }), grouping: PerSubpopulationInstance }, schema: SummarySchema { fields: [SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"max(raw_samples.value)\", dtype: ExactAggregate(MinMax, MinMax), nullable: false }], time_index: None }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"ExactAggregate(MinMax)\" }, ChildGuarantee { input_index: 0, guarantee: ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] } }, CompositionStep { operator: ExactExtremum, rule: \"exact_input\" }] }) }, operation: Project { cols: [ProjectItem { alias: None, expr: Column(0) }, ProjectItem { alias: Some(\"value\"), expr: Column(1) }], qualifier: None }, timing: ReadTime }, schema: SummarySchema { fields: [SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"value\", dtype: Plain(Float64), nullable: false }], time_index: None }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"ExactAggregate(MinMax)\" }, ChildGuarantee { input_index: 0, guarantee: ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] } }, CompositionStep { operator: ExactExtremum, rule: \"exact_input\" }] }) }, operation: Sort { keys: [SortKey { expr: Column(1), ascending: false, nulls_first: true }, SortKey { expr: Column(0), ascending: true, nulls_first: false }], partition_by: GroupKeys { keys: [], without: false } }, timing: ReadTime }, schema: SummarySchema { fields: [SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"value\", dtype: Plain(Float64), nullable: false }], time_index: None }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"ExactAggregate(MinMax)\" }, ChildGuarantee { input_index: 0, guarantee: ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] } }, CompositionStep { operator: ExactExtremum, rule: \"exact_input\" }] }) }, operation: Limit { n: 2, offset: 0 }, timing: ReadTime }, schema: SummarySchema { fields: [SummaryField { name: \"labels\", dtype: Plain(Utf8), nullable: false }, SummaryField { name: \"value\", dtype: Plain(Float64), nullable: false }], time_index: None }, guarantee: Some(ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"ExactAggregate(MinMax)\" }, ChildGuarantee { input_index: 0, guarantee: ResultGuarantee { metric: AbsoluteValue, bound: Zero, failure_probability: Zero, provenance: [Exact { reason: \"KeepPreAsap\" }] } }, CompositionStep { operator: ExactExtremum, rule: \"exact_input\" }] }) }))",
+      "publication": "failure",
+      "reason": "SQL lowering failed: invalid QueryPlan: SQL population predicate on metric needs a canonical catalog filter",
+      "sql": "SELECT labels,max(value) AS value FROM raw_samples WHERE metric='backend_retry_backlog_depth' AND ts_ms>1788891296000-21600000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY value DESC,labels LIMIT 2"
+    },
+    {
+      "id": "q24",
+      "operators": [
+        "rate",
+        "max_over_time",
+        "sum",
+        "subquery",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+      "sql": "SELECT map() labels,max(a.value/b.value) value FROM (SELECT grid_ms,sum(value) value FROM (SELECT grid_ms,labels,corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/300 value FROM (SELECT grid_ms,labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(grid_ms-300000))/1000<sampled/(n-1)*1.1,(first_ts-(grid_ms-300000))/1000,sampled/(n-1)/2) start_extra,if((grid_ms-last_ts)/1000<sampled/(n-1)*1.1,(grid_ms-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT grid_ms,labels,arraySort(x->x.1,groupArray((ts_ms,value))) samples FROM raw_samples CROSS JOIN (SELECT arrayJoin(arrayMap(x->x*60000,range(toUInt64(intDiv(1788891296000-21600000+59999,60000)),toUInt64(intDiv(1788891296000,60000)+1)))) grid_ms) grids WHERE metric='order_service_http_5xx_total' AND ts_ms>=grid_ms-300000 AND ts_ms<=grid_ms GROUP BY grid_ms,labels) WHERE n>=2)) GROUP BY grid_ms) a INNER JOIN (SELECT grid_ms,sum(value) value FROM (SELECT grid_ms,labels,corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/300 value FROM (SELECT grid_ms,labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(grid_ms-300000))/1000<sampled/(n-1)*1.1,(first_ts-(grid_ms-300000))/1000,sampled/(n-1)/2) start_extra,if((grid_ms-last_ts)/1000<sampled/(n-1)*1.1,(grid_ms-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT grid_ms,labels,arraySort(x->x.1,groupArray((ts_ms,value))) samples FROM raw_samples CROSS JOIN (SELECT arrayJoin(arrayMap(x->x*60000,range(toUInt64(intDiv(1788891296000-21600000+59999,60000)),toUInt64(intDiv(1788891296000,60000)+1)))) grid_ms) grids WHERE metric='order_service_http_requests_total' AND ts_ms>=grid_ms-300000 AND ts_ms<=grid_ms GROUP BY grid_ms,labels) WHERE n>=2)) GROUP BY grid_ms) b ON a.grid_ms=b.grid_ms"
+    },
+    {
+      "id": "q25",
+      "operators": [
+        "topk",
+        "scalar",
+        "increase",
+        "sum",
+        "division"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")",
+      "sql": "SELECT * FROM (SELECT a.labels,a.value/b.value value FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-86400000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-86400000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-86400000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) a CROSS JOIN (SELECT map() labels,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-86400000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-86400000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_http_5xx_total' AND ts_ms>=((1788891296000-0)-86400000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) b) ORDER BY value DESC,labels LIMIT 1"
+    },
+    {
+      "id": "q26",
+      "operators": [
+        "topk",
+        "rate"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: labels\")",
+      "sql": "SELECT * FROM (SELECT map('job',job) labels,sum(value) value FROM (SELECT labels['job'] job,value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(21600000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-((1788891296000-0)-21600000))/1000<sampled/(n-1)*1.1,(first_ts-((1788891296000-0)-21600000))/1000,sampled/(n-1)/2) start_extra,if(((1788891296000-0)-last_ts)/1000<sampled/(n-1)*1.1,((1788891296000-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='backend_process_cpu_seconds_total' AND ts_ms>=((1788891296000-0)-21600000) AND ts_ms<=(1788891296000-0) GROUP BY labels) WHERE n>=2))) GROUP BY job) ORDER BY value DESC,labels LIMIT 1"
+    },
+    {
+      "id": "q27",
+      "operators": [
+        "topk",
+        "avg_over_time",
+        "subquery"
+      ],
+      "parser_planner": "failure",
+      "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'today'?",
+      "sql": "SELECT map('job',job) labels,avg(value) value FROM (SELECT labels['job'] job,ts_ms,sum(value) value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms+4000>=1788891296000-21600000 AND ts_ms+4000<=1788891296000 AND modulo(ts_ms+4000,60000)=0 GROUP BY job,ts_ms) GROUP BY job ORDER BY value DESC,job LIMIT 3"
+    }
+  ],
+  "query_count": 27
+}
