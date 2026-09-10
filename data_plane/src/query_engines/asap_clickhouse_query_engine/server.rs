@@ -248,6 +248,8 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.headers()["x-asap-execution"], "warm");
+        assert_eq!(response.headers()["x-asap-execution-detail"], "asap");
 
         assert_eq!(
             response.into_body().collect().await.unwrap().to_bytes(),
@@ -283,6 +285,11 @@ mod tests {
                     .unwrap();
 
             assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-asap-execution"], "exact_fallback");
+            assert_eq!(
+                response.headers()["x-asap-execution-detail"],
+                "external_exact"
+            );
             assert_eq!(*fallback.sql.lock().unwrap(), vec!["SELECT 1"]);
         }
     }
@@ -339,16 +346,45 @@ async fn query_post(
 
 async fn execute_or_fallback(state: &ServerState, request: &ClickHouseQueryRequest) -> Response {
     match state.accelerator.execute(request).await {
-        ClickHouseAccelerationOutcome::Accelerated(response) => return raw_response(response),
-        ClickHouseAccelerationOutcome::Fallback(reason) => tracing::info!(
-            failure_stage = reason.stage(),
-            failure_reason = reason.reason_code(),
-            "ClickHouse acceleration routed to exact fallback"
-        ),
-    }
-    match state.fallback.execute(request).await {
-        Ok(v) => raw_response(v),
-        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+        ClickHouseAccelerationOutcome::Accelerated(response) => {
+            let mut response = raw_response(response);
+            response
+                .headers_mut()
+                .entry("x-asap-execution")
+                .or_insert(axum::http::HeaderValue::from_static("warm"));
+            response
+                .headers_mut()
+                .entry("x-asap-execution-detail")
+                .or_insert(axum::http::HeaderValue::from_static("asap"));
+            return response;
+        }
+        ClickHouseAccelerationOutcome::Fallback(reason) => {
+            tracing::info!(
+                failure_stage = reason.stage(),
+                failure_reason = reason.reason_code(),
+                "ClickHouse acceleration routed to exact fallback"
+            );
+            let stage = reason.stage();
+            let reason = reason.reason_code();
+            return match state.fallback.execute(request).await {
+                Ok(v) => {
+                    let mut response = raw_response(v);
+                    for (name, value) in [
+                        ("x-asap-execution", "exact_fallback"),
+                        ("x-asap-execution-detail", "external_exact"),
+                        ("x-asap-failure-stage", stage),
+                        ("x-asap-failure-reason", reason),
+                    ] {
+                        response.headers_mut().insert(
+                            axum::http::HeaderName::from_static(name),
+                            axum::http::HeaderValue::from_static(value),
+                        );
+                    }
+                    response
+                }
+                Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+            };
+        }
     }
 }
 
