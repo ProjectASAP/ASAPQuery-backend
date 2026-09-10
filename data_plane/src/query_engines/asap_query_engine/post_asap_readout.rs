@@ -90,6 +90,17 @@ pub fn execute_query_plan_readout(
     execute_physical_query_payload(index, entry, entry.root, t0_ms, t1_ms, is_cumulative)
 }
 
+pub fn execute_query_plan_payload_readout(
+    index: &SketchStore,
+    entry: &control_plane::query_plan::ExecutableQueryPlan,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
+    let view = entry.execution_view("shared-executable".into(), "internal".into());
+    execute_query_plan_readout(index, &view, t0_ms, t1_ms, is_cumulative)
+}
+
 pub fn execute_query_plan_from_readout(
     index: &SketchStore,
     entry: &control_plane::query_plan::QueryPlanEntry,
@@ -1048,10 +1059,8 @@ mod tests {
         }
 
         let entry = control_plane::query_plan::QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "q-rate".into(),
-            canonical_query: "rate(requests_total[1m])".into(),
-            fixed_evaluation: None,
+            canonical_promql: "rate(requests_total[1m])".into(),
             root: control_plane::query_plan::QueryNodeId(0),
             nodes: BTreeMap::from([
                 (
@@ -1144,10 +1153,8 @@ mod tests {
         idx.append_precompute(7, BTreeMap::new(), (0, 60_000), Box::new(accumulator));
 
         let entry = control_plane::query_plan::QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "q-rate".into(),
-            canonical_query: "rate(requests_total[1m])".into(),
-            fixed_evaluation: None,
+            canonical_promql: "rate(requests_total[1m])".into(),
             root: control_plane::query_plan::QueryNodeId(0),
             nodes: BTreeMap::from([
                 (

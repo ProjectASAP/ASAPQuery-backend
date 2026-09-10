@@ -168,6 +168,8 @@ async fn erp_measured_kll_collector_to_query_oracle() {
         precompute_plan: plan.precompute_plan,
         transmission_plan: plan.transmission_plan,
         query_plan: plan.query_plan,
+        metricsql_plan: None,
+        clickhouse_sql: None,
         storage_routing: None,
         adaptation_evidence: vec![],
     };
@@ -486,6 +488,8 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
         precompute_plan: plan.precompute_plan,
         transmission_plan: plan.transmission_plan,
         query_plan: plan.query_plan,
+        metricsql_plan: None,
+        clickhouse_sql: None,
         storage_routing: None,
         adaptation_evidence: vec![],
     };

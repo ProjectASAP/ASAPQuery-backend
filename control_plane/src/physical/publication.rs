@@ -12,6 +12,10 @@ pub struct PhysicalPlanPublication {
     pub collector_plans: Vec<CollectorPlan>,
     pub transmission_plan: TransmissionPlan,
     pub query_plan: QueryPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metricsql_plan: Option<crate::query_plan::MetricsQlPlanCatalog>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clickhouse_sql: Option<serde_json::Value>,
 }
 impl PhysicalPlanPublication {
     /// Validate every plan against the shared catalog snapshot.
@@ -95,6 +99,8 @@ impl PhysicalPlan {
             collector_plans: self.collector_plans.clone(),
             transmission_plan: self.transmission_plan.clone(),
             query_plan: self.query_plan.clone(),
+            metricsql_plan: self.metricsql_plan.clone(),
+            clickhouse_sql: None,
         };
         artifact.validate()?;
         Ok(artifact)

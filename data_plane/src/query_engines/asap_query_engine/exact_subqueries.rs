@@ -383,10 +383,8 @@ mod tests {
     use control_plane::query_plan::{FallbackPolicy, InstantExecution};
     fn entry(nodes: BTreeMap<QueryNodeId, QueryPlanNode>) -> QueryPlanEntry {
         QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "remote-cut".into(),
-            canonical_query: "a / b".into(),
-            fixed_evaluation: None,
+            canonical_promql: "a / b".into(),
             root: QueryNodeId(0),
             nodes,
             instant: InstantExecution {

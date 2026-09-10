@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use asap_types::sds::{SummaryDefinitionId, SummaryDescriptor, SummaryOperator};
 use asap_types::summary_catalog::SummaryCatalog;
 use asap_types::AggregationType;
-use control_plane::query_plan::{ExactReadout, QueryPlanEntry, QueryPlanNode, QueryReadout};
+use control_plane::query_plan::{
+    ExactReadout, ExecutableQueryPlan, QueryPlanEntry, QueryPlanNode, QueryReadout,
+};
 
 use crate::query_engines::EngineError;
 
@@ -114,12 +116,12 @@ pub(crate) fn validate_entry(
     plan_id: u64,
     plan_version: u64,
 ) -> Result<(), EngineError> {
-    validate_payload(catalog, entry, plan_id, plan_version)
+    validate_payload(catalog, &entry.executable(), plan_id, plan_version)
 }
 
 pub(crate) fn validate_payload(
     catalog: Option<&SummaryCatalog>,
-    entry: &QueryPlanEntry,
+    entry: &ExecutableQueryPlan,
     plan_id: u64,
     plan_version: u64,
 ) -> Result<(), EngineError> {

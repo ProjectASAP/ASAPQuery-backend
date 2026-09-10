@@ -163,17 +163,18 @@ async fn real_victoriametrics_ingest_published_dag_is_differential() {
     let plan = control_plane::physical::compiler::PhysicalCompiler
         .compile_metricsql(request, environment)
         .unwrap();
-    assert!(plan
-        .query_plan
+    let metricsql_plan = plan.metricsql_plan.clone().expect("MetricsQL sidecar");
+    let binding = metricsql_plan
         .entries
         .values()
-        .any(|entry| { entry.language == control_plane::query_plan::QueryLanguage::MetricsQl }));
-    let binding = plan
-        .query_plan
-        .entries
-        .values()
-        .find(|entry| entry.language == control_plane::query_plan::QueryLanguage::MetricsQl)
-        .and_then(|entry| entry.materialization_bindings().into_iter().next())
+        .next()
+        .and_then(|entry| {
+            entry
+                .executable
+                .materialization_bindings()
+                .into_iter()
+                .next()
+        })
         .expect("published MetricsQL DAG has a bound SummaryScan");
     assert_eq!(binding.readout_lookback_ms, Some(5_000));
     let artifact = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
@@ -182,6 +183,8 @@ async fn real_victoriametrics_ingest_published_dag_is_differential() {
         precompute_plan: plan.precompute_plan,
         transmission_plan: plan.transmission_plan,
         query_plan: plan.query_plan,
+        metricsql_plan: plan.metricsql_plan,
+        clickhouse_sql: None,
         storage_routing: None,
         adaptation_evidence: vec![],
     };
@@ -189,11 +192,17 @@ async fn real_victoriametrics_ingest_published_dag_is_differential() {
         serde_json::from_value(serde_json::to_value(&artifact).unwrap()).unwrap();
     assert_eq!(
         artifact
-            .query_plan
+            .metricsql_plan
+            .as_ref()
+            .unwrap()
             .entries
             .values()
-            .find(|entry| entry.language == control_plane::query_plan::QueryLanguage::MetricsQl)
-            .and_then(|entry| entry.materialization_bindings().into_iter().next())
+            .next()
+            .and_then(|entry| entry
+                .executable
+                .materialization_bindings()
+                .into_iter()
+                .next())
             .and_then(|binding| binding.readout_lookback_ms),
         Some(5_000),
         "MetricsQL effective lookback survives publication serialization"

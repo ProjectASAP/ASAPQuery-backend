@@ -11,12 +11,11 @@ use planner_types::workload::SqlDialect;
 use crate::physical::compiler::{PrecomputePlan, TransmissionPlan};
 use crate::physical::post_asap::{cost_model::ControlPlaneCostModel, PhysicalExpr};
 use crate::query_plan::{
-    ClickHousePlanningContext, FallbackPolicy, FixedEvaluationRange, InstantExecution,
-    MaterializationBinding, PhysicalGrouping, QueryLanguage, QueryPlan, QueryPlanEntry,
+    FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping, QueryPlanEntry,
 };
 use asap_types::summary_catalog::SummaryCatalog;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClickHousePlanningError {
@@ -90,13 +89,13 @@ pub struct ClickHouseSqlWorkloadEntry {
     pub cumulative: bool,
 }
 
-/// Physical-plan components produced for the normal atomic install path.
+/// Wire bundle consumed by the independent backend SQL catalog.
 #[derive(Debug, Serialize)]
 pub struct ClickHouseCompiledBundle {
     pub sds: SummaryCatalog,
     pub tables: HashMap<String, planner_types::pre_asap::Schema>,
     pub accuracy: AccuracyTarget,
-    pub query_plan: QueryPlan,
+    pub plans: Vec<serde_json::Value>,
     pub precompute_plan: PrecomputePlan,
     pub transmission_plan: TransmissionPlan,
 }
@@ -115,7 +114,7 @@ pub async fn compile_clickhouse_workload(
     let catalog = SqlCatalog {
         tables: request.tables.clone(),
     };
-    let mut entries = std::collections::BTreeMap::new();
+    let mut plans = Vec::with_capacity(request.queries.len());
     for query in &request.queries {
         let planned = plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
         let PhysicalExpr::Committed(crate::physical::post_asap::PostAsapPlan::Summary(root)) =
@@ -126,14 +125,7 @@ pub async fn compile_clickhouse_workload(
             ));
         };
         let executable = QueryPlanEntry::compile_bound_relational(
-            query.sql.clone(),
-            planned.canonical_sql.clone(),
             &root,
-            FixedEvaluationRange {
-                start_ms: query.start_ms,
-                end_ms: query.end_ms,
-                cumulative: query.cumulative,
-            },
             InstantExecution {
                 lookback_ms: query.end_ms.saturating_sub(query.start_ms),
                 full_history: query.start_ms == 0,
@@ -153,6 +145,10 @@ pub async fn compile_clickhouse_workload(
             ));
         }
         let bindings = executable.materialization_bindings();
+        let materializations = bindings
+            .iter()
+            .map(|binding| binding.materialization.fingerprint())
+            .collect::<BTreeSet<_>>();
         let identities = bindings
             .iter()
             .map(|binding| {
@@ -167,37 +163,21 @@ pub async fn compile_clickhouse_workload(
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // Descriptor references are already represented by each DAG's
-        // MaterializationBinding and validated through SummaryCatalog.
-        let _descriptor_ids = identities
-            .iter()
-            .map(|identity| {
-                (
-                    &identity.summary_descriptor_id,
-                    &identity.data_descriptor_id,
-                )
-            })
-            .collect::<Vec<_>>();
-        let identity = QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &planned.canonical_sql);
-        if entries.insert(identity.clone(), executable).is_some() {
-            return Err(ClickHousePlanningError::Lower(format!(
-                "duplicate canonical SQL query identity `{identity}`"
-            )));
-        }
+        plans.push(serde_json::json!({
+            "sql": planned.canonical_sql,
+            "runtime": { "start_ms": query.start_ms, "end_ms": query.end_ms,
+                "cumulative": query.cumulative,
+                "materializations": materializations,
+                "executable": executable },
+            "descriptors": { "summaries": identities.iter().map(|identity| identity.summary_descriptor_id.clone()).collect::<BTreeSet<_>>(),
+                "data": identities.iter().map(|identity| identity.data_descriptor_id.clone()).collect::<BTreeSet<_>>() }
+        }));
     }
     Ok(ClickHouseCompiledBundle {
         sds: request.sds.clone(),
         tables: request.tables.clone(),
         accuracy: request.accuracy.clone(),
-        query_plan: QueryPlan {
-            plan_id: request.sds.plan_id,
-            plan_version: request.sds.plan_version,
-            clickhouse_context: Some(ClickHousePlanningContext {
-                tables: request.tables.clone(),
-                accuracy: request.accuracy.clone(),
-            }),
-            entries,
-        },
+        plans,
         precompute_plan: request.precompute_plan.clone(),
         transmission_plan: request.transmission_plan.clone(),
     })
@@ -226,7 +206,7 @@ fn bind_selected_node(
         window_ms: selected.slide_interval.saturating_mul(1000),
         pane_origin_ms: selected.pane_origin_ms,
         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1000)),
-        item_labels: selected.aggregated_labels.labels.clone(),
+        item_labels: Default::default(),
     })
 }
 

@@ -822,13 +822,20 @@ async fn handle_compile_and_publish_clickhouse_plan(
         )
             .into_response();
     };
+    let empty_query_plan = control_plane::query_plan::QueryPlan {
+        plan_id,
+        plan_version,
+        entries: Default::default(),
+    };
     if let Err(error) = client
-        .post_physical_plan_typed(
+        .post_physical_plan_with_sidecars(
             &bundle.precompute_plan,
             &bundle.transmission_plan,
-            &bundle.query_plan,
+            &empty_query_plan,
             None,
             &[],
+            None,
+            Some(serde_json::to_value(&bundle).expect("SQL bundle serializes")),
         )
         .await
     {

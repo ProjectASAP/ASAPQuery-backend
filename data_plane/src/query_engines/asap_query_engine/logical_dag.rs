@@ -856,10 +856,8 @@ mod topk_tests {
         let summary = QueryNodeId(0);
         let root = QueryNodeId(1);
         let entry = QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "summary-rate-topk".into(),
-            canonical_query: "topk(2, rate(requests_total[5m]))".into(),
-            fixed_evaluation: None,
+            canonical_promql: "topk(2, rate(requests_total[5m]))".into(),
             root,
             nodes: BTreeMap::from([
                 (
@@ -985,10 +983,8 @@ mod topk_tests {
         let value_id = QueryNodeId(1);
         let root = QueryNodeId(2);
         let entry = QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
             query_id: "candidate-topk".into(),
-            canonical_query: "topk(1, rate(requests_total[5m]))".into(),
-            fixed_evaluation: None,
+            canonical_promql: "topk(1, rate(requests_total[5m]))".into(),
             root,
             nodes: BTreeMap::from([
                 (
