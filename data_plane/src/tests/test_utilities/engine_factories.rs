@@ -139,7 +139,7 @@ pub fn create_engine_single_pop_with_aggregated(
         ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg, &output, acc.as_ref());
     }
 
-    ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
+    ASAPQueryEngine::new(1).with_sketch_index(sketch_index)
 }
 
 /// Creates a ASAPQueryEngine with dual-input (separate value and keys
@@ -270,7 +270,7 @@ pub fn create_engine_dual_input(
         ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_2, &output, acc.as_ref());
     }
 
-    ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
+    ASAPQueryEngine::new(1).with_sketch_index(sketch_index)
 }
 
 /// Creates a ASAPQueryEngine with two independent metrics, each with their own
@@ -381,7 +381,7 @@ pub fn create_engine_two_metrics(
         ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg_2, &output, acc.as_ref());
     }
     let _ = (query_a, query_b);
-    ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
+    ASAPQueryEngine::new(1).with_sketch_index(sketch_index)
 }
 
 /// Creates a ASAPQueryEngine with three independent metrics, each with their own
@@ -478,7 +478,7 @@ pub fn create_engine_three_metrics(
     }
 
     let _ = (labels_a, labels_b, labels_c, query_a, query_b, query_c);
-    ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
+    ASAPQueryEngine::new(1).with_sketch_index(sketch_index)
 }
 
 /// Creates a single-pop engine with data at multiple timestamps for testing merge.
@@ -540,7 +540,7 @@ pub fn create_engine_multi_timestamp(
         );
         ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg, &output, acc.as_ref());
     }
-    ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
+    ASAPQueryEngine::new(1).with_sketch_index(sketch_index)
 }
 
 /// Creates a single-pop engine with data at multiple timestamps and configurable window.
@@ -608,5 +608,5 @@ pub fn create_engine_multi_timestamp_with_window(
         );
         ingest_with_fresh_resolver(&sketch_index, &resolver, &agg_cfg, &output, acc.as_ref());
     }
-    ASAPQueryEngine::new(streaming_config, 1).with_sketch_index(sketch_index)
+    ASAPQueryEngine::new(1).with_sketch_index(sketch_index)
 }

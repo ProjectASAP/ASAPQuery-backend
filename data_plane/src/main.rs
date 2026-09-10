@@ -793,26 +793,19 @@ async fn main() -> Result<()> {
             active_physical_plan.clone(),
         );
 
-    // Setup query engine. ASAPQueryEngine shares the same
-    // HotReloadStreamingConfig handle as the HTTP server, so a POST
-    // to /api/v1/streaming-config is observable by the next query
-    // (PR E phase 2). Without sharing the handle, ASAPQueryEngine
-    // would take a one-time snapshot at construction and ignore
-    // subsequent swaps.
+    // Query execution reads generation-consistent runtime configuration from
+    // the ActivePhysicalPlan installed below.
     let engine = {
-        let mut engine = ASAPQueryEngine::new_with_hot_reload(
-            hot_reload_config.clone(),
-            args.prometheus_scrape_interval,
-        )
-        // Phase 5 wire-in (refactor 2026-05): hand the ASAP-tier
-        // SketchStore to the query engine so SeriesLookup classification
-        // drives the Phase 6 archive failover via
-        // EngineError::CapabilityMiss when the ASAP tier is empty
-        // / ghost / unknown.
-        .with_sketch_index(sketch_index.clone())
-        .with_active_physical_plan(active_physical_plan.clone())
-        .with_exact_subquery_endpoint(args.prometheus_server.clone())
-        .with_metricsql_exact_subquery_endpoint(args.victoriametrics_url.clone());
+        let mut engine = ASAPQueryEngine::new(args.prometheus_scrape_interval)
+            // Phase 5 wire-in (refactor 2026-05): hand the ASAP-tier
+            // SketchStore to the query engine so SeriesLookup classification
+            // drives the Phase 6 archive failover via
+            // EngineError::CapabilityMiss when the ASAP tier is empty
+            // / ghost / unknown.
+            .with_sketch_index(sketch_index.clone())
+            .with_active_physical_plan(active_physical_plan.clone())
+            .with_exact_subquery_endpoint(args.prometheus_server.clone())
+            .with_metricsql_exact_subquery_endpoint(args.victoriametrics_url.clone());
         if let Some(control_plane_endpoint) = args.control_plane_endpoint.as_ref() {
             info!(
                 "Capability-miss notifications enabled → {}",

@@ -276,10 +276,8 @@ async fn start_backend_http_server() -> (u16, HotReloadStreamingConfig) {
 
     let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
     let sketch_index = Arc::new(SketchStore::new());
-    let query_engine = Arc::new(
-        ASAPQueryEngine::new_with_hot_reload(hot_reload.clone(), 15_000)
-            .with_sketch_index(sketch_index.clone()),
-    );
+    let query_engine =
+        Arc::new(ASAPQueryEngine::new(15_000).with_sketch_index(sketch_index.clone()));
 
     let adapter_config = AdapterConfig::prometheus_promql(
         "http://127.0.0.1:9999".to_string(), // unused — no forwarding in this test
@@ -436,7 +434,7 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
         adapter_config,
     };
     let query_engine = Arc::new(
-        ASAPQueryEngine::new_with_hot_reload(hot_reload.clone(), 15_000)
+        ASAPQueryEngine::new(15_000)
             // CRITICAL: without this the engine's `sketch_index` is
             // None and every fast path that reads sid → SketchInstance
             // metadata is silently skipped. Sketches DO land in
