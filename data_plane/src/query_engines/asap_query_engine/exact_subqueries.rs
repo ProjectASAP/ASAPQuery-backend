@@ -457,6 +457,9 @@ mod tests {
                         language: QueryLanguage::PromQl,
                         expression: query.into(),
                         output: control_plane::query_plan::ExternalExactOutput::InstantVector,
+                        parameters: BTreeMap::new(),
+                        start_parameter: None,
+                        end_parameter: None,
                         input_contracts: vec![ExternalExactInput::CandidateMembership {
                             item_label: "job".into(),
                         }],

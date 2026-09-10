@@ -5,12 +5,15 @@ use axum::{
     body::Bytes,
     http::{HeaderMap, HeaderValue, StatusCode},
 };
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use super::{
     clickhouse_result_adapter::ClickHouseFormat,
-    execution::{execute_sql_dag, ClickHouseDagFallback, ClickHouseDagOutcome},
-    fallback::ClickHouseRawResponse,
+    execution::{
+        execute_sql_dag_with_external, ClickHouseDagFallback, ClickHouseDagOutcome,
+        PreparedExternalLeaves,
+    },
+    fallback::{ClickHouseExactBackend, ClickHouseRawResponse},
     request::ClickHouseQueryRequest,
     server::{
         ClickHouseAccelerationFallback, ClickHouseAccelerationOutcome, ClickHouseAccelerator,
@@ -21,6 +24,7 @@ use crate::storage_engines::sketch_db::index::SketchStore;
 pub struct CatalogClickHouseAccelerator {
     pub store: Arc<SketchStore>,
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
+    exact_backend: Option<Arc<dyn ClickHouseExactBackend>>,
 }
 
 impl CatalogClickHouseAccelerator {
@@ -28,6 +32,7 @@ impl CatalogClickHouseAccelerator {
         Self {
             store,
             active_physical_plan: None,
+            exact_backend: None,
         }
     }
 
@@ -38,6 +43,82 @@ impl CatalogClickHouseAccelerator {
         let mut accelerator = Self::empty(store);
         accelerator.active_physical_plan = Some(active);
         accelerator
+    }
+
+    pub fn with_exact_backend(mut self, exact_backend: Arc<dyn ClickHouseExactBackend>) -> Self {
+        self.exact_backend = Some(exact_backend);
+        self
+    }
+
+    async fn prepare_external_exact(
+        &self,
+        entry: &control_plane::query_plan::QueryPlanEntry,
+        start_ms: u64,
+        end_ms: u64,
+        request_context: &ClickHouseQueryRequest,
+    ) -> Result<PreparedExternalLeaves, String> {
+        let mut prepared = PreparedExternalLeaves::new();
+        let leaves = entry.nodes.iter().filter_map(|(id, node)| match node {
+            control_plane::query_plan::QueryPlanNode::ExternalExact { request, inputs }
+                if request.language == asap_types::QueryLanguage::ClickHouseSql
+                    && inputs.is_empty() =>
+            {
+                Some((*id, request))
+            }
+            _ => None,
+        });
+        for (id, bound) in leaves {
+            let backend = self
+                .exact_backend
+                .as_ref()
+                .ok_or_else(|| "ClickHouse exact subtree endpoint unavailable".to_owned())?;
+            let schema = match &bound.output {
+                control_plane::query_plan::ExternalExactOutput::Relation { schema } => {
+                    serde_json::from_value(schema.clone()).map_err(|error| error.to_string())?
+                }
+                _ => return Err("ClickHouse exact subtree must produce a relation".into()),
+            };
+            let mut parameters = bound
+                .parameters
+                .iter()
+                .map(|(name, value)| (format!("param_{name}"), value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            if let Some(name) = &bound.start_parameter {
+                parameters.insert(format!("param_{name}"), start_ms.to_string());
+            }
+            if let Some(name) = &bound.end_parameter {
+                parameters.insert(format!("param_{name}"), end_ms.to_string());
+            }
+            parameters.insert("default_format".into(), "JSONCompact".into());
+            if let Some(database) = request_context.database() {
+                parameters.insert("database".into(), database.into());
+            }
+            let request = ClickHouseQueryRequest {
+                method: axum::http::Method::POST,
+                sql: bound.expression.clone(),
+                body: Bytes::from(bound.expression.clone()),
+                parameters,
+                headers: request_context.headers.clone(),
+            };
+            let response = backend
+                .execute(&request)
+                .await
+                .map_err(|error| error.to_string())?;
+            if !response.status.is_success() {
+                return Err(format!(
+                    "ClickHouse external subtree returned HTTP {}",
+                    response.status
+                ));
+            }
+            let mut relation = super::relational_adapter::ClickHouseRelation::from_json_compact(
+                &schema,
+                &response.body,
+            )
+            .map_err(|error| error.to_string())?;
+            relation.coverage = Some((start_ms, end_ms));
+            prepared.insert(id, relation);
+        }
+        Ok(prepared)
     }
 }
 
@@ -109,10 +190,22 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                 ),
             );
         };
-        match execute_sql_dag(
+        let prepared = match self
+            .prepare_external_exact(entry, range.start_ms, range.end_ms, request)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return ClickHouseAccelerationOutcome::Fallback(
+                    ClickHouseAccelerationFallback::Execution(error),
+                )
+            }
+        };
+        match execute_sql_dag_with_external(
             self.store.as_ref(),
             entry,
             catalog.as_ref(),
+            &prepared,
             range.start_ms,
             range.end_ms,
             range.cumulative,
@@ -164,10 +257,36 @@ mod tests {
     use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
     use axum::http::Method;
     use control_plane::query_plan::{
-        ClickHousePlanningContext, ExactReadout, FallbackPolicy, FixedEvaluationRange,
-        InstantExecution, MaterializationBinding, PhysicalGrouping, QueryLanguage, QueryNodeId,
-        QueryPlan, QueryPlanEntry, QueryPlanNode,
+        ClickHousePlanningContext, ExactReadout, ExternalExactOutput, ExternalExactRequest,
+        FallbackPolicy, FixedEvaluationRange, InstantExecution, MaterializationBinding,
+        PhysicalGrouping, QueryLanguage, QueryNodeId, QueryPlan, QueryPlanEntry, QueryPlanNode,
     };
+
+    struct FixedExactSubtree;
+
+    #[async_trait]
+    impl ClickHouseExactBackend for FixedExactSubtree {
+        async fn execute(
+            &self,
+            request: &ClickHouseQueryRequest,
+        ) -> Result<ClickHouseRawResponse, super::super::fallback::ClickHouseFallbackError>
+        {
+            assert_eq!(request.parameters.get("param_from"), Some(&"0".into()));
+            assert_eq!(request.parameters.get("param_to"), Some(&"2000".into()));
+            Ok(ClickHouseRawResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                body: Bytes::from_static(br#"{"meta":[{"name":"timestamp","type":"Int64"},{"name":"divisor","type":"Float64"}],"data":[[2000,10.0]],"rows":1}"#),
+            })
+        }
+
+        async fn ping(
+            &self,
+        ) -> Result<ClickHouseRawResponse, super::super::fallback::ClickHouseFallbackError>
+        {
+            unreachable!()
+        }
+    }
     use planner_types::{
         post_asap::{SummaryFamilyType, SummaryField, SummarySchema, ValueOperation},
         pre_asap::{
@@ -623,5 +742,116 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(accelerated_value, exact_value);
+    }
+
+    #[tokio::test]
+    async fn summary_and_external_exact_leaf_compose_in_one_query_dag() {
+        let (accelerator, request) = fixture(2_000).await;
+        let physical = accelerator
+            .active_physical_plan
+            .as_ref()
+            .unwrap()
+            .snapshot();
+        let mut entry = physical.query_plan.entries.values().next().unwrap().clone();
+        let left = QueryNodeId(1);
+        let external = QueryNodeId(6);
+        let join = QueryNodeId(7);
+        let project = QueryNodeId(8);
+        let left_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("value", DataType::Float64),
+        ]);
+        let right_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("divisor", DataType::Float64),
+        ]);
+        let joined_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("value", DataType::Float64),
+            ("timestamp", DataType::Timestamp),
+            ("divisor", DataType::Float64),
+        ]);
+        let output_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("ratio", DataType::Float64),
+        ]);
+        entry
+            .nodes
+            .retain(|id, _| *id == QueryNodeId(0) || *id == left);
+        entry.nodes.insert(external, QueryPlanNode::ExternalExact {
+            request: ExternalExactRequest {
+                language: QueryLanguage::ClickHouseSql,
+                expression: "SELECT toInt64(2000) AS timestamp, toFloat64(10) AS divisor WHERE {from:UInt64} <= {to:UInt64}".into(),
+                output: ExternalExactOutput::Relation { schema: serde_json::to_value(&right_schema).unwrap() },
+                parameters: BTreeMap::new(),
+                start_parameter: Some("from".into()),
+                end_parameter: Some("to".into()),
+                input_contracts: vec![],
+            },
+            inputs: vec![],
+        });
+        entry.nodes.insert(
+            join,
+            QueryPlanNode::RelationalJoin {
+                inputs: [left, external],
+                join_kind: planner_types::pre_asap::JoinKind::Inner,
+                pred: serde_json::to_value(Predicate(Rc::new(QueryExpr::Compare {
+                    left: Rc::new(QueryExpr::Column(0)),
+                    op: CompareOpKind::Eq,
+                    right: Rc::new(QueryExpr::Column(2)),
+                })))
+                .unwrap(),
+                left_schema,
+                right_schema,
+                output_schema: joined_schema.clone(),
+            },
+        );
+        entry.nodes.insert(
+            project,
+            QueryPlanNode::Relational {
+                input: join,
+                operation: serde_json::to_value(ValueOperation::Project {
+                    cols: vec![
+                        ProjectItem {
+                            alias: Some("timestamp".into()),
+                            expr: QueryExpr::Column(0),
+                        },
+                        ProjectItem {
+                            alias: Some("ratio".into()),
+                            expr: QueryExpr::Arithmetic {
+                                op: ArithmeticOpKind::Div,
+                                left: Rc::new(QueryExpr::Column(1)),
+                                right: Rc::new(QueryExpr::Column(3)),
+                            },
+                        },
+                    ],
+                    qualifier: None,
+                })
+                .unwrap(),
+                input_schema: joined_schema,
+                output_schema,
+            },
+        );
+        entry.root = project;
+        let accelerator = accelerator.with_exact_backend(Arc::new(FixedExactSubtree));
+        let prepared = accelerator
+            .prepare_external_exact(&entry, 0, 2_000, &request)
+            .await
+            .unwrap();
+        let ClickHouseDagOutcome::Accelerated(result) = execute_sql_dag_with_external(
+            accelerator.store.as_ref(),
+            &entry,
+            physical.summary_catalog.as_ref().unwrap(),
+            &prepared,
+            0,
+            2_000,
+            true,
+        ) else {
+            panic!("mixed summary/external DAG should execute")
+        };
+        assert_eq!(
+            String::from_utf8(result.encode(ClickHouseFormat::TabSeparated).unwrap()).unwrap(),
+            "1970-01-01T00:00:02\t0.5\n"
+        );
     }
 }

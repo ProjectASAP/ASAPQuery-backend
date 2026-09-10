@@ -9,6 +9,7 @@ use arrow::{
     datatypes::{DataType as ArrowDataType, Field, Schema},
     record_batch::RecordBatch,
 };
+use chrono::{DateTime, NaiveDateTime, TimeZone};
 use planner_types::{
     post_asap::{SummaryFamilyType, SummaryNode, SummarySchema, ValueOperation},
     pre_asap::{ArithmeticOpKind, CompareOpKind, DataType, QueryExpr, ScalarValue, SortKey},
@@ -46,7 +47,92 @@ enum Cell {
     Timestamp(i64),
 }
 
-#[derive(Debug)]
+fn json_cell(
+    value: &serde_json::Value,
+    dtype: &DataType,
+    nullable: bool,
+    clickhouse_type: &str,
+) -> Result<Cell, ClickHouseRelationalError> {
+    if value.is_null() && nullable {
+        return Ok(Cell::Null);
+    }
+    let invalid = || {
+        ClickHouseRelationalError::Invalid(format!(
+            "external value {value} does not match {dtype:?}"
+        ))
+    };
+    match dtype {
+        DataType::Int64 => value.as_i64().map(Cell::Int64).ok_or_else(invalid),
+        DataType::Float64 => value.as_f64().map(Cell::Float64).ok_or_else(invalid),
+        DataType::Utf8 => value
+            .as_str()
+            .map(|value| Cell::Utf8(value.into()))
+            .ok_or_else(invalid),
+        DataType::Bool => value.as_bool().map(Cell::Bool).ok_or_else(invalid),
+        DataType::Timestamp => parse_clickhouse_timestamp(value, clickhouse_type)
+            .map(Cell::Timestamp)
+            .ok_or_else(invalid),
+    }
+}
+
+fn parse_clickhouse_timestamp(value: &serde_json::Value, clickhouse_type: &str) -> Option<i64> {
+    let clickhouse_type = clickhouse_type
+        .strip_prefix("Nullable(")
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or(clickhouse_type);
+    if clickhouse_type == "Int64" {
+        return value.as_i64();
+    }
+    let text = value.as_str()?;
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(text) {
+        return Some(timestamp.timestamp_millis());
+    }
+    let (scale, timezone) = if clickhouse_type == "DateTime" {
+        (0, "UTC")
+    } else if let Some(timezone) = clickhouse_type
+        .strip_prefix("DateTime(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        (0, timezone.trim().trim_matches('\''))
+    } else {
+        let args = clickhouse_type
+            .strip_prefix("DateTime64(")?
+            .strip_suffix(')')?;
+        let mut args = args.split(',').map(str::trim);
+        let scale = args.next()?.parse::<usize>().ok()?;
+        if scale > 9 {
+            return None;
+        }
+        let timezone = args.next().unwrap_or("UTC").trim_matches('\'');
+        if args.next().is_some() {
+            return None;
+        }
+        (scale, timezone)
+    };
+    let fraction_digits = text
+        .split_once('.')
+        .map(|(_, fraction)| fraction.len())
+        .unwrap_or(0);
+    if fraction_digits != scale {
+        return None;
+    }
+    let naive = NaiveDateTime::parse_from_str(
+        text,
+        if scale == 0 {
+            "%Y-%m-%d %H:%M:%S"
+        } else {
+            "%Y-%m-%d %H:%M:%S%.f"
+        },
+    )
+    .ok()?;
+    let timezone: chrono_tz::Tz = timezone.parse().ok()?;
+    timezone
+        .from_local_datetime(&naive)
+        .single()
+        .map(|value| value.timestamp_millis())
+}
+
+#[derive(Clone, Debug)]
 pub struct ClickHouseRelation {
     rows: Vec<Vec<Cell>>,
     fields: Vec<(String, DataType, bool)>,
@@ -54,6 +140,81 @@ pub struct ClickHouseRelation {
 }
 
 impl ClickHouseRelation {
+    pub fn from_json_compact(
+        schema: &SummarySchema,
+        body: &[u8],
+    ) -> Result<Self, ClickHouseRelationalError> {
+        let document: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?;
+        let meta = document
+            .get("meta")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                ClickHouseRelationalError::Invalid(
+                    "ClickHouse JSONCompact response has no typed metadata".into(),
+                )
+            })?;
+        let data = document
+            .get("data")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                ClickHouseRelationalError::Invalid(
+                    "ClickHouse JSONCompact response has no data rows".into(),
+                )
+            })?;
+        let fields = fields_from_schema(schema);
+        if meta.len() != fields.len()
+            || meta
+                .iter()
+                .zip(&fields)
+                .any(|(actual, (name, dtype, nullable))| {
+                    actual.get("name").and_then(serde_json::Value::as_str) != Some(name)
+                        || !clickhouse_type_matches(
+                            actual.get("type").and_then(serde_json::Value::as_str),
+                            dtype,
+                            *nullable,
+                        )
+                })
+        {
+            return Err(ClickHouseRelationalError::Invalid(
+                "ClickHouse external metadata differs from its planned schema".into(),
+            ));
+        }
+        let mut rows = Vec::with_capacity(data.len());
+        for encoded in data {
+            let encoded = encoded.as_array().ok_or_else(|| {
+                ClickHouseRelationalError::Invalid(
+                    "ClickHouse JSONCompact row is not an array".into(),
+                )
+            })?;
+            if encoded.len() != fields.len() {
+                return Err(ClickHouseRelationalError::Invalid(
+                    "ClickHouse external row differs from its planned schema".into(),
+                ));
+            }
+            rows.push(
+                encoded
+                    .iter()
+                    .zip(&fields)
+                    .zip(meta)
+                    .map(|((value, (_, dtype, nullable)), metadata)| {
+                        json_cell(
+                            value,
+                            dtype,
+                            *nullable,
+                            metadata["type"].as_str().expect("metadata validated"),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(Self {
+            rows,
+            fields,
+            coverage: None,
+        })
+    }
+
     pub fn from_series_rows(
         schema: &SummarySchema,
         series: Vec<(BTreeMap<String, String>, Vec<(i64, f64)>)>,
@@ -87,6 +248,35 @@ impl ClickHouseRelation {
         Ok(ClickHouseQueryResult {
             batches: vec![batch],
         })
+    }
+}
+
+fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: bool) -> bool {
+    let Some(mut actual) = actual else {
+        return false;
+    };
+    if nullable {
+        let Some(inner) = actual
+            .strip_prefix("Nullable(")
+            .and_then(|value| value.strip_suffix(')'))
+        else {
+            return false;
+        };
+        actual = inner;
+    } else if actual.starts_with("Nullable(") {
+        return false;
+    }
+    match expected {
+        DataType::Int64 => actual == "Int64",
+        DataType::Float64 => actual == "Float64",
+        DataType::Utf8 => actual == "String",
+        DataType::Bool => actual == "Bool",
+        DataType::Timestamp => {
+            actual == "Int64"
+                || actual == "DateTime"
+                || actual.starts_with("DateTime(")
+                || actual.starts_with("DateTime64(")
+        }
     }
 }
 
