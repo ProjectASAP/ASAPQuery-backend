@@ -244,9 +244,25 @@ async fn push_documents_coupled(
         clickhouse_context: None,
         entries: Default::default(),
     };
+    let catalog = match crate::physical::summary_catalog::SummaryCatalog::from_materializations(
+        precompute_plan.envelope.plan_id,
+        precompute_plan.envelope.plan_version,
+        &precompute_plan.materializations,
+    ) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            warn!(%error, "failed to build compatibility SummaryCatalog");
+            return (false, false, 0);
+        }
+    };
+    let mut precompute_plan = precompute_plan.clone();
+    if let Err(error) = precompute_plan.bind_catalog(&catalog) {
+        warn!(%error, "failed to bind compatibility PrecomputePlan to SummaryCatalog");
+        return (false, false, 0);
+    }
     let transmission_plan = match crate::physical::compiler::TransmissionPlan::build(
         precompute_plan.envelope.clone(),
-        precompute_plan,
+        &precompute_plan,
         &Default::default(),
     ) {
         Ok(plan) => plan,
@@ -255,16 +271,17 @@ async fn push_documents_coupled(
             return (false, false, 0);
         }
     };
+    let publication = crate::physical::publication::PhysicalPlanPublication {
+        summary_catalog: catalog,
+        precompute_plan,
+        collector_plans: Vec::new(),
+        transmission_plan,
+        query_plan,
+    };
 
     for attempt in 1..=RETRY_MAX_ATTEMPTS {
         match client
-            .post_physical_plan_typed(
-                precompute_plan,
-                &transmission_plan,
-                &query_plan,
-                Some(routing.clone()),
-                &[],
-            )
+            .post_catalog_plan_typed(&publication, Some(routing.clone()), &[])
             .await
         {
             Ok(()) => return (true, true, attempt),
@@ -456,10 +473,13 @@ async fn push_cumulative_entries(
             return PushOutcome::EmitFailed;
         }
     };
-    let precompute_plan = match PrecomputePlan::build(
+    // This compatibility path installs state in the backend-local precompute
+    // engine.  It must not manufacture a distributed collector producer: an
+    // authoritative publication requires every producer to have a matching
+    // CollectorPlan, and no collector exists on this path.
+    let precompute_plan = match PrecomputePlan::build_backend_local(
         precompute_envelope,
         materializations,
-        &["legacy-replanner".into()],
     ) {
         Ok(plan) => plan,
         Err(error) => {
