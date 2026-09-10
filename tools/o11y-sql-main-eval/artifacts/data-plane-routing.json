@@ -1,0 +1,139 @@
+{
+  "queries": [
+    {
+      "id": "q01",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: .\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q02",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: .\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q03",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: identifier, found: )\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q04",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: identifier, found: )\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q05",
+      "reason": "CatalogMiss",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q06",
+      "reason": "CatalogMiss",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q07",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: Error during planning: Invalid function 'mapconcat'.\\nDid you mean 'concat'?\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q08",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: ,\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q09",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: Error during planning: Error during planning: map does not support zero arguments. No function matches the given name and argument types 'map()'. You might need to add explicit type casts.\\n\\tCandidate functions:\\n\\tmap(Any, .., Any)\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q10",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\\nDid you mean 'md5'?\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q11",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: labels\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q12",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: This feature is not implemented: Map Access\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q13",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: ,\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q14",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: ,\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q15",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: [\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q16",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: identifier, found: )\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q17",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: .\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q18",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: labels\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q19",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: ,\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q20",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: ,\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q21",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: ), found: .1\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q22",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: ,\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q23",
+      "reason": "CatalogMiss",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q24",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: ,\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q25",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: .\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q26",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: SQL error: ParserError(\\\"Expected: joined table, found: labels\\\")\")",
+      "route": "exact_fallback"
+    },
+    {
+      "id": "q27",
+      "reason": "Planning(\"SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\\nDid you mean 'today'?\")",
+      "route": "exact_fallback"
+    }
+  ]
+}
