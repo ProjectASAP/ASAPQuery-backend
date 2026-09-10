@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "source": "/mydata/evaluation_query_datasets.yaml",
+  "source": "source-corpus.json",
   "count": 27,
   "queries": [
     {
@@ -337,5 +337,6 @@
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
       "sql_mapping_status": "oracle_valid"
     }
-  ]
+  ],
+  "source_sha256": "72c334fab18674746a2cef7c926e81d06a13dc9f11858d080460a99aa5b31ecf"
 }

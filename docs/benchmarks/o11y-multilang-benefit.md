@@ -4,18 +4,16 @@ This benchmark keeps all 27 source occurrences in the denominator. `corpus.json`
 
 ## Reproduce
 
-The command below starts with an empty output directory. It deterministically generates the OpenMetrics fixture, Prometheus configuration and TSDB, and physical plan; records their SHA-256 hashes; runs both production frontend/compiler auditors; provisions fresh Prometheus, VictoriaMetrics, ClickHouse, and data-plane state; then writes raw requests, structured comparisons, phase resources, and terminal-stage coverage.
+The command below starts with an empty output directory. It deterministically generates the OpenMetrics fixture, Prometheus configuration and TSDB, and physical plan; records their SHA-256 hashes; builds the data-plane binary from that same clean HEAD; runs both production frontend/compiler auditors; provisions fresh Prometheus, VictoriaMetrics, ClickHouse, and data-plane state; then writes raw requests, structured comparisons, phase resources, and terminal-stage coverage.
 
 ```bash
 CARGO_TARGET_DIR=/path/to/target python3 tools/o11y-multilang/reproduce.py \
   --backend-source "$PWD" \
-  --binary-source /path/to/backend/source \
-  --binary /path/to/data_plane \
   --output-dir tools/o11y-multilang/repro-fresh \
   --trials 1 --repetitions 3 --seed 20260910
 ```
 
-The seed randomizes query order independently for each repetition. Engine order alternates. Each trial creates new storage and process state and removes it afterward. The manifest records the actual backend Git HEAD, binary hash, immutable container digests, generated-input hashes, lifecycle and ingest duration, and process CPU ticks, RSS/HWM, and storage at start, after ingest, and after queries.
+The seed randomizes query order independently for each repetition. Engine order alternates. Each trial creates new storage and process state and removes it afterward. Container images are launched by immutable digest and the manifest also records their actual image IDs. Resource snapshots are totals for the mixed alternating query phase and cannot be attributed to native or ASAP mode independently. The manifest records the clean source HEAD, binary hash, generated-input hashes, lifecycle and ingest duration, and process CPU ticks, RSS/HWM, and storage at start, after ingest, and after queries.
 
 ## Observed result
 
@@ -28,11 +26,11 @@ The checked-in evidence is one fresh trial with three repetitions and 27 queries
 - Prometheus versus VictoriaMetrics: 48/81 strict matches and 33/81 mismatches.
 - Prometheus versus ClickHouse label/value SQL oracle: 81/81 matches; timestamps and result type are reported as protocol-noncomparable.
 
-The parser/canonical stage accepts 12/27 MetricsQL expressions, the early planner accepts 7/27, and the production compiler/publication validator accepts 2/27. The SQL acceleration frontend accepts 0/27 of the exact ClickHouse dialect mappings. Every row records its observed terminal fallback stage. Although q03 and q16 pass offline publication validation, the benchmark physical plan deliberately contains no corpus sidecars, so their measured requests terminate at a publication catalog miss. Binder, validator, and executor are not reached in this fallback-only experiment.
+The offline fail-closed matrix reports that the parser/canonical stage accepts 12/27 MetricsQL expressions, the early planner accepts 7/27, and the production compiler/publication validator accepts 2/27. The SQL acceleration frontend accepts 0/27 of the exact ClickHouse dialect mappings. Every row records its offline terminal stage plus the HTTP-observed exact fallback. Although q03 and q16 pass offline publication validation, the benchmark physical plan deliberately contains no corpus sidecars; their catalog-miss classification is inferred from that artifact, while only exact fallback is observed on the wire. Binder, validator, and executor are not reached in this fallback-only experiment.
 
 ## Evidence files
 
-- `stage-coverage.json`: per-query parser, planner, compiler, publication, terminal, adapter, and fallback result.
+- `repro-fresh/stage-coverage.json`: per-query parser, planner, compiler, publication, terminal, adapter, and fallback result.
 - `repro-fresh/manifest.json`: hashes, immutable images, lifecycle timing, and phase resource snapshots.
 - `repro-fresh/trial-0-raw.json`: every timed response and `x-asap-execution` value.
 - `repro-fresh/trial-0-comparisons.json`: labels, value, timestamp, result type, and warnings for each required engine pair.
@@ -40,4 +38,4 @@ The parser/canonical stage accepts 12/27 MetricsQL expressions, the early planne
 
 ## Limitations
 
-This is one fresh trial and does not estimate variance across trials. CPU is process scheduler ticks rather than normalized CPU time. Container writable-layer size is an operational proxy for VM and ClickHouse storage. The production corpus has no warm executions, so it cannot quantify acceleration benefit. Native-histogram exponential interpolation is outside q21, which consumes classic `_bucket` series.
+This is one fresh trial and does not estimate variance across trials. CPU is process scheduler ticks rather than normalized CPU time, and the process totals cover mixed alternating native and ASAP requests rather than either mode alone. Container writable-layer size is an operational proxy for VM and ClickHouse storage. The production corpus has no warm executions, so it cannot quantify acceleration benefit. Native-histogram exponential interpolation is outside q21, which consumes classic `_bucket` series.
