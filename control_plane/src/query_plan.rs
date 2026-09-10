@@ -490,7 +490,6 @@ impl QueryPlanEntry {
         }
         Ok(())
     }
-
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
