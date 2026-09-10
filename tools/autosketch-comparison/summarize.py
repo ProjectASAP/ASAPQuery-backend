@@ -3,6 +3,7 @@
 
 import argparse
 import json
+from collections import Counter
 from pathlib import Path
 from statistics import mean
 
@@ -20,6 +21,7 @@ def summarize(report):
             "method": method,
             "runs": len(outcomes),
             "calibration_feasible": len(selected),
+            "selected_families": dict(Counter(o["selected"].get("family", "cms") for o in selected)),
             "held_out_pass": sum(o["held_out_pass"] is True for o in outcomes),
             "held_out_fail": sum(o["held_out_pass"] is False for o in outcomes),
             "no_feasible_configuration": len(outcomes) - len(selected),
@@ -34,6 +36,8 @@ def summarize(report):
         "cardinality": report["args"]["cardinality"],
         "zipf": report["args"]["zipf"],
         "epsilon": report["args"]["epsilon"],
+        "memory_budget_bytes": report["args"].get("memory_budget_bytes"),
+        "sketches": report["args"].get("sketches", ["cms"]),
         "mean_search_table_evaluations": mean(len(r["search"]["visited"])
                                              for r in report["runs"]),
         "mean_full_grid_calibration_seconds": mean(r["calibration_wall_seconds"]

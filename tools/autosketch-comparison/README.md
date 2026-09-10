@@ -1,14 +1,24 @@
 # AutoSketch comparison: first executable slice
 
 This runner starts E3 of the [evaluation plan (PR #545)](https://github.com/ProjectASAP/ASAPQuery-backend/pull/545).
-It is a fixed-CMS **shared-calibration-table selection experiment**, not a full
+It is a memory-constrained CMS/Count Sketch **shared-calibration-table selection experiment**, not a full
 ASAPPlanner, recurring-window, or native AutoSketch benchmark.
 
 ## What runs
 
-- Actual `asap_sketchlib::CountMinSketch`, the portable f64 CMS used by the backend.
-- The same 56 configurations for every method: widths 64 through 4096 in powers
-  of two, depths 1 through 8. Objective: counter payload bytes, not process RSS.
+- Actual `asap_sketchlib::CountMinSketch` and `CountSketch` implementations.
+- Up to 56 configurations per family: widths 64 through 4096 in powers of two,
+  depths 1 through 8. All methods see the same budget- and legality-filtered grid.
+  Portable Count Sketch requires `depth * (log2(width) + 1) <= 64`; CMS supports
+  larger hash layouts automatically.
+- `--memory-budget-bytes` is a hard cap on f64 counter payload for the selected
+  sketch, applied **before calibration and selection**. It is not an RSS cap or
+  a multi-window total-memory constraint. Object/allocator headers and transient
+  query scratch space are excluded. No populated key sidecar is used by these
+  point-frequency updates. Objective remains minimum counter payload bytes.
+- `--sketches cms,count-sketch` enables both families (default). Each family gets
+  an independent search frontier; the cheapest feasible result wins globally.
+  Use `--sketches cms` or `--sketches count-sketch` for family ablations.
 - Exact frequency oracle across all declared keys, including absent keys.
   Error is maximum `abs(estimate - truth) / events` over those keys.
 - A software AutoSketch-style LHS/neighbor search, the real ASAPPlanner
@@ -28,10 +38,12 @@ and sketch-library checkout, are required. No new dependencies are introduced.
 cargo test -p data_plane --example autosketch_comparison
 cargo run --release -p data_plane --example autosketch_comparison -- \
   --output /tmp/cms-uniform.json --backend-revision "$(git rev-parse HEAD)" \
-  --events 10000 --cardinality 1000 --runs 10 --seed 42 --epsilon 0.01
+  --events 10000 --cardinality 1000 --runs 10 --seed 42 --epsilon 0.01 \
+  --sketches cms,count-sketch --memory-budget-bytes 4096
 cargo run --release -p data_plane --example autosketch_comparison -- \
   --output /tmp/cms-zipf.json --backend-revision "$(git rev-parse HEAD)" \
-  --events 10000 --cardinality 1000 --runs 10 --seed 42 --epsilon 0.01 --zipf 1.2
+  --events 10000 --cardinality 1000 --runs 10 --seed 42 --epsilon 0.01 --zipf 1.2 \
+  --sketches cms,count-sketch --memory-budget-bytes 4096
 ```
 
 Use new output paths: the runner refuses to overwrite artifacts. A failed run
@@ -53,10 +65,20 @@ including held-out accuracy failures.
 ## Adaptation boundary
 
 The reference is [AutoSketch Algorithm 4 and Section 5.2](https://www.usenix.org/system/files/nsdi24-sun.pdf).
-Seven initial points have distinct width and depth coordinates. Feasible paths
+Seven initial points per family have distinct width and depth coordinates. Feasible paths
 decrease width/depth; infeasible paths increase them. Paths stop at a feasibility
 crossing. Evaluations are cached, and out-of-grid neighbors are excluded.
 Infeasible branches costing at least the feasible incumbent are pruned.
+Illegal/over-budget seeds and neighbors are discarded. Each family also gets its
+smallest legal in-budget point, so tight budgets cannot accidentally eliminate
+the entire family through LHS filtering. A budget below 512 bytes admits no
+configuration and produces explicit `no_feasible_configuration` outcomes.
+
+Sketch selection exhaustively considers both registered frequency families and
+performs parameter search within each. It is a software adaptation, not the
+paper's separate sampled family-preselection phase. CMS and Count Sketch use
+the same empirical absolute additive-error metric on nonnegative updates; this
+does not equate their theoretical L1/L2 guarantees. No P4 code is generated.
 
 Differences from the hardware algorithm are intentional and must be retained in
 results: there is no stage dimension, ALU budget, or 16-KiB page alignment;

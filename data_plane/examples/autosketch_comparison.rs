@@ -1,10 +1,10 @@
-//! Fixed-CMS configuration experiment; not a whole-planner/system benchmark.
+//! Memory-constrained frequency-sketch selection; not a whole-system benchmark.
 use asap_aware_mapping::erp::{
     AccuracyMode, ErpArtifact, ErpRecord, ErpResourceProfile, ErpSelectionRequest,
     ERP_SCHEMA_VERSION,
 };
-use asap_sketchlib::CountMinSketch;
-use clap::Parser;
+use asap_sketchlib::{CountMinSketch, CountSketch};
+use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -32,10 +32,36 @@ struct Args {
     /// Required provenance, obtained with git rev-parse HEAD.
     #[arg(long)]
     backend_revision: String,
+    /// Hard cap on resident f64 counter payload per selected sketch (not RSS).
+    #[arg(long, default_value_t = 32768)]
+    memory_budget_bytes: usize,
+    #[arg(
+        long,
+        value_enum,
+        value_delimiter = ',',
+        default_value = "cms,count-sketch"
+    )]
+    sketches: Vec<Family>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum Family {
+    Cms,
+    CountSketch,
+}
+impl Family {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Cms => "cms",
+            Self::CountSketch => "count_sketch",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 struct Config {
+    family: Family,
     width: usize,
     depth: usize,
 }
@@ -44,7 +70,12 @@ impl Config {
         self.width * self.depth * std::mem::size_of::<f64>()
     }
     fn id(self) -> String {
-        format!("cms-{:05}-{:02}", self.width, self.depth)
+        format!("{}-{:05}-{:02}", self.family.name(), self.width, self.depth)
+    }
+    fn legal(self) -> bool {
+        // CMS selects Packed64/128/Rows automatically; portable CountSketch
+        // hardcodes Packed64 and needs room for every column/sign bit.
+        self.family == Family::Cms || self.depth * (self.width.ilog2() as usize + 1) <= 64
     }
 }
 
@@ -52,10 +83,21 @@ fn grid() -> Vec<Config> {
     (0..7)
         .flat_map(|i| {
             (1..=8).map(move |depth| Config {
+                family: Family::Cms,
                 width: 64 << i,
                 depth,
             })
         })
+        .collect()
+}
+
+fn candidate_grid(families: &[Family], budget: usize) -> Vec<Config> {
+    families
+        .iter()
+        .flat_map(|&family| grid().into_iter().map(move |c| Config { family, ..c }))
+        .filter(|c| c.legal() && c.bytes() <= budget)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect()
 }
 
@@ -108,14 +150,29 @@ fn measure(config: Config, data: &[usize], keys: &[String]) -> Measurement {
     for &key in data {
         exact[key] += 1;
     }
-    let mut sketch = CountMinSketch::new(config.depth, config.width);
+    assert!(config.legal());
+    let mut cms =
+        (config.family == Family::Cms).then(|| CountMinSketch::new(config.depth, config.width));
+    let mut cs = (config.family == Family::CountSketch)
+        .then(|| CountSketch::new(config.depth, config.width));
     let started = Instant::now();
     for &key in data {
-        sketch.update(&keys[key], 1.0);
+        match (&mut cms, &mut cs) {
+            (Some(sketch), _) => sketch.update(&keys[key], 1.0),
+            (_, Some(sketch)) => sketch.update(&keys[key], 1.0),
+            _ => unreachable!(),
+        }
     }
     let update_wall_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
-    let estimates: Vec<_> = keys.iter().map(|key| sketch.estimate(key)).collect();
+    let estimates: Vec<_> = keys
+        .iter()
+        .map(|key| match (&cms, &cs) {
+            (Some(sketch), _) => sketch.estimate(key),
+            (_, Some(sketch)) => sketch.estimate(key),
+            _ => unreachable!(),
+        })
+        .collect();
     let query_wall_seconds = started.elapsed().as_secs_f64();
     let error = estimates
         .iter()
@@ -144,6 +201,7 @@ fn lhs(seed: u64) -> Vec<Config> {
         .into_iter()
         .zip(depths)
         .map(|(w, depth)| Config {
+            family: Family::Cms,
             width: 64 << w,
             depth,
         })
@@ -160,9 +218,42 @@ struct Search {
 // Discrete software adaptation of Algorithm 4: depth +/-1, width x2 or /2.
 // Each LHS path stops after crossing feasibility; duplicate evaluations are
 // cached. Pruned feasible nodes may still lead to cheaper neighbors.
-fn search(seed: u64, epsilon: f64, mut evaluate: impl FnMut(Config) -> f64) -> Search {
+#[cfg(test)]
+fn search(seed: u64, epsilon: f64, evaluate: impl FnMut(Config) -> f64) -> Search {
+    search_candidates(
+        seed,
+        epsilon,
+        &candidate_grid(&[Family::Cms], usize::MAX),
+        evaluate,
+    )
+}
+
+fn search_candidates(
+    seed: u64,
+    epsilon: f64,
+    candidates: &[Config],
+    mut evaluate: impl FnMut(Config) -> f64,
+) -> Search {
     let started = Instant::now();
-    let mut pending: VecDeque<_> = lhs(seed).into_iter().map(|c| (c, None)).collect();
+    let families: BTreeSet<_> = candidates.iter().map(|c| c.family).collect();
+    let mut pending = VecDeque::new();
+    for family in families {
+        for point in lhs(seed) {
+            let c = Config { family, ..point };
+            if candidates.contains(&c) {
+                pending.push_back((c, None));
+            }
+        }
+        // A tight budget can exclude every LHS point. Keep a legal seed for
+        // every family rather than silently removing it from sketch selection.
+        if let Some(&minimum) = candidates
+            .iter()
+            .filter(|c| c.family == family)
+            .min_by_key(|c| (c.bytes(), **c))
+        {
+            pending.push_back((minimum, None));
+        }
+    }
     let mut expanded = BTreeSet::new();
     let mut cache = BTreeMap::new();
     let mut visited = Vec::new();
@@ -210,7 +301,9 @@ fn search(seed: u64, epsilon: f64, mut evaluate: impl FnMut(Config) -> f64) -> S
             ]
         };
         for next in neighbors.into_iter().flatten() {
-            pending.push_back((next, Some(direction)));
+            if candidates.contains(&next) {
+                pending.push_back((next, Some(direction)));
+            }
         }
     }
     Search {
@@ -235,7 +328,7 @@ fn artifact(rows: &[Measurement], distribution: serde_json::Value, revision: &st
             .iter()
             .map(|m| ErpRecord {
                 id: m.config.id(),
-                sketch: "cms".into(),
+                sketch: m.config.family.name().into(),
                 implementation: "asap_sketchlib-portable".into(),
                 parameters: serde_json::json!({"width":m.config.width,"depth":m.config.depth}),
                 distribution: distribution.clone(),
@@ -265,7 +358,7 @@ fn erp_select(
     let request = ErpSelectionRequest {
         distribution,
         implementation: Some("asap_sketchlib-portable".into()),
-        allowed_sketches: vec!["cms".into()],
+        allowed_sketches: vec!["cms".into(), "count_sketch".into()],
         error_metric: "max_normalized_additive_error".into(),
         max_error: epsilon,
         min_trials: 1,
@@ -279,6 +372,11 @@ fn erp_select(
     };
     match profile.select(&request) {
         Ok(point) => Some(Config {
+            family: match point.record.sketch.as_str() {
+                "cms" => Family::Cms,
+                "count_sketch" => Family::CountSketch,
+                _ => panic!("unknown family"),
+            },
             width: point.record.parameters["width"].as_u64().unwrap() as usize,
             depth: point.record.parameters["depth"].as_u64().unwrap() as usize,
         }),
@@ -314,15 +412,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let distribution = serde_json::json!({"generator":"splitmix64-truncated-zipf-v1",
             "events":args.events,"cardinality":args.cardinality,"zipf":args.zipf,"seed":calibration_seed});
         let start = Instant::now();
-        let mut candidates = grid();
+        let mut candidates = candidate_grid(&args.sketches, args.memory_budget_bytes);
         Rng(calibration_seed).shuffle(&mut candidates);
         let rows: Vec<_> = candidates
-            .into_iter()
+            .iter()
+            .copied()
             .map(|c| measure(c, &calibration, &keys))
             .collect();
         let calibration_wall_seconds = start.elapsed().as_secs_f64();
         let profile = artifact(&rows, distribution.clone(), &args.backend_revision);
-        let adapted = search(calibration_seed, args.epsilon, |c| {
+        let adapted = search_candidates(calibration_seed, args.epsilon, &candidates, |c| {
             rows.iter()
                 .find(|m| m.config == c)
                 .unwrap()
@@ -367,7 +466,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output,
         &serde_json::json!({"schema_version":1,"args":args,
         "debug_assertions":cfg!(debug_assertions),
-        "scope":"fixed-sketch shared-table selection; not full ASAPPlanner or system evaluation",
+        "scope":"memory-constrained CMS/CountSketch family and parameter selection; not full ASAPPlanner or system evaluation",
         "memory_metric":"f64 counter payload bytes; excludes allocator and object overhead",
         "hash_seeds":"library fixed hash; only data/search seeds vary",
         "timing_metric":"wall seconds, not CPU seconds; calibration cost reported separately",
@@ -379,6 +478,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hard_budget_prunes_before_benchmark_and_empty_budget_fails_closed() {
+        for budget in [0, 511, 512, 2048] {
+            let candidates = candidate_grid(&[Family::Cms, Family::CountSketch], budget);
+            let result = search_candidates(42, 0.01, &candidates, |c| {
+                assert!(c.bytes() <= budget);
+                assert!(c.legal());
+                0.0
+            });
+            assert_eq!(result.selected.is_none(), budget < 512);
+            assert_eq!(candidates.is_empty(), budget < 512);
+            let rows: Vec<_> = candidates
+                .into_iter()
+                .map(|config| Measurement {
+                    config,
+                    max_normalized_additive_error: 0.0,
+                    counter_bytes: config.bytes(),
+                    update_wall_seconds: 0.0,
+                    query_wall_seconds: 0.0,
+                })
+                .collect();
+            let context = serde_json::json!({"test":"budget"});
+            let selected = erp_select(&artifact(&rows, context.clone(), "test"), context, 0.01);
+            assert_eq!(selected, oracle(&rows, 0.01));
+            assert_eq!(selected.is_none(), budget < 512);
+            assert!(selected.is_none_or(|c| c.bytes() <= budget));
+        }
+    }
+    #[test]
+    fn sketch_selection_can_choose_either_family() {
+        let candidates = candidate_grid(&[Family::Cms, Family::CountSketch], 2048);
+        for preferred in [Family::Cms, Family::CountSketch] {
+            let rows: Vec<_> = candidates
+                .iter()
+                .map(|&config| Measurement {
+                    config,
+                    max_normalized_additive_error: if config.family == preferred {
+                        0.0
+                    } else {
+                        1.0
+                    },
+                    counter_bytes: config.bytes(),
+                    update_wall_seconds: 0.0,
+                    query_wall_seconds: 0.0,
+                })
+                .collect();
+            let result = search_candidates(42, 0.01, &candidates, |c| {
+                rows.iter()
+                    .find(|r| r.config == c)
+                    .unwrap()
+                    .max_normalized_additive_error
+            });
+            let context = serde_json::json!({"test":"family"});
+            let selected = erp_select(&artifact(&rows, context.clone(), "test"), context, 0.01);
+            assert_eq!(result.selected.unwrap().family, preferred);
+            assert_eq!(selected.unwrap().family, preferred);
+            assert_eq!(selected, oracle(&rows, 0.01));
+        }
+    }
+    #[test]
+    fn count_sketch_hash_limit_and_single_key_oracle() {
+        let candidates = candidate_grid(&[Family::CountSketch], usize::MAX);
+        assert!(candidates
+            .iter()
+            .all(|c| c.depth * (c.width.ilog2() as usize + 1) <= 64));
+        assert!(!candidates.contains(&Config {
+            family: Family::CountSketch,
+            width: 4096,
+            depth: 8
+        }));
+        for config in candidates {
+            assert_eq!(
+                measure(config, &[0; 100], &["only".into()]).max_normalized_additive_error,
+                0.0
+            );
+        }
+    }
     #[test]
     fn lhs_has_unique_coordinates_and_is_reproducible() {
         let sample = lhs(42);
@@ -417,6 +593,7 @@ mod tests {
         assert_eq!(
             search(42, 0.01, |_| 0.0).selected,
             Some(Config {
+                family: Family::Cms,
                 width: 64,
                 depth: 1
             })
@@ -436,6 +613,7 @@ mod tests {
     fn actual_cms_single_key_has_zero_error() {
         let m = measure(
             Config {
+                family: Family::Cms,
                 width: 64,
                 depth: 1,
             },
