@@ -18,6 +18,9 @@ use prost::Message;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+#[path = "support/erp_planning_process.rs"]
+mod erp_planning_process;
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {

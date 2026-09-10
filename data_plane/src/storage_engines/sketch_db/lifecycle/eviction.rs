@@ -275,6 +275,7 @@ mod tests {
             num_aggregates_to_retain: None,
             table_name: None,
             value_column: None,
+            partitioning: None,
         }
     }
 

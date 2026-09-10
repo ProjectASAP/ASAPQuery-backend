@@ -861,6 +861,7 @@ mod tests {
             num_aggregates_to_retain: None,
             table_name: None,
             value_column: None,
+            partitioning: None,
         };
         let policy_fp = aggregation.policy_fp_u64();
         let streaming = StreamingConfig::new(HashMap::from([(policy_fp, aggregation)]));
@@ -914,6 +915,7 @@ mod tests {
                 num_aggregates_to_retain: Some(80),
                 table_name: None,
                 value_column: None,
+                partitioning: None,
             };
         let cms = config(
             AggregationType::CountMinSketchWithHeap,
