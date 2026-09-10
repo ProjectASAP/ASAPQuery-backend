@@ -3,7 +3,9 @@ P=pathlib.Path(__file__).with_name('run.py'); S=importlib.util.spec_from_file_lo
 class ContractTests(unittest.TestCase):
  def manifest(self, root):
   data=root/'data.tsv'; data.write_text('0\t1\n'); sha=hashlib.sha256(data.read_bytes()).hexdigest()
-  contract={'candidate_space':[{'family':'cms','width':64,'depth':2}],'memory_budget_bytes':1024,'accuracy':{'metric':'max_normalized_additive_error','upper_bound':0.01},'window':{'pane_seconds':60,'window_panes':[1,5]}}
+  contract={'candidate_space':[{'family':'cms','width':64,'depth':2}],'memory_budget_bytes':1024,'accuracy':{'metric':'max_error','upper_bound':0.01},'window':{'pane_seconds':60,'window_panes':[1,5]},
+   'erp_observation':{'cardinality':20,'observed_events':1000,'fits':[{'family':'zipf','parameters':{'exponent':1.1},'goodness_of_fit':0.03,'confidence':0.9}],'empirical_fingerprint':'fixture-v1'},
+   'erp_selection_policy':{'minimum_benchmark_events':100,'max_log2_cardinality_distance':1.0,'max_parameter_distance':0.2,'max_goodness_of_fit':0.1,'minimum_confidence':0.8,'minimum_confidence_margin':0.1}}
   arms=[{'name':n,'command':['true']} for n in R.ARM_NAMES]
   return {'schema_version':1,'dataset':{'path':'data.tsv','sha256':sha},'constraints':contract,'arms':arms}
  def test_accepts_one_shared_contract(self):
@@ -16,6 +18,13 @@ class ContractTests(unittest.TestCase):
   with tempfile.TemporaryDirectory() as d:
    root=pathlib.Path(d); m=self.manifest(root); m['arms'].reverse()
    with self.assertRaisesRegex(ValueError,'ordered exactly'): R.validate_manifest(m,root)
+ def test_rejects_ambiguous_or_invalid_fit_contract(self):
+  with tempfile.TemporaryDirectory() as d:
+   root=pathlib.Path(d); m=self.manifest(root)
+   m['constraints']['erp_observation']['fits'].append(dict(m['constraints']['erp_observation']['fits'][0]))
+   with self.assertRaisesRegex(ValueError,'unique'): R.validate_manifest(m,root)
+   m=self.manifest(root); m['constraints']['erp_observation']['fits'][0]['confidence']=1.1
+   with self.assertRaisesRegex(ValueError,'confidence'): R.validate_manifest(m,root)
  def test_rejects_arm_contract_drift(self):
   with tempfile.TemporaryDirectory() as d:
    root=pathlib.Path(d); script=root/'arm.py'; script.write_text("import json; print(json.dumps({'contract':{},'selected_plan':{},'metrics':{'state_bytes':0,'max_error':0}}))")

@@ -9,7 +9,9 @@
 5. `exact`
 
 The manifest pins a dataset SHA-256 and one candidate space, memory budget,
-accuracy requirement, and window workload. Each arm runs in a separate process.
+accuracy requirement, window workload, multi-family `ErpShapeObservation`, and
+the complete fit/divergence/confidence selection policy from ASAPPlanner #380.
+Each arm runs in a separate process.
 The runner measures wall time, user/system CPU, and peak RSS with GNU `time`;
 the arm reports its selected plan, selected candidate records, retained state
 bytes, measured error, and any additional metrics. The runner checks that every
@@ -18,6 +20,14 @@ total memory and accuracy bounds. A successful arm must echo the exact contract 
 `ASAP_FIGURE1_CONTRACT_JSON`; the dataset path is supplied in
 `ASAP_FIGURE1_DATASET`. Contract drift aborts the experiment rather than
 producing a comparison.
+
+The observation must contain positive cardinality/event counts and one or more
+unique fitted families. Every fit records numeric parameters, non-negative
+goodness-of-fit, and confidence in `[0,1]`. The shared selection policy includes
+event/cardinality/parameter gates plus maximum goodness-of-fit, minimum
+confidence, and minimum confidence margin. This keeps poor or ambiguous fits
+visible to every arm instead of letting the ERP arm silently use an older
+single-family shape contract.
 
 ```sh
 python3 tools/erp-figure1/run.py \
