@@ -3,6 +3,7 @@
 ## Testing
 
 - [Manual component and whole-system E2E tests](03-how-to-guides/manual-e2e-tests.md)
+- [ASAPQuery vs. AutoSketch evaluation plan](evaluation/autosketch-comparison.md)
 
 ## Canonical system design
 
