@@ -475,6 +475,7 @@ mod tests {
             accuracy: AccuracyTarget::Exact,
             queries: vec![ClickHouseSqlWorkloadEntry {
                 sql: "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='cache_refresh_lag_seconds' AND ts_ms>1788848096000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY labels".into(),
+                planning_sql: None,
                 start_ms: 1_788_848_096_000,
                 end_ms: 1_788_891_296_000,
                 cumulative: true,
