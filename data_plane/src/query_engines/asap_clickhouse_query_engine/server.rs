@@ -161,9 +161,11 @@ mod tests {
             request: &ClickHouseQueryRequest,
         ) -> Result<ClickHouseRawResponse, ClickHouseFallbackError> {
             self.sql.lock().unwrap().push(request.sql.clone());
+            let mut headers = HeaderMap::new();
+            headers.insert("x-clickhouse-summary", "upstream".parse().unwrap());
             Ok(ClickHouseRawResponse {
                 status: StatusCode::OK,
-                headers: HeaderMap::new(),
+                headers,
                 body: Bytes::from_static(b"1\n"),
             })
         }
@@ -191,6 +193,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(get_response.status(), StatusCode::OK);
+        assert_eq!(
+            get_response.headers().get("x-asap-execution").unwrap(),
+            "exact_fallback"
+        );
+        assert_eq!(get_response.headers()["x-clickhouse-summary"], "upstream");
         let post_response = app
             .clone()
             .oneshot(
@@ -203,6 +210,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
+            post_response.headers()["x-asap-execution"],
+            "exact_fallback"
+        );
+        assert_eq!(post_response.headers()["x-clickhouse-summary"], "upstream");
+        assert_eq!(
             post_response
                 .into_body()
                 .collect()
@@ -210,6 +222,26 @@ mod tests {
                 .unwrap()
                 .to_bytes(),
             "1\n"
+        );
+        let grafana_response = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/?query=SELECT%203%20FORMAT%20JSON")
+                    .header("user-agent", "Grafana")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            grafana_response.headers()["x-asap-execution"],
+            "exact_fallback"
+        );
+        assert_eq!(
+            grafana_response.headers()["x-clickhouse-summary"],
+            "upstream"
         );
         let ping = app
             .oneshot(
@@ -224,7 +256,10 @@ mod tests {
             ping.into_body().collect().await.unwrap().to_bytes(),
             "Ok.\n"
         );
-        assert_eq!(*fallback.sql.lock().unwrap(), vec!["SELECT 1", "SELECT 2"]);
+        assert_eq!(
+            *fallback.sql.lock().unwrap(),
+            vec!["SELECT 1", "SELECT 2", "SELECT 3 FORMAT JSON"]
+        );
     }
 
     #[tokio::test]
@@ -248,6 +283,8 @@ mod tests {
             )
             .await
             .unwrap();
+
+        assert_eq!(response.headers().get("x-asap-execution").unwrap(), "warm");
 
         assert_eq!(
             response.into_body().collect().await.unwrap().to_bytes(),
@@ -283,6 +320,8 @@ mod tests {
                     .unwrap();
 
             assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-asap-execution"], "exact_fallback");
+            assert_eq!(response.headers()["x-clickhouse-summary"], "upstream");
             assert_eq!(*fallback.sql.lock().unwrap(), vec!["SELECT 1"]);
         }
     }
@@ -339,17 +378,29 @@ async fn query_post(
 
 async fn execute_or_fallback(state: &ServerState, request: &ClickHouseQueryRequest) -> Response {
     match state.accelerator.execute(request).await {
-        ClickHouseAccelerationOutcome::Accelerated(response) => return raw_response(response),
+        ClickHouseAccelerationOutcome::Accelerated(response) => {
+            let mut response = raw_response(response);
+            response.headers_mut().insert(
+                "x-asap-execution",
+                "warm".parse().expect("static header value"),
+            );
+            return response;
+        }
         ClickHouseAccelerationOutcome::Fallback(reason) => tracing::info!(
             failure_stage = reason.stage(),
             failure_reason = reason.reason_code(),
             "ClickHouse acceleration routed to exact fallback"
         ),
     }
-    match state.fallback.execute(request).await {
+    let mut response = match state.fallback.execute(request).await {
         Ok(v) => raw_response(v),
         Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-    }
+    };
+    response.headers_mut().insert(
+        "x-asap-execution",
+        "exact_fallback".parse().expect("static header value"),
+    );
+    response
 }
 
 async fn ping(State(state): State<ServerState>) -> Response {
