@@ -11,8 +11,9 @@
 //! The control plane drives the streaming-config: a `QueryWorkload`
 //! goes through `bind_workload_typed` → `split_typed_three_stage` →
 //! `emit_backend_streaming_config_json`, the resulting JSON is posted
-//! to the backend's `/api/v1/streaming-config` endpoint, and the
-//! backend's `AggregationConfig::from_yaml_data` parses it.
+//! to the backend's `/api/v1/streaming-config` endpoint in parser tests.
+//! Query roundtrips project that config into explicit physical-plan fixtures
+//! with QueryPlan/SummaryCatalog bindings and stage/activate them before ingest.
 //!
 //! Out of scope (per the task spec): Thanos / Gorilla / MinIO cold
 //! path; the gateway tier (retired in #241/#243/#377); the real
@@ -36,6 +37,96 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+#[path = "support/physical_fixture.rs"]
+mod physical_fixture;
+
+type FixturePlans = std::sync::Mutex<
+    std::collections::BTreeMap<
+        u16,
+        Arc<data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest>,
+    >,
+>;
+static FIXTURE_PLANS: std::sync::OnceLock<FixturePlans> = std::sync::OnceLock::new();
+static FIXTURE_TIMES: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeMap<u16, u64>>> =
+    std::sync::OnceLock::new();
+fn evaluation_time(stack: &FullStack) -> String {
+    let ns = FIXTURE_TIMES.get().unwrap().lock().unwrap()[&stack.otlp_http_port];
+    (ns as f64 / 1e9).to_string()
+}
+
+fn phase_aligned_now_ns() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time before UNIX epoch")
+        .as_nanos() as u64;
+    now - now % 5_000_000_000 + 3_000_000_000
+}
+
+async fn post_full_config(client: &reqwest::Client, stack: &FullStack, json: &JsonValue) {
+    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
+        &serde_yaml::to_value(json).unwrap(),
+    )
+    .unwrap();
+    let mut artifact = physical_fixture::artifact(&runtime);
+    if runtime
+        .aggregation_configs
+        .values()
+        .any(|c| c.metric == "http_requests_total_latency_ms")
+    {
+        for rule in &mut artifact.transmission_plan.rules {
+            rule.mode = control_plane::physical::compiler::TransmissionMode::Delta;
+            rule.full_checkpoint_every_ms = Some(rule.emit_every_ms);
+            rule.runtime_policy.delta = Some(control_plane::physical::compiler::DeltaPolicy {
+                absolute_threshold: 0.0,
+                gos: None,
+            });
+        }
+    }
+    for entry in artifact
+        .query_plan
+        .entries
+        .values_mut()
+        .filter(|e| e.canonical_promql.starts_with("count("))
+    {
+        entry.instant.lookback_ms = 1000;
+        for node in entry.nodes.values_mut() {
+            if let control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } = node
+            {
+                binding.readout_lookback_ms = Some(1000);
+            }
+        }
+    }
+    let plan = Arc::new(artifact);
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/api/v1/physical-plan",
+            stack.backend_port
+        ))
+        .json(&*plan)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert!(status.is_success(), "physical plan install: {body}");
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{}/api/v1/physical-plan/activate",
+            stack.backend_port
+        ))
+        .json(&serde_json::json!({"plan_id": 1, "plan_version": 1}))
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert!(status.is_success(), "physical plan activation: {body}");
+    FIXTURE_PLANS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(stack.otlp_http_port, plan);
+}
 
 use control_plane::types::{AggType, QueryWorkload, WorkloadCharacteristics};
 use data_plane::storage_engines::types::HotReloadStreamingConfig;
@@ -268,6 +359,12 @@ struct FullStack {
 }
 
 async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .with_test_writer()
+        .try_init();
     use data_plane::drivers::ingest::series_resolver::SeriesIdResolver;
     use data_plane::drivers::ingest::{OtlpReceiver, OtlpReceiverConfig};
     use data_plane::drivers::query::adapters::config::AdapterConfig;
@@ -277,10 +374,12 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
     use data_plane::precompute_engine::PrecomputeEngine;
     use data_plane::query_engines::asap_query_engine::engine::ASAPQueryEngine;
     use data_plane::storage_engines::sketch_db::index::SketchStore;
-    use data_plane::storage_engines::types::StreamingConfig;
 
     let sketch_index = Arc::new(SketchStore::new());
-    let hot_reload = HotReloadStreamingConfig::new(StreamingConfig::default());
+    let active = data_plane::storage_engines::types::HotReloadActivePhysicalPlan::new(
+        physical_fixture::bootstrap(),
+    );
+    let hot_reload = HotReloadStreamingConfig::from_active(active.clone());
     let series_resolver = Arc::new(SeriesIdResolver::new());
 
     // SketchStoreSink writes precompute output back into SketchStore so
@@ -344,10 +443,12 @@ async fn start_full_stack(otlp_http_port: u16, otlp_grpc_port: u16) -> FullStack
             // `sketch_index` via OTLP ingest (the engine's
             // `precompute_engine` shares the Arc), but the query
             // path can't see them without this binding.
-            .with_sketch_index(sketch_index.clone()),
+            .with_sketch_index(sketch_index.clone())
+            .with_active_physical_plan(active.clone()),
     );
     let server = HttpServer::new(http_config, query_engine, sketch_index)
-        .with_hot_reload_config(hot_reload.clone());
+        .with_hot_reload_config(hot_reload.clone())
+        .with_active_physical_plan(active);
     let backend_port = server
         .start_test_server()
         .await
@@ -725,7 +826,27 @@ fn build_count_min_export(
 /// POST a protobuf-encoded `ExportMetricsServiceRequest` to the OTLP HTTP
 /// receiver on `localhost:port/v1/metrics`. Panics with the unexpected
 /// status code on non-2xx.
-async fn post_otlp_http(client: &reqwest::Client, port: u16, req: ExportMetricsServiceRequest) {
+async fn post_otlp_http(client: &reqwest::Client, port: u16, mut req: ExportMetricsServiceRequest) {
+    let data = req.resource_metrics[0].scope_metrics[0].metrics[0]
+        .data
+        .as_ref()
+        .unwrap();
+    let ns = match data {
+        Data::Ddsketch(s) => s.data_points[0].time_unix_nano,
+        Data::Kllsketch(s) => s.data_points[0].time_unix_nano,
+        Data::Hllsketch(s) => s.data_points[0].time_unix_nano,
+        Data::Countminsketch(s) => s.data_points[0].time_unix_nano,
+        Data::Countsketch(s) => s.data_points[0].time_unix_nano,
+        _ => unreachable!(),
+    };
+    FIXTURE_TIMES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(port)
+        .or_insert(ns);
+    let plan = FIXTURE_PLANS.get().unwrap().lock().unwrap()[&port].clone();
+    physical_fixture::stamp(&mut req, &plan);
     let body = req.encode_to_vec();
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/metrics"))
@@ -734,11 +855,9 @@ async fn post_otlp_http(client: &reqwest::Client, port: u16, req: ExportMetricsS
         .send()
         .await
         .expect("OTLP HTTP send failed");
-    assert!(
-        resp.status().is_success(),
-        "OTLP HTTP returned unexpected status {}",
-        resp.status()
-    );
+    let status = resp.status();
+    let body = resp.text().await.unwrap();
+    assert!(status.is_success(), "OTLP {status}: {body}");
 }
 
 // ── Test 1 — single DDSketch-quantile workload, no grouping ─────────────────
@@ -926,7 +1045,7 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
         vec![0.99],
     );
     let streaming_config_json = plan_streaming_config_json(&workload);
-    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+    post_full_config(&client, &stack, &streaming_config_json).await;
 
     // ── 2. Build a DDSketch state with a known distribution ────────────
     //
@@ -944,15 +1063,12 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     // ── 3. POST the sketch DP via OTLP HTTP ────────────────────────────
     //
     // Use wall-clock-relative timestamps so the PromQL query at default
-    // evaluation time (also wall-clock) sees the data inside its `[10s]`
+    // evaluation time (also wall-clock) sees the data inside its `[1s]`
     // lookback window. The sketch lands at `now - 3s` so it's well
     // inside a 1-second window that closed `now - 2s`; the watermark
     // advance is at `now - 1s` so the engine sees the window-end
     // boundary cross.
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_nanos() as u64;
+    let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
     let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
 
@@ -994,7 +1110,8 @@ async fn controller_plan_to_query_full_roundtrip_ddsketch() {
     let query_url = format!("http://127.0.0.1:{}/api/v1/query", stack.backend_port);
     let response: JsonValue = client
         .get(&query_url)
-        .query(&[("query", "quantile_over_time(0.99, http_latency_ms[10s])")])
+        .query(&[("time", evaluation_time(&stack))])
+        .query(&[("query", "quantile_over_time(0.99, http_latency_ms[1s])")])
         .send()
         .await
         .expect("PromQL query failed to send")
@@ -1076,17 +1193,16 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
         "DatasketchesKLL",
         "controller must emit KLL aggregationType for SketchType::KLL override\n{streaming_config_json}"
     );
-    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+    post_full_config(&client, &stack, &streaming_config_json).await;
 
-    let k = 200u32;
+    let k = streaming_config_json["aggregations"][0]["parameters"]["k"]
+        .as_u64()
+        .unwrap() as u32;
     let items: Vec<f64> = (1..=50).map(|i| i as f64).collect();
     let kll_state = build_kll_state(k, items);
     let sketch_bytes = kll_state.encode_to_vec();
 
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_nanos() as u64;
+    let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
     let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
 
@@ -1116,7 +1232,8 @@ async fn controller_plan_to_query_full_roundtrip_kll() {
             "http://127.0.0.1:{}/api/v1/query",
             stack.backend_port
         ))
-        .query(&[("query", "quantile_over_time(0.5, request_size_bytes[10s])")])
+        .query(&[("query", "quantile_over_time(0.5, request_size_bytes[1s])")])
+        .query(&[("time", evaluation_time(&stack))])
         .send()
         .await
         .expect("query failed")
@@ -1167,7 +1284,7 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
         streaming_config_json["aggregations"][0]["aggregationType"], "HLL",
         "controller must emit HLL aggregationType for SketchType::HLL override\n{streaming_config_json}"
     );
-    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+    post_full_config(&client, &stack, &streaming_config_json).await;
 
     // Precision must match what the controller plans for this
     // workload (`HLLDefaults` in `control_plane::types`). The
@@ -1177,7 +1294,9 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
     // register two separate sids for the same metric — one with
     // policy_fp=UNSET (no matching policy params) — and the query
     // wouldn't find the policy-tagged one.
-    let precision = 10u32;
+    let precision = streaming_config_json["aggregations"][0]["parameters"]["precision"]
+        .as_u64()
+        .unwrap() as u32;
     let num_registers = 1usize << precision;
     let mut registers = vec![0u8; num_registers];
     // Set a few non-zero registers so the cardinality estimate is
@@ -1185,14 +1304,11 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
     registers[0] = 5;
     registers[100] = 7;
     registers[500] = 3;
-    registers[1000] = 4;
+    registers[num_registers - 1] = 4;
     let hll_state = build_hll_state(precision, registers);
     let sketch_bytes = hll_state.encode_to_vec();
 
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_nanos() as u64;
+    let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
     let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
 
@@ -1227,6 +1343,7 @@ async fn controller_plan_to_query_full_roundtrip_hll() {
             stack.backend_port
         ))
         .query(&[("query", "count(unique_users_per_min)")])
+        .query(&[("time", evaluation_time(&stack))])
         .send()
         .await
         .expect("query failed")
@@ -1282,7 +1399,7 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch() {
         streaming_config_json["aggregations"][0]["aggregationType"], "CountSketchWithHeap",
         "controller must emit CountSketchWithHeap for top_endpoint_qps (TopK metric)\n{streaming_config_json}"
     );
-    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+    post_full_config(&client, &stack, &streaming_config_json).await;
 
     // Use the planner-picked `(w, d)` so the OTLP DP's wire-level
     // `rows`/`cols` line up with the policy's `parameters.{d, w}` —
@@ -1296,10 +1413,7 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch() {
     let items: &[(&str, u64)] = &[("alpha", 100), ("beta", 50), ("gamma", 200), ("delta", 75)];
     let sketch_bytes = build_heap_bearing_msgpack(rows, cols, 10, items);
 
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_nanos() as u64;
+    let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
     let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
 
@@ -1330,7 +1444,8 @@ async fn controller_plan_to_query_full_roundtrip_count_sketch() {
             "http://127.0.0.1:{}/api/v1/query",
             stack.backend_port
         ))
-        .query(&[("query", "count_over_time(top_endpoint_qps[10s])")])
+        .query(&[("query", "count_over_time(top_endpoint_qps[1s])")])
+        .query(&[("time", evaluation_time(&stack))])
         .send()
         .await
         .expect("query failed")
@@ -1389,7 +1504,7 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
         streaming_config_json["aggregations"][0]["aggregationType"], "CountMinSketch",
         "controller must emit CountMinSketch aggregationType for SketchType::CountMinSketch override\n{streaming_config_json}"
     );
-    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+    post_full_config(&client, &stack, &streaming_config_json).await;
 
     // Use planner-picked `(w, d)` so the wire DP's `rows`/`cols`
     // match the policy's `parameters.{d, w}` — the policy_fp content
@@ -1401,10 +1516,7 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
     let cms_state = build_count_min_state(rows, cols, counts);
     let sketch_bytes = cms_state.encode_to_vec();
 
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_nanos() as u64;
+    let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
     let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
 
@@ -1436,7 +1548,8 @@ async fn controller_plan_to_query_full_roundtrip_count_min_sketch() {
             "http://127.0.0.1:{}/api/v1/query",
             stack.backend_port
         ))
-        .query(&[("query", "count_over_time(endpoint_request_freq[10s])")])
+        .query(&[("query", "count_over_time(endpoint_request_freq[1s])")])
+        .query(&[("time", evaluation_time(&stack))])
         .send()
         .await
         .expect("query failed")
@@ -1585,7 +1698,7 @@ fn build_count_sketch_with_heap_msgpack_export(
 //
 // Same wire setup as Test 7 (heap-less CMS, `endpoint_request_freq`
 // with `AggType::Frequency`), but the query goes through
-// `/api/v1/query_range?query=count_over_time(metric[10s])` instead
+// `/api/v1/query_range?query=count_over_time(metric[1s])` instead
 // of the instant endpoint. The result `resultType` is `matrix`
 // (Prometheus spec for range queries).
 
@@ -1604,7 +1717,7 @@ async fn controller_plan_to_range_query_count_over_time_cms() {
         Some(SketchType::CountMinSketch),
     );
     let streaming_config_json = plan_streaming_config_json(&workload);
-    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+    post_full_config(&client, &stack, &streaming_config_json).await;
 
     let (w, d) = extract_w_d_from_streaming_config(&streaming_config_json);
     let rows = d;
@@ -1613,12 +1726,9 @@ async fn controller_plan_to_range_query_count_over_time_cms() {
     let cms_state = build_count_min_state(rows, cols, counts);
     let sketch_bytes = cms_state.encode_to_vec();
 
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_nanos() as u64;
+    let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
-    let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
+    let watermark_t_ns = sketch_t_ns + 5_000_000_000;
 
     let req = build_count_min_export(
         "endpoint_request_freq",
@@ -1645,17 +1755,16 @@ async fn controller_plan_to_range_query_count_over_time_cms() {
 
     // Query range covering the watermark + sketch windows. Prometheus's
     // /api/v1/query_range expects epoch-second floats for start/end/step.
-    let now_secs = now_ns as f64 / 1e9;
-    let start_secs = now_secs - 10.0;
-    let end_secs = now_secs;
-    let step_secs = 1.0;
+    let start_secs: f64 = evaluation_time(&stack).parse().unwrap();
+    let end_secs = start_secs + 5.0;
+    let step_secs = 5.0;
     let response: JsonValue = client
         .get(format!(
             "http://127.0.0.1:{}/api/v1/query_range",
             stack.backend_port
         ))
         .query(&[
-            ("query", "count_over_time(endpoint_request_freq[10s])"),
+            ("query", "count_over_time(endpoint_request_freq[1s])"),
             ("start", &format!("{start_secs}")),
             ("end", &format!("{end_secs}")),
             ("step", &format!("{step_secs}")),
@@ -1853,7 +1962,7 @@ async fn controller_plan_to_query_ddsketch_delta_subwindow_roundtrip() {
         vec![0.99],
     );
     let streaming_config_json = plan_streaming_config_json(&workload);
-    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+    post_full_config(&client, &stack, &streaming_config_json).await;
 
     // ── 2. Three windows of known distributions. Each window is split into
     //       three sub-window emits whose increments together cover the
@@ -1867,14 +1976,9 @@ async fn controller_plan_to_query_ddsketch_delta_subwindow_roundtrip() {
         (1000..=1030).map(|v| v as f64).collect(),
     ];
 
-    // Wall-clock-relative window placement so the PromQL eval (also
-    // wall-clock) sees the windows inside its [3m] lookback. Windows end at
-    // now-150s, now-149s, now-148s — comfortably inside [3m] and outside the
-    // near-`now` watermark fuzz.
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_nanos() as u64;
+    // Three contiguous retained windows; evaluate explicitly at the last
+    // window end with a three-second lookback, independent of wall-clock drift.
+    let now_ns = phase_aligned_now_ns();
     let sec: u64 = 1_000_000_000;
 
     for (w_idx, dist) in window_dists.iter().enumerate() {
@@ -1888,9 +1992,9 @@ async fn controller_plan_to_query_ddsketch_delta_subwindow_roundtrip() {
 
         for (f_idx, frame_vals) in sub.iter().enumerate() {
             let sk = dd_over_values(alpha, frame_vals);
-            // window 1's FIRST frame is a PROTO full snapshot; every other
-            // frame (including windows 2+ first frame) is a delta-from-empty.
-            let (bytes, encoding) = if w_idx == 0 && f_idx == 0 {
+            // Each window starts a fresh full checkpoint, followed by two
+            // increments referring to that checkpoint.
+            let (bytes, encoding) = if f_idx == 0 {
                 (encode_dd_full_envelope(&sk), ENCODING_PROTO)
             } else {
                 (encode_dd_delta_against_empty(&sk), ENCODING_PROTO_DELTA)
@@ -1908,16 +2012,23 @@ async fn controller_plan_to_query_ddsketch_delta_subwindow_roundtrip() {
         }
     }
 
+    FIXTURE_TIMES
+        .get()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .insert(stack.otlp_http_port, now_ns - 148 * sec);
     // Give the receiver time to land every frame in the SketchStore.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // ── 3. Query the BARE metric via PromQL quantile_over_time over [3m].
+    // ── 3. Query the BARE metric over the three ingested seconds.
     let query_url = format!("http://127.0.0.1:{}/api/v1/query", stack.backend_port);
     let response: JsonValue = client
         .get(&query_url)
+        .query(&[("time", evaluation_time(&stack))])
         .query(&[(
             "query",
-            format!("quantile_over_time(0.99, {bare_metric}[3m])").as_str(),
+            format!("quantile_over_time(0.99, {bare_metric}[3s])").as_str(),
         )])
         .send()
         .await
@@ -1946,7 +2057,7 @@ async fn controller_plan_to_query_ddsketch_delta_subwindow_roundtrip() {
         serde_json::to_string_pretty(&response).unwrap_or_default()
     );
 
-    // cumulative_evaluate rolls the [3m] range into ONE union over all three
+    // cumulative_evaluate rolls the [3s] range into ONE union over all three
     // windows (1..=30 ∪ 100..=130 ∪ 1000..=1030 = 1..=1030, 93 samples).
     // Its p99 ≈ 1020. Pull the scalar out of the (instant or range) shape
     // and assert it lands near that within a generous DDSketch-α envelope.
@@ -2041,7 +2152,7 @@ async fn shadow_mode_does_not_change_served_ddsketch_quantile() {
         vec![0.99],
     );
     let streaming_config_json = plan_streaming_config_json(&workload);
-    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+    post_full_config(&client, &stack, &streaming_config_json).await;
 
     // Same fixture data as `controller_plan_to_query_full_roundtrip_ddsketch`
     // — this test isn't checking quantile accuracy (that's Test 3's job),
@@ -2052,10 +2163,7 @@ async fn shadow_mode_does_not_change_served_ddsketch_quantile() {
     let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
     let sketch_bytes = dd_state.encode_to_vec();
 
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_nanos() as u64;
+    let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
     let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
 
@@ -2083,7 +2191,8 @@ async fn shadow_mode_does_not_change_served_ddsketch_quantile() {
     let query_url = format!("http://127.0.0.1:{}/api/v1/query", stack.backend_port);
     let response: JsonValue = client
         .get(&query_url)
-        .query(&[("query", "quantile_over_time(0.99, http_latency_ms[10s])")])
+        .query(&[("time", evaluation_time(&stack))])
+        .query(&[("query", "quantile_over_time(0.99, http_latency_ms[1s])")])
         .send()
         .await
         .expect("PromQL query failed to send")
@@ -2162,17 +2271,14 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
         vec![0.99],
     );
     let streaming_config_json = plan_streaming_config_json(&workload);
-    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+    post_full_config(&client, &stack, &streaming_config_json).await;
 
     let alpha = 0.01;
     let store_counts = vec![5u64, 10, 15, 20];
     let dd_state = build_dd_sketch_state(alpha, store_counts, -1);
     let sketch_bytes = dd_state.encode_to_vec();
 
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_nanos() as u64;
+    let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
     let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
 
@@ -2200,7 +2306,8 @@ async fn live_serve_actually_answers_ddsketch_quantile() {
     let query_url = format!("http://127.0.0.1:{}/api/v1/query", stack.backend_port);
     let response: JsonValue = client
         .get(&query_url)
-        .query(&[("query", "quantile_over_time(0.99, http_latency_ms[10s])")])
+        .query(&[("time", evaluation_time(&stack))])
+        .query(&[("query", "quantile_over_time(0.99, http_latency_ms[1s])")])
         .send()
         .await
         .expect("PromQL query failed to send")
@@ -2272,15 +2379,14 @@ async fn live_serve_hll_global_count_merges_across_sids() {
         Some(SketchType::HLL),
     );
     let streaming_config_json = plan_streaming_config_json(&workload);
-    post_streaming_config(&client, stack.backend_port, &streaming_config_json).await;
+    post_full_config(&client, &stack, &streaming_config_json).await;
 
-    let precision = 10u32;
+    let precision = streaming_config_json["aggregations"][0]["parameters"]["precision"]
+        .as_u64()
+        .unwrap() as u32;
     let num_registers = 1usize << precision;
 
-    let now_ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system time before UNIX epoch")
-        .as_nanos() as u64;
+    let now_ns = phase_aligned_now_ns();
     let sketch_t_ns = now_ns.saturating_sub(3_000_000_000);
     let watermark_t_ns = now_ns.saturating_sub(1_000_000_000);
 
@@ -2320,6 +2426,7 @@ async fn live_serve_hll_global_count_merges_across_sids() {
             stack.backend_port
         ))
         .query(&[("query", "count(unique_users_per_min)")])
+        .query(&[("time", evaluation_time(&stack))])
         .send()
         .await
         .expect("query failed")

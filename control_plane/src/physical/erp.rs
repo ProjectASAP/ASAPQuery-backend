@@ -5,6 +5,93 @@ use planner_types::post_asap::{SketchAlgorithm, SketchParams};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// ERP v1 measures error magnitudes, not tail probabilities. Only an explicit
+/// epsilon-only request may use these observations as its accuracy contract.
+pub(crate) struct ErpAccuracyModel<'a> {
+    pub policy: Option<&'a ErpPlanningInput>,
+    pub max_error: f64,
+}
+
+impl asap_aware_mapping::AccuracyModel for ErpAccuracyModel<'_> {
+    fn exact_operation_rule(
+        &self,
+        operation: &planner_types::post_asap::ExactOperation,
+    ) -> Option<planner_types::post_asap::CompositionOperator> {
+        asap_aware_mapping::DefaultAccuracyModel.exact_operation_rule(operation)
+    }
+    fn local_guarantee(
+        &self,
+        family: &planner_types::post_asap::SummaryFamilyType,
+        query: &planner_types::post_asap::SketchQuery,
+    ) -> Option<planner_types::post_asap::ResultGuarantee> {
+        use planner_types::post_asap::*;
+        let mut guarantee =
+            asap_aware_mapping::DefaultAccuracyModel.local_guarantee(family, query)?;
+        if let (Some(policy), SummaryFamilyType::Sketch(kind, _)) = (self.policy, family) {
+            let decision = policy.select(
+                kind.algorithm().clone(),
+                self.max_error,
+                kind.params().clone(),
+            );
+            if matches!(decision, ErpParameterDecision::ExactFallback { .. }) {
+                return None;
+            }
+            if let ErpParameterDecision::Empirical {
+                params,
+                record_id,
+                observed_error,
+                ..
+            } = decision
+            {
+                if &params == kind.params() {
+                    // This is the only benchmark-to-query metric mapping currently
+                    // validated end to end. Means and value errors are not rank bounds.
+                    if guarantee.metric != ErrorMetric::Rank
+                        || policy.error_metric != "max_rank_err"
+                    {
+                        return None;
+                    }
+                    guarantee.bound = BoundExpr::Constant {
+                        value: observed_error,
+                    };
+                    guarantee.failure_probability = ProbabilityExpr::Unknown {
+                        statistic: "erp_v1_has_no_failure_probability_evidence".into(),
+                    };
+                    guarantee.provenance = vec![GuaranteeSource::SketchReadout {
+                        algorithm: format!("{:?}", kind.algorithm()),
+                        contract: format!(
+                            "erp_v1_empirical:{}:{}",
+                            policy.artifact.producer_version, record_id
+                        ),
+                        params: serde_json::to_value(&params).ok()?,
+                        query: format!("{query:?}"),
+                    }];
+                }
+            }
+        }
+        Some(guarantee)
+    }
+
+    fn propagate(
+        &self,
+        op: &planner_types::post_asap::CompositionOperator,
+        inputs: &[planner_types::post_asap::ResultGuarantee],
+        local: Option<&planner_types::post_asap::ResultGuarantee>,
+        stats: &asap_aware_mapping::PropagationStats,
+    ) -> Result<planner_types::post_asap::ResultGuarantee, planner_types::post_asap::AccuracyError>
+    {
+        asap_aware_mapping::DefaultAccuracyModel.propagate(op, inputs, local, stats)
+    }
+
+    fn satisfies(
+        &self,
+        guarantee: &planner_types::post_asap::ResultGuarantee,
+        target: &crate::types_v2::AccuracyTarget,
+    ) -> bool {
+        asap_aware_mapping::DefaultAccuracyModel.satisfies(guarantee, target)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ErpAccuracyMode {
@@ -275,7 +362,7 @@ fn valid_runtime_params(algorithm: &SketchAlgorithm, params: &SketchParams) -> b
             },
         ) => *width >= 2 && width.is_power_of_two() && *depth >= 1 && *heap_size >= 1,
         (SketchAlgorithm::Hll, SketchParams::Hll { precision }) => (4..=18).contains(precision),
-        (SketchAlgorithm::Kll, SketchParams::Kll { k }) => *k >= 2,
+        (SketchAlgorithm::Kll, SketchParams::Kll { k }) => (8..=65_535).contains(k),
         (SketchAlgorithm::DDSketch, SketchParams::DDSketch { alpha }) => {
             alpha.is_finite() && (0.0..1.0).contains(alpha)
         }
@@ -290,6 +377,23 @@ mod tests {
     use asap_aware_mapping::erp::{ErpRecord, ErpResourceProfile, ERP_SCHEMA_VERSION};
 
     use super::*;
+
+    /// Match the collector and portable-state decoder's supported k range.
+    #[test]
+    fn kll_runtime_limits_reject_unusable_profiles() {
+        for k in [0, 2, 7, 65_536] {
+            assert!(!valid_runtime_params(
+                &SketchAlgorithm::Kll,
+                &SketchParams::Kll { k }
+            ));
+        }
+        for k in [8, 32, 65_535] {
+            assert!(valid_runtime_params(
+                &SketchAlgorithm::Kll,
+                &SketchParams::Kll { k }
+            ));
+        }
+    }
 
     fn input(mode: ErpAccuracyMode) -> ErpPlanningInput {
         ErpPlanningInput {

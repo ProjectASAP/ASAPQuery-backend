@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "producer_version": "dedc2d4",
+  "records": [
+    {
+      "id": "erp-0",
+      "sketch": "kll-percall",
+      "implementation": "lib",
+      "parameters": {
+        "algorithm": "kll-percall",
+        "params": {
+          "k": 32
+        }
+      },
+      "distribution": {
+        "synthetic": {
+          "description": {
+            "column_num": 1,
+            "column_label": [
+              "key"
+            ],
+            "column_spec": [
+              {
+                "distribution": {
+                  "kind": "uniform",
+                  "lower_bound": 0.0,
+                  "upper_bound": 1.0,
+                  "seed": 42
+                },
+                "special_rule": 0,
+                "data_type": "f64"
+              }
+            ],
+            "row_num": 1000
+          }
+        }
+      },
+      "trials": 10,
+      "error_metrics": {
+        "accuracy_runs": 1.0,
+        "grid_points": 101.0,
+        "items": 1000.0,
+        "max_rank_err": 0.051,
+        "mean_rank_err": 0.01618811881188117
+      },
+      "resources": {
+        "memory_bytes": 1024.0,
+        "update_cpu_seconds": 5.588000000000001e-7,
+        "merge_cpu_seconds": 0.000051599999999999994,
+        "query_cpu_seconds": 0.000031625742574257424
+      }
+    }
+  ]
+}

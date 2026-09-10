@@ -26,6 +26,8 @@ use prost::Message;
 use serde_json::Value;
 
 const SERVICE: &str = "oracle-e2e";
+#[path = "support/physical_fixture.rs"]
+mod physical_fixture;
 // These parameters satisfy the production query path's LIVE_ACCURACY
 // (`epsilon = 0.01`). ASAPPlanner validates an observed `SketchKind`
 // against that accuracy before committing it, so the fixture must use the
@@ -51,6 +53,8 @@ impl Drop for ChildGuard {
 }
 
 struct Backend {
+    evaluation_ms: std::sync::atomic::AtomicU64,
+    artifact: data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest,
     _child: ChildGuard,
     client: reqwest::Client,
     query_base: String,
@@ -71,7 +75,8 @@ fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
-        .as_nanos() as u64
+        .as_secs()
+        * 1_000_000_000
 }
 
 fn labels() -> Vec<KeyValue> {
@@ -113,11 +118,38 @@ async fn start_backend(config_yaml: &str, live_delta: Option<&str>) -> Backend {
         .write_all(config_yaml.as_bytes())
         .expect("write streaming config");
     config.flush().expect("flush streaming config");
+    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
+        &serde_yaml::from_str(config_yaml).unwrap(),
+    )
+    .unwrap();
+    let mut physical = tempfile::NamedTempFile::new().unwrap();
+    let mut install = physical_fixture::artifact(&runtime);
+    for rule in &mut install.transmission_plan.rules {
+        if matches!(
+            install
+                .precompute_plan
+                .schemas
+                .iter()
+                .find(|s| s.materialization == rule.materialization)
+                .unwrap()
+                .family,
+            control_plane::physical::compiler::StateFamilyContract::Sketch {
+                algorithm: planner_types::post_asap::SketchAlgorithm::Cms
+                    | planner_types::post_asap::SketchAlgorithm::CountSketch,
+                ..
+            }
+        ) {
+            rule.encoding = control_plane::physical::compiler::StateEncoding::SketchCoreMsgpackV1;
+        }
+    }
+    serde_json::to_writer(&mut physical, &install).unwrap();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_data_plane"));
     command
         .arg("--streaming-config")
         .arg(config.path())
+        .arg("--physical-plan")
+        .arg(physical.path())
         .arg("--http-port")
         .arg(query_port.to_string())
         .arg("--output-dir")
@@ -152,6 +184,8 @@ async fn start_backend(config_yaml: &str, live_delta: Option<&str>) -> Backend {
             .is_ok_and(|response| response.status().is_success())
         {
             return Backend {
+                artifact: install,
+                evaluation_ms: std::sync::atomic::AtomicU64::new(0),
                 _child: child,
                 client,
                 query_base,
@@ -165,17 +199,33 @@ async fn start_backend(config_yaml: &str, live_delta: Option<&str>) -> Backend {
     panic!("data-plane did not become ready at {health}");
 }
 
-async fn post(backend: &Backend, request: ExportMetricsServiceRequest) {
+async fn post(backend: &Backend, mut request: ExportMetricsServiceRequest) {
+    let data = request.resource_metrics[0].scope_metrics[0].metrics[0]
+        .data
+        .as_ref()
+        .unwrap();
+    let ns = match data {
+        Data::Kllsketch(s) => s.data_points[0].time_unix_nano,
+        Data::Hllsketch(s) => s.data_points[0].time_unix_nano,
+        Data::Countminsketch(s) => s.data_points[0].time_unix_nano,
+        Data::Countsketch(s) => s.data_points[0].time_unix_nano,
+        _ => unreachable!(),
+    };
     backend
+        .evaluation_ms
+        .store(ns / 1_000_000, std::sync::atomic::Ordering::Relaxed);
+    physical_fixture::stamp(&mut request, &backend.artifact);
+    let response = backend
         .client
         .post(&backend.otlp_url)
         .header("content-type", "application/x-protobuf")
         .body(request.encode_to_vec())
         .send()
         .await
-        .expect("post modified OTLP")
-        .error_for_status()
-        .expect("production backend accepted modified OTLP");
+        .expect("post modified OTLP");
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert!(status.is_success(), "OTLP {status}: {body}");
 }
 
 async fn query(backend: &Backend, promql: &str) -> Value {
@@ -185,6 +235,14 @@ async fn query(backend: &Backend, promql: &str) -> Value {
             .client
             .get(format!("{}/api/v1/query", backend.query_base))
             .query(&[("query", promql)])
+            .query(&[(
+                "time",
+                (backend
+                    .evaluation_ms
+                    .load(std::sync::atomic::Ordering::Relaxed) as f64
+                    / 1000.0)
+                    .to_string(),
+            )])
             .send()
             .await
             .expect("query production backend")
@@ -392,7 +450,7 @@ fn assert_frequency_point_oracle(response: &Value, raw: &[&str], item: &str) {
 async fn production_kll_matches_raw_quantile_oracle() {
     let metric = "oracle_kll_latency";
     let backend = start_backend(
-        &config(metric, "DatasketchesKLL", &format!("      K: {K}")),
+        &config(metric, "DatasketchesKLL", &format!("      k: {K}")),
         None,
     )
     .await;
@@ -404,7 +462,7 @@ async fn production_kll_matches_raw_quantile_oracle() {
         kll_export(metric, timestamp + 1_000_000_000, &raw),
     )
     .await;
-    let response = query(&backend, &format!("quantile_over_time(0.5, {metric}[10s])")).await;
+    let response = query(&backend, &format!("quantile_over_time(0.5, {metric}[2s])")).await;
     let samples = scalar_values(&response);
     assert_eq!(
         samples[0].0.get("service").map(String::as_str),
@@ -463,7 +521,7 @@ async fn production_cms_matches_raw_frequency_oracle() {
         cms_export(metric, timestamp + 1_000_000_000, &raw),
     )
     .await;
-    let response = query(&backend, &format!("count_over_time({metric}[10s])")).await;
+    let response = query(&backend, &format!("count_over_time({metric}[2s])")).await;
     let mut merged_raw = raw.clone();
     merged_raw.extend_from_slice(&raw);
     assert_frequency_total_oracle(&response, &merged_raw);
@@ -488,7 +546,7 @@ async fn production_count_sketch_matches_raw_frequency_oracle() {
     .await;
     let response = query(
         &backend,
-        &format!("count_over_time({metric}{{item=\"alpha\"}}[10s])"),
+        &format!("count_over_time({metric}{{item=\"alpha\"}}[2s])"),
     )
     .await;
     let mut merged_raw = raw.clone();
