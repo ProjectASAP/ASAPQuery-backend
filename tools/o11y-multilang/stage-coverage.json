@@ -42,7 +42,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")",
@@ -104,7 +104,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")",
@@ -165,7 +165,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: identifier, found: )\")",
@@ -228,7 +228,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: identifier, found: )\")",
@@ -287,7 +287,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "physical mapping failed: ASAPPlanner produced no legal summary candidate for the target",
@@ -346,7 +346,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "physical mapping failed: ASAPPlanner produced no legal summary candidate for the target",
@@ -403,7 +403,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'mapconcat'.\nDid you mean 'concat'?",
@@ -464,7 +464,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
@@ -523,7 +523,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: Error during planning: Error during planning: map does not support zero arguments. No function matches the given name and argument types 'map()'. You might need to add explicit type casts.\n\tCandidate functions:\n\tmap(Any, .., Any)",
@@ -585,7 +585,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'ifnull'?",
@@ -646,7 +646,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: labels\")",
@@ -706,7 +706,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: This feature is not implemented: Map Access",
@@ -769,7 +769,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
@@ -830,7 +830,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
@@ -890,7 +890,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: [\")",
@@ -951,7 +951,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: identifier, found: )\")",
@@ -1013,7 +1013,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")",
@@ -1073,7 +1073,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: labels\")",
@@ -1134,7 +1134,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
@@ -1196,7 +1196,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
@@ -1257,7 +1257,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: ), found: .1\")",
@@ -1318,7 +1318,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
@@ -1379,7 +1379,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "physical mapping failed: ASAPPlanner produced no legal summary candidate for the target",
@@ -1443,7 +1443,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
@@ -1507,7 +1507,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")",
@@ -1568,7 +1568,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: labels\")",
@@ -1630,7 +1630,7 @@
         },
         "clickhouse_sql": {
           "exact_sql_oracle": {
-            "status": "oracle_pending"
+            "status": "oracle_valid"
           },
           "parser_canonical": {
             "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'ifnull'?",
