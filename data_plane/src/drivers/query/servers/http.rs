@@ -2756,6 +2756,7 @@ mod tests {
                     },
                     schemas: Vec::new(),
                     producers: Vec::new(),
+                    executable_dags: Default::default(),
                     materializations: Vec::new(),
                 },
                 transmission_plan: TransmissionPlan {

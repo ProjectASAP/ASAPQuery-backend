@@ -308,13 +308,40 @@ impl QueryPlanEntry {
         root: &Rc<SummaryNode>,
         instant: InstantExecution,
         fallback: FallbackPolicy,
-        mut bind: F,
+        bind: F,
     ) -> Result<Self, QueryPlanError>
     where
         F: FnMut(
             &Rc<SummaryNode>,
             &SummaryFamilyType,
         ) -> Result<MaterializationBinding, QueryPlanError>,
+    {
+        Self::compile_bound_mapped(
+            query_id,
+            canonical_query,
+            root,
+            instant,
+            fallback,
+            bind,
+            |_, _| {},
+        )
+    }
+
+    pub fn compile_bound_mapped<F, G>(
+        query_id: String,
+        canonical_query: String,
+        root: &Rc<SummaryNode>,
+        instant: InstantExecution,
+        fallback: FallbackPolicy,
+        mut bind: F,
+        mut lowered: G,
+    ) -> Result<Self, QueryPlanError>
+    where
+        F: FnMut(
+            &Rc<SummaryNode>,
+            &SummaryFamilyType,
+        ) -> Result<MaterializationBinding, QueryPlanError>,
+        G: FnMut(&Rc<SummaryNode>, QueryNodeId),
     {
         let mut compiler = DagCompiler {
             next_id: 0,
@@ -323,6 +350,7 @@ impl QueryPlanEntry {
             bind: &mut bind,
             logical_source: None,
             preserve_relational: false,
+            lowered: Some(&mut lowered),
         };
         let root = compiler.lower(root)?;
         Ok(Self {
@@ -359,6 +387,7 @@ impl QueryPlanEntry {
             bind: &mut bind,
             logical_source: None,
             preserve_relational: true,
+            lowered: None,
         };
         let root = compiler.lower(root)?;
         Ok(Self {
@@ -381,13 +410,44 @@ impl QueryPlanEntry {
         root: &Rc<SummaryNode>,
         instant: InstantExecution,
         fallback: FallbackPolicy,
-        mut bind: F,
+        bind: F,
     ) -> Result<Self, QueryPlanError>
     where
         F: FnMut(
             &Rc<SummaryNode>,
             &SummaryFamilyType,
         ) -> Result<MaterializationBinding, QueryPlanError>,
+    {
+        Self::compile_bound_composable_mapped(
+            query_id,
+            canonical_query,
+            root,
+            instant,
+            fallback,
+            bind,
+            |_, _| {},
+        )
+    }
+
+    /// Compile a composable query while exposing the stable mapping from
+    /// Planner semantic nodes to installed query nodes. The control-plane
+    /// physical compiler uses this to persist backend placement without
+    /// relying on pointer values or reconstructing query shape later.
+    pub fn compile_bound_composable_mapped<F, G>(
+        query_id: String,
+        canonical_query: String,
+        root: &Rc<SummaryNode>,
+        instant: InstantExecution,
+        fallback: FallbackPolicy,
+        mut bind: F,
+        mut lowered: G,
+    ) -> Result<Self, QueryPlanError>
+    where
+        F: FnMut(
+            &Rc<SummaryNode>,
+            &SummaryFamilyType,
+        ) -> Result<MaterializationBinding, QueryPlanError>,
+        G: FnMut(&Rc<SummaryNode>, QueryNodeId),
     {
         let mut compiler = DagCompiler {
             next_id: 0,
@@ -396,6 +456,7 @@ impl QueryPlanEntry {
             bind: &mut bind,
             logical_source: Some(canonical_query.clone()),
             preserve_relational: false,
+            lowered: Some(&mut lowered),
         };
         let root = compiler.lower(root)?;
         let mut entry = Self {
@@ -426,6 +487,25 @@ impl QueryPlanEntry {
             }
             if matches!(node, QueryPlanNode::Scalar { value } if !value.is_finite()) {
                 return Err(QueryPlanError::Invalid("non-finite scalar constant".into()));
+            }
+            if let QueryPlanNode::ExternalExact { request, inputs } = node {
+                if request.expression.trim().is_empty() {
+                    return Err(QueryPlanError::Invalid(
+                        "external exact expression must not be empty".into(),
+                    ));
+                }
+                if request.input_contracts.len() != inputs.len() {
+                    return Err(QueryPlanError::Invalid(
+                        "external exact input contracts must match DAG inputs".into(),
+                    ));
+                }
+                if request.input_contracts.iter().any(|contract| {
+                    matches!(contract, ExternalExactInput::CandidateMembership { item_label } if item_label.is_empty())
+                }) {
+                    return Err(QueryPlanError::Invalid(
+                        "external exact candidate item label must not be empty".into(),
+                    ));
+                }
             }
             if let QueryPlanNode::CandidateTopK {
                 k, completeness, ..
@@ -521,6 +601,38 @@ pub enum PhysicalGrouping {
     Reduce(Vec<String>),
 }
 
+/// Result shape promised by an external exact engine. The backend uses this
+/// contract to type-check downstream DAG nodes without depending on an
+/// engine-specific response envelope.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExternalExactOutput {
+    Scalar,
+    InstantVector,
+    RangeVector,
+    Relation { schema: serde_json::Value },
+}
+
+/// How an ordinary DAG input constrains an external exact evaluation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ExternalExactInput {
+    CandidateMembership { item_label: String },
+}
+
+/// Language-neutral request contract for an exact subtree. Evaluation time is
+/// inherited from the containing QueryPlanEntry, avoiding a second time-range
+/// envelope that could drift from the installed query plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalExactRequest {
+    pub language: QueryLanguage,
+    pub expression: String,
+    pub output: ExternalExactOutput,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_contracts: Vec<ExternalExactInput>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryPlanNode {
@@ -570,6 +682,12 @@ pub enum QueryPlanNode {
         grouping: logical::Grouping,
         completeness: CandidateCompleteness,
     },
+    /// An exact subtree evaluated outside ASAP. Its results enter the query DAG
+    /// like any other node output and may depend on summary-produced inputs.
+    ExternalExact {
+        request: ExternalExactRequest,
+        inputs: Vec<QueryNodeId>,
+    },
     ExactFallback {
         reason: String,
     },
@@ -586,7 +704,9 @@ impl QueryPlanNode {
             | Self::Relational { input, .. }
             | Self::SummaryEstimate { input, .. }
             | Self::ExactReadout { input, .. } => std::slice::from_ref(input),
-            Self::SummaryMerge { inputs } | Self::Logical { inputs, .. } => inputs,
+            Self::SummaryMerge { inputs }
+            | Self::Logical { inputs, .. }
+            | Self::ExternalExact { inputs, .. } => inputs,
             Self::CandidateTopK { inputs, .. } => inputs,
         }
     }
@@ -649,6 +769,7 @@ struct DagCompiler<'a, F> {
     bind: &'a mut F,
     logical_source: Option<String>,
     preserve_relational: bool,
+    lowered: Option<&'a mut dyn FnMut(&Rc<SummaryNode>, QueryNodeId)>,
 }
 
 impl<F> DagCompiler<'_, F>
@@ -677,7 +798,9 @@ where
         }
         for (local, mut physical) in nodes {
             match &mut physical {
-                QueryPlanNode::Logical { inputs, .. } | QueryPlanNode::SummaryMerge { inputs } => {
+                QueryPlanNode::Logical { inputs, .. }
+                | QueryPlanNode::SummaryMerge { inputs }
+                | QueryPlanNode::ExternalExact { inputs, .. } => {
                     for input in inputs {
                         *input = remap[input];
                     }
@@ -717,6 +840,9 @@ where
             // second runtime readout node.
             let child_id = self.lower(child)?;
             self.seen.insert(identity, child_id);
+            if let Some(lowered) = &mut self.lowered {
+                lowered(node, child_id);
+            }
             return Ok(child_id);
         }
         let id = QueryNodeId(self.next_id);
@@ -738,7 +864,11 @@ where
             _ => None,
         };
         if let Some((root, nodes)) = residual {
-            return self.graft(id, root, nodes);
+            let id = self.graft(id, root, nodes)?;
+            if let Some(lowered) = &mut self.lowered {
+                lowered(node, id);
+            }
+            return Ok(id);
         }
 
         let physical = match &node.expr {
@@ -964,10 +1094,14 @@ where
                     self.next_id += 1;
                     self.nodes.insert(
                         value_id,
-                        QueryPlanNode::Logical {
-                            operator: logical::LogicalOperator::CandidateExactSubquery {
-                                query: aggregate.expr.to_string(),
-                                item_label,
+                        QueryPlanNode::ExternalExact {
+                            request: ExternalExactRequest {
+                                language: QueryLanguage::PromQl,
+                                expression: aggregate.expr.to_string(),
+                                output: ExternalExactOutput::InstantVector,
+                                input_contracts: vec![ExternalExactInput::CandidateMembership {
+                                    item_label,
+                                }],
                             },
                             inputs: vec![candidate_input],
                         },
@@ -1182,6 +1316,9 @@ where
             },
         };
         self.nodes.insert(id, physical);
+        if let Some(lowered) = &mut self.lowered {
+            lowered(node, id);
+        }
         Ok(id)
     }
 }

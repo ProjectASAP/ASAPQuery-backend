@@ -759,6 +759,7 @@ async fn main() -> Result<()> {
             .values()
             .cloned()
             .collect(),
+        executable_dags: Default::default(),
     };
     let initial_transmission_plan = control_plane::physical::compiler::TransmissionPlan {
         summary_catalog: None,
