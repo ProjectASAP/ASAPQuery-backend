@@ -14,9 +14,9 @@ use asap_aware_mapping::{
     SummaryMaintenanceLifecycleCapabilities, SummaryMaintenanceLifecycleCostInputs, WorkloadDemand,
 };
 use planner_types::post_asap::{
-    CompositionOperator, EvaluationSchedule, OutputRepresentation, SketchAlgorithm, SketchParams,
-    SketchQuery, SummaryExpr, SummaryFamilyType, SummaryMaintenanceLifecycle,
-    SummaryMaintenanceMode, SummaryNode, SummaryWindowFramework,
+    CompositionOperator, EvaluationSchedule, ExecutableDagCompilation, OutputRepresentation,
+    PostAsapNodeId, SketchAlgorithm, SketchParams, SketchQuery, SummaryExpr, SummaryFamilyType,
+    SummaryMaintenanceLifecycle, SummaryMaintenanceMode, SummaryNode, SummaryWindowFramework,
 };
 use planner_types::pre_asap::QueryExpr;
 use planner_types::workload::{
@@ -1920,7 +1920,8 @@ impl BackendLocalPlanningSnapshot {
 /// unless the selected DAG explicitly authorizes pooling the source entities.
 fn has_unsafe_raw_entity_leaf(
     node: &Rc<SummaryNode>,
-    selected: &BTreeSet<usize>,
+    node_ids: &planner_types::post_asap::ExecutableNodeIdentityMap,
+    selected: &BTreeSet<PostAsapNodeId>,
     pooling: bool,
 ) -> bool {
     use planner_types::post_asap::ExactKind;
@@ -1932,7 +1933,10 @@ fn has_unsafe_raw_entity_leaf(
             family,
             ..
         } => {
-            if selected.contains(&(Rc::as_ptr(node) as usize)) {
+            if node_ids
+                .node_id(node)
+                .is_some_and(|node_id| selected.contains(&node_id))
+            {
                 let preserves_series_state = matches!(
                     family,
                     SummaryFamilyType::ExactAggregate(
@@ -1956,18 +1960,18 @@ fn has_unsafe_raw_entity_leaf(
                         ..
                     }
                 );
-            has_unsafe_raw_entity_leaf(child, selected, additive_reduction)
+            has_unsafe_raw_entity_leaf(child, node_ids, selected, additive_reduction)
         }
         SummaryExpr::BinaryOp { lhs, rhs, .. } => {
-            has_unsafe_raw_entity_leaf(lhs, selected, false)
-                || has_unsafe_raw_entity_leaf(rhs, selected, false)
+            has_unsafe_raw_entity_leaf(lhs, node_ids, selected, false)
+                || has_unsafe_raw_entity_leaf(rhs, node_ids, selected, false)
         }
         SummaryExpr::SummaryEstimate { summary_input, .. } => {
-            has_unsafe_raw_entity_leaf(summary_input, selected, false)
+            has_unsafe_raw_entity_leaf(summary_input, node_ids, selected, false)
         }
         SummaryExpr::SummaryMerge { children } => children
             .iter()
-            .any(|child| has_unsafe_raw_entity_leaf(child, selected, false)),
+            .any(|child| has_unsafe_raw_entity_leaf(child, node_ids, selected, false)),
         _ => false,
     }
 }
@@ -1982,9 +1986,28 @@ fn preserve_native_unsafe_raw_roots(queries: &mut [PlanningQuery]) -> Result<(),
                     reason,
                 }
             })?;
+        let executable =
+            planner_types::post_asap::compile_executable_dag_with_node_ids(&query.post_asap)
+                .map_err(|error| CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason: format!("invalid executable subDAG: {error}"),
+                })?;
+        let selected_ids = selected
+            .iter()
+            .map(|state| {
+                executable
+                    .node_ids
+                    .node_id(&state.node)
+                    .ok_or_else(|| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: "selected state is absent from executable Planner DAG".into(),
+                    })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
         let unsafe_entities = has_unsafe_raw_entity_leaf(
             &query.post_asap,
-            &selected.iter().map(|state| state.node_identity).collect(),
+            &executable.node_ids,
+            &selected_ids,
             false,
         );
         if unsafe_entities {
@@ -2130,7 +2153,19 @@ impl PhysicalCompiler {
         // materializations, then consumed by QueryPlan lowering. The key is
         // the planner DAG node identity across the workload; serving never scans
         // downstream components to rediscover this decision.
-        let mut node_bindings = HashMap::<usize, asap_types::PolicyFingerprint>::new();
+        let executable_dags = request
+            .queries
+            .iter()
+            .map(|query| {
+                planner_types::post_asap::compile_executable_dag_with_node_ids(&query.post_asap)
+                    .map_err(|error| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: format!("invalid executable subDAG: {error}"),
+                    })
+            })
+            .collect::<Result<Vec<ExecutableDagCompilation>, CompileError>>()?;
+        let mut node_bindings =
+            BTreeMap::<(usize, PostAsapNodeId), asap_types::PolicyFingerprint>::new();
         let consumers = materialization_consumers(
             &request.queries,
             environment.target,
@@ -2139,7 +2174,7 @@ impl PhysicalCompiler {
         let mut lifecycle_estimates =
             BTreeMap::<asap_types::PolicyFingerprint, MaterializationLifecycleEstimate>::new();
 
-        for query in &request.queries {
+        for (query_index, query) in request.queries.iter().enumerate() {
             let evidence = request.evidence.get(&query.query_id);
             if let Some(e) = evidence {
                 validate_evidence(&query.query_id, e, &environment)?;
@@ -2367,7 +2402,15 @@ impl PhysicalCompiler {
                         expected_updates: planner_selection.expected_updates,
                         lifecycle_cost: planner_selection.lifecycle_cost,
                     });
-                let binding_key = selected.node_identity;
+                let node_id = executable_dags[query_index]
+                    .node_ids
+                    .node_id(&selected.node)
+                    .ok_or_else(|| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason: "selected materialization is absent from the compiled Planner DAG"
+                            .into(),
+                    })?;
+                let binding_key = (query_index, node_id);
                 if let Some(existing) = node_bindings.insert(binding_key, materialization) {
                     if existing != materialization {
                         return Err(CompileError::Query {
@@ -2506,7 +2549,7 @@ impl PhysicalCompiler {
             .map(asap_types::PrecomputeMaterialization::policy_fingerprint)
             .collect();
         let mut query_entries = BTreeMap::new();
-        for query in &request.queries {
+        for (query_index, query) in request.queries.iter().enumerate() {
             let canonical = if metricsql {
                 asap_frontend_metricsql::canonical_metricsql(&query.query_string).map_err(
                     |error| CompileError::Query {
@@ -2517,14 +2560,22 @@ impl PhysicalCompiler {
             } else {
                 canonical_promql(&query.query_string)?
             };
-            let binding = |node: &SummaryNode, node_family: &SummaryFamilyType| -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
+            let binding = |node: &Rc<SummaryNode>, node_family: &SummaryFamilyType| -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
                     summary_agg_metric(node).ok_or_else(|| {
                         crate::query_plan::QueryPlanError::Invalid(
                             "materialized node has no unique time-series source".into(),
                         )
                     })?;
+                    let node_id = executable_dags[query_index]
+                        .node_ids
+                        .node_id(node)
+                        .ok_or_else(|| {
+                            crate::query_plan::QueryPlanError::Invalid(
+                                "query materialization is absent from the compiled Planner DAG".into(),
+                            )
+                        })?;
                     let fingerprint = node_bindings
-                        .get(&(node as *const SummaryNode as usize))
+                        .get(&(query_index, node_id))
                         .copied()
                         .ok_or_else(|| {
                             crate::query_plan::QueryPlanError::Invalid(format!(
@@ -3469,7 +3520,6 @@ pub(crate) fn materialization_leaf_contract(
 
 struct SelectedMaterialization {
     node: Rc<SummaryNode>,
-    node_identity: usize,
     metric: String,
     window_secs: Option<u64>,
     spatial_filter: String,
@@ -3791,7 +3841,6 @@ fn collect_selected_materializations(
                         };
                     selected.push(SelectedMaterialization {
                         node: Rc::clone(node),
-                        node_identity: Rc::as_ptr(node) as usize,
                         metric,
                         window_secs,
                         spatial_filter,
@@ -3818,7 +3867,6 @@ fn collect_selected_materializations(
                     };
                 selected.push(SelectedMaterialization {
                     node: Rc::clone(node),
-                    node_identity: Rc::as_ptr(node) as usize,
                     metric,
                     window_secs,
                     spatial_filter,
@@ -3842,8 +3890,20 @@ fn collect_selected_materializations(
     let mut selected = Vec::new();
     walk(node, None, composable, None, &mut selected)?;
     if composable {
+        let executable = planner_types::post_asap::compile_executable_dag_with_node_ids(node)
+            .map_err(|error| format!("invalid executable subDAG: {error}"))?;
         selected.retain(|state| {
-            !has_unsafe_raw_entity_leaf(node, &BTreeSet::from([state.node_identity]), false)
+            executable
+                .node_ids
+                .node_id(&state.node)
+                .is_some_and(|node_id| {
+                    !has_unsafe_raw_entity_leaf(
+                        node,
+                        &executable.node_ids,
+                        &BTreeSet::from([node_id]),
+                        false,
+                    )
+                })
         });
     }
     if !selected.is_empty() {

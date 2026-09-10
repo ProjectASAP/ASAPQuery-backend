@@ -320,7 +320,7 @@ impl QueryPlanEntry {
     ) -> Result<Self, QueryPlanError>
     where
         F: FnMut(
-            &SummaryNode,
+            &Rc<SummaryNode>,
             &SummaryFamilyType,
         ) -> Result<MaterializationBinding, QueryPlanError>,
     {
@@ -356,7 +356,7 @@ impl QueryPlanEntry {
     ) -> Result<Self, QueryPlanError>
     where
         F: FnMut(
-            &SummaryNode,
+            &Rc<SummaryNode>,
             &SummaryFamilyType,
         ) -> Result<MaterializationBinding, QueryPlanError>,
     {
@@ -393,7 +393,7 @@ impl QueryPlanEntry {
     ) -> Result<Self, QueryPlanError>
     where
         F: FnMut(
-            &SummaryNode,
+            &Rc<SummaryNode>,
             &SummaryFamilyType,
         ) -> Result<MaterializationBinding, QueryPlanError>,
     {
@@ -661,7 +661,10 @@ struct DagCompiler<'a, F> {
 
 impl<F> DagCompiler<'_, F>
 where
-    F: FnMut(&SummaryNode, &SummaryFamilyType) -> Result<MaterializationBinding, QueryPlanError>,
+    F: FnMut(
+        &Rc<SummaryNode>,
+        &SummaryFamilyType,
+    ) -> Result<MaterializationBinding, QueryPlanError>,
 {
     fn graft(
         &mut self,
