@@ -73,6 +73,11 @@ fn inspect(
             left: lhs,
             right: rhs,
         }
+        | SummaryExpr::RelationalJoin {
+            left: lhs,
+            right: rhs,
+            ..
+        }
         | SummaryExpr::BinaryOp { lhs, rhs, .. } => {
             inspect(lhs, model, seen, states, raw);
             inspect(rhs, model, seen, states, raw);

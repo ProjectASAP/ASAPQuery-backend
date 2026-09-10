@@ -93,6 +93,39 @@ impl ClickHouseRelation {
 pub struct ClickHouseRelationalAdapter;
 
 impl ClickHouseRelationalAdapter {
+    pub fn apply_inner_equi_join(
+        &self,
+        pred: &planner_types::pre_asap::Predicate,
+        output_schema: &SummarySchema,
+        left: ClickHouseRelation,
+        right: ClickHouseRelation,
+    ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
+        let coverage = match (left.coverage, right.coverage) {
+            (Some((left_start, left_end)), Some((right_start, right_end))) => {
+                let start = left_start.max(right_start);
+                let end = left_end.min(right_end);
+                (start <= end).then_some((start, end))
+            }
+            _ => None,
+        };
+        let mut rows = Vec::new();
+        for left_row in &left.rows {
+            for right_row in &right.rows {
+                let mut joined = Vec::with_capacity(left_row.len() + right_row.len());
+                joined.extend(left_row.iter().cloned());
+                joined.extend(right_row.iter().cloned());
+                if matches!(eval(&pred.0, &joined)?, Cell::Bool(true)) {
+                    rows.push(joined);
+                }
+            }
+        }
+        Ok(ClickHouseRelation {
+            rows,
+            fields: fields_from_schema(output_schema),
+            coverage,
+        })
+    }
+
     pub fn apply_filter(
         &self,
         pred: &planner_types::pre_asap::Predicate,
@@ -645,5 +678,71 @@ mod tests {
         let row = vec![Cell::Float64(1.0)];
         let error = eval(&QueryExpr::BoolAnd(vec![]), &row).unwrap_err();
         assert!(matches!(error, ClickHouseRelationalError::Unsupported(_)));
+    }
+
+    #[test]
+    fn inner_equi_join_feeds_typed_ratio_projection() {
+        let side_schema = schema(&[("service", DataType::Utf8), ("value", DataType::Float64)]);
+        let left = ClickHouseRelation {
+            rows: vec![vec![Cell::Utf8("api".into()), Cell::Float64(2.0)]],
+            fields: fields_from_schema(&side_schema),
+            coverage: Some((300_000, 600_000)),
+        };
+        let right = ClickHouseRelation {
+            rows: vec![vec![Cell::Utf8("api".into()), Cell::Float64(10.0)]],
+            fields: fields_from_schema(&side_schema),
+            coverage: Some((300_000, 600_000)),
+        };
+        let joined_schema = schema(&[
+            ("service", DataType::Utf8),
+            ("left_value", DataType::Float64),
+            ("service", DataType::Utf8),
+            ("right_value", DataType::Float64),
+        ]);
+        let pred = planner_types::pre_asap::Predicate(Rc::new(QueryExpr::Compare {
+            left: Rc::new(QueryExpr::Column(0)),
+            op: CompareOpKind::Eq,
+            right: Rc::new(QueryExpr::Column(2)),
+        }));
+        let joined = ClickHouseRelationalAdapter
+            .apply_inner_equi_join(&pred, &joined_schema, left, right)
+            .unwrap();
+        let output_schema = schema(&[("service", DataType::Utf8), ("ratio", DataType::Float64)]);
+        let projected = ClickHouseRelationalAdapter
+            .apply_operation(
+                &ValueOperation::Project {
+                    cols: vec![
+                        ProjectItem {
+                            alias: Some("service".into()),
+                            expr: QueryExpr::Column(0),
+                        },
+                        ProjectItem {
+                            alias: Some("ratio".into()),
+                            expr: QueryExpr::Arithmetic {
+                                op: ArithmeticOpKind::Div,
+                                left: Rc::new(QueryExpr::Column(1)),
+                                right: Rc::new(QueryExpr::Column(3)),
+                            },
+                        },
+                    ],
+                    qualifier: None,
+                },
+                &output_schema,
+                joined,
+            )
+            .unwrap();
+        assert_eq!(projected.coverage, Some((300_000, 600_000)));
+        let result = projected.into_result().unwrap();
+        let batch = &result.batches[0];
+        assert_eq!(batch.schema().field(1).name(), "ratio");
+        assert_eq!(
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(0),
+            0.2
+        );
     }
 }
