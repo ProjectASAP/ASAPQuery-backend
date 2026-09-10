@@ -318,7 +318,7 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
 mod tests {
     use super::*;
     use crate::{
-        precompute_engine::operators::SumAccumulator,
+        precompute_engine::operators::{MinMaxAccumulator, SumAccumulator},
         storage_engines::sketch_db::index::{AggKind, Capability, SketchInstanceMetadata},
     };
     use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
@@ -334,6 +334,7 @@ mod tests {
             QueryExpr, ScalarValue, Schema, SortKey,
         },
     };
+    use std::collections::BTreeMap;
     use std::rc::Rc;
 
     fn relation_schema(names: &[(&str, DataType)]) -> SummarySchema {
@@ -579,6 +580,133 @@ mod tests {
             panic!("expected accelerated response")
         };
         assert_eq!(response.body, "1970-01-01T00:00:02\t50.0\n");
+    }
+
+    #[tokio::test]
+    async fn q05_compiled_sidecar_executes_grouped_max_as_typed_clickhouse_result() {
+        let start_ms = 1_788_848_096_000;
+        let end_ms = 1_788_891_296_000;
+        let mut config = PrecomputeMaterialization::new(
+            AggregationType::MinMax,
+            "max".into(),
+            Default::default(),
+            KeyByLabelNames::new(vec!["labels".into()]),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            43_200,
+            43_200,
+            WindowKind::Tumbling,
+            String::new(),
+            "cache_refresh_lag_seconds".into(),
+            None,
+            Some("raw_samples".into()),
+            Some("value".into()),
+        );
+        config.pane_origin_ms = Some(start_ms as i64);
+        let sds = SummaryCatalog::from_materializations(72, 1, &[config.clone()]).unwrap();
+        let envelope = control_plane::physical::compiler::PlanEnvelope {
+            plan_id: 72,
+            plan_version: 1,
+            generated_at_unix_ms: 0,
+            activation_unix_ms: 0,
+            expiry_unix_ms: None,
+            backend_compat: "test".into(),
+            planner_revision: "test".into(),
+            capability_snapshot_id: "test".into(),
+        };
+        let mut precompute =
+            control_plane::physical::compiler::PrecomputePlan::build_backend_local(
+                envelope.clone(),
+                vec![config.clone()],
+            )
+            .unwrap();
+        precompute.summary_catalog = Some(sds.reference().unwrap());
+        let mut transmission = control_plane::physical::compiler::TransmissionPlan::build(
+            envelope,
+            &precompute,
+            &Default::default(),
+        )
+        .unwrap();
+        transmission.summary_catalog = precompute.summary_catalog.clone();
+        let schema = Schema::with_time_index(
+            vec![
+                Column::new("metric", DataType::Utf8, false),
+                Column::new("labels", DataType::Utf8, false),
+                Column::new("ts_ms", DataType::Timestamp, false),
+                Column::new("value", DataType::Float64, false),
+            ],
+            2,
+            vec![],
+        );
+        let sql = "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='cache_refresh_lag_seconds' AND ts_ms>1788848096000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY labels";
+        let compiled = control_plane::clickhouse::compile_clickhouse_workload(
+            &control_plane::clickhouse::ClickHouseSqlWorkload {
+                sds: sds.clone(),
+                precompute_plan: precompute,
+                transmission_plan: transmission,
+                tables: HashMap::from([("raw_samples".into(), schema)]),
+                accuracy: planner_types::types::AccuracyTarget::Exact,
+                queries: vec![control_plane::clickhouse::ClickHouseSqlWorkloadEntry {
+                    sql: sql.into(),
+                    start_ms,
+                    end_ms,
+                    cumulative: true,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        let bundle: ClickHousePlanBundle =
+            serde_json::from_value(serde_json::to_value(compiled).unwrap()).unwrap();
+        let materialization = config.policy_fingerprint();
+        let store = Arc::new(SketchStore::new());
+        store.install_summary_catalog(Arc::new(sds)).unwrap();
+        store.register(SketchInstanceMetadata {
+            sid: 72,
+            metric_name: config.metric.clone(),
+            group_by_keys: BTreeSet::from(["labels".into()]),
+            capability: Some(Capability::ExactAgg(AggregationType::MinMax)),
+            agg_kind: AggKind::ExactAgg {
+                agg_type: AggregationType::MinMax,
+                parameters_canonical: String::new(),
+                spatial_filter_canonical: String::new(),
+            },
+            accuracy: None,
+            first_seen_unix_ms: start_ms as i64,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            policy_fp: materialization,
+        });
+        for (labels, value) in [("{instance=a}", 7.0), ("{instance=b}", 11.0)] {
+            store.append_precompute(
+                72,
+                BTreeMap::from([("labels".into(), labels.into())]),
+                (start_ms, end_ms),
+                Box::new(MinMaxAccumulator::with_value(value, "max".into())),
+            );
+        }
+        let accelerator = CatalogClickHouseAccelerator::from_bundle(bundle, store).unwrap();
+        let request = ClickHouseQueryRequest {
+            method: Method::GET,
+            sql: sql.into(),
+            body: Bytes::new(),
+            parameters: Default::default(),
+            headers: HeaderMap::new(),
+        };
+        let ClickHouseAccelerationOutcome::Accelerated(response) =
+            accelerator.execute(&request).await
+        else {
+            panic!("compiled q05 sidecar did not reach the warm executor")
+        };
+        assert_eq!(
+            response.headers["content-type"],
+            "text/tab-separated-values; charset=UTF-8"
+        );
+        assert_eq!(
+            std::str::from_utf8(&response.body).unwrap(),
+            "{instance=a}\t7.0\n{instance=b}\t11.0\n"
+        );
     }
 
     #[tokio::test]
