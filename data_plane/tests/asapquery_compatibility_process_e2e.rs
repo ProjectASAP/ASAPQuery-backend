@@ -710,7 +710,7 @@ async fn run_shared_dashboard(multi_pane: bool) {
             let mut candidates = query.window_implementations;
             let mut small = candidates[0].clone();
             small.implementation_id = "five-second-pane".into();
-            small.pane_secs = 5;
+            small.layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 5 };
             small.cost.weighted_cost = 0.0;
             candidates[0].cost.weighted_cost = 10.0;
             candidates.push(small);

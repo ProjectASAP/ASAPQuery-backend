@@ -370,6 +370,7 @@ mod tests {
                 asap_types::PolicyFingerprint(7),
                 summary.clone(),
                 data.clone(),
+                asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 },
             )],
         )
         .unwrap();

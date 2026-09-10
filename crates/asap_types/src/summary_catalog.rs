@@ -10,6 +10,7 @@ use crate::sds::{
     SummaryDescriptor, SummaryDescriptorId, ValueProjectionIdentity,
 };
 use crate::PolicyFingerprint;
+use crate::WindowMaterializationLayout;
 use serde::{Deserialize, Serialize};
 
 pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 2;
@@ -21,6 +22,10 @@ pub const SUMMARY_CATALOG_SCHEMA_VERSION: u32 = 2;
 pub struct SummaryDefinitionIdentity {
     pub summary_descriptor_id: SummaryDescriptorId,
     pub data_descriptor_id: DataDescriptorId,
+    /// Backend-selected physical representation. It is catalog-visible so
+    /// producers, readers, lifecycle management, and recovery agree on the
+    /// concrete state being referenced.
+    pub window_layout: WindowMaterializationLayout,
     /// Pane boundary selected from the shared consumer workload. Legacy
     /// snapshots deserialize as unknown and fail closed at pane-only reads.
     #[serde(
@@ -123,6 +128,7 @@ impl SummaryCatalog {
                     config.policy_fingerprint(),
                     summary,
                     data,
+                    config.window_layout.clone(),
                     config.pane_origin_ms,
                 ))
             })
@@ -133,14 +139,23 @@ impl SummaryCatalog {
     pub fn build(
         plan_id: u64,
         plan_version: u64,
-        entries: impl IntoIterator<Item = (PolicyFingerprint, SummaryDescriptor, DataDescriptor)>,
+        entries: impl IntoIterator<
+            Item = (
+                PolicyFingerprint,
+                SummaryDescriptor,
+                DataDescriptor,
+                WindowMaterializationLayout,
+            ),
+        >,
     ) -> Result<Self, SummaryCatalogError> {
         Self::build_with_origins(
             plan_id,
             plan_version,
             entries
                 .into_iter()
-                .map(|(fingerprint, summary, data)| (fingerprint, summary, data, None)),
+                .map(|(fingerprint, summary, data, layout)| {
+                    (fingerprint, summary, data, layout, None)
+                }),
         )
     }
 
@@ -152,6 +167,7 @@ impl SummaryCatalog {
                 PolicyFingerprint,
                 SummaryDescriptor,
                 DataDescriptor,
+                WindowMaterializationLayout,
                 Option<i64>,
             ),
         >,
@@ -164,7 +180,7 @@ impl SummaryCatalog {
             data_descriptors: BTreeMap::new(),
             materializations: BTreeMap::new(),
         };
-        for (fingerprint, summary, data, pane_origin_ms) in entries {
+        for (fingerprint, summary, data, window_layout, pane_origin_ms) in entries {
             let materialization = SummaryDefinitionId::from(fingerprint);
             summary
                 .validate()
@@ -174,6 +190,7 @@ impl SummaryCatalog {
             let binding = SummaryDefinitionIdentity {
                 summary_descriptor_id: summary.id().clone(),
                 data_descriptor_id: data.id().clone(),
+                window_layout,
                 pane_origin_ms,
             };
             if catalog
@@ -374,8 +391,18 @@ mod tests {
             1,
             1,
             [
-                (first.policy_fingerprint(), summary.clone(), data[0].clone()),
-                (first.policy_fingerprint(), summary, data[1].clone()),
+                (
+                    first.policy_fingerprint(),
+                    summary.clone(),
+                    data[0].clone(),
+                    first.window_layout.clone(),
+                ),
+                (
+                    first.policy_fingerprint(),
+                    summary,
+                    data[1].clone(),
+                    first.window_layout.clone(),
+                ),
             ],
         )
         .unwrap_err();

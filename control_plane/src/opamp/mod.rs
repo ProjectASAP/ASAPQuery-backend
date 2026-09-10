@@ -1027,9 +1027,9 @@ mod tests {
                 abstract_window_framework:
                     planner_types::post_asap::SummaryWindowFramework::Tumbling,
                 window_implementation_id: "collector-tumbling-v1".into(),
-                pane_secs: 60,
+                slide_secs: 60,
                 pane_origin_ms: Some(0),
-                state_layout: "anchored-pane-v1".into(),
+                window_layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 },
                 evidence_source: None,
                 lifecycle: crate::physical::compiler::CollectorLifecycle {
                     kind: "continuously_maintained".into(),

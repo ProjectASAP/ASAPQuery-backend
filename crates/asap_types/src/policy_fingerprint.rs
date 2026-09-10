@@ -148,6 +148,16 @@ impl PolicyFingerprint {
         );
         buf.push(0);
 
+        // Physical representation is part of state identity. A full overlapping
+        // window and a mergeable pane layout may share semantic descriptors but
+        // never share payload instances or lifecycle accounting.
+        buf.extend_from_slice(
+            serde_json::to_string(&cfg.window_layout)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        buf.push(0);
+
         // 9. pane origin. Presence is explicit so a legacy definition with
         // unknown phase cannot alias an epoch-aligned definition.
         match cfg.pane_origin_ms {
@@ -236,6 +246,24 @@ mod tests {
         assert_eq!(
             PolicyFingerprint::from_config(&a),
             PolicyFingerprint::from_config(&b)
+        );
+    }
+
+    #[test]
+    fn physical_window_layout_is_part_of_state_identity() {
+        let panes = cfg(
+            "http_lat",
+            AggregationType::Sum,
+            HashMap::new(),
+            vec!["zone"],
+            60,
+            "",
+        );
+        let mut full = panes.clone();
+        full.window_layout = crate::WindowMaterializationLayout::FullWindow;
+        assert_ne!(
+            PolicyFingerprint::from_config(&panes),
+            PolicyFingerprint::from_config(&full)
         );
     }
 

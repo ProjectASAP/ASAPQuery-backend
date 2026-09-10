@@ -90,12 +90,17 @@ pub struct ImplementationCostEvidence {
     pub observed_at_unix_ms: u64,
     pub valid_for_ms: u64,
     pub horizon_seconds: f64,
+    /// Measured build plus incremental-update CPU over `horizon_seconds`.
     pub cpu_cost: f64,
     pub peak_memory_bytes: u64,
     pub network_bytes: u64,
     pub storage_bytes: u64,
     pub source_scan_bytes: u64,
-    /// Dimensionally calibrated scalar passed to Planner for comparison.
+    /// Dimensionally calibrated scalar passed to Planner for comparison. The
+    /// evidence producer must price update CPU, query-time merges at the
+    /// workload's read frequency, retained memory, storage, source scans, and
+    /// network traffic. Keeping the components alongside this quote makes the
+    /// selected tradeoff auditable without teaching Planner backend units.
     pub weighted_cost: f64,
 }
 
@@ -106,8 +111,8 @@ pub struct WindowImplementationCandidate {
     pub implementation_id: String,
     pub framework: SummaryWindowFramework,
     pub window_secs: u64,
-    pub pane_secs: u64,
-    pub state_layout: String,
+    pub slide_secs: u64,
+    pub layout: asap_types::WindowMaterializationLayout,
     pub cost: ImplementationCostEvidence,
 }
 
@@ -218,7 +223,6 @@ pub struct BackendLocalImplementation {
     pub evidence_valid_for_ms: u64,
     pub horizon_seconds: f64,
     pub window_implementation_id: String,
-    pub state_layout: String,
     pub implementation_cost: ImplementationCostEvidence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_sample_interval_ms: Option<u64>,
@@ -271,14 +275,14 @@ pub struct CollectorMaterialization {
     pub window_secs: u64,
     pub abstract_window_framework: SummaryWindowFramework,
     pub window_implementation_id: String,
-    pub pane_secs: u64,
+    pub slide_secs: u64,
     #[serde(
         default,
         alias = "paneOriginMs",
         skip_serializing_if = "Option::is_none"
     )]
     pub pane_origin_ms: Option<i64>,
-    pub state_layout: String,
+    pub window_layout: asap_types::WindowMaterializationLayout,
     pub evidence_source: Option<String>,
     pub lifecycle: CollectorLifecycle,
 }
@@ -467,6 +471,11 @@ pub enum PrecomputePlanError {
     InvalidSchema { schema_id: String },
     #[error("materialization {0} uses a summary family unsupported by the runtime schema")]
     UnsupportedFamily(u64),
+    #[error("materialization {materialization} has an invalid window layout: {reason}")]
+    InvalidWindowLayout {
+        materialization: u64,
+        reason: String,
+    },
     #[error("producer {producer_id} references an unknown materialization or schema")]
     InvalidProducer { producer_id: String },
     #[error("materialization {0} has no registered producer")]
@@ -622,6 +631,24 @@ impl PrecomputePlan {
         }
         let mut materializations = BTreeSet::new();
         for materialization in &self.materializations {
+            materialization
+                .window_layout
+                .validate(materialization.window_size, materialization.slide_interval)
+                .map_err(|reason| PrecomputePlanError::InvalidWindowLayout {
+                    materialization: materialization.policy_fp_u64(),
+                    reason,
+                })?;
+            let expected_kind = if materialization.slide_interval == materialization.window_size {
+                asap_types::WindowKind::Tumbling
+            } else {
+                asap_types::WindowKind::Sliding
+            };
+            if materialization.window_type != expected_kind {
+                return Err(PrecomputePlanError::InvalidWindowLayout {
+                    materialization: materialization.policy_fp_u64(),
+                    reason: "window kind disagrees with size and slide".into(),
+                });
+            }
             // HLL is supported as an ingested sketch envelope, not as a raw
             // accumulator. Validate here so external installs cannot bypass it.
             if self.ingest.protocol == IngestProtocol::PrometheusRemoteWriteV1
@@ -1874,8 +1901,10 @@ impl BackendLocalPlanningSnapshot {
                             implementation_id: self.implementation.window_implementation_id.clone(),
                             framework: SummaryWindowFramework::Tumbling,
                             window_secs: lookback_ms / 1_000,
-                            pane_secs: lookback_ms / 1_000,
-                            state_layout: self.implementation.state_layout.clone(),
+                            slide_secs: lookback_ms / 1_000,
+                            layout: asap_types::WindowMaterializationLayout::Pane {
+                                pane_secs: lookback_ms / 1_000,
+                            },
                             cost,
                         }]
                     }),
@@ -2343,33 +2372,27 @@ impl PhysicalCompiler {
                     })?;
                 // The logical consumer group is identified above. The installed state
                 // identity includes the actual pane width selected by Planner.
-                aggregation.window_secs = if environment.target
-                    == PhysicalDeploymentTarget::BackendLocalRemoteWrite
-                    && matches!(
-                        &selected.family,
-                        SummaryFamilyType::ExactAggregate(
-                            planner_types::post_asap::ExactKind::Increase
-                                | planner_types::post_asap::ExactKind::Rate
-                                | planner_types::post_asap::ExactKind::MinMax,
-                            _
-                        )
-                    ) {
-                    // Exact temporal readouts may only merge panes wholly
-                    // contained by the requested interval. Use the runtime's
-                    // smallest supported pane and let the data plane anchor it
-                    // to the first event-time sample; common scrape/repetition
-                    // cadences then preserve exact boundaries without raw data.
-                    exact_temporal_pane_secs(
-                        window_implementation.pane_secs,
-                        query.lifecycle.evaluation_interval_ms,
-                        request.source_sample_interval_ms,
-                    )
-                } else {
-                    window_implementation.pane_secs
-                };
+                // Preserve semantic window and evaluation cadence independently
+                // from the selected storage representation.
+                aggregation.window_secs = window_implementation.window_secs;
                 let mut runtime_materialization =
                     aggregation_config_for_materialization(&aggregation)?;
-                let pane_width_ms = runtime_materialization.slide_interval.saturating_mul(1_000);
+                runtime_materialization.window_size = window_implementation.window_secs;
+                runtime_materialization.slide_interval = window_implementation.slide_secs;
+                runtime_materialization.window_type =
+                    if window_implementation.slide_secs == window_implementation.window_secs {
+                        asap_types::WindowKind::Tumbling
+                    } else {
+                        asap_types::WindowKind::Sliding
+                    };
+                runtime_materialization.window_layout = window_implementation.layout.clone();
+                let pane_width_ms = match &window_implementation.layout {
+                    asap_types::WindowMaterializationLayout::FullWindow => {
+                        window_implementation.slide_secs
+                    }
+                    layout => layout.base_pane_secs(),
+                }
+                .saturating_mul(1_000);
                 runtime_materialization.pane_origin_ms = shared_pane_origin_ms(
                     request.query_workload.as_ref(),
                     consumers[&materialization].iter().copied(),
@@ -2450,9 +2473,9 @@ impl PhysicalCompiler {
                     window_secs: runtime_materialization.window_size,
                     abstract_window_framework: planner_selection.window_framework.clone(),
                     window_implementation_id: window_implementation.implementation_id.clone(),
-                    pane_secs: runtime_materialization.slide_interval,
+                    slide_secs: runtime_materialization.slide_interval,
                     pane_origin_ms: runtime_materialization.pane_origin_ms,
-                    state_layout: window_implementation.state_layout.clone(),
+                    window_layout: window_implementation.layout.clone(),
                     evidence_source: evidence.map(|e| e.source.clone()),
                     lifecycle: planner_selection.lifecycle.clone(),
                 };
@@ -2605,11 +2628,17 @@ impl PhysicalCompiler {
                                 fingerprint.0
                             ))
                         })?;
-                    let pane_ms = precompute_plan
+                    let stored_interval_ms = precompute_plan
                         .materializations
                         .iter()
                         .find(|candidate| candidate.policy_fingerprint() == fingerprint)
-                        .map(|candidate| candidate.slide_interval.saturating_mul(1_000))
+                        .map(|candidate| match &candidate.window_layout {
+                            asap_types::WindowMaterializationLayout::FullWindow => {
+                                candidate.window_size
+                            }
+                            layout => layout.base_pane_secs(),
+                        }
+                        .saturating_mul(1_000))
                         .ok_or_else(|| {
                             crate::query_plan::QueryPlanError::Invalid(format!(
                                 "compiled binding {} has no precompute materialization",
@@ -2639,7 +2668,7 @@ impl PhysicalCompiler {
                             materialization.grouping_labels.labels.clone(),
                         ),
                         item_labels: materialization.aggregated_labels.labels.clone(),
-                        window_ms: pane_ms,
+                        window_ms: stored_interval_ms,
                         pane_origin_ms: materialization.pane_origin_ms,
                     })
             };
@@ -2770,11 +2799,11 @@ impl PhysicalCompiler {
                 .filter_map(|binding| binding.readout_lookback_ms)
                 .max();
             if let Some(lookback_ms) = max_lookback_ms {
-                let pane_ms = materialization.slide_interval.saturating_mul(1_000).max(1);
-                materialization.num_aggregates_to_retain = Some(retained_window_count(
+                materialization.num_aggregates_to_retain = Some(retained_state_count(
                     lookback_ms,
                     request.query_staleness_margin_ms,
-                    pane_ms,
+                    materialization.slide_interval.saturating_mul(1_000),
+                    &materialization.window_layout,
                 ));
             }
         }
@@ -3191,7 +3220,6 @@ fn validate_window_implementations(
         let valid = evidence.observed_at_unix_ms <= environment.observed_at_unix_ms
             && !candidate.implementation_id.trim().is_empty()
             && ids.insert(candidate.implementation_id.clone())
-            && !candidate.state_layout.trim().is_empty()
             && !evidence.model_version.trim().is_empty()
             && !evidence.workload_fingerprint.trim().is_empty()
             && evidence.valid_for_ms != 0
@@ -3203,16 +3231,32 @@ fn validate_window_implementations(
             && evidence.weighted_cost.is_finite()
             && evidence.weighted_cost >= 0.0
             && candidate.window_secs == query.window_secs
-            && candidate.pane_secs != 0
-            && candidate.pane_secs <= candidate.window_secs
-            && candidate.window_secs % candidate.pane_secs == 0
-            && candidate.framework == SummaryWindowFramework::Tumbling
+            && candidate
+                .layout
+                .validate(candidate.window_secs, candidate.slide_secs)
+                .is_ok()
+            && match (&candidate.framework, &candidate.layout) {
+                (
+                    SummaryWindowFramework::Tumbling | SummaryWindowFramework::Sliding,
+                    asap_types::WindowMaterializationLayout::Pane { .. },
+                )
+                | (
+                    SummaryWindowFramework::Sliding,
+                    asap_types::WindowMaterializationLayout::FullWindow,
+                ) => true,
+                (
+                    SummaryWindowFramework::Extension(name),
+                    asap_types::WindowMaterializationLayout::HierarchicalRollup { .. },
+                ) => name == "backend.exact-hierarchical-rollup.v1",
+                _ => false,
+            }
             && match environment.target {
                 PhysicalDeploymentTarget::DistributedCollectors => {
-                    candidate.pane_secs == candidate.window_secs
+                    matches!(
+                        candidate.layout,
+                        asap_types::WindowMaterializationLayout::FullWindow
+                    ) || matches!(candidate.layout, asap_types::WindowMaterializationLayout::Pane { pane_secs } if pane_secs == candidate.window_secs)
                 }
-                // Cadence does not establish phase alignment. Serving checks each
-                // actual interval and falls back when whole panes cannot cover it.
                 PhysicalDeploymentTarget::BackendLocalRemoteWrite => true,
             };
         if !valid {
@@ -3239,37 +3283,27 @@ fn validate_window_implementations(
     Ok(candidates)
 }
 
-fn exact_temporal_pane_secs(
-    candidate_pane_secs: u64,
-    evaluation_interval_ms: u32,
-    source_sample_interval_ms: Option<u64>,
+fn retained_state_count(
+    lookback_ms: u64,
+    staleness_margin_ms: u64,
+    slide_ms: u64,
+    layout: &asap_types::WindowMaterializationLayout,
 ) -> u64 {
-    fn gcd(mut left: u64, mut right: u64) -> u64 {
-        while right != 0 {
-            (left, right) = (right, left % right);
+    match layout {
+        asap_types::WindowMaterializationLayout::FullWindow => staleness_margin_ms
+            .div_ceil(slide_ms.max(1))
+            .saturating_add(1),
+        asap_types::WindowMaterializationLayout::Pane { pane_secs } => lookback_ms
+            .saturating_add(staleness_margin_ms)
+            .div_ceil(pane_secs.saturating_mul(1_000).max(1))
+            .saturating_add(1),
+        asap_types::WindowMaterializationLayout::HierarchicalRollup { base_pane_secs, .. } => {
+            lookback_ms
+                .saturating_add(staleness_margin_ms)
+                .div_ceil(base_pane_secs.saturating_mul(1_000).max(1))
+                .saturating_add(1)
         }
-        left
     }
-
-    let minimum = crate::emit::stage_config::MIN_WINDOW_SECS;
-    let Some(source_ms) = source_sample_interval_ms else {
-        return minimum;
-    };
-    if source_ms % 1_000 != 0 || u64::from(evaluation_interval_ms) % 1_000 != 0 {
-        return minimum;
-    }
-    let aligned = gcd(
-        candidate_pane_secs,
-        gcd(source_ms / 1_000, u64::from(evaluation_interval_ms) / 1_000),
-    );
-    aligned.max(minimum)
-}
-
-fn retained_window_count(lookback_ms: u64, staleness_margin_ms: u64, pane_ms: u64) -> u64 {
-    lookback_ms
-        .saturating_add(staleness_margin_ms)
-        .div_ceil(pane_ms.max(1))
-        .saturating_add(1)
 }
 
 /// Estimate the encoded bytes retained by one physical state. Sketch matrix
@@ -4111,8 +4145,8 @@ mod tests {
         assert_eq!(plan.precompute_plan.materializations.len(), 1);
         assert_eq!(
             plan.precompute_plan.materializations[0].num_aggregates_to_retain,
-            Some(13),
-            "one-minute readout retains twelve five-second panes plus a boundary pane"
+            Some(2),
+            "the explicitly selected one-minute pane plus a boundary pane is retained"
         );
         assert!(plan
             .query_plan
@@ -4522,8 +4556,8 @@ mod tests {
                     implementation_id: "collector-tumbling-v1".into(),
                     framework: SummaryWindowFramework::Tumbling,
                     window_secs: 60,
-                    pane_secs: 60,
-                    state_layout: "anchored-pane-v1".into(),
+                    slide_secs: 60,
+                    layout: asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 },
                     cost: ImplementationCostEvidence {
                         model_version: "test-cost-v1".into(),
                         workload_fingerprint: "test-workload".into(),
@@ -4921,13 +4955,6 @@ mod tests {
             .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExactReadout { .. })));
     }
 
-    #[test]
-    fn exact_temporal_pane_uses_observed_source_and_query_cadence() {
-        assert_eq!(exact_temporal_pane_secs(86_400, 60_000, Some(30_000)), 30);
-        assert_eq!(exact_temporal_pane_secs(43_200, 60_000, Some(30_000)), 30);
-        assert_eq!(exact_temporal_pane_secs(21_600, 60_000, None), 5);
-    }
-
     fn phase_workload(phases: &[u64]) -> QueryWorkload {
         QueryWorkload {
             language: QueryLanguage::PromQL,
@@ -4975,11 +5002,24 @@ mod tests {
 
     #[test]
     fn query_staleness_extends_retention_without_changing_readout_lookback() {
+        let panes = asap_types::WindowMaterializationLayout::Pane { pane_secs: 30 };
         assert_eq!(
-            retained_window_count(6 * 60 * 60_000, 19 * 60_000, 30_000),
+            retained_state_count(6 * 60 * 60_000, 19 * 60_000, 30_000, &panes),
             759
         );
-        assert_eq!(retained_window_count(6 * 60 * 60_000, 0, 30_000), 721);
+        assert_eq!(
+            retained_state_count(6 * 60 * 60_000, 0, 30_000, &panes),
+            721
+        );
+        assert_eq!(
+            retained_state_count(
+                6 * 60 * 60_000,
+                19 * 60_000,
+                30_000,
+                &asap_types::WindowMaterializationLayout::FullWindow,
+            ),
+            39
+        );
     }
 
     // Both production adapters preserve canonical root identity and select the
@@ -5182,26 +5222,17 @@ mod tests {
 
     #[test]
     fn shared_materialization_rejects_conflicting_deployment_contracts() {
-        for field in ["implementation", "layout"] {
-            let mut workload = request("q90", "quantile_over_time(0.90, m[1m])");
-            let mut other = request("q99", "quantile_over_time(0.99, m[1m])");
-            let implementation = &mut other.queries[0].window_implementations[0];
-            if field == "implementation" {
-                implementation.implementation_id = "another-implementation".into();
-            } else {
-                implementation.state_layout = "another-layout".into();
-            }
-            workload.queries.extend(other.queries);
-            let error = PhysicalCompiler
-                .compile(workload, environment(10_000))
-                .expect_err("conflicting shared state must fail before publication");
-            assert!(
-                error
-                    .to_string()
-                    .contains("conflicting deployment contracts"),
-                "{error}"
-            );
-        }
+        let mut workload = request("q90", "quantile_over_time(0.90, m[1m])");
+        let mut other = request("q99", "quantile_over_time(0.99, m[1m])");
+        other.queries[0].window_implementations[0].implementation_id =
+            "another-implementation".into();
+        workload.queries.extend(other.queries);
+        let error = PhysicalCompiler
+            .compile(workload, environment(10_000))
+            .expect_err("conflicting shared state must fail before publication");
+        assert!(error
+            .to_string()
+            .contains("conflicting deployment contracts"));
     }
 
     #[test]
@@ -5401,7 +5432,9 @@ mod tests {
         let mut five_minutes = query.window_implementations[0].clone();
         five_minutes.implementation_id = "five-minute-evidence".into();
         five_minutes.window_secs = 300;
-        five_minutes.pane_secs = 300;
+        five_minutes.framework = SummaryWindowFramework::Sliding;
+        five_minutes.slide_secs = 60;
+        five_minutes.layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 60 };
         query.window_implementations.push(five_minutes);
         let plan = PhysicalCompiler.compile(request, env).unwrap();
         let bindings = plan
@@ -5796,7 +5829,7 @@ mod tests {
                 plan.materializations[0].window_implementation_id,
                 "collector-tumbling-v1"
             );
-            assert_eq!(plan.materializations[0].pane_secs, 60);
+            assert_eq!(plan.materializations[0].slide_secs, 60);
             assert_eq!(
                 plan.materializations[0].lifecycle,
                 CollectorLifecycle {
@@ -5932,7 +5965,6 @@ mod tests {
                 evidence_valid_for_ms: 60_000,
                 horizon_seconds: 300.0,
                 window_implementation_id: "backend-tumbling-v1".into(),
-                state_layout: "anchored-pane-v1".into(),
                 implementation_cost: template.window_implementations[0].cost.clone(),
                 source_sample_interval_ms: None,
                 query_staleness_margin_ms: 0,
@@ -6250,13 +6282,15 @@ mod tests {
     // Concrete candidates with the same framework survive selection; changing
     // their quoted costs changes installed state, not the query's lookback.
     #[test]
-    fn tumbling_sizes_are_selected_by_cost_and_installed() {
-        for (small_cost, expected_secs, expected_id) in [(0.1, 10, "small"), (10.0, 60, "large")] {
+    fn pane_sizes_are_selected_by_cost_without_changing_semantic_window() {
+        for (small_cost, expected_pane_secs, expected_id) in
+            [(0.1, 10, "small"), (10.0, 60, "large")]
+        {
             let mut request = request("q", "sum(sum_over_time(m[1m]))");
             let query = &mut request.queries[0];
             let mut small = query.window_implementations[0].clone();
             small.implementation_id = "small".into();
-            small.pane_secs = 10;
+            small.layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 10 };
             small.cost.weighted_cost = small_cost;
             query.window_implementations[0].implementation_id = "large".into();
             query.window_implementations.push(small);
@@ -6265,7 +6299,11 @@ mod tests {
             env.collector_ids.clear();
             let bundle = PhysicalCompiler.compile(request, env).unwrap();
             let materialization = bundle.precompute_plan.materializations.first().unwrap();
-            assert_eq!(materialization.window_size, expected_secs);
+            assert_eq!(materialization.window_size, 60);
+            assert_eq!(
+                materialization.window_layout.base_pane_secs(),
+                expected_pane_secs
+            );
             let entry = bundle
                 .query_plan
                 .lookup("sum(sum_over_time(m[1m]))")
@@ -6273,7 +6311,7 @@ mod tests {
             assert_eq!(entry.instant.lookback_ms, 60_000);
             assert_eq!(
                 entry.materialization_bindings()[0].window_ms,
-                expected_secs * 1000
+                expected_pane_secs * 1000
             );
             assert_eq!(
                 bundle.lifecycle_estimates[0].window_implementation_id,
@@ -6282,7 +6320,59 @@ mod tests {
         }
     }
 
-    // Distinct logical cohorts cannot silently coalesce using only the first quote.
+    #[test]
+    fn sliding_layout_cost_selects_query_or_update_optimized_state() {
+        for (full_cost, expected_id, full_selected) in [
+            (0.1, "full-window", true),
+            (100.0, "mergeable-panes", false),
+        ] {
+            let mut request = request("q", "sum(sum_over_time(m[1m]))");
+            let query = &mut request.queries[0];
+            let mut panes = query.window_implementations[0].clone();
+            panes.implementation_id = "mergeable-panes".into();
+            panes.framework = SummaryWindowFramework::Sliding;
+            panes.slide_secs = 10;
+            panes.layout = asap_types::WindowMaterializationLayout::Pane { pane_secs: 10 };
+            panes.cost.weighted_cost = 1.0;
+            panes.cost.cpu_cost = 0.2;
+            panes.cost.storage_bytes = 1_024;
+
+            let mut full = panes.clone();
+            full.implementation_id = "full-window".into();
+            full.layout = asap_types::WindowMaterializationLayout::FullWindow;
+            full.cost.weighted_cost = full_cost;
+            // Full windows spend more update CPU and retained bytes, while
+            // avoiding query-time pane merges. The provider's weighted quote
+            // includes the workload's measured read frequency and cardinality.
+            full.cost.cpu_cost = 20.0;
+            full.cost.storage_bytes = 64 * 1_024;
+            query.window_implementations = vec![panes, full];
+
+            let mut env = environment(10_000);
+            env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+            env.collector_ids.clear();
+            let bundle = PhysicalCompiler.compile(request, env).unwrap();
+            assert_eq!(
+                bundle.lifecycle_estimates[0].window_implementation_id,
+                expected_id
+            );
+            assert_eq!(
+                matches!(
+                    bundle.precompute_plan.materializations[0].window_layout,
+                    asap_types::WindowMaterializationLayout::FullWindow
+                ),
+                full_selected
+            );
+            assert_eq!(bundle.precompute_plan.materializations[0].window_size, 60);
+            assert_eq!(
+                bundle.precompute_plan.materializations[0].slide_interval,
+                10
+            );
+        }
+    }
+
+    // Distinct semantic windows remain distinct definitions even when they use
+    // an equal base-pane width and implementation provider.
     #[test]
     fn selected_panes_reject_unpriced_cross_cohort_coalescing() {
         let mut workload = request("q20", "sum(sum_over_time(m[20s]))");
@@ -6296,22 +6386,25 @@ mod tests {
         second.window_implementations[0].window_secs = 40;
         workload.queries.push(second);
         for query in &mut workload.queries {
-            query.window_implementations[0].pane_secs = 10;
+            query.window_implementations[0].framework = SummaryWindowFramework::Sliding;
+            query.window_implementations[0].slide_secs = 10;
+            query.window_implementations[0].layout =
+                asap_types::WindowMaterializationLayout::Pane { pane_secs: 10 };
             query.window_implementations[0].implementation_id = "shared-ten-second-pane".into();
         }
         let mut env = environment(10_000);
         env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         env.collector_ids.clear();
-        assert!(
-            matches!(PhysicalCompiler.compile(workload, env), Err(CompileError::Lifecycle { reason, .. }) if reason.contains("distinct logical consumer cohorts"))
-        );
+        let bundle = PhysicalCompiler.compile(workload, env).unwrap();
+        assert_eq!(bundle.precompute_plan.materializations.len(), 2);
     }
 
     // Non-divisor panes cannot reconstruct a lookback from whole states.
     #[test]
     fn tumbling_sizes_reject_non_divisors() {
         let mut request = request("q", "sum(sum_over_time(m[1m]))");
-        request.queries[0].window_implementations[0].pane_secs = 7;
+        request.queries[0].window_implementations[0].layout =
+            asap_types::WindowMaterializationLayout::Pane { pane_secs: 7 };
         let mut env = environment(10_000);
         env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         assert!(PhysicalCompiler.compile(request, env).is_err());
