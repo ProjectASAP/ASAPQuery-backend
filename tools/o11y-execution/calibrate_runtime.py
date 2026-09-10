@@ -130,6 +130,7 @@ def measure(args, artifact, corpus, snapshot, folder):
             query_phase = phase(folder, "query-" + qid, before, after, time.perf_counter_ns() - start)
             raw = folder / f"queries-{qid}.json"
             runner.write_json(raw, records)
+            validate_candidate_topk_execution(candidate, records)
             routes = {record["execution"] for record in records}
             correct = all(record["comparison"]["equal"] and record["exact"]["http_status"] == 200 for record in records)
             row["queries"][qid] = {"cpu_ns": query_phase["cpu_ns"], "evaluations": len(records),
@@ -174,6 +175,80 @@ def measure(args, artifact, corpus, snapshot, folder):
     return row
 
 
+
+def _candidate_topk_inputs(nodes, root):
+    bindings, visiting, visited = set(), set(), set()
+    def visit(node_id):
+        node_id = str(node_id)
+        if node_id in visiting:
+            raise ValueError("CandidateTopK input DAG contains a cycle")
+        if node_id in visited:
+            return
+        if node_id not in nodes:
+            raise ValueError(f"CandidateTopK input DAG references missing node {node_id}")
+        visiting.add(node_id)
+        node = nodes[node_id]
+        if node.get("op") == "exact_fallback":
+            raise ValueError("CandidateTopK input contains ExactFallback")
+        if node.get("op") == "read_materialization":
+            bindings.add(str(node["binding"]["materialization"]))
+        children = [str(value) for value in node.get("inputs", [])]
+        if "input" in node:
+            children.append(str(node["input"]))
+        for child in children:
+            visit(child)
+        visiting.remove(node_id)
+        visited.add(node_id)
+    visit(root)
+    return bindings
+
+
+def validate_candidate_topk_artifact(artifact):
+    """Reject CandidateTopK plans whose membership sidecar is not locally installed."""
+    request = artifact.get("install_request", {})
+    schemas = {str(row["materialization"]): row for row in request.get("precompute_plan", {}).get("schemas", [])}
+    for entry in request.get("query_plan", {}).get("entries", {}).values():
+        nodes = entry.get("nodes", {})
+        for node in nodes.values():
+            if node.get("op") != "candidate_top_k":
+                continue
+            inputs = node.get("inputs", [])
+            if len(inputs) != 2:
+                raise ValueError("CandidateTopK requires membership and exact-value inputs")
+            membership_bindings = _candidate_topk_inputs(nodes, inputs[0])
+            value_bindings = _candidate_topk_inputs(nodes, inputs[1])
+            heap_bindings = []
+            for materialization in membership_bindings:
+                schema = schemas.get(materialization)
+                family = json.dumps((schema or {}).get("family", {}), sort_keys=True)
+                if "CmsWithHeap" in family or "CountSketchWithHeap" in family:
+                    heap_bindings.append(materialization)
+            if not heap_bindings:
+                raise ValueError("CandidateTopK membership input has no installed heap materialization")
+            if not any("exact" in json.dumps((schemas.get(mid) or {}).get("family", {})).lower()
+                       and any(kind in json.dumps((schemas.get(mid) or {}).get("family", {})).lower()
+                               for kind in ("counter", "rate", "increase"))
+                       for mid in value_bindings):
+                raise ValueError("CandidateTopK value input has no installed ExactCounter materialization")
+
+
+def validate_candidate_topk_execution(artifact, records):
+    has_candidate_topk = any(node.get("op") == "candidate_top_k"
+        for entry in artifact.get("install_request", {}).get("query_plan", {}).get("entries", {}).values()
+        for node in entry.get("nodes", {}).values())
+    if not has_candidate_topk:
+        return
+    for record in records:
+        provenance = record.get("execution_provenance", {})
+        if record.get("execution") != "warm":
+            raise ValueError("CandidateTopK execution was not warm")
+        for key in ("exact_subquery_rpcs", "exact_subquery_evaluations", "exact_branch_evaluations"):
+            if provenance.get(key, 0) != 0:
+                raise ValueError(f"CandidateTopK execution used exact path: {key}")
+        if provenance.get("summary_readout_evaluations", 0) < 2:
+            raise ValueError("CandidateTopK execution did not read both summary branches")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["candidates", "metrics", "queries", "snapshot", "data-plane", "prometheus", "output"]:
@@ -197,7 +272,11 @@ def main():
     runner.validate_workload(snapshot, corpus)
     result = {"units": "cpu_ns", "data_snapshot_id": "sha256:" + hashlib.sha256(args.metrics.read_bytes()).hexdigest(),
               "scope": "accelerated finite-input calibration; measured wall residency is not full logical-horizon residency", "validated_sample_count": sample_count, "candidates": []}
-    for index, candidate in enumerate(json.loads(args.candidates.read_text())["candidates"]):
+    candidates = json.loads(args.candidates.read_text())["candidates"]
+    for candidate in candidates:
+        if "manifest" in candidate and "install_request" in candidate:
+            validate_candidate_topk_artifact(candidate)
+    for index, candidate in enumerate(candidates):
         if "manifest" not in candidate or "install_request" not in candidate:
             continue
         result["candidates"].append(measure(args, candidate, corpus, snapshot, args.output / f"candidate-{index}"))
