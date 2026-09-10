@@ -1,7 +1,9 @@
 use super::{
-    clickhouse_result_adapter::raw_response, fallback::ClickHouseExactBackend,
+    clickhouse_result_adapter::raw_response,
+    fallback::{ClickHouseExactBackend, ClickHouseRawResponse},
     request::ClickHouseQueryRequest,
 };
+use async_trait::async_trait;
 use axum::{
     body::Bytes,
     extract::{Query, State},
@@ -19,6 +21,41 @@ use tokio::net::TcpListener;
 #[derive(Clone)]
 struct ServerState {
     fallback: Arc<dyn ClickHouseExactBackend>,
+    accelerator: Arc<dyn ClickHouseAccelerator>,
+}
+
+/// The SQL-language boundary for accelerated execution.
+///
+/// Implementations own plan-catalog lookup, planning/binding, DAG execution,
+/// coverage validation, and ClickHouse result encoding. Every fail-closed
+/// outcome is routed to the exact ClickHouse backend by this HTTP adapter.
+#[async_trait]
+pub trait ClickHouseAccelerator: Send + Sync {
+    async fn execute(&self, request: &ClickHouseQueryRequest) -> ClickHouseAccelerationOutcome;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClickHouseAccelerationFallback {
+    CatalogMiss,
+    Planning(String),
+    Execution(String),
+    IncompleteCoverage,
+    UnsupportedFormat(String),
+}
+
+#[derive(Debug)]
+pub enum ClickHouseAccelerationOutcome {
+    Accelerated(ClickHouseRawResponse),
+    Fallback(ClickHouseAccelerationFallback),
+}
+
+struct DisabledAccelerator;
+
+#[async_trait]
+impl ClickHouseAccelerator for DisabledAccelerator {
+    async fn execute(&self, _request: &ClickHouseQueryRequest) -> ClickHouseAccelerationOutcome {
+        ClickHouseAccelerationOutcome::Fallback(ClickHouseAccelerationFallback::CatalogMiss)
+    }
 }
 
 pub struct ClickHouseHttpServer {
@@ -27,8 +64,22 @@ pub struct ClickHouseHttpServer {
 }
 
 impl ClickHouseHttpServer {
+    /// Builds the original exact-only router.
     pub fn router(fallback: Arc<dyn ClickHouseExactBackend>) -> Router {
-        let state = ServerState { fallback };
+        Self::router_with_accelerator(fallback, Arc::new(DisabledAccelerator))
+    }
+
+    /// Builds a router that attempts accelerated SQL execution before exact
+    /// fallback. The accelerator must return a fully encoded ClickHouse HTTP
+    /// response so format conversion remains at the SQL boundary.
+    pub fn router_with_accelerator(
+        fallback: Arc<dyn ClickHouseExactBackend>,
+        accelerator: Arc<dyn ClickHouseAccelerator>,
+    ) -> Router {
+        let state = ServerState {
+            fallback,
+            accelerator,
+        };
         Router::new()
             .route("/", get(query_get).post(query_post))
             .route("/ping", get(ping))
@@ -37,6 +88,15 @@ impl ClickHouseHttpServer {
 
     pub async fn run(self) -> Result<(), std::io::Error> {
         let app = Self::router(self.fallback);
+        let listener = TcpListener::bind(&self.listen_address).await?;
+        axum::serve(listener, app).await
+    }
+
+    pub async fn run_with_accelerator(
+        self,
+        accelerator: Arc<dyn ClickHouseAccelerator>,
+    ) -> Result<(), std::io::Error> {
+        let app = Self::router_with_accelerator(self.fallback, accelerator);
         let listener = TcpListener::bind(&self.listen_address).await?;
         axum::serve(listener, app).await
     }
@@ -56,6 +116,20 @@ mod tests {
     #[derive(Default)]
     struct RecordingFallback {
         sql: Mutex<Vec<String>>,
+    }
+
+    struct FixedAccelerator {
+        outcome: Mutex<Option<ClickHouseAccelerationOutcome>>,
+    }
+
+    #[async_trait]
+    impl ClickHouseAccelerator for FixedAccelerator {
+        async fn execute(
+            &self,
+            _request: &ClickHouseQueryRequest,
+        ) -> ClickHouseAccelerationOutcome {
+            self.outcome.lock().unwrap().take().unwrap()
+        }
     }
 
     #[async_trait]
@@ -130,6 +204,66 @@ mod tests {
         );
         assert_eq!(*fallback.sql.lock().unwrap(), vec!["SELECT 1", "SELECT 2"]);
     }
+
+    #[tokio::test]
+    async fn returns_accelerated_response_without_calling_exact_backend() {
+        let fallback = Arc::new(RecordingFallback::default());
+        let accelerator = Arc::new(FixedAccelerator {
+            outcome: Mutex::new(Some(ClickHouseAccelerationOutcome::Accelerated(
+                ClickHouseRawResponse {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::new(),
+                    body: Bytes::from_static(b"accelerated\n"),
+                },
+            ))),
+        });
+        let response = ClickHouseHttpServer::router_with_accelerator(fallback.clone(), accelerator)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/?query=SELECT%201")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "accelerated\n"
+        );
+        assert!(fallback.sql.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_acceleration_failure_routes_to_exact_backend() {
+        let cases = [
+            ClickHouseAccelerationFallback::CatalogMiss,
+            ClickHouseAccelerationFallback::Planning("cannot bind".into()),
+            ClickHouseAccelerationFallback::Execution("unsupported operator".into()),
+            ClickHouseAccelerationFallback::IncompleteCoverage,
+            ClickHouseAccelerationFallback::UnsupportedFormat("Native".into()),
+        ];
+
+        for reason in cases {
+            let fallback = Arc::new(RecordingFallback::default());
+            let accelerator = Arc::new(FixedAccelerator {
+                outcome: Mutex::new(Some(ClickHouseAccelerationOutcome::Fallback(reason))),
+            });
+            let response =
+                ClickHouseHttpServer::router_with_accelerator(fallback.clone(), accelerator)
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .uri("/?query=SELECT%201")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(*fallback.sql.lock().unwrap(), vec!["SELECT 1"]);
+        }
+    }
 }
 
 fn request(
@@ -165,10 +299,7 @@ async fn query_get(
         Ok(v) => v,
         Err(e) => return e,
     };
-    match state.fallback.execute(&request).await {
-        Ok(v) => raw_response(v),
-        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-    }
+    execute_or_fallback(&state, &request).await
 }
 
 async fn query_post(
@@ -181,7 +312,16 @@ async fn query_post(
         Ok(v) => v,
         Err(e) => return e,
     };
-    match state.fallback.execute(&request).await {
+    execute_or_fallback(&state, &request).await
+}
+
+async fn execute_or_fallback(state: &ServerState, request: &ClickHouseQueryRequest) -> Response {
+    if let ClickHouseAccelerationOutcome::Accelerated(response) =
+        state.accelerator.execute(request).await
+    {
+        return raw_response(response);
+    }
+    match state.fallback.execute(request).await {
         Ok(v) => raw_response(v),
         Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     }

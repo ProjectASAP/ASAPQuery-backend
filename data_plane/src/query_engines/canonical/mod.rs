@@ -4,6 +4,8 @@
 //! callers migrate. These re-exports give SQL and PromQL one execution API
 //! without changing the existing PromQL types or behavior.
 
+pub mod relational;
+
 pub mod executor {
     pub use crate::query_engines::asap_query_engine::summary_exec::{
         execute, ExecError, ExecOutcome, SummaryExecutor,

@@ -20,4 +20,16 @@ impl ClickHouseQueryRequest {
     pub fn query_id(&self) -> Option<&str> {
         self.parameters.get("query_id").map(String::as_str)
     }
+
+    pub fn format(&self) -> Option<&str> {
+        self.parameters
+            .get("default_format")
+            .map(String::as_str)
+            .or_else(|| {
+                let upper = self.sql.to_ascii_uppercase();
+                upper
+                    .rfind(" FORMAT ")
+                    .map(|index| self.sql[index + " FORMAT ".len()..].trim())
+            })
+    }
 }

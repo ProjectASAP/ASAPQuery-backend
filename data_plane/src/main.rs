@@ -110,6 +110,11 @@ struct Args {
     #[arg(long, env = "ASAP_CLICKHOUSE_DATABASE", default_value = "default")]
     clickhouse_database: String,
 
+    /// JSON bundle containing the independently published SQL plan catalog,
+    /// its SDS snapshot reference, and ClickHouse table schemas.
+    #[arg(long, env = "ASAP_CLICKHOUSE_PLAN_BUNDLE")]
+    clickhouse_plan_bundle: Option<String>,
+
     /// Deprecated/no-op: the backend's only HTTP listener is the
     /// PromQL query surface (`--http-port` / `--query-port`). The
     /// old PRW ingest port was deleted in PR #100; this flag is
@@ -1328,6 +1333,20 @@ async fn main() -> Result<()> {
 
     let victoria_task = victoria_server.map(|server| tokio::spawn(server.run()));
 
+    let clickhouse_accelerator = if let Some(path) = args.clickhouse_plan_bundle.as_ref() {
+        let bytes = fs::read(path)?;
+        let bundle: data_plane::query_engines::asap_clickhouse_query_engine::accelerator::ClickHousePlanBundle =
+            serde_json::from_slice(&bytes)?;
+        Some(Arc::new(
+            data_plane::query_engines::asap_clickhouse_query_engine::accelerator::CatalogClickHouseAccelerator::from_bundle(
+                bundle,
+                sketch_index.clone(),
+            )?,
+        ) as Arc<dyn data_plane::query_engines::asap_clickhouse_query_engine::ClickHouseAccelerator>)
+    } else {
+        None
+    };
+
     let clickhouse_server_handle = args.clickhouse_http_port.map(|port| {
         let fallback = Arc::new(
             data_plane::query_engines::asap_clickhouse_query_engine::ClickHouseHttpFallback::new(
@@ -1342,7 +1361,11 @@ async fn main() -> Result<()> {
             };
         info!("Starting ClickHouse-compatible HTTP proxy on port {port}");
         tokio::spawn(async move {
-            if let Err(error) = clickhouse_server.run().await {
+            let result = match clickhouse_accelerator {
+                Some(accelerator) => clickhouse_server.run_with_accelerator(accelerator).await,
+                None => clickhouse_server.run().await,
+            };
+            if let Err(error) = result {
                 error!("ClickHouse HTTP server error: {error}");
             }
         })
