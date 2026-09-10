@@ -4695,7 +4695,10 @@ mod sid_bucketing_tests {
         let frame = take_summary_frame_identity(&mut attrs, 100, 200).expect("valid identity");
         assert_eq!(frame.plan_id, 42);
         assert_eq!(frame.plan_version, 3);
-        assert_eq!(frame.materialization, asap_types::PolicyFingerprint(99).into());
+        assert_eq!(
+            frame.materialization,
+            asap_types::PolicyFingerprint(99).into()
+        );
         assert_eq!(attrs, HashMap::from([("service".into(), "api".into())]));
     }
 }

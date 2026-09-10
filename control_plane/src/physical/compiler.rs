@@ -650,13 +650,16 @@ impl PrecomputePlan {
             let materialization = self
                 .materializations
                 .iter()
-                .find(|candidate| candidate.policy_fingerprint() == schema.materialization.fingerprint())
+                .find(|candidate| {
+                    candidate.policy_fingerprint() == schema.materialization.fingerprint()
+                })
                 .ok_or(PrecomputePlanError::SchemaSetMismatch)?;
-            let accumulator = materialization
-                .accumulator_spec()
-                .map_err(|_| PrecomputePlanError::UnsupportedFamily(schema.materialization.as_u64()))?;
-            let family = StateFamilyContract::try_from(&accumulator.family)
-                .map_err(|_| PrecomputePlanError::UnsupportedFamily(schema.materialization.as_u64()))?;
+            let accumulator = materialization.accumulator_spec().map_err(|_| {
+                PrecomputePlanError::UnsupportedFamily(schema.materialization.as_u64())
+            })?;
+            let family = StateFamilyContract::try_from(&accumulator.family).map_err(|_| {
+                PrecomputePlanError::UnsupportedFamily(schema.materialization.as_u64())
+            })?;
             let source = materialization.table_name.as_ref().map_or_else(
                 || Source::TimeSeries {
                     metric: materialization.metric.clone(),
@@ -1077,10 +1080,7 @@ fn validate_catalog_projection(
         ));
     }
     for id in materializations {
-        if !catalog
-            .materializations
-            .contains_key(&id)
-        {
+        if !catalog.materializations.contains_key(&id) {
             return Err(TransmissionPlanError::Catalog(format!(
                 "unknown materialization {}",
                 id.as_u64()
