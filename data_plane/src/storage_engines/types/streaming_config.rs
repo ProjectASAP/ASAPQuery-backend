@@ -131,7 +131,7 @@ impl StreamingConfig {
                 let config = AggregationConfig::from_yaml_data(
                     aggregation_data,
                     num_aggregates_to_retain,
-                    QueryLanguage::promql,
+                    QueryLanguage::PromQl,
                 )?;
                 // PR 5: the map key IS the policy-fingerprint u64.
                 // `AggregationConfig::policy_fp_u64()` is the canonical

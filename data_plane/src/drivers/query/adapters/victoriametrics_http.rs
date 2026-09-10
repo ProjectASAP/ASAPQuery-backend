@@ -131,7 +131,7 @@ mod tests {
     fn adapter() -> VictoriaMetricsHttpAdapter {
         VictoriaMetricsHttpAdapter::new(AdapterConfig::new(
             QueryProtocol::PrometheusHttp,
-            QueryLanguage::promql,
+            QueryLanguage::PromQl,
             None,
         ))
     }

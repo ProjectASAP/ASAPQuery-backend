@@ -15,6 +15,7 @@ use planner_types::pre_asap::Reduction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use asap_types::QueryLanguage;
 use asap_types::{sds::SummaryDefinitionId, PolicyFingerprint};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -202,15 +203,6 @@ impl QueryPlan {
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum QueryLanguage {
-    #[default]
-    PromQl,
-    MetricsQl,
-    ClickHouseSql,
 }
 
 /// Stable identity inside one query entry. Edges are IDs so common

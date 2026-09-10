@@ -335,14 +335,26 @@ impl PrecomputeMaterialization {
             .unwrap_or("")
             .to_string();
 
-        // Only PromQL is supported after the dead-code cleanup.
         let (metric, table_name, value_column) = match query_language {
-            QueryLanguage::promql => {
+            QueryLanguage::PromQl | QueryLanguage::MetricsQl => {
                 let metric = aggregation_data["metric"]
                     .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Missing metric for PromQL query language"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Missing metric for time-series query language")
+                    })?
                     .to_string();
                 (metric, None, None)
+            }
+            QueryLanguage::ClickHouseSql => {
+                let table = aggregation_data["tableName"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing tableName for ClickHouse SQL"))?
+                    .to_string();
+                let column = aggregation_data["valueColumn"]
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("Missing valueColumn for ClickHouse SQL"))?
+                    .to_string();
+                (format!("{table}.{column}"), Some(table), Some(column))
             }
         };
 
@@ -427,10 +439,10 @@ mod tests {
     #[test]
     fn explicit_aggregation_id_in_yaml_is_ignored() {
         let with =
-            AggregationConfig::from_yaml_data(&sample_yaml(true), None, QueryLanguage::promql)
+            AggregationConfig::from_yaml_data(&sample_yaml(true), None, QueryLanguage::PromQl)
                 .expect("parse ok");
         let without =
-            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::promql)
+            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
                 .expect("parse ok");
         assert_eq!(
             with.policy_fingerprint(),
@@ -442,9 +454,9 @@ mod tests {
     /// Round-tripping the same content yields the same fingerprint.
     #[test]
     fn fingerprint_is_deterministic_per_content() {
-        let a = AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::promql)
+        let a = AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
             .expect("parse a");
-        let b = AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::promql)
+        let b = AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
             .expect("parse b");
         assert_eq!(a.policy_fingerprint(), b.policy_fingerprint());
         assert_ne!(
@@ -457,7 +469,7 @@ mod tests {
     #[test]
     fn pane_origin_round_trips_and_changes_definition_identity() {
         let mut epoch =
-            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::promql)
+            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
                 .expect("parse");
         let unknown = epoch.policy_fingerprint();
         epoch.pane_origin_ms = Some(7_000);
@@ -493,7 +505,7 @@ mod tests {
     #[test]
     fn policy_fp_u64_accessor_equals_fingerprint_u64() {
         let cfg =
-            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::promql)
+            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
                 .expect("parse");
         assert_eq!(cfg.policy_fp_u64(), cfg.policy_fingerprint().as_u64());
     }
@@ -502,7 +514,7 @@ mod tests {
     #[test]
     fn serialize_to_json_omits_aggregation_id() {
         let cfg =
-            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::promql)
+            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
                 .expect("parse");
         let json = cfg.serialize_to_json();
         assert!(
