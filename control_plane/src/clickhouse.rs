@@ -16,6 +16,7 @@ use crate::query_plan::{
 use asap_types::summary_catalog::SummaryCatalog;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
+use std::rc::Rc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClickHousePlanningError {
@@ -42,8 +43,24 @@ pub async fn plan_clickhouse_sql(
     // SQL keeps relational parents such as Project and Filter above a
     // summary-capable Aggregate. Use ASAPPlanner's recursive selector here;
     // the PromQL deployment lowering retains its existing conservative rules.
-    let cost_model = ControlPlaneCostModel::new(accuracy);
-    let selected = crate::planner_selection::select_summary(&canonical, &cost_model)?;
+    let cost_model = ControlPlaneCostModel::new(accuracy.clone());
+    // SQL commonly keeps relational operators (Project/Filter/Sort/Limit)
+    // above the summary-capable aggregate. Workload search materializes those
+    // residual parents around the selected inner summary; root-only candidate
+    // selection incorrectly rejects such queries before recursive mapping.
+    let selected = crate::planner_selection::select_workload(
+        vec![(0, Rc::new(canonical.clone()))],
+        accuracy,
+        &cost_model,
+    )?
+    .into_iter()
+    .next()
+    .map(|(_, node)| node)
+    .ok_or_else(|| {
+        crate::planner_selection::SelectionError::Workload(
+            "SQL workload search returned no root".into(),
+        )
+    })?;
     let physical = PhysicalExpr::committed(selected);
     Ok(ClickHousePlannedQuery {
         canonical_sql: canonical_sql_identity(&canonical),
@@ -245,6 +262,33 @@ fn select_materialization<'a>(
 mod tests {
     use super::*;
     use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    use planner_types::pre_asap::{Column, DataType, Schema};
+
+    #[tokio::test]
+    async fn relational_sql_root_recursively_selects_inner_summary() {
+        let schema = Schema::with_time_index(
+            vec![
+                Column::new("metric", DataType::Utf8, false),
+                Column::new("labels", DataType::Utf8, false),
+                Column::new("ts_ms", DataType::Timestamp, false),
+                Column::new("value", DataType::Float64, false),
+            ],
+            2,
+            vec![],
+        );
+        let catalog = SqlCatalog::new().with_table("raw_samples", schema);
+        let planned = plan_clickhouse_sql(
+            "SELECT labels, max(value) AS value FROM raw_samples \
+             WHERE metric='cache_refresh_lag_seconds' \
+             AND ts_ms>1788848096000 AND ts_ms<=1788891296000 \
+             GROUP BY labels ORDER BY labels",
+            &catalog,
+            AccuracyTarget::Exact,
+        )
+        .await
+        .expect("relational parents must be retained around the selected aggregate");
+        assert!(matches!(planned.physical, PhysicalExpr::Committed(_)));
+    }
 
     fn materialization(
         agg: AggregationType,
