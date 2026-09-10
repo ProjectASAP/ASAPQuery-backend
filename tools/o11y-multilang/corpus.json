@@ -14,7 +14,7 @@
         "division"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q02",
@@ -27,7 +27,7 @@
         "division"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q03",
@@ -40,7 +40,7 @@
         "division"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q04",
@@ -54,7 +54,7 @@
         "division"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q05",
@@ -65,7 +65,7 @@
         "max_over_time"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q06",
@@ -76,7 +76,7 @@
         "max_over_time"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q07",
@@ -85,7 +85,7 @@
       "clickhouse_sql": "SELECT mapConcat(labels,map('__name__','user_service_cache_refresh_lag_seconds')) AS labels, argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>{eval_ms}-300000 AND ts_ms<={eval_ms} GROUP BY labels ORDER BY labels",
       "operators": [],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q08",
@@ -97,7 +97,7 @@
         "sum"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q09",
@@ -108,7 +108,7 @@
         "sum"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q10",
@@ -121,7 +121,7 @@
         "subquery"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q11",
@@ -133,7 +133,7 @@
         "rate"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q12",
@@ -144,7 +144,7 @@
         "topk"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q13",
@@ -158,7 +158,7 @@
         "subquery"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q14",
@@ -170,7 +170,7 @@
         "sum"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q15",
@@ -181,7 +181,7 @@
         "rate"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q16",
@@ -194,7 +194,7 @@
         "division"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q17",
@@ -207,7 +207,7 @@
         "division"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q18",
@@ -219,7 +219,7 @@
         "comparison"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q19",
@@ -231,7 +231,7 @@
         "sum"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q20",
@@ -244,19 +244,19 @@
         "offset"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q21",
       "promql": "histogram_quantile(0.95, sum by (le) (rate(order_service_http_request_duration_seconds_bucket[5m])))",
       "metricsql": "histogram_quantile(0.95, sum by (le) (rate(order_service_http_request_duration_seconds_bucket[5m])))",
-      "clickhouse_sql": "SELECT map() labels,if(idx=length(buckets),buckets[idx-1].1,if(idx=1 AND buckets[idx].1<=0,buckets[idx].1,(if(idx=1,0.,buckets[idx-1].1)+(buckets[idx].1-if(idx=1,0.,buckets[idx-1].1))*(rank-if(idx=1,0.,buckets[idx-1].2))/(buckets[idx].2-if(idx=1,0.,buckets[idx-1].2))))) value FROM (SELECT buckets,0.95*buckets[length(buckets)].2 rank,arrayFirstIndex(x->x.2>=rank,buckets) idx FROM (SELECT arraySort(x->x.1,groupArray((if(le='+Inf',inf,toFloat64(le)),value))) buckets FROM (SELECT labels['le'] le,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-300000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_request_duration_seconds_bucket' AND ts_ms>=(({eval_ms}-0)-300000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2)) GROUP BY le))) WHERE idx>0",
+      "clickhouse_sql": "SELECT map() labels,if(idx=length(buckets),buckets[idx-1].1,if(idx=1 AND buckets[idx].1<=0,buckets[idx].1,(if(idx=1,0.,buckets[idx-1].1)+(buckets[idx].1-if(idx=1,0.,buckets[idx-1].1))*(rank-if(idx=1,0.,buckets[idx-1].2))/(buckets[idx].2-if(idx=1,0.,buckets[idx-1].2))))) value FROM (SELECT buckets,0.95*buckets[length(buckets)].2 rank,arrayFirstIndex(x->x.2>=rank,buckets) idx FROM (SELECT arrayMap(i->(raw[i].1,arrayMax(arrayMap(x->x.2,arraySlice(raw,1,i)))),range(1,length(raw)+1)) buckets FROM (SELECT arraySort(x->x.1,groupArray((if(le='+Inf',inf,toFloat64(le)),value))) raw FROM (SELECT labels['le'] le,sum(value) value FROM (SELECT labels, corrected*(sampled+least(start_extra,if(corrected>0,sampled*(first_value/corrected),start_extra))+end_extra)/sampled/(300000/1000) AS value FROM (SELECT labels,samples,length(samples) n,samples[1].1 first_ts,samples[n].1 last_ts,samples[1].2 first_value,samples[n].2 last_value,(last_ts-first_ts)/1000 sampled,(last_value-first_value)+arraySum(i -> if(samples[i].2<samples[i-1].2,samples[i-1].2,0.),range(2,n+1)) corrected,if((first_ts-(({eval_ms}-0)-300000))/1000<sampled/(n-1)*1.1,(first_ts-(({eval_ms}-0)-300000))/1000,sampled/(n-1)/2) start_extra,if((({eval_ms}-0)-last_ts)/1000<sampled/(n-1)*1.1,(({eval_ms}-0)-last_ts)/1000,sampled/(n-1)/2) end_extra FROM (SELECT labels,arraySort(x -> x.1,groupArray((ts_ms,value))) samples FROM raw_samples WHERE metric='order_service_http_request_duration_seconds_bucket' AND ts_ms>=(({eval_ms}-0)-300000) AND ts_ms<=({eval_ms}-0) GROUP BY labels) WHERE n>=2)) GROUP BY le)))) WHERE idx>0",
       "operators": [
         "histogram_quantile",
         "rate"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q22",
@@ -268,7 +268,7 @@
         "sum"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q23",
@@ -280,7 +280,7 @@
         "max_over_time"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q24",
@@ -295,7 +295,7 @@
         "division"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q25",
@@ -310,7 +310,7 @@
         "division"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q26",
@@ -322,7 +322,7 @@
         "rate"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     },
     {
       "id": "q27",
@@ -335,7 +335,7 @@
         "subquery"
       ],
       "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
-      "sql_mapping_status": "oracle_valid"
+      "sql_mapping_status": "oracle_pending"
     }
   ]
 }
