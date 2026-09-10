@@ -6,7 +6,7 @@
 //! answers are independently computed from those raw fixtures.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -20,20 +20,22 @@ use asap_otel_proto::tonic::metrics::v1::{
     KllSketch as OtelKllSketch, KllSketchDataPoint, KllSketchEncoding, Metric, ResourceMetrics,
     ScopeMetrics,
 };
-use asap_sketchlib::proto::sketchlib::{HllVariant as ProtoHllVariant, HyperLogLogState, KllState};
-use asap_sketchlib::{CountMinSketch, CountSketch, HllSketch, HllVariant, MessagePackCodec};
+use asap_sketchlib::proto::sketchlib::{
+    CountMinState, CountSketchState, CounterType, HllVariant as ProtoHllVariant, HyperLogLogState,
+    KllState,
+};
+use asap_sketchlib::{CountMinSketch, CountSketch, HllSketch, HllVariant};
+use data_plane::SerializableToSink;
 use prost::Message;
 use serde_json::Value;
 
 const SERVICE: &str = "oracle-e2e";
-#[path = "support/physical_fixture.rs"]
-mod physical_fixture;
 // These parameters satisfy the production query path's LIVE_ACCURACY
 // (`epsilon = 0.01`). ASAPPlanner validates an observed `SketchKind`
 // against that accuracy before committing it, so the fixture must use the
 // same contract as a real control-plane-generated materialization.
 const K: u32 = 269;
-const HLL_PRECISION: u32 = 14;
+const HLL_PRECISION: u32 = 7;
 const CMS_ROWS: usize = 5;
 const CMS_COLS: usize = 2048;
 // ASAPPlanner's CountSketch guarantee is L2-based: epsilon=sqrt(3/width),
@@ -53,14 +55,16 @@ impl Drop for ChildGuard {
 }
 
 struct Backend {
-    evaluation_ms: std::sync::atomic::AtomicU64,
-    artifact: data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest,
     _child: ChildGuard,
     client: reqwest::Client,
     query_base: String,
     otlp_url: String,
     _config: tempfile::NamedTempFile,
+    _streaming_config: tempfile::NamedTempFile,
     _output_dir: tempfile::TempDir,
+    frame: Vec<(String, String)>,
+    window_start_ns: u64,
+    sketch_params: planner_types::post_asap::SketchParams,
 }
 
 fn unused_port() -> u16 {
@@ -75,8 +79,7 @@ fn now_ns() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock before UNIX epoch")
-        .as_secs()
-        * 1_000_000_000
+        .as_nanos() as u64
 }
 
 fn labels() -> Vec<KeyValue> {
@@ -108,48 +111,134 @@ fn envelope(metric: &str, data: Data) -> ExportMetricsServiceRequest {
     }
 }
 
-async fn start_backend(config_yaml: &str, live_delta: Option<&str>) -> Backend {
+async fn start_backend(
+    config_yaml: &str,
+    live_delta: Option<&str>,
+    promql: &str,
+    algorithm: planner_types::post_asap::SketchAlgorithm,
+    accuracy: planner_types::types::AccuracyTarget,
+) -> Backend {
     let query_port = unused_port();
     let otlp_http_port = unused_port();
     let otlp_grpc_port = unused_port();
     let output_dir = tempfile::tempdir().expect("create data-plane output directory");
-    let mut config = tempfile::NamedTempFile::new().expect("create streaming config");
-    config
-        .write_all(config_yaml.as_bytes())
-        .expect("write streaming config");
-    config.flush().expect("flush streaming config");
-    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
-        &serde_yaml::from_str(config_yaml).unwrap(),
+    let mut streaming_config = tempfile::NamedTempFile::new().unwrap();
+    streaming_config.write_all(config_yaml.as_bytes()).unwrap();
+    streaming_config.flush().unwrap();
+    let mut fixture: Value = serde_json::from_str(include_str!(
+        "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+    ))
+    .unwrap();
+    let mut demand = fixture["query_workload"]["repeating_queries"][0].clone();
+    demand["query"] = promql.into();
+    demand["time_selection"]["lookback"] = 10_000.into();
+    fixture["query_workload"]["repeating_queries"] = serde_json::json!([demand]);
+    fixture["implementation"]["topk_evidence"] = serde_json::json!({});
+    let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        serde_json::from_value(fixture).unwrap();
+    let (mut request, mut environment) = snapshot.planning_request().unwrap();
+    request.hybrid_execution = false;
+    request.query_workload = None;
+    request.queries[0].window_implementations[0].implementation_id = "collector-tumbling-v1".into();
+    environment.target =
+        control_plane::physical::compiler::PhysicalDeploymentTarget::DistributedCollectors;
+    environment.collector_ids = vec!["oracle-e2e-collector".into()];
+    request.queries[0].accuracy = accuracy.clone();
+    request.queries[0].group_by = vec!["service".into()];
+    let expr =
+        control_plane::query_parser::parse_query_expr_canonical(promql, accuracy.clone()).unwrap();
+    request.queries[0].post_asap = control_plane::planner_selection::select_summary(
+        &expr,
+        &control_plane::physical::post_asap::cost_model::ForcedFamilyCostModel::new(
+            accuracy,
+            algorithm.clone(),
+        ),
     )
     .unwrap();
-    let mut physical = tempfile::NamedTempFile::new().unwrap();
-    let mut install = physical_fixture::artifact(&runtime);
-    for rule in &mut install.transmission_plan.rules {
-        if matches!(
-            install
-                .precompute_plan
-                .schemas
-                .iter()
-                .find(|s| s.materialization == rule.materialization)
-                .unwrap()
-                .family,
-            control_plane::physical::compiler::StateFamilyContract::Sketch {
-                algorithm: planner_types::post_asap::SketchAlgorithm::Cms
-                    | planner_types::post_asap::SketchAlgorithm::CountSketch,
-                ..
-            }
-        ) {
-            rule.encoding = control_plane::physical::compiler::StateEncoding::SketchCoreMsgpackV1;
-        }
-    }
-    serde_json::to_writer(&mut physical, &install).unwrap();
+    let plan = control_plane::physical::compiler::PhysicalCompiler
+        .compile(request, environment)
+        .unwrap();
+    let mut installed = plan.precompute_plan.materializations[0].serialize_to_json();
+    installed["labels"] = serde_json::json!({
+        "grouping": plan.precompute_plan.materializations[0].grouping_labels.labels,
+        "rollup": [],
+        "aggregated": []
+    });
+    streaming_config.as_file_mut().set_len(0).unwrap();
+    streaming_config.as_file_mut().rewind().unwrap();
+    serde_json::to_writer(
+        &mut streaming_config,
+        &serde_json::json!({"aggregations": [installed]}),
+    )
+    .unwrap();
+    streaming_config.flush().unwrap();
+    let schema = plan
+        .precompute_plan
+        .schemas
+        .first()
+        .expect("compiled state schema");
+    let producer = plan.precompute_plan.producers.first().unwrap_or_else(|| {
+        panic!(
+            "compiled producer; schemas={:?}, materializations={:?}, collectors={:?}",
+            plan.precompute_plan.schemas,
+            plan.precompute_plan.materializations,
+            plan.collector_plans
+        )
+    });
+    let control_plane::physical::compiler::StateFamilyContract::Sketch {
+        parameters: sketch_params,
+        ..
+    } = &schema.family
+    else {
+        panic!("oracle requires sketch schema")
+    };
+    let sketch_params = sketch_params.clone();
+    let encoding = "sketchlib_protobuf_v1";
+    let frame = vec![
+        ("identity_version".into(), "1".into()),
+        ("plan_id".into(), plan.envelope.plan_id.to_string()),
+        (
+            "plan_version".into(),
+            plan.envelope.plan_version.to_string(),
+        ),
+        (
+            "backend_compat".into(),
+            plan.envelope.backend_compat.clone(),
+        ),
+        (
+            "materialization".into(),
+            schema.materialization.as_u64().to_string(),
+        ),
+        (
+            "series_identity".into(),
+            data_plane::drivers::ingest::canonical_attrs_fingerprint(&[("service", SERVICE)]),
+        ),
+        ("schema_id".into(), schema.schema_id.clone()),
+        ("producer_id".into(), producer.producer_id.clone()),
+        ("producer_epoch".into(), "oracle-e2e".into()),
+        ("kind".into(), "full".into()),
+        ("encoding".into(), encoding.into()),
+    ];
+    let artifact = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
+        summary_catalog: plan.summary_catalog,
+        collector_plans: plan.collector_plans,
+        precompute_plan: plan.precompute_plan,
+        transmission_plan: plan.transmission_plan,
+        query_plan: plan.query_plan,
+        metricsql_plan_catalog: plan.metricsql_plan_catalog,
+        storage_routing: None,
+        adaptation_evidence: vec![],
+    };
+    let mut config = tempfile::NamedTempFile::new().expect("create physical plan");
+    serde_json::to_writer(&mut config, &artifact).unwrap();
+    config.flush().unwrap();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_data_plane"));
     command
-        .arg("--streaming-config")
-        .arg(config.path())
         .arg("--physical-plan")
-        .arg(physical.path())
+        .arg(config.path())
+        .arg("--streaming-config")
+        .arg(streaming_config.path())
         .arg("--http-port")
         .arg(query_port.to_string())
         .arg("--output-dir")
@@ -184,14 +273,16 @@ async fn start_backend(config_yaml: &str, live_delta: Option<&str>) -> Backend {
             .is_ok_and(|response| response.status().is_success())
         {
             return Backend {
-                artifact: install,
-                evaluation_ms: std::sync::atomic::AtomicU64::new(0),
                 _child: child,
                 client,
                 query_base,
                 otlp_url: format!("http://127.0.0.1:{otlp_http_port}/v1/metrics"),
                 _config: config,
+                _streaming_config: streaming_config,
                 _output_dir: output_dir,
+                frame,
+                window_start_ns: now_ns() / 10_000_000_000 * 10_000_000_000 - 10_000_000_000,
+                sketch_params,
             };
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -199,22 +290,26 @@ async fn start_backend(config_yaml: &str, live_delta: Option<&str>) -> Backend {
     panic!("data-plane did not become ready at {health}");
 }
 
-async fn post(backend: &Backend, mut request: ExportMetricsServiceRequest) {
-    let data = request.resource_metrics[0].scope_metrics[0].metrics[0]
-        .data
-        .as_ref()
-        .unwrap();
-    let ns = match data {
-        Data::Kllsketch(s) => s.data_points[0].time_unix_nano,
-        Data::Hllsketch(s) => s.data_points[0].time_unix_nano,
-        Data::Countminsketch(s) => s.data_points[0].time_unix_nano,
-        Data::Countsketch(s) => s.data_points[0].time_unix_nano,
-        _ => unreachable!(),
+async fn post(backend: &Backend, mut request: ExportMetricsServiceRequest, sequence: u64) {
+    let metric = &mut request.resource_metrics[0].scope_metrics[0].metrics[0];
+    let attributes = match metric.data.as_mut().expect("metric data") {
+        Data::Kllsketch(value) => &mut value.data_points[0].attributes,
+        Data::Hllsketch(value) => &mut value.data_points[0].attributes,
+        Data::Countminsketch(value) => &mut value.data_points[0].attributes,
+        Data::Countsketch(value) => &mut value.data_points[0].attributes,
+        other => panic!("unexpected oracle metric: {other:?}"),
     };
-    backend
-        .evaluation_ms
-        .store(ns / 1_000_000, std::sync::atomic::Ordering::Relaxed);
-    physical_fixture::stamp(&mut request, &backend.artifact);
+    let mut frame = backend.frame.clone();
+    frame.extend([
+        ("sequence".into(), sequence.to_string()),
+        ("checkpoint_id".into(), format!("oracle-{sequence}")),
+    ]);
+    attributes.extend(frame.into_iter().map(|(key, value)| KeyValue {
+        key: format!("asap.frame.{key}"),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value)),
+        }),
+    }));
     let response = backend
         .client
         .post(&backend.otlp_url)
@@ -224,8 +319,11 @@ async fn post(backend: &Backend, mut request: ExportMetricsServiceRequest) {
         .await
         .expect("post modified OTLP");
     let status = response.status();
-    let body = response.text().await.unwrap();
-    assert!(status.is_success(), "OTLP {status}: {body}");
+    let body = response.text().await.expect("read modified OTLP response");
+    assert!(
+        status.is_success(),
+        "production backend rejected modified OTLP ({status}): {body}"
+    );
 }
 
 async fn query(backend: &Backend, promql: &str) -> Value {
@@ -234,15 +332,13 @@ async fn query(backend: &Backend, promql: &str) -> Value {
         response = backend
             .client
             .get(format!("{}/api/v1/query", backend.query_base))
-            .query(&[("query", promql)])
-            .query(&[(
-                "time",
-                (backend
-                    .evaluation_ms
-                    .load(std::sync::atomic::Ordering::Relaxed) as f64
-                    / 1000.0)
-                    .to_string(),
-            )])
+            .query(&[
+                ("query", promql.to_string()),
+                (
+                    "time",
+                    ((backend.window_start_ns + 10_000_000_000) as f64 / 1e9).to_string(),
+                ),
+            ])
             .send()
             .await
             .expect("query production backend")
@@ -332,14 +428,19 @@ fn kll_export(metric: &str, timestamp_ns: u64, raw: &[f64]) -> ExportMetricsServ
     )
 }
 
-fn hll_export(metric: &str, timestamp_ns: u64, raw: &[&str]) -> ExportMetricsServiceRequest {
-    let mut sketch = HllSketch::new(HllVariant::Regular, HLL_PRECISION);
+fn hll_export(
+    metric: &str,
+    timestamp_ns: u64,
+    raw: &[&str],
+    precision: u32,
+) -> ExportMetricsServiceRequest {
+    let mut sketch = HllSketch::new(HllVariant::Regular, precision);
     for value in raw {
         sketch.update(value.as_bytes());
     }
     let state = HyperLogLogState {
         variant: ProtoHllVariant::Regular as i32,
-        precision: HLL_PRECISION,
+        precision,
         registers: sketch.registers,
         hip_kxq0: 0.0,
         hip_kxq1: 0.0,
@@ -359,13 +460,19 @@ fn hll_export(metric: &str, timestamp_ns: u64, raw: &[&str]) -> ExportMetricsSer
                 series_id: 0,
             }],
             aggregation_temporality: 0,
-            precision: HLL_PRECISION,
+            precision,
         }),
     )
 }
 
-fn cms_export(metric: &str, timestamp_ns: u64, raw: &[&str]) -> ExportMetricsServiceRequest {
-    let mut sketch = CountMinSketch::new(CMS_ROWS, CMS_COLS);
+fn cms_export(
+    metric: &str,
+    timestamp_ns: u64,
+    raw: &[&str],
+    rows: usize,
+    cols: usize,
+) -> ExportMetricsServiceRequest {
+    let mut sketch = CountMinSketch::new(rows, cols);
     for key in raw {
         sketch.update(key, 1.0);
     }
@@ -376,14 +483,25 @@ fn cms_export(metric: &str, timestamp_ns: u64, raw: &[&str]) -> ExportMetricsSer
                 attributes: labels(),
                 start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
                 time_unix_nano: timestamp_ns,
-                sketch: sketch.to_msgpack().expect("encode CMS-with-heap"),
-                encoding: CountMinSketchEncoding::Msgpack as i32,
+                sketch: CountMinState {
+                    rows: rows as u32,
+                    cols: cols as u32,
+                    counter_type: CounterType::Float64 as i32,
+                    counts_int: vec![],
+                    counts_float: sketch.sketch().into_iter().flatten().collect(),
+                    sum_counts: vec![],
+                    sum2_counts: vec![],
+                    l1: vec![],
+                    l2: vec![],
+                }
+                .encode_to_vec(),
+                encoding: CountMinSketchEncoding::Proto as i32,
                 flags: 0,
                 series_id: 0,
             }],
             aggregation_temporality: 0,
-            rows: CMS_ROWS as i32,
-            cols: CMS_COLS as i32,
+            rows: rows as i32,
+            cols: cols as i32,
         }),
     )
 }
@@ -392,8 +510,10 @@ fn count_sketch_export(
     metric: &str,
     timestamp_ns: u64,
     raw: &[&str],
+    rows: usize,
+    cols: usize,
 ) -> ExportMetricsServiceRequest {
-    let mut sketch = CountSketch::new(COUNT_SKETCH_ROWS, COUNT_SKETCH_COLS);
+    let mut sketch = CountSketch::new(rows, cols);
     for key in raw {
         sketch.update(key, 1.0);
     }
@@ -404,14 +524,23 @@ fn count_sketch_export(
                 attributes: labels(),
                 start_time_unix_nano: timestamp_ns.saturating_sub(1_000_000_000),
                 time_unix_nano: timestamp_ns,
-                sketch: sketch.to_msgpack().expect("encode CountSketch-with-heap"),
-                encoding: CountSketchEncoding::Msgpack as i32,
+                sketch: CountSketchState {
+                    rows: rows as u32,
+                    cols: cols as u32,
+                    counter_type: CounterType::Float64 as i32,
+                    counts_int: vec![],
+                    counts_float: sketch.matrix.into_iter().flatten().collect(),
+                    l2: vec![],
+                    topk: None,
+                }
+                .encode_to_vec(),
+                encoding: CountSketchEncoding::Proto as i32,
                 flags: 0,
                 series_id: 0,
             }],
             aggregation_temporality: 0,
-            rows: COUNT_SKETCH_ROWS as i32,
-            cols: COUNT_SKETCH_COLS as i32,
+            rows: rows as i32,
+            cols: cols as i32,
         }),
     )
 }
@@ -423,16 +552,6 @@ fn exact_quantile(raw: &[f64], q: f64) -> f64 {
     let low = rank.floor() as usize;
     let high = rank.ceil() as usize;
     sorted[low] + (sorted[high] - sorted[low]) * (rank - low as f64)
-}
-
-fn assert_frequency_total_oracle(response: &Value, raw: &[&str]) {
-    let samples = scalar_values(response);
-    assert_eq!(samples.len(), 1, "expected one grouped frequency total");
-    assert_eq!(
-        samples[0].0.get("service").map(String::as_str),
-        Some(SERVICE)
-    );
-    assert_eq!(samples[0].1.round() as usize, raw.len());
 }
 
 fn assert_frequency_point_oracle(response: &Value, raw: &[&str], item: &str) {
@@ -450,19 +569,32 @@ fn assert_frequency_point_oracle(response: &Value, raw: &[&str], item: &str) {
 async fn production_kll_matches_raw_quantile_oracle() {
     let metric = "oracle_kll_latency";
     let backend = start_backend(
-        &config(metric, "DatasketchesKLL", &format!("      k: {K}")),
+        &config(metric, "DatasketchesKLL", &format!("      K: {K}")),
         None,
+        &format!("quantile_over_time(0.5, {metric}[10s])"),
+        planner_types::post_asap::SketchAlgorithm::Kll,
+        planner_types::types::AccuracyTarget::EpsilonDelta {
+            epsilon: 0.01,
+            delta: 0.01,
+        },
     )
     .await;
     let raw: Vec<f64> = (1..=101).map(f64::from).collect();
-    let timestamp = now_ns().saturating_sub(2_000_000_000);
-    post(&backend, kll_export(metric, timestamp, &raw)).await;
+    let timestamp = backend.window_start_ns + 9_000_000_000;
+    post(&backend, kll_export(metric, timestamp, &raw), 1).await;
     post(
         &backend,
         kll_export(metric, timestamp + 1_000_000_000, &raw),
+        2,
     )
     .await;
-    let response = query(&backend, &format!("quantile_over_time(0.5, {metric}[2s])")).await;
+    post(
+        &backend,
+        kll_export(metric, timestamp + 10_000_000_000, &raw),
+        3,
+    )
+    .await;
+    let response = query(&backend, &format!("quantile_over_time(0.5, {metric}[10s])")).await;
     let samples = scalar_values(&response);
     assert_eq!(
         samples[0].0.get("service").map(String::as_str),
@@ -478,17 +610,31 @@ async fn production_hll_matches_raw_distinct_oracle() {
     let backend = start_backend(
         &config(metric, "HLL", &format!("      precision: {HLL_PRECISION}")),
         None,
+        &format!("count({metric})"),
+        planner_types::post_asap::SketchAlgorithm::Hll,
+        planner_types::types::AccuracyTarget::Epsilon(0.1),
     )
     .await;
     let owned: Vec<String> = (0..2_000).map(|i| format!("user-{i}")).collect();
     let mut raw: Vec<&str> = owned.iter().map(String::as_str).collect();
     raw.extend(owned.iter().take(500).map(String::as_str));
     let exact = raw.iter().copied().collect::<HashSet<_>>().len() as f64;
-    let timestamp = now_ns().saturating_sub(2_000_000_000);
-    post(&backend, hll_export(metric, timestamp, &raw)).await;
+    let planner_types::post_asap::SketchParams::Hll { precision } = &backend.sketch_params else {
+        panic!("HLL plan")
+    };
+    let precision = u32::from(*precision);
+    let timestamp = backend.window_start_ns + 9_000_000_000;
+    post(&backend, hll_export(metric, timestamp, &raw, precision), 1).await;
     post(
         &backend,
-        hll_export(metric, timestamp + 1_000_000_000, &raw),
+        hll_export(metric, timestamp + 1_000_000_000, &raw, precision),
+        2,
+    )
+    .await;
+    post(
+        &backend,
+        hll_export(metric, timestamp + 10_000_000_000, &raw, precision),
+        3,
     )
     .await;
     let response = query(&backend, &format!("count({metric})")).await;
@@ -512,19 +658,45 @@ fn frequency_fixture() -> Vec<&'static str> {
 async fn production_cms_matches_raw_frequency_oracle() {
     let metric = "oracle_cms_frequency";
     let params = format!("      w: {CMS_COLS}\n      d: {CMS_ROWS}");
-    let backend = start_backend(&config(metric, "CountMinSketch", &params), None).await;
-    let raw = frequency_fixture();
-    let timestamp = now_ns().saturating_sub(2_000_000_000);
-    post(&backend, cms_export(metric, timestamp, &raw)).await;
-    post(
-        &backend,
-        cms_export(metric, timestamp + 1_000_000_000, &raw),
+    let backend = start_backend(
+        &config(metric, "CountMinSketch", &params),
+        None,
+        &format!("count_over_time({metric}{{item=\"alpha\"}}[10s])"),
+        planner_types::post_asap::SketchAlgorithm::Cms,
+        planner_types::types::AccuracyTarget::EpsilonDelta {
+            epsilon: 0.01,
+            delta: 0.01,
+        },
     )
     .await;
-    let response = query(&backend, &format!("count_over_time({metric}[2s])")).await;
+    let raw = frequency_fixture();
+    let planner_types::post_asap::SketchParams::Cms { width, depth } = &backend.sketch_params
+    else {
+        panic!("CMS plan")
+    };
+    let (rows, cols) = (*depth as usize, *width as usize);
+    let timestamp = backend.window_start_ns + 9_000_000_000;
+    post(&backend, cms_export(metric, timestamp, &raw, rows, cols), 1).await;
+    post(
+        &backend,
+        cms_export(metric, timestamp + 1_000_000_000, &raw, rows, cols),
+        2,
+    )
+    .await;
+    post(
+        &backend,
+        cms_export(metric, timestamp + 10_000_000_000, &raw, rows, cols),
+        3,
+    )
+    .await;
+    let response = query(
+        &backend,
+        &format!("count_over_time({metric}{{item=\"alpha\"}}[10s])"),
+    )
+    .await;
     let mut merged_raw = raw.clone();
     merged_raw.extend_from_slice(&raw);
-    assert_frequency_total_oracle(&response, &merged_raw);
+    assert_frequency_point_oracle(&response, &merged_raw, "alpha");
 }
 
 #[tokio::test]
@@ -535,18 +707,46 @@ async fn production_count_sketch_matches_raw_frequency_oracle() {
     // current packed-hash runtime can execute at this width. Keep the default
     // production SLA untouched and declare the weaker contract explicitly
     // for this isolated algorithm-oracle process.
-    let backend = start_backend(&config(metric, "CountSketch", &params), Some("0.8")).await;
+    let backend = start_backend(
+        &config(metric, "CountSketch", &params),
+        Some("0.8"),
+        &format!("count_over_time({metric}{{item=\"alpha\"}}[10s])"),
+        planner_types::post_asap::SketchAlgorithm::CountSketch,
+        planner_types::types::AccuracyTarget::EpsilonDelta {
+            epsilon: 0.03,
+            delta: 0.8,
+        },
+    )
+    .await;
     let raw = frequency_fixture();
-    let timestamp = now_ns().saturating_sub(2_000_000_000);
-    post(&backend, count_sketch_export(metric, timestamp, &raw)).await;
+    let planner_types::post_asap::SketchParams::CountSketch { width, depth } =
+        &backend.sketch_params
+    else {
+        panic!("CountSketch plan")
+    };
+    let (rows, cols) = (*depth as usize, *width as usize);
+    let timestamp = backend.window_start_ns + 9_000_000_000;
     post(
         &backend,
-        count_sketch_export(metric, timestamp + 1_000_000_000, &raw),
+        count_sketch_export(metric, timestamp, &raw, rows, cols),
+        1,
+    )
+    .await;
+    post(
+        &backend,
+        count_sketch_export(metric, timestamp + 1_000_000_000, &raw, rows, cols),
+        2,
+    )
+    .await;
+    post(
+        &backend,
+        count_sketch_export(metric, timestamp + 10_000_000_000, &raw, rows, cols),
+        3,
     )
     .await;
     let response = query(
         &backend,
-        &format!("count_over_time({metric}{{item=\"alpha\"}}[2s])"),
+        &format!("count_over_time({metric}{{item=\"alpha\"}}[10s])"),
     )
     .await;
     let mut merged_raw = raw.clone();

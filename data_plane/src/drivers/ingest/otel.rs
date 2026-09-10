@@ -1265,7 +1265,16 @@ async fn route_modified_otlp_sketches_to_precompute(
                                     &dp.attrs.keys().cloned().collect(),
                                 )
                             });
-                        if observed_policy != frame.materialization {
+                        if observed_policy != frame.materialization
+                            && !declared_sketch_policy_matches(
+                                ingest_state,
+                                frame.materialization,
+                                &canonical_name,
+                                sketch_algorithm_for(&dp),
+                                &dp.container_config,
+                                &dp.attrs.keys().cloned().collect(),
+                            )
+                        {
                             unreachable!(
                                 "materialization changed after successful request preflight"
                             );
@@ -1333,12 +1342,17 @@ async fn route_modified_otlp_sketches_to_precompute(
                             // surfaces as an UNSET registration so the
                             // legacy `instances_matching` walk still
                             // covers it).
-                            let policy_fp = derive_sketch_policy_fp(
-                                ingest_state,
-                                &canonical_name,
-                                algorithm.clone(),
-                                &cfg,
-                                &group_by_keys,
+                            let policy_fp = frame_identity.as_ref().map_or_else(
+                                || {
+                                    derive_sketch_policy_fp(
+                                        ingest_state,
+                                        &canonical_name,
+                                        algorithm.clone(),
+                                        &cfg,
+                                        &group_by_keys,
+                                    )
+                                },
+                                |frame| frame.materialization,
                             );
                             // Per-item dimension (item_label) the controller threaded
                             // into the matched policy's parameters — recorded on the sid
@@ -1873,7 +1887,7 @@ fn sketch_config_to_params(
         SketchConfig::Hll { precision } => {
             params.insert("precision".to_string(), serde_json::json!(*precision));
         }
-        SketchConfig::CountSketch { rows, cols } | SketchConfig::CountMin { rows, cols } => {
+        SketchConfig::CountSketch { rows, cols } => {
             // Canonical key mapping (matches the controller's
             // `sketch_params_to_json` in
             // `control_plane::emit::stage_config`): `w` is the
@@ -1881,6 +1895,11 @@ fn sketch_config_to_params(
             // controller writes `{w, d}` into the streaming-config
             // `parameters`, so the policy_fp content match has to
             // probe the same keys.
+            params.insert("w".to_string(), serde_json::json!(*cols));
+            params.insert("d".to_string(), serde_json::json!(*rows));
+            params.insert("with_heap".to_string(), serde_json::json!(false));
+        }
+        SketchConfig::CountMin { rows, cols } => {
             params.insert("w".to_string(), serde_json::json!(*cols));
             params.insert("d".to_string(), serde_json::json!(*rows));
         }
@@ -1923,6 +1942,33 @@ fn derive_sketch_policy_fp(
     index
         .find_policy_by_content(metric, group_by_keys, agg_type, &params)
         .unwrap_or(asap_types::PolicyFingerprint::UNSET)
+}
+
+fn declared_sketch_policy_matches(
+    ingest_state: &IngestState,
+    declared: asap_types::PolicyFingerprint,
+    metric: &str,
+    kind: crate::storage_engines::sketch_db::index::SketchAlgorithm,
+    cfg: &crate::storage_engines::sketch_db::data::SketchConfig,
+    group_by_keys: &std::collections::BTreeSet<String>,
+) -> bool {
+    let Some(agg_type) = aggregation_type_for_sketch_algorithm(kind) else {
+        return false;
+    };
+    let expected = sketch_config_to_params(cfg);
+    let snapshot = ingest_state.config_snapshot();
+    let registry = snapshot.policy_registry();
+    let Some(policy) = registry.get(declared) else {
+        return false;
+    };
+    let policy_keys: std::collections::BTreeSet<_> =
+        policy.grouping_labels.labels.iter().cloned().collect();
+    policy.metric == metric
+        && policy.aggregation_type == agg_type
+        && &policy_keys == group_by_keys
+        && expected
+            .iter()
+            .all(|(key, value)| policy.parameters.get(key) == Some(value))
 }
 
 /// Phase 5 helper — map a `ModifiedOtlpSketchDp` to the matching
@@ -2237,7 +2283,16 @@ fn preflight_summary_frames(
                 &dp.attrs.keys().cloned().collect(),
             )
         };
-        if observed != frame.materialization {
+        if observed != frame.materialization
+            && !declared_sketch_policy_matches(
+                ingest_state,
+                frame.materialization,
+                canonical_name,
+                sketch_algorithm_for(&dp),
+                &dp.container_config,
+                &dp.attrs.keys().cloned().collect(),
+            )
+        {
             return Err(format!(
                 "summary frame for {metric_name} declares materialization {} but active schema resolves {}",
                 frame.materialization.0, observed.0
@@ -3370,6 +3425,7 @@ mod policy_fp_lookup_tests {
         // matches `control_plane::emit::stage_config::sketch_params_to_json`.
         assert_eq!(cs.get("w"), Some(&serde_json::json!(256)));
         assert_eq!(cs.get("d"), Some(&serde_json::json!(4)));
+        assert_eq!(cs.get("with_heap"), Some(&serde_json::json!(false)));
 
         let cm = sketch_config_to_params(&SketchConfig::CountMin { rows: 4, cols: 256 });
         assert_eq!(cm.get("w"), Some(&serde_json::json!(256)));

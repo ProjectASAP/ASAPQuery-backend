@@ -923,10 +923,12 @@ where
                     let mut binding = match (self.bind)(node, family) {
                         Ok(binding) => binding,
                         Err(error) => {
-                            if let Some(original) = &self.logical_source {
-                                let (root, nodes) =
-                                    logical::selected_residual_nodes(original, node)?;
-                                return self.graft(id, root, nodes);
+                            if node.guarantee.as_ref().is_some_and(|g| g.is_exact()) {
+                                if let Some(original) = &self.logical_source {
+                                    let (root, nodes) =
+                                        logical::selected_residual_nodes(original, node)?;
+                                    return self.graft(id, root, nodes);
+                                }
                             }
                             return Err(error);
                         }
