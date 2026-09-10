@@ -606,6 +606,15 @@ impl PrecomputePlan {
         }
         let mut materializations = BTreeSet::new();
         for materialization in &self.materializations {
+            // HLL is supported as an ingested sketch envelope, not as a raw
+            // accumulator. Validate here so external installs cannot bypass it.
+            if self.ingest.protocol == IngestProtocol::PrometheusRemoteWriteV1
+                && materialization.aggregation_type == asap_types::AggregationType::HLL
+            {
+                return Err(PrecomputePlanError::UnsupportedFamily(
+                    materialization.policy_fp_u64(),
+                ));
+            }
             if !materializations.insert(materialization.policy_fingerprint()) {
                 return Err(PrecomputePlanError::DuplicateMaterialization(
                     materialization.policy_fp_u64(),
@@ -2756,6 +2765,24 @@ pub fn select_workload_roots_with_erp(
         }
     }
     for (accuracy, scope, roots) in cohorts {
+        // ERP v1 has no calibrated failure probability. Preserve explicit
+        // confidence requirements through theoretical/exact fallback.
+        let scoped_erp = erp.map(|policy| {
+            let mut policy = policy.clone();
+            if !matches!(accuracy, AccuracyTarget::Epsilon(_))
+                || policy.error_metric != "max_rank_err"
+            {
+                policy.artifact.records.clear();
+            }
+            // A benchmark of a different KLL implementation is not evidence
+            // for the collector's sketchlib KLL, even with the same k.
+            policy
+                .artifact
+                .records
+                .retain(|row| row.sketch == "kll-percall" && row.implementation == "lib");
+            policy
+        });
+        let erp = scoped_erp.as_ref();
         let mut model = ControlPlaneCostModel::new(accuracy.clone()).with_exact_composition_costs(
             scope
                 .as_ref()
@@ -2767,11 +2794,19 @@ pub fn select_workload_roots_with_erp(
             model = model.with_erp(erp.clone());
         }
         let certificate = scope.as_ref().and_then(|id| evidence.get(id));
-        let selected = crate::planner_selection::select_workload_with_evidence(
+        let accuracy_model = super::erp::ErpAccuracyModel {
+            policy: erp,
+            max_error: match accuracy {
+                AccuracyTarget::Epsilon(e) | AccuracyTarget::EpsilonDelta { epsilon: e, .. } => e,
+                AccuracyTarget::Exact => 0.0,
+            },
+        };
+        let selected = crate::planner_selection::select_workload_with_accuracy_model(
             roots,
             accuracy,
             &model,
             &QueryEvidence(certificate),
+            &accuracy_model,
         )
         .map_err(|error| CompileError::Snapshot(error.to_string()))?;
         for (index, node) in selected {
@@ -4309,6 +4344,149 @@ mod tests {
         ));
     }
 
+    // Frozen sketch-bench output exercises the same wire schema on every CI run.
+    #[test]
+    fn measured_erp_kll_parameters_survive_workload_selection() {
+        use super::super::erp::{
+            ErpAccuracyMode, ErpParameterDecision, ErpPlanningInput, ErpRuntimeCapabilities,
+        };
+
+        let artifact: asap_aware_mapping::erp::ErpArtifact =
+            serde_json::from_str(include_str!("../../tests/fixtures/erp-kll-measured.json"))
+                .unwrap();
+        let row = artifact
+            .records
+            .first()
+            .expect("nonempty measured artifact");
+        let erp = ErpPlanningInput {
+            distribution: row.distribution.clone(),
+            implementation: Some("lib".into()),
+            artifact,
+            error_metric: "max_rank_err".into(),
+            min_trials: 10,
+            expected_updates: 1000.0,
+            expected_queries: 10.0,
+            expected_merges: 0.0,
+            retention_seconds: 60.0,
+            cpu_weight: 1.0,
+            byte_second_weight: 1e-9,
+            mode: ErpAccuracyMode::Hybrid,
+            runtime: ErpRuntimeCapabilities {
+                allowed_algorithms: vec![SketchAlgorithm::Kll],
+                max_memory_bytes: None,
+            },
+        };
+        assert!(
+            matches!(
+                erp.select(SketchAlgorithm::Kll, 0.06, SketchParams::Kll { k: 269 }),
+                ErpParameterDecision::Empirical {
+                    params: SketchParams::Kll { k: 32 },
+                    ..
+                }
+            ),
+            "the measured row must pass adapter selection before testing the planner"
+        );
+
+        let mut workload = request("q", "quantile_over_time(0.9, m[1m])");
+        workload.queries[0].accuracy = AccuracyTarget::Epsilon(0.06);
+        let root = Rc::new(
+            crate::query_parser::parse_query_expr_canonical(
+                &workload.queries[0].query_string,
+                workload.queries[0].accuracy.clone(),
+            )
+            .unwrap(),
+        );
+        select_workload_roots_with_erp(
+            &mut workload.queries,
+            vec![root],
+            &workload.evidence,
+            &workload.exact_composition_costs,
+            Some(&erp),
+        )
+        .unwrap();
+
+        fn contains_measured_kll(node: &SummaryNode) -> bool {
+            match &node.expr {
+                SummaryExpr::SummaryAgg { family, child, .. } => {
+                    matches!(family, SummaryFamilyType::Sketch(kind, _)
+                        if matches!(kind.params(), SketchParams::Kll { k: 32 }))
+                        || contains_measured_kll(child)
+                }
+                SummaryExpr::SummaryEstimate { summary_input, .. }
+                | SummaryExpr::ValueOperation {
+                    child: summary_input,
+                    ..
+                } => contains_measured_kll(summary_input),
+                _ => false,
+            }
+        }
+        assert!(
+            contains_measured_kll(&workload.queries[0].post_asap),
+            "ERP hit was lost before physical compilation: {:#?}",
+            workload.queries[0].post_asap
+        );
+        let guarantee = workload.queries[0].post_asap.guarantee.as_ref().unwrap();
+        assert_eq!(guarantee.failure_probability.evaluate(), None);
+        assert!(!guarantee.is_exact());
+        let plan = PhysicalCompiler
+            .compile(workload, environment(10000))
+            .unwrap();
+        assert_eq!(plan.precompute_plan.materializations[0].parameters["k"], 32);
+        let empirical_identity = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let mut drift = erp.clone();
+        drift.distribution = serde_json::json!({"shifted": true});
+        let mut unsupported = drift.clone();
+        unsupported.runtime.allowed_algorithms = vec![SketchAlgorithm::Hll];
+        let mut wrong_implementation = erp.clone();
+        wrong_implementation.artifact.records[0].implementation = "oxide".into();
+        wrong_implementation.implementation = Some("oxide".into());
+        for (policy, accuracy, exact) in [
+            (drift, AccuracyTarget::Epsilon(0.06), false),
+            (wrong_implementation, AccuracyTarget::Epsilon(0.06), false),
+            (
+                erp.clone(),
+                AccuracyTarget::EpsilonDelta {
+                    epsilon: 0.06,
+                    delta: 0.01,
+                },
+                false,
+            ),
+            (unsupported, AccuracyTarget::Epsilon(0.06), true),
+        ] {
+            let mut workload = request("q", "quantile_over_time(0.9, m[1m])");
+            workload.queries[0].accuracy = accuracy.clone();
+            let root = Rc::new(
+                crate::query_parser::parse_query_expr_canonical(
+                    &workload.queries[0].query_string,
+                    accuracy,
+                )
+                .unwrap(),
+            );
+            select_workload_roots_with_erp(
+                &mut workload.queries,
+                vec![root],
+                &workload.evidence,
+                &workload.exact_composition_costs,
+                Some(&policy),
+            )
+            .unwrap();
+            if exact {
+                assert!(matches!(
+                    workload.queries[0].post_asap.expr,
+                    SummaryExpr::KeepPreAsap(_)
+                ));
+            } else {
+                assert!(!contains_measured_kll(&workload.queries[0].post_asap));
+                let plan = PhysicalCompiler
+                    .compile(workload, environment(10000))
+                    .unwrap();
+                let state = &plan.precompute_plan.materializations[0];
+                assert!(state.parameters["k"].as_u64().unwrap() > 32);
+                assert_ne!(state.policy_fingerprint(), empirical_identity);
+            }
+        }
+    }
+
     fn measured_exact_composition_rows(
         expr: &QueryExpr,
         observed_at_unix_ms: u64,
@@ -5339,6 +5517,42 @@ mod tests {
                 "ddsketch" | "kll"
             ));
         }
+    }
+
+    #[test]
+    fn backend_local_hll_rejected_but_envelope_ingest_supported() {
+        let bundle = PhysicalCompiler
+            .compile(
+                request("q", "quantile_over_time(0.99, m[1m])"),
+                environment(10_000),
+            )
+            .unwrap();
+        let mut materializations = bundle.precompute_plan.materializations;
+        materializations[0].aggregation_type = asap_types::AggregationType::HLL;
+        materializations[0].parameters.clear();
+        let mut envelope_plan = PrecomputePlan::build(
+            bundle.envelope.clone(),
+            materializations.clone(),
+            &["collector".into()],
+        )
+        .unwrap();
+        envelope_plan.ingest = IngestContract {
+            protocol: IngestProtocol::PrometheusRemoteWriteV1,
+            endpoint_path: "/api/v1/write".into(),
+            timestamp_unit: TimestampUnit::UnixMilliseconds,
+            require_plan_identity: false,
+            require_summary_definition_identity: false,
+            require_registered_producer: false,
+        };
+        envelope_plan.producers.clear();
+        assert!(matches!(
+            envelope_plan.validate(),
+            Err(PrecomputePlanError::UnsupportedFamily(_))
+        ));
+        assert!(matches!(
+            PrecomputePlan::build_backend_local(bundle.envelope, materializations),
+            Err(PrecomputePlanError::UnsupportedFamily(_))
+        ));
     }
 
     #[test]

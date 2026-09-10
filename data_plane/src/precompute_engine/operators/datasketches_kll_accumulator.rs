@@ -138,11 +138,26 @@ impl DatasketchesKLLAccumulator {
         // boundary array — which it does for any non-empty sketch. Falls back to
         // the statistical replay only when `levels` is absent (empty sketch).
         if !state.levels.is_empty() {
-            let levels: Vec<usize> = state.levels.iter().map(|&l| l as usize).collect();
+            // KllState is highest-level first; the in-memory constructor
+            // expects L0 first. Replaying or copying the wire order changes
+            // retained-item weights after the first compaction.
+            let mut items = Vec::with_capacity(state.items.len());
+            let mut levels = vec![0];
+            if state
+                .levels
+                .windows(2)
+                .any(|bounds| bounds[0] > bounds[1] || bounds[1] as usize > state.items.len())
+            {
+                return Err("KllState levels must be monotonic and within items".into());
+            }
+            for bounds in state.levels.windows(2).rev() {
+                items.extend_from_slice(&state.items[bounds[0] as usize..bounds[1] as usize]);
+                levels.push(items.len());
+            }
             return Ok(Self {
                 inner: KllSketch::from_portable_state(
                     k,
-                    &state.items,
+                    &items,
                     &levels,
                     state.num_levels as usize,
                 )
@@ -596,6 +611,35 @@ mod tests {
             q01 <= q99,
             "quantile monotonicity violated: q01={q01}, q99={q99}"
         );
+    }
+
+    // Compacted portable state is highest-level first, unlike the runtime buffer.
+    #[test]
+    fn compacted_wire_state_preserves_count_and_quantiles() {
+        use asap_sketchlib::{proto::sketchlib::KllState, sketches::KLL};
+        use prost::Message;
+        let mut source = KLL::<f64>::init_kll_with_seed(32, 123);
+        for i in 0..1000 {
+            source.update(&(((i * 7919 + 17) % 1009) as f64 / 1009.0));
+        }
+        assert!(source.wire_num_levels() > 1);
+        let state = KllState {
+            k: 32,
+            m: source.wire_m(),
+            num_levels: source.wire_num_levels(),
+            levels: source.wire_levels(),
+            items: source.wire_items(),
+            coin: None,
+            offset: 0.0,
+            value_scale: 0,
+            residuals: vec![],
+        };
+        let decoded =
+            DatasketchesKLLAccumulator::from_sketchlib_proto_bytes(&state.encode_to_vec()).unwrap();
+        assert_eq!(decoded.inner.count(), source.count() as u64);
+        for q in [0.0, 0.1, 0.5, 0.9, 1.0] {
+            assert_eq!(decoded.inner.quantile(q), source.quantile(q), "q={q}");
+        }
     }
 
     #[test]

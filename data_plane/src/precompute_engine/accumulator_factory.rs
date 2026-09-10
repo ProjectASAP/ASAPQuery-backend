@@ -1152,15 +1152,9 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             )))
         }
 
-        // unsupported HLL, Count, Rate, Kmv, and Theta families: no
-        // `AggregationType` resolves to one of these via
-        // `accumulator_spec()`'s `Ok` path today — HLL is caught by
-        // `AccumulatorSpecError::UnmappedAggregationType` above (see its
-        // doc for why: a pre-existing gap, not introduced here), and the
-        // other four have no `AggregationType` counterpart at all. Kept
-        // as an explicit warning fallback rather than `unreachable!()`
-        // so a future `SummaryFamilyType` this dispatch doesn't yet know how
-        // to build fails safe instead of panicking.
+        // HLL has an envelope catalog identity but no raw updater; the
+        // backend-local plan builder rejects it before reaching this factory.
+        // Other unsupported families retain the legacy warning fallback.
         (other_family, keyed) => {
             tracing::warn!(
                 "SummaryFamilyType {:?} (keyed={}) has no accumulator_factory mapping, defaulting to Sum",

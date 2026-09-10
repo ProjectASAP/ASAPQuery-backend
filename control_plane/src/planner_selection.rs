@@ -177,13 +177,30 @@ pub fn select_workload_with_evidence(
     cost_model: &dyn CostModel,
     evidence: &dyn AccuracyEvidenceProvider,
 ) -> Result<Vec<(usize, Rc<SummaryNode>)>, SelectionError> {
+    select_workload_with_accuracy_model(
+        roots,
+        accuracy,
+        cost_model,
+        evidence,
+        &asap_aware_mapping::DefaultAccuracyModel,
+    )
+}
+
+/// Keep replacement legality and workload-root validation on the same model.
+pub fn select_workload_with_accuracy_model(
+    roots: Vec<(usize, Rc<QueryExpr>)>,
+    accuracy: AccuracyTarget,
+    cost_model: &dyn CostModel,
+    evidence: &dyn AccuracyEvidenceProvider,
+    accuracy_model: &dyn AccuracyModel,
+) -> Result<Vec<(usize, Rc<SummaryNode>)>, SelectionError> {
     // Canonical CSE still runs inside search_workload_with_targets. Do not
     // offer CSE's per-invocation recompute alternative: this runtime currently
     // provisions continuously maintained, content-addressed state only.
     let strategies: Vec<Box<dyn ReplacementStrategy + '_>> = vec![
         Box::new(SketchAlgorithmStrategy::with_models_and_evidence(
             cost_model,
-            &asap_aware_mapping::DefaultAccuracyModel,
+            accuracy_model,
             &asap_aware_mapping::EqualSplitAllocator,
             evidence,
         )),
@@ -198,7 +215,7 @@ pub fn select_workload_with_evidence(
             .map(|(id, root)| (id, root, Some(accuracy.clone())))
             .collect(),
         &strategies,
-        &asap_aware_mapping::DefaultAccuracyModel,
+        accuracy_model,
     );
     let selection = space.global_selection(cost_model);
     let roots = space

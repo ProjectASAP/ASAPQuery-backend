@@ -117,6 +117,279 @@ fn is_warm(response: &Value) -> bool {
     })
 }
 
+// Measured ERP parameters must reach the real accumulator and answer held-out
+// raw samples through the installed QueryPlan, without native fallback.
+#[tokio::test]
+async fn erp_measured_kll_collector_to_query_oracle() {
+    use control_plane::physical::compiler::{BackendLocalPlanningSnapshot, PhysicalCompiler};
+    const QUERY: &str = "quantile_over_time(0.9, erp_latency[5s])";
+    let artifact: Value = serde_json::from_str(include_str!(
+        "../../control_plane/tests/fixtures/erp-kll-measured.json"
+    ))
+    .unwrap();
+    let mut fixture: Value = serde_json::from_str(include_str!(
+        "../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+    ))
+    .unwrap();
+    let mut entry = fixture["query_workload"]["repeating_queries"][3].clone();
+    entry["query"] = QUERY.into();
+    entry["requirements"]["accuracy"] = serde_json::json!({"explicit": {"Epsilon": 0.06}});
+    fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
+    fixture["implementation"]["erp"] = serde_json::json!({
+        "distribution": artifact["records"][0]["distribution"],
+        "artifact": artifact, "implementation": "lib", "error_metric": "max_rank_err",
+        "min_trials": 10, "expected_updates": 1000.0, "expected_queries": 10.0,
+        "expected_merges": 0.0, "retention_seconds": 60.0, "cpu_weight": 1.0,
+        "byte_second_weight": 1e-9, "mode": "hybrid",
+        "runtime": {"allowed_algorithms": ["Kll"], "max_memory_bytes": null}
+    });
+    let snapshot: BackendLocalPlanningSnapshot = serde_json::from_value(fixture).unwrap();
+    let (mut request, mut environment) = snapshot.planning_request().unwrap();
+    request.hybrid_execution = false;
+    request.queries[0].group_by = vec!["service".into()];
+    let lifecycle_entry = &mut request
+        .query_workload
+        .as_mut()
+        .unwrap()
+        .repeating_queries
+        .as_mut()
+        .unwrap()[0];
+    lifecycle_entry.time_selection.scope = planner_types::workload::QueryTimeScope::Unknown;
+    environment.target =
+        control_plane::physical::compiler::PhysicalDeploymentTarget::DistributedCollectors;
+    environment.collector_ids = vec!["erp-collector".into()];
+    let plan = PhysicalCompiler.compile(request, environment).unwrap();
+    assert_eq!(plan.precompute_plan.materializations.len(), 1);
+    assert_eq!(plan.precompute_plan.materializations[0].parameters["k"], 32);
+    let collector = serde_json::to_value(&plan.collector_plans[0]).unwrap();
+    let install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
+        summary_catalog: plan.summary_catalog,
+        collector_plans: plan.collector_plans,
+        precompute_plan: plan.precompute_plan,
+        transmission_plan: plan.transmission_plan,
+        query_plan: plan.query_plan,
+        storage_routing: None,
+        adaptation_evidence: vec![],
+    };
+    let output = tempfile::tempdir().unwrap();
+    let mut artifact_file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&mut artifact_file, &install).unwrap();
+    let port = unused_port();
+    let otlp_port = unused_port();
+    let grpc_port = unused_port();
+    let mut bootstrap_config = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(
+        &mut bootstrap_config,
+        &serde_json::json!({"aggregations": []}),
+    )
+    .unwrap();
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_data_plane"))
+            .args(["--physical-plan"])
+            .arg(artifact_file.path())
+            .arg("--streaming-config")
+            .arg(bootstrap_config.path())
+            .args(["--http-port", &port.to_string(), "--output-dir"])
+            .arg(output.path())
+            .args([
+                "--enable-otel-ingest",
+                "--otel-http-port",
+                &otlp_port.to_string(),
+                "--otel-grpc-port",
+                &grpc_port.to_string(),
+            ])
+            .args([
+                "--precompute-allowed-lateness-ms",
+                "0",
+                "--precompute-flush-interval-ms",
+                "25",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let client = reqwest::Client::new();
+    let backend = format!("http://127.0.0.1:{port}");
+    wait_until_ready(&client, &format!("{backend}/api/v1/health"), &mut child.0).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let base = now - now.rem_euclid(5000) - 20000;
+    // A different deterministic stream from training seed 42; the oracle
+    // evaluates rank error, not the unrelated relative error of the value.
+    let raw: Vec<f64> = (0..1000)
+        .map(|i| ((i * 7919 + 17) % 1009) as f64 / 1009.0)
+        .collect();
+    for (sequence, end, values) in [
+        (1, base + 5000, raw.as_slice()),
+        (2, base + 15000, &[0.5][..]),
+    ] {
+        let payload = erp_collector_kll_export(&collector, end as u64, values, sequence);
+        client
+            .post(format!("http://127.0.0.1:{otlp_port}/v1/metrics"))
+            .header("content-type", "application/x-protobuf")
+            .body(payload)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    let response = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let response: Value = client
+                .get(format!("{backend}/api/v1/query"))
+                .query(&[
+                    ("query", QUERY.to_string()),
+                    ("time", ((base + 5000) as f64 / 1000.0).to_string()),
+                ])
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if response["status"] == "success" && is_warm(&response) {
+                break response;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("ERP plan must answer without exact fallback");
+    let estimate = first_value(&response, "value").expect("numeric estimate");
+    let rank = raw.iter().filter(|v| **v <= estimate).count() as f64 / raw.len() as f64;
+    assert!(
+        (rank - 0.9).abs() <= 0.06,
+        "rank={rank}, response={response}"
+    );
+}
+
+fn erp_collector_kll_export(plan: &Value, end_ms: u64, raw: &[f64], sequence: u64) -> Vec<u8> {
+    use asap_otel_proto::tonic::{
+        collector::metrics::v1::ExportMetricsServiceRequest,
+        common::v1::{any_value, AnyValue, KeyValue},
+        metrics::v1::{
+            metric::Data, KllSketch, KllSketchDataPoint, KllSketchEncoding, Metric,
+            ResourceMetrics, ScopeMetrics,
+        },
+    };
+    use asap_precompute_rs::Precompute;
+    use asap_sketchlib::proto::sketchlib::{sketch_envelope, SketchEnvelope};
+    let decoded = asap_precompute_rs::CollectorPlan::from_json(
+        &serde_json::to_vec(plan).unwrap(),
+        "erp-collector",
+    )
+    .unwrap();
+    let config = decoded
+        .to_precompute_config_set()
+        .unwrap()
+        .configs
+        .remove(0);
+    let k = config.sketch_params["k"] as i32;
+    assert_eq!(k, 32);
+    let runtime = asap_precompute_rs::precompute::PrecomputeImpl::new(
+        Some(config),
+        Some(Box::new(move || {
+            Box::new(asap_precompute_rs::sketches::KLLWrapper::new(k, Some(123)))
+        })),
+        Some(Box::new(asap_precompute_rs::sketches::KLLObserver)),
+    );
+    for value in raw {
+        runtime
+            .observe(&asap_precompute_rs::Observation::new(
+                end_ms - 500,
+                "erp_latency",
+                vec![],
+                vec![asap_precompute_rs::KeyValue::new("service", "erp")],
+                asap_precompute_rs::ObservationValue {
+                    kind: asap_precompute_rs::ObservationValueKind::Float,
+                    float: *value,
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+    }
+    let envelopes = runtime.tick(end_ms);
+    assert_eq!(envelopes.len(), 1);
+    let wire = SketchEnvelope::decode(envelopes[0].payload.as_slice()).unwrap();
+    let Some(sketch_envelope::SketchState::Kll(state)) = wire.sketch_state else {
+        panic!("KLL state required")
+    };
+    assert_eq!(state.k, k as u32);
+    let kv = |key: &str, value: String| KeyValue {
+        key: key.into(),
+        value: Some(AnyValue {
+            value: Some(any_value::Value::StringValue(value)),
+        }),
+    };
+    let materialization = plan["materializations"][0]["materialization"]
+        .as_u64()
+        .unwrap();
+    let mut attributes = vec![kv("service", "erp".into())];
+    for (key, value) in [
+        ("identity_version", "1".into()),
+        ("plan_id", plan["envelope"]["plan_id"].to_string()),
+        ("plan_version", plan["envelope"]["plan_version"].to_string()),
+        (
+            "backend_compat",
+            control_plane::physical::compiler::BACKEND_COMPAT.into(),
+        ),
+        ("materialization", materialization.to_string()),
+        (
+            "series_identity",
+            data_plane::drivers::ingest::canonical_attrs_fingerprint(&[("service", "erp")]),
+        ),
+        (
+            "schema_id",
+            format!(
+                "{}:summary-state:v1:{materialization}",
+                control_plane::physical::compiler::BACKEND_COMPAT
+            ),
+        ),
+        ("producer_id", "erp-collector".into()),
+        ("producer_epoch", "erp-test".into()),
+        ("sequence", sequence.to_string()),
+        ("kind", "full".into()),
+        ("encoding", "sketchlib_protobuf_v1".into()),
+        ("checkpoint_id", format!("checkpoint-{sequence}")),
+    ] {
+        attributes.push(kv(&format!("asap.frame.{key}"), value));
+    }
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: None,
+            schema_url: String::new(),
+            scope_metrics: vec![ScopeMetrics {
+                scope: None,
+                schema_url: String::new(),
+                metrics: vec![Metric {
+                    name: "erp_latency".into(),
+                    description: String::new(),
+                    unit: String::new(),
+                    metadata: vec![],
+                    data: Some(Data::Kllsketch(KllSketch {
+                        k: k as u32,
+                        aggregation_temporality: 0,
+                        data_points: vec![KllSketchDataPoint {
+                            attributes,
+                            start_time_unix_nano: (end_ms - 5000) * 1_000_000,
+                            time_unix_nano: end_ms * 1_000_000,
+                            sketch: state.encode_to_vec(),
+                            encoding: KllSketchEncoding::Proto as i32,
+                            flags: 0,
+                            series_id: 0,
+                        }],
+                    })),
+                }],
+            }],
+        }],
+    }
+    .encode_to_vec()
+}
+
 // Both heap implementations must execute registered temporal counts through
 // an installed QueryPlan, retaining all three ranked identities and values.
 #[tokio::test]
@@ -723,6 +996,45 @@ async fn wait_for_warm_instant(
     panic!("query never became warm: {query}: {last}\nbackend log:\n{log}");
 }
 
+async fn wait_for_warm_range(
+    client: &reqwest::Client,
+    base: &str,
+    query: &str,
+    start_seconds: f64,
+    end_seconds: f64,
+    step_seconds: u64,
+    log_path: &std::path::Path,
+) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..80 {
+        last = client
+            .get(format!("{base}/api/v1/query_range"))
+            .query(&[
+                ("query", query.to_string()),
+                ("start", start_seconds.to_string()),
+                ("end", end_seconds.to_string()),
+                ("step", step_seconds.to_string()),
+            ])
+            .send()
+            .await
+            .expect("range query")
+            .json()
+            .await
+            .expect("range JSON");
+        if is_warm(&last)
+            && last["data"]["result"]
+                .as_array()
+                .is_some_and(|result| !result.is_empty())
+        {
+            return last;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let log = std::fs::read_to_string(log_path)
+        .unwrap_or_else(|error| format!("log unavailable: {error}"));
+    panic!("range query never became warm: {query}: {last}\nbackend log:\n{log}");
+}
+
 #[tokio::test]
 async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() {
     let fallback_calls = Arc::new(Mutex::new(Vec::<(
@@ -933,13 +1245,32 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let first_eval = (base + 5_000) as f64 / 1_000.0;
     let second_eval = (base + 10_000) as f64 / 1_000.0;
     let backend_log = output_dir.path().join("query_engine.log");
-    // Counter and bare per-series quantile roots retain the complete exact request
-    // until raw producers can preserve the required per-series state.
+    // Reset-aware counter panes align with the installed workload phase and
+    // must serve both instant and range requests through the warm path.
     for query in [
         "rate(asap_demo_counter_total[5s])",
         "increase(asap_demo_counter_total[5s])",
-        "quantile_over_time(0.5, asap_demo_latency_ms[5s])",
     ] {
+        let instant =
+            wait_for_warm_instant(&client, &backend, query, first_eval, &backend_log).await;
+        assert_eq!(instant["status"], "success", "{query}: {instant}");
+        assert!(is_warm(&instant), "{query}: {instant}");
+        let range = wait_for_warm_range(
+            &client,
+            &backend,
+            query,
+            first_eval,
+            second_eval,
+            5,
+            &backend_log,
+        )
+        .await;
+        assert_eq!(range["status"], "success", "{query}: {range}");
+        assert!(is_warm(&range), "{query}: {range}");
+    }
+    // The bare per-series quantile has no producer binding and must forward
+    // the complete request to the exact backend.
+    for query in ["quantile_over_time(0.5, asap_demo_latency_ms[5s])"] {
         let instant: Value = client
             .get(format!("{backend}/api/v1/query"))
             .query(&[
@@ -1242,71 +1573,36 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let materializations = status["materializations"]
         .as_array()
         .expect("materialization statuses");
-    assert_eq!(materializations.len(), 3);
-    assert!(materializations
-        .iter()
-        .all(|entry| entry["phase"] == "serving"));
+    let planned_snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+        serde_json::from_str(&std::fs::read_to_string(snapshot).unwrap()).unwrap();
+    let planned = planned_snapshot.compile().unwrap();
+    // All four installed states, including the reset-aware counter state, have
+    // closed phase-aligned panes and are available to their query bindings.
+    assert_eq!(materializations.len(), 4, "{materializations:?}");
+    for entry in materializations {
+        assert_eq!(entry["phase"], "serving", "{entry}");
+        assert!(
+            entry["coverage_start_unix_ms"].as_u64().is_some(),
+            "{entry}"
+        );
+        assert!(entry["coverage_end_unix_ms"].as_u64().is_some(), "{entry}");
+    }
 
-    // A previously generated raw counter plan must be rejected before staging,
-    // while the current safe generation remains available to readers.
-    let mut snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
-        serde_json::from_str(include_str!(
-            "../../docs/examples/asapquery-planning-snapshot.json"
-        ))
-        .unwrap();
-    snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
-        planner_types::workload::Query("rate(asap_demo_counter_total[1m])".into());
-    // This fixture constructs an old envelope counter over whole retired panes,
-    // not a real-time retracting raw counter (which Planner correctly refuses).
-    snapshot.query_workload.repeating_queries.as_mut().unwrap()[0]
-        .time_selection
-        .scope = planner_types::workload::QueryTimeScope::Unknown;
-    let (mut legacy_request, mut environment) = snapshot.planning_request().unwrap();
-    legacy_request.hybrid_execution = false;
-    let query = &mut legacy_request.queries[0];
-    let parsed = control_plane::query_parser::parse_query_expr_canonical(
-        &query.query_string,
-        query.accuracy.clone(),
-    )
-    .unwrap();
-    query.post_asap = control_plane::physical::compiler::select_post_asap(
-        &parsed,
-        query.accuracy.clone(),
-        &query.lifecycle,
-        None,
-    )
-    .unwrap();
-    environment.target =
-        control_plane::physical::compiler::PhysicalDeploymentTarget::DistributedCollectors;
-    environment.collector_ids = vec!["legacy-counter-source".into()];
-    environment.plan_version = 2;
-    let mut legacy = control_plane::physical::compiler::PhysicalCompiler
-        .compile(legacy_request, environment)
-        .unwrap();
-    legacy.precompute_plan.ingest.protocol =
-        control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1;
-    legacy.precompute_plan.ingest.endpoint_path = "/api/v1/write".into();
-    legacy.precompute_plan.ingest.timestamp_unit =
-        control_plane::physical::compiler::TimestampUnit::UnixMilliseconds;
-    legacy.precompute_plan.ingest.require_plan_identity = false;
-    legacy
-        .precompute_plan
-        .ingest
-        .require_summary_definition_identity = false;
-    legacy.precompute_plan.ingest.require_registered_producer = false;
-    legacy.precompute_plan.producers.clear();
-    legacy.transmission_plan.rules.clear();
-    let artifact = serde_json::json!({"summary_catalog": legacy.summary_catalog,
-        "collector_plans": legacy.collector_plans, "precompute_plan": legacy.precompute_plan,
-        "transmission_plan": legacy.transmission_plan,
-        "query_plan": legacy.query_plan, "storage_routing": null, "adaptation_evidence": []});
+    // A producer definition that disagrees with the authoritative catalog must
+    // be rejected before staging, leaving the serving generation unchanged.
+    let mut invalid = planned;
+    invalid.precompute_plan.materializations[0].slide_interval += 1;
+    let artifact = serde_json::json!({"summary_catalog": invalid.summary_catalog,
+        "collector_plans": invalid.collector_plans, "precompute_plan": invalid.precompute_plan,
+        "transmission_plan": invalid.transmission_plan,
+        "query_plan": invalid.query_plan, "storage_routing": null, "adaptation_evidence": []});
     let built = data_plane::drivers::query::servers::http::build_active_physical_plan(
         serde_json::from_value(artifact.clone()).unwrap(),
         std::sync::Arc::new(data_plane::storage_engines::types::BackendStorageRouting::empty()),
     );
-    assert!(matches!(built, Err(error) if error.contains("raw counter state")));
-    // HTTP may reject this old generation at the earlier successor authorization
-    // boundary; either way it must leave the installed generation unchanged.
+    assert!(matches!(built, Err(error) if error.contains("catalog validation")));
+    // HTTP may reject at an earlier successor authorization boundary;
+    // either way it must leave the installed generation unchanged.
     let rejected = client
         .post(format!("{backend}/api/v1/physical-plan"))
         .json(&artifact)

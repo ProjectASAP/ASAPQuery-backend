@@ -109,13 +109,8 @@ pub enum AccumulatorSpecError {
     /// than the `SingleSubpopulation` case).
     UnknownMultipleSubpopulationSubType(String),
     /// `aggregation_type` itself has no accumulator-dispatch mapping.
-    /// Today this is only ever `AggregationType::HLL` — it maps to the real
-    /// `SketchAlgorithm::Hll` identity and `control_plane` can emit
-    /// `aggregationType: HLL` on the wire, but
-    /// `accumulator_factory::create_accumulator_updater` never grew a
-    /// real HLL arm (HLL accumulators are built via the SketchEnvelope
-    /// ingest path instead, bypassing raw-value dispatch). Pre-existing
-    /// gap, not introduced by this refactor — preserved as-is.
+    /// Also returned for an invalid HLL precision. A resolved family identifies
+    /// stored state; it does not imply raw-value updater support.
     UnmappedAggregationType(AggregationType),
 }
 
@@ -279,7 +274,26 @@ impl AggregationConfig {
                 ),
                 false,
             ),
-            HLL => return Err(AccumulatorSpecError::UnmappedAggregationType(HLL)),
+            HLL => {
+                let precision = match self.parameters.get("precision") {
+                    None => 14,
+                    Some(value) => value
+                        .as_u64()
+                        .ok_or(AccumulatorSpecError::UnmappedAggregationType(HLL))?,
+                };
+                if !(4..=18).contains(&precision) {
+                    return Err(AccumulatorSpecError::UnmappedAggregationType(HLL));
+                }
+                (
+                    independent_sketch(
+                        SketchAlgorithm::Hll,
+                        SketchParams::Hll {
+                            precision: precision as u8,
+                        },
+                    ),
+                    false,
+                )
+            }
             SingleSubpopulation => match sub_type {
                 "Sum" | "sum" => (
                     SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
@@ -625,13 +639,28 @@ mod tests {
     }
 
     #[test]
-    fn hll_is_unmapped_preserving_pre_step5_gap() {
+    fn hll_has_catalog_identity_for_sketch_envelope_ingest() {
         let cfg = make_config(AggregationType::HLL, "", HashMap::new(), vec![]);
-        let err = cfg.accumulator_spec().expect_err("HLL has no dispatch arm");
-        assert_eq!(
-            err,
-            AccumulatorSpecError::UnmappedAggregationType(AggregationType::HLL)
+        let spec = cfg.accumulator_spec().unwrap();
+        assert_sketch(
+            &spec,
+            SketchAlgorithm::Hll,
+            SketchParams::Hll { precision: 14 },
         );
+        for precision in [
+            serde_json::json!(3),
+            serde_json::json!(19),
+            serde_json::json!(4.5),
+            serde_json::json!("bad"),
+        ] {
+            let cfg = make_config(
+                AggregationType::HLL,
+                "",
+                HashMap::from([("precision".into(), precision)]),
+                vec![],
+            );
+            assert!(cfg.accumulator_spec().is_err());
+        }
     }
 
     // ---- wrapper (Single/MultipleSubpopulation) variants ------------
