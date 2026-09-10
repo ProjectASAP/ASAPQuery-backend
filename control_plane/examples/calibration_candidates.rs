@@ -74,6 +74,16 @@ fn planner_forest(queries: &[control_plane::physical::compiler::PlanningQuery]) 
                 vec![outer, inner],
                 json!({"key_debug":format!("{key:?}"),"family_debug":format!("{family:?}")}),
             ),
+            SummaryExpr::RelationalJoin {
+                left,
+                right,
+                kind,
+                pred,
+            } => (
+                "RelationalJoin",
+                vec![left, right],
+                json!({"kind_debug":format!("{kind:?}"),"predicate_debug":format!("{pred:?}")}),
+            ),
             SummaryExpr::SummarySubtract { left, right } => {
                 ("SummarySubtract", vec![left, right], json!({}))
             }

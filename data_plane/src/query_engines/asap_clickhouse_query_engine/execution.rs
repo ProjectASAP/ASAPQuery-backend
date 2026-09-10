@@ -24,6 +24,102 @@ pub enum ClickHouseDagFallback {
     },
     ResultEncoding(String),
 }
+
+fn apply_relational_operation(
+    operation: serde_json::Value,
+    output_schema: &planner_types::post_asap::SummarySchema,
+    relation: ClickHouseRelation,
+) -> Result<ClickHouseRelation, String> {
+    let adapter = ClickHouseRelationalAdapter;
+    if let Some(filter) = operation.get("Filter") {
+        let predicate = filter
+            .get("pred")
+            .cloned()
+            .ok_or_else(|| "published Filter lacks pred".to_owned())
+            .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))?;
+        return adapter
+            .apply_filter(&predicate, relation)
+            .map_err(|error| error.to_string());
+    }
+    let operation: ValueOperation =
+        serde_json::from_value(operation).map_err(|error| error.to_string())?;
+    adapter
+        .apply_operation(&operation, output_schema, relation)
+        .map_err(|error| error.to_string())
+}
+
+fn execute_relation_subtree(
+    index: &SketchStore,
+    entry: &QueryPlanEntry,
+    root: QueryNodeId,
+    expected_schema: &planner_types::post_asap::SummarySchema,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+) -> Result<ClickHouseRelation, String> {
+    match entry.nodes.get(&root) {
+        Some(QueryPlanNode::Relational {
+            input,
+            operation,
+            input_schema,
+            output_schema,
+        }) => {
+            let input = execute_relation_subtree(
+                index,
+                entry,
+                *input,
+                input_schema,
+                t0_ms,
+                t1_ms,
+                is_cumulative,
+            )?;
+            apply_relational_operation(operation.clone(), output_schema, input)
+        }
+        Some(QueryPlanNode::RelationalJoin {
+            inputs,
+            join_kind,
+            pred,
+            left_schema,
+            right_schema,
+            output_schema,
+        }) => {
+            if !matches!(join_kind, planner_types::pre_asap::JoinKind::Inner) {
+                return Err("only inner relational joins are executable".into());
+            }
+            let left = execute_relation_subtree(
+                index,
+                entry,
+                inputs[0],
+                left_schema,
+                t0_ms,
+                t1_ms,
+                is_cumulative,
+            )?;
+            let right = execute_relation_subtree(
+                index,
+                entry,
+                inputs[1],
+                right_schema,
+                t0_ms,
+                t1_ms,
+                is_cumulative,
+            )?;
+            let pred = serde_json::from_value(pred.clone()).map_err(|error| error.to_string())?;
+            ClickHouseRelationalAdapter
+                .apply_inner_equi_join(&pred, output_schema, left, right)
+                .map_err(|error| error.to_string())
+        }
+        Some(_) => {
+            validate_reachable(entry, root)?;
+            let outcome =
+                execute_query_plan_from_readout(index, entry, root, t0_ms, t1_ms, is_cumulative)
+                    .map_err(|error| format!("{error:?}"))?;
+            ClickHouseRelation::from_series_rows(expected_schema, outcome.series, outcome.coverage)
+                .map_err(|error| error.to_string())
+        }
+        None => Err(format!("published DAG references missing node {}", root.0)),
+    }
+}
 pub enum ClickHouseDagOutcome {
     Accelerated(ClickHouseQueryResult),
     Fallback(ClickHouseDagFallback),
@@ -54,6 +150,59 @@ pub fn execute_sql_dag(
         return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
             error.to_string(),
         ));
+    }
+    let has_relational_join = entry.topological_order().is_ok_and(|ids| {
+        ids.iter().any(|id| {
+            matches!(
+                entry.nodes.get(id),
+                Some(QueryPlanNode::RelationalJoin { .. })
+            )
+        })
+    });
+    if has_relational_join {
+        let root_schema = match entry.nodes.get(&entry.root) {
+            Some(QueryPlanNode::Relational { output_schema, .. })
+            | Some(QueryPlanNode::RelationalJoin { output_schema, .. }) => output_schema,
+            _ => {
+                return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
+                    "relational join plan root has no relation schema".into(),
+                ))
+            }
+        };
+        let relation = match execute_relation_subtree(
+            index,
+            entry,
+            entry.root,
+            root_schema,
+            t0_ms,
+            t1_ms,
+            is_cumulative,
+        ) {
+            Ok(relation) => relation,
+            Err(error) => {
+                return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
+                    error,
+                ))
+            }
+        };
+        let pane_ms = entry
+            .materialization_bindings()
+            .iter()
+            .map(|binding| binding.window_ms)
+            .max()
+            .unwrap_or(0);
+        if !complete_pane_coverage(relation.coverage, (t0_ms, t1_ms), pane_ms) {
+            return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::IncompleteCoverage {
+                requested: (t0_ms, t1_ms),
+                observed: relation.coverage,
+            });
+        }
+        return match relation.into_result() {
+            Ok(result) => ClickHouseDagOutcome::Accelerated(result),
+            Err(error) => ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::ResultEncoding(
+                error.to_string(),
+            )),
+        };
     }
     let mut base_root = entry.root;
     let mut relational = Vec::new();

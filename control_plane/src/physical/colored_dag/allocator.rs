@@ -184,6 +184,13 @@ impl ThreeStageWalker {
                 }
                 StageId::Backend
             }
+            SummaryExpr::RelationalJoin { left, right, .. } => {
+                for child in [left, right] {
+                    let (cid, _) = self.visit_l4node(child)?;
+                    self.dag.edges.push((id, cid));
+                }
+                StageId::Backend
+            }
             SummaryExpr::ValueOperation { child, timing, .. } => {
                 let (cid, child_stage) = self.visit_l4node(child)?;
                 self.dag.edges.push((id, cid));
