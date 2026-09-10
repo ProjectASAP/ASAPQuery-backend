@@ -1642,12 +1642,12 @@ async fn annotate_data_source(response: Response, data_source_id: &'static str) 
                     }
                     if raw > 0 {
                         ("failed", "invalid_provenance")
+                    } else if remote > 0 && summary > 0 {
+                        ("hybrid", "hybrid")
                     } else if remote > 0 || summary == 0 {
                         (
                             "exact_fallback",
-                            if summary > 0 {
-                                "hybrid"
-                            } else if remote > 0 {
+                            if remote > 0 {
                                 "external_exact"
                             } else {
                                 "invalid_provenance"
@@ -6795,14 +6795,14 @@ mod logical_provenance_tests {
     use super::*;
 
     #[tokio::test]
-    async fn hybrid_execution_is_fallback_with_measured_branch_counts() {
+    async fn hybrid_execution_has_its_own_route_with_measured_branch_counts() {
         // A successful mixed graph must never inherit the pure-ASAP route from its engine name.
         let response = Json(serde_json::json!({"status":"success", "warnings":[
             "asap_execution:hybrid", "asap_logical_stats:raw=0,summary=1,memo_hits=3,remote=2,remote_rpcs=1,remote_branches=2"
         ], "data":{"resultType":"vector", "result":[]}}))
         .into_response();
         let response = annotate_data_source(response, "asap_query").await;
-        assert_eq!(response.headers()["x-asap-execution"], "exact_fallback");
+        assert_eq!(response.headers()["x-asap-execution"], "hybrid");
         assert_eq!(response.headers()["x-asap-execution-detail"], "hybrid");
         assert_eq!(
             response.headers()["x-asap-summary-readout-evaluations"],

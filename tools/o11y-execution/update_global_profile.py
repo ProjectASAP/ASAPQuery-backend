@@ -25,7 +25,7 @@ def update(snapshot, measurements, sample_count):
     reads = []
     for row in rows:
         for query in row["queries"].values():
-            if query["evaluations"] <= 0 or not query.get("correct") or query.get("classification") not in ("warm", "exact_fallback"):
+            if query["evaluations"] <= 0 or not query.get("correct") or query.get("classification") not in ("warm", "hybrid", "exact_fallback"):
                 raise ValueError("profile requires successful correct query measurements")
             reads.append(nonnegative(query["cpu_ns"], "query CPU") / query["evaluations"])
     costs = {"build": phase("install"), "maintenance_per_update": phase("ingest_and_build") / sample_count,

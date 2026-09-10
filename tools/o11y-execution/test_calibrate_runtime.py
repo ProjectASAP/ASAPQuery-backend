@@ -21,6 +21,18 @@ class CandidateTopKArtifactTests(unittest.TestCase):
             ]},
         }}
 
+    def candidate_filtered_artifact(self):
+        artifact = self.artifact({"op": "read_materialization", "binding": {"materialization": 7}})
+        request = artifact["install_request"]
+        request["query_plan"]["entries"]["q"]["nodes"]["3"] = {
+            "op": "logical",
+            "operator": {"kind": "candidate_exact_subquery", "query": "sum by (job) (rate(m[5m]))",
+                         "item_label": "job"},
+            "inputs": [1],
+        }
+        request["precompute_plan"]["schemas"] = request["precompute_plan"]["schemas"][:1]
+        return artifact
+
     def test_rejects_exact_membership_fallback(self):
         with self.assertRaisesRegex(ValueError, "contains ExactFallback"):
             validate_candidate_topk_artifact(self.artifact({"op": "exact_fallback", "reason": "unsupported"}))
@@ -66,6 +78,37 @@ class CandidateTopKArtifactTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "used exact path"):
             validate_candidate_topk_execution(artifact, [{"execution": "warm", "execution_provenance": {
                 **provenance, "exact_subquery_rpcs": 1}}])
+
+    def test_accepts_one_heap_and_candidate_filtered_external_exact(self):
+        validate_candidate_topk_artifact(self.candidate_filtered_artifact())
+
+    def test_candidate_filtered_contract_rejects_local_exact_state_or_unshared_input(self):
+        artifact = self.candidate_filtered_artifact()
+        artifact["install_request"]["precompute_plan"]["schemas"].append(
+            {"materialization": 8, "family": {"family": "exact", "kind": "increase"}})
+        with self.assertRaisesRegex(ValueError, "must not install"):
+            validate_candidate_topk_artifact(artifact)
+        artifact = self.candidate_filtered_artifact()
+        artifact["install_request"]["query_plan"]["entries"]["q"]["nodes"]["3"]["inputs"] = [2]
+        with self.assertRaisesRegex(ValueError, "shared membership"):
+            validate_candidate_topk_artifact(artifact)
+
+    def test_candidate_filtered_execution_requires_hybrid_one_rpc_and_one_summary_read(self):
+        artifact = self.candidate_filtered_artifact()
+        provenance = {"detail": "hybrid", "raw_scan_evaluations": 0,
+                      "summary_readout_evaluations": 1, "exact_subquery_rpcs": 1,
+                      "exact_subquery_evaluations": 1, "exact_branch_evaluations": 1}
+        validate_candidate_topk_execution(
+            artifact, [{"execution": "hybrid", "execution_provenance": provenance}])
+        for key in ("summary_readout_evaluations", "exact_subquery_rpcs",
+                    "exact_subquery_evaluations", "exact_branch_evaluations"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "invalid provenance"):
+                validate_candidate_topk_execution(artifact, [{"execution": "hybrid",
+                    "execution_provenance": {**provenance, key: 0}}])
+        with self.assertRaisesRegex(ValueError, "hybrid execution"):
+            validate_candidate_topk_execution(
+                artifact, [{"execution": "hybrid", "execution_provenance": {
+                    **provenance, "detail": "external_exact"}}])
 
 
 if __name__ == "__main__":

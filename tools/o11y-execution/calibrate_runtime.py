@@ -156,7 +156,7 @@ def measure(args, artifact, corpus, snapshot, folder):
         runner.write_json(retirement, {"wait4_children_cpu_ns": total_cpu, "proc_before_retirement_cpu_ns": before_total,
                                       "note": "difference includes /proc tick rounding; nonnegative clamp below tick resolution"})
         row["horizon_phases"]["retirement"] = {"cpu_ns": max(0, total_cpu - before_total), "raw_measurement_file": str(retirement.resolve())}
-        invalid = [qid for qid, q in row["queries"].items() if not q["correct"] or q["classification"] not in ("warm", "exact_fallback") or q["cpu_resolution_censored"]]
+        invalid = [qid for qid, q in row["queries"].items() if not q["correct"] or q["classification"] not in ("warm", "hybrid", "exact_fallback") or q["cpu_resolution_censored"]]
         if invalid:
             row["unavailable_reason"] = "failed/mixed/incorrect or CPU below measurement resolution: " + ",".join(invalid)
         else:
@@ -207,6 +207,7 @@ def validate_candidate_topk_artifact(artifact):
     """Reject CandidateTopK plans whose membership sidecar is not locally installed."""
     request = artifact.get("install_request", {})
     schemas = {str(row["materialization"]): row for row in request.get("precompute_plan", {}).get("schemas", [])}
+    modes = set()
     for entry in request.get("query_plan", {}).get("entries", {}).values():
         nodes = entry.get("nodes", {})
         for node in nodes.values():
@@ -225,28 +226,59 @@ def validate_candidate_topk_artifact(artifact):
                     heap_bindings.append(materialization)
             if not heap_bindings:
                 raise ValueError("CandidateTopK membership input has no installed heap materialization")
-            if not any("exact" in json.dumps((schemas.get(mid) or {}).get("family", {})).lower()
-                       and any(kind in json.dumps((schemas.get(mid) or {}).get("family", {})).lower()
-                               for kind in ("counter", "rate", "increase"))
-                       for mid in value_bindings):
-                raise ValueError("CandidateTopK value input has no installed ExactCounter materialization")
+            value_node = nodes.get(str(inputs[1]), {})
+            operator = value_node.get("operator", {}) if value_node.get("op") == "logical" else {}
+            if operator.get("kind") == "candidate_exact_subquery":
+                modes.add("candidate_filtered_exact")
+                if value_node.get("inputs") != [inputs[0]]:
+                    raise ValueError("candidate exact input must be the shared membership node")
+                if not operator.get("query") or not operator.get("item_label"):
+                    raise ValueError("candidate exact operator lacks query or item label")
+                heap_families = [json.dumps(row.get("family", {}), sort_keys=True)
+                                 for row in schemas.values()]
+                if sum("CmsWithHeap" in family or "CountSketchWithHeap" in family
+                       for family in heap_families) != 1 or len(heap_bindings) != 1:
+                    raise ValueError("candidate-filtered TopK requires exactly one installed heap materialization")
+                if any("exact" in family.lower() and any(kind in family.lower()
+                       for kind in ("counter", "rate", "increase")) for family in heap_families):
+                    raise ValueError("candidate-filtered TopK must not install an ExactCounter materialization")
+            else:
+                modes.add("local_exact")
+                if not any("exact" in json.dumps((schemas.get(mid) or {}).get("family", {})).lower()
+                           and any(kind in json.dumps((schemas.get(mid) or {}).get("family", {})).lower()
+                                   for kind in ("counter", "rate", "increase"))
+                           for mid in value_bindings):
+                    raise ValueError("CandidateTopK value input has no installed ExactCounter materialization")
+    return modes
 
 
 def validate_candidate_topk_execution(artifact, records):
-    has_candidate_topk = any(node.get("op") == "candidate_top_k"
-        for entry in artifact.get("install_request", {}).get("query_plan", {}).get("entries", {}).values()
-        for node in entry.get("nodes", {}).values())
-    if not has_candidate_topk:
+    modes = validate_candidate_topk_artifact(artifact)
+    if not modes:
         return
+    if len(modes) != 1:
+        raise ValueError("mixed CandidateTopK execution contracts are not calibratable together")
+    mode = next(iter(modes))
     for record in records:
         provenance = record.get("execution_provenance", {})
-        if record.get("execution") != "warm":
-            raise ValueError("CandidateTopK execution was not warm")
-        for key in ("exact_subquery_rpcs", "exact_subquery_evaluations", "exact_branch_evaluations"):
-            if provenance.get(key, 0) != 0:
-                raise ValueError(f"CandidateTopK execution used exact path: {key}")
-        if provenance.get("summary_readout_evaluations", 0) < 2:
-            raise ValueError("CandidateTopK execution did not read both summary branches")
+        if provenance.get("raw_scan_evaluations", 0) not in (0, None):
+            raise ValueError("CandidateTopK execution used a forbidden local raw scan")
+        if mode == "candidate_filtered_exact":
+            if record.get("execution") != "hybrid" or provenance.get("detail") != "hybrid":
+                raise ValueError("candidate-filtered TopK did not report hybrid execution")
+            expected = {"summary_readout_evaluations": 1, "exact_subquery_rpcs": 1,
+                        "exact_subquery_evaluations": 1, "exact_branch_evaluations": 1}
+            for key, value in expected.items():
+                if provenance.get(key) != value:
+                    raise ValueError(f"candidate-filtered TopK has invalid provenance: {key}")
+        else:
+            if record.get("execution") != "warm" or provenance.get("detail") not in (None, "asap"):
+                raise ValueError("local CandidateTopK execution was not warm")
+            for key in ("exact_subquery_rpcs", "exact_subquery_evaluations", "exact_branch_evaluations"):
+                if provenance.get(key, 0) != 0:
+                    raise ValueError(f"CandidateTopK execution used exact path: {key}")
+            if provenance.get("summary_readout_evaluations", 0) < 2:
+                raise ValueError("CandidateTopK execution did not read both summary branches")
 
 
 def main():

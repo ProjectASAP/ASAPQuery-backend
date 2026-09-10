@@ -39,11 +39,11 @@ def classify(response, headers=None):
     if response.get("status") != "success":
         return "failed"
     declared = (headers or {}).get("x-asap-execution")
-    if declared in ("exact_fallback", "failed"):
+    if declared in ("hybrid", "exact_fallback", "failed"):
         return declared
     detail = (headers or {}).get("x-asap-execution-detail")
     if detail == "hybrid":
-        return "exact_fallback"
+        return "hybrid"
     if detail == "invalid_provenance":
         return "failed"
     sources = {x for x in response.get("infos", []) if isinstance(x, str) and x.startswith("data_source:")}
@@ -59,7 +59,7 @@ def execution_provenance(response, headers=None):
     route = classify(response, headers)
     detail = headers.get("x-asap-execution-detail")
     if detail is None:
-        detail = "asap" if route == "warm" else "external_exact" if route == "exact_fallback" else "failed"
+        detail = "asap" if route == "warm" else "hybrid" if route == "hybrid" else "external_exact" if route == "exact_fallback" else "failed"
     counts = {}
     for name, header in (("raw_scan_evaluations", "x-asap-raw-scan-evaluations"),
                          ("summary_readout_evaluations", "x-asap-summary-readout-evaluations"),
@@ -454,7 +454,7 @@ def main():
                        "scope": "logical file bytes including WAL; backend output also contains logs; concurrent snapshots are approximate"}
             write_json(args.output / "storage.json", storage)
             write_json(args.output / "completion.json", {"complete": True,
-                       "execution_counts": {k: sum(r["execution"] == k for r in results) for k in ["warm", "exact_fallback", "failed"]},
+                       "execution_counts": {k: sum(r["execution"] == k for r in results) for k in ["warm", "hybrid", "exact_fallback", "failed"]},
                        "execution_detail_counts": {k: sum(r["execution_provenance"]["detail"] == k for r in results) for k in ["asap", "hybrid", "external_exact", "failed", "invalid_provenance"]},
                        "benefit_claim": None})
             if args.compare:
@@ -464,7 +464,7 @@ def main():
                           "by_query_occurrence": {query["id"]: summarize([r for r in results if r["id"] == query["id"]])
                                                   for query in queries},
                           "by_execution": {route: summarize([r for r in results if r["execution"] == route])
-                                           for route in ["warm", "exact_fallback", "failed"]},
+                                           for route in ["warm", "hybrid", "exact_fallback", "failed"]},
                           "by_execution_detail": {detail: summarize([r for r in results if r["execution_provenance"]["detail"] == detail])
                                                   for detail in ["asap", "hybrid", "external_exact"]},
                           "estimated_cost": plan["cost_comparison"],

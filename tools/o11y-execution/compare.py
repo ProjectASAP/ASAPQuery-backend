@@ -91,7 +91,7 @@ def summarize(rows):
                    row.get("comparison", {}).get("relative_tolerance", 0.0),
                    row.get("comparison", {}).get("absolute_tolerance", 0.0)) for row in rows]
     eligible = bool(rows) and all(
-        c["equal"] and r["execution"] in ("warm", "exact_fallback") and r["exact"].get("http_status") == 200
+        c["equal"] and r["execution"] in ("warm", "hybrid", "exact_fallback") and r["exact"].get("http_status") == 200
         for r, c in zip(rows, comparisons))
     actual = sum(r["elapsed_ns"] for r in rows)
     exact = sum(r.get("exact", {}).get("elapsed_ns", 0) for r in rows)
@@ -107,9 +107,9 @@ def summarize(rows):
             "baseline_over_backend_cpu_ratio": exact_cpu / backend_cpu if eligible and backend_cpu and exact_cpu is not None else None,
             "cpu_scope": "request intervals, whole processes including background work; fallback CPU charged to backend; /proc tick granularity",
             "occurrences": len(rows),
-            "execution_counts": {k: sum(r["execution"] == k for r in rows) for k in ("warm", "exact_fallback", "failed")},
+            "execution_counts": {k: sum(r["execution"] == k for r in rows) for k in ("warm", "hybrid", "exact_fallback", "failed")},
             "execution_detail_counts": {k: sum(r.get("execution_provenance", {}).get("detail") == k for r in rows) for k in ("asap", "hybrid", "external_exact")},
-            "summary_acceleration_scope": "warm contains summary-only execution; hybrid is reported separately under exact_fallback",
+            "summary_acceleration_scope": "warm is summary-only; hybrid combines summary candidates with a filtered exact subtree",
             "equal_results": sum(c["equal"] for c in comparisons),
             "uncomparable_results": sum(not c["comparable"] for c in comparisons),
             "comparisons": comparisons,

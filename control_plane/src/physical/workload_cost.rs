@@ -234,7 +234,11 @@ pub fn manifest(
                 ));
             }
             if let crate::query_plan::QueryPlanNode::Logical {
-                operator: crate::query_plan::logical::LogicalOperator::ExactSubquery { query },
+                operator:
+                    crate::query_plan::logical::LogicalOperator::ExactSubquery { query }
+                    | crate::query_plan::logical::LogicalOperator::CandidateExactSubquery {
+                        query, ..
+                    },
                 ..
             } = node
             {

@@ -73,7 +73,7 @@ def calibrate(candidates, measurements, data_snapshot_id, observed_at_unix_ms, v
             count = row["evaluations"]
             if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
                 raise ValueError("query evaluation count must be positive")
-            if row.get("classification") not in ("warm", "exact_fallback") or not row.get("correct"):
+            if row.get("classification") not in ("warm", "hybrid", "exact_fallback") or not row.get("correct"):
                 raise ValueError(f"candidate {pid}: {qid} failed execution/correctness validation")
             if not row.get("raw_measurement_file"):
                 raise ValueError("each query requires a raw measurement artifact")
