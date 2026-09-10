@@ -25,8 +25,10 @@ goes directly to exact execution. Selection and fallback reasons are emitted as
 structured tracing events. ERP observations remain empirical and must not be
 rendered as formal `(epsilon, delta)` guarantees.
 
-ERP v1 matches the complete distribution JSON by equality. A caller detects
-drift by supplying its latest descriptor with every new plan generation. A
+ERP exact mode matches the complete distribution JSON by equality. This is the
+default for user-provided datasets: sketch-bench retains their logical dataset
+ID and selected window, so evidence from an unrelated trace cannot be reused.
+A caller detects drift by supplying its latest descriptor with every new plan generation. A
 changed descriptor cannot reuse the old profile accidentally.
 
 ## Validation and current scope
@@ -46,6 +48,14 @@ seed 42, and measured maximum rank error 0.051. Its ten resource trials are
 **not** ten independent accuracy trials (`accuracy_runs` is one). Resource
 timings are machine-specific. This is a reproducible integration fixture,
 not evidence of a distribution-independent error bound.
+
+Shape-aware mode uses an extensible descriptor with `family`, `parameters`,
+`cardinality`, and `benchmark_events`. Synthetic catalogs may include uniform,
+Zipf/discrete power law, continuous power law, normal, and later families.
+Only equal families with equal parameter keys are candidates for interpolation.
+Runtime observation currently classifies frequency ranks as uniform or Zipf;
+callers may instead provide a fitted shape for other families. If classification
+is unavailable, the backend uses exact dataset matching or Hybrid fallback.
 
 Run from the backend repository:
 

@@ -6,7 +6,7 @@ use asap_aware_mapping::erp::{
 use planner_types::post_asap::{SketchAlgorithm, SketchParams};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -63,7 +63,14 @@ impl ErpShapeObserver {
         let mut counts: Vec<_> = self.frequencies.values().copied().collect();
         counts.sort_unstable_by(|left, right| right.cmp(left));
         let exponent = fit_zipf_exponent(&counts);
-        let zipf_exponent = (exponent > uniform_exponent_threshold).then_some(exponent);
+        let (family, parameters) = if exponent > uniform_exponent_threshold {
+            (
+                "zipf".to_owned(),
+                BTreeMap::from([("exponent".to_owned(), exponent)]),
+            )
+        } else {
+            ("uniform".to_owned(), BTreeMap::new())
+        };
         let mut nonzero: Vec<_> = self
             .interval_updates
             .iter()
@@ -76,7 +83,8 @@ impl ErpShapeObserver {
         Some(ErpObservedShape {
             shape: ErpDataShape {
                 cardinality: self.frequencies.len() as u64,
-                zipf_exponent,
+                family,
+                parameters,
                 benchmark_events: self.updates,
             },
             burst_ratio: peak as f64 / median as f64,
@@ -284,7 +292,7 @@ impl ErpPlanningInput {
 pub struct ErpShapeMatchPolicy {
     pub minimum_benchmark_events: u64,
     pub max_log2_cardinality_distance: f64,
-    pub max_zipf_distance: f64,
+    pub max_parameter_distance: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -360,14 +368,14 @@ impl ErpPlanningInput {
         let empirical = if request.allowed_sketches.is_empty() {
             Err(asap_aware_mapping::erp::ErpError::NoApplicableConfiguration)
         } else {
-            let selected = match (self.observed_shape, self.shape_match) {
+            let selected = match (&self.observed_shape, self.shape_match) {
                 (Some(observed), Some(policy)) => {
                     self.artifact.select_nearest(&ErpNearestSelectionRequest {
                         selection: request.clone(),
-                        observed,
+                        observed: observed.clone(),
                         minimum_benchmark_events: policy.minimum_benchmark_events,
                         max_log2_cardinality_distance: policy.max_log2_cardinality_distance,
-                        max_zipf_distance: policy.max_zipf_distance,
+                        max_parameter_distance: policy.max_parameter_distance,
                     })
                 }
                 (None, None) => self.artifact.select(&request),
@@ -690,7 +698,8 @@ mod tests {
         }
         let observed = observer.snapshot(0.05).unwrap();
         assert_eq!(observed.shape.cardinality, 4);
-        assert!(observed.shape.zipf_exponent.unwrap() > 1.0);
+        assert_eq!(observed.shape.family, "zipf");
+        assert!(observed.shape.parameters["exponent"] > 1.0);
         assert!(observed.burst_ratio > 30.0);
     }
 
@@ -706,7 +715,8 @@ mod tests {
                 "erp_observed_shape": {
                     "shape": {
                         "cardinality": 1000,
-                        "zipf_exponent": 1.1,
+                        "family": "zipf",
+                        "parameters": {"exponent": 1.1},
                         "benchmark_events": 500000
                     },
                     "burst_ratio": 2.5
@@ -738,13 +748,14 @@ mod tests {
         let mut policy = input(ErpAccuracyMode::Hybrid);
         policy.observed_shape = Some(ErpDataShape {
             cardinality: 1_000_000,
-            zipf_exponent: Some(2.0),
+            family: "zipf".into(),
+            parameters: BTreeMap::from([("exponent".into(), 2.0)]),
             benchmark_events: 10_000,
         });
         policy.shape_match = Some(ErpShapeMatchPolicy {
             minimum_benchmark_events: 1_000,
             max_log2_cardinality_distance: 1.0,
-            max_zipf_distance: 0.2,
+            max_parameter_distance: 0.2,
         });
         let theory = SketchParams::Cms {
             width: 4096,
