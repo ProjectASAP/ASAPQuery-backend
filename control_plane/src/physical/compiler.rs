@@ -296,7 +296,7 @@ pub struct CollectorLifecycle {
 pub struct CollectorPlan {
     /// Absent only in legacy artifacts; catalog-aware validation requires it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary_catalog: Option<super::summary_catalog::SummaryCatalogReference>,
+    pub summary_catalog: Option<asap_types::sds::CatalogGeneration>,
     pub collector_id: String,
     pub envelope: PlanEnvelope,
     pub materializations: Vec<CollectorMaterialization>,
@@ -311,7 +311,7 @@ pub struct CollectorPlan {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputePlan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary_catalog: Option<super::summary_catalog::SummaryCatalogReference>,
+    pub summary_catalog: Option<asap_types::sds::CatalogGeneration>,
     pub envelope: PlanEnvelope,
     pub ingest: IngestContract,
     pub schemas: Vec<StateSchemaContract>,
@@ -997,7 +997,7 @@ pub struct RuntimeAdaptationEvidence {
 pub struct TransmissionPlan {
     /// Absent only in legacy artifacts; catalog-aware validation requires it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summary_catalog: Option<super::summary_catalog::SummaryCatalogReference>,
+    pub summary_catalog: Option<asap_types::sds::CatalogGeneration>,
     pub envelope: PlanEnvelope,
     pub frame_identity: FrameIdentityContract,
     pub rules: Vec<TransmissionRule>,
@@ -1063,7 +1063,7 @@ pub enum TransmissionPlanError {
 }
 
 fn validate_catalog_projection(
-    reference: Option<&super::summary_catalog::SummaryCatalogReference>,
+    reference: Option<&asap_types::sds::CatalogGeneration>,
     envelope: &PlanEnvelope,
     materializations: impl IntoIterator<Item = asap_types::sds::SummaryDefinitionId>,
     catalog: &super::summary_catalog::SummaryCatalog,
@@ -5259,7 +5259,7 @@ mod tests {
                 let identity = &plan.summary_catalog.materializations[&binding.materialization];
                 let data = &plan.summary_catalog.data_descriptors[&identity.data_descriptor_id];
                 (
-                    data.metric_name.as_str(),
+                    data.time_series_metric().unwrap(),
                     binding.window_ms,
                     binding.readout_lookback_ms,
                 )
@@ -5292,7 +5292,7 @@ mod tests {
         let identity = &plan.summary_catalog.materializations[&bindings[0].materialization];
         let data = &plan.summary_catalog.data_descriptors[&identity.data_descriptor_id];
         assert_eq!(
-            (data.metric_name.as_str(), bindings[0].window_ms),
+            (data.time_series_metric().unwrap(), bindings[0].window_ms),
             ("a", 60_000)
         );
         assert!(!query
@@ -6064,8 +6064,8 @@ mod tests {
                         .summary_catalog
                         .materializations[&binding.materialization]
                         .data_descriptor_id]
-                        .metric_name
-                        .as_str(),
+                        .time_series_metric()
+                        .unwrap(),
                 ),
                 _ => None,
             })

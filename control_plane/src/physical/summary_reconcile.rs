@@ -143,7 +143,7 @@ fn catalog_generation(catalog: &SummaryCatalog) -> Result<CatalogGeneration, Sum
         schema_version: reference.schema_version,
         plan_id: reference.plan_id,
         plan_version: reference.plan_version,
-        snapshot_digest: reference.snapshot_sha256,
+        snapshot_sha256: reference.snapshot_sha256,
     })
 }
 
