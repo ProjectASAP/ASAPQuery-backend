@@ -257,7 +257,7 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
         .arg("--clickhouse-url")
         .arg(&clickhouse_url)
         .arg("--clickhouse-backfill-table")
-        .arg("telemetry")
+        .arg("deployment_default_not_the_job_table")
         .arg("--clickhouse-backfill-database")
         .arg("default")
         .arg("--enable-backfill-worker")
