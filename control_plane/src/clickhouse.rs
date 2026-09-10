@@ -427,7 +427,7 @@ mod tests {
                 Column::new("value", DataType::Float64, false),
             ],
             2,
-            vec![],
+            vec![vec![1]],
         );
         let catalog = SqlCatalog::new().with_table("raw_samples", schema);
         let planned = plan_clickhouse_sql(
@@ -453,7 +453,7 @@ mod tests {
                 Column::new("value", DataType::Float64, false),
             ],
             2,
-            vec![],
+            vec![vec![1, 2]],
         );
         let catalog = SqlCatalog::new().with_table("raw_samples", schema);
         let planned = plan_clickhouse_sql(
@@ -523,6 +523,7 @@ mod tests {
             accuracy: AccuracyTarget::Exact,
             queries: vec![ClickHouseSqlWorkloadEntry {
                 sql: "SELECT labels, asap_rate(value, ts_ms, 300000) AS value FROM raw_samples WHERE metric='requests_total' GROUP BY labels".into(),
+                planning_sql: None,
                 start_ms: 0,
                 end_ms: 300_000,
                 cumulative: true,
