@@ -253,12 +253,7 @@ fn precision(pred: &[(String, f64)], truth: &[(u32, u64)]) -> f64 {
     if pred.is_empty() {
         return f64::from(truth.is_empty());
     }
-    let truth: HashSet<_> = truth.iter().map(|(key, _)| *key).collect();
-    pred.iter()
-        .filter_map(|(key, _)| key.strip_prefix("key-")?.parse::<u32>().ok())
-        .filter(|key| truth.contains(key))
-        .count() as f64
-        / pred.len() as f64
+    recall(pred, truth) * truth.len().min(K) as f64 / pred.len() as f64
 }
 fn ndcg(pred: &[(String, f64)], truth: &[(u32, u64)]) -> f64 {
     let rel: HashMap<_, _> = truth.iter().copied().collect();
@@ -479,7 +474,10 @@ fn run_sketch(
         }
         for (q, &window) in WINDOWS.iter().enumerate() {
             let store = &stores[if shared { 0 } else { q }];
-            let refs: Vec<_> = store.iter().rev().take(window).collect();
+            let mut refs: Vec<_> = store.iter().rev().take(window).collect();
+            // Heap reconciliation can depend on merge order. Match the
+            // chronological order used for both calibration and ERP evidence.
+            refs.reverse();
             let t = Instant::now();
             let mut merged = refs[0].clone();
             for s in refs.iter().skip(1) {

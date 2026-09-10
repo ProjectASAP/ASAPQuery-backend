@@ -25,7 +25,7 @@ def main():
         if output.exists():
             existing = json.loads(output.read_text())
             recorded = existing.get("args", existing.get("provenance", {}).get("args", {}))
-            if recorded.get("backend_revision") != args.revision:
+            if not recorded.get("backend_revision") or ("--build-erp" not in extra and recorded.get("backend_revision") != args.revision):
                 raise ValueError(f"stale output: {output}")
         else:
             with output.with_suffix(".log").open("w") as log:
