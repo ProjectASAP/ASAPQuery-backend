@@ -786,4 +786,86 @@ mod topk_tests {
         assert_eq!(stats.remote_rpcs, 1);
         assert_eq!(stats.raw_scan_evaluations, 0);
     }
+
+    #[test]
+    fn installed_topk_ranks_exact_rate_summary_values() {
+        let summary = QueryNodeId(0);
+        let root = QueryNodeId(1);
+        let entry = QueryPlanEntry {
+            query_id: "summary-rate-topk".into(),
+            canonical_promql: "topk(2, rate(requests_total[5m]))".into(),
+            root,
+            nodes: BTreeMap::from([
+                (
+                    summary,
+                    QueryPlanNode::ExactReadout {
+                        input: QueryNodeId(99),
+                        readout: control_plane::query_plan::ExactReadout::Rate,
+                    },
+                ),
+                (
+                    root,
+                    QueryPlanNode::Logical {
+                        operator: LogicalOperator::TopKSelection {
+                            k: 2,
+                            grouping: Grouping {
+                                labels: vec![],
+                                without: false,
+                            },
+                        },
+                        inputs: vec![summary],
+                    },
+                ),
+            ]),
+            instant: InstantExecution {
+                lookback_ms: 300_000,
+                full_history: false,
+                cumulative_readout: false,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        let (result, stats) = execute_installed(&entry, &BTreeMap::new(), 300_000, |id, at| {
+            assert_eq!(id, summary);
+            assert_eq!(at, 300_000);
+            Ok(QueryResult::Vector(
+                crate::query_engines::query_result::InstantVector {
+                    values: vec![
+                        InstantVectorElement::new(
+                            KeyByLabelValues::new_with_labels(vec!["a".into()]),
+                            0.4,
+                        )
+                        .with_label_keys_override(vec!["pod".into()]),
+                        InstantVectorElement::new(
+                            KeyByLabelValues::new_with_labels(vec!["b".into()]),
+                            1.2,
+                        )
+                        .with_label_keys_override(vec!["pod".into()]),
+                        InstantVectorElement::new(
+                            KeyByLabelValues::new_with_labels(vec!["c".into()]),
+                            0.8,
+                        )
+                        .with_label_keys_override(vec!["pod".into()]),
+                    ],
+                    timestamp: at,
+                    warnings: vec![],
+                    accuracy: None,
+                    window_used: Some((0, at)),
+                },
+            ))
+        })
+        .unwrap();
+        let QueryResult::Vector(result) = result else {
+            panic!("instant vector expected")
+        };
+        assert_eq!(
+            result
+                .values
+                .iter()
+                .map(|point| point.value)
+                .collect::<Vec<_>>(),
+            vec![1.2, 0.8]
+        );
+        assert_eq!(stats.summary_readout_evaluations, 1);
+        assert_eq!(stats.remote_branch_evaluations, 0);
+    }
 }
