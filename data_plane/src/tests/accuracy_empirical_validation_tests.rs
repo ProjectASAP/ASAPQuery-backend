@@ -33,7 +33,9 @@ use asap_types::AggregationType;
 use asap_types::KeyByLabelNames;
 use serde_json::{json, Value};
 
-use crate::storage_engines::sketch_db::accuracy::{AccuracyKind, AccuracyProfile};
+use crate::storage_engines::sketch_db::accuracy::{
+    AccuracyKind, AccuracyProfile, BackendAccuracyProfile,
+};
 
 fn cfg(agg_type: AggregationType, params: HashMap<String, Value>) -> AggregationConfig {
     AggregationConfig::new(

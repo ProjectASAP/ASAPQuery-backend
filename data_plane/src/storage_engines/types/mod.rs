@@ -32,6 +32,6 @@ pub use asap_types::aggregation_config::*;
 // Re-export the query-side routing surface so existing call sites
 // like `crate::storage_engines::types::BackendStorageRouting` keep compiling.
 pub use crate::query_engines::routing::{
-    classify_query_shape, BackendStorageRouting, HotReloadBackendStorageRouting, QueryShape,
-    RoutingTarget,
+    classify_query_shape, BackendStorageRouting, HotReloadBackendStorageRouting,
+    QueryOperatorShape, RoutingTarget,
 };

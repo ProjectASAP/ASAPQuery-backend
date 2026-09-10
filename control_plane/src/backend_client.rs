@@ -332,19 +332,9 @@ impl BackendClient {
         storage_routing: Option<serde_json::Value>,
         adaptation_evidence: &[crate::physical::compiler::RuntimeAdaptationEvidence],
     ) -> std::result::Result<(), BackendPostError> {
-        publication
-            .validate()
+        let body = publication
+            .install_request(storage_routing, adaptation_evidence.to_vec())
             .map_err(|error| BackendPostError::Permanent(anyhow::anyhow!(error)))?;
-        let mut body = serde_json::to_value(publication)
-            .map_err(|error| BackendPostError::Permanent(error.into()))?;
-        let fields = body
-            .as_object_mut()
-            .expect("publication serializes as object");
-        fields.insert("storage_routing".into(), serde_json::json!(storage_routing));
-        fields.insert(
-            "adaptation_evidence".into(),
-            serde_json::json!(adaptation_evidence),
-        );
         let response = self
             .http
             .post(derive_physical_plan_url(&self.endpoint))
@@ -636,12 +626,18 @@ mod tests {
             .unwrap();
         let bodies = hits.lock().unwrap();
         assert_eq!(bodies.len(), 1);
+        let envelope: crate::physical::publication::PhysicalPlanInstallRequest =
+            serde_json::from_value(bodies[0].clone()).unwrap();
+        assert!(envelope.storage_routing.is_none());
+        assert!(envelope.adaptation_evidence.is_empty());
         for field in [
             "summary_catalog",
             "precompute_plan",
             "collector_plans",
             "transmission_plan",
             "query_plan",
+            "storage_routing",
+            "adaptation_evidence",
         ] {
             assert!(bodies[0].get(field).is_some(), "missing {field}");
         }

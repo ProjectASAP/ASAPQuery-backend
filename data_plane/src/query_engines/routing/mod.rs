@@ -37,7 +37,7 @@ pub use capability_matching::{compatible_storage_backends, AccuracyTarget};
 
 pub use backend_storage_routing::{
     classify_query_shape, routing_table_hash, BackendStorageRouting,
-    HotReloadBackendStorageRouting, QueryShape, RoutingTarget, DEFAULT_TENANT,
+    HotReloadBackendStorageRouting, QueryOperatorShape, RoutingTarget, DEFAULT_TENANT,
 };
 pub use freshness_probe_cache::{
     is_freshness_probe, now_ms as freshness_probe_now_ms, FreshnessProbeCache, ProbeSample,

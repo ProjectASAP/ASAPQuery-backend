@@ -13,6 +13,25 @@ pub struct PhysicalPlanPublication {
     pub transmission_plan: TransmissionPlan,
     pub query_plan: QueryPlan,
 }
+
+/// Complete typed envelope accepted by the data-plane install endpoint.
+///
+/// Runtime-only routing and adaptation evidence decorate the compiler-owned
+/// publication without changing its catalog generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhysicalPlanInstallRequest {
+    pub summary_catalog: SummaryCatalog,
+    #[serde(default)]
+    pub collector_plans: Vec<CollectorPlan>,
+    pub precompute_plan: PrecomputePlan,
+    pub transmission_plan: TransmissionPlan,
+    pub query_plan: QueryPlan,
+    pub storage_routing: Option<serde_json::Value>,
+    #[serde(default)]
+    pub adaptation_evidence: Vec<super::compiler::RuntimeAdaptationEvidence>,
+}
+
 impl PhysicalPlanPublication {
     /// Validate every plan against the shared catalog snapshot.
     pub fn validate(&self) -> Result<(), String> {
@@ -85,6 +104,23 @@ impl PhysicalPlanPublication {
             }
         }
         Ok(())
+    }
+
+    pub fn install_request(
+        &self,
+        storage_routing: Option<serde_json::Value>,
+        adaptation_evidence: Vec<super::compiler::RuntimeAdaptationEvidence>,
+    ) -> Result<PhysicalPlanInstallRequest, String> {
+        self.validate()?;
+        Ok(PhysicalPlanInstallRequest {
+            summary_catalog: self.summary_catalog.clone(),
+            collector_plans: self.collector_plans.clone(),
+            precompute_plan: self.precompute_plan.clone(),
+            transmission_plan: self.transmission_plan.clone(),
+            query_plan: self.query_plan.clone(),
+            storage_routing,
+            adaptation_evidence,
+        })
     }
 }
 impl PhysicalPlan {
