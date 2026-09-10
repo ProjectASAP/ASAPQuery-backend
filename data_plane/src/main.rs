@@ -1333,16 +1333,20 @@ async fn main() -> Result<()> {
 
     let victoria_task = victoria_server.map(|server| tokio::spawn(server.run()));
 
-    let clickhouse_accelerator = if let Some(path) = args.clickhouse_plan_bundle.as_ref() {
-        let bytes = fs::read(path)?;
-        let bundle: data_plane::query_engines::asap_clickhouse_query_engine::accelerator::ClickHousePlanBundle =
-            serde_json::from_slice(&bytes)?;
-        Some(Arc::new(
-            data_plane::query_engines::asap_clickhouse_query_engine::accelerator::CatalogClickHouseAccelerator::from_bundle(
-                bundle,
+    let clickhouse_accelerator = if args.clickhouse_http_port.is_some() {
+        let accelerator = Arc::new(
+            data_plane::query_engines::asap_clickhouse_query_engine::accelerator::CatalogClickHouseAccelerator::empty(
                 sketch_index.clone(),
-            )?,
-        ) as Arc<dyn data_plane::query_engines::asap_clickhouse_query_engine::ClickHouseAccelerator>)
+            ),
+        );
+        if let Some(path) = args.clickhouse_plan_bundle.as_ref() {
+            let bytes = fs::read(path)?;
+            let bundle: data_plane::query_engines::asap_clickhouse_query_engine::accelerator::ClickHousePlanBundle =
+            serde_json::from_slice(&bytes)?;
+            let staged = accelerator.stage_bundle(bundle)?;
+            accelerator.activate(staged.plan_id, staged.plan_version)?;
+        }
+        Some(accelerator)
     } else {
         None
     };
@@ -1362,7 +1366,7 @@ async fn main() -> Result<()> {
         info!("Starting ClickHouse-compatible HTTP proxy on port {port}");
         tokio::spawn(async move {
             let result = match clickhouse_accelerator {
-                Some(accelerator) => clickhouse_server.run_with_accelerator(accelerator).await,
+                Some(accelerator) => clickhouse_server.run_with_catalog(accelerator).await,
                 None => clickhouse_server.run().await,
             };
             if let Err(error) = result {

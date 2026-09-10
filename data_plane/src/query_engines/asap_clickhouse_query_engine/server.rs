@@ -1,4 +1,5 @@
 use super::{
+    accelerator::{CatalogClickHouseAccelerator, ClickHousePlanBundle},
     clickhouse_result_adapter::raw_response,
     fallback::{ClickHouseExactBackend, ClickHouseRawResponse},
     request::ClickHouseQueryRequest,
@@ -10,7 +11,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Router,
+    Json, Router,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -22,6 +23,7 @@ use tokio::net::TcpListener;
 struct ServerState {
     fallback: Arc<dyn ClickHouseExactBackend>,
     accelerator: Arc<dyn ClickHouseAccelerator>,
+    publisher: Option<Arc<CatalogClickHouseAccelerator>>,
 }
 
 /// The SQL-language boundary for accelerated execution.
@@ -79,10 +81,36 @@ impl ClickHouseHttpServer {
         let state = ServerState {
             fallback,
             accelerator,
+            publisher: None,
         };
         Router::new()
             .route("/", get(query_get).post(query_post))
             .route("/ping", get(ping))
+            .with_state(state)
+    }
+
+    /// Adds the SQL plan publication surface to the independent ClickHouse
+    /// listener. The PromQL and physical-plan routes are not involved.
+    pub fn router_with_catalog(
+        fallback: Arc<dyn ClickHouseExactBackend>,
+        accelerator: Arc<CatalogClickHouseAccelerator>,
+    ) -> Router {
+        let state = ServerState {
+            fallback,
+            accelerator: accelerator.clone(),
+            publisher: Some(accelerator),
+        };
+        Router::new()
+            .route("/", get(query_get).post(query_post))
+            .route("/ping", get(ping))
+            .route(
+                "/api/v1/clickhouse-plan/stage",
+                axum::routing::post(stage_plan),
+            )
+            .route(
+                "/api/v1/clickhouse-plan/activate",
+                axum::routing::post(activate_plan),
+            )
             .with_state(state)
     }
 
@@ -99,6 +127,55 @@ impl ClickHouseHttpServer {
         let app = Self::router_with_accelerator(self.fallback, accelerator);
         let listener = TcpListener::bind(&self.listen_address).await?;
         axum::serve(listener, app).await
+    }
+
+    pub async fn run_with_catalog(
+        self,
+        accelerator: Arc<CatalogClickHouseAccelerator>,
+    ) -> Result<(), std::io::Error> {
+        let app = Self::router_with_catalog(self.fallback, accelerator);
+        let listener = TcpListener::bind(&self.listen_address).await?;
+        axum::serve(listener, app).await
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ActivatePlanRequest {
+    plan_id: u64,
+    plan_version: u64,
+}
+
+async fn stage_plan(
+    State(state): State<ServerState>,
+    Json(bundle): Json<ClickHousePlanBundle>,
+) -> Response {
+    let Some(publisher) = state.publisher else {
+        return (
+            StatusCode::NOT_FOUND,
+            "ClickHouse plan publication is disabled",
+        )
+            .into_response();
+    };
+    match publisher.stage_bundle(bundle) {
+        Ok(ack) => Json(ack).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
+    }
+}
+
+async fn activate_plan(
+    State(state): State<ServerState>,
+    Json(request): Json<ActivatePlanRequest>,
+) -> Response {
+    let Some(publisher) = state.publisher else {
+        return (
+            StatusCode::NOT_FOUND,
+            "ClickHouse plan publication is disabled",
+        )
+            .into_response();
+    };
+    match publisher.activate(request.plan_id, request.plan_version) {
+        Ok(ack) => Json(ack).into_response(),
+        Err(error) => (StatusCode::CONFLICT, error.to_string()).into_response(),
     }
 }
 
@@ -263,6 +340,80 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(*fallback.sql.lock().unwrap(), vec!["SELECT 1"]);
         }
+    }
+
+    #[tokio::test]
+    async fn remotely_stages_and_activates_an_atomic_sql_generation() {
+        use asap_types::{
+            summary_catalog::SummaryCatalog, AggregationType, KeyByLabelNames,
+            PrecomputeMaterialization, WindowKind,
+        };
+        use planner_types::types::AccuracyTarget;
+
+        let materialization = PrecomputeMaterialization::new(
+            AggregationType::Sum,
+            String::new(),
+            Default::default(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            60,
+            60,
+            WindowKind::Tumbling,
+            String::new(),
+            "requests".into(),
+            None,
+            None,
+            None,
+        );
+        let bundle = ClickHousePlanBundle {
+            sds: SummaryCatalog::from_materializations(19, 4, &[materialization]).unwrap(),
+            tables: HashMap::new(),
+            accuracy: AccuracyTarget::Exact,
+            plans: Vec::new(),
+        };
+        let fallback = Arc::new(RecordingFallback::default());
+        let accelerator = Arc::new(CatalogClickHouseAccelerator::empty(Arc::new(
+            crate::storage_engines::sketch_db::index::SketchStore::new(),
+        )));
+        let app = ClickHouseHttpServer::router_with_catalog(fallback, accelerator);
+
+        let staged = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/clickhouse-plan/stage")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&bundle).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(staged.status(), StatusCode::OK);
+        let staged: serde_json::Value =
+            serde_json::from_slice(&staged.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(staged["phase"], "staged");
+        assert_eq!(staged["plan_version"], 4);
+
+        let activated = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/clickhouse-plan/activate")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"plan_id":19,"plan_version":4}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(activated.status(), StatusCode::OK);
+        let activated: serde_json::Value =
+            serde_json::from_slice(&activated.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(activated["phase"], "active");
     }
 }
 

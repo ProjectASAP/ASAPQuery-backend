@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::Arc,
+    sync::{Arc, Mutex, RwLock},
 };
 
 use asap_types::{summary_catalog::SummaryCatalog, PolicyFingerprint};
@@ -36,7 +36,7 @@ pub struct SqlRuntimePlan {
     pub materializations: BTreeSet<PolicyFingerprint>,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ClickHousePublishedPlan {
     pub sql: String,
     pub runtime: SqlRuntimePlan,
@@ -45,7 +45,7 @@ pub struct ClickHousePublishedPlan {
 
 /// Independently published ClickHouse planning bundle. SDS remains the
 /// descriptor authority; SQL DAG metadata lives in this separate catalog.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ClickHousePlanBundle {
     pub sds: SummaryCatalog,
     pub tables: HashMap<String, planner_types::pre_asap::Schema>,
@@ -55,15 +55,39 @@ pub struct ClickHousePlanBundle {
 
 pub struct CatalogClickHouseAccelerator {
     pub catalog: Arc<SqlPlanCatalog<SqlRuntimePlan>>,
-    pub binder: ClickHouseSqlBinder,
+    binder: RwLock<Option<ClickHouseSqlBinder>>,
+    staged_binder: Mutex<Option<(u64, u64, ClickHouseSqlBinder)>>,
+    publication: RwLock<()>,
     pub store: Arc<SketchStore>,
 }
 
 impl CatalogClickHouseAccelerator {
+    pub fn empty(store: Arc<SketchStore>) -> Self {
+        Self {
+            catalog: Arc::new(SqlPlanCatalog::default()),
+            binder: RwLock::new(None),
+            staged_binder: Mutex::new(None),
+            publication: RwLock::new(()),
+            store,
+        }
+    }
+
     pub fn from_bundle(
         bundle: ClickHousePlanBundle,
         store: Arc<SketchStore>,
     ) -> Result<Self, super::plan_catalog::SqlPlanCatalogError> {
+        let accelerator = Self::empty(store);
+        let staged = accelerator.stage_bundle(bundle)?;
+        accelerator.activate(staged.plan_id, staged.plan_version)?;
+        Ok(accelerator)
+    }
+
+    pub fn stage_bundle(
+        &self,
+        bundle: ClickHousePlanBundle,
+    ) -> Result<super::plan_catalog::SqlPlanCatalogAck, super::plan_catalog::SqlPlanCatalogError>
+    {
+        let _publication = self.publication.write().unwrap();
         let entries = bundle.plans.into_iter().map(|plan| SqlPlanEntry {
             sql_template: plan.sql,
             plan: plan.runtime,
@@ -72,17 +96,41 @@ impl CatalogClickHouseAccelerator {
         let generation = SqlPlanCatalogGeneration::build(&bundle.sds, entries)?;
         let plan_id = generation.sds.plan_id;
         let plan_version = generation.sds.plan_version;
-        let catalog = Arc::new(SqlPlanCatalog::default());
-        catalog.stage(generation)?;
-        catalog.activate(plan_id, plan_version)?;
-        let sql_catalog = control_plane::clickhouse::ClickHouseSqlCatalog {
-            tables: bundle.tables,
+        let binder = ClickHouseSqlBinder::new(
+            control_plane::clickhouse::ClickHouseSqlCatalog {
+                tables: bundle.tables,
+            },
+            bundle.accuracy,
+        );
+        let ack = self.catalog.stage(generation)?;
+        *self.staged_binder.lock().unwrap() = Some((plan_id, plan_version, binder));
+        Ok(ack)
+    }
+
+    pub fn activate(
+        &self,
+        plan_id: u64,
+        plan_version: u64,
+    ) -> Result<super::plan_catalog::SqlPlanCatalogAck, super::plan_catalog::SqlPlanCatalogError>
+    {
+        let _publication = self.publication.write().unwrap();
+        let mut staged = self.staged_binder.lock().unwrap();
+        let Some((staged_id, staged_version, _)) = staged.as_ref() else {
+            return Err(super::plan_catalog::SqlPlanCatalogError::NotStaged {
+                plan_id,
+                plan_version,
+            });
         };
-        Ok(Self {
-            catalog,
-            binder: ClickHouseSqlBinder::new(sql_catalog, bundle.accuracy),
-            store,
-        })
+        if (*staged_id, *staged_version) != (plan_id, plan_version) {
+            return Err(super::plan_catalog::SqlPlanCatalogError::NotStaged {
+                plan_id,
+                plan_version,
+            });
+        }
+        let ack = self.catalog.activate(plan_id, plan_version)?;
+        let (_, _, binder) = staged.take().expect("staged binder checked above");
+        *self.binder.write().unwrap() = Some(binder);
+        Ok(ack)
     }
 }
 
@@ -103,7 +151,14 @@ fn requested_format(request: &ClickHouseQueryRequest) -> Result<ClickHouseFormat
 #[async_trait]
 impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
     async fn execute(&self, request: &ClickHouseQueryRequest) -> ClickHouseAccelerationOutcome {
-        let Some(entry) = self.catalog.lookup(&request.sql) else {
+        let (entry, binder) = {
+            let _publication = self.publication.read().unwrap();
+            (
+                self.catalog.lookup(&request.sql),
+                self.binder.read().unwrap().clone(),
+            )
+        };
+        let Some(entry) = entry else {
             return ClickHouseAccelerationOutcome::Fallback(
                 ClickHouseAccelerationFallback::CatalogMiss,
             );
@@ -116,7 +171,12 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                 )
             }
         };
-        let planned = match self.binder.bind(&request.sql).await {
+        let Some(binder) = binder else {
+            return ClickHouseAccelerationOutcome::Fallback(
+                ClickHouseAccelerationFallback::CatalogMiss,
+            );
+        };
+        let planned = match binder.bind(&request.sql).await {
             Ok(planned) => planned,
             Err(error) => {
                 return ClickHouseAccelerationOutcome::Fallback(

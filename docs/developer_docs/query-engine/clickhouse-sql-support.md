@@ -19,6 +19,14 @@ materialization fingerprints. Omitting the bundle keeps the listener in exact
 proxy mode. Historical ClickHouse rows can be replayed through
 `ClickHouseReader` into the existing isolated backfill worker.
 
+The same bundle can be published without restarting the backend. POST it to
+`/api/v1/clickhouse-plan/stage`; the backend validates its SDS snapshot and all
+SQL-plan descriptor foreign keys before returning a `staged` ACK. Then POST
+`{"plan_id": ..., "plan_version": ...}` to
+`/api/v1/clickhouse-plan/activate`. Activation switches the SQL plan generation
+and its schema binder together and returns an `active` ACK. These endpoints are
+served only on the independent ClickHouse listener.
+
 The executable subset is intentionally narrower than ClickHouse SQL. Joins,
 window functions, partitioned ranking, unsupported scalar functions, missing
 plans, missing materializations, and incomplete coverage route to exact
@@ -170,3 +178,13 @@ Existing PromQL tests must pass unchanged. ClickHouse coverage includes protocol
 and forwarding tests, SQL frontend-to-`SummaryNode` tests, SDS reference
 validation, shared-executor parity, time-boundary and type tests, Grafana smoke
 tests, and a real-ClickHouse differential end-to-end test.
+
+Run the optional real-server protocol and Grafana smoke suite with:
+
+```bash
+CLICKHOUSE_URL=http://127.0.0.1:8123 \
+  cargo test -p data_plane --test clickhouse_differential_e2e -- --nocapture
+```
+
+The test compares proxy and exact responses for a deterministic SQL query,
+ClickHouse version discovery, database discovery, and table discovery.
