@@ -17,14 +17,14 @@ pub enum MetricsQlBindingError {
     Physical(String),
 }
 
-/// Bind the PromQL-compatible subset of MetricsQL to the existing canonical
-/// query and physical DAG. MetricsQL-only syntax deliberately returns
+/// Bind VictoriaMetrics' supported PromQL-compatible subset to the existing
+/// canonical query and physical DAG. MetricsQL-only syntax deliberately returns
 /// `Unsupported`, which routes the original request to VictoriaMetrics.
 pub fn bind_metricsql(
     query: &str,
     accuracy: AccuracyTarget,
 ) -> Result<MetricsQlBinding, MetricsQlBindingError> {
-    let canonical = asap_frontend_metricsql::lower_metricsql(query, accuracy.clone())
+    let canonical = asap_frontend_promql::lower_promql(query, accuracy.clone())
         .map_err(|error| MetricsQlBindingError::Unsupported(error.to_string()))?;
     let physical = bind_query_expr(&canonical, accuracy)
         .map_err(|error| MetricsQlBindingError::Physical(error.to_string()))?;
@@ -49,9 +49,17 @@ mod tests {
     }
 
     #[test]
-    fn explicit_metricsql_rollup_reaches_shared_planning() {
-        bind_metricsql("default_rollup(cpu_usage[5m])", accuracy())
-            .expect("explicit MetricsQL rollup must bind");
+    fn asap_parser_extension_reaches_shared_planning() {
+        bind_metricsql("mad_over_time(cpu_usage[5m])", accuracy())
+            .expect("the pinned ASAP parser supports mad_over_time");
+    }
+
+    #[test]
+    fn metricsql_only_rollup_fails_closed() {
+        assert!(matches!(
+            bind_metricsql("default_rollup(cpu_usage[5m])", accuracy()),
+            Err(MetricsQlBindingError::Unsupported(_))
+        ));
     }
 
     #[test]
@@ -69,6 +77,14 @@ mod tests {
                 "rate(http_requests_total[5m]) keep_metric_names",
                 accuracy()
             ),
+            Err(MetricsQlBindingError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn unsupported_metricsql_function_fails_closed() {
+        assert!(matches!(
+            bind_metricsql("distinct_over_time(cpu_usage[5m])", accuracy()),
             Err(MetricsQlBindingError::Unsupported(_))
         ));
     }

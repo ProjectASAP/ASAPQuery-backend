@@ -650,8 +650,8 @@ impl PhysicalQueryFrontend {
         match self {
             Self::PromQl => parse_query_expr_canonical(query, accuracy)
                 .map_err(|e| format!("frontend.promql: {e}")),
-            Self::MetricsQl => asap_frontend_metricsql::lower_metricsql(query, accuracy)
-                .map_err(|e| format!("frontend.metricsql: {e}")),
+            Self::MetricsQl => parse_query_expr_canonical(query, accuracy)
+                .map_err(|e| format!("victoriametrics.promql_subset: {e}")),
         }
     }
     fn compile(
