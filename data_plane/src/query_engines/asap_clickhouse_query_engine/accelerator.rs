@@ -756,6 +756,8 @@ mod tests {
             None,
         );
         cfg.pane_origin_ms = Some(0);
+        cfg.table_name = Some("asap_e2e.samples".into());
+        cfg.value_column = Some("value".into());
         let hot = crate::storage_engines::types::HotReloadStreamingConfig::from_arc(Arc::new(
             crate::storage_engines::types::StreamingConfig::new(HashMap::from([(
                 cfg.policy_fp_u64(),
