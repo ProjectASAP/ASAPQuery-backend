@@ -1,0 +1,345 @@
+{
+  "eval_ms": 1788891296000,
+  "results": [
+    {
+      "id": "q05",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "instance",
+              "api-gateway:8081"
+            ],
+            [
+              "job",
+              "api-gateway"
+            ]
+          ],
+          0.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "order-service:8083"
+            ],
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "payment-service:8084"
+            ],
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "user-service:8082"
+            ],
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          530.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "webapp:8080"
+            ],
+            [
+              "job",
+              "webapp"
+            ]
+          ],
+          0.0
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "instance",
+              "api-gateway:8081"
+            ],
+            [
+              "job",
+              "api-gateway"
+            ]
+          ],
+          0.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "order-service:8083"
+            ],
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          0.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "payment-service:8084"
+            ],
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          0.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "user-service:8082"
+            ],
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          530.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "webapp:8080"
+            ],
+            [
+              "job",
+              "webapp"
+            ]
+          ],
+          0.0
+        ]
+      ],
+      "sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='cache_refresh_lag_seconds' AND ts_ms>1788891296000-43200000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY labels FORMAT JSON"
+    },
+    {
+      "id": "q06",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "instance",
+              "user-service:8082"
+            ],
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          530.0
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "instance",
+              "user-service:8082"
+            ],
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          530.0
+        ]
+      ],
+      "sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>1788891296000-43200000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY labels FORMAT JSON"
+    },
+    {
+      "id": "q07",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "__name__",
+              "user_service_cache_refresh_lag_seconds"
+            ],
+            [
+              "instance",
+              "user-service:8082"
+            ],
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          0.0
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "__name__",
+              "user_service_cache_refresh_lag_seconds"
+            ],
+            [
+              "instance",
+              "user-service:8082"
+            ],
+            [
+              "job",
+              "user-service"
+            ]
+          ],
+          0.0
+        ]
+      ],
+      "sql": "SELECT mapConcat(labels,map('__name__','user_service_cache_refresh_lag_seconds')) AS labels, argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>1788891296000-300000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY labels FORMAT JSON"
+    },
+    {
+      "id": "q09",
+      "valid": true,
+      "prometheus": [
+        [
+          [],
+          570522659.0
+        ]
+      ],
+      "clickhouse": [
+        [
+          [],
+          570522659.0
+        ]
+      ],
+      "sql": "SELECT map() AS labels, sum(value) AS value FROM (SELECT labels,argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms>1788891296000-300000 AND ts_ms<=1788891296000 GROUP BY labels) FORMAT JSON"
+    },
+    {
+      "id": "q12",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "job",
+              "api-gateway"
+            ]
+          ],
+          116909806.0
+        ],
+        [
+          [
+            [
+              "job",
+              "webapp"
+            ]
+          ],
+          119294036.0
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "job",
+              "api-gateway"
+            ]
+          ],
+          116909806.0
+        ],
+        [
+          [
+            [
+              "job",
+              "webapp"
+            ]
+          ],
+          119294036.0
+        ]
+      ],
+      "sql": "SELECT map('job',job) AS labels,sum(value) AS value FROM (SELECT labels['job'] AS job,labels,argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms>1788891296000-300000 AND ts_ms<=1788891296000 GROUP BY job,labels) GROUP BY job ORDER BY value DESC,job LIMIT 2 FORMAT JSON"
+    },
+    {
+      "id": "q23",
+      "valid": true,
+      "prometheus": [
+        [
+          [
+            [
+              "instance",
+              "order-service:8083"
+            ],
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          24.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "payment-service:8084"
+            ],
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          101.0
+        ]
+      ],
+      "clickhouse": [
+        [
+          [
+            [
+              "instance",
+              "order-service:8083"
+            ],
+            [
+              "job",
+              "order-service"
+            ]
+          ],
+          24.0
+        ],
+        [
+          [
+            [
+              "instance",
+              "payment-service:8084"
+            ],
+            [
+              "job",
+              "payment-service"
+            ]
+          ],
+          101.0
+        ]
+      ],
+      "sql": "SELECT labels,max(value) AS value FROM raw_samples WHERE metric='backend_retry_backlog_depth' AND ts_ms>1788891296000-21600000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY value DESC,labels LIMIT 2 FORMAT JSON"
+    }
+  ]
+}

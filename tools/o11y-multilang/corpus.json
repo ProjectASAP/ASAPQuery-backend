@@ -1,0 +1,341 @@
+{
+  "schema_version": 1,
+  "source": "/mydata/evaluation_query_datasets.yaml",
+  "count": 27,
+  "queries": [
+    {
+      "id": "q01",
+      "promql": "sort_desc(sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+      "metricsql": "sort_desc(sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+      "clickhouse_sql": null,
+      "operators": [
+        "sort_desc",
+        "increase",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q02",
+      "promql": "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+      "metricsql": "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+      "clickhouse_sql": null,
+      "operators": [
+        "topk",
+        "increase",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q03",
+      "promql": "sum(increase(payment_service_http_5xx_total[1h])) / sum(increase(payment_service_http_requests_total[1h]))",
+      "metricsql": "sum(increase(payment_service_http_5xx_total[1h])) / sum(increase(payment_service_http_requests_total[1h]))",
+      "clickhouse_sql": null,
+      "operators": [
+        "increase",
+        "sum",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q04",
+      "promql": "sum(increase(payment_service_http_5xx_total[1h] offset 6h)) / sum(increase(payment_service_http_requests_total[1h] offset 6h))",
+      "metricsql": "sum(increase(payment_service_http_5xx_total[1h] offset 6h)) / sum(increase(payment_service_http_requests_total[1h] offset 6h))",
+      "clickhouse_sql": null,
+      "operators": [
+        "increase",
+        "sum",
+        "offset",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q05",
+      "promql": "max_over_time(cache_refresh_lag_seconds[12h])",
+      "metricsql": "max_over_time(cache_refresh_lag_seconds[12h])",
+      "clickhouse_sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='cache_refresh_lag_seconds' AND ts_ms>{eval_ms}-43200000 AND ts_ms<={eval_ms} GROUP BY labels ORDER BY labels",
+      "operators": [
+        "max_over_time"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q06",
+      "promql": "max_over_time(user_service_cache_refresh_lag_seconds[12h])",
+      "metricsql": "max_over_time(user_service_cache_refresh_lag_seconds[12h])",
+      "clickhouse_sql": "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>{eval_ms}-43200000 AND ts_ms<={eval_ms} GROUP BY labels ORDER BY labels",
+      "operators": [
+        "max_over_time"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q07",
+      "promql": "user_service_cache_refresh_lag_seconds",
+      "metricsql": "user_service_cache_refresh_lag_seconds",
+      "clickhouse_sql": "SELECT mapConcat(labels,map('__name__','user_service_cache_refresh_lag_seconds')) AS labels, argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='user_service_cache_refresh_lag_seconds' AND ts_ms>{eval_ms}-300000 AND ts_ms<={eval_ms} GROUP BY labels ORDER BY labels",
+      "operators": [],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q08",
+      "promql": "sum(rate(backend_process_cpu_seconds_total[1h]))",
+      "metricsql": "sum(rate(backend_process_cpu_seconds_total[1h]))",
+      "clickhouse_sql": null,
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q09",
+      "promql": "sum(backend_process_resident_memory_bytes)",
+      "metricsql": "sum(backend_process_resident_memory_bytes)",
+      "clickhouse_sql": "SELECT map() AS labels, sum(value) AS value FROM (SELECT labels,argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms>{eval_ms}-300000 AND ts_ms<={eval_ms} GROUP BY labels)",
+      "operators": [
+        "sum"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q10",
+      "promql": "max_over_time((sum(backend_process_resident_memory_bytes))[6h:])",
+      "metricsql": "max_over_time((sum(backend_process_resident_memory_bytes))[6h:])",
+      "clickhouse_sql": null,
+      "operators": [
+        "max_over_time",
+        "sum",
+        "subquery"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q11",
+      "promql": "topk(2, sum by (job) (rate(backend_process_cpu_seconds_total[1h])))",
+      "metricsql": "topk(2, sum by (job) (rate(backend_process_cpu_seconds_total[1h])))",
+      "clickhouse_sql": null,
+      "operators": [
+        "topk",
+        "rate"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q12",
+      "promql": "topk(2, sum by (job) (backend_process_resident_memory_bytes))",
+      "metricsql": "topk(2, sum by (job) (backend_process_resident_memory_bytes))",
+      "clickhouse_sql": "SELECT map('job',job) AS labels,sum(value) AS value FROM (SELECT labels['job'] AS job,labels,argMax(value,ts_ms) AS value FROM raw_samples WHERE metric='backend_process_resident_memory_bytes' AND ts_ms>{eval_ms}-300000 AND ts_ms<={eval_ms} GROUP BY job,labels) GROUP BY job ORDER BY value DESC,job LIMIT 2",
+      "operators": [
+        "topk"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q13",
+      "promql": "max_over_time((sum(rate(backend_process_cpu_seconds_total[5m])))[6h:])",
+      "metricsql": "max_over_time((sum(rate(backend_process_cpu_seconds_total[5m])))[6h:])",
+      "clickhouse_sql": null,
+      "operators": [
+        "rate",
+        "max_over_time",
+        "sum",
+        "subquery"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q14",
+      "promql": "sum(rate(backend_http_requests_total[5m]))",
+      "metricsql": "sum(rate(backend_http_requests_total[5m]))",
+      "clickhouse_sql": null,
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q15",
+      "promql": "sum by (job) (rate(backend_http_requests_total[5m]))",
+      "metricsql": "sum by (job) (rate(backend_http_requests_total[5m]))",
+      "clickhouse_sql": null,
+      "operators": [
+        "rate"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q16",
+      "promql": "sum(increase(backend_http_5xx_total[60m])) / sum(increase(backend_http_requests_total[60m]))",
+      "metricsql": "sum(increase(backend_http_5xx_total[60m])) / sum(increase(backend_http_requests_total[60m]))",
+      "clickhouse_sql": null,
+      "operators": [
+        "increase",
+        "sum",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q17",
+      "promql": "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+      "metricsql": "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))",
+      "clickhouse_sql": null,
+      "operators": [
+        "topk",
+        "increase",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q18",
+      "promql": "sum by (job) (increase(backend_http_5xx_total[24h])) > 0",
+      "metricsql": "sum by (job) (increase(backend_http_5xx_total[24h])) > 0",
+      "clickhouse_sql": null,
+      "operators": [
+        "increase",
+        "comparison"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q19",
+      "promql": "sum(rate(order_service_http_requests_total[5m]))",
+      "metricsql": "sum(rate(order_service_http_requests_total[5m]))",
+      "clickhouse_sql": null,
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q20",
+      "promql": "sum(rate(order_service_http_requests_total[5m] offset 1h))",
+      "metricsql": "sum(rate(order_service_http_requests_total[5m] offset 1h))",
+      "clickhouse_sql": null,
+      "operators": [
+        "rate",
+        "sum",
+        "offset"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q21",
+      "promql": "histogram_quantile(0.95, sum by (le) (rate(order_service_http_request_duration_seconds_bucket[5m])))",
+      "metricsql": "histogram_quantile(0.95, sum by (le) (rate(order_service_http_request_duration_seconds_bucket[5m])))",
+      "clickhouse_sql": null,
+      "operators": [
+        "histogram_quantile",
+        "rate"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q22",
+      "promql": "sum(rate(order_service_http_requests_total[5m]))",
+      "metricsql": "sum(rate(order_service_http_requests_total[5m]))",
+      "clickhouse_sql": null,
+      "operators": [
+        "rate",
+        "sum"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q23",
+      "promql": "topk(2, max_over_time(backend_retry_backlog_depth[6h]))",
+      "metricsql": "topk(2, max_over_time(backend_retry_backlog_depth[6h]))",
+      "clickhouse_sql": "SELECT labels,max(value) AS value FROM raw_samples WHERE metric='backend_retry_backlog_depth' AND ts_ms>{eval_ms}-21600000 AND ts_ms<={eval_ms} GROUP BY labels ORDER BY value DESC,labels LIMIT 2",
+      "operators": [
+        "topk",
+        "max_over_time"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "oracle_valid"
+    },
+    {
+      "id": "q24",
+      "promql": "max_over_time((sum(rate(order_service_http_5xx_total[5m])) / sum(rate(order_service_http_requests_total[5m])))[6h:])",
+      "metricsql": "max_over_time((sum(rate(order_service_http_5xx_total[5m])) / sum(rate(order_service_http_requests_total[5m])))[6h:])",
+      "clickhouse_sql": null,
+      "operators": [
+        "rate",
+        "max_over_time",
+        "sum",
+        "subquery",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q25",
+      "promql": "topk(1, sum by (job) (increase(backend_http_5xx_total[24h])) / scalar(sum(increase(backend_http_5xx_total[24h]))))",
+      "metricsql": "topk(1, sum by (job) (increase(backend_http_5xx_total[24h])) / scalar(sum(increase(backend_http_5xx_total[24h]))))",
+      "clickhouse_sql": null,
+      "operators": [
+        "topk",
+        "scalar",
+        "increase",
+        "sum",
+        "division"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q26",
+      "promql": "topk(1, sum by (job) (rate(backend_process_cpu_seconds_total[6h])))",
+      "metricsql": "topk(1, sum by (job) (rate(backend_process_cpu_seconds_total[6h])))",
+      "clickhouse_sql": null,
+      "operators": [
+        "topk",
+        "rate"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    },
+    {
+      "id": "q27",
+      "promql": "topk(3, avg_over_time((sum by (job) (backend_process_resident_memory_bytes))[6h:]))",
+      "metricsql": "topk(3, avg_over_time((sum by (job) (backend_process_resident_memory_bytes))[6h:]))",
+      "clickhouse_sql": null,
+      "operators": [
+        "topk",
+        "avg_over_time",
+        "subquery"
+      ],
+      "sql_mapping_contract": "Derived from identical raw samples by the checked Prometheus-semantics loader, never from baseline query answers.",
+      "sql_mapping_status": "later_pattern_batch"
+    }
+  ]
+}
