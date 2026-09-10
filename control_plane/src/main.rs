@@ -828,21 +828,22 @@ async fn handle_compile_and_publish_clickhouse_plan(
         entries: Default::default(),
     };
     if let Err(error) = client
-        .post_physical_plan_typed(
+        .post_physical_plan_with_sidecar(
             &bundle.precompute_plan,
             &bundle.transmission_plan,
             &empty_query_plan,
             None,
             &[],
+            Some(serde_json::to_value(&bundle).expect("compiled ClickHouse bundle serializes")),
         )
         .await
     {
         return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
     }
-    if let Err(error) = client
-        .publish_clickhouse_plan(&bundle, plan_id, plan_version)
-        .await
-    {
+    if let Err(error) = client.activate_physical_plan(plan_id, plan_version).await {
+        let _ = client
+            .discard_staged_physical_plan(plan_id, plan_version)
+            .await;
         return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
     }
     Json(serde_json::json!({

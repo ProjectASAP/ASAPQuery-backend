@@ -576,6 +576,7 @@ async fn main() -> Result<()> {
                 precompute_plan: plan.precompute_plan,
                 transmission_plan: plan.transmission_plan,
                 query_plan: plan.query_plan,
+                clickhouse_sql: None,
                 storage_routing: None,
                 adaptation_evidence: Vec::new(),
             },
@@ -789,6 +790,7 @@ async fn main() -> Result<()> {
             transmission_plan: initial_transmission_plan,
             runtime_config: streaming_config.clone(),
             query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
+            clickhouse_sql: None,
             storage_routing: Arc::new(
                 data_plane::storage_engines::types::BackendStorageRouting::empty(),
             ),
@@ -1177,6 +1179,7 @@ async fn main() -> Result<()> {
             transmission_plan: current.transmission_plan.clone(),
             runtime_config: current.runtime_config.clone(),
             query_plan: current.query_plan.clone(),
+            clickhouse_sql: current.clickhouse_sql.clone(),
             storage_routing: Arc::new(bootstrap_routing),
         });
     }
@@ -1394,8 +1397,9 @@ async fn main() -> Result<()> {
 
     let clickhouse_accelerator = if args.clickhouse_http_port.is_some() {
         let accelerator = Arc::new(
-            data_plane::query_engines::asap_clickhouse_query_engine::accelerator::CatalogClickHouseAccelerator::empty(
+            data_plane::query_engines::asap_clickhouse_query_engine::accelerator::CatalogClickHouseAccelerator::with_active_physical_plan(
                 sketch_index.clone(),
+                active_physical_plan.clone(),
             ),
         );
         if let Some(path) = args.clickhouse_plan_bundle.as_ref() {
@@ -1410,7 +1414,6 @@ async fn main() -> Result<()> {
         None
     };
 
-    let clickhouse_plan_token = args.clickhouse_plan_token.clone();
     let clickhouse_server_handle = args.clickhouse_http_port.map(|port| {
         let fallback = Arc::new(
             data_plane::query_engines::asap_clickhouse_query_engine::ClickHouseHttpFallback::new(
@@ -1426,11 +1429,7 @@ async fn main() -> Result<()> {
         info!("Starting ClickHouse-compatible HTTP proxy on port {port}");
         tokio::spawn(async move {
             let result = match clickhouse_accelerator {
-                Some(accelerator) => {
-                    clickhouse_server
-                        .run_with_catalog(accelerator, clickhouse_plan_token)
-                        .await
-                }
+                Some(accelerator) => clickhouse_server.run_with_accelerator(accelerator).await,
                 None => clickhouse_server.run().await,
             };
             if let Err(error) = result {

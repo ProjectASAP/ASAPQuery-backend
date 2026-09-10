@@ -5,7 +5,7 @@ use control_plane::clickhouse::{
 };
 use planner_types::types::AccuracyTarget;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ClickHouseSqlBinder {
     catalog: ClickHouseSqlCatalog,
     accuracy: AccuracyTarget,

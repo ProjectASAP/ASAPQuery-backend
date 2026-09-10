@@ -95,6 +95,8 @@ pub struct ActivePhysicalPlan {
     pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
     pub runtime_config: Arc<StreamingConfig>,
     pub query_plan: Arc<control_plane::query_plan::QueryPlan>,
+    /// SQL-specific executable catalog, validated against this snapshot's SDS.
+    pub clickhouse_sql: Option<Arc<crate::query_engines::asap_clickhouse_query_engine::accelerator::ClickHouseActiveGeneration>>,
     pub storage_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
 }
 
@@ -692,6 +694,7 @@ mod tests {
                 plan_version,
                 entries: Default::default(),
             }),
+            clickhouse_sql: None,
             storage_routing: Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
         }
     }

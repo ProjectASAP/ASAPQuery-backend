@@ -2713,6 +2713,7 @@ mod tests {
                     plan_version: 1,
                     entries: Default::default(),
                 }),
+                clickhouse_sql: None,
                 storage_routing: Arc::new(
                     crate::storage_engines::types::BackendStorageRouting::empty(),
                 ),
@@ -6005,6 +6006,8 @@ pub struct PhysicalPlanInstallRequest {
     pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
     pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
     pub query_plan: control_plane::query_plan::QueryPlan,
+    #[serde(default)]
+    pub clickhouse_sql: Option<serde_json::Value>,
     pub storage_routing: Option<serde_json::Value>,
     #[serde(default)]
     pub adaptation_evidence: Vec<control_plane::physical::compiler::RuntimeAdaptationEvidence>,
@@ -6083,6 +6086,14 @@ pub fn build_active_physical_plan(
         .query_plan
         .validate(&typed_fps)
         .map_err(|error| format!("QueryPlan validation error: {error}"))?;
+    let clickhouse_sql = request.clickhouse_sql
+        .map(|value| {
+            let bundle = serde_json::from_value(value)
+                .map_err(|error| format!("ClickHouse SQL sidecar decode error: {error}"))?;
+            crate::query_engines::asap_clickhouse_query_engine::accelerator::build_active_generation(
+                bundle, &request.summary_catalog,
+            ).map(Arc::new).map_err(|error| format!("ClickHouse SQL sidecar validation error: {error}"))
+        }).transpose()?;
     let storage_routing = match request.storage_routing.as_ref() {
         Some(value) => Arc::new(
             crate::storage_engines::types::BackendStorageRouting::from_json_payload(value)
@@ -6097,6 +6108,7 @@ pub fn build_active_physical_plan(
         transmission_plan: request.transmission_plan,
         runtime_config: Arc::new(runtime_config),
         query_plan: Arc::new(request.query_plan),
+        clickhouse_sql,
         storage_routing,
     })
 }
@@ -6181,6 +6193,11 @@ async fn handle_post_physical_plan(
         .values()
         .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::MetricsQl)
         .count();
+    let clickhouse_plan_count = active
+        .clickhouse_sql
+        .as_ref()
+        .map(|generation| generation.catalog.len())
+        .unwrap_or(0);
     let plan_version = active.plan_version();
     let now = unix_time_ms();
     if let Err(error) = lifecycle.stage(active, now) {
@@ -6195,7 +6212,8 @@ async fn handle_post_physical_plan(
         axum::Json(serde_json::json!({
             "status": "staged", "plan_id": plan_id, "plan_version": plan_version,
             "materialization_count": materialization_count,
-            "metricsql_query_count": metricsql_query_count
+            "metricsql_query_count": metricsql_query_count,
+            "clickhouse_plan_count": clickhouse_plan_count
         })),
     )
         .into_response()
@@ -6239,6 +6257,11 @@ async fn handle_activate_physical_plan(
         }
     };
     let activated = active_handle.snapshot();
+    let clickhouse_plan_count = activated
+        .clickhouse_sql
+        .as_ref()
+        .map(|generation| generation.catalog.len())
+        .unwrap_or(0);
     if let Some(catalog) = activated.summary_catalog.as_ref() {
         if let Err(error) = state
             .sketch_index
@@ -6277,7 +6300,8 @@ async fn handle_activate_physical_plan(
         StatusCode::OK,
         axum::Json(serde_json::json!({
             "status": "active", "plan_id": request.plan_id, "plan_version": request.plan_version,
-            "sids_retired": retired.retired
+            "sids_retired": retired.retired,
+            "clickhouse_plan_count": clickhouse_plan_count
         })),
     )
         .into_response()
@@ -7111,6 +7135,7 @@ mod catalog_install_tests {
             precompute_plan: plan.precompute_plan,
             transmission_plan: plan.transmission_plan,
             query_plan: plan.query_plan,
+            clickhouse_sql: None,
             storage_routing: None,
             adaptation_evidence: vec![],
         }
@@ -7122,6 +7147,22 @@ mod catalog_install_tests {
             request,
             Arc::new(crate::storage_engines::types::BackendStorageRouting::empty()),
         )
+    }
+
+    #[test]
+    fn invalid_clickhouse_sidecar_cannot_change_active_generation() {
+        let active = install(request()).expect("baseline plan installs");
+        let handle = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active);
+        let before = handle.snapshot();
+        let mut candidate = request();
+        candidate.clickhouse_sql = Some(serde_json::json!({"plans": []}));
+
+        let error = install(candidate).expect_err("incomplete SQL sidecar must fail staging");
+        assert!(error.contains("ClickHouse SQL sidecar decode error"));
+        let after = handle.snapshot();
+        assert_eq!(after.plan_id(), before.plan_id());
+        assert_eq!(after.plan_version(), before.plan_version());
+        assert!(after.clickhouse_sql.is_none());
     }
 
     // Installing transports the exact supplied snapshot, rather than rebuilding it.

@@ -55,12 +55,61 @@ pub struct ClickHousePlanBundle {
     pub plans: Vec<ClickHousePublishedPlan>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ClickHouseActiveGeneration {
+    pub catalog: Arc<SqlPlanCatalogGeneration<SqlRuntimePlan>>,
+    pub binder: ClickHouseSqlBinder,
+}
+
+pub fn build_active_generation(
+    bundle: ClickHousePlanBundle,
+    physical_sds: &SummaryCatalog,
+) -> Result<ClickHouseActiveGeneration, super::plan_catalog::SqlPlanCatalogError> {
+    if bundle
+        .sds
+        .reference()
+        .map_err(|e| super::plan_catalog::SqlPlanCatalogError::InvalidSds(e.to_string()))?
+        != physical_sds
+            .reference()
+            .map_err(|e| super::plan_catalog::SqlPlanCatalogError::InvalidSds(e.to_string()))?
+    {
+        return Err(super::plan_catalog::SqlPlanCatalogError::InvalidSds(
+            "SQL sidecar SDS differs from physical publication SDS".into(),
+        ));
+    }
+    for plan in &bundle.plans {
+        crate::query_engines::asap_query_engine::catalog_resolver::validate_payload(
+            Some(physical_sds),
+            &plan.runtime.executable,
+            physical_sds.plan_id,
+            physical_sds.plan_version,
+        )
+        .map_err(|e| super::plan_catalog::SqlPlanCatalogError::InvalidSds(e.to_string()))?;
+    }
+    let entries = bundle.plans.into_iter().map(|plan| SqlPlanEntry {
+        sql_template: plan.sql,
+        plan: plan.runtime,
+        descriptors: plan.descriptors,
+    });
+    let generation = SqlPlanCatalogGeneration::build(physical_sds, entries)?;
+    Ok(ClickHouseActiveGeneration {
+        catalog: Arc::new(generation),
+        binder: ClickHouseSqlBinder::new(
+            control_plane::clickhouse::ClickHouseSqlCatalog {
+                tables: bundle.tables,
+            },
+            bundle.accuracy,
+        ),
+    })
+}
+
 pub struct CatalogClickHouseAccelerator {
     pub catalog: Arc<SqlPlanCatalog<SqlRuntimePlan>>,
     binder: RwLock<Option<ClickHouseSqlBinder>>,
     staged_binder: Mutex<Option<(u64, u64, ClickHouseSqlBinder)>>,
     publication: RwLock<()>,
     pub store: Arc<SketchStore>,
+    active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
 }
 
 impl CatalogClickHouseAccelerator {
@@ -71,7 +120,17 @@ impl CatalogClickHouseAccelerator {
             staged_binder: Mutex::new(None),
             publication: RwLock::new(()),
             store,
+            active_physical_plan: None,
         }
+    }
+
+    pub fn with_active_physical_plan(
+        store: Arc<SketchStore>,
+        active: crate::storage_engines::types::HotReloadActivePhysicalPlan,
+    ) -> Self {
+        let mut accelerator = Self::empty(store);
+        accelerator.active_physical_plan = Some(active);
+        accelerator
     }
 
     pub fn from_bundle(
@@ -164,7 +223,12 @@ fn requested_format(request: &ClickHouseQueryRequest) -> Result<ClickHouseFormat
 #[async_trait]
 impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
     async fn execute(&self, request: &ClickHouseQueryRequest) -> ClickHouseAccelerationOutcome {
-        let binder = self.binder.read().unwrap().clone();
+        let physical = self.active_physical_plan.as_ref().map(|h| h.snapshot());
+        let sidecar = physical.as_ref().and_then(|p| p.clickhouse_sql.clone());
+        let binder = sidecar
+            .as_ref()
+            .map(|s| s.binder.clone())
+            .or_else(|| self.binder.read().unwrap().clone());
         let Some(binder) = binder else {
             return ClickHouseAccelerationOutcome::Fallback(
                 ClickHouseAccelerationFallback::CatalogMiss,
@@ -178,7 +242,12 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                 )
             }
         };
-        let (entry, generation) = {
+        let (entry, generation) = if let Some(sidecar) = sidecar {
+            (
+                sidecar.catalog.lookup(&canonical_sql),
+                Some(sidecar.catalog.clone()),
+            )
+        } else {
             let _publication = self.publication.read().unwrap();
             (self.catalog.lookup(&canonical_sql), self.catalog.active())
         };
