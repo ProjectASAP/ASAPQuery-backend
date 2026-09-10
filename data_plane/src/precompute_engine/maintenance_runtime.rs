@@ -37,7 +37,6 @@ impl PrecomputeOperatorRegistry<SummaryState> for OperatorAdapter<'_> {
         }
         match &node.payload {
             ExecutableOperatorPayload::SummaryAgg { .. }
-            | ExecutableOperatorPayload::SummaryJoin { .. }
             | ExecutableOperatorPayload::SummaryMerge => merge_inputs(inputs),
             payload => Err(format!(
                 "maintenance operator {:?} has no summary-state implementation",
