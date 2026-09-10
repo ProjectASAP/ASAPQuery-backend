@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "e28284231e861c18beb4222cada4bf5e0afeae22";
+pub const PLANNER_REVISION: &str = "e284154a2a028ee670ab1f0c5f2362602736750f";
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 
 #[derive(Debug, Clone)]
@@ -2565,6 +2565,12 @@ fn summary_agg_metric(node: &SummaryNode) -> Option<String> {
                 }
             }
             SummaryExpr::SummaryAgg { child, .. } => walk(child, metrics),
+            SummaryExpr::CandidateTopK {
+                candidates, values, ..
+            } => {
+                walk(candidates, metrics);
+                walk(values, metrics);
+            }
             SummaryExpr::ValueOperation { child, .. } => walk(child, metrics),
             SummaryExpr::SummaryEstimate { summary_input, .. } => walk(summary_input, metrics),
             SummaryExpr::SummaryMerge { children } => {
@@ -2705,6 +2711,12 @@ fn requires_exact_erp_fallback(
             } => {
                 walk(left, out);
                 walk(right, out);
+            }
+            SummaryExpr::CandidateTopK {
+                candidates, values, ..
+            } => {
+                walk(candidates, out);
+                walk(values, out);
             }
             SummaryExpr::KeepPreAsap(_) => {}
         }
@@ -3339,6 +3351,12 @@ fn collect_selected_materializations(
             None
         };
         match &node.expr {
+            SummaryExpr::CandidateTopK {
+                candidates, values, ..
+            } => {
+                walk(candidates, readout, composable, grouping.clone(), selected)?;
+                walk(values, readout, composable, grouping.clone(), selected)?;
+            }
             SummaryExpr::ValueOperation { child, .. } => {
                 walk(child, readout, composable, grouping.clone(), selected)?;
             }
