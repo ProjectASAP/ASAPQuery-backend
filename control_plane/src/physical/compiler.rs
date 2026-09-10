@@ -1513,9 +1513,12 @@ fn has_unsafe_raw_entity_leaf(
                         _
                     )
                 );
+                let scalar_series_input = matches!(&node.expr,
+                    SummaryExpr::SummaryAgg { input, .. }
+                    if input.item.is_none() && matches!(&input.weight, planner_types::post_asap::SummaryInputExpr::Column(planner_types::pre_asap::ColumnRef::SampleValue)));
                 return matches!(reduction, Reduction::PerEntity)
                     && !pooling
-                    && !preserves_series_state;
+                    && !(preserves_series_state || scalar_series_input);
             }
             let additive_reduction = matches!(reduction, Reduction::Reduce(_))
                 && matches!(family, SummaryFamilyType::ExactAggregate(ExactKind::Sum, _))
@@ -1872,7 +1875,7 @@ impl PhysicalCompiler {
                     environment.target,
                 );
                 let precompute_materialization =
-                    aggregation_config_for_materialization(&aggregation)?;
+                    scoped_materialization(&aggregation, &selected.node)?;
                 let materialization = precompute_materialization.policy_fingerprint();
                 let state_consumers = consumers[&materialization]
                     .iter()
@@ -1904,7 +1907,7 @@ impl PhysicalCompiler {
                 // from the selected storage representation.
                 aggregation.window_secs = window_implementation.window_secs;
                 let mut runtime_materialization =
-                    aggregation_config_for_materialization(&aggregation)?;
+                    scoped_materialization(&aggregation, &selected.node)?;
                 runtime_materialization.window_size = window_implementation.window_secs;
                 runtime_materialization.slide_interval = window_implementation.slide_secs;
                 runtime_materialization.window_type =
@@ -2859,10 +2862,12 @@ fn retained_partition_count(
     // Reset-aware and min/max state remains source-series scoped even with an
     // empty output grouping. Grouped states have at most one partition per
     // input series. Other empty groupings are the Reduce([]) global singleton.
-    if matches!(
-        materialization.aggregation_type,
-        A::Increase | A::MultipleIncrease | A::MinMax | A::MultipleMinMax
-    ) || !materialization.grouping_labels.labels.is_empty()
+    if materialization.partitioning == Some(asap_types::sds::PopulationPartitioning::PerEntity)
+        || matches!(
+            materialization.aggregation_type,
+            A::Increase | A::MultipleIncrease | A::MinMax | A::MultipleMinMax
+        )
+        || !materialization.grouping_labels.labels.is_empty()
     {
         u128::from(input_cardinality.unwrap_or(1).max(1))
     } else {
@@ -3213,6 +3218,25 @@ fn physical_aggregation(
 /// content-addressed materialization contract. This is the one conversion
 /// shared by the physical compiler and the compatibility replanner; it does
 /// not create a second registry or wire plan.
+fn scoped_materialization(
+    aggregation: &BackendAggregation,
+    node: &SummaryNode,
+) -> anyhow::Result<asap_types::PrecomputeMaterialization> {
+    let mut config = aggregation_config_for_materialization(aggregation)?;
+    let SummaryExpr::SummaryAgg { reduction, .. } = &node.expr else {
+        anyhow::bail!("materialization lacks SummaryAgg partition contract");
+    };
+    config.partitioning = Some(match reduction {
+        planner_types::pre_asap::Reduction::PerEntity => {
+            asap_types::sds::PopulationPartitioning::PerEntity
+        }
+        planner_types::pre_asap::Reduction::Reduce(_) => {
+            asap_types::sds::PopulationPartitioning::Grouped
+        }
+    });
+    Ok(config)
+}
+
 pub(crate) fn aggregation_config_for_materialization(
     aggregation: &BackendAggregation,
 ) -> anyhow::Result<asap_types::PrecomputeMaterialization> {
@@ -3254,12 +3278,10 @@ fn materialization_consumers(
             {
                 continue;
             }
-            let config = aggregation_config_for_materialization(&physical_aggregation(
-                query,
-                &state,
-                query.query_id.clone(),
-                target,
-            ))?;
+            let config = scoped_materialization(
+                &physical_aggregation(query, &state, query.query_id.clone(), target),
+                &state.node,
+            )?;
             consumers
                 .entry(config.policy_fingerprint())
                 .or_default()
@@ -3605,7 +3627,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn raw_per_entity_state_requires_explicit_additive_reduction() {
+    fn raw_per_entity_state_carries_explicit_isolation() {
         for query in [
             "sum_over_time(m[1m])",
             "quantile_over_time(0.99, m[1m])",
@@ -3618,7 +3640,11 @@ mod tests {
                 .compile(request("per-entity", query), environment)
                 .unwrap();
             assert!(
-                plan.precompute_plan.materializations.is_empty(),
+                plan.precompute_plan
+                    .materializations
+                    .iter()
+                    .all(|state| state.partitioning
+                        == Some(asap_types::sds::PopulationPartitioning::PerEntity)),
                 "{query} pooled source entities"
             );
         }
@@ -4894,8 +4920,8 @@ mod tests {
     }
 
     #[test]
-    fn composable_per_entity_window_delegates_exact_subtree_to_prometheus() {
-        use crate::query_plan::{logical::LogicalOperator, QueryPlanNode};
+    fn composable_per_entity_window_installs_isolated_state() {
+        use crate::query_plan::QueryPlanNode;
         let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -4905,24 +4931,16 @@ mod tests {
         entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
         let (request, env) = snapshot.planning_request().unwrap();
         let plan = PhysicalCompiler.compile(request, env).unwrap();
-        assert!(plan.precompute_plan.materializations.is_empty());
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        assert_eq!(
+            plan.precompute_plan.materializations[0].partitioning,
+            Some(asap_types::sds::PopulationPartitioning::PerEntity)
+        );
         let entry = plan.query_plan.lookup("sum_over_time(m[1m])").unwrap();
-        assert!(entry.nodes.values().any(|node| matches!(
-            node,
-            QueryPlanNode::Logical {
-                operator: LogicalOperator::ExactSubquery { query },
-                ..
-            } if query == "sum_over_time(m[1m])"
-        )));
-        assert!(entry.nodes.values().all(|node| !matches!(
-            node,
-            QueryPlanNode::ReadMaterialization { .. }
-                | QueryPlanNode::ExactFallback { .. }
-                | QueryPlanNode::Logical {
-                    operator: LogicalOperator::Scan { .. },
-                    ..
-                }
-        )));
+        assert!(entry
+            .nodes
+            .values()
+            .any(|node| matches!(node, QueryPlanNode::ReadMaterialization { .. })));
     }
 
     // Each operand retains its source and semantic range; a smaller shared pane
@@ -5607,11 +5625,13 @@ mod tests {
             .compile()
             .expect("unquoted v1 compatibility startup remains available");
         let (local, env) = snapshot.clone().planning_request().unwrap();
-        assert!(PhysicalCompiler
-            .compile(local, env)
-            .unwrap_err()
-            .to_string()
-            .contains("native residual substitution requires an exact selected value"));
+        let isolated = PhysicalCompiler.compile(local, env).unwrap();
+        assert!(!isolated.precompute_plan.materializations.is_empty());
+        assert!(isolated
+            .precompute_plan
+            .materializations
+            .iter()
+            .all(|state| state.partitioning.is_some()));
         let (request, environment) = snapshot.planning_request().unwrap();
         let native = crate::physical::workload_cost::with_exact_alternative(request)
             .unwrap()
@@ -5641,11 +5661,13 @@ mod tests {
             .compile()
             .expect("unquoted v1 compatibility startup remains available");
         let (local, env) = snapshot.clone().planning_request().unwrap();
-        assert!(PhysicalCompiler
-            .compile(local, env)
-            .unwrap_err()
-            .to_string()
-            .contains("native residual substitution requires an exact selected value"));
+        let isolated = PhysicalCompiler.compile(local, env).unwrap();
+        assert!(!isolated.precompute_plan.materializations.is_empty());
+        assert!(isolated
+            .precompute_plan
+            .materializations
+            .iter()
+            .all(|state| state.partitioning.is_some()));
         let (request, environment) = snapshot.planning_request().unwrap();
         let native = crate::physical::workload_cost::with_exact_alternative(request)
             .unwrap()

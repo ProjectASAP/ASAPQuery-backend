@@ -560,13 +560,16 @@ fn route_messages(
             // accumulator per source series. Their emitted label values still
             // follow the physical grouping, so query-time Reduce nodes can
             // combine those independent SDS instances safely.
-            let series_scoped = matches!(
-                config.aggregation_type,
-                asap_types::AggregationType::Increase
-                    | asap_types::AggregationType::MultipleIncrease
-                    | asap_types::AggregationType::MinMax
-                    | asap_types::AggregationType::MultipleMinMax
-            );
+            let series_scoped = config.partitioning
+                == Some(asap_types::sds::PopulationPartitioning::PerEntity)
+                || (config.partitioning.is_none()
+                    && matches!(
+                        config.aggregation_type,
+                        asap_types::AggregationType::Increase
+                            | asap_types::AggregationType::MultipleIncrease
+                            | asap_types::AggregationType::MinMax
+                            | asap_types::AggregationType::MultipleMinMax
+                    ));
             let grouping_pairs: Vec<(&str, &str)> = if series_scoped {
                 Vec::new()
             } else {
