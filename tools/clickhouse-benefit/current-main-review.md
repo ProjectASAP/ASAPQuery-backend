@@ -66,7 +66,8 @@ the summary build/update work.
 
 Three trials restarted a dedicated ClickHouse 26.8.2.7 process and rebuilt the
 summary. Each then alternated 1,000 warm and 1,000 direct-exact requests after ten
-warmups. Backend and ClickHouse both ran on CPU cores 60–61; ClickHouse used two
+warmups. Backend/test driver and ClickHouse ran in separate containers, each with
+CPU cores 60–61, a two-CPU quota, and a 4 GiB memory limit. ClickHouse used two
 threads and its query cache was disabled. Rust 1.98.0 produced the release build.
 The ClickHouse image digest was
 `sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb`.
@@ -79,31 +80,40 @@ MergeTree with timestamp ordering.
 
 | Trial | ASAP median / p95 | ClickHouse median / p95 | Median speedup | ASAP query CPU | ClickHouse exact query CPU |
 |---|---:|---:|---:|---:|---:|
-| 1 | 0.853 / 0.935 ms | 6.575 / 13.609 ms | 7.71× | 770 ms | 7,650 ms |
-| 2 | 0.853 / 1.017 ms | 6.832 / 15.356 ms | 8.01× | 770 ms | 8,410 ms |
-| 3 | 0.853 / 0.952 ms | 6.764 / 15.569 ms | 7.93× | 780 ms | 8,530 ms |
+| 1 | 0.851 / 0.965 ms | 6.892 / 15.056 ms | 8.10× | 770 ms | 8,530 ms |
+| 2 | 0.848 / 0.955 ms | 7.449 / 15.657 ms | 8.78× | 760 ms | 9,640 ms |
+| 3 | 0.850 / 0.955 ms | 7.019 / 15.255 ms | 8.26× | 780 ms | 8,560 ms |
 
 CPU covers 1,000 queries per route, with 10 ms scheduler-tick precision.
-ClickHouse also consumed 70–130 ms of background CPU during the warm requests.
-The reciprocal mean latency was 1,179–1,188 requests/s for ASAP and 130–146
+ClickHouse also consumed 60–130 ms of background CPU during the warm requests.
+The reciprocal mean latency was 1,169–1,192 requests/s for ASAP and 117–132
 requests/s for ClickHouse; this is a serial service rate, not a concurrency test.
 
-Backend query-phase RSS was 50.9–52.4 MiB; ClickHouse RSS was 783.7–832.0 MiB.
-Lifecycle high-water marks were 50.9–52.4 MiB and 862.8–892.2 MiB respectively.
+Backend query-phase RSS was 51.3–53.6 MiB; ClickHouse RSS was 751.2–777.7 MiB.
+Lifecycle high-water marks were 51.3–53.6 MiB and 807.0–891.0 MiB respectively.
 The backend output directory occupied 5,721 bytes, including persisted state
 and metadata; the complete ClickHouse table occupied 507,146 bytes. Those
 footprints cover different retention scopes: the summary is for 12 hours, while
 the ClickHouse table retains the complete approximately 24-hour selected series.
 They must not be interpreted as a like-for-like compression ratio.
 
-Source loading took 0.575–0.622 s. Additional summary backfill took 1.319 s,
-using 190–260 ms of backend CPU plus 190–340 ms of ClickHouse CPU. The first
-post-build warm request took 3.89–5.68 ms; direct exact took 6.00–8.44 ms. These
+Source loading took 0.556–0.627 s. Additional summary backfill took 1.319–1.321 s,
+using 200–220 ms of backend CPU plus 180–230 ms of ClickHouse CPU. The first
+post-build warm request took 3.20–7.97 ms; direct exact took 5.24–9.52 ms. There
+was no consistent first-request advantage. These
 are first post-build requests, not cold filesystem-cache tests. Overall build,
 source loading, and backfill are retained separately in the artifacts.
 
 This establishes repeatable query latency and query CPU benefits for this
 predeclared single-series MinMax state. It does not establish total deployment
 memory savings, full-corpus acceleration, or automatic candidate selection.
-Summaries are in `artifacts/fine-1s-release-trial{1,2,3}-summary.json`; complete
+Summaries are in `artifacts/fine-1s-matched-trial{1,2,3}-summary.json`; complete
 per-request traces remain under `/mydata/clickhouse-o11y-main-results/`.
+
+The earlier three host-process trials obtained 7.71–8.01×, but did not impose a
+backend memory limit. Their `fine-1s-release-*` artifacts are retained as
+supplemental evidence; the table above uses the subsequent matched-budget runs.
+Selective Docker configuration snapshots, executable SHA-256s, and exact
+reproduction commands accompany the matched trials. Their JSON `git_head` is
+null because the runtime image lacks Git; the host checkout revision and binary
+hashes identify the tested artifacts instead.

@@ -72,3 +72,32 @@ separate build-phase record.
 The reported serial service rate is the reciprocal mean request latency, not a
 concurrent throughput test. `CLICKHOUSE_BENCH_REPETITIONS` defaults to 100 per
 route; longer runs reduce the relative scheduler-tick quantization error.
+
+## Reproduce the matched-budget trials
+
+`run_matched_trial.sh` gives both services two CPUs (cores 60–61) and 4 GiB.
+It restarts the named evaluation ClickHouse container, runs an already-built
+probe in a separate container, and records Docker limits and binary hashes.
+The backend container also contains the HTTP test driver. Host PID/network
+namespaces let the probe sample both process counters and reach the exact
+backend; only the build tree, checkout, selected input, and result directory
+are mounted. The ClickHouse image is pinned by digest inside the script.
+
+Build first, then set `TEST_BINARY` to the executable path printed by Cargo:
+
+```sh
+export CARGO_TARGET_DIR=/dev/shm/asap-clickhouse-release
+cargo +1.98.0 test --release -p data_plane --test clickhouse_q05_process_e2e --no-run
+export TEST_BINARY=/absolute/path/printed/by/cargo
+export RESULT_DIR=/mydata/clickhouse-o11y-main-results
+export CLICKHOUSE_BENCH_INPUT=$RESULT_DIR/fine-1s-24h-series.jsonl
+export CLICKHOUSE_BENCH_METRIC=service_cache_refresh_lag_seconds
+export CLICKHOUSE_BENCH_END_MS=1788891296001
+# Set CLICKHOUSE_USER and CLICKHOUSE_PASSWORD to the evaluation account.
+bash tools/clickhouse-benefit/run_matched_trial.sh repro-1
+```
+
+Use a new trial suffix for each run. The script preserves named containers and
+input/results; the probe replaces only its `asap_q05_e2e.q05_samples` table.
+The runtime image has no Git, so use the accompanying host revision and
+executable-hash files when the trace's `git_head` field is null.
