@@ -155,7 +155,10 @@ representation for shared runtime snapshots; it is not Planner's
 node IDs and typed operator tags while serializing Planner payloads that contain
 process-local `Rc` pointers. The control plane constructs it and checks its
 bindings against QueryPlan; precompute execution consumes the shared contract.
-`QueryPlan` and `PrecomputePlan` definitions still reside in the control-plane
+`PrecomputePlan`, its envelope, ingest, producer, state schema, and catalog
+consistency checks live in `asap_types::precompute_plan`. The compiler chooses
+materializations and placement; data-plane installation uses the shared
+contract. `QueryPlan` definitions still reside in the control-plane
 crate while their remaining compilation methods are separated from wire types.
 
 The implemented ownership split is:
