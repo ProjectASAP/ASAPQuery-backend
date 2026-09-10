@@ -89,6 +89,56 @@ Catalog misses, SQL canonicalization failures, unsupported formats, incomplete
 pane coverage, and execution errors fail closed to exact ClickHouse. The proxy
 preserves the upstream status, safe headers, and response body.
 
+### `asap_last` boundary
+
+`asap_last(value, timestamp, window_ms)` is intentionally unavailable on the
+accelerated path. The SQL frontend must reject it during planning and the HTTP
+boundary must send the original, equivalent ClickHouse SQL to exact fallback.
+It must not map `asap_last` to `argMax`, `MinMax`, `Sum`, or `Increase`.
+
+The current shared contracts cannot represent its state without acquiring new
+meaning:
+
+| Existing contract | Why it cannot represent `asap_last` |
+| --- | --- |
+| `ExactAggregate(MinMax)` / `MinMaxAccumulator` | Chooses the minimum or maximum **value**, rather than the value from the greatest event timestamp. |
+| `ExactAggregate(Increase)` / `IncreaseAccumulator` | Owns counter reset, extrapolation, and rate/increase semantics. Although its implementation retains a last sample, publishing a gauge-last descriptor as `Increase` would make capability matching and persisted payload identity false. |
+| `ExactAggregate(Sum)` | Loses both the last value and its event timestamp. |
+| Opaque sketch payload | Still requires a shared `SketchAlgorithm` and corresponding merge/readout semantics; it is not an untyped extension slot. |
+| Raw sample storage | Can answer an exact scan but is not a mergeable materialized summary and cannot back a `SummaryAgg` DAG node. |
+
+The `AggregationType`, `Statistic`, accumulator factory, SDS capability,
+materialization metadata, persistence decoder, pane merger, and DAG readout all
+dispatch through closed shared vocabularies. A ClickHouse-only plan sidecar can
+name a private operation, but it cannot cause SummaryStore to build, decode,
+merge, or query an otherwise unknown payload. Encoding private last state under
+an existing type would silently change that type's identity and is forbidden.
+
+Full acceleration therefore requires an explicitly approved contract
+extension. The smallest coherent design is:
+
+```text
+SqlLast plan leaf (ClickHouse-owned syntax and result binding)
+  -> exact timestamped-value materialization descriptor
+  -> per-series LastState { event_timestamp, value }
+  -> pane/shard merge by greatest event_timestamp
+  -> finalize value, retaining the declared series-key columns
+```
+
+The table catalog must prove `(timestamp, complete series identity)` is unique,
+as it does for SQL rate/increase planning. This removes equal-timestamp
+ambiguity within one series. Missing identity proof, duplicate timestamps,
+non-numeric values, partial window coverage, mismatched payload identity, or an
+unknown decoder must fail closed. `argMax(arg, val)` remains the existing SQL
+extension with its original row-selection semantics and is not rewritten to
+this operation.
+
+Adding only `SqlLastPlanEntry` is insufficient. An implementation would also
+need a distinct persisted payload identity, accumulator factory and serializer,
+single- and multi-series materialization, pane merge, coverage-aware readout,
+and capability validation. Those are changes to the shared SDS/ingest contract,
+so they are outside the compatibility constraint for this work.
+
 ClickHouse can also provide samples to the queued backfill service through the
 explicit `clickhouse://configured` source marker. Backfill populates the same
 SummaryStore instances used by other ingest sources; it does not introduce a
