@@ -40,6 +40,16 @@ source revision, Cargo.lock, build debug-assertion status, calibration rows,
 ERP artifacts, visited configurations, selections, and held-out outcomes.
 Debug runs are smoke evaluations, not publishable performance measurements.
 
+Summarize without excluding failures:
+
+```sh
+python3 -m unittest discover -s tools/autosketch-comparison -p 'test_*.py'
+python3 tools/autosketch-comparison/summarize.py /tmp/cms-uniform.json /tmp/cms-zipf.json
+```
+
+See [initial smoke results](smoke-results.md) for the first executed runs,
+including held-out accuracy failures.
+
 ## Adaptation boundary
 
 The reference is [AutoSketch Algorithm 4 and Section 5.2](https://www.usenix.org/system/files/nsdi24-sun.pdf).
