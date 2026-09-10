@@ -593,9 +593,16 @@ mod tests {
             node,
             crate::query_plan::QueryPlanNode::RelationalJoin { .. }
         )));
-        assert!(entry.nodes.values().any(|node| matches!(
-            node,
-            crate::query_plan::QueryPlanNode::RelationalProject { .. }
-        )));
+        assert!(entry.nodes.values().any(|node| {
+            let crate::query_plan::QueryPlanNode::Relational { operation, .. } = node else {
+                return false;
+            };
+            matches!(
+                serde_json::from_value::<planner_types::post_asap::ValueOperation>(
+                    operation.clone()
+                ),
+                Ok(planner_types::post_asap::ValueOperation::Project { .. })
+            )
+        }));
     }
 }
