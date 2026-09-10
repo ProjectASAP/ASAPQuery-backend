@@ -174,6 +174,43 @@ def measure(args, artifact, corpus, snapshot, folder):
     return row
 
 
+
+def validate_candidate_topk_artifact(artifact):
+    """Reject CandidateTopK plans whose membership sidecar is not locally installed."""
+    request = artifact.get("install_request", {})
+    schemas = {str(row["materialization"]): row for row in request.get("precompute_plan", {}).get("schemas", [])}
+    for entry in request.get("query_plan", {}).get("entries", {}).values():
+        nodes = entry.get("nodes", {})
+        for node in nodes.values():
+            if node.get("op") != "candidate_top_k":
+                continue
+            inputs = node.get("inputs", [])
+            if len(inputs) != 2:
+                raise ValueError("CandidateTopK requires membership and exact-value inputs")
+            pending, seen, bindings = [str(inputs[0])], set(), set()
+            while pending:
+                node_id = pending.pop()
+                if node_id in seen or node_id not in nodes:
+                    continue
+                seen.add(node_id)
+                child = nodes[node_id]
+                if child.get("op") == "exact_fallback":
+                    raise ValueError("CandidateTopK membership input contains ExactFallback")
+                if child.get("op") == "read_materialization":
+                    bindings.add(str(child["binding"]["materialization"]))
+                pending.extend(str(value) for value in child.get("inputs", []))
+                if "input" in child:
+                    pending.append(str(child["input"]))
+            heap_bindings = []
+            for materialization in bindings:
+                schema = schemas.get(materialization)
+                family = json.dumps((schema or {}).get("family", {}), sort_keys=True)
+                if "CmsWithHeap" in family or "CountSketchWithHeap" in family:
+                    heap_bindings.append(materialization)
+            if not heap_bindings:
+                raise ValueError("CandidateTopK membership input has no installed heap materialization")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ["candidates", "metrics", "queries", "snapshot", "data-plane", "prometheus", "output"]:
@@ -197,7 +234,11 @@ def main():
     runner.validate_workload(snapshot, corpus)
     result = {"units": "cpu_ns", "data_snapshot_id": "sha256:" + hashlib.sha256(args.metrics.read_bytes()).hexdigest(),
               "scope": "accelerated finite-input calibration; measured wall residency is not full logical-horizon residency", "validated_sample_count": sample_count, "candidates": []}
-    for index, candidate in enumerate(json.loads(args.candidates.read_text())["candidates"]):
+    candidates = json.loads(args.candidates.read_text())["candidates"]
+    for candidate in candidates:
+        if "manifest" in candidate and "install_request" in candidate:
+            validate_candidate_topk_artifact(candidate)
+    for index, candidate in enumerate(candidates):
         if "manifest" not in candidate or "install_request" not in candidate:
             continue
         result["candidates"].append(measure(args, candidate, corpus, snapshot, args.output / f"candidate-{index}"))
