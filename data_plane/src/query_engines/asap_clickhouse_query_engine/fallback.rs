@@ -52,6 +52,20 @@ impl ClickHouseHttpFallback {
             .map_err(|e| ClickHouseFallbackError::Response(e.to_string()))?;
         let mut headers = HeaderMap::new();
         for (name, value) in response.headers() {
+            if matches!(
+                name.as_str(),
+                "connection"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailer"
+                    | "transfer-encoding"
+                    | "upgrade"
+                    | "content-length"
+            ) {
+                continue;
+            }
             if let (Ok(name), Ok(value)) = (
                 HeaderName::from_str(name.as_str()),
                 HeaderValue::from_bytes(value.as_bytes()),
