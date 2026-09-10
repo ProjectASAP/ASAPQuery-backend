@@ -53,6 +53,10 @@ struct GroupState {
     window_manager: WindowManager,
     /// Active panes for raw-sample accumulation, keyed by pane_start_ms.
     active_panes: BTreeMap<i64, Box<dyn AccumulatorUpdater>>,
+    /// Last cumulative counter sample per source series for heap membership
+    /// materializations. This is bounded O(series) derivative state, not a
+    /// raw-sample history, and deliberately survives pane rotation.
+    counter_previous: HashMap<String, (i64, f64)>,
     /// Active panes for pre-built accumulator inputs (e.g. OTLP-delivered
     /// sketches), keyed by pane_start_ms. Each entry is the running merge
     /// of every accumulator that landed in that pane's time range. Kept
@@ -365,6 +369,7 @@ impl Worker {
                 policy_fp,
                 group_key: group_key.to_string(),
                 active_panes: BTreeMap::new(),
+                counter_previous: HashMap::new(),
                 sketch_panes: BTreeMap::new(),
                 max_event_time_ms: i64::MIN,
                 closure_watermark_ms: i64::MIN,
@@ -485,6 +490,21 @@ impl Worker {
                         continue;
                     }
                     LateDataPolicy::ForwardToStore => {
+                        // A late cumulative sample cannot be converted to a
+                        // derivative without its time-adjacent neighbours.
+                        // Never feed the raw counter value into a membership
+                        // heap; the authoritative ExactCounter branch remains
+                        // responsible for the visible result.
+                        if state
+                            .config
+                            .parameters
+                            .get("weight_mode")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("counter_delta")
+                        {
+                            record_late_input("drop", "counter_delta_membership");
+                            continue;
+                        }
                         record_late_input("append_correction", "raw_sample");
                         let mut updater = create_accumulator_updater(&state.config);
                         apply_sample(&mut *updater, series_key, *val, *ts, &state.config);
@@ -511,12 +531,27 @@ impl Worker {
             // only closes an idle pane, not a long-running bulk ingest whose
             // records share one event timestamp.
             state.touch_pane(pane_start, now_ms);
+            let value = if state
+                .config
+                .parameters
+                .get("weight_mode")
+                .and_then(serde_json::Value::as_str)
+                == Some("counter_delta")
+            {
+                let Some(delta) =
+                    reset_aware_counter_delta(&mut state.counter_previous, series_key, *val, *ts)
+                else {
+                    continue;
+                };
+                delta
+            } else {
+                *val
+            };
             let updater = state
                 .active_panes
                 .entry(pane_start)
                 .or_insert_with(|| create_accumulator_updater(&state.config));
-
-            apply_sample(&mut **updater, series_key, *val, *ts, &state.config);
+            apply_sample(&mut **updater, series_key, value, *ts, &state.config);
         }
 
         // Check for closed windows
@@ -1282,6 +1317,35 @@ pub(crate) fn apply_sample(
     }
 }
 
+/// Convert a cumulative counter sample into a non-negative, reset-aware
+/// increment. Only the immediately preceding sample per series is retained;
+/// pane rotation therefore cannot lose the boundary increment.
+fn reset_aware_counter_delta(
+    previous: &mut HashMap<String, (i64, f64)>,
+    series_key: &str,
+    value: f64,
+    timestamp_ms: i64,
+) -> Option<f64> {
+    if !value.is_finite() {
+        return None;
+    }
+    match previous.get(series_key).copied() {
+        Some((previous_ts, _)) if timestamp_ms <= previous_ts => None,
+        Some((_, previous_value)) => {
+            previous.insert(series_key.to_owned(), (timestamp_ms, value));
+            Some(if value >= previous_value {
+                value - previous_value
+            } else {
+                value.max(0.0)
+            })
+        }
+        None => {
+            previous.insert(series_key.to_owned(), (timestamp_ms, value));
+            None
+        }
+    }
+}
+
 /// Extract aggregated label values from a series key string.
 /// These are the labels that form the key dimension *inside* keyed accumulators
 /// (MultipleSum, CMS, HydraKLL), matching Arroyo's `agg_columns`.
@@ -1375,6 +1439,30 @@ fn merge_sketch_panes_for_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_delta_is_reset_aware_series_local_and_cross_pane_safe() {
+        let mut previous = HashMap::new();
+        assert_eq!(reset_aware_counter_delta(&mut previous, "a", 10.0, 1), None);
+        assert_eq!(reset_aware_counter_delta(&mut previous, "b", 40.0, 1), None);
+        assert_eq!(
+            reset_aware_counter_delta(&mut previous, "a", 15.0, 2),
+            Some(5.0)
+        );
+        assert_eq!(
+            reset_aware_counter_delta(&mut previous, "a", 3.0, 3),
+            Some(3.0)
+        );
+        assert_eq!(
+            reset_aware_counter_delta(&mut previous, "b", 44.0, 4),
+            Some(4.0)
+        );
+        assert_eq!(reset_aware_counter_delta(&mut previous, "a", 99.0, 2), None);
+        assert_eq!(
+            reset_aware_counter_delta(&mut previous, "a", 5.0, 5),
+            Some(2.0)
+        );
+    }
 
     use flate2::{write::GzEncoder, Compression};
     use serde_json::json;

@@ -1360,6 +1360,7 @@ mod tests {
                     weight: planner_types::post_asap::SummaryInputExpr::Column(
                         ColumnRef::SampleValue,
                     ),
+                    weight_domain: Default::default(),
                 },
                 reduction,
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
@@ -1389,6 +1390,7 @@ mod tests {
                     weight: planner_types::post_asap::SummaryInputExpr::Column(
                         ColumnRef::SampleValue,
                     ),
+                    weight_domain: Default::default(),
                 },
                 reduction,
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
@@ -1544,6 +1546,7 @@ mod tests {
                     weight: planner_types::post_asap::SummaryInputExpr::Column(
                         ColumnRef::SampleValue,
                     ),
+                    weight_domain: Default::default(),
                 },
                 reduction: Reduction::by(vec![]),
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
@@ -1612,6 +1615,7 @@ mod tests {
                     weight: planner_types::post_asap::SummaryInputExpr::Column(
                         ColumnRef::SampleValue,
                     ),
+                    weight_domain: Default::default(),
                 },
                 reduction: Reduction::by(vec![]),
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
@@ -1661,6 +1665,7 @@ mod tests {
                     weight: planner_types::post_asap::SummaryInputExpr::Column(
                         ColumnRef::SampleValue,
                     ),
+                    weight_domain: Default::default(),
                 },
                 // Sum is a genuine PromQL aggregation operator -- an empty
                 // `by` always means "reduce fully," never `PerEntity` (see
@@ -2491,6 +2496,7 @@ mod tests {
                     weight: planner_types::post_asap::SummaryInputExpr::Column(
                         ColumnRef::SampleValue,
                     ),
+                    weight_domain: Default::default(),
                 },
                 reduction: Reduction::by(vec![]),
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
@@ -2957,6 +2963,7 @@ mod tests {
                     weight: planner_types::post_asap::SummaryInputExpr::Column(
                         ColumnRef::SampleValue,
                     ),
+                    weight_domain: Default::default(),
                 },
                 reduction: Reduction::by(vec![]),
                 grouping: planner_types::post_asap::GroupingStrategy::default(),

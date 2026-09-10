@@ -348,6 +348,7 @@ mod tests {
                     weight: planner_types::post_asap::SummaryInputExpr::Column(
                         ColumnRef::SampleValue,
                     ),
+                    weight_domain: Default::default(),
                 },
                 reduction,
                 grouping: planner_types::post_asap::GroupingStrategy::default(),
@@ -512,10 +513,12 @@ mod tests {
             SummaryUpdate {
                 item: Some(SummaryInputExpr::Column(ColumnRef::Named("key".into()))),
                 weight: SummaryInputExpr::Column(ColumnRef::SampleValue),
+                weight_domain: Default::default(),
             },
             SummaryUpdate {
                 item: None,
                 weight: SummaryInputExpr::Constant(1.0),
+                weight_domain: Default::default(),
             },
         ] {
             let mut tree = agg_node(sum(), logical_node());

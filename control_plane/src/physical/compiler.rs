@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "e284154a2a028ee670ab1f0c5f2362602736750f";
+pub const PLANNER_REVISION: &str = "1d50d437e7e6a10f3ee4499090d0e899340ec95a";
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 
 #[derive(Debug, Clone)]
@@ -3231,6 +3231,7 @@ fn physical_aggregation(
             match mode.as_str() {
                 Some("count") => Some("count"),
                 Some("value") => Some("value"),
+                Some("counter_delta") => Some("counter_delta"),
                 _ => None,
             }
         }),
@@ -3413,6 +3414,16 @@ fn collect_selected_materializations(
                             SummaryInputExpr::Column(
                                 planner_types::pre_asap::ColumnRef::SampleValue,
                             ) => "value",
+                            SummaryInputExpr::ResetAwareCounterDelta { .. }
+                                if matches!(
+                                    input.weight_domain,
+                                    planner_types::post_asap::WeightDomain::NonNegative {
+                                        proof: planner_types::post_asap::NonNegativeWeightProof::ResetAwareCounterDerivative
+                                    }
+                                ) => "counter_delta",
+                            SummaryInputExpr::ResetAwareCounterDelta { .. } => {
+                                return Err("counter-delta TopK input lacks a non-negative reset-aware proof".into())
+                            }
                             _ => return Err("unsupported TopK SummaryUpdate weight".into()),
                         };
                         parameters["weight_mode"] = mode.into();
@@ -3702,6 +3713,74 @@ mod tests {
                 "{query}"
             );
         }
+    }
+
+    #[test]
+    fn weighted_counter_topk_keeps_heap_membership_separate_from_exact_values() {
+        let query = "topk(2, sum by (job) (rate(m[1m])))";
+        let evidence = TopKMembershipEvidence {
+            selected_lower_bound: 101.0,
+            excluded_upper_bound: 100.0,
+            interval_failure_probability: 0.001,
+            observed_at_unix_ms: 9_500,
+            source: "unit-fixture".into(),
+        };
+        let request = request_with_evidence("topk-rate", query, Some(evidence)).unwrap();
+        let plan = PhysicalCompiler
+            .compile(request, environment(10_000))
+            .unwrap();
+        let entry = plan.query_plan.entries.values().next().unwrap();
+        let crate::query_plan::QueryPlanNode::CandidateTopK { inputs, .. } =
+            &entry.nodes[&entry.root]
+        else {
+            panic!("Planner weighted TopK must lower to CandidateTopK: {entry:#?}");
+        };
+        assert!(matches!(
+            entry.nodes[&inputs[0]],
+            crate::query_plan::QueryPlanNode::SummaryEstimate {
+                query: crate::query_plan::QueryReadout::TopK { .. },
+                ..
+            }
+        ));
+        let candidate_read = match &entry.nodes[&inputs[0]] {
+            crate::query_plan::QueryPlanNode::SummaryEstimate { input, .. } => *input,
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            entry.nodes[&candidate_read],
+            crate::query_plan::QueryPlanNode::ReadMaterialization { .. }
+        ));
+        assert!(!entry
+            .nodes
+            .values()
+            .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExactFallback { .. })));
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            crate::query_plan::QueryPlanNode::ExactReadout {
+                readout: crate::query_plan::ExactReadout::Rate,
+                ..
+            }
+        )));
+        assert!(plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .any(|materialization| {
+                materialization.aggregation_type
+                    == asap_types::AggregationType::CountMinSketchWithHeap
+                    && materialization.parameters["weight_mode"] == "counter_delta"
+            }));
+        assert!(plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .any(|materialization| {
+                matches!(
+                    materialization.aggregation_type,
+                    asap_types::AggregationType::Increase
+                        | asap_types::AggregationType::MultipleIncrease
+                )
+            }));
     }
 
     fn environment(now: u64) -> DeploymentEnvironment {
