@@ -6,7 +6,7 @@ use super::subdag_scheduler::{
     PrecomputeOperatorRegistry, ScheduleError,
 };
 use crate::storage_engines::types::{AggregateCore, HotReloadStreamingConfig, PrecomputedOutput};
-use control_plane::physical::executable_binding::{BackendExecutableBinding, BackendNodeBinding};
+use asap_types::executable_plan::{BackendExecutableBinding, BackendNodeBinding};
 use planner_types::post_asap::{ExecutableDagNode, ExecutableOperatorPayload, PostAsapNodeId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
