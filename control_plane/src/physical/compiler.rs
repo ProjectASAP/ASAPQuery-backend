@@ -1938,6 +1938,9 @@ fn has_unsafe_raw_entity_leaf(
                     SummaryFamilyType::ExactAggregate(
                         ExactKind::Increase | ExactKind::Rate | ExactKind::MinMax,
                         _
+                    ) | SummaryFamilyType::Sketch(
+                        _,
+                        planner_types::post_asap::GroupingStrategy::PerSubpopulationInstance
                     )
                 );
                 return matches!(reduction, Reduction::PerEntity)
@@ -3917,7 +3920,6 @@ mod tests {
     fn raw_per_entity_state_requires_explicit_additive_reduction() {
         for query in [
             "sum_over_time(m[1m])",
-            "quantile_over_time(0.99, m[1m])",
             "sum_over_time(m[1m]) / count_over_time(m[1m])",
         ] {
             let mut environment = environment(10_000);
@@ -3931,6 +3933,17 @@ mod tests {
                 "{query} pooled source entities"
             );
         }
+        let mut sketch_environment = environment(10_000);
+        sketch_environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        sketch_environment.collector_ids.clear();
+        let sketch = PhysicalCompiler
+            .compile(
+                request("per-series-sketch", "quantile_over_time(0.99, m[1m])"),
+                sketch_environment,
+            )
+            .unwrap();
+        assert_eq!(sketch.precompute_plan.materializations.len(), 1);
+
         for query in [
             "sum(sum_over_time(m[1m]))",
             "sum by (job) (sum_over_time(m[1m]))",
@@ -5822,11 +5835,10 @@ mod tests {
             .compile()
             .expect("unquoted v1 compatibility startup remains available");
         let (local, env) = snapshot.clone().planning_request().unwrap();
-        assert!(PhysicalCompiler
+        let selected = PhysicalCompiler
             .compile(local, env)
-            .unwrap_err()
-            .to_string()
-            .contains("native residual substitution requires an exact selected value"));
+            .expect("per-series selected summaries compile");
+        assert!(!selected.precompute_plan.materializations.is_empty());
         let (request, environment) = snapshot.planning_request().unwrap();
         let native = crate::physical::workload_cost::with_exact_alternative(request)
             .unwrap()
@@ -5856,11 +5868,10 @@ mod tests {
             .compile()
             .expect("unquoted v1 compatibility startup remains available");
         let (local, env) = snapshot.clone().planning_request().unwrap();
-        assert!(PhysicalCompiler
+        let selected = PhysicalCompiler
             .compile(local, env)
-            .unwrap_err()
-            .to_string()
-            .contains("native residual substitution requires an exact selected value"));
+            .expect("per-series selected summaries compile");
+        assert!(!selected.precompute_plan.materializations.is_empty());
         let (request, environment) = snapshot.planning_request().unwrap();
         let native = crate::physical::workload_cost::with_exact_alternative(request)
             .unwrap()
