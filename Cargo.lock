@@ -405,7 +405,7 @@ dependencies = [
 
 [[package]]
 name = "asap_sketchlib"
-version = "0.3.0"
+version = "0.2.2"
 dependencies = [
  "bytes",
  "prost",
