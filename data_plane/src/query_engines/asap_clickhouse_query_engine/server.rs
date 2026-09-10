@@ -389,6 +389,7 @@ async fn execute_or_fallback(state: &ServerState, request: &ClickHouseQueryReque
         ClickHouseAccelerationOutcome::Fallback(reason) => tracing::info!(
             failure_stage = reason.stage(),
             failure_reason = reason.reason_code(),
+            failure_detail = ?reason,
             "ClickHouse acceleration routed to exact fallback"
         ),
     }
