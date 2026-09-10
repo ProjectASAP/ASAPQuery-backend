@@ -3,13 +3,15 @@ use asap_aware_mapping::erp::{
     AccuracyMode, ErpArtifact, ErpRecord, ErpResourceProfile, ErpSelectionRequest,
     ERP_SCHEMA_VERSION,
 };
-use asap_sketchlib::{CountMinSketch, CountSketch};
+use asap_sketchlib::{Bloom, CountMinSketch, CountSketch, DataInput, DefaultXxHasher, RegularPath};
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     time::Instant,
 };
+
+type MembershipBloom = Bloom<RegularPath, DefaultXxHasher>;
 
 #[derive(Parser, Debug, Serialize)]
 struct Args {
@@ -26,6 +28,9 @@ struct Args {
     seed: u64,
     #[arg(long, default_value_t = 0.01)]
     epsilon: f64,
+    /// Query semantics determine which sketch families are legal.
+    #[arg(long, value_enum, default_value = "frequency")]
+    query: Query,
     /// Zero is uniform; positive values generate a truncated Zipf distribution.
     #[arg(long, default_value_t = 0.0)]
     zipf: f64,
@@ -39,7 +44,7 @@ struct Args {
         long,
         value_enum,
         value_delimiter = ',',
-        default_value = "cms,count-sketch"
+        default_value = "cms,count-sketch,bloom"
     )]
     sketches: Vec<Family>,
 }
@@ -49,12 +54,36 @@ struct Args {
 enum Family {
     Cms,
     CountSketch,
+    Bloom,
 }
 impl Family {
     fn name(self) -> &'static str {
         match self {
             Self::Cms => "cms",
             Self::CountSketch => "count_sketch",
+            Self::Bloom => "bloom",
+        }
+    }
+
+    fn supports(self, query: Query) -> bool {
+        matches!(
+            (self, query),
+            (Self::Cms | Self::CountSketch, Query::Frequency) | (Self::Bloom, Query::Membership)
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+enum Query {
+    Frequency,
+    Membership,
+}
+impl Query {
+    fn error_metric(self) -> &'static str {
+        match self {
+            Self::Frequency => "max_normalized_additive_error",
+            Self::Membership => "false_positive_rate",
         }
     }
 }
@@ -67,7 +96,14 @@ struct Config {
 }
 impl Config {
     fn bytes(self) -> usize {
-        self.width * self.depth * std::mem::size_of::<f64>()
+        match self.family {
+            Family::Cms | Family::CountSketch => {
+                self.width * self.depth * std::mem::size_of::<f64>()
+            }
+            Family::Bloom => {
+                MembershipBloom::with_dimensions(self.depth, self.width).size_in_bytes()
+            }
+        }
     }
     fn id(self) -> String {
         format!("{}-{:05}-{:02}", self.family.name(), self.width, self.depth)
@@ -91,11 +127,11 @@ fn grid() -> Vec<Config> {
         .collect()
 }
 
-fn candidate_grid(families: &[Family], budget: usize) -> Vec<Config> {
+fn candidate_grid(families: &[Family], query: Query, budget: usize) -> Vec<Config> {
     families
         .iter()
         .flat_map(|&family| grid().into_iter().map(move |c| Config { family, ..c }))
-        .filter(|c| c.legal() && c.bytes() <= budget)
+        .filter(|c| c.family.supports(query) && c.legal() && c.bytes() <= budget)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -138,13 +174,13 @@ fn stream(events: usize, cardinality: usize, zipf: f64, seed: u64) -> Vec<usize>
 #[derive(Debug, Serialize)]
 struct Measurement {
     config: Config,
-    max_normalized_additive_error: f64,
-    counter_bytes: usize,
+    error: f64,
+    payload_bytes: usize,
     update_wall_seconds: f64,
     query_wall_seconds: f64,
 }
 
-fn measure(config: Config, data: &[usize], keys: &[String]) -> Measurement {
+fn measure(config: Config, query: Query, data: &[usize], keys: &[String]) -> Measurement {
     assert!(!data.is_empty());
     let mut exact = vec![0_u64; keys.len()];
     for &key in data {
@@ -155,37 +191,49 @@ fn measure(config: Config, data: &[usize], keys: &[String]) -> Measurement {
         (config.family == Family::Cms).then(|| CountMinSketch::new(config.depth, config.width));
     let mut cs = (config.family == Family::CountSketch)
         .then(|| CountSketch::new(config.depth, config.width));
+    let mut bloom: Option<MembershipBloom> = (config.family == Family::Bloom)
+        .then(|| Bloom::with_dimensions(config.depth, config.width));
     let started = Instant::now();
     for &key in data {
-        match (&mut cms, &mut cs) {
-            (Some(sketch), _) => sketch.update(&keys[key], 1.0),
-            (_, Some(sketch)) => sketch.update(&keys[key], 1.0),
+        match (&mut cms, &mut cs, &mut bloom) {
+            (Some(sketch), _, _) => sketch.update(&keys[key], 1.0),
+            (_, Some(sketch), _) => sketch.update(&keys[key], 1.0),
+            (_, _, Some(sketch)) => sketch.insert(&DataInput::U64(key as u64)),
             _ => unreachable!(),
         }
     }
     let update_wall_seconds = started.elapsed().as_secs_f64();
     let started = Instant::now();
-    let estimates: Vec<_> = keys
-        .iter()
-        .map(|key| match (&cms, &cs) {
-            (Some(sketch), _) => sketch.estimate(key),
-            (_, Some(sketch)) => sketch.estimate(key),
-            _ => unreachable!(),
-        })
-        .collect();
+    let error = match query {
+        Query::Frequency => keys
+            .iter()
+            .zip(exact)
+            .map(|(key, truth)| {
+                let estimate = match (&cms, &cs) {
+                    (Some(sketch), _) => sketch.estimate(key),
+                    (_, Some(sketch)) => sketch.estimate(key),
+                    _ => unreachable!(),
+                };
+                assert!(estimate.is_finite());
+                (estimate - truth as f64).abs() / data.len() as f64
+            })
+            .fold(0.0_f64, f64::max),
+        Query::Membership => {
+            let sketch = bloom.as_ref().expect("membership requires Bloom");
+            assert!(data
+                .iter()
+                .all(|key| sketch.contains(&DataInput::U64(*key as u64))));
+            let false_positives = (keys.len()..keys.len() * 2)
+                .filter(|key| sketch.contains(&DataInput::U64(*key as u64)))
+                .count();
+            false_positives as f64 / keys.len() as f64
+        }
+    };
     let query_wall_seconds = started.elapsed().as_secs_f64();
-    let error = estimates
-        .iter()
-        .zip(exact)
-        .map(|(estimate, truth)| {
-            assert!(estimate.is_finite());
-            (estimate - truth as f64).abs() / data.len() as f64
-        })
-        .fold(0.0_f64, f64::max);
     Measurement {
         config,
-        max_normalized_additive_error: error,
-        counter_bytes: config.bytes(),
+        error,
+        payload_bytes: config.bytes(),
         update_wall_seconds,
         query_wall_seconds,
     }
@@ -223,7 +271,7 @@ fn search(seed: u64, epsilon: f64, evaluate: impl FnMut(Config) -> f64) -> Searc
     search_candidates(
         seed,
         epsilon,
-        &candidate_grid(&[Family::Cms], usize::MAX),
+        &candidate_grid(&[Family::Cms], Query::Frequency, usize::MAX),
         evaluate,
     )
 }
@@ -315,12 +363,17 @@ fn search_candidates(
 
 fn oracle(rows: &[Measurement], epsilon: f64) -> Option<Config> {
     rows.iter()
-        .filter(|m| m.max_normalized_additive_error <= epsilon)
+        .filter(|m| m.error <= epsilon)
         .map(|m| m.config)
         .min_by_key(|c| (c.bytes(), *c))
 }
 
-fn artifact(rows: &[Measurement], distribution: serde_json::Value, revision: &str) -> ErpArtifact {
+fn artifact(
+    rows: &[Measurement],
+    distribution: serde_json::Value,
+    revision: &str,
+    query: Query,
+) -> ErpArtifact {
     ErpArtifact {
         schema_version: ERP_SCHEMA_VERSION,
         producer_version: revision.into(),
@@ -333,14 +386,11 @@ fn artifact(rows: &[Measurement], distribution: serde_json::Value, revision: &st
                 parameters: serde_json::json!({"width":m.config.width,"depth":m.config.depth}),
                 distribution: distribution.clone(),
                 trials: 1,
-                error_metrics: BTreeMap::from([(
-                    "max_normalized_additive_error".into(),
-                    m.max_normalized_additive_error,
-                )]),
+                error_metrics: BTreeMap::from([(query.error_metric().into(), m.error)]),
                 // Memory-only experiment. Timings are wall measurements, not CPU
                 // profiles: deliberately do not mislabel them as ERP CPU evidence.
                 resources: ErpResourceProfile {
-                    memory_bytes: m.counter_bytes as f64,
+                    memory_bytes: m.payload_bytes as f64,
                     update_cpu_seconds: 0.0,
                     query_cpu_seconds: 0.0,
                     merge_cpu_seconds: 0.0,
@@ -354,12 +404,16 @@ fn erp_select(
     profile: &ErpArtifact,
     distribution: serde_json::Value,
     epsilon: f64,
+    query: Query,
 ) -> Option<Config> {
     let request = ErpSelectionRequest {
         distribution,
         implementation: Some("asap_sketchlib-portable".into()),
-        allowed_sketches: vec!["cms".into(), "count_sketch".into()],
-        error_metric: "max_normalized_additive_error".into(),
+        allowed_sketches: match query {
+            Query::Frequency => vec!["cms".into(), "count_sketch".into()],
+            Query::Membership => vec!["bloom".into()],
+        },
+        error_metric: query.error_metric().into(),
         max_error: epsilon,
         min_trials: 1,
         expected_updates: 0.0,
@@ -375,6 +429,7 @@ fn erp_select(
             family: match point.record.sketch.as_str() {
                 "cms" => Family::Cms,
                 "count_sketch" => Family::CountSketch,
+                "bloom" => Family::Bloom,
                 _ => panic!("unknown family"),
             },
             width: point.record.parameters["width"].as_u64().unwrap() as usize,
@@ -412,23 +467,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let distribution = serde_json::json!({"generator":"splitmix64-truncated-zipf-v1",
             "events":args.events,"cardinality":args.cardinality,"zipf":args.zipf,"seed":calibration_seed});
         let start = Instant::now();
-        let mut candidates = candidate_grid(&args.sketches, args.memory_budget_bytes);
+        let mut candidates = candidate_grid(&args.sketches, args.query, args.memory_budget_bytes);
         Rng(calibration_seed).shuffle(&mut candidates);
         let rows: Vec<_> = candidates
             .iter()
             .copied()
-            .map(|c| measure(c, &calibration, &keys))
+            .map(|c| measure(c, args.query, &calibration, &keys))
             .collect();
         let calibration_wall_seconds = start.elapsed().as_secs_f64();
-        let profile = artifact(&rows, distribution.clone(), &args.backend_revision);
+        let profile = artifact(
+            &rows,
+            distribution.clone(),
+            &args.backend_revision,
+            args.query,
+        );
         let adapted = search_candidates(calibration_seed, args.epsilon, &candidates, |c| {
-            rows.iter()
-                .find(|m| m.config == c)
-                .unwrap()
-                .max_normalized_additive_error
+            rows.iter().find(|m| m.config == c).unwrap().error
         });
         let start = Instant::now();
-        let erp = erp_select(&profile, distribution, args.epsilon);
+        let erp = erp_select(&profile, distribution, args.epsilon, args.query);
         let erp_selection_wall_seconds = start.elapsed().as_secs_f64();
         let start = Instant::now();
         let exhaustive = oracle(&rows, args.epsilon);
@@ -445,10 +502,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ("asapplanner_erp_selector", erp),
             ("grid_oracle", exhaustive),
         ] {
-            let measured = selected.map(|c| measure(c, &held_out, &keys));
-            let pass = measured
-                .as_ref()
-                .map(|m| m.max_normalized_additive_error <= args.epsilon);
+            let measured = selected.map(|c| measure(c, args.query, &held_out, &keys));
+            let pass = measured.as_ref().map(|m| m.error <= args.epsilon);
             outcomes.push(serde_json::json!({"method":name,"selected":selected,
                 "status":if selected.is_some(){"calibration_feasible"}else{"no_feasible_configuration"},
                 "held_out_pass":pass,"held_out":measured}));
@@ -466,8 +521,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output,
         &serde_json::json!({"schema_version":1,"args":args,
         "debug_assertions":cfg!(debug_assertions),
-        "scope":"memory-constrained CMS/CountSketch family and parameter selection; not full ASAPPlanner or system evaluation",
-        "memory_metric":"f64 counter payload bytes; excludes allocator and object overhead",
+        "scope":"memory-constrained query-compatible sketch family and parameter selection; not full ASAPPlanner or system evaluation",
+        "memory_metric":"sketch payload bytes (f64 counters or packed Bloom bits); excludes allocator and object overhead",
         "hash_seeds":"library fixed hash; only data/search seeds vary",
         "timing_metric":"wall seconds, not CPU seconds; calibration cost reported separately",
         "cargo_lock":include_str!("../../Cargo.lock"),"runs":runs}),
@@ -481,7 +536,11 @@ mod tests {
     #[test]
     fn hard_budget_prunes_before_benchmark_and_empty_budget_fails_closed() {
         for budget in [0, 511, 512, 2048] {
-            let candidates = candidate_grid(&[Family::Cms, Family::CountSketch], budget);
+            let candidates = candidate_grid(
+                &[Family::Cms, Family::CountSketch],
+                Query::Frequency,
+                budget,
+            );
             let result = search_candidates(42, 0.01, &candidates, |c| {
                 assert!(c.bytes() <= budget);
                 assert!(c.legal());
@@ -493,14 +552,19 @@ mod tests {
                 .into_iter()
                 .map(|config| Measurement {
                     config,
-                    max_normalized_additive_error: 0.0,
-                    counter_bytes: config.bytes(),
+                    error: 0.0,
+                    payload_bytes: config.bytes(),
                     update_wall_seconds: 0.0,
                     query_wall_seconds: 0.0,
                 })
                 .collect();
             let context = serde_json::json!({"test":"budget"});
-            let selected = erp_select(&artifact(&rows, context.clone(), "test"), context, 0.01);
+            let selected = erp_select(
+                &artifact(&rows, context.clone(), "test", Query::Frequency),
+                context,
+                0.01,
+                Query::Frequency,
+            );
             assert_eq!(selected, oracle(&rows, 0.01));
             assert_eq!(selected.is_none(), budget < 512);
             assert!(selected.is_none_or(|c| c.bytes() <= budget));
@@ -508,38 +572,82 @@ mod tests {
     }
     #[test]
     fn sketch_selection_can_choose_either_family() {
-        let candidates = candidate_grid(&[Family::Cms, Family::CountSketch], 2048);
+        let candidates =
+            candidate_grid(&[Family::Cms, Family::CountSketch], Query::Frequency, 2048);
         for preferred in [Family::Cms, Family::CountSketch] {
             let rows: Vec<_> = candidates
                 .iter()
                 .map(|&config| Measurement {
                     config,
-                    max_normalized_additive_error: if config.family == preferred {
-                        0.0
-                    } else {
-                        1.0
-                    },
-                    counter_bytes: config.bytes(),
+                    error: if config.family == preferred { 0.0 } else { 1.0 },
+                    payload_bytes: config.bytes(),
                     update_wall_seconds: 0.0,
                     query_wall_seconds: 0.0,
                 })
                 .collect();
             let result = search_candidates(42, 0.01, &candidates, |c| {
-                rows.iter()
-                    .find(|r| r.config == c)
-                    .unwrap()
-                    .max_normalized_additive_error
+                rows.iter().find(|r| r.config == c).unwrap().error
             });
             let context = serde_json::json!({"test":"family"});
-            let selected = erp_select(&artifact(&rows, context.clone(), "test"), context, 0.01);
+            let selected = erp_select(
+                &artifact(&rows, context.clone(), "test", Query::Frequency),
+                context,
+                0.01,
+                Query::Frequency,
+            );
             assert_eq!(result.selected.unwrap().family, preferred);
             assert_eq!(selected.unwrap().family, preferred);
             assert_eq!(selected, oracle(&rows, 0.01));
         }
     }
     #[test]
+    fn query_semantics_filter_incompatible_families() {
+        let all = [Family::Cms, Family::CountSketch, Family::Bloom];
+        let frequency = candidate_grid(&all, Query::Frequency, usize::MAX);
+        let membership = candidate_grid(&all, Query::Membership, usize::MAX);
+        assert!(frequency.iter().all(|c| c.family != Family::Bloom));
+        assert!(membership.iter().all(|c| c.family == Family::Bloom));
+        assert!(!membership.is_empty());
+    }
+    #[test]
+    fn bloom_uses_sketchlib_packed_memory_and_has_no_false_negatives() {
+        let config = Config {
+            family: Family::Bloom,
+            width: 1024,
+            depth: 4,
+        };
+        let keys: Vec<_> = (0..100).map(|i| format!("key-{i}")).collect();
+        let data: Vec<_> = (0..100).collect();
+        let measured = measure(config, Query::Membership, &data, &keys);
+        let library_bytes =
+            MembershipBloom::with_dimensions(config.depth, config.width).size_in_bytes();
+        assert_eq!(measured.payload_bytes, library_bytes);
+        assert!((0.0..=1.0).contains(&measured.error));
+    }
+    #[test]
+    fn bloom_autosketch_erp_and_oracle_share_budget_and_fpp_target() {
+        let candidates = candidate_grid(&[Family::Bloom], Query::Membership, 1024);
+        let keys: Vec<_> = (0..200).map(|i| format!("key-{i}")).collect();
+        let data: Vec<_> = (0..200).collect();
+        let rows: Vec<_> = candidates
+            .iter()
+            .copied()
+            .map(|c| measure(c, Query::Membership, &data, &keys))
+            .collect();
+        let adapted = search_candidates(42, 0.05, &candidates, |c| {
+            rows.iter().find(|m| m.config == c).unwrap().error
+        });
+        let context = serde_json::json!({"test":"bloom"});
+        let profile = artifact(&rows, context.clone(), "test", Query::Membership);
+        let erp = erp_select(&profile, context, 0.05, Query::Membership);
+        assert_eq!(erp, oracle(&rows, 0.05));
+        assert!(adapted
+            .selected
+            .is_none_or(|c| { c.family == Family::Bloom && c.bytes() <= 1024 }));
+    }
+    #[test]
     fn count_sketch_hash_limit_and_single_key_oracle() {
-        let candidates = candidate_grid(&[Family::CountSketch], usize::MAX);
+        let candidates = candidate_grid(&[Family::CountSketch], Query::Frequency, usize::MAX);
         assert!(candidates
             .iter()
             .all(|c| c.depth * (c.width.ilog2() as usize + 1) <= 64));
@@ -550,7 +658,7 @@ mod tests {
         }));
         for config in candidates {
             assert_eq!(
-                measure(config, &[0; 100], &["only".into()]).max_normalized_additive_error,
+                measure(config, Query::Frequency, &[0; 100], &["only".into()]).error,
                 0.0
             );
         }
@@ -617,11 +725,12 @@ mod tests {
                 width: 64,
                 depth: 1,
             },
+            Query::Frequency,
             &[0; 100],
             &["only".into()],
         );
-        assert_eq!(m.max_normalized_additive_error, 0.0);
-        assert_eq!(m.counter_bytes, 512);
+        assert_eq!(m.error, 0.0);
+        assert_eq!(m.payload_bytes, 512);
     }
     #[test]
     fn real_erp_matches_oracle_and_fails_closed_on_context_miss() {
@@ -629,22 +738,35 @@ mod tests {
             .into_iter()
             .map(|config| Measurement {
                 config,
-                max_normalized_additive_error: 1.0 / config.width as f64,
-                counter_bytes: config.bytes(),
+                error: 1.0 / config.width as f64,
+                payload_bytes: config.bytes(),
                 update_wall_seconds: 0.0,
                 query_wall_seconds: 0.0,
             })
             .collect();
         let distribution = serde_json::json!({"seed":42});
-        let profile = artifact(&rows, distribution.clone(), "test-revision");
+        let profile = artifact(
+            &rows,
+            distribution.clone(),
+            "test-revision",
+            Query::Frequency,
+        );
         assert_eq!(
-            erp_select(&profile, distribution.clone(), 0.01),
+            erp_select(&profile, distribution.clone(), 0.01, Query::Frequency),
             oracle(&rows, 0.01)
         );
         assert_eq!(
-            erp_select(&profile, serde_json::json!({"seed":43}), 0.01),
+            erp_select(
+                &profile,
+                serde_json::json!({"seed":43}),
+                0.01,
+                Query::Frequency,
+            ),
             None
         );
-        assert_eq!(erp_select(&profile, distribution, 0.0), None);
+        assert_eq!(
+            erp_select(&profile, distribution, 0.0, Query::Frequency),
+            None
+        );
     }
 }

@@ -1,26 +1,32 @@
 # AutoSketch comparison: first executable slice
 
 This runner starts E3 of the [evaluation plan (PR #545)](https://github.com/ProjectASAP/ASAPQuery-backend/pull/545).
-It is a memory-constrained CMS/Count Sketch **shared-calibration-table selection experiment**, not a full
+It is a memory-constrained frequency/membership **shared-calibration-table selection experiment**, not a full
 ASAPPlanner, recurring-window, or native AutoSketch benchmark.
 
 ## What runs
 
-- Actual `asap_sketchlib::CountMinSketch` and `CountSketch` implementations.
+- Actual `asap_sketchlib::CountMinSketch`, `CountSketch`, and packed-bit `Bloom`
+  implementations. No sketch implementation is duplicated in the backend.
+- `--query frequency` admits CMS and Count Sketch; `--query membership` admits
+  Bloom. Incompatible families are filtered before measurement because their
+  result semantics and error metrics are not interchangeable.
 - Up to 56 configurations per family: widths 64 through 4096 in powers of two,
   depths 1 through 8. All methods see the same budget- and legality-filtered grid.
   Portable Count Sketch requires `depth * (log2(width) + 1) <= 64`; CMS supports
   larger hash layouts automatically.
-- `--memory-budget-bytes` is a hard cap on f64 counter payload for the selected
-  sketch, applied **before calibration and selection**. It is not an RSS cap or
+- `--memory-budget-bytes` is a hard cap on the selected sketch's f64 counter or
+  packed-bit payload, applied **before calibration and selection**. It is not an RSS cap or
   a multi-window total-memory constraint. Object/allocator headers and transient
   query scratch space are excluded. No populated key sidecar is used by these
-  point-frequency updates. Objective remains minimum counter payload bytes.
-- `--sketches cms,count-sketch` enables both families (default). Each family gets
+  point-frequency updates. Objective remains minimum sketch payload bytes.
+- `--sketches cms,count-sketch,bloom` registers all families by default, after
+  which `--query` removes incompatible candidates. Each legal family gets
   an independent search frontier; the cheapest feasible result wins globally.
   Use `--sketches cms` or `--sketches count-sketch` for family ablations.
-- Exact frequency oracle across all declared keys, including absent keys.
-  Error is maximum `abs(estimate - truth) / events` over those keys.
+- Frequency uses an exact oracle across all declared keys and maximum
+  `abs(estimate - truth) / events`. Membership checks zero false negatives and
+  measures FPP over a disjoint absent-key set.
 - A software AutoSketch-style LHS/neighbor search, the real ASAPPlanner
   `ErpArtifact::select`, and an independently enumerated finite-grid oracle.
 - Separate calibration/test data seeds per run. Selection occurs before test
@@ -39,11 +45,16 @@ cargo test -p data_plane --example autosketch_comparison
 cargo run --release -p data_plane --example autosketch_comparison -- \
   --output /tmp/cms-uniform.json --backend-revision "$(git rev-parse HEAD)" \
   --events 10000 --cardinality 1000 --runs 10 --seed 42 --epsilon 0.01 \
-  --sketches cms,count-sketch --memory-budget-bytes 4096
+  --query frequency --sketches cms,count-sketch,bloom --memory-budget-bytes 4096
 cargo run --release -p data_plane --example autosketch_comparison -- \
   --output /tmp/cms-zipf.json --backend-revision "$(git rev-parse HEAD)" \
   --events 10000 --cardinality 1000 --runs 10 --seed 42 --epsilon 0.01 --zipf 1.2 \
-  --sketches cms,count-sketch --memory-budget-bytes 4096
+  --query frequency --sketches cms,count-sketch,bloom --memory-budget-bytes 4096
+
+# Membership configuration using measured false-positive rate
+cargo run --release -p data_plane --example autosketch_comparison -- \
+  --output /tmp/bloom.json --backend-revision "$(git rev-parse HEAD)" \
+  --query membership --sketches bloom --epsilon 0.01 --memory-budget-bytes 4096
 ```
 
 Use new output paths: the runner refuses to overwrite artifacts. A failed run
@@ -71,14 +82,16 @@ crossing. Evaluations are cached, and out-of-grid neighbors are excluded.
 Infeasible branches costing at least the feasible incumbent are pruned.
 Illegal/over-budget seeds and neighbors are discarded. Each family also gets its
 smallest legal in-budget point, so tight budgets cannot accidentally eliminate
-the entire family through LHS filtering. A budget below 512 bytes admits no
-configuration and produces explicit `no_feasible_configuration` outcomes.
+the entire family through LHS filtering. A budget admitting no legal configuration
+produces explicit `no_feasible_configuration` outcomes.
 
-Sketch selection exhaustively considers both registered frequency families and
-performs parameter search within each. It is a software adaptation, not the
+Sketch selection considers every query-compatible registered family and performs
+parameter search within each. It is a software adaptation, not the
 paper's separate sampled family-preselection phase. CMS and Count Sketch use
 the same empirical absolute additive-error metric on nonnegative updates; this
-does not equate their theoretical L1/L2 guarantees. No P4 code is generated.
+does not equate their theoretical L1/L2 guarantees. Bloom uses empirical FPP and
+is never compared to frequency sketches as if their errors were equivalent. No
+P4 code is generated.
 
 Differences from the hardware algorithm are intentional and must be retained in
 results: there is no stage dimension, ALU budget, or 16-KiB page alignment;

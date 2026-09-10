@@ -16,7 +16,7 @@ def summarize(report):
         outcomes = [next(o for o in run["outcomes"] if o["method"] == method)
                     for run in report["runs"]]
         selected = [o for o in outcomes if o["selected"] is not None]
-        errors = [o["held_out"]["max_normalized_additive_error"] for o in selected]
+        errors = [o["held_out"]["error"] for o in selected]
         rows.append({
             "method": method,
             "runs": len(outcomes),
@@ -25,7 +25,7 @@ def summarize(report):
             "held_out_pass": sum(o["held_out_pass"] is True for o in outcomes),
             "held_out_fail": sum(o["held_out_pass"] is False for o in outcomes),
             "no_feasible_configuration": len(outcomes) - len(selected),
-            "mean_selected_counter_bytes": mean(o["held_out"]["counter_bytes"]
+            "mean_selected_payload_bytes": mean(o["held_out"]["payload_bytes"]
                                                 for o in selected) if selected else None,
             "max_held_out_error": max(errors) if errors else None,
         })
@@ -36,6 +36,7 @@ def summarize(report):
         "cardinality": report["args"]["cardinality"],
         "zipf": report["args"]["zipf"],
         "epsilon": report["args"]["epsilon"],
+        "query": report["args"].get("query", "frequency"),
         "memory_budget_bytes": report["args"].get("memory_budget_bytes"),
         "sketches": report["args"].get("sketches", ["cms"]),
         "mean_search_table_evaluations": mean(len(r["search"]["visited"])

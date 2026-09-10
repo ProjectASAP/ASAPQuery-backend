@@ -7,8 +7,8 @@ class SummaryTests(unittest.TestCase):
         def outcome(method, selected, passed):
             return {"method": method, "selected": {} if selected else None,
                     "held_out_pass": passed,
-                    "held_out": {"counter_bytes": 512,
-                                 "max_normalized_additive_error": 0.02} if selected else None}
+                    "held_out": {"payload_bytes": 512,
+                                 "error": 0.02} if selected else None}
         report = {"schema_version": 1, "debug_assertions": True,
                   "args": {"backend_revision": "test", "events": 100,
                            "cardinality": 10, "zipf": 0, "epsilon": 0.01},
@@ -19,7 +19,7 @@ class SummaryTests(unittest.TestCase):
         rows = summarize(report)["outcomes"]
         self.assertEqual(rows[0]["no_feasible_configuration"], 1)
         self.assertEqual(rows[0]["held_out_fail"], 0)
-        self.assertIsNone(rows[0]["mean_selected_counter_bytes"])
+        self.assertIsNone(rows[0]["mean_selected_payload_bytes"])
         self.assertEqual(rows[1]["held_out_fail"], 1)
         self.assertEqual(rows[1]["held_out_pass"], 0)
 
