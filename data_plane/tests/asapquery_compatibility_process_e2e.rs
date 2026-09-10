@@ -486,7 +486,6 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
         precompute_plan: plan.precompute_plan,
         transmission_plan: plan.transmission_plan,
         query_plan: plan.query_plan,
-        metricsql_plan_catalog: plan.metricsql_plan_catalog,
         storage_routing: None,
         adaptation_evidence: vec![],
     };

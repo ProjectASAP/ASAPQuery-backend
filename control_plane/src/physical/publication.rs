@@ -1,7 +1,6 @@
 //! Canonical publication document for one catalog generation.
 use super::compiler::{CollectorPlan, PhysicalPlan, PrecomputePlan, TransmissionPlan};
 use super::summary_catalog::SummaryCatalog;
-use crate::metricsql_plan::MetricsQlPlanCatalog;
 use crate::query_plan::QueryPlan;
 use serde::{Deserialize, Serialize};
 
@@ -13,8 +12,6 @@ pub struct PhysicalPlanPublication {
     pub collector_plans: Vec<CollectorPlan>,
     pub transmission_plan: TransmissionPlan,
     pub query_plan: QueryPlan,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub metricsql_plan_catalog: Option<MetricsQlPlanCatalog>,
 }
 impl PhysicalPlanPublication {
     /// Validate every plan against the shared catalog snapshot.
@@ -32,20 +29,6 @@ impl PhysicalPlanPublication {
         self.query_plan
             .validate_against_catalog(catalog)
             .map_err(|e| e.to_string())?;
-        if let Some(metricsql) = &self.metricsql_plan_catalog {
-            if (metricsql.plan_id, metricsql.plan_version)
-                != (self.query_plan.plan_id, self.query_plan.plan_version)
-            {
-                return Err("MetricsQL catalog generation differs from QueryPlan".into());
-            }
-            let available = self
-                .precompute_plan
-                .materializations
-                .iter()
-                .map(|config| config.policy_fingerprint())
-                .collect();
-            metricsql.validate(&available).map_err(|e| e.to_string())?;
-        }
         let materializations = self
             .precompute_plan
             .materializations
@@ -63,21 +46,6 @@ impl PhysicalPlanPublication {
                 }
                 if config.pane_origin_ms != binding.pane_origin_ms {
                     return Err("query pane origin differs from precompute definition".into());
-                }
-            }
-        }
-        if let Some(metricsql) = &self.metricsql_plan_catalog {
-            for entry in metricsql.entries.values() {
-                for binding in entry.executable.materialization_bindings() {
-                    let config = materializations
-                        .get(&binding.materialization.fingerprint())
-                        .copied()
-                        .ok_or("MetricsQL binding has no precompute materialization")?;
-                    if config.slide_interval.checked_mul(1000) != Some(binding.window_ms) {
-                        return Err(
-                            "MetricsQL pane differs from precompute emission interval".into()
-                        );
-                    }
                 }
             }
         }
@@ -127,7 +95,6 @@ impl PhysicalPlan {
             collector_plans: self.collector_plans.clone(),
             transmission_plan: self.transmission_plan.clone(),
             query_plan: self.query_plan.clone(),
-            metricsql_plan_catalog: self.metricsql_plan_catalog.clone(),
         };
         artifact.validate()?;
         Ok(artifact)

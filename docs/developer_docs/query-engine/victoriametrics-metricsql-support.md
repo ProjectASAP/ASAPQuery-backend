@@ -36,8 +36,9 @@ runtime evaluation step, and `keep_metric_names` needs metric-name lineage that
 the canonical IR does not represent; both fail closed to the configured
 VictoriaMetrics backend with the original expression and parameters.
 
-This boundary adds no variants to PromQL, SDS, QueryExpr, or the shared physical
-DAG. Native acceleration for additional MetricsQL syntax must be added in a
+This boundary adds no variants to SDS, QueryExpr, or the shared physical DAG.
+`QueryPlanEntry.language` records which frontend produced the canonical query
+identity. Native acceleration for additional MetricsQL syntax must be added in a
 MetricsQL-specific frontend and lowered to existing canonical operations only
 when the equivalence is defined.
 
@@ -52,19 +53,18 @@ The listener also accepts VictoriaMetrics cluster paths
 `/select/{tenant}/prometheus/api/v1/query_range`. The path tenant scopes the
 installed routing snapshot and is preserved in the exact fallback URL.
 
-The control plane exposes an independent MetricsQL physical-plan publication
-endpoint. It lowers the MetricsQL AST to `QueryExpr`, invokes the shared
-ASAP-aware physical compiler, and publishes a `MetricsQlPlanCatalog` sidecar.
-Each sidecar entry owns `canonical_metricsql` and a language-neutral executable
-payload. The existing `QueryPlanEntry.canonical_promql`, its wire encoding, and
-its lookup rules remain unchanged.
+The control plane lowers the MetricsQL AST to `QueryExpr`, invokes the shared
+ASAP-aware physical compiler, and publishes a language-tagged entry in the
+authoritative `QueryPlan`. `canonical_query` is the frontend's AST identity;
+the language tag prevents a MetricsQL request from resolving a PromQL entry.
 
-The backend stages and activates the sidecar atomically with the SDS catalog,
-precompute plan, transmission plan, and PromQL query plan. A VictoriaMetrics
-request can execute only a matching entry in the active sidecar. The executable
-payload uses the shared DAG validator, descriptor resolver, SummaryStore
-readout, and executor. A catalog miss, incomplete coverage, validation failure,
-or execution failure routes the original request to VictoriaMetrics.
+The backend stages and activates that `QueryPlan` atomically with the SDS
+catalog, precompute plan, and transmission plan. MetricsQL bindings therefore
+receive the same SummaryCatalog validation, including pane duration and pane
+origin, as PromQL bindings. The executor reads the installed entry directly;
+it does not clone the DAG into a compatibility view. A plan miss, incomplete
+coverage, validation failure, or execution failure routes the original request
+to VictoriaMetrics.
 
 ## MetricsQL operator coverage
 
@@ -87,6 +87,6 @@ accelerated queries.
 ## Verification
 
 Focused tests cover request parsing, response compatibility, canonical binding,
-strict aggregate arity, independent sidecar serialization and validation,
-unchanged PromQL entry serialization, atomic installation, tenant-prefixed
-fallback, upstream status/header preservation, and instant/range fallback.
+strict aggregate arity, language-tagged QueryPlan serialization and validation,
+atomic installation, tenant-prefixed fallback, upstream status/header
+preservation, and instant/range fallback.

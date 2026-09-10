@@ -2713,9 +2713,6 @@ mod tests {
                     plan_version: 1,
                     entries: Default::default(),
                 }),
-                metricsql_plan_catalog: Arc::new(
-                    control_plane::metricsql_plan::MetricsQlPlanCatalog::empty(),
-                ),
                 storage_routing: Arc::new(
                     crate::storage_engines::types::BackendStorageRouting::empty(),
                 ),
@@ -6008,8 +6005,6 @@ pub struct PhysicalPlanInstallRequest {
     pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
     pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
     pub query_plan: control_plane::query_plan::QueryPlan,
-    #[serde(default)]
-    pub metricsql_plan_catalog: Option<control_plane::metricsql_plan::MetricsQlPlanCatalog>,
     pub storage_routing: Option<serde_json::Value>,
     #[serde(default)]
     pub adaptation_evidence: Vec<control_plane::physical::compiler::RuntimeAdaptationEvidence>,
@@ -6034,13 +6029,6 @@ pub fn build_active_physical_plan(
         .query_plan
         .validate_against_catalog(&request.summary_catalog)
         .map_err(|error| format!("QueryPlan catalog validation error: {error}"))?;
-    if let Some(metricsql) = &request.metricsql_plan_catalog {
-        if (metricsql.plan_id, metricsql.plan_version)
-            != (request.query_plan.plan_id, request.query_plan.plan_version)
-        {
-            return Err("MetricsQL catalog generation differs from QueryPlan".into());
-        }
-    }
     for collector in &request.collector_plans {
         collector
             .validate_against_catalog(&request.summary_catalog)
@@ -6065,25 +6053,6 @@ pub fn build_active_physical_plan(
                     "query physical pane origin differs from installed precompute definition"
                         .into(),
                 );
-            }
-        }
-    }
-    if let Some(metricsql) = &request.metricsql_plan_catalog {
-        for entry in metricsql.entries.values() {
-            for binding in entry.executable.materialization_bindings() {
-                let materialization = request
-                    .precompute_plan
-                    .materializations
-                    .iter()
-                    .find(|config| {
-                        config.policy_fingerprint() == binding.materialization.fingerprint()
-                    })
-                    .ok_or_else(|| "MetricsQL binding has no precompute definition".to_string())?;
-                if binding.window_ms != materialization.slide_interval.saturating_mul(1_000) {
-                    return Err(
-                        "MetricsQL pane differs from installed precompute definition".into(),
-                    );
-                }
             }
         }
     }
@@ -6114,11 +6083,6 @@ pub fn build_active_physical_plan(
         .query_plan
         .validate(&typed_fps)
         .map_err(|error| format!("QueryPlan validation error: {error}"))?;
-    if let Some(metricsql) = &request.metricsql_plan_catalog {
-        metricsql
-            .validate(&typed_fps)
-            .map_err(|error| format!("MetricsQL plan validation error: {error}"))?;
-    }
     let storage_routing = match request.storage_routing.as_ref() {
         Some(value) => Arc::new(
             crate::storage_engines::types::BackendStorageRouting::from_json_payload(value)
@@ -6133,11 +6097,6 @@ pub fn build_active_physical_plan(
         transmission_plan: request.transmission_plan,
         runtime_config: Arc::new(runtime_config),
         query_plan: Arc::new(request.query_plan),
-        metricsql_plan_catalog: Arc::new(
-            request
-                .metricsql_plan_catalog
-                .unwrap_or_else(control_plane::metricsql_plan::MetricsQlPlanCatalog::empty),
-        ),
         storage_routing,
     })
 }
@@ -6216,7 +6175,12 @@ async fn handle_post_physical_plan(
     }
     let plan_id = active.plan_id();
     let materialization_count = active.precompute_plan.materializations.len();
-    let metricsql_query_count = active.metricsql_plan_catalog.entries.len();
+    let metricsql_query_count = active
+        .query_plan
+        .entries
+        .values()
+        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::MetricsQl)
+        .count();
     let plan_version = active.plan_version();
     let now = unix_time_ms();
     if let Err(error) = lifecycle.stage(active, now) {
@@ -7147,7 +7111,6 @@ mod catalog_install_tests {
             precompute_plan: plan.precompute_plan,
             transmission_plan: plan.transmission_plan,
             query_plan: plan.query_plan,
-            metricsql_plan_catalog: plan.metricsql_plan_catalog,
             storage_routing: None,
             adaptation_evidence: vec![],
         }
@@ -7223,5 +7186,24 @@ mod catalog_install_tests {
             .expect("demo has maintained summaries");
         binding.window_ms += 1;
         assert!(install(request).unwrap_err().contains("pane duration"));
+    }
+
+    #[test]
+    fn catalog_install_applies_pane_origin_validation_to_metricsql_entries() {
+        let mut request = request();
+        let entry = request.query_plan.entries.values_mut().next().unwrap();
+        entry.language = control_plane::query_plan::QueryLanguage::MetricsQl;
+        let binding = entry
+            .nodes
+            .values_mut()
+            .find_map(|node| match node {
+                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                    Some(binding)
+                }
+                _ => None,
+            })
+            .expect("demo has maintained summaries");
+        binding.pane_origin_ms = Some(1);
+        assert!(install(request).unwrap_err().contains("pane origin"));
     }
 }

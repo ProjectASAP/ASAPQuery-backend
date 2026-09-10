@@ -254,7 +254,7 @@ pub fn manifest(
         for node_id in entry.topological_order()? {
             add(
                 format!("query:{}:{}", entry.query_id, node_id.0),
-                json!({"node": entry.nodes[&node_id], "query": entry.canonical_promql, "instant": entry.instant}),
+                json!({"node": entry.nodes[&node_id], "query": entry.canonical_query, "instant": entry.instant}),
                 "query_evaluation",
                 evaluations,
             );
