@@ -3850,7 +3850,7 @@ fn collect_selected_materializations(
     Ok(selected)
 }
 
-fn physical_materialization_family(family: &SummaryFamilyType) -> SummaryFamilyType {
+pub(crate) fn physical_materialization_family(family: &SummaryFamilyType) -> SummaryFamilyType {
     match family {
         SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _) => {
             // The SummaryStore Sum accumulator retains the observation count

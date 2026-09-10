@@ -98,12 +98,13 @@ fn classify_http_status(status: reqwest::StatusCode, body: String, what: &str) -
 pub struct BackendClient {
     endpoint: String,
     http: Client,
+    clickhouse_plan_token: Option<String>,
 }
 
 impl BackendClient {
     /// Publish one compiler-produced ClickHouse SQL catalog generation and
     /// activate it only after the backend acknowledges staging.
-    pub async fn publish_clickhouse_plan<T: serde::Serialize>(
+    async fn publish_clickhouse_plan_to<T: serde::Serialize>(
         endpoint: &str,
         token: Option<&str>,
         bundle: &T,
@@ -140,6 +141,23 @@ impl BackendClient {
         }
         Ok(())
     }
+
+    pub async fn publish_clickhouse_plan<T: serde::Serialize>(
+        &self,
+        bundle: &T,
+        plan_id: u64,
+        plan_version: u64,
+    ) -> Result<()> {
+        let endpoint = derive_clickhouse_base_url(&self.endpoint);
+        Self::publish_clickhouse_plan_to(
+            &endpoint,
+            self.clickhouse_plan_token.as_deref(),
+            bundle,
+            plan_id,
+            plan_version,
+        )
+        .await
+    }
     /// Construct a client pointing at the backend's plan-push endpoint.
     /// `endpoint` should be the full URL, e.g.
     /// `http://backend.svc:8088/api/v1/streaming-config`.
@@ -156,6 +174,7 @@ impl BackendClient {
         Self {
             endpoint: endpoint.into(),
             http,
+            clickhouse_plan_token: std::env::var("CONTROLLER_CLICKHOUSE_PLAN_TOKEN").ok(),
         }
     }
 
@@ -166,6 +185,7 @@ impl BackendClient {
         Self {
             endpoint: endpoint.into(),
             http,
+            clickhouse_plan_token: None,
         }
     }
 
@@ -527,6 +547,17 @@ fn derive_physical_plan_url(endpoint: &str) -> String {
         .or_else(|| endpoint.strip_suffix(UNDERSCORE))
         .map(|base| format!("{base}{PHYSICAL}"))
         .unwrap_or_else(|| endpoint.to_string())
+}
+
+fn derive_clickhouse_base_url(endpoint: &str) -> String {
+    const DASH: &str = "/api/v1/streaming-config";
+    const UNDERSCORE: &str = "/api/v1/streaming_config";
+    endpoint
+        .strip_suffix(DASH)
+        .or_else(|| endpoint.strip_suffix(UNDERSCORE))
+        .unwrap_or(endpoint)
+        .trim_end_matches('/')
+        .to_owned()
 }
 
 /// Map a streaming-config endpoint URL to the sibling storage-routing
@@ -911,7 +942,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        BackendClient::publish_clickhouse_plan(
+        BackendClient::publish_clickhouse_plan_to(
             &format!("http://{address}"),
             Some("secret"),
             &serde_json::json!({"bundle": true}),

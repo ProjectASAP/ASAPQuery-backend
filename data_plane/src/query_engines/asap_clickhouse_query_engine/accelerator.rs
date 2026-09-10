@@ -164,9 +164,23 @@ fn requested_format(request: &ClickHouseQueryRequest) -> Result<ClickHouseFormat
 #[async_trait]
 impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
     async fn execute(&self, request: &ClickHouseQueryRequest) -> ClickHouseAccelerationOutcome {
+        let binder = self.binder.read().unwrap().clone();
+        let Some(binder) = binder else {
+            return ClickHouseAccelerationOutcome::Fallback(
+                ClickHouseAccelerationFallback::CatalogMiss,
+            );
+        };
+        let canonical_sql = match binder.canonical_identity(&request.sql).await {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                return ClickHouseAccelerationOutcome::Fallback(
+                    ClickHouseAccelerationFallback::Planning(error.to_string()),
+                )
+            }
+        };
         let (entry, generation) = {
             let _publication = self.publication.read().unwrap();
-            (self.catalog.lookup(&request.sql), self.catalog.active())
+            (self.catalog.lookup(&canonical_sql), self.catalog.active())
         };
         let Some(entry) = entry else {
             return ClickHouseAccelerationOutcome::Fallback(
@@ -246,8 +260,8 @@ mod tests {
     use planner_types::{
         post_asap::{SummaryFamilyType, SummaryField, SummarySchema, ValueOperation},
         pre_asap::{
-            ArithmeticOpKind, CompareOpKind, DataType, GroupKeys, Predicate, ProjectItem,
-            QueryExpr, ScalarValue, SortKey,
+            ArithmeticOpKind, Column, CompareOpKind, DataType, GroupKeys, Predicate, ProjectItem,
+            QueryExpr, ScalarValue, Schema, SortKey,
         },
     };
     use std::rc::Rc;
@@ -268,7 +282,7 @@ mod tests {
         }
     }
 
-    fn fixture(end_ms: u64) -> (CatalogClickHouseAccelerator, ClickHouseQueryRequest) {
+    async fn fixture(end_ms: u64) -> (CatalogClickHouseAccelerator, ClickHouseQueryRequest) {
         let config = PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
@@ -406,12 +420,30 @@ mod tests {
             summaries: sds.summary_descriptors.keys().cloned().collect(),
             data: sds.data_descriptors.keys().cloned().collect(),
         };
+        let table_schema = Schema::with_time_index(
+            vec![
+                Column::new("timestamp", DataType::Timestamp, false),
+                Column::new("value", DataType::Float64, false),
+            ],
+            0,
+            vec![],
+        );
+        let tables = HashMap::from([("requests".into(), table_schema)]);
+        let canonical_sql = control_plane::clickhouse::canonicalize_clickhouse_sql(
+            "SELECT sum(value) FROM requests",
+            &control_plane::clickhouse::ClickHouseSqlCatalog {
+                tables: tables.clone(),
+            },
+            planner_types::types::AccuracyTarget::Exact,
+        )
+        .await
+        .unwrap();
         let bundle = ClickHousePlanBundle {
             sds: sds.clone(),
-            tables: HashMap::new(),
+            tables,
             accuracy: planner_types::types::AccuracyTarget::Exact,
             plans: vec![ClickHousePublishedPlan {
-                sql: "SELECT sum(value) FROM requests".into(),
+                sql: canonical_sql,
                 runtime: SqlRuntimePlan {
                     start_ms: 0,
                     end_ms,
@@ -465,7 +497,7 @@ mod tests {
 
     #[tokio::test]
     async fn catalog_hit_executes_bound_summary_store_dag_and_encodes_typed_result() {
-        let (accelerator, request) = fixture(2_000);
+        let (accelerator, request) = fixture(2_000).await;
         let ClickHouseAccelerationOutcome::Accelerated(response) =
             accelerator.execute(&request).await
         else {
@@ -476,7 +508,7 @@ mod tests {
 
     #[tokio::test]
     async fn incomplete_summary_store_coverage_falls_back() {
-        let (accelerator, request) = fixture(3_000);
+        let (accelerator, request) = fixture(3_000).await;
         assert!(matches!(
             accelerator.execute(&request).await,
             ClickHouseAccelerationOutcome::Fallback(

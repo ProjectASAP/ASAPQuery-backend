@@ -8,8 +8,11 @@ use planner_types::pre_asap::QueryExpr;
 use planner_types::types::AccuracyTarget;
 use planner_types::workload::SqlDialect;
 
+use crate::physical::compiler::{PrecomputePlan, TransmissionPlan};
 use crate::physical::post_asap::{cost_model::ControlPlaneCostModel, PhysicalExpr};
-use crate::query_plan::{FallbackPolicy, InstantExecution, MaterializationBinding, QueryPlanEntry};
+use crate::query_plan::{
+    FallbackPolicy, InstantExecution, MaterializationBinding, PhysicalGrouping, QueryPlanEntry,
+};
 use asap_types::summary_catalog::SummaryCatalog;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -24,6 +27,7 @@ pub enum ClickHousePlanningError {
 
 pub struct ClickHousePlannedQuery {
     pub canonical: QueryExpr,
+    pub canonical_sql: String,
     pub physical: PhysicalExpr,
 }
 
@@ -42,18 +46,36 @@ pub async fn plan_clickhouse_sql(
     let selected = crate::planner_selection::select_summary(&canonical, &cost_model)?;
     let physical = PhysicalExpr::committed(selected);
     Ok(ClickHousePlannedQuery {
+        canonical_sql: canonical_sql_identity(&canonical),
         canonical,
         physical,
     })
+}
+
+pub async fn canonicalize_clickhouse_sql(
+    sql: &str,
+    catalog: &SqlCatalog,
+    accuracy: AccuracyTarget,
+) -> Result<String, ClickHousePlanningError> {
+    let canonical = lower_sql_dialect(sql, catalog, SqlDialect::ClickhouseSQL, accuracy)
+        .await
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+    Ok(canonical_sql_identity(&canonical))
+}
+
+/// Identity derived from ASAPPlanner's resolved canonical AST. Equivalent SQL
+/// formatting therefore maps to one catalog key without reparsing at serving.
+pub fn canonical_sql_identity(canonical: &QueryExpr) -> String {
+    format!("{canonical:?}")
 }
 
 pub use asap_frontend_sql::SqlCatalog as ClickHouseSqlCatalog;
 
 #[derive(Debug, Deserialize)]
 pub struct ClickHouseSqlWorkload {
-    pub backend_endpoint: String,
-    pub bearer_token: Option<String>,
     pub sds: SummaryCatalog,
+    pub precompute_plan: PrecomputePlan,
+    pub transmission_plan: TransmissionPlan,
     pub tables: HashMap<String, planner_types::pre_asap::Schema>,
     pub accuracy: AccuracyTarget,
     pub queries: Vec<ClickHouseSqlWorkloadEntry>,
@@ -65,7 +87,6 @@ pub struct ClickHouseSqlWorkloadEntry {
     pub start_ms: u64,
     pub end_ms: u64,
     pub cumulative: bool,
-    pub binding: MaterializationBinding,
 }
 
 /// Wire bundle consumed by the independent backend SQL catalog.
@@ -75,11 +96,21 @@ pub struct ClickHouseCompiledBundle {
     pub tables: HashMap<String, planner_types::pre_asap::Schema>,
     pub accuracy: AccuracyTarget,
     pub plans: Vec<serde_json::Value>,
+    pub precompute_plan: PrecomputePlan,
+    pub transmission_plan: TransmissionPlan,
 }
 
 pub async fn compile_clickhouse_workload(
     request: &ClickHouseSqlWorkload,
 ) -> Result<ClickHouseCompiledBundle, ClickHousePlanningError> {
+    request
+        .precompute_plan
+        .validate_against_catalog(&request.sds)
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+    request
+        .transmission_plan
+        .validate(&request.precompute_plan)
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     let catalog = SqlCatalog {
         tables: request.tables.clone(),
     };
@@ -101,7 +132,7 @@ pub async fn compile_clickhouse_workload(
                 cumulative_readout: query.cumulative,
             },
             FallbackPolicy::ExactBackend,
-            |_, _| Ok(query.binding.clone()),
+            |node, family| bind_selected_node(node, family, query, request),
         )
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
         if executable
@@ -113,21 +144,33 @@ pub async fn compile_clickhouse_workload(
                 "compiled SQL contains an unsupported operator; publication refused".into(),
             ));
         }
-        let identity = request
-            .sds
-            .materializations
-            .get(&query.binding.materialization)
-            .ok_or_else(|| {
-                ClickHousePlanningError::Lower("SQL binding is absent from SDS".into())
-            })?;
+        let bindings = executable.materialization_bindings();
+        let materializations = bindings
+            .iter()
+            .map(|binding| binding.materialization.fingerprint())
+            .collect::<BTreeSet<_>>();
+        let identities = bindings
+            .iter()
+            .map(|binding| {
+                request
+                    .sds
+                    .materializations
+                    .get(&binding.materialization)
+                    .ok_or_else(|| {
+                        ClickHousePlanningError::Lower(
+                            "compiled SQL binding is absent from SDS".into(),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         plans.push(serde_json::json!({
-            "sql": query.sql,
+            "sql": planned.canonical_sql,
             "runtime": { "start_ms": query.start_ms, "end_ms": query.end_ms,
                 "cumulative": query.cumulative,
-                "materializations": BTreeSet::from([query.binding.materialization.fingerprint()]),
+                "materializations": materializations,
                 "executable": executable },
-            "descriptors": { "summaries": [identity.summary_descriptor_id.clone()],
-                "data": [identity.data_descriptor_id.clone()] }
+            "descriptors": { "summaries": identities.iter().map(|identity| identity.summary_descriptor_id.clone()).collect::<BTreeSet<_>>(),
+                "data": identities.iter().map(|identity| identity.data_descriptor_id.clone()).collect::<BTreeSet<_>>() }
         }));
     }
     Ok(ClickHouseCompiledBundle {
@@ -135,5 +178,52 @@ pub async fn compile_clickhouse_workload(
         tables: request.tables.clone(),
         accuracy: request.accuracy.clone(),
         plans,
+        precompute_plan: request.precompute_plan.clone(),
+        transmission_plan: request.transmission_plan.clone(),
+    })
+}
+
+fn bind_selected_node(
+    node: &planner_types::post_asap::SummaryNode,
+    family: &planner_types::post_asap::SummaryFamilyType,
+    query: &ClickHouseSqlWorkloadEntry,
+    request: &ClickHouseSqlWorkload,
+) -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
+    let (metric, source_window, spatial_filter) =
+        crate::physical::compiler::materialization_leaf_contract(node)
+            .map_err(crate::query_plan::QueryPlanError::Invalid)?;
+    let expected = crate::physical::compiler::physical_materialization_family(family);
+    let mut matches = request
+        .precompute_plan
+        .materializations
+        .iter()
+        .filter(|candidate| {
+            candidate.metric == metric
+                && candidate.spatial_filter_normalized == spatial_filter
+                && candidate
+                    .accumulator_spec()
+                    .ok()
+                    .is_some_and(|spec| spec.family == expected)
+                && source_window
+                    .unwrap_or((query.end_ms.saturating_sub(query.start_ms)) / 1000)
+                    .checked_mul(1000)
+                    .is_some_and(|window| window % candidate.window_size.saturating_mul(1000) == 0)
+        });
+    let selected = matches.next().ok_or_else(|| {
+        crate::query_plan::QueryPlanError::Invalid(format!(
+            "no precompute materialization matches {metric}/{family:?}"
+        ))
+    })?;
+    if matches.next().is_some() {
+        return Err(crate::query_plan::QueryPlanError::Invalid(format!(
+            "ambiguous precompute materializations match {metric}/{family:?}"
+        )));
+    }
+    Ok(MaterializationBinding {
+        materialization: selected.policy_fingerprint().into(),
+        output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.labels.clone()),
+        window_ms: selected.slide_interval.saturating_mul(1000),
+        pane_origin_ms: selected.pane_origin_ms,
+        readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1000)),
     })
 }

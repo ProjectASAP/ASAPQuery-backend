@@ -806,6 +806,7 @@ async fn compile_and_publish_physical_plan(
 }
 
 async fn handle_compile_and_publish_clickhouse_plan(
+    State(state): State<AppState>,
     Json(request): Json<clickhouse::ClickHouseSqlWorkload>,
 ) -> impl IntoResponse {
     let bundle = match clickhouse::compile_clickhouse_workload(&request).await {
@@ -814,14 +815,33 @@ async fn handle_compile_and_publish_clickhouse_plan(
     };
     let plan_id = bundle.sds.plan_id;
     let plan_version = bundle.sds.plan_version;
-    if let Err(error) = backend_client::BackendClient::publish_clickhouse_plan(
-        &request.backend_endpoint,
-        request.bearer_token.as_deref(),
-        &bundle,
+    let Some(client) = state.backend_client.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "backend publication is not configured",
+        )
+            .into_response();
+    };
+    let empty_query_plan = control_plane::query_plan::QueryPlan {
         plan_id,
         plan_version,
-    )
-    .await
+        entries: Default::default(),
+    };
+    if let Err(error) = client
+        .post_physical_plan_typed(
+            &bundle.precompute_plan,
+            &bundle.transmission_plan,
+            &empty_query_plan,
+            None,
+            &[],
+        )
+        .await
+    {
+        return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
+    }
+    if let Err(error) = client
+        .publish_clickhouse_plan(&bundle, plan_id, plan_version)
+        .await
     {
         return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
     }

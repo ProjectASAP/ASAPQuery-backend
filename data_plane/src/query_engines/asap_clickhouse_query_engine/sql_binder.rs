@@ -21,4 +21,13 @@ impl ClickHouseSqlBinder {
     pub async fn bind(&self, sql: &str) -> Result<ClickHousePlannedQuery, ClickHousePlanningError> {
         plan_clickhouse_sql(sql, &self.catalog, self.accuracy.clone()).await
     }
+
+    pub async fn canonical_identity(&self, sql: &str) -> Result<String, ClickHousePlanningError> {
+        control_plane::clickhouse::canonicalize_clickhouse_sql(
+            sql,
+            &self.catalog,
+            self.accuracy.clone(),
+        )
+        .await
+    }
 }
