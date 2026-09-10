@@ -229,9 +229,8 @@ fn bind_selected_node(
     query: &ClickHouseSqlWorkloadEntry,
     request: &ClickHouseSqlWorkload,
 ) -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
-    let (metric, source_window, spatial_filter) =
-        crate::physical::compiler::materialization_leaf_contract(node)
-            .map_err(crate::query_plan::QueryPlanError::Invalid)?;
+    let (metric, source_window, spatial_filter) = clickhouse_materialization_leaf_contract(node)
+        .map_err(crate::query_plan::QueryPlanError::Invalid)?;
     let expected = crate::physical::compiler::physical_materialization_family(family);
     let selected = select_materialization(
         &request.precompute_plan.materializations,
@@ -248,6 +247,103 @@ fn bind_selected_node(
         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1000)),
         item_labels: Default::default(),
     })
+}
+
+/// Resolve the table-shaped SQL source without teaching the shared PromQL
+/// materialization contract about SQL's metric and timestamp columns.
+fn clickhouse_materialization_leaf_contract(
+    node: &planner_types::post_asap::SummaryNode,
+) -> Result<(String, Option<u64>, String), String> {
+    use planner_types::{
+        post_asap::SummaryExpr,
+        pre_asap::{CompareOpKind, QueryExpr, ScalarValue, Source},
+    };
+    let SummaryExpr::SummaryAgg { child, .. } = &node.expr else {
+        return crate::physical::compiler::materialization_leaf_contract(node);
+    };
+    let SummaryExpr::KeepPreAsap(expr) = &child.expr else {
+        return crate::physical::compiler::materialization_leaf_contract(node);
+    };
+    let QueryExpr::Scan {
+        source: Source::Table { .. },
+        predicates,
+        schema,
+    } = expr.as_ref()
+    else {
+        return crate::physical::compiler::materialization_leaf_contract(node);
+    };
+
+    fn comparisons<'a>(expr: &'a QueryExpr, out: &mut Vec<&'a QueryExpr>) {
+        if let QueryExpr::BoolAnd(children) = expr {
+            for child in children {
+                comparisons(child, out);
+            }
+        } else {
+            out.push(expr);
+        }
+    }
+    let mut metric = None;
+    let mut lower_ms = None;
+    let mut upper_ms = None;
+    let mut leaves = Vec::new();
+    for predicate in predicates {
+        comparisons(&predicate.0, &mut leaves);
+    }
+    for leaf in leaves {
+        let QueryExpr::Compare { left, op, right } = leaf else {
+            return Err("SQL materialization predicate is not a comparison".into());
+        };
+        let QueryExpr::Column(column) = left.as_ref() else {
+            return Err("SQL materialization predicate must reference a column".into());
+        };
+        let name = schema
+            .columns
+            .get(*column)
+            .map(|column| column.name.as_str())
+            .ok_or_else(|| {
+                "SQL materialization predicate references an unknown column".to_string()
+            })?;
+        match (name, op, right.as_ref()) {
+            ("metric", CompareOpKind::Eq, QueryExpr::Literal(ScalarValue::Utf8(value))) => {
+                metric = Some(value.clone());
+            }
+            (
+                name,
+                CompareOpKind::Gt | CompareOpKind::Ge,
+                QueryExpr::Literal(ScalarValue::Int64(value)),
+            ) if schema
+                .time_index
+                .is_some_and(|index| schema.columns[index].name == name) =>
+            {
+                lower_ms = Some(*value);
+            }
+            (
+                name,
+                CompareOpKind::Lt | CompareOpKind::Le,
+                QueryExpr::Literal(ScalarValue::Int64(value)),
+            ) if schema
+                .time_index
+                .is_some_and(|index| schema.columns[index].name == name) =>
+            {
+                upper_ms = Some(*value);
+            }
+            _ => {
+                return Err(format!(
+                    "unsupported SQL materialization predicate on {name}"
+                ))
+            }
+        }
+    }
+    let metric = metric.ok_or_else(|| "SQL table summary requires metric='...'".to_string())?;
+    let window_secs = match (lower_ms, upper_ms) {
+        (Some(lower), Some(upper)) if upper > lower && (upper - lower) % 1_000 == 0 => {
+            Some((upper - lower) as u64 / 1_000)
+        }
+        _ => {
+            return Err("SQL table summary requires a positive whole-second timestamp range".into())
+        }
+    };
+    Ok((metric, window_secs, String::new()))
 }
 
 fn select_materialization<'a>(
@@ -322,6 +418,72 @@ mod tests {
         .await
         .expect("relational parents must be retained around the selected aggregate");
         assert!(matches!(planned.physical, PhysicalExpr::Committed(_)));
+    }
+
+    #[tokio::test]
+    async fn q05_max_over_time_sql_compiles_to_publishable_summary_dag() {
+        let schema = Schema::with_time_index(
+            vec![
+                Column::new("metric", DataType::Utf8, false),
+                Column::new("labels", DataType::Utf8, false),
+                Column::new("ts_ms", DataType::Timestamp, false),
+                Column::new("value", DataType::Float64, false),
+            ],
+            2,
+            vec![],
+        );
+        let mut config = PrecomputeMaterialization::new(
+            AggregationType::MinMax,
+            "max".into(),
+            Default::default(),
+            KeyByLabelNames::new(vec!["labels".into()]),
+            KeyByLabelNames::empty(),
+            KeyByLabelNames::empty(),
+            String::new(),
+            43_200,
+            60,
+            WindowKind::Tumbling,
+            String::new(),
+            "cache_refresh_lag_seconds".into(),
+            None,
+            None,
+            None,
+        );
+        config.pane_origin_ms = Some(0);
+        let sds = SummaryCatalog::from_materializations(71, 1, &[config.clone()]).unwrap();
+        let envelope = crate::physical::compiler::PlanEnvelope {
+            plan_id: 71,
+            plan_version: 1,
+            generated_at_unix_ms: 0,
+            activation_unix_ms: 0,
+            expiry_unix_ms: None,
+            backend_compat: "test".into(),
+            planner_revision: "test".into(),
+            capability_snapshot_id: "test".into(),
+        };
+        let mut precompute_plan =
+            PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
+        precompute_plan.summary_catalog = Some(sds.reference().unwrap());
+        let mut transmission_plan =
+            TransmissionPlan::build(envelope, &precompute_plan, &Default::default()).unwrap();
+        transmission_plan.summary_catalog = precompute_plan.summary_catalog.clone();
+        let request = ClickHouseSqlWorkload {
+            sds,
+            precompute_plan,
+            transmission_plan,
+            tables: HashMap::from([("raw_samples".into(), schema)]),
+            accuracy: AccuracyTarget::Exact,
+            queries: vec![ClickHouseSqlWorkloadEntry {
+                sql: "SELECT labels, max(value) AS value FROM raw_samples WHERE metric='cache_refresh_lag_seconds' AND ts_ms>1788848096000 AND ts_ms<=1788891296000 GROUP BY labels ORDER BY labels".into(),
+                start_ms: 1_788_848_096_000,
+                end_ms: 1_788_891_296_000,
+                cumulative: true,
+            }],
+        };
+        let bundle = compile_clickhouse_workload(&request)
+            .await
+            .expect("q05 SQL must compile for atomic sidecar publication");
+        assert_eq!(bundle.plans.len(), 1);
     }
 
     fn materialization(
