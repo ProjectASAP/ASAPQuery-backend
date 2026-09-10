@@ -176,11 +176,54 @@ impl ASAPQueryEngine {
             physical.query_plan.plan_id,
             physical.query_plan.plan_version,
         )?;
-        super::exact_subqueries::prepare(
+        // Candidate-filtered exact cuts have a data dependency: read the
+        // installed membership subtree once, then use that vector to build the
+        // Prometheus selector. Keeping the result as a prepared leaf also means
+        // CandidateTopK reuses the same membership readout during composition.
+        let dependencies = super::exact_subqueries::candidate_dependencies(entry, times)?;
+        let mut prepared = super::logical_dag::PreparedLeaves::new();
+        let unique_inputs = dependencies
+            .into_iter()
+            .map(|(_, input, at, _)| (input, at))
+            .collect::<std::collections::BTreeSet<_>>();
+        for (input, at) in unique_inputs {
+            let evaluation_ms = u64::try_from(at).map_err(|_| {
+                crate::query_engines::EngineError::capability_miss(
+                    "exact_subquery",
+                    "candidate evaluation predates epoch",
+                )
+            })?;
+            let mut subtree = entry.clone();
+            subtree.root = input;
+            let reachable = subtree.topological_order().map_err(|error| {
+                crate::query_engines::EngineError::capability_miss(
+                    "installed_logical_dag",
+                    error.to_string(),
+                )
+            })?;
+            subtree.nodes.retain(|id, _| reachable.contains(id));
+            let (result, _) = self.execute_logical_entry(
+                physical,
+                &subtree,
+                &super::logical_dag::PreparedLeaves::new(),
+                evaluation_ms,
+            )?;
+            prepared.insert(
+                (input, at),
+                super::logical_dag::PreparedLeaf {
+                    value: super::logical_dag::from_result(result)?,
+                    remote: false,
+                    remote_evaluations: 0,
+                    remote_rpcs: 0,
+                },
+            );
+        }
+        super::exact_subqueries::prepare_with_candidates(
             entry,
             times,
             self.exact_subquery_endpoint.as_deref(),
             &self.exact_subquery_client,
+            prepared,
         )
         .await
     }

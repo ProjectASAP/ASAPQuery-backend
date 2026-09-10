@@ -16,6 +16,12 @@ pub enum LogicalOperator {
     ExactSubquery {
         query: String,
     },
+    /// Prometheus exact subtree whose selectors are restricted at runtime by
+    /// the candidate vector produced by its single input.
+    CandidateExactSubquery {
+        query: String,
+        item_label: String,
+    },
     Scan {
         metric: Option<String>,
         matchers: Vec<LabelMatcher>,
@@ -141,6 +147,7 @@ impl LogicalOperator {
     pub fn validate(&self, inputs: usize) -> Result<(), QueryPlanError> {
         let expected = match self {
             Self::Scan { .. } | Self::ExactSubquery { .. } => 0,
+            Self::CandidateExactSubquery { .. } => 1,
             Self::Binary { .. } | Self::HistogramQuantile => 2,
             _ => 1,
         };
@@ -156,7 +163,7 @@ impl LogicalOperator {
         ) {
             return Err(invalid("zero range"));
         }
-        if let Self::ExactSubquery { query } = self {
+        if let Self::ExactSubquery { query } | Self::CandidateExactSubquery { query, .. } = self {
             let parsed = parser::parse(query).map_err(|e| invalid(e.to_string()))?;
             if matches!(parsed, Expr::MatrixSelector(_) | Expr::Subquery(_)) {
                 return Err(invalid(
@@ -1407,7 +1414,9 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         if let QueryPlanNode::Logical { operator, .. } = node {
             exact = matches!(
                 operator,
-                LogicalOperator::Scan { .. } | LogicalOperator::ExactSubquery { .. }
+                LogicalOperator::Scan { .. }
+                    | LogicalOperator::ExactSubquery { .. }
+                    | LogicalOperator::CandidateExactSubquery { .. }
             );
         }
         for child in node.inputs() {
@@ -1422,7 +1431,8 @@ pub fn externalize_residuals(entry: &mut QueryPlanEntry) -> Result<(), QueryPlan
         if matches!(
             entry.nodes.get(&id),
             Some(QueryPlanNode::Logical {
-                operator: LogicalOperator::ExactSubquery { .. },
+                operator: LogicalOperator::ExactSubquery { .. }
+                    | LogicalOperator::CandidateExactSubquery { .. },
                 ..
             })
         ) {

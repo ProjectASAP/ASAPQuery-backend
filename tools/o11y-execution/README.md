@@ -53,15 +53,15 @@ new output directory after investigating a failure.
 
 `planning.json` contains the envelope, cost comparison, lifecycle estimates and
 install request. `installed.json` records runtime status. `queries.json` preserves
-every response, occurrence ID, timing and `warm`, `exact_fallback` or `failed`
+every response, occurrence ID, timing and `warm`, `hybrid`, `exact_fallback` or `failed`
 classification. Forwarded responses carry a backend-owned `x-asap-execution`
 header; an unmarked success is not counted as warm or fallback. `ingestion.json`
 records accepted batches; acceptance does not prove worker completion.
 
 `execution_provenance` distinguishes summary-only `asap`, `hybrid`, and
 `external_exact`, and records summary readouts and Prometheus exact-subquery
-requests. Hybrid execution remains under `exact_fallback`; it is never reported
-as summary-only warm execution. A typed residual DAG can retain selected summary
+requests. Hybrid execution has its own top-level classification; `exact_fallback`
+means the whole query ran externally. A typed residual DAG can retain selected summary
 siblings, but a particular corpus may still produce no materializations.
 
 The runner waits for the finite-input completion barrier. The first traversal is

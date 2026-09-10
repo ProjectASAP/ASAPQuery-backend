@@ -6,6 +6,9 @@ use control_plane::query_plan::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+const MAX_CANDIDATE_VALUES: usize = 10_000;
+const MAX_CANDIDATE_QUERY_BYTES: usize = 1_048_576;
+
 fn miss(message: impl Into<String>) -> EngineError {
     EngineError::capability_miss("exact_subquery", message.into())
 }
@@ -40,7 +43,8 @@ fn leaves(
                 LogicalOperator::Scan { .. } => {
                     return Err(miss("local raw Scan is forbidden in deployed plans"))
                 }
-                LogicalOperator::ExactSubquery { .. } => {
+                LogicalOperator::ExactSubquery { .. }
+                | LogicalOperator::CandidateExactSubquery { .. } => {
                     result.insert((id, at), operator.clone());
                 }
                 LogicalOperator::Subquery {
@@ -74,11 +78,117 @@ fn leaves(
                 }
                 _ => pending.extend(inputs.iter().map(|input| (*input, at))),
             },
+            // CandidateTopK is a typed composition node rather than a Logical
+            // wrapper, but its value input can still be a Prometheus leaf.
+            QueryPlanNode::CandidateTopK { inputs, .. } => {
+                pending.extend(inputs.iter().map(|input| (*input, at)));
+            }
             // Existing bound summary subtrees are read by the synchronous callback.
             _ => {}
         }
     }
     Ok(result)
+}
+
+pub(super) fn candidate_dependencies(
+    entry: &QueryPlanEntry,
+    times: &[u64],
+) -> Result<Vec<(QueryNodeId, QueryNodeId, i64, String)>, EngineError> {
+    let mut result = Vec::new();
+    for ((id, at), operator) in leaves(entry, times)? {
+        if let LogicalOperator::CandidateExactSubquery { item_label, .. } = operator {
+            let input = *entry.nodes[&id]
+                .inputs()
+                .first()
+                .ok_or_else(|| miss("candidate exact subtree has no membership input"))?;
+            result.push((id, input, at, item_label));
+        }
+    }
+    Ok(result)
+}
+
+fn inject_candidate_matcher(
+    query: &str,
+    item_label: &str,
+    candidates: &[String],
+) -> Result<String, EngineError> {
+    use promql_parser::{
+        label::{MatchOp, Matcher},
+        parser::Expr,
+    };
+    // Go's regexp.QuoteMeta (used by Prometheus) escapes a smaller set than
+    // Rust's regex::escape; in particular, `\-` is not valid RE2 syntax.
+    fn re2_quote_meta(value: &str) -> String {
+        let mut quoted = String::with_capacity(value.len());
+        for character in value.chars() {
+            match character {
+                '\\' | '.' | '+' | '*' | '?' | '(' | ')' | '|' | '[' | ']' | '{' | '}' | '^'
+                | '$' => {
+                    quoted.push('\\');
+                    quoted.push(character);
+                }
+                '\n' => quoted.push_str("\\n"),
+                '\r' => quoted.push_str("\\r"),
+                '\t' => quoted.push_str("\\t"),
+                character if character.is_control() => {
+                    quoted.push_str(&format!("\\x{{{:x}}}", character as u32));
+                }
+                _ => quoted.push(character),
+            }
+        }
+        quoted
+    }
+    let pattern = format!(
+        "^(?:{})$",
+        candidates
+            .iter()
+            .map(|value| re2_quote_meta(value))
+            .collect::<Vec<_>>()
+            .join("|")
+    );
+    // promql-parser's AST formatter writes programmatically constructed
+    // matcher values verbatim between double quotes. Store the PromQL string
+    // escapes separately from the compiled regex so its formatted AST remains
+    // valid for dots, quotes, backslashes, and other literal label bytes.
+    let promql_pattern = pattern.replace('\\', "\\\\").replace('"', "\\\"");
+    let matcher = Matcher::new(
+        MatchOp::Re(regex::Regex::new(&pattern).map_err(|error| miss(error.to_string()))?),
+        item_label,
+        &promql_pattern,
+    );
+    fn visit(expr: &mut Expr, matcher: &Matcher) {
+        let append = |matchers: &mut promql_parser::label::Matchers| {
+            if matchers.or_matchers.is_empty() {
+                matchers.matchers.push(matcher.clone());
+            } else {
+                for branch in &mut matchers.or_matchers {
+                    branch.push(matcher.clone());
+                }
+            }
+        };
+        match expr {
+            Expr::VectorSelector(selector) => append(&mut selector.matchers),
+            Expr::MatrixSelector(selector) => append(&mut selector.vs.matchers),
+            Expr::Aggregate(node) => visit(&mut node.expr, matcher),
+            Expr::Unary(node) => visit(&mut node.expr, matcher),
+            Expr::Binary(node) => {
+                visit(&mut node.lhs, matcher);
+                visit(&mut node.rhs, matcher);
+            }
+            Expr::Paren(node) => visit(&mut node.expr, matcher),
+            Expr::Subquery(node) => visit(&mut node.expr, matcher),
+            Expr::Call(node) => {
+                for input in &mut node.args.args {
+                    visit(input, matcher);
+                }
+            }
+            Expr::NumberLiteral(_) | Expr::StringLiteral(_) | Expr::Extension(_) => {}
+        }
+    }
+    let mut expression = promql_parser::parser::parse(query)
+        .map_err(|error| miss(format!("invalid candidate exact query: {error}")))?;
+    visit(&mut expression, &matcher);
+    Ok(expression.to_string())
 }
 
 fn parse_result(body: &serde_json::Value, at: i64) -> Result<Value, EngineError> {
@@ -147,19 +257,76 @@ fn parse_result(body: &serde_json::Value, at: i64) -> Result<Value, EngineError>
     }
 }
 
+#[cfg(test)]
 pub(super) async fn prepare(
     entry: &QueryPlanEntry,
     times: &[u64],
     endpoint: Option<&str>,
     client: &reqwest::Client,
 ) -> Result<PreparedLeaves, EngineError> {
-    let mut prepared = PreparedLeaves::new();
+    prepare_with_candidates(entry, times, endpoint, client, PreparedLeaves::new()).await
+}
+
+pub(super) async fn prepare_with_candidates(
+    entry: &QueryPlanEntry,
+    times: &[u64],
+    endpoint: Option<&str>,
+    client: &reqwest::Client,
+    mut prepared: PreparedLeaves,
+) -> Result<PreparedLeaves, EngineError> {
     // Equivalent exact cuts at the same time share one actual remote request.
     let mut remote_cache = BTreeMap::<(String, i64), Value>::new();
     for ((id, at), operator) in leaves(entry, times)? {
         u64::try_from(at).map_err(|_| miss("subquery predates epoch"))?;
-        let query = match &operator {
-            LogicalOperator::ExactSubquery { query } => query.clone(),
+        let (query, candidate_filtered) = match &operator {
+            LogicalOperator::ExactSubquery { query } => (query.clone(), false),
+            LogicalOperator::CandidateExactSubquery { query, item_label } => {
+                let candidate_input = entry.nodes[&id].inputs()[0];
+                let candidate = prepared
+                    .get(&(candidate_input, at))
+                    .ok_or_else(|| miss("candidate membership was not prepared"))?;
+                let Value::Vector(rows) = &candidate.value else {
+                    return Err(miss("candidate membership is not an instant vector"));
+                };
+                let mut values = rows
+                    .iter()
+                    .map(|(labels, _)| {
+                        labels.get(item_label).cloned().ok_or_else(|| {
+                            miss(format!(
+                                "candidate membership is missing item label {item_label}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                values.sort();
+                values.dedup();
+                if values.is_empty() {
+                    prepared.insert(
+                        (id, at),
+                        PreparedLeaf {
+                            value: Value::Vector(Vec::new()),
+                            remote: true,
+                            remote_evaluations: 0,
+                            remote_rpcs: 0,
+                        },
+                    );
+                    continue;
+                }
+                if values.len() > MAX_CANDIDATE_VALUES {
+                    return Err(miss(format!(
+                        "candidate set has {} values, exceeding limit {MAX_CANDIDATE_VALUES}",
+                        values.len()
+                    )));
+                }
+                let restricted = inject_candidate_matcher(query, item_label, &values)?;
+                if restricted.len() > MAX_CANDIDATE_QUERY_BYTES {
+                    return Err(miss(format!(
+                        "candidate-filtered exact query has {} bytes, exceeding limit {MAX_CANDIDATE_QUERY_BYTES}",
+                        restricted.len()
+                    )));
+                }
+                (restricted, true)
+            }
             _ => return Err(miss("prepared leaf is not an exact subtree")),
         };
         let key = (query.clone(), at);
@@ -168,12 +335,21 @@ pub(super) async fn prepare(
             value.clone()
         } else {
             let endpoint = endpoint.ok_or_else(|| miss("Prometheus exact endpoint unavailable"))?;
-            let response = client
-                .get(format!("{}/api/v1/query", endpoint.trim_end_matches('/')))
-                .query(&[
-                    ("query", query.as_str()),
-                    ("time", &format!("{:.3}", at as f64 / 1000.0)),
-                ])
+            let url = format!("{}/api/v1/query", endpoint.trim_end_matches('/'));
+            let time = format!("{:.3}", at as f64 / 1000.0);
+            // Candidate sets can be large enough to exceed proxy URL limits;
+            // Prometheus accepts the instant-query parameters as an encoded
+            // form body. Static exact cuts keep their existing GET contract.
+            let request = if candidate_filtered {
+                client
+                    .post(url)
+                    .form(&[("query", query.as_str()), ("time", time.as_str())])
+            } else {
+                client
+                    .get(url)
+                    .query(&[("query", query.as_str()), ("time", time.as_str())])
+            };
+            let response = request
                 .send()
                 .await
                 .map_err(|e| miss(format!("exact request failed: {e}")))?;
@@ -224,6 +400,232 @@ mod tests {
         assert!(matches!(parse_result(&serde_json::json!({"status":"success","data":{"resultType":"scalar","result":[1,"2"]}}),1000).unwrap(),Value::Scalar(2.0)));
         assert!(parse_result(&serde_json::json!({"status":"success","warnings":["partial"],"data":{"resultType":"scalar","result":[1,"2"]}}),1000).is_err());
         assert!(parse_result(&serde_json::json!({"status":"success","data":{"resultType":"scalar","result":[2,"2"]}}),1000).is_err());
+    }
+
+    fn candidate_entry(query: &str) -> QueryPlanEntry {
+        entry(BTreeMap::from([
+            (
+                QueryNodeId(0),
+                QueryPlanNode::Logical {
+                    operator: LogicalOperator::CandidateExactSubquery {
+                        query: query.into(),
+                        item_label: "job".into(),
+                    },
+                    inputs: vec![QueryNodeId(1)],
+                },
+            ),
+            (
+                QueryNodeId(1),
+                QueryPlanNode::SummaryMerge { inputs: vec![] },
+            ),
+        ]))
+    }
+
+    fn candidate_rows(values: impl IntoIterator<Item = String>) -> PreparedLeaves {
+        [(
+            (QueryNodeId(1), 1_000),
+            PreparedLeaf {
+                value: Value::Vector(
+                    values
+                        .into_iter()
+                        .map(|value| (BTreeMap::from([("job".into(), value)]), 1.0))
+                        .collect(),
+                ),
+                remote: false,
+                remote_evaluations: 0,
+                remote_rpcs: 0,
+            },
+        )]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn candidate_matcher_is_ast_conjoined_and_regex_escaped() {
+        use promql_parser::parser::Expr;
+        let values = vec!["api.v1".into(), "quote\"slash\\".into(), "a|b".into()];
+        let restricted = inject_candidate_matcher(
+            "sum by (job) (rate(m{cluster=\"prod\",job!=\"blocked\"}[5m]))",
+            "job",
+            &values,
+        )
+        .unwrap();
+        let expression = promql_parser::parser::parse(&restricted).unwrap();
+        let Expr::Aggregate(aggregate) = expression else {
+            panic!("aggregate expected: {restricted}")
+        };
+        let Expr::Call(call) = aggregate.expr.as_ref() else {
+            panic!("rate expected: {restricted}")
+        };
+        let Expr::MatrixSelector(selector) = &*call.args.args[0] else {
+            panic!("matrix selector expected: {restricted}")
+        };
+        assert!(selector
+            .vs
+            .matchers
+            .matchers
+            .iter()
+            .any(|matcher| matcher.name == "cluster" && matcher.is_match("prod")));
+        assert!(selector
+            .vs
+            .matchers
+            .matchers
+            .iter()
+            .any(|matcher| matcher.name == "job" && !matcher.is_match("blocked")));
+        let candidate_matcher = selector
+            .vs
+            .matchers
+            .matchers
+            .iter()
+            .find(|matcher| matcher.name == "job" && matcher.value.starts_with("^(?:"))
+            .unwrap();
+        assert!(candidate_matcher.value.contains(r"api\\.v1"));
+        assert!(candidate_matcher.value.contains(r"a\\|b"));
+        assert!(restricted.contains(r#"quote\"slash\\\\"#));
+        let semantic = regex::Regex::new(r#"^(?:api\.v1|quote"slash\\|a\|b)$"#).unwrap();
+        for value in &values {
+            assert!(semantic.is_match(value), "{value:?}: {restricted}");
+        }
+        assert!(!semantic.is_match("apiXv1"));
+        assert!(!semantic.is_match("a"));
+    }
+
+    #[tokio::test]
+    async fn empty_candidate_set_returns_empty_exact_leaf_without_rpc() {
+        let entry = candidate_entry("sum by (job) (rate(m[5m]))");
+        let prepared = prepare_with_candidates(
+            &entry,
+            &[1_000],
+            None,
+            &reqwest::Client::new(),
+            candidate_rows(Vec::new()),
+        )
+        .await
+        .unwrap();
+        let exact = &prepared[&(QueryNodeId(0), 1_000)];
+        assert!(matches!(&exact.value, Value::Vector(rows) if rows.is_empty()));
+        assert_eq!((exact.remote_evaluations, exact.remote_rpcs), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn candidate_exact_is_discovered_and_prepared_behind_candidate_topk_root() {
+        use control_plane::query_plan::{logical::Grouping, CandidateCompleteness};
+        let mut entry = candidate_entry("sum by (job) (rate(m[5m]))");
+        entry.nodes.insert(
+            QueryNodeId(2),
+            QueryPlanNode::CandidateTopK {
+                inputs: [QueryNodeId(1), QueryNodeId(0)],
+                k: 2,
+                grouping: Grouping {
+                    labels: vec![],
+                    without: false,
+                },
+                completeness: CandidateCompleteness::BestEffort { guarantee: None },
+            },
+        );
+        entry.root = QueryNodeId(2);
+        let dependencies = candidate_dependencies(&entry, &[1_000]).unwrap();
+        assert_eq!(
+            dependencies,
+            vec![(QueryNodeId(0), QueryNodeId(1), 1_000, "job".into())]
+        );
+        let prepared = prepare_with_candidates(
+            &entry,
+            &[1_000],
+            None,
+            &reqwest::Client::new(),
+            candidate_rows(Vec::new()),
+        )
+        .await
+        .unwrap();
+        assert!(prepared.contains_key(&(QueryNodeId(0), 1_000)));
+    }
+
+    #[tokio::test]
+    async fn high_cardinality_candidates_use_one_post_and_preserve_exact_labels() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = axum::Router::new().route(
+            "/api/v1/query",
+            axum::routing::post(
+                move |axum::Form(params): axum::Form<BTreeMap<String, String>>| {
+                    let count = count.clone();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        assert_eq!(params["time"], "1.000");
+                        let parsed = promql_parser::parser::parse(&params["query"]).unwrap();
+                        assert!(matches!(parsed, promql_parser::parser::Expr::Aggregate(_)));
+                        assert!(params["query"].contains("job-999"));
+                        axum::Json(serde_json::json!({
+                            "status":"success",
+                            "data":{"resultType":"vector","result":[{
+                                "metric":{"__name__":"m","job":"job-999"},
+                                "value":[1,"42"]
+                            }]}
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let entry = candidate_entry("sum by (job) (rate(m{job!=\"blocked\"}[5m]))");
+        let candidates = (0..1_000).map(|index| format!("job-{index}"));
+
+        let prepared = prepare_with_candidates(
+            &entry,
+            &[1_000],
+            Some(&format!("http://{address}")),
+            &reqwest::Client::new(),
+            candidate_rows(candidates),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let exact = &prepared[&(QueryNodeId(0), 1_000)];
+        assert_eq!((exact.remote_evaluations, exact.remote_rpcs), (1, 1));
+        assert!(matches!(
+            &exact.value,
+            Value::Vector(rows)
+                if rows.len() == 1
+                    && rows[0].0.get("job").map(String::as_str) == Some("job-999")
+                    && rows[0].0.get("__name__").map(String::as_str) == Some("m")
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn candidate_exact_rpc_failure_is_a_capability_miss_for_whole_query_fallback() {
+        let app = axum::Router::new().route(
+            "/api/v1/query",
+            axum::routing::post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = prepare_with_candidates(
+            &candidate_entry("sum by (job) (rate(m[5m]))"),
+            &[1_000],
+            Some(&format!("http://{address}")),
+            &reqwest::Client::new(),
+            candidate_rows(["api".into()]),
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("HTTP failure must reject the hybrid branch")
+        };
+        assert!(matches!(
+            error,
+            EngineError::CapabilityMiss { engine_id: "exact_subquery", ref detail }
+                if detail.contains("HTTP 503")
+        ));
+        server.abort();
     }
     #[tokio::test]
     async fn exact_leaf_calls_prometheus_and_combines_with_prepared_summary() {

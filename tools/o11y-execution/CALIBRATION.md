@@ -22,7 +22,7 @@ compares its complete quotes and installs the selected artifact.
    Record installation, ingestion/build/update, residency, and retirement CPU,
    and each query's inclusive process CPU over enough repetitions to exceed the
    operating system's accounting resolution. Validate correctness and record
-   `warm`, `exact_fallback`, or failure. Record memory and storage separately.
+   `warm`, `hybrid`, `exact_fallback`, or failure. Record memory and storage separately.
    Retain all raw artifacts. Do not reuse calibration timings as the independent
    held-out performance evaluation.
 4. Run `update_global_profile.py --snapshot DISCOVERY --measurements MEASUREMENTS

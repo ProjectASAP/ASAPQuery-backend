@@ -187,7 +187,9 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
             QueryPlanNode::Logical { operator, inputs } => {
                 if matches!(
                     operator,
-                    LogicalOperator::Scan { .. } | LogicalOperator::ExactSubquery { .. }
+                    LogicalOperator::Scan { .. }
+                        | LogicalOperator::ExactSubquery { .. }
+                        | LogicalOperator::CandidateExactSubquery { .. }
                 ) {
                     return Err(miss(
                         "installed Prometheus leaf was not prepared; backend raw execution is forbidden",
@@ -235,7 +237,8 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                 .ok_or_else(|| miss("missing logical input"))
         };
         match operator {
-            LogicalOperator::ExactSubquery { .. } => {
+            LogicalOperator::ExactSubquery { .. }
+            | LogicalOperator::CandidateExactSubquery { .. } => {
                 Err(miss("Prometheus exact leaf was not prepared"))
             }
             LogicalOperator::Scan { .. } => {

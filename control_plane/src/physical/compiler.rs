@@ -3655,7 +3655,12 @@ fn collect_selected_materializations(
                 candidates, values, ..
             } => {
                 walk(candidates, readout, composable, grouping.clone(), selected)?;
-                walk(values, readout, composable, grouping.clone(), selected)?;
+                // In a hybrid TopK, the sketch is only a candidate-membership
+                // sidecar. Prometheus owns the authoritative value subtree;
+                // provisioning local exact state here duplicates that work.
+                if !composable {
+                    walk(values, readout, composable, grouping.clone(), selected)?;
+                }
             }
             SummaryExpr::ValueOperation { child, .. } => {
                 walk(child, readout, composable, grouping.clone(), selected)?;
@@ -4123,6 +4128,53 @@ mod tests {
             })
             .expect("reset-aware exact counter");
         assert_eq!(retained_partition_count(counter, Some(5)), 5);
+    }
+
+    #[test]
+    fn hybrid_weighted_topk_installs_only_candidates_and_delegates_filtered_exact_values() {
+        use crate::query_plan::{logical::LogicalOperator, QueryPlanNode};
+        let query = "topk(2, sum by (job) (rate(m[1m])))";
+        let evidence = TopKMembershipEvidence {
+            selected_lower_bound: 101.0,
+            excluded_upper_bound: 100.0,
+            interval_failure_probability: 0.001,
+            observed_at_unix_ms: 9_500,
+            source: "unit-fixture".into(),
+        };
+        let mut request = request_with_evidence("topk-rate", query, Some(evidence)).unwrap();
+        request.hybrid_execution = true;
+        let mut environment = environment(10_000);
+        environment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        environment.collector_ids.clear();
+
+        let plan = PhysicalCompiler.compile(request, environment).unwrap();
+
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        assert_eq!(
+            plan.precompute_plan.materializations[0].aggregation_type,
+            asap_types::AggregationType::CountMinSketchWithHeap
+        );
+        let entry = plan.query_plan.lookup(query).unwrap();
+        let QueryPlanNode::CandidateTopK { inputs, .. } = &entry.nodes[&entry.root] else {
+            panic!("expected candidate TopK: {entry:#?}");
+        };
+        assert!(matches!(
+            &entry.nodes[&inputs[1]],
+            QueryPlanNode::Logical {
+                operator: LogicalOperator::CandidateExactSubquery { query, item_label },
+                inputs: exact_inputs,
+            } if query == "sum by (job) (rate(m[1m]))"
+                && item_label == "job"
+                && exact_inputs == &vec![inputs[0]]
+        ));
+        assert!(entry.nodes.values().all(|node| !matches!(
+            node,
+            QueryPlanNode::ExactReadout { .. }
+                | QueryPlanNode::Logical {
+                    operator: LogicalOperator::Scan { .. },
+                    ..
+                }
+        )));
     }
 
     #[test]
