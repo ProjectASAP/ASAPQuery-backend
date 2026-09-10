@@ -5881,12 +5881,12 @@ async fn handle_store_metrics(State(state): State<AppState>) -> axum::response::
 
     // M2.3.6g — earliest timestamps come from SketchStore's per-sid
     // `first_seen_unix_ms` metadata. Always succeeds (no I/O).
-    let timestamps = state.sketch_index.earliest_timestamps_per_sid();
+    let timestamps = state.sketch_index.earliest_timestamps_per_series_id();
     let body = serde_json::json!({
         "status": "success",
         "sid_count": timestamps.len(),
         "approx_resident_bytes": state.sketch_index.approx_resident_bytes(),
-        "earliest_timestamps_per_sid": timestamps});
+        "earliest_timestamps_per_series_id": timestamps});
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -6582,7 +6582,7 @@ async fn handle_get_schemas(
         .iter()
         .filter(|m| allowed.contains(&m.status()))
         .map(|metadata| {
-            let descriptors = state.sketch_index.descriptors_for_sid(metadata.sid);
+            let descriptors = state.sketch_index.descriptors_for_series_id(metadata.sid);
             sid_instance_to_json(metadata, descriptors.as_ref())
         })
         .collect();
@@ -6646,7 +6646,7 @@ async fn handle_post_schema_retire(
         crate::storage_engines::sketch_db::DEFAULT_RETIREMENT_RETENTION,
     ) {
         Some(meta) => {
-            let descriptors = state.sketch_index.descriptors_for_sid(sid);
+            let descriptors = state.sketch_index.descriptors_for_series_id(sid);
             let body = serde_json::json!({
                 "status": "success",
                 "schema": sid_instance_to_json(&meta, descriptors.as_ref())});
@@ -6672,7 +6672,7 @@ async fn handle_post_schema_expire(
     use axum::response::IntoResponse;
     match state.sketch_index.force_expire(sid) {
         Some(meta) => {
-            let descriptors = state.sketch_index.descriptors_for_sid(sid);
+            let descriptors = state.sketch_index.descriptors_for_series_id(sid);
             let body = serde_json::json!({
                 "status": "success",
                 "schema": sid_instance_to_json(&meta, descriptors.as_ref())});

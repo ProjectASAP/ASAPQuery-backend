@@ -375,7 +375,7 @@ impl HttpProtocolAdapter for PrometheusHttpAdapter {
         // M2.3.6g — earliest timestamps now come from SketchStore's
         // per-sid `first_seen_unix_ms` metadata. Wire field renamed
         // accordingly below.
-        let earliest_timestamps = sketch_index.earliest_timestamps_per_sid();
+        let earliest_timestamps = sketch_index.earliest_timestamps_per_series_id();
 
         // Get runtime info from fallback if available
         let mut runtime_data = if let Some(fallback) = &self.config.fallback {

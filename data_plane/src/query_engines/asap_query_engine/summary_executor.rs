@@ -481,7 +481,7 @@ impl QueryExecutionContext<'_> {
         };
         let mut sids = self
             .index
-            .sids_for_policy(binding.materialization.fingerprint());
+            .series_ids_for_policy(binding.materialization.fingerprint());
         sids.sort_unstable();
         sids.dedup();
         let mut matched_metadata = 0usize;
@@ -707,7 +707,7 @@ impl<'a> SummaryExecutor for QueryExecutionContext<'a> {
         let candidate_sids = if let Some(allowed) = &self.allowed_materializations {
             let mut sids: Vec<_> = allowed
                 .iter()
-                .flat_map(|fingerprint| self.index.sids_for_policy(*fingerprint))
+                .flat_map(|fingerprint| self.index.series_ids_for_policy(*fingerprint))
                 .collect();
             sids.sort_unstable();
             sids.dedup();

@@ -75,8 +75,8 @@ fn legacy_summary(kind: &AggKind) -> SummaryDescriptor {
     })
 }
 
-/// Runtime foreign-key binding from one SID to shared descriptors. Every pane
-/// row stored under the SID is a Summary Instance: `(binding, interval,
+/// Runtime foreign-key binding from one SeriesId to shared descriptors. Every pane
+/// row stored under the SeriesId is a Summary Instance: `(binding, interval,
 /// group-values, state)`. Descriptor references are normalized here instead of
 /// copied into every pane row.
 #[derive(Debug, Clone)]
@@ -97,7 +97,7 @@ impl std::ops::Deref for SdsBinding {
 /// Content-addressed descriptor registry owned by one SummaryStore.
 #[derive(Default)]
 pub struct SummaryDescriptorRegistry {
-    // Weak values let descriptors disappear with their last SID binding. The
+    // Weak values let descriptors disappear with their last SeriesId binding. The
     // registry must not turn retired materializations into a permanent leak.
     summaries: RwLock<HashMap<SummaryDescriptorId, Weak<SummaryDescriptor>>>,
     data: RwLock<HashMap<DataDescriptorId, Weak<DataDescriptor>>>,
@@ -205,7 +205,7 @@ impl SummaryDescriptorRegistry {
             .count()
     }
 
-    /// Remove dead weak entries after SID retirement. Live snapshots remain
+    /// Remove dead weak entries after SeriesId retirement. Live snapshots remain
     /// valid and are collected by a later prune once their handles are gone.
     pub fn prune(&self) {
         self.summaries

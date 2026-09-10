@@ -588,7 +588,9 @@ mod tests {
             registry.get(job).unwrap().status,
             crate::storage_engines::sketch_db::backfill::BackfillStatus::Complete
         );
-        assert!(!store.sids_for_policy(cfg.policy_fingerprint()).is_empty());
+        assert!(!store
+            .series_ids_for_policy(cfg.policy_fingerprint())
+            .is_empty());
         let (accelerator, request) = fixture_with_store(2_000, store, false).await;
         let ClickHouseAccelerationOutcome::Accelerated(response) =
             accelerator.execute(&request).await

@@ -59,7 +59,7 @@ use crate::storage_engines::types::AggregationType;
 use super::{PersistError, PersistResult};
 
 /// File name of the sid-metadata sidecar under the persistence dir.
-pub const SID_METADATA_FILE: &str = "sid_metadata.json";
+pub const SERIES_ID_METADATA_FILE: &str = "sid_metadata.json";
 
 /// Serializable mirror of [`SketchConfig`]. Kept local (rather than
 /// deriving serde on the control-plane `SketchConfig`) so the sidecar
@@ -295,7 +295,7 @@ impl SidMetaRecord {
     }
 
     /// Derive the warm-tier [`Capability`] from `agg_kind`, mirroring the
-    /// ingest path (`otel.rs`) and `ingest_precompute_with_sid`. Returns
+    /// ingest path (`otel.rs`) and `ingest_precompute_with_series_id`. Returns
     /// `None` only when `agg_kind` itself fails to reconstruct.
     pub fn capability(&self) -> Option<Capability> {
         let agg_kind = self.agg_kind()?;
@@ -344,7 +344,7 @@ struct SidBindingRec {
     first_seen_unix_ms: i64,
 }
 
-/// Version-2 normalized sidecar. Descriptors appear once and SID bindings hold
+/// Version-2 normalized sidecar. Descriptors appear once and SeriesId bindings hold
 /// foreign keys, mirroring the in-memory SDS registry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SdsSidecar {
@@ -411,7 +411,7 @@ impl SdsSidecar {
                     .get(&binding.summary_descriptor_id)
                     .ok_or_else(|| {
                         PersistError::Format(format!(
-                            "SID {} references missing summary descriptor {}",
+                            "SeriesId {} references missing summary descriptor {}",
                             binding.sid, binding.summary_descriptor_id
                         ))
                     })?;
@@ -420,7 +420,7 @@ impl SdsSidecar {
                     .get(&binding.data_descriptor_id)
                     .ok_or_else(|| {
                         PersistError::Format(format!(
-                            "SID {} references missing data descriptor {}",
+                            "SeriesId {} references missing data descriptor {}",
                             binding.sid, binding.data_descriptor_id
                         ))
                     })?;
@@ -450,7 +450,7 @@ impl SidMetadataStore {
     /// `<disk_path>/sid_metadata.json`.
     pub fn new(disk_path: &Path) -> Self {
         Self {
-            path: disk_path.join(SID_METADATA_FILE),
+            path: disk_path.join(SERIES_ID_METADATA_FILE),
         }
     }
 
@@ -508,7 +508,7 @@ impl SidMetadataStore {
                 }
             };
         }
-        // Version 1 was a flat SID map. Read it and normalize on the next write.
+        // Version 1 was a flat SeriesId map. Read it and normalize on the next write.
         let map: HashMap<String, SidMetaRecord> = match serde_json::from_value(value) {
             Ok(map) => map,
             Err(error) => {

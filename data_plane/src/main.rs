@@ -804,7 +804,7 @@ async fn main() -> Result<()> {
             args.prometheus_scrape_interval,
         )
         // Phase 5 wire-in (refactor 2026-05): hand the ASAP-tier
-        // SketchStore to the query engine so SidLookup classification
+        // SketchStore to the query engine so SeriesLookup classification
         // drives the Phase 6 archive failover via
         // EngineError::CapabilityMiss when the ASAP tier is empty
         // / ghost / unknown.

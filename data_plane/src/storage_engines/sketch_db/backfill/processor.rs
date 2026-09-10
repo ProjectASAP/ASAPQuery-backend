@@ -307,7 +307,7 @@ impl WindowProcessor for BackfillWindowProcessor {
 
         // Build per-sid `(sid, PrecomputedOutput, accumulator)` triples.
         // Carrying the sid alongside the pair lets the write loop hand
-        // it straight to `ingest_precompute_with_sid` instead of
+        // it straight to `ingest_precompute_with_series_id` instead of
         // re-resolving inside the mint-driven path.
         let mut batch: Vec<(
             u64,
@@ -356,7 +356,12 @@ impl WindowProcessor for BackfillWindowProcessor {
                     // but the round-trip is redundant now that we hold
                     // the value.
                     for (sid, output, accumulator) in &batch {
-                        idx.ingest_precompute_with_sid(*sid, &config, output, accumulator.as_ref());
+                        idx.ingest_precompute_with_series_id(
+                            *sid,
+                            &config,
+                            output,
+                            accumulator.as_ref(),
+                        );
                     }
                 }
                 None => {
@@ -810,7 +815,7 @@ mod tests {
 
     /// Regression for B7.7 (schema-retirement #5 step 6): the
     /// backfill processor groups raw samples by `sid: u64` and writes
-    /// each bucket via `SketchStore::ingest_precompute_with_sid`. The
+    /// each bucket via `SketchStore::ingest_precompute_with_series_id`. The
     /// sids it allocates match what the shared `SeriesIdResolver`
     /// would mint for the same `(metric, grouping-values, agg_kind)`
     /// tuple — i.e. live ingest and backfill share one sid namespace.
@@ -829,7 +834,7 @@ mod tests {
     #[tokio::test]
     async fn process_window_buckets_by_sid_via_resolver() {
         use crate::drivers::ingest::series_resolver::SeriesIdResolver;
-        use crate::storage_engines::sketch_db::index::{SidLookup, SketchStore};
+        use crate::storage_engines::sketch_db::index::{SeriesLookup, SketchStore};
 
         let cfg = sum_config(1, "latency", vec!["svc"]);
         let fp = cfg.policy_fp_u64();
@@ -894,8 +899,8 @@ mod tests {
         let sid_a = resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"a\"}");
         let sid_b = resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"b\"}");
         assert_ne!(sid_a, sid_b, "distinct svc values mint distinct sids");
-        assert_eq!(sketch_index.classify(sid_a), SidLookup::Hit);
-        assert_eq!(sketch_index.classify(sid_b), SidLookup::Hit);
+        assert_eq!(sketch_index.classify(sid_a), SeriesLookup::Hit);
+        assert_eq!(sketch_index.classify(sid_b), SeriesLookup::Hit);
 
         // Provenance was recorded once per window (not once per
         // bucket) — same shape as the pre-rekey path.
