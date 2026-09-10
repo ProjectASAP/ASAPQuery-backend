@@ -82,11 +82,18 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_metricsql_function_fails_closed() {
-        assert!(matches!(
-            bind_metricsql("distinct_over_time(cpu_usage[5m])", accuracy()),
-            Err(MetricsQlBindingError::Unsupported(_))
-        ));
+    fn parsed_functions_without_lowering_semantics_fail_closed() {
+        for query in [
+            "distinct_over_time(cpu_usage[5m])",
+            "entropy_over_time(cpu_usage[5m])",
+        ] {
+            promql_parser::parser::parse(query)
+                .unwrap_or_else(|error| panic!("pinned parser must accept {query:?}: {error}"));
+            assert!(matches!(
+                bind_metricsql(query, accuracy()),
+                Err(MetricsQlBindingError::Unsupported(_))
+            ));
+        }
     }
 
     #[test]

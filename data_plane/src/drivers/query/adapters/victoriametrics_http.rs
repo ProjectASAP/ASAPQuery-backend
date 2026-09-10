@@ -159,16 +159,19 @@ mod tests {
     }
 
     #[test]
-    fn acceleration_identity_accepts_only_the_shared_promql_subset() {
-        assert!(adapter()
-            .canonical_plan_identity("mad_over_time(cpu_usage[5m])")
-            .unwrap()
-            .is_some());
-        assert!(adapter()
-            .canonical_plan_identity("default_rollup(cpu_usage[5m])")
-            .is_err());
-        assert!(adapter()
-            .canonical_plan_identity("distinct_over_time(cpu_usage[5m])")
-            .is_err());
+    fn identity_tracks_the_shared_parser_boundary() {
+        for query in [
+            "mad_over_time(cpu_usage[5m])",
+            "distinct_over_time(cpu_usage[5m])",
+            "entropy_over_time(cpu_usage[5m])",
+        ] {
+            assert!(adapter().canonical_plan_identity(query).unwrap().is_some());
+        }
+        for query in [
+            "default_rollup(cpu_usage[5m])",
+            "topk_over_time(3, cpu_usage[5m])",
+        ] {
+            assert!(adapter().canonical_plan_identity(query).is_err());
+        }
     }
 }
