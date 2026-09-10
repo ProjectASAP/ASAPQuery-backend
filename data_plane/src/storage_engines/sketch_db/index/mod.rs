@@ -127,7 +127,7 @@ fn reconstruct_exact_agg(
 }
 
 /// Joint helper shared by [`SketchStore::ingest_precompute_for_agg_config`]
-/// and [`SketchStore::ingest_precompute_with_sid`] — folds the
+/// and [`SketchStore::ingest_precompute_with_series_id`] — folds the
 /// grouping-label values on `output` against the
 /// `agg_cfg.grouping_labels` ordering into:
 ///
@@ -216,7 +216,7 @@ pub struct SketchInstanceMetadata {
     /// `AggSchema::expires_at_ms`.
     pub expires_at_ms: Option<u64>,
     /// Content-addressed back-reference to the policy that minted this
-    /// sid. Together with [`SketchStore::policy_to_sids`] this gives
+    /// sid. Together with [`SketchStore::policy_to_series_ids`] this gives
     /// the query path a direct `policy_fp → [sid]` index without
     /// walking the metadata map. `PolicyFingerprint::UNSET` is reserved
     /// for the legacy registration path that doesn't carry a source
@@ -539,7 +539,7 @@ pub struct SketchStore {
     /// whose state was merged away by an upstream gateway before
     /// reaching this backend).
     instances: RwLock<HashMap<u64, SdsBinding>>,
-    /// Interns immutable SDS descriptors across all SIDs and panes.
+    /// Interns immutable SDS descriptors across all Series IDs and panes.
     descriptors: SummaryDescriptorRegistry,
     /// sid → item_label (the data-point attribute NAME, e.g. "service"
     /// or "endpoint") for CountMin/CountSketch sids registered in
@@ -572,28 +572,28 @@ pub struct SketchStore {
     ///
     /// ## Cross-index atomicity invariant (P2-1)
     ///
-    /// `instances`, `policy_to_sids`, and `metric_to_sids` form ONE
+    /// `instances`, `policy_to_series_ids`, and `metric_to_series_ids` form ONE
     /// logical index whose three maps must agree: every sid present in
-    /// `instances` must also be present in `metric_to_sids` (keyed by
+    /// `instances` must also be present in `metric_to_series_ids` (keyed by
     /// its metric_name) and — when its `policy_fp` is non-UNSET — in
-    /// `policy_to_sids`. A concurrent reader must never observe a sid in
+    /// `policy_to_series_ids`. A concurrent reader must never observe a sid in
     /// `instances` that is missing from the secondary indexes (or vice
     /// versa). To preserve this, every writer ([`Self::register`],
     /// [`Self::remove_instance`]) acquires ALL THREE write guards
-    /// together in the fixed order `instances → policy_to_sids →
-    /// metric_to_sids` BEFORE mutating any of them, so the update is
+    /// together in the fixed order `instances → policy_to_series_ids →
+    /// metric_to_series_ids` BEFORE mutating any of them, so the update is
     /// atomic with respect to any reader that takes the `instances` lock.
     /// The fixed acquisition order is also the deadlock-avoidance order:
     /// no code path takes these locks in a different order.
-    policy_to_sids: RwLock<HashMap<PolicyFingerprint, BTreeSet<u64>>>,
+    policy_to_series_ids: RwLock<HashMap<PolicyFingerprint, BTreeSet<u64>>>,
     /// Secondary index: `metric_name → {sids}` (P2-2). Lets
     /// [`Self::instances_matching`] do a keyed lookup of the sids for a
     /// metric instead of an O(N) full scan of `instances`. Maintained in
     /// lock-step with `instances` under the same write-lock domain (see
-    /// the atomicity invariant on `policy_to_sids`). Holds every
+    /// the atomicity invariant on `policy_to_series_ids`). Holds every
     /// registered sid (UNSET-policy sids included), since the query path
     /// keys candidate selection on metric name, not policy.
-    metric_to_sids: RwLock<HashMap<String, BTreeSet<u64>>>,
+    metric_to_series_ids: RwLock<HashMap<String, BTreeSet<u64>>>,
     /// Pointer (as `usize`) of the `Arc<StreamingConfig>` this store
     /// last reconciled against. `reconcile_from_streaming_config` runs
     /// on every ingest batch, but the config is a lock-free
@@ -642,7 +642,7 @@ pub struct PersistenceReadHandle {
 /// - `Unknown`: sid not registered. Sender's cache is stale; respond
 ///   with `unknown_series_ids` so sender re-emits with attributes.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SidLookup {
+pub enum SeriesLookup {
     Hit,
     Ghost,
     Unknown,
@@ -653,22 +653,22 @@ impl SketchStore {
         Self::default()
     }
 
-    /// Classify a sid for query routing. See `SidLookup` for semantics.
-    pub fn classify(&self, sid: u64) -> SidLookup {
+    /// Classify a sid for query routing. See `SeriesLookup` for semantics.
+    pub fn classify(&self, sid: u64) -> SeriesLookup {
         let known = self.instances.read().unwrap().contains_key(&sid);
         if !known {
-            return SidLookup::Unknown;
+            return SeriesLookup::Unknown;
         }
         match self.series.get(&sid) {
             Some(store) => {
                 let g = store.read().unwrap();
                 if !g.current_epoch.is_empty() || !g.sealed_epochs.is_empty() {
-                    SidLookup::Hit
+                    SeriesLookup::Hit
                 } else {
-                    SidLookup::Ghost
+                    SeriesLookup::Ghost
                 }
             }
-            None => SidLookup::Ghost,
+            None => SeriesLookup::Ghost,
         }
     }
 
@@ -680,11 +680,11 @@ impl SketchStore {
     /// ## Atomicity (P2-1)
     ///
     /// All three index write guards are acquired together, in the fixed
-    /// order `instances → policy_to_sids → metric_to_sids`, BEFORE any
+    /// order `instances → policy_to_series_ids → metric_to_series_ids`, BEFORE any
     /// map is mutated. This makes the three updates atomic with respect
     /// to a concurrent reader that takes the `instances` lock: such a
     /// reader can never see the sid in `instances` while it is still
-    /// absent from `policy_to_sids` / `metric_to_sids` (the pre-fix race
+    /// absent from `policy_to_series_ids` / `metric_to_series_ids` (the pre-fix race
     /// where the two indexes were written under separate sequential
     /// locks). See the index-field doc comments for the full invariant.
     pub fn register(&self, meta: SketchInstanceMetadata) {
@@ -701,10 +701,10 @@ impl SketchStore {
             }
         };
         let metric_name = instance.data_descriptor.metric_name.clone();
-        // Fixed lock order: instances → policy_to_sids → metric_to_sids.
+        // Fixed lock order: instances → policy_to_series_ids → metric_to_series_ids.
         let mut instances = self.instances.write().unwrap();
-        let mut policy_idx = self.policy_to_sids.write().unwrap();
-        let mut metric_idx = self.metric_to_sids.write().unwrap();
+        let mut policy_idx = self.policy_to_series_ids.write().unwrap();
+        let mut metric_idx = self.metric_to_series_ids.write().unwrap();
         instances.insert(sid, instance);
         if !policy_fp.is_unset() {
             policy_idx.entry(policy_fp).or_default().insert(sid);
@@ -713,7 +713,7 @@ impl SketchStore {
     }
 
     /// Install one authoritative catalog snapshot for future registrations.
-    /// Existing SIDs retain their generation's descriptor Arcs while draining.
+    /// Existing Series IDs retain their generation's descriptor Arcs while draining.
     pub fn install_summary_catalog(
         &self,
         catalog: Arc<asap_types::summary_catalog::SummaryCatalog>,
@@ -751,11 +751,11 @@ impl SketchStore {
     /// caller passes [`PolicyFingerprint::UNSET`]. The order of the
     /// returned slice is sorted (the underlying index is a `BTreeSet`)
     /// so callers can hash / compare it deterministically.
-    pub fn sids_for_policy(&self, policy_fp: PolicyFingerprint) -> Vec<u64> {
+    pub fn series_ids_for_policy(&self, policy_fp: PolicyFingerprint) -> Vec<u64> {
         if policy_fp.is_unset() {
             return Vec::new();
         }
-        self.policy_to_sids
+        self.policy_to_series_ids
             .read()
             .unwrap()
             .get(&policy_fp)
@@ -767,7 +767,7 @@ impl SketchStore {
     /// least one sid. Useful for telemetry / `/runtime` introspection
     /// (mirrors the legacy "active aggregation count" metric).
     pub fn policy_count(&self) -> usize {
-        self.policy_to_sids.read().unwrap().len()
+        self.policy_to_series_ids.read().unwrap().len()
     }
 
     /// Look up the metadata for a sid (cloned because callers usually
@@ -780,8 +780,8 @@ impl SketchStore {
             .map(|instance| Arc::clone(&instance.metadata))
     }
 
-    /// Shared SDS descriptors bound to a materialized SID.
-    pub fn descriptors_for_sid(
+    /// Shared SDS descriptors bound to a materialized SeriesId.
+    pub fn descriptors_for_series_id(
         &self,
         sid: u64,
     ) -> Option<(Arc<SummaryDescriptor>, Arc<DataDescriptor>)> {
@@ -1824,7 +1824,7 @@ impl SketchStore {
         // `Box<dyn AggregateCore>` from `payload.as_sketch()`),
         // OR routing `handle_query` through the newer
         // `ASAPQueryEngine::execute(&str)` trait path which uses
-        // `idx.sids_for_policy(fp)` + reducer dispatch and
+        // `idx.series_ids_for_policy(fp)` + reducer dispatch and
         // already handles sketches natively.
         //
         // Diagnosed in the e2e test arc (#247 → #248 → #249 →
@@ -1910,7 +1910,7 @@ impl SketchStore {
     /// (one write per first-seen sid), so taking the lock per query is
     /// inexpensive.
     ///
-    /// P2-2: uses the `metric_to_sids` secondary index for a keyed
+    /// P2-2: uses the `metric_to_series_ids` secondary index for a keyed
     /// lookup of the candidate sids for `metric_name` instead of an O(N)
     /// full scan of `instances`; only that metric's (typically small)
     /// sid set is then filtered on the `group_by_keys` superset test.
@@ -1924,7 +1924,7 @@ impl SketchStore {
         metric_name: &str,
         required_keys: &BTreeSet<String>,
     ) -> Vec<u64> {
-        let metric_idx = self.metric_to_sids.read().unwrap();
+        let metric_idx = self.metric_to_series_ids.read().unwrap();
         let Some(candidate_sids) = metric_idx.get(metric_name) else {
             return Vec::new();
         };
@@ -2066,7 +2066,7 @@ impl SketchStore {
     pub fn approx_resident_bytes(&self) -> usize {
         let mut total = 0usize;
 
-        // 1. SID bindings, compatibility metadata, and shared SDS descriptors.
+        // 1. SeriesId bindings, compatibility metadata, and shared SDS descriptors.
         if let Ok(insts) = self.instances.read() {
             for m in insts.values() {
                 total += std::mem::size_of::<SketchInstanceMetadata>();
@@ -2223,7 +2223,7 @@ impl SketchStore {
     }
 
     /// Drop a sid's metadata + its series state + both secondary-index
-    /// entries (`policy_to_sids` and `metric_to_sids`). Mirrors
+    /// entries (`policy_to_series_ids` and `metric_to_series_ids`). Mirrors
     /// `SchemaRegistry::remove_schema` for the eviction path's
     /// post-data-drop cleanup. Returns the removed metadata, or `None`
     /// if the sid was absent.
@@ -2231,7 +2231,7 @@ impl SketchStore {
     /// ## Atomicity (P2-1)
     ///
     /// Takes all three index write guards together in the fixed order
-    /// `instances → policy_to_sids → metric_to_sids` so the removal is
+    /// `instances → policy_to_series_ids → metric_to_series_ids` so the removal is
     /// atomic with respect to a concurrent reader — the sid never
     /// lingers in a secondary index after it has left `instances`. The
     /// `series` DashMap is touched after the index guards are released
@@ -2239,10 +2239,10 @@ impl SketchStore {
     /// invariant).
     pub fn remove_instance(&self, sid: u64) -> Option<Arc<SketchInstanceMetadata>> {
         let removed = {
-            // Fixed lock order: instances → policy_to_sids → metric_to_sids.
+            // Fixed lock order: instances → policy_to_series_ids → metric_to_series_ids.
             let mut instances = self.instances.write().ok()?;
-            let mut policy_idx = self.policy_to_sids.write().unwrap();
-            let mut metric_idx = self.metric_to_sids.write().unwrap();
+            let mut policy_idx = self.policy_to_series_ids.write().unwrap();
+            let mut metric_idx = self.metric_to_series_ids.write().unwrap();
             let removed = instances.remove(&sid);
             if let Some(meta) = &removed {
                 if !meta.policy_fp.is_unset() {
@@ -2303,7 +2303,7 @@ impl SketchStore {
     /// an analogous `agg_id → ts` map; this is the SketchStore
     /// equivalent. HTTP server's `/api/v1/status/runtimeinfo` adapter
     /// surfaces it under the JSON field `earliest_timestamp_per_sid`.
-    pub fn earliest_timestamps_per_sid(&self) -> std::collections::HashMap<u64, u64> {
+    pub fn earliest_timestamps_per_series_id(&self) -> std::collections::HashMap<u64, u64> {
         let g = self.instances.read().unwrap();
         g.iter()
             .map(|(sid, m)| (*sid, m.first_seen_unix_ms.max(0) as u64))
@@ -2336,7 +2336,7 @@ impl SketchStore {
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
         // B7.7 — this wrapper now derives the sid via `mint_sid` and
-        // delegates to `ingest_precompute_with_sid`. Callers that
+        // delegates to `ingest_precompute_with_series_id`. Callers that
         // already hold the bucket sid (B7.6's worker passes it on the
         // `WorkerMessage`; B7.7's backfill processor groups raw
         // samples by sid up-front) skip the resolver round-trip by
@@ -2345,7 +2345,7 @@ impl SketchStore {
         let agg_kind_canonical =
             crate::storage_engines::sketch_db::data::materialization_kind_for_config(agg_cfg);
         let sid = mint_sid(&agg_cfg.metric, &attrs_fp, &agg_kind_canonical);
-        self.ingest_precompute_with_sid(sid, agg_cfg, output, accumulator)
+        self.ingest_precompute_with_series_id(sid, agg_cfg, output, accumulator)
     }
 
     /// B7.7 sid-direct sibling of [`Self::ingest_precompute_for_agg_config`].
@@ -2362,7 +2362,7 @@ impl SketchStore {
     /// The §6.3 ingest barrier (`Retired` / `Expired` sids reject
     /// writes) and first-sight metadata registration are identical to
     /// the mint-driven path.
-    pub fn ingest_precompute_with_sid(
+    pub fn ingest_precompute_with_series_id(
         &self,
         sid: u64,
         agg_cfg: &asap_types::aggregation_config::AggregationConfig,
@@ -2934,8 +2934,8 @@ mod tests {
         let second_lookup = store.instance(1).unwrap();
         assert!(Arc::ptr_eq(&first_lookup, &second_lookup));
 
-        let (summary_a, data_a) = store.descriptors_for_sid(1).unwrap();
-        let (summary_b, data_b) = store.descriptors_for_sid(2).unwrap();
+        let (summary_a, data_a) = store.descriptors_for_series_id(1).unwrap();
+        let (summary_b, data_b) = store.descriptors_for_series_id(2).unwrap();
         assert!(Arc::ptr_eq(&summary_a, &summary_b));
         assert!(Arc::ptr_eq(&data_a, &data_b));
         assert_eq!(store.descriptor_counts(), (1, 1));
@@ -3049,8 +3049,8 @@ mod tests {
     fn ghost_classification() {
         let idx = SketchStore::new();
         idx.register(meta(42));
-        assert_eq!(idx.classify(42), SidLookup::Ghost);
-        assert_eq!(idx.classify(999), SidLookup::Unknown);
+        assert_eq!(idx.classify(42), SeriesLookup::Ghost);
+        assert_eq!(idx.classify(999), SeriesLookup::Unknown);
     }
 
     #[test]
@@ -3058,7 +3058,7 @@ mod tests {
         let idx = SketchStore::new();
         idx.register(meta(7));
         idx.append_sample(7, BTreeMap::new(), (1000, 1010), sample(1));
-        assert_eq!(idx.classify(7), SidLookup::Hit);
+        assert_eq!(idx.classify(7), SeriesLookup::Hit);
     }
 
     #[test]
@@ -3444,10 +3444,10 @@ mod tests {
         let idx = SketchStore::new();
         idx.register(meta(1));
         idx.append_sample(1, BTreeMap::new(), (0, 10), sample(1));
-        assert_eq!(idx.classify(1), SidLookup::Hit);
+        assert_eq!(idx.classify(1), SeriesLookup::Hit);
         let removed = idx.remove_instance(1).expect("sid known");
         assert_eq!(removed.sid, 1);
-        assert_eq!(idx.classify(1), SidLookup::Unknown);
+        assert_eq!(idx.classify(1), SeriesLookup::Unknown);
     }
 
     #[test]
@@ -3542,7 +3542,11 @@ mod tests {
             series.iter().all(|s| s.samples.is_empty()),
             "precompute payloads must not surface as sketch results"
         );
-        assert_eq!(idx.classify(42), SidLookup::Hit, "storage has data — Hit");
+        assert_eq!(
+            idx.classify(42),
+            SeriesLookup::Hit,
+            "storage has data — Hit"
+        );
     }
 
     #[test]
@@ -3716,16 +3720,16 @@ mod tests {
     // ── policy_fp reverse-index tests ────────────────────────────────
 
     #[test]
-    fn sids_for_policy_returns_empty_for_unset_or_missing() {
+    fn series_ids_for_policy_returns_empty_for_unset_or_missing() {
         let idx = SketchStore::new();
         // Empty store → nothing for any fp.
         assert!(idx
-            .sids_for_policy(asap_types::PolicyFingerprint(42))
+            .series_ids_for_policy(asap_types::PolicyFingerprint(42))
             .is_empty());
         // The UNSET sentinel always returns empty regardless of state.
         idx.register(meta_with_policy(1, asap_types::PolicyFingerprint::UNSET));
         assert!(idx
-            .sids_for_policy(asap_types::PolicyFingerprint::UNSET)
+            .series_ids_for_policy(asap_types::PolicyFingerprint::UNSET)
             .is_empty());
     }
 
@@ -3734,7 +3738,7 @@ mod tests {
         let idx = SketchStore::new();
         let fp = asap_types::PolicyFingerprint(7);
         idx.register(meta_with_policy(1, fp));
-        assert_eq!(idx.sids_for_policy(fp), vec![1]);
+        assert_eq!(idx.series_ids_for_policy(fp), vec![1]);
         assert_eq!(idx.policy_count(), 1);
     }
 
@@ -3745,7 +3749,7 @@ mod tests {
         idx.register(meta_with_policy(1, fp));
         idx.register(meta_with_policy(2, fp));
         idx.register(meta_with_policy(3, fp));
-        let mut sids = idx.sids_for_policy(fp);
+        let mut sids = idx.series_ids_for_policy(fp);
         sids.sort();
         assert_eq!(sids, vec![1, 2, 3]);
         assert_eq!(idx.policy_count(), 1);
@@ -3759,8 +3763,8 @@ mod tests {
         idx.register(meta_with_policy(1, fp_a));
         idx.register(meta_with_policy(2, fp_b));
         idx.register(meta_with_policy(3, fp_a));
-        assert_eq!(idx.sids_for_policy(fp_a), vec![1, 3]);
-        assert_eq!(idx.sids_for_policy(fp_b), vec![2]);
+        assert_eq!(idx.series_ids_for_policy(fp_a), vec![1, 3]);
+        assert_eq!(idx.series_ids_for_policy(fp_b), vec![2]);
         assert_eq!(idx.policy_count(), 2);
     }
 
@@ -3771,7 +3775,7 @@ mod tests {
         idx.register(meta_with_policy(1, fp));
         // sid 2 has UNSET — should NOT show up under any fp.
         idx.register(meta_with_policy(2, asap_types::PolicyFingerprint::UNSET));
-        assert_eq!(idx.sids_for_policy(fp), vec![1]);
+        assert_eq!(idx.series_ids_for_policy(fp), vec![1]);
         assert_eq!(idx.policy_count(), 1);
         // But it IS still in the main `instances` map.
         assert!(idx.instance(2).is_some());
@@ -3784,15 +3788,15 @@ mod tests {
         idx.register(meta_with_policy(1, fp));
         idx.register(meta_with_policy(2, fp));
         idx.remove_instance(1);
-        assert_eq!(idx.sids_for_policy(fp), vec![2]);
+        assert_eq!(idx.series_ids_for_policy(fp), vec![2]);
         assert_eq!(idx.policy_count(), 1);
         idx.remove_instance(2);
-        assert!(idx.sids_for_policy(fp).is_empty());
+        assert!(idx.series_ids_for_policy(fp).is_empty());
         // Empty entry collapses — policy_count drops to 0.
         assert_eq!(idx.policy_count(), 0);
     }
 
-    // ── metric_to_sids secondary-index tests (P2-2) ──────────────────
+    // ── metric_to_series_ids secondary-index tests (P2-2) ──────────────────
 
     /// Metadata with a chosen metric name + group-by key set, so the
     /// secondary-index tests can register several metrics/keys.
@@ -3887,7 +3891,7 @@ mod tests {
 
         let from_instances: BTreeSet<u64> = idx.instances.read().unwrap().keys().copied().collect();
         let from_metric_idx: BTreeSet<u64> = idx
-            .metric_to_sids
+            .metric_to_series_ids
             .read()
             .unwrap()
             .values()
@@ -3895,7 +3899,7 @@ mod tests {
             .collect();
         assert_eq!(
             from_instances, from_metric_idx,
-            "metric_to_sids union must equal the instances key set (P2-1 invariant)"
+            "metric_to_series_ids union must equal the instances key set (P2-1 invariant)"
         );
         // And the cleared metric key must be gone, not lingering empty.
         assert_eq!(

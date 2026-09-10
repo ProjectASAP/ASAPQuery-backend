@@ -259,7 +259,7 @@ impl OutputSink for NoopOutputSink {
 mod tests {
     use super::*;
     use crate::precompute_engine::operators::{DDSketchAccumulator, SumAccumulator};
-    use crate::storage_engines::sketch_db::index::{AggKind, SidLookup};
+    use crate::storage_engines::sketch_db::index::{AggKind, SeriesLookup};
     use crate::storage_engines::types::{KeyByLabelValues, StreamingConfig};
     use asap_types::aggregation_config::AggregationConfig;
     use asap_types::enums::WindowKind;
@@ -328,7 +328,7 @@ mod tests {
         assert_eq!(instances.len(), 1);
         let meta = instances[0].clone();
         let sid = meta.sid;
-        assert_eq!(sketch_index.classify(sid), SidLookup::Hit);
+        assert_eq!(sketch_index.classify(sid), SeriesLookup::Hit);
         assert!(
             matches!(
                 meta.agg_kind,

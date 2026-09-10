@@ -1973,7 +1973,7 @@ mod asap_tier_classify_tests {
         let engine = build_engine_with_index(idx);
         // The query asks for grouping=[zone] (subset of registered
         // group_by_keys). Pre-fix this returned CapabilityMiss because
-        // `sids_for_policy(UNSET)` is empty; post-fix the fallback
+        // `series_ids_for_policy(UNSET)` is empty; post-fix the fallback
         // finds sid 42 via `instances_matching` and the request
         // proceeds to the reducer.
         let result = engine
@@ -2380,7 +2380,7 @@ mod asap_tier_classify_tests {
         // The sid must classify as Hit (in-memory unsealed state counts).
         assert_eq!(
             idx.classify(sid),
-            crate::storage_engines::sketch_db::index::SidLookup::Hit,
+            crate::storage_engines::sketch_db::index::SeriesLookup::Hit,
             "KLL sid with appended in-memory state must classify Hit"
         );
 

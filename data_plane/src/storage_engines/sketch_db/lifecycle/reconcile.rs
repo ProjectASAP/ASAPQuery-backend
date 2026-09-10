@@ -482,7 +482,7 @@ mod tests {
         assert!(
             matches!(
                 store.classify(1),
-                crate::storage_engines::sketch_db::index::SidLookup::Ghost
+                crate::storage_engines::sketch_db::index::SeriesLookup::Ghost
             ),
             "sketch sid 1 stays registered + Active (Ghost only because no data appended in-test)"
         );
