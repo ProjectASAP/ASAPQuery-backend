@@ -49,16 +49,12 @@ struct Args {
 enum Family {
     Cms,
     CountSketch,
-    Bloom,
-    CountingBloom,
 }
 impl Family {
     fn name(self) -> &'static str {
         match self {
             Self::Cms => "cms",
             Self::CountSketch => "count_sketch",
-            Self::Bloom => "bloom",
-            Self::CountingBloom => "counting_bloom",
         }
     }
 }
@@ -79,8 +75,7 @@ impl Config {
     fn legal(self) -> bool {
         // CMS selects Packed64/128/Rows automatically; portable CountSketch
         // hardcodes Packed64 and needs room for every column/sign bit.
-        !matches!(self.family, Family::CountSketch)
-            || self.depth * (self.width.ilog2() as usize + 1) <= 64
+        self.family == Family::Cms || self.depth * (self.width.ilog2() as usize + 1) <= 64
     }
 }
 
@@ -104,45 +99,6 @@ fn candidate_grid(families: &[Family], budget: usize) -> Vec<Config> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
-}
-
-/// Minimal Rust Bloom implementations for the paper's distinct operator.
-/// They intentionally expose the same width/depth parameter grid as the
-/// frequency sketches; the benchmark task reports membership false positives.
-#[derive(Clone)]
-struct Bloom {
-    bits: Vec<u8>,
-    counters: bool,
-    depth: usize,
-}
-impl Bloom {
-    fn new(width: usize, depth: usize, counters: bool) -> Self {
-        Self {
-            bits: vec![0; width],
-            counters,
-            depth,
-        }
-    }
-    fn index(&self, key: &str, row: usize) -> usize {
-        let mut h = 1469598103934665603_u64 ^ row as u64;
-        for byte in key.bytes() {
-            h = (h ^ byte as u64).wrapping_mul(1099511628211);
-        }
-        (h as usize) % self.bits.len()
-    }
-    fn insert(&mut self, key: &str) {
-        for row in 0..self.depth {
-            let i = self.index(key, row);
-            self.bits[i] = if self.counters {
-                self.bits[i].saturating_add(1)
-            } else {
-                1
-            };
-        }
-    }
-    fn contains(&self, key: &str) -> bool {
-        (0..self.depth).all(|row| self.bits[self.index(key, row)] != 0)
-    }
 }
 
 // Small deterministic PRNG for workload sampling and LHS permutations. CMS
@@ -199,19 +155,11 @@ fn measure(config: Config, data: &[usize], keys: &[String]) -> Measurement {
         (config.family == Family::Cms).then(|| CountMinSketch::new(config.depth, config.width));
     let mut cs = (config.family == Family::CountSketch)
         .then(|| CountSketch::new(config.depth, config.width));
-    let mut bloom = matches!(config.family, Family::Bloom | Family::CountingBloom).then(|| {
-        Bloom::new(
-            config.width,
-            config.depth,
-            config.family == Family::CountingBloom,
-        )
-    });
     let started = Instant::now();
     for &key in data {
-        match (&mut cms, &mut cs, &mut bloom) {
-            (Some(sketch), _, _) => sketch.update(&keys[key], 1.0),
-            (_, Some(sketch), _) => sketch.update(&keys[key], 1.0),
-            (_, _, Some(sketch)) => sketch.insert(&keys[key]),
+        match (&mut cms, &mut cs) {
+            (Some(sketch), _) => sketch.update(&keys[key], 1.0),
+            (_, Some(sketch)) => sketch.update(&keys[key], 1.0),
             _ => unreachable!(),
         }
     }
@@ -219,16 +167,9 @@ fn measure(config: Config, data: &[usize], keys: &[String]) -> Measurement {
     let started = Instant::now();
     let estimates: Vec<_> = keys
         .iter()
-        .map(|key| match (&cms, &cs, &bloom) {
-            (Some(sketch), _, _) => sketch.estimate(key),
-            (_, Some(sketch), _) => sketch.estimate(key),
-            (_, _, Some(sketch)) => {
-                if sketch.contains(key) {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
+        .map(|key| match (&cms, &cs) {
+            (Some(sketch), _) => sketch.estimate(key),
+            (_, Some(sketch)) => sketch.estimate(key),
             _ => unreachable!(),
         })
         .collect();
@@ -238,11 +179,7 @@ fn measure(config: Config, data: &[usize], keys: &[String]) -> Measurement {
         .zip(exact)
         .map(|(estimate, truth)| {
             assert!(estimate.is_finite());
-            if matches!(config.family, Family::Bloom | Family::CountingBloom) {
-                (estimate - f64::from(truth > 0)).abs()
-            } else {
-                (estimate - truth as f64).abs() / data.len() as f64
-            }
+            (estimate - truth as f64).abs() / data.len() as f64
         })
         .fold(0.0_f64, f64::max);
     Measurement {
@@ -421,12 +358,7 @@ fn erp_select(
     let request = ErpSelectionRequest {
         distribution,
         implementation: Some("asap_sketchlib-portable".into()),
-        allowed_sketches: vec![
-            "cms".into(),
-            "count_sketch".into(),
-            "bloom".into(),
-            "counting_bloom".into(),
-        ],
+        allowed_sketches: vec!["cms".into(), "count_sketch".into()],
         error_metric: "max_normalized_additive_error".into(),
         max_error: epsilon,
         min_trials: 1,
