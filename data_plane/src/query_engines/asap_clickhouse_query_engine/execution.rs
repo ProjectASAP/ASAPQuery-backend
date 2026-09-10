@@ -12,7 +12,9 @@ use crate::{
 use asap_types::summary_catalog::SummaryCatalog;
 use control_plane::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use planner_types::post_asap::ValueOperation;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub type PreparedExternalLeaves = BTreeMap<QueryNodeId, ClickHouseRelation>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClickHouseDagFallback {
@@ -53,11 +55,31 @@ fn execute_relation_subtree(
     entry: &QueryPlanEntry,
     root: QueryNodeId,
     expected_schema: &planner_types::post_asap::SummarySchema,
+    prepared: &PreparedExternalLeaves,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
 ) -> Result<ClickHouseRelation, String> {
     match entry.nodes.get(&root) {
+        Some(QueryPlanNode::ExternalExact { request, .. }) => {
+            if request.language != asap_types::QueryLanguage::ClickHouseSql {
+                return Err("ClickHouse DAG contains an external leaf for another language".into());
+            }
+            let control_plane::query_plan::ExternalExactOutput::Relation { schema } =
+                &request.output
+            else {
+                return Err("ClickHouse external leaf must declare relation output".into());
+            };
+            let declared: planner_types::post_asap::SummarySchema =
+                serde_json::from_value(schema.clone()).map_err(|error| error.to_string())?;
+            if &declared != expected_schema {
+                return Err("external exact leaf schema differs from its parent edge".into());
+            }
+            prepared
+                .get(&root)
+                .cloned()
+                .ok_or_else(|| "published external exact leaf was not prepared".into())
+        }
         Some(QueryPlanNode::Relational {
             input,
             operation,
@@ -69,6 +91,7 @@ fn execute_relation_subtree(
                 entry,
                 *input,
                 input_schema,
+                prepared,
                 t0_ms,
                 t1_ms,
                 is_cumulative,
@@ -91,6 +114,7 @@ fn execute_relation_subtree(
                 entry,
                 inputs[0],
                 left_schema,
+                prepared,
                 t0_ms,
                 t1_ms,
                 is_cumulative,
@@ -100,6 +124,7 @@ fn execute_relation_subtree(
                 entry,
                 inputs[1],
                 right_schema,
+                prepared,
                 t0_ms,
                 t1_ms,
                 is_cumulative,
@@ -186,6 +211,26 @@ pub fn execute_sql_dag(
     t1_ms: u64,
     is_cumulative: bool,
 ) -> ClickHouseDagOutcome {
+    execute_sql_dag_with_external(
+        index,
+        entry,
+        sds,
+        &PreparedExternalLeaves::new(),
+        t0_ms,
+        t1_ms,
+        is_cumulative,
+    )
+}
+
+pub fn execute_sql_dag_with_external(
+    index: &SketchStore,
+    entry: &QueryPlanEntry,
+    sds: &SummaryCatalog,
+    prepared: &PreparedExternalLeaves,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+) -> ClickHouseDagOutcome {
     if let Err(error) = validate_payload(Some(sds), entry, sds.plan_id, sds.plan_version) {
         return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
             error.to_string(),
@@ -195,14 +240,31 @@ pub fn execute_sql_dag(
         ids.iter().any(|id| {
             matches!(
                 entry.nodes.get(id),
-                Some(QueryPlanNode::RelationalJoin { .. })
+                Some(QueryPlanNode::RelationalJoin { .. } | QueryPlanNode::ExternalExact { .. })
             )
         })
     });
     if has_relational_join {
         let root_schema = match entry.nodes.get(&entry.root) {
             Some(QueryPlanNode::Relational { output_schema, .. })
-            | Some(QueryPlanNode::RelationalJoin { output_schema, .. }) => output_schema,
+            | Some(QueryPlanNode::RelationalJoin { output_schema, .. }) => output_schema.clone(),
+            Some(QueryPlanNode::ExternalExact { request, .. }) => {
+                let control_plane::query_plan::ExternalExactOutput::Relation { schema } =
+                    &request.output
+                else {
+                    return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
+                        "ClickHouse external root must declare relation output".into(),
+                    ));
+                };
+                match serde_json::from_value(schema.clone()) {
+                    Ok(schema) => schema,
+                    Err(error) => {
+                        return ClickHouseDagOutcome::Fallback(
+                            ClickHouseDagFallback::UnsupportedPlan(error.to_string()),
+                        )
+                    }
+                }
+            }
             _ => {
                 return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
                     "relational join plan root has no relation schema".into(),
@@ -213,7 +275,8 @@ pub fn execute_sql_dag(
             index,
             entry,
             entry.root,
-            root_schema,
+            &root_schema,
+            prepared,
             t0_ms,
             t1_ms,
             is_cumulative,

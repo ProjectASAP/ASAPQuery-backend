@@ -278,6 +278,46 @@ pub struct InstantExecution {
 }
 
 impl QueryPlanEntry {
+    /// Replace an explicit planner fallback cut with a typed external-exact leaf.
+    /// The control plane chooses the cut; serving only executes the published DAG.
+    pub fn bind_external_exact_leaf(
+        &mut self,
+        node_id: QueryNodeId,
+        request: ExternalExactRequest,
+    ) -> Result<(), QueryPlanError> {
+        if request.language != self.language {
+            return Err(QueryPlanError::Invalid(
+                "external exact language differs from its query plan".into(),
+            ));
+        }
+        if !request.input_contracts.is_empty() {
+            return Err(QueryPlanError::Invalid(
+                "leaf binding cannot declare DAG input contracts".into(),
+            ));
+        }
+        match self.nodes.get(&node_id) {
+            Some(QueryPlanNode::ExactFallback { .. }) => {}
+            Some(_) => {
+                return Err(QueryPlanError::Invalid(
+                    "external exact binding must replace a planner fallback cut".into(),
+                ))
+            }
+            None => {
+                return Err(QueryPlanError::Invalid(
+                    "external exact cut node is absent".into(),
+                ))
+            }
+        }
+        self.nodes.insert(
+            node_id,
+            QueryPlanNode::ExternalExact {
+                request,
+                inputs: Vec::new(),
+            },
+        );
+        Ok(())
+    }
+
     /// Materializations this executable DAG reads, in stable node order.
     /// Serving uses this set for readiness accounting; it never performs a
     /// catalog candidate search to reconstruct dependencies.
@@ -629,6 +669,14 @@ pub struct ExternalExactRequest {
     pub language: QueryLanguage,
     pub expression: String,
     pub output: ExternalExactOutput,
+    /// Engine parameters forwarded without embedding transport details in the DAG.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: BTreeMap<String, String>,
+    /// Optional parameter names populated from the query entry's evaluation range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_parameter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_parameter: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_contracts: Vec<ExternalExactInput>,
 }
@@ -1128,6 +1176,9 @@ where
                                 language: QueryLanguage::PromQl,
                                 expression: aggregate.expr.to_string(),
                                 output: ExternalExactOutput::InstantVector,
+                                parameters: BTreeMap::new(),
+                                start_parameter: None,
+                                end_parameter: None,
                                 input_contracts: vec![ExternalExactInput::CandidateMembership {
                                     item_label,
                                 }],
