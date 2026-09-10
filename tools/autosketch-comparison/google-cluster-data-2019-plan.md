@@ -1,5 +1,9 @@
 # Google ClusterData 2019 evaluation plan
 
+The first frequency/window experiment has now been executed. See the
+[real-data results](google-cluster-data-2019-results.md), including failed
+configuration points, raw JSON, and the Exact result.
+
 ## Status and reproducibility
 
 The first official data shard has been downloaded and verified at

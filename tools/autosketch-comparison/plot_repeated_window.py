@@ -29,7 +29,7 @@ def main():
     parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="600" viewBox="0 0 1080 600">',
              '<rect width="100%" height="100%" fill="white"/>',
              '<style>text{font-family:system-ui,sans-serif;fill:#253047}.title{font-size:19px;font-weight:700}.axis{font-size:11px}.value{font-size:11px;font-weight:600}</style>',
-             '<text x="540" y="30" text-anchor="middle" class="title">Repeated-window comparison — median of 7 executed release trials</text>']
+             f'<text x="540" y="30" text-anchor="middle" class="title">Repeated-window comparison — median of {len(report["trials"])} executed release trials</text>']
     for panel, (title, field, scale) in enumerate(panels):
         x0, y0 = 55 + (panel % 2) * 530, 65 + (panel // 2) * 265
         chart_h, chart_w = 170, 455

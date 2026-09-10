@@ -1,0 +1,160 @@
+{
+  "adaptation": "AutoSketch is deployed independently per recurring query; ASAP-NoSharing intentionally has the same physical plan and isolates configuration; ASAP-Full shares one minute panes",
+  "args": {
+    "backend_revision": "37120510d73f40e5a202b2cdff14f4abeb7e55bf",
+    "cardinality": 44806,
+    "depth": 4,
+    "events_per_pane": 2000,
+    "input_tsv": "/mydata/google-cluster-asap-eval-20260910/replay.tsv",
+    "output": "/mydata/google-cluster-asap-eval-20260910/results-w256.json",
+    "pane_seconds": 300,
+    "panes": 8929,
+    "query_repetitions": 3,
+    "seed": 42,
+    "trials": 3,
+    "width": 256,
+    "window_panes": [
+      1,
+      3,
+      12,
+      72,
+      288
+    ]
+  },
+  "memory_metric": "logical retained payload; CMS counters or raw usize keys; excludes allocator overhead",
+  "pane_seconds": 300,
+  "schema_version": 1,
+  "timing_metric": "wall seconds; methods execute sequentially and are not CPU profiles",
+  "trials": [
+    {
+      "methods": [
+        {
+          "logical_payload_bytes": 3080192,
+          "maintenance_updates": 3131685,
+          "max_normalized_additive_error": 0.011494252873563218,
+          "method": "autosketch_per_query",
+          "query_wall_seconds": 6.730288648,
+          "retained_sketches": 376,
+          "update_wall_seconds": 1.079394527
+        },
+        {
+          "logical_payload_bytes": 3080192,
+          "maintenance_updates": 3131685,
+          "max_normalized_additive_error": 0.011494252873563218,
+          "method": "asap_no_sharing",
+          "query_wall_seconds": 6.721295625,
+          "retained_sketches": 376,
+          "update_wall_seconds": 1.08312948
+        },
+        {
+          "logical_payload_bytes": 2359296,
+          "maintenance_updates": 626337,
+          "max_normalized_additive_error": 0.011494252873563218,
+          "method": "asap_full_shared",
+          "query_wall_seconds": 6.715673332,
+          "retained_sketches": 288,
+          "update_wall_seconds": 0.217204958
+        },
+        {
+          "logical_payload_bytes": 169336,
+          "maintenance_updates": 626337,
+          "max_normalized_additive_error": 0.0,
+          "method": "exact_raw",
+          "query_wall_seconds": 0.00030232,
+          "retained_sketches": 0,
+          "update_wall_seconds": 0.000057776
+        }
+      ],
+      "trial": 0
+    },
+    {
+      "methods": [
+        {
+          "logical_payload_bytes": 3080192,
+          "maintenance_updates": 3131685,
+          "max_normalized_additive_error": 0.011494252873563218,
+          "method": "autosketch_per_query",
+          "query_wall_seconds": 6.714486171,
+          "retained_sketches": 376,
+          "update_wall_seconds": 1.080262839
+        },
+        {
+          "logical_payload_bytes": 3080192,
+          "maintenance_updates": 3131685,
+          "max_normalized_additive_error": 0.011494252873563218,
+          "method": "asap_no_sharing",
+          "query_wall_seconds": 6.706765113,
+          "retained_sketches": 376,
+          "update_wall_seconds": 1.078079812
+        },
+        {
+          "logical_payload_bytes": 2359296,
+          "maintenance_updates": 626337,
+          "max_normalized_additive_error": 0.011494252873563218,
+          "method": "asap_full_shared",
+          "query_wall_seconds": 6.716763378,
+          "retained_sketches": 288,
+          "update_wall_seconds": 0.215893698
+        },
+        {
+          "logical_payload_bytes": 169336,
+          "maintenance_updates": 626337,
+          "max_normalized_additive_error": 0.0,
+          "method": "exact_raw",
+          "query_wall_seconds": 0.000282012,
+          "retained_sketches": 0,
+          "update_wall_seconds": 0.000056425
+        }
+      ],
+      "trial": 1
+    },
+    {
+      "methods": [
+        {
+          "logical_payload_bytes": 3080192,
+          "maintenance_updates": 3131685,
+          "max_normalized_additive_error": 0.011494252873563218,
+          "method": "autosketch_per_query",
+          "query_wall_seconds": 6.723760437,
+          "retained_sketches": 376,
+          "update_wall_seconds": 1.077614055
+        },
+        {
+          "logical_payload_bytes": 3080192,
+          "maintenance_updates": 3131685,
+          "max_normalized_additive_error": 0.011494252873563218,
+          "method": "asap_no_sharing",
+          "query_wall_seconds": 6.720946545,
+          "retained_sketches": 376,
+          "update_wall_seconds": 1.079808675
+        },
+        {
+          "logical_payload_bytes": 2359296,
+          "maintenance_updates": 626337,
+          "max_normalized_additive_error": 0.011494252873563218,
+          "method": "asap_full_shared",
+          "query_wall_seconds": 6.713714126,
+          "retained_sketches": 288,
+          "update_wall_seconds": 0.216501828
+        },
+        {
+          "logical_payload_bytes": 169336,
+          "maintenance_updates": 626337,
+          "max_normalized_additive_error": 0.0,
+          "method": "exact_raw",
+          "query_wall_seconds": 0.000280613,
+          "retained_sketches": 0,
+          "update_wall_seconds": 0.000058384
+        }
+      ],
+      "trial": 2
+    }
+  ],
+  "windows_minutes": [
+    5,
+    15,
+    60,
+    360,
+    1440
+  ]
+}

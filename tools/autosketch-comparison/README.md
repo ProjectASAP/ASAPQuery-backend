@@ -109,6 +109,9 @@ The next real-data stage uses an official Google ClusterData 2019
 `instance_usage` Parquet shard. See the [dataset manifest and evaluation
 plan](google-cluster-data-2019-plan.md) for the downloaded object, exact schema
 mapping, workload, exclusions, metrics, and staged expansion policy.
+The [executed real-data report](google-cluster-data-2019-results.md) records the
+frequency configuration sweep and repeated-window comparison without treating
+the Exact loss or failed configurations as successes.
 
 ## Adaptation boundary
 
