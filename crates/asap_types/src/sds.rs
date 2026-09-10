@@ -986,7 +986,7 @@ mod tests {
     fn configured_identity_preserves_heap_hydra_and_subtype_and_excludes_population() {
         let yaml:serde_yaml::Value=serde_yaml::from_str("aggregationType: DDSketch\naggregationSubType: ''\nmetric: m\nlabels:\n  grouping: []\n  rollup: []\n  aggregated: []\nparameters:\n  relative_accuracy: 0.01\nwindowSize: 30\nwindowType: tumbling\nspatialFilter: ''\n").unwrap();
         let mut config =
-            PrecomputeMaterialization::from_yaml_data(&yaml, None, crate::QueryLanguage::promql)
+            PrecomputeMaterialization::from_yaml_data(&yaml, None, crate::QueryLanguage::PromQl)
                 .unwrap();
         assert!(matches!(
             SummaryDescriptor::from_config(&config).unwrap().fidelity,
@@ -1025,7 +1025,7 @@ mod tests {
         )
         .unwrap();
         let config =
-            PrecomputeMaterialization::from_yaml_data(&yaml, None, crate::QueryLanguage::promql)
+            PrecomputeMaterialization::from_yaml_data(&yaml, None, crate::QueryLanguage::PromQl)
                 .unwrap();
         assert!(matches!(
             SummaryDescriptor::from_config(&config).unwrap().fidelity,

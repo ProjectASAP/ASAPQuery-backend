@@ -417,7 +417,7 @@ mod tests {
     use crate::storage_engines::types::enums::{QueryLanguage, QueryProtocol};
 
     fn create_test_adapter() -> PrometheusHttpAdapter {
-        let config = AdapterConfig::new(QueryProtocol::PrometheusHttp, QueryLanguage::promql, None);
+        let config = AdapterConfig::new(QueryProtocol::PrometheusHttp, QueryLanguage::PromQl, None);
         PrometheusHttpAdapter::new(config)
     }
 
