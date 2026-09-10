@@ -1278,6 +1278,12 @@ pub fn materialization_candidate_keys(
                 visit(original, lhs, keys)?;
                 visit(original, rhs, keys)?;
             }
+            SummaryExpr::CandidateTopK {
+                candidates, values, ..
+            } => {
+                visit(original, candidates, keys)?;
+                visit(original, values, keys)?;
+            }
             SummaryExpr::ValueOperation { child, .. } => visit(original, child, keys)?,
             SummaryExpr::SummaryAgg { child, .. } => visit(original, child, keys)?,
             SummaryExpr::SummaryEstimate { summary_input, .. }

@@ -422,14 +422,13 @@ fn candidate_topk(
     let selected = topk_selection(k, grouping, matched);
     let warning = match completeness {
         CandidateCompleteness::Certified { .. } => None,
-        CandidateCompleteness::BestEffort { reason } => Some(format!(
-            "ASAP TopK candidate membership is approximate: {reason}"
-        )),
-        CandidateCompleteness::ExactFallback { reason } => {
-            return Err(miss(format!(
-                "TopK candidate completeness is not guaranteed: {reason}"
-            )))
-        }
+        CandidateCompleteness::BestEffort { guarantee } => Some(match guarantee {
+            Some(guarantee) => format!(
+                "ASAP TopK candidate membership is approximate: {:?}",
+                guarantee.metric
+            ),
+            None => "ASAP TopK candidate membership is approximate and uncertified".into(),
+        }),
     };
     Ok((selected, warning))
 }
@@ -931,6 +930,16 @@ mod topk_tests {
         assert_eq!(stats.remote_branch_evaluations, 0);
     }
 
+    fn topk_membership_guarantee() -> planner_types::post_asap::ResultGuarantee {
+        use planner_types::post_asap::{BoundExpr, ErrorMetric, ProbabilityExpr, ResultGuarantee};
+        ResultGuarantee {
+            metric: ErrorMetric::TopKMembership,
+            bound: BoundExpr::Zero,
+            failure_probability: ProbabilityExpr::Constant { value: 0.01 },
+            provenance: vec![],
+        }
+    }
+
     #[test]
     fn candidate_sidecar_intersects_then_reranks_exact_values() {
         let candidates = vec![
@@ -951,8 +960,7 @@ mod topk_tests {
             candidates,
             exact,
             &CandidateCompleteness::Certified {
-                evidence_id: "membership-gap-1".into(),
-                max_failure_probability: 0.01,
+                guarantee: topk_membership_guarantee(),
             },
         )
         .unwrap();
@@ -998,8 +1006,7 @@ mod topk_tests {
                             without: false,
                         },
                         completeness: CandidateCompleteness::Certified {
-                            evidence_id: "gap-1".into(),
-                            max_failure_probability: 0.001,
+                            guarantee: topk_membership_guarantee(),
                         },
                     },
                 ),
@@ -1061,23 +1068,25 @@ mod topk_tests {
             },
             candidates.clone(),
             exact.clone(),
-            &CandidateCompleteness::BestEffort {
-                reason: "no membership gap certificate".into(),
-            },
+            &CandidateCompleteness::BestEffort { guarantee: None },
         )
         .unwrap();
         assert!(warning.unwrap().contains("approximate"));
+        // Exact queries never lower an uncertified CandidateTopK. The Planner
+        // emits its ordinary exact fallback instead; this runtime node is only
+        // valid for certified or explicitly approximate plans.
+        let certified = CandidateCompleteness::Certified {
+            guarantee: topk_membership_guarantee(),
+        };
         assert!(candidate_topk(
             1,
             &Grouping {
                 labels: vec![],
                 without: false
             },
-            candidates,
+            vec![(labels(&[("pod", "missing")]), 1.0)],
             exact,
-            &CandidateCompleteness::ExactFallback {
-                reason: "exact target".into()
-            },
+            &certified,
         )
         .is_err());
     }

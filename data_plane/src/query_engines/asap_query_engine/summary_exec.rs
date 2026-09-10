@@ -244,6 +244,11 @@ pub fn execute<E: SummaryExecutor>(
         }
 
         SummaryExpr::SummaryJoin { .. } => Err(ExecError::NotYetSupported("SummaryJoin")),
+        // CandidateTopK is lowered to the deployed QueryPlan DAG, where both
+        // row inputs retain labels for intersection and exact reranking. This
+        // legacy generic adapter exposes opaque GroupKey values and cannot
+        // implement that contract without losing label identity.
+        SummaryExpr::CandidateTopK { .. } => Err(ExecError::NotYetSupported("CandidateTopK")),
         SummaryExpr::BinaryOp { .. } => Err(ExecError::NotYetSupported("BinaryOp")),
         SummaryExpr::ValueOperation { .. } => Err(ExecError::NotYetSupported("ValueOperation")),
         SummaryExpr::SummarySubtract { .. } => Err(ExecError::NotYetSupported("SummarySubtract")),
