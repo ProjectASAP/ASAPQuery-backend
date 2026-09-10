@@ -263,7 +263,7 @@ pub struct PlanEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CollectorMaterialization {
     pub query_id: String,
-    pub materialization: asap_types::PolicyFingerprint,
+    pub materialization: asap_types::sds::SummaryDefinitionId,
     pub metric: String,
     pub algorithm: String,
     pub parameters: Value,
@@ -412,7 +412,7 @@ impl TryFrom<&SummaryFamilyType> for StateFamilyContract {
 pub struct StateSchemaContract {
     pub schema_id: String,
     pub schema_version: u32,
-    pub materialization: asap_types::PolicyFingerprint,
+    pub materialization: asap_types::sds::SummaryDefinitionId,
     pub family: StateFamilyContract,
     pub source: Source,
     pub value_column: planner_types::pre_asap::ColumnRef,
@@ -442,7 +442,7 @@ pub struct StateWindowContract {
 pub struct ProducerContract {
     pub producer_id: String,
     pub collector_id: String,
-    pub materialization: asap_types::PolicyFingerprint,
+    pub materialization: asap_types::sds::SummaryDefinitionId,
     pub schema_id: String,
 }
 
@@ -501,7 +501,7 @@ impl PrecomputePlan {
                 Ok(StateSchemaContract {
                     schema_id: state_schema_id(fingerprint),
                     schema_version: 1,
-                    materialization: fingerprint,
+                    materialization: fingerprint.into(),
                     family,
                     source,
                     value_column,
@@ -615,7 +615,7 @@ impl PrecomputePlan {
                     materialization.policy_fp_u64(),
                 ));
             }
-            if !materializations.insert(materialization.policy_fingerprint()) {
+            if !materializations.insert(materialization.policy_fingerprint().into()) {
                 return Err(PrecomputePlanError::DuplicateMaterialization(
                     materialization.policy_fp_u64(),
                 ));
@@ -650,13 +650,13 @@ impl PrecomputePlan {
             let materialization = self
                 .materializations
                 .iter()
-                .find(|candidate| candidate.policy_fingerprint() == schema.materialization)
+                .find(|candidate| candidate.policy_fingerprint() == schema.materialization.fingerprint())
                 .ok_or(PrecomputePlanError::SchemaSetMismatch)?;
             let accumulator = materialization
                 .accumulator_spec()
-                .map_err(|_| PrecomputePlanError::UnsupportedFamily(schema.materialization.0))?;
+                .map_err(|_| PrecomputePlanError::UnsupportedFamily(schema.materialization.as_u64()))?;
             let family = StateFamilyContract::try_from(&accumulator.family)
-                .map_err(|_| PrecomputePlanError::UnsupportedFamily(schema.materialization.0))?;
+                .map_err(|_| PrecomputePlanError::UnsupportedFamily(schema.materialization.as_u64()))?;
             let source = materialization.table_name.as_ref().map_or_else(
                 || Source::TimeSeries {
                     metric: materialization.metric.clone(),
@@ -670,7 +670,7 @@ impl PrecomputePlan {
                 .clone()
                 .map(planner_types::pre_asap::ColumnRef::Named)
                 .unwrap_or(planner_types::pre_asap::ColumnRef::SampleValue);
-            if schema.schema_id != state_schema_id(schema.materialization)
+            if schema.schema_id != state_schema_id(schema.materialization.fingerprint())
                 || schema.family != family
                 || schema.source != source
                 || schema.value_column != value_column
@@ -720,7 +720,7 @@ impl PrecomputePlan {
         }
         if self.ingest.require_registered_producer {
             if let Some(missing) = materializations.difference(&produced).next() {
-                return Err(PrecomputePlanError::MissingProducer(missing.0));
+                return Err(PrecomputePlanError::MissingProducer(missing.as_u64()));
             }
         }
         Ok(())
@@ -744,7 +744,7 @@ pub struct PhysicalPlan {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MaterializationLifecycleEstimate {
-    pub materialization: asap_types::PolicyFingerprint,
+    pub materialization: asap_types::sds::SummaryDefinitionId,
     pub consumer_query_ids: Vec<String>,
     pub window_implementation_id: String,
     pub horizon_seconds: f64,
@@ -778,7 +778,7 @@ pub struct FrameIdentityContract {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TransmissionRule {
-    pub materialization: asap_types::PolicyFingerprint,
+    pub materialization: asap_types::sds::SummaryDefinitionId,
     pub producer_id: String,
     pub schema_id: String,
     pub mode: TransmissionMode,
@@ -981,7 +981,7 @@ pub struct RuntimeRulePolicy {
 pub struct RuntimeAdaptationEvidence {
     pub plan_id: u64,
     pub plan_version: u64,
-    pub materialization: asap_types::PolicyFingerprint,
+    pub materialization: asap_types::sds::SummaryDefinitionId,
     pub producer_id: String,
     pub schema_id: String,
     pub producer_version: String,
@@ -1017,7 +1017,7 @@ pub struct SummaryFrameIdentity {
     pub plan_id: u64,
     pub plan_version: u64,
     pub backend_compat: String,
-    pub materialization: asap_types::PolicyFingerprint,
+    pub materialization: asap_types::sds::SummaryDefinitionId,
     /// Canonical producer-side identity for one concrete retained-label group.
     pub series_identity: String,
     pub schema_id: String,
@@ -1062,7 +1062,7 @@ pub enum TransmissionPlanError {
 fn validate_catalog_projection(
     reference: Option<&super::summary_catalog::SummaryCatalogReference>,
     envelope: &PlanEnvelope,
-    materializations: impl IntoIterator<Item = asap_types::PolicyFingerprint>,
+    materializations: impl IntoIterator<Item = asap_types::sds::SummaryDefinitionId>,
     catalog: &super::summary_catalog::SummaryCatalog,
 ) -> Result<(), TransmissionPlanError> {
     let expected = catalog
@@ -1079,11 +1079,11 @@ fn validate_catalog_projection(
     for id in materializations {
         if !catalog
             .materializations
-            .contains_key(&asap_types::sds::SummaryDefinitionId::from(id))
+            .contains_key(&id)
         {
             return Err(TransmissionPlanError::Catalog(format!(
                 "unknown materialization {}",
-                id.0
+                id.as_u64()
             )));
         }
     }
@@ -1143,10 +1143,10 @@ impl TransmissionPlan {
                 let materialization = precompute
                     .materializations
                     .iter()
-                    .find(|m| m.policy_fingerprint() == producer.materialization)
+                    .find(|m| m.policy_fingerprint() == producer.materialization.fingerprint())
                     .expect("validated PrecomputePlan materialization binding");
                 let runtime_policy = runtime_policies
-                    .get(&producer.materialization)
+                    .get(&producer.materialization.fingerprint())
                     .cloned()
                     .unwrap_or_default();
                 let mode = if runtime_policy.delta.is_some() {
@@ -2371,7 +2371,7 @@ impl PhysicalCompiler {
                 lifecycle_estimates
                     .entry(materialization)
                     .or_insert_with(|| MaterializationLifecycleEstimate {
-                        materialization,
+                        materialization: materialization.into(),
                         consumer_query_ids,
                         window_implementation_id: window_implementation.implementation_id.clone(),
                         horizon_seconds: query.lifecycle.horizon_seconds,
@@ -2414,7 +2414,7 @@ impl PhysicalCompiler {
                 compiled_materializations.push(runtime_materialization.clone());
                 let collector_materialization = CollectorMaterialization {
                     query_id: format!("state-{}", materialization.0),
-                    materialization,
+                    materialization: materialization.into(),
                     metric: metric.clone(),
                     algorithm: physical_algorithm,
                     parameters: selected.parameters,
@@ -5399,7 +5399,7 @@ mod tests {
         assert!(validate_catalog_projection(
             Some(&catalog.reference().unwrap()),
             &bundle.envelope,
-            [asap_types::PolicyFingerprint(u64::MAX)],
+            [asap_types::PolicyFingerprint(u64::MAX).into()],
             catalog
         )
         .is_err());

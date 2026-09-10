@@ -45,7 +45,7 @@ pub enum FrameLineageError {
 struct FrameLineageKey {
     plan_id: u64,
     plan_version: u64,
-    materialization: asap_types::PolicyFingerprint,
+    materialization: asap_types::sds::SummaryDefinitionId,
     series_identity: String,
     producer_id: String,
     producer_epoch: String,
@@ -199,7 +199,7 @@ mod tests {
             plan_id: 7,
             plan_version: 3,
             backend_compat: "asap-query-backend.v1".into(),
-            materialization: asap_types::PolicyFingerprint(41),
+            materialization: asap_types::PolicyFingerprint(41).into(),
             series_identity: "service=checkout,zone=a".into(),
             schema_id: "schema-41".into(),
             producer_id: "edge-a".into(),
