@@ -1,4 +1,6 @@
-use planner_types::post_asap::{ExecutableDag, ExecutableDagNode, ExecutionMode};
+use control_plane::physical::executable_binding::{BackendExecutableBinding, BackendNodeBinding};
+use planner_types::post_asap::PostAsapNodeId;
+use planner_types::post_asap::{ExecutableDag, ExecutableDagNode, ExecutionDataState};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -44,7 +46,8 @@ pub enum ScheduleError<OperatorError, SinkError> {
 /// materialization sinks are committed by their own lineage-keyed invocation.
 pub fn execute_precompute_sink<V, R, S>(
     dag: &ExecutableDag,
-    sink_node: u32,
+    binding: &BackendExecutableBinding,
+    sink_node: PostAsapNodeId,
     key: MaterializationCommitKey,
     registry: &R,
     sink: &S,
@@ -53,13 +56,19 @@ where
     R: PrecomputeOperatorRegistry<V>,
     S: IdempotentCommitSink<V>,
 {
-    if key.node_id != sink_node {
+    if key.node_id != sink_node.0 {
         return Err(ScheduleError::Invalid(format!(
-            "commit key node {} does not match sink {sink_node}",
-            key.node_id
+            "commit key node {} does not match sink {}",
+            key.node_id, sink_node.0
         )));
     }
-    if !dag.precompute_sinks.contains(&sink_node) {
+    binding.validate(dag).map_err(ScheduleError::Invalid)?;
+    if !binding.precompute_sinks.contains(&sink_node)
+        || !matches!(
+            binding.node(sink_node),
+            Some(BackendNodeBinding::Materialization { .. })
+        )
+    {
         return Err(ScheduleError::Invalid(
             "node is not a precompute sink".into(),
         ));
@@ -70,11 +79,14 @@ where
     let nodes = dag
         .nodes
         .iter()
-        .map(|n| (n.id, n))
+        .map(|n| (n.id.0, n))
         .collect::<BTreeMap<_, _>>();
     let mut inputs = BTreeMap::<u32, Vec<u32>>::new();
     for edge in &dag.edges {
-        inputs.entry(edge.consumer).or_default().push(edge.producer);
+        inputs
+            .entry(edge.consumer.0)
+            .or_default()
+            .push(edge.producer.0);
     }
     let mut active = BTreeSet::new();
     let mut values = BTreeMap::<u32, Arc<V>>::new();
@@ -98,7 +110,7 @@ where
         let node = nodes
             .get(&id)
             .ok_or_else(|| ScheduleError::Invalid(format!("missing node {id}")))?;
-        if node.mode != ExecutionMode::Precompute {
+        if node.output_state == ExecutionDataState::READ_ROWS {
             return Err(ScheduleError::Invalid(format!(
                 "query-time node {id} in precompute dependency path"
             )));
@@ -119,14 +131,14 @@ where
         Ok(())
     }
     visit(
-        sink_node,
+        sink_node.0,
         &nodes,
         &inputs,
         &mut active,
         &mut values,
         registry,
     )?;
-    sink.commit_if_absent(key, values.remove(&sink_node).unwrap())
+    sink.commit_if_absent(key, values.remove(&sink_node.0).unwrap())
         .map_err(ScheduleError::Sink)
 }
 
@@ -140,12 +152,36 @@ mod tests {
     };
     use std::sync::Mutex;
 
+    fn binding() -> BackendExecutableBinding {
+        BackendExecutableBinding {
+            nodes: (0..4)
+                .map(|id| {
+                    (
+                        PostAsapNodeId(id),
+                        BackendNodeBinding::Materialization {
+                            summary_definition: asap_types::PolicyFingerprint(u64::from(id) + 1)
+                                .into(),
+                        },
+                    )
+                })
+                .chain([(
+                    PostAsapNodeId(4),
+                    BackendNodeBinding::Query {
+                        query_node: control_plane::query_plan::QueryNodeId(9),
+                    },
+                )])
+                .collect(),
+            query_sink: PostAsapNodeId(4),
+            precompute_sinks: vec![PostAsapNodeId(3)],
+        }
+    }
+
     fn node(id: u32) -> ExecutableDagNode {
         ExecutableDagNode {
-            id,
+            id: PostAsapNodeId(id),
             operator: ExecutableOperator::SummarySubtract,
             payload: ExecutableOperatorPayload::SummarySubtract,
-            mode: ExecutionMode::Precompute,
+            output_state: ExecutionDataState::MAINTENANCE_SUMMARY,
             output_schema: SummarySchema {
                 fields: Vec::new(),
                 time_index: None,
@@ -156,8 +192,8 @@ mod tests {
 
     fn edge(producer: u32, consumer: u32) -> ExecutableDagEdge {
         ExecutableDagEdge {
-            producer,
-            consumer,
+            producer: PostAsapNodeId(producer),
+            consumer: PostAsapNodeId(consumer),
             role: EdgeRole::Input,
             intermediate_schema: SummarySchema {
                 fields: Vec::new(),
@@ -180,8 +216,8 @@ mod tests {
             node: &ExecutableDagNode,
             inputs: &[Arc<u32>],
         ) -> Result<u32, Self::Error> {
-            *self.0.lock().unwrap().entry(node.id).or_default() += 1;
-            Ok(node.id + inputs.iter().map(|v| **v).sum::<u32>())
+            *self.0.lock().unwrap().entry(node.id.0).or_default() += 1;
+            Ok(node.id.0 + inputs.iter().map(|v| **v).sum::<u32>())
         }
     }
 
@@ -220,18 +256,40 @@ mod tests {
     fn shared_dependency_executes_once_and_replay_reads_committed_value() {
         // 0 is shared by 1 and 2; 3 consumes both branches.
         let dag = ExecutableDag {
-            nodes: (0..4).map(node).collect(),
-            edges: vec![edge(0, 1), edge(0, 2), edge(1, 3), edge(2, 3)],
-            query_sink: 3,
-            precompute_sinks: vec![3],
+            nodes: (0..4)
+                .map(node)
+                .chain([{
+                    let mut query = node(4);
+                    query.output_state = ExecutionDataState::READ_ROWS;
+                    query
+                }])
+                .collect(),
+            edges: vec![edge(0, 1), edge(0, 2), edge(1, 3), edge(2, 3), edge(3, 4)],
+            root: PostAsapNodeId(4),
         };
         let registry = Registry::default();
         let sink = Sink::default();
-        let first = execute_precompute_sink(&dag, 3, key(3), &registry, &sink).unwrap();
+        let first = execute_precompute_sink(
+            &dag,
+            &binding(),
+            PostAsapNodeId(3),
+            key(3),
+            &registry,
+            &sink,
+        )
+        .unwrap();
         assert_eq!(*first, 6);
         assert_eq!(registry.0.lock().unwrap().values().sum::<usize>(), 4);
 
-        let replay = execute_precompute_sink(&dag, 3, key(3), &registry, &sink).unwrap();
+        let replay = execute_precompute_sink(
+            &dag,
+            &binding(),
+            PostAsapNodeId(3),
+            key(3),
+            &registry,
+            &sink,
+        )
+        .unwrap();
         assert!(Arc::ptr_eq(&first, &replay));
         assert_eq!(registry.0.lock().unwrap().values().sum::<usize>(), 4);
     }
@@ -239,21 +297,40 @@ mod tests {
     #[test]
     fn rejects_query_node_in_precompute_path_and_mismatched_lineage_key() {
         let mut query_child = node(0);
-        query_child.mode = ExecutionMode::Query;
+        query_child.output_state = ExecutionDataState::READ_ROWS;
         let dag = ExecutableDag {
             nodes: vec![query_child, node(1)],
             edges: vec![edge(0, 1)],
-            query_sink: 0,
-            precompute_sinks: vec![1],
+            root: PostAsapNodeId(0),
         };
         let registry = Registry::default();
         let sink = Sink::default();
+        let invalid_path_binding = BackendExecutableBinding {
+            nodes: [
+                (
+                    PostAsapNodeId(0),
+                    BackendNodeBinding::Query {
+                        query_node: control_plane::query_plan::QueryNodeId(1),
+                    },
+                ),
+                (
+                    PostAsapNodeId(1),
+                    BackendNodeBinding::Materialization {
+                        summary_definition: asap_types::PolicyFingerprint(2).into(),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            query_sink: PostAsapNodeId(0),
+            precompute_sinks: vec![PostAsapNodeId(1)],
+        };
         assert!(matches!(
-            execute_precompute_sink(&dag, 1, key(1), &registry, &sink),
+            execute_precompute_sink(&dag, &invalid_path_binding, PostAsapNodeId(1), key(1), &registry, &sink),
             Err(ScheduleError::Invalid(message)) if message.contains("query-time node")
         ));
         assert!(matches!(
-            execute_precompute_sink(&dag, 1, key(0), &registry, &sink),
+            execute_precompute_sink(&dag, &invalid_path_binding, PostAsapNodeId(1), key(0), &registry, &sink),
             Err(ScheduleError::Invalid(message)) if message.contains("does not match")
         ));
     }

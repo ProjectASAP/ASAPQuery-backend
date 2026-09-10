@@ -26,6 +26,7 @@ pub mod compiler;
 pub mod deployment;
 pub mod deployment_cost;
 pub mod erp;
+pub mod executable_binding;
 pub mod plan;
 pub mod plan_cache;
 pub mod planner;

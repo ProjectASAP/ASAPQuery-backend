@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "4cbdaf82c4dea3cc374f4652f9e596d2b8050663";
+pub const PLANNER_REVISION: &str = "0deceda3e776216c5542d638d958b159f22e27ce";
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 
 #[derive(Debug, Clone)]
@@ -3322,7 +3322,7 @@ fn collect_selected_materializations(
     }) {
         return Err(format!(
             "executable subDAG contains incompatible grouping edge {} -> {} ({:?})",
-            edge.producer, edge.consumer, edge.role
+            edge.producer.0, edge.consumer.0, edge.role
         ));
     }
     fn walk(
