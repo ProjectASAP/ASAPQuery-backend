@@ -100,6 +100,10 @@ AutoSketch paper implements window sharing, nor an end-to-end Planner/control-
 plane benchmark. Methods execute sequentially, so compare medians and structural
 counts; do not interpret wall time as isolated CPU time. See
 [executed results](repeated-window-results.md).
+The report links the checked-in per-trial raw JSON and generated SVG figure;
+`plot_repeated_window.py` regenerates the figure using only Python's standard
+library. Smoke results remain development evidence and are not used as the
+formal repeated-window performance result.
 
 ## Adaptation boundary
 
