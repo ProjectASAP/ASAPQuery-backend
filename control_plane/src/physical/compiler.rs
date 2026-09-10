@@ -313,7 +313,8 @@ pub struct IngestContract {
     pub endpoint_path: String,
     pub timestamp_unit: TimestampUnit,
     pub require_plan_identity: bool,
-    pub require_materialization_identity: bool,
+    #[serde(alias = "require_materialization_identity")]
+    pub require_summary_definition_identity: bool,
     pub require_registered_producer: bool,
 }
 
@@ -504,7 +505,7 @@ impl PrecomputePlan {
                 endpoint_path: "/v1/metrics".into(),
                 timestamp_unit: TimestampUnit::UnixNanoseconds,
                 require_plan_identity: true,
-                require_materialization_identity: true,
+                require_summary_definition_identity: true,
                 require_registered_producer: true,
             },
             schemas,
@@ -527,7 +528,7 @@ impl PrecomputePlan {
             endpoint_path: "/api/v1/write".into(),
             timestamp_unit: TimestampUnit::UnixMilliseconds,
             require_plan_identity: false,
-            require_materialization_identity: false,
+            require_summary_definition_identity: false,
             require_registered_producer: false,
         };
         plan.producers.clear();
@@ -553,14 +554,14 @@ impl PrecomputePlan {
                 self.ingest.endpoint_path == "/v1/metrics"
                     && self.ingest.timestamp_unit == TimestampUnit::UnixNanoseconds
                     && self.ingest.require_plan_identity
-                    && self.ingest.require_materialization_identity
+                    && self.ingest.require_summary_definition_identity
                     && self.ingest.require_registered_producer
             }
             IngestProtocol::PrometheusRemoteWriteV1 => {
                 self.ingest.endpoint_path == "/api/v1/write"
                     && self.ingest.timestamp_unit == TimestampUnit::UnixMilliseconds
                     && !self.ingest.require_plan_identity
-                    && !self.ingest.require_materialization_identity
+                    && !self.ingest.require_summary_definition_identity
                     && !self.ingest.require_registered_producer
             }
         };
@@ -1032,7 +1033,7 @@ fn validate_catalog_projection(
     for id in materializations {
         if !catalog
             .materializations
-            .contains_key(&asap_types::sds::MaterializationId::from(id))
+            .contains_key(&asap_types::sds::SummaryDefinitionId::from(id))
         {
             return Err(TransmissionPlanError::Catalog(format!(
                 "unknown materialization {}",
@@ -3633,7 +3634,7 @@ mod tests {
         raw.ingest.endpoint_path = "/api/v1/write".into();
         raw.ingest.timestamp_unit = TimestampUnit::UnixMilliseconds;
         raw.ingest.require_plan_identity = false;
-        raw.ingest.require_materialization_identity = false;
+        raw.ingest.require_summary_definition_identity = false;
         raw.ingest.require_registered_producer = false;
         raw.producers.clear();
         raw.bind_catalog(&catalog).unwrap();

@@ -1,7 +1,7 @@
 //! Catalog consistency checks for the precompute execution plan.
 use super::compiler::*;
 use super::summary_catalog::SummaryCatalog;
-use asap_types::sds::{MaterializationId, SummaryDescriptor};
+use asap_types::sds::{SummaryDefinitionId, SummaryDescriptor};
 use planner_types::pre_asap::{ColumnRef, Source};
 use std::collections::BTreeSet;
 fn invalid(reason: impl Into<String>) -> PrecomputePlanError {
@@ -13,7 +13,7 @@ impl PrecomputePlan {
     /// only the immutable snapshot reference; descriptors are installed once.
     pub fn bind_catalog(&mut self, catalog: &SummaryCatalog) -> Result<(), PrecomputePlanError> {
         for config in &self.materializations {
-            let id = MaterializationId::from(config.policy_fingerprint());
+            let id = SummaryDefinitionId::from(config.policy_fingerprint());
             catalog.materializations.get(&id).ok_or_else(|| {
                 invalid(format!("missing catalog materialization {}", id.as_u64()))
             })?;
@@ -51,13 +51,13 @@ impl PrecomputePlan {
         let ids: BTreeSet<_> = self
             .materializations
             .iter()
-            .map(|m| MaterializationId::from(m.policy_fingerprint()))
+            .map(|m| SummaryDefinitionId::from(m.policy_fingerprint()))
             .collect();
         if ids != catalog.materializations.keys().copied().collect() {
             return Err(invalid("catalog/reference/materialization sets differ"));
         }
         for config in &self.materializations {
-            let id = MaterializationId::from(config.policy_fingerprint());
+            let id = SummaryDefinitionId::from(config.policy_fingerprint());
             let binding = &catalog.materializations[&id];
             let expected =
                 SummaryDescriptor::from_config(config).map_err(|e| invalid(e.to_string()))?;

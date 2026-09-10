@@ -2495,7 +2495,7 @@ mod tests {
                         endpoint_path: "/api/v1/write".into(),
                         timestamp_unit: TimestampUnit::UnixMilliseconds,
                         require_plan_identity: false,
-                        require_materialization_identity: false,
+                        require_summary_definition_identity: false,
                         require_registered_producer: false,
                     },
                     schemas: Vec::new(),
@@ -6069,7 +6069,7 @@ async fn handle_summary_inventory(State(state): State<AppState>) -> axum::respon
         .iter()
         .map(|producer| {
             (
-                asap_types::sds::MaterializationId::from(producer.materialization),
+                asap_types::sds::SummaryDefinitionId::from(producer.materialization),
                 producer.producer_id.clone(),
             )
         })

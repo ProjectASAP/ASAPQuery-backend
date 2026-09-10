@@ -510,7 +510,7 @@ pub fn plan_promql_to_post_asap(
 
     // This dynamic lowering path is retained for isolated executor tests.
     // Production serving executes the installed QueryPlan and resolves its
-    // MaterializationId bindings through SummaryCatalog.
+    // SummaryDefinitionId bindings through SummaryCatalog.
     let metric = find_metric_in_query_expr(&qe);
     let mut observed = Vec::new();
     if let Some(family) = metric

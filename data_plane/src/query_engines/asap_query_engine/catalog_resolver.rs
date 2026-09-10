@@ -3,7 +3,7 @@
 //! query execution checks only reachable IDs and their requested capabilities.
 use std::collections::{BTreeMap, BTreeSet};
 
-use asap_types::sds::{MaterializationId, SummaryDescriptor, SummaryOperator};
+use asap_types::sds::{SummaryDefinitionId, SummaryDescriptor, SummaryOperator};
 use asap_types::summary_catalog::SummaryCatalog;
 use asap_types::AggregationType;
 use control_plane::query_plan::{ExactReadout, QueryPlanEntry, QueryPlanNode, QueryReadout};
@@ -21,7 +21,7 @@ fn miss(reason: impl Into<String>) -> EngineError {
 /// Borrow descriptors; never reconstruct them from bindings or store payloads.
 pub(crate) fn resolve(
     catalog: &SummaryCatalog,
-    id: MaterializationId,
+    id: SummaryDefinitionId,
 ) -> Result<ResolvedMaterialization<'_>, EngineError> {
     let identity = catalog
         .materializations
@@ -138,7 +138,7 @@ pub(crate) fn validate_entry(
             QueryPlanNode::SummaryMerge { inputs } => {
                 let mut ids = BTreeSet::new();
                 for input in inputs {
-                    let children: &BTreeSet<MaterializationId> = states
+                    let children: &BTreeSet<SummaryDefinitionId> = states
                         .get(input)
                         .ok_or_else(|| miss("summary merge has no state input"))?;
                     if children.is_empty() {
@@ -150,7 +150,7 @@ pub(crate) fn validate_entry(
             }
             QueryPlanNode::SummaryEstimate { input, .. }
             | QueryPlanNode::ExactReadout { input, .. } => {
-                let ids: &BTreeSet<MaterializationId> = states
+                let ids: &BTreeSet<SummaryDefinitionId> = states
                     .get(input)
                     .ok_or_else(|| miss("readout has no state input"))?;
                 if ids.is_empty() || ids.iter().any(|id| !resolved[id].supports(node)) {

@@ -58,7 +58,7 @@ struct DataDescriptor {
 
 struct SummaryInstance {
     id: SummaryInstanceId,
-    materialization_id: MaterializationId,
+    summary_definition_id: SummaryDefinitionId,
     summary_descriptor_id: SummaryDescriptorId,
     data_descriptor_id: DataDescriptorId,
     interval: HalfOpenInterval,
@@ -105,7 +105,7 @@ or create persistent desired state by itself.
                                   |
                                   v
                     Control-plane SummaryCatalog
-       SummaryDescriptor + DataDescriptor + MaterializationIdentity
+       SummaryDescriptor + DataDescriptor + SummaryDefinitionIdentity
                                   |
               catalog references | shared snapshot
           +-----------------------+-----------------------+

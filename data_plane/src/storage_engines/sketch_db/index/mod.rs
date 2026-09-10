@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asap_types::sds::{
     CatalogGeneration, HalfOpenTimeRange, InstanceCompleteness, InstanceLifecycle,
-    MaterializationId, ObservedSummaryInventory, SummaryInstance, SummaryInstanceId,
+    ObservedSummaryInventory, SummaryDefinitionId, SummaryInstance, SummaryInstanceId,
     SummaryInstanceStatus, SummaryPlacement, SummaryStateReference,
 };
 use asap_types::PolicyFingerprint;
@@ -807,7 +807,7 @@ impl SketchStore {
         &self,
         reporter_id: &str,
         storage_node_id: &str,
-        producers: &BTreeMap<MaterializationId, String>,
+        producers: &BTreeMap<SummaryDefinitionId, String>,
         inventory_version: u64,
         observed_at_ms: i64,
     ) -> Result<ObservedSummaryInventory, String> {
@@ -825,25 +825,27 @@ impl SketchStore {
         let instances = self.instances.read().unwrap();
         let mut reported = BTreeMap::new();
         for (sid, binding) in instances.iter() {
-            let materialization_id = MaterializationId::from(binding.metadata.policy_fp);
+            let summary_definition_id = SummaryDefinitionId::from(binding.metadata.policy_fp);
             if binding.metadata.policy_fp.is_unset()
-                || !catalog.materializations.contains_key(&materialization_id)
+                || !catalog
+                    .materializations
+                    .contains_key(&summary_definition_id)
             {
                 continue;
             }
             let producer_id = producers
-                .get(&materialization_id)
+                .get(&summary_definition_id)
                 .map(String::as_str)
                 .ok_or_else(|| {
                     format!(
                         "materialization {} has no producer in the active PrecomputePlan",
-                        materialization_id.as_u64()
+                        summary_definition_id.as_u64()
                     )
                 })?;
             let instance_id = SummaryInstanceId::new(format!(
                 "summary-instance:v1:{}:{}:{}",
                 generation.plan_version,
-                materialization_id.as_u64(),
+                summary_definition_id.as_u64(),
                 sid
             ))
             .map_err(|error| error.to_string())?;
@@ -869,7 +871,7 @@ impl SketchStore {
             };
             let instance = SummaryInstance {
                 instance_id: instance_id.clone(),
-                materialization_id,
+                summary_definition_id,
                 summary_descriptor_id: binding.summary_descriptor.id().clone(),
                 data_descriptor_id: binding.data_descriptor.id().clone(),
                 time_range,
@@ -2927,7 +2929,7 @@ mod tests {
         store.register(meta_with_policy(41, fingerprint));
 
         let producers = BTreeMap::from([(
-            MaterializationId::from(fingerprint),
+            SummaryDefinitionId::from(fingerprint),
             "producer-a".to_string(),
         )]);
         let inventory = store
@@ -2935,9 +2937,10 @@ mod tests {
             .unwrap();
         inventory.validate().unwrap();
         let instance = inventory.instances.values().next().unwrap();
-        assert_eq!(instance.materialization_id.fingerprint(), fingerprint);
+        assert_eq!(instance.summary_definition_id.fingerprint(), fingerprint);
         assert_eq!(instance.status, SummaryInstanceStatus::MissingPayload);
-        let catalog_identity = &plan.summary_catalog.materializations[&instance.materialization_id];
+        let catalog_identity =
+            &plan.summary_catalog.materializations[&instance.summary_definition_id];
         assert_eq!(
             instance.summary_descriptor_id,
             catalog_identity.summary_descriptor_id

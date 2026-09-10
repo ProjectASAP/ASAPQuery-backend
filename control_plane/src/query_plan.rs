@@ -15,7 +15,7 @@ use planner_types::pre_asap::Reduction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use asap_types::{sds::MaterializationId, PolicyFingerprint};
+use asap_types::{sds::SummaryDefinitionId, PolicyFingerprint};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -357,7 +357,7 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
-    pub materialization: MaterializationId,
+    pub materialization: SummaryDefinitionId,
     /// Query operator grouping applied while folding those SIDs.
     pub output_grouping: PhysicalGrouping,
     pub window_ms: u64,

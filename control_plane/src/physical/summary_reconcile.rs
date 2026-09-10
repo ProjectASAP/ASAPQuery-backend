@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 
 use asap_types::sds::{
-    CatalogGeneration, InstanceLifecycle, MaterializationId, ObservedSummaryInventory,
+    CatalogGeneration, InstanceLifecycle, ObservedSummaryInventory, SummaryDefinitionId,
     SummaryInstanceId, SummaryInstanceStatus,
 };
 use serde::{Deserialize, Serialize};
@@ -15,15 +15,15 @@ use super::summary_catalog::{SummaryCatalog, SummaryCatalogError};
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SummaryReconcileAction {
     Create {
-        materialization_id: MaterializationId,
+        summary_definition_id: SummaryDefinitionId,
     },
     Update {
         instance_id: SummaryInstanceId,
-        materialization_id: MaterializationId,
+        summary_definition_id: SummaryDefinitionId,
     },
     Recover {
         instance_id: SummaryInstanceId,
-        materialization_id: MaterializationId,
+        summary_definition_id: SummaryDefinitionId,
     },
     Retire {
         instance_id: SummaryInstanceId,
@@ -33,7 +33,7 @@ pub enum SummaryReconcileAction {
     },
     PromoteEphemeral {
         instance_id: SummaryInstanceId,
-        materialization_id: MaterializationId,
+        summary_definition_id: SummaryDefinitionId,
     },
     ExpireEphemeral {
         instance_id: SummaryInstanceId,
@@ -63,7 +63,9 @@ pub fn reconcile_summary_inventory(
     let mut actions = Vec::new();
 
     for instance in observed.instances.values() {
-        let desired_identity = desired.materializations.get(&instance.materialization_id);
+        let desired_identity = desired
+            .materializations
+            .get(&instance.summary_definition_id);
         match &instance.lifecycle {
             InstanceLifecycle::Ephemeral { lease } if lease.expires_at_ms <= now_ms => {
                 actions.push(SummaryReconcileAction::ExpireEphemeral {
@@ -76,10 +78,10 @@ pub fn reconcile_summary_inventory(
                     identity.summary_descriptor_id == instance.summary_descriptor_id
                         && identity.data_descriptor_id == instance.data_descriptor_id
                 }) {
-                    represented.insert(instance.materialization_id);
+                    represented.insert(instance.summary_definition_id);
                     actions.push(SummaryReconcileAction::PromoteEphemeral {
                         instance_id: instance.instance_id.clone(),
-                        materialization_id: instance.materialization_id,
+                        summary_definition_id: instance.summary_definition_id,
                     });
                 }
                 continue;
@@ -101,7 +103,7 @@ pub fn reconcile_summary_inventory(
             }
             continue;
         };
-        represented.insert(instance.materialization_id);
+        represented.insert(instance.summary_definition_id);
 
         if matches!(
             instance.status,
@@ -109,7 +111,7 @@ pub fn reconcile_summary_inventory(
         ) {
             actions.push(SummaryReconcileAction::Recover {
                 instance_id: instance.instance_id.clone(),
-                materialization_id: instance.materialization_id,
+                summary_definition_id: instance.summary_definition_id,
             });
         } else if identity.summary_descriptor_id != instance.summary_descriptor_id
             || identity.data_descriptor_id != instance.data_descriptor_id
@@ -120,7 +122,7 @@ pub fn reconcile_summary_inventory(
         {
             actions.push(SummaryReconcileAction::Update {
                 instance_id: instance.instance_id.clone(),
-                materialization_id: instance.materialization_id,
+                summary_definition_id: instance.summary_definition_id,
             });
         }
     }
@@ -128,7 +130,7 @@ pub fn reconcile_summary_inventory(
     for id in desired.materializations.keys() {
         if !represented.contains(id) {
             actions.push(SummaryReconcileAction::Create {
-                materialization_id: *id,
+                summary_definition_id: *id,
             });
         }
     }
@@ -182,10 +184,10 @@ mod tests {
         status: SummaryInstanceStatus,
         observed_at_ms: i64,
     ) -> asap_types::sds::SummaryInstance {
-        let (materialization_id, identity) = catalog.materializations.iter().next().unwrap();
+        let (summary_definition_id, identity) = catalog.materializations.iter().next().unwrap();
         asap_types::sds::SummaryInstance {
             instance_id: SummaryInstanceId::new(id).unwrap(),
-            materialization_id: *materialization_id,
+            summary_definition_id: *summary_definition_id,
             summary_descriptor_id: identity.summary_descriptor_id.clone(),
             data_descriptor_id: identity.data_descriptor_id.clone(),
             time_range: HalfOpenTimeRange {

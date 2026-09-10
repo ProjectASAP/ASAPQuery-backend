@@ -1290,7 +1290,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     legacy
         .precompute_plan
         .ingest
-        .require_materialization_identity = false;
+        .require_summary_definition_identity = false;
     legacy.precompute_plan.ingest.require_registered_producer = false;
     legacy.precompute_plan.producers.clear();
     legacy.transmission_plan.rules.clear();

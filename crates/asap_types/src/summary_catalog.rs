@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use crate::sds::{
-    DataDescriptor, DataDescriptorId, MaterializationId, SummaryDescriptor, SummaryDescriptorId,
+    DataDescriptor, DataDescriptorId, SummaryDefinitionId, SummaryDescriptor, SummaryDescriptorId,
 };
 use crate::PolicyFingerprint;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ pub struct SummaryCatalogReference {
 /// Concrete intervals, groups and completeness belong to runtime instances.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct MaterializationIdentity {
+pub struct SummaryDefinitionIdentity {
     pub summary_descriptor_id: SummaryDescriptorId,
     pub data_descriptor_id: DataDescriptorId,
 }
@@ -40,7 +40,7 @@ pub struct SummaryCatalog {
     pub plan_version: u64,
     pub summary_descriptors: BTreeMap<SummaryDescriptorId, SummaryDescriptor>,
     pub data_descriptors: BTreeMap<DataDescriptorId, DataDescriptor>,
-    pub materializations: BTreeMap<MaterializationId, MaterializationIdentity>,
+    pub materializations: BTreeMap<SummaryDefinitionId, SummaryDefinitionIdentity>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -124,13 +124,13 @@ impl SummaryCatalog {
             materializations: BTreeMap::new(),
         };
         for (fingerprint, summary, data) in entries {
-            let materialization = MaterializationId::from(fingerprint);
+            let materialization = SummaryDefinitionId::from(fingerprint);
             summary
                 .validate()
                 .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
             data.validate()
                 .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
-            let binding = MaterializationIdentity {
+            let binding = SummaryDefinitionIdentity {
                 summary_descriptor_id: summary.id().clone(),
                 data_descriptor_id: data.id().clone(),
             };

@@ -679,7 +679,7 @@ async fn main() -> Result<()> {
             endpoint_path: "/v1/metrics".into(),
             timestamp_unit: control_plane::physical::compiler::TimestampUnit::UnixNanoseconds,
             require_plan_identity: false,
-            require_materialization_identity: false,
+            require_summary_definition_identity: false,
             require_registered_producer: false,
         },
         schemas: Vec::new(),
