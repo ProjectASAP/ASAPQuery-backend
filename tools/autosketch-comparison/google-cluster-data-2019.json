@@ -1,0 +1,27 @@
+{
+  "dataset": "Google ClusterData 2019",
+  "license": "CC-BY-4.0",
+  "cell": "a",
+  "table": "instance_usage",
+  "object": "instance_usage-000000000000.parquet.gz",
+  "source_url": "https://storage.googleapis.com/clusterdata_2019_a/instance_usage-000000000000.parquet.gz",
+  "gcs_generation": "1682721397229175",
+  "downloaded_bytes": 36204879,
+  "sha256": "c70b806cb89f110a4235f40285957f0244edf49f28c2a83803646a911d0d6fb6",
+  "format": "Apache Parquet (the official object name ends in .gz but its content is not gzip-wrapped)",
+  "rows": 626337,
+  "row_groups": 2,
+  "columns": 21,
+  "start_time_min": 300000000,
+  "start_time_max": 2678998000000,
+  "end_time_min": 600000000,
+  "end_time_max": 2679000000000,
+  "distinct_collection_ids": 44806,
+  "distinct_instance_indexes": 16126,
+  "distinct_machine_ids": 9990,
+  "schema": {
+    "source_url": "https://storage.googleapis.com/clusterdata_2019_schema/instance_usage.schema.json",
+    "downloaded_bytes": 2193,
+    "sha256": "82c1ffb74988c2b7a7b60a134840bb234f588949950bfab762dac8863a72b559"
+  }
+}

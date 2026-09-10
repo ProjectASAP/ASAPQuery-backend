@@ -105,6 +105,11 @@ The report links the checked-in per-trial raw JSON and generated SVG figure;
 library. Smoke results remain development evidence and are not used as the
 formal repeated-window performance result.
 
+The next real-data stage uses an official Google ClusterData 2019
+`instance_usage` Parquet shard. See the [dataset manifest and evaluation
+plan](google-cluster-data-2019-plan.md) for the downloaded object, exact schema
+mapping, workload, exclusions, metrics, and staged expansion policy.
+
 ## Adaptation boundary
 
 The reference is [AutoSketch Algorithm 4 and Section 5.2](https://www.usenix.org/system/files/nsdi24-sun.pdf).
