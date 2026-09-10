@@ -6,7 +6,9 @@ ASAPPlanner, recurring-window, or native AutoSketch benchmark.
 
 ## What runs
 
-- Actual `asap_sketchlib::CountMinSketch` and `CountSketch` implementations.
+- Actual `asap_sketchlib::CountMinSketch` and `CountSketch` implementations,
+  plus small Rust Bloom and Counting Bloom implementations for the paper's
+  distinct operator (no upstream Bloom dependency is pulled in).
 - Up to 56 configurations per family: widths 64 through 4096 in powers of two,
   depths 1 through 8. All methods see the same budget- and legality-filtered grid.
   Portable Count Sketch requires `depth * (log2(width) + 1) <= 64`; CMS supports
@@ -79,6 +81,9 @@ performs parameter search within each. It is a software adaptation, not the
 paper's separate sampled family-preselection phase. CMS and Count Sketch use
 the same empirical absolute additive-error metric on nonnegative updates; this
 does not equate their theoretical L1/L2 guarantees. No P4 code is generated.
+Bloom rows use membership false-positive error rather than frequency error and
+must be evaluated with a distinct-membership workload; they are not directly
+comparable to CMS/Count Sketch frequency rows.
 
 Differences from the hardware algorithm are intentional and must be retained in
 results: there is no stage dimension, ALU budget, or 16-KiB page alignment;
