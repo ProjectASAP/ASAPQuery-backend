@@ -3476,12 +3476,12 @@ fn select_lifecycle(
             reason: "latest ASAPPlanner selected no window framework from the supplied physical evidence".into(),
         })?;
     Ok(PlannerPhysicalSelection {
-        window_implementation_id: plan.selected_physical_plan_id.clone().ok_or_else(|| {
-            CompileError::Lifecycle {
+        window_implementation_id: plan.selected_window_implementation_id.clone().ok_or_else(
+            || CompileError::Lifecycle {
                 query_id: query.query_id.clone(),
                 reason: "Planner returned no concrete window implementation identity".into(),
-            }
-        })?,
+            },
+        )?,
         expected_reads: plan.expected_reads.ok_or_else(|| CompileError::Lifecycle {
             query_id: query.query_id.clone(),
             reason: "missing joint read demand".into(),
