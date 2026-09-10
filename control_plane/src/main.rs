@@ -809,25 +809,18 @@ async fn handle_compile_and_publish_clickhouse_plan(
     State(state): State<AppState>,
     Json(request): Json<clickhouse::ClickHouseSqlWorkload>,
 ) -> impl IntoResponse {
-    let bundle = match clickhouse::compile_clickhouse_workload(&request).await {
-        Ok(bundle) => bundle,
+    let publication = match clickhouse::compile_clickhouse_workload(&request).await {
+        Ok(publication) => publication,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
-    let plan_id = bundle.sds.plan_id;
-    let plan_version = bundle.sds.plan_version;
+    let plan_id = publication.summary_catalog.plan_id;
+    let plan_version = publication.summary_catalog.plan_version;
     let Some(client) = state.backend_client.as_ref() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "backend publication is not configured",
         )
             .into_response();
-    };
-    let publication = physical::publication::PhysicalPlanPublication {
-        summary_catalog: bundle.sds,
-        precompute_plan: bundle.precompute_plan,
-        collector_plans: Vec::new(),
-        transmission_plan: bundle.transmission_plan,
-        query_plan: bundle.query_plan,
     };
     if let Err(error) = client
         .post_catalog_plan_typed(&publication, None, &[])
