@@ -2,6 +2,51 @@
 
 ## Claim and scope
 
+Implementation status (v2): measured configuration selection is executable via
+ASAPPlanner's ERP selector. The runner chooses shared or independent **30-second
+panes**, minimizing retained memory; arbitrary pane-width/sliding-framework
+search remains a subsequent experiment. The measured catalog is produced by a
+backend window benchmark adapter in sketch-bench's ERP-v1 record format, extended
+with per-window recall loss and empirical shape descriptors. The adapter is
+necessary because atomic frequency-estimation error does not certify merged
+Top-K membership. It is not the production control-plane observer or an invocation
+of the sketch-bench executable. The broader design below describes the target
+experiment; only completed paths may be presented as measured results.
+
+The v1 result files are withdrawn: their ERP configuration was hardcoded,
+initial sampling was not LHS, updates preaggregated events through an unordered
+map, exact and approximate endpoints differed, and memory accounting for exact
+retention was incorrect. Do not cite v1 speedups or accuracy comparisons.
+
+### Executable v2 selection and validation
+
+- Build and persist a catalog before comparison. Synthetic benchmark seeds
+  1000–1002 (Zipf) and 2000–2002 (uniform) are disjoint from evaluation seeds
+  42–44. Custom-data profiling reads only the calibration prefix and reports
+  its construction cost separately as a required cold-start cost.
+- Observe cardinality, per-pane event rate, and top-1/10/100/1000 rank mass.
+  Match the nearest catalog descriptor, independent of whether its smaller
+  configurations pass accuracy. Reject distance above 0.5 or a distance gap
+  below 0.05. This descriptor matching avoids a forced family label; it is not
+  a calibrated statistical confidence estimator.
+- Filter measured worst-case calibration Recall loss by window. Ask Planner
+  to minimize retained memory under 128 KiB per sketch and 16 MiB total.
+  Compare full sharing against independent configurations; sharing is optional.
+  Record composed empirical update/merge/query cost as an estimate.
+- Use the same 72-point CMS/CountSketch depth/width/heap grid and memory objective
+  for the AutoSketch CPU adaptation. Use per-family LHS and one-dimension
+  neighbors, with Algorithm 4 direction stopping and visited/resource pruning.
+  Log infeasible calibration selections instead of claiming a guarantee.
+- A miss goes to exact because a theoretical additive frequency bound alone
+  does not imply a Recall@10 SLA. The analytical arm remains a separately scored
+  reference. Report all held-out failures even when calibration passes.
+- Record 400 timestamped query samples per trial and assert common endpoints,
+  summed merge/readout times, and retained-memory limits. Logical memory excludes
+  heap-string/allocator overhead and query temporaries; RSS remains future work.
+
+Run commands and checked results are recorded under
+`tools/autosketch-comparison/data/topk-dashboard-v2/`.
+
 This experiment tests whether ASAPPlanner improves a recurring multi-window
 dashboard by jointly choosing sketch parameters, window implementation,
 retention, and cross-query sharing. AutoSketch is adapted without its P4

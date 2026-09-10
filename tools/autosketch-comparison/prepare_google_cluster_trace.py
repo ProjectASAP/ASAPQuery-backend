@@ -13,6 +13,8 @@ def main():
     parser.add_argument("output")
     parser.add_argument("--metadata", required=True)
     parser.add_argument("--pane-seconds", type=int, default=300)
+    parser.add_argument("--start-pane", type=int, default=0)
+    parser.add_argument("--panes", type=int)
     args = parser.parse_args()
     if args.pane_seconds <= 0:
         parser.error("pane seconds must be positive")
@@ -26,6 +28,13 @@ def main():
     identities = {value: index for index, value in enumerate(sorted(set(collections)))}
     rows = sorted(((timestamp - minimum) // pane_us, identities[key])
                   for timestamp, key in zip(start, collections))
+    if args.start_pane < 0 or (args.panes is not None and args.panes <= 0):
+        parser.error("start pane must be nonnegative and panes positive")
+    rows = [(pane - args.start_pane, key) for pane, key in rows
+            if pane >= args.start_pane and
+            (args.panes is None or pane < args.start_pane + args.panes)]
+    if not rows:
+        raise ValueError("selected interval is empty")
     output = pathlib.Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("x", encoding="utf-8") as target:
@@ -34,6 +43,9 @@ def main():
     metadata = {
         "input": str(pathlib.Path(args.input).resolve()),
         "rows": len(rows),
+        "selected_start_pane": args.start_pane,
+        "selected_panes": args.panes,
+        "selected_keys": len(set(key for _, key in rows)),
         "keys": len(identities),
         "pane_seconds": args.pane_seconds,
         "minimum_start_time_us": minimum,
