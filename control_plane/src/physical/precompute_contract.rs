@@ -1,7 +1,9 @@
 //! Catalog consistency checks for the precompute execution plan.
 use super::compiler::*;
 use super::summary_catalog::SummaryCatalog;
-use asap_types::sds::{SummaryDefinitionId, SummaryDescriptor};
+use asap_types::sds::{
+    DataSourceIdentity, SummaryDefinitionId, SummaryDescriptor, ValueProjectionIdentity,
+};
 use planner_types::pre_asap::{ColumnRef, Source};
 use std::collections::BTreeSet;
 fn invalid(reason: impl Into<String>) -> PrecomputePlanError {
@@ -70,7 +72,22 @@ impl PrecomputePlan {
                 return Err(invalid("pane origin differs from catalog definition"));
             }
             let data = &catalog.data_descriptors[&binding.data_descriptor_id];
-            if data.metric_name != config.metric
+            let expected_source = config.table_name.as_ref().map_or_else(
+                || DataSourceIdentity::TimeSeries {
+                    metric: config.metric.clone(),
+                },
+                |table_ref| DataSourceIdentity::Table {
+                    table_ref: table_ref.clone(),
+                },
+            );
+            let expected_projection = config
+                .value_column
+                .as_ref()
+                .map_or(ValueProjectionIdentity::SampleValue, |name| {
+                    ValueProjectionIdentity::Column { name: name.clone() }
+                });
+            if data.source != expected_source
+                || data.value_projection != expected_projection
                 || data.population_filter_canonical
                     != asap_types::utils::normalize_spatial_filter(&config.spatial_filter)
                 || data.group_by_keys != config.grouping_labels.labels.iter().cloned().collect()
