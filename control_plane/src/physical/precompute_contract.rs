@@ -66,6 +66,9 @@ impl PrecomputePlan {
                     "summary operator/update contract differs from catalog",
                 ));
             }
+            if binding.pane_origin_ms != config.pane_origin_ms {
+                return Err(invalid("pane origin differs from catalog definition"));
+            }
             let data = &catalog.data_descriptors[&binding.data_descriptor_id];
             if data.metric_name != config.metric
                 || data.population_filter_canonical
@@ -127,6 +130,7 @@ impl PrecomputePlan {
                 || schema.window.kind != config.window_type
                 || schema.window.size_ms != size
                 || schema.window.slide_ms != expected_slide
+                || schema.window.pane_origin_ms != config.pane_origin_ms
             {
                 return Err(PrecomputePlanError::InvalidSchema {
                     schema_id: schema.schema_id.clone(),

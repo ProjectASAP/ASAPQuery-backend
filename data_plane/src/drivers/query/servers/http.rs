@@ -3421,6 +3421,7 @@ aggregations:
                 window_size: 1,
                 slide_interval: 1,
                 window_type: WindowKind::Tumbling,
+                pane_origin_ms: None,
                 spatial_filter: String::new(),
                 spatial_filter_normalized: String::new(),
                 metric: metric.clone(),
@@ -5816,6 +5817,12 @@ pub fn build_active_physical_plan(
             if binding.window_ms != materialization.slide_interval.saturating_mul(1_000) {
                 return Err(
                     "query physical pane duration differs from installed precompute definition"
+                        .into(),
+                );
+            }
+            if binding.pane_origin_ms != materialization.pane_origin_ms {
+                return Err(
+                    "query physical pane origin differs from installed precompute definition"
                         .into(),
                 );
             }

@@ -34,6 +34,15 @@ pub struct PrecomputeMaterialization {
     pub window_size: u64,        // Window size in seconds (e.g., 900s for 15m)
     pub slide_interval: u64,     // Slide/hop interval in seconds (e.g., 30s)
     pub window_type: WindowKind, // Tumbling or Sliding
+    /// Unix millisecond timestamp on the pane-boundary grid selected from
+    /// the consuming query workload. Missing on legacy definitions, which
+    /// must not be used for certified pane-only reads.
+    #[serde(
+        default,
+        alias = "paneOriginMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pane_origin_ms: Option<i64>,
 
     pub spatial_filter: String,
     pub spatial_filter_normalized: String,
@@ -112,6 +121,7 @@ impl PrecomputeMaterialization {
             window_size,
             slide_interval,
             window_type,
+            pane_origin_ms: None,
             spatial_filter,
             spatial_filter_normalized,
             metric,
@@ -188,6 +198,11 @@ impl PrecomputeMaterialization {
             .and_then(|v| v.as_u64())
             .unwrap_or(window_size);
 
+        let pane_origin_ms = data
+            .get("paneOriginMs")
+            .or_else(|| data.get("pane_origin_ms"))
+            .and_then(|v| v.as_i64());
+
         let spatial_filter = data["spatialFilter"].as_str().unwrap_or("").to_string();
 
         let metric = data["metric"].as_str().ok_or("Missing metric")?.to_string();
@@ -204,7 +219,7 @@ impl PrecomputeMaterialization {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        Ok(Self::new(
+        let mut config = Self::new(
             aggregation_type,
             aggregation_sub_type,
             parameters,
@@ -220,7 +235,9 @@ impl PrecomputeMaterialization {
             num_aggregates_to_retain,
             table_name,
             value_column,
-        ))
+        );
+        config.pane_origin_ms = pane_origin_ms;
+        Ok(config)
     }
 
     pub fn deserialize_from_bytes(
@@ -308,6 +325,11 @@ impl PrecomputeMaterialization {
             .and_then(|v| v.as_u64())
             .unwrap_or(window_size);
 
+        let pane_origin_ms = aggregation_data
+            .get("paneOriginMs")
+            .or_else(|| aggregation_data.get("pane_origin_ms"))
+            .and_then(|v| v.as_i64());
+
         let spatial_filter = aggregation_data["spatialFilter"]
             .as_str()
             .unwrap_or("")
@@ -324,7 +346,7 @@ impl PrecomputeMaterialization {
             }
         };
 
-        Ok(Self::new(
+        let mut config = Self::new(
             aggregation_type,
             aggregation_sub_type,
             parameters,
@@ -340,7 +362,9 @@ impl PrecomputeMaterialization {
             num_aggregates_to_retain,
             table_name,
             value_column,
-        ))
+        );
+        config.pane_origin_ms = pane_origin_ms;
+        Ok(config)
     }
 }
 
@@ -363,6 +387,9 @@ impl SerializableToSink for PrecomputeMaterialization {
         // Only include numAggregatesToRetain if it's Some
         if let Some(num_aggregates) = self.num_aggregates_to_retain {
             json["numAggregatesToRetain"] = serde_json::json!(num_aggregates);
+        }
+        if let Some(pane_origin_ms) = self.pane_origin_ms {
+            json["paneOriginMs"] = serde_json::json!(pane_origin_ms);
         }
 
         // SQL-specific fields (only include if present)
@@ -424,6 +451,41 @@ mod tests {
             a.policy_fingerprint().as_u64(),
             0,
             "fingerprint is never the 0 sentinel for a real config",
+        );
+    }
+
+    #[test]
+    fn pane_origin_round_trips_and_changes_definition_identity() {
+        let mut epoch =
+            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::promql)
+                .expect("parse");
+        let unknown = epoch.policy_fingerprint();
+        epoch.pane_origin_ms = Some(7_000);
+        let planned = epoch.policy_fingerprint();
+        assert_ne!(unknown, planned);
+
+        let wire = epoch.serialize_to_json();
+        assert_eq!(wire["paneOriginMs"], serde_json::json!(7_000));
+        let mut derived = serde_json::to_value(&epoch).unwrap();
+        let origin = derived
+            .as_object_mut()
+            .unwrap()
+            .remove("pane_origin_ms")
+            .unwrap();
+        derived
+            .as_object_mut()
+            .unwrap()
+            .insert("paneOriginMs".into(), origin);
+        let decoded: AggregationConfig = serde_json::from_value(derived.clone()).unwrap();
+        assert_eq!(decoded.pane_origin_ms, Some(7_000));
+
+        let mut legacy = derived;
+        legacy.as_object_mut().unwrap().remove("paneOriginMs");
+        assert_eq!(
+            serde_json::from_value::<AggregationConfig>(legacy)
+                .expect("decode legacy wire")
+                .pane_origin_ms,
+            None
         );
     }
 

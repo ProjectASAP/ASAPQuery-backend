@@ -30,6 +30,14 @@ pub struct SummaryCatalogReference {
 pub struct SummaryDefinitionIdentity {
     pub summary_descriptor_id: SummaryDescriptorId,
     pub data_descriptor_id: DataDescriptorId,
+    /// Pane boundary selected from the shared consumer workload. Legacy
+    /// snapshots deserialize as unknown and fail closed at pane-only reads.
+    #[serde(
+        default,
+        alias = "paneOriginMs",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pane_origin_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -104,16 +112,42 @@ impl SummaryCatalog {
                     crate::utils::normalize_spatial_filter(&config.spatial_filter),
                     config.grouping_labels.labels.clone(),
                 );
-                Ok((config.policy_fingerprint(), summary, data))
+                Ok((
+                    config.policy_fingerprint(),
+                    summary,
+                    data,
+                    config.pane_origin_ms,
+                ))
             })
             .collect::<Result<Vec<_>, SummaryCatalogError>>()?;
-        Self::build(plan_id, plan_version, entries)
+        Self::build_with_origins(plan_id, plan_version, entries)
     }
 
     pub fn build(
         plan_id: u64,
         plan_version: u64,
         entries: impl IntoIterator<Item = (PolicyFingerprint, SummaryDescriptor, DataDescriptor)>,
+    ) -> Result<Self, SummaryCatalogError> {
+        Self::build_with_origins(
+            plan_id,
+            plan_version,
+            entries
+                .into_iter()
+                .map(|(fingerprint, summary, data)| (fingerprint, summary, data, None)),
+        )
+    }
+
+    fn build_with_origins(
+        plan_id: u64,
+        plan_version: u64,
+        entries: impl IntoIterator<
+            Item = (
+                PolicyFingerprint,
+                SummaryDescriptor,
+                DataDescriptor,
+                Option<i64>,
+            ),
+        >,
     ) -> Result<Self, SummaryCatalogError> {
         let mut catalog = Self {
             schema_version: SUMMARY_CATALOG_SCHEMA_VERSION,
@@ -123,7 +157,7 @@ impl SummaryCatalog {
             data_descriptors: BTreeMap::new(),
             materializations: BTreeMap::new(),
         };
-        for (fingerprint, summary, data) in entries {
+        for (fingerprint, summary, data, pane_origin_ms) in entries {
             let materialization = SummaryDefinitionId::from(fingerprint);
             summary
                 .validate()
@@ -133,6 +167,7 @@ impl SummaryCatalog {
             let binding = SummaryDefinitionIdentity {
                 summary_descriptor_id: summary.id().clone(),
                 data_descriptor_id: data.id().clone(),
+                pane_origin_ms,
             };
             if catalog
                 .materializations
@@ -296,6 +331,23 @@ mod tests {
         let decoded: SummaryCatalog = serde_json::from_slice(&bytes).unwrap();
         decoded.validate().unwrap();
         assert_eq!(decoded, forward);
+    }
+
+    #[test]
+    fn catalog_persists_definition_pane_origin() {
+        let mut materialization = config("requests", "", 60);
+        materialization.pane_origin_ms = Some(7_000);
+        let id = SummaryDefinitionId::from(materialization.policy_fingerprint());
+        let catalog = SummaryCatalog::from_materializations(7, 2, &[materialization]).unwrap();
+        assert_eq!(catalog.materializations[&id].pane_origin_ms, Some(7_000));
+
+        let mut legacy = serde_json::to_value(&catalog).unwrap();
+        legacy["materializations"][id.as_u64().to_string()]
+            .as_object_mut()
+            .unwrap()
+            .remove("pane_origin_ms");
+        let decoded: SummaryCatalog = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.materializations[&id].pane_origin_ms, None);
     }
 
     // The same materialization cannot silently rebind to another population.

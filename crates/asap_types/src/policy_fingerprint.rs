@@ -12,7 +12,7 @@
 //!
 //! `PolicyFingerprint = h(metric, agg_type, sub_type, parameters,
 //! grouping_labels, aggregated_labels, rollup_labels, window_size,
-//! slide_interval, window_type, spatial_filter_normalized)`
+//! slide_interval, window_type, pane_origin_ms, spatial_filter_normalized)`
 //!
 //! The hash includes **every** field of `AggregationConfig` that
 //! determines what the policy does — sketch / exact-agg shape,
@@ -148,7 +148,18 @@ impl PolicyFingerprint {
         );
         buf.push(0);
 
-        // 9. spatial_filter_normalized — canonicalized predicate
+        // 9. pane origin. Presence is explicit so a legacy definition with
+        // unknown phase cannot alias an epoch-aligned definition.
+        match cfg.pane_origin_ms {
+            Some(origin) => {
+                buf.push(1);
+                buf.extend_from_slice(&origin.to_le_bytes());
+            }
+            None => buf.push(0),
+        }
+        buf.push(0);
+
+        // 10. spatial_filter_normalized — canonicalized predicate
         buf.extend_from_slice(cfg.spatial_filter_normalized.as_bytes());
 
         Self(xxh64(&buf, 0))

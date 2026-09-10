@@ -6,7 +6,7 @@
     "repeating_queries": [
       {
         "query": "quantile_over_time(0.99, m[1m])",
-        "demand": { "fixed_interval": 10000 },
+        "demand": { "fixed_interval_at": { "interval": 10000, "evaluation_phase": 0 } },
         "requirements": {
           "accuracy": {
             "explicit": {

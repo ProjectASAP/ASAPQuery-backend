@@ -811,6 +811,7 @@ mod hybrid_tests {
                         .into(),
                         output_grouping: PhysicalGrouping::PerEntity,
                         window_ms: 300_000,
+                        pane_origin_ms: Some(0),
                         readout_lookback_ms: Some(300_000),
                     })
                 },

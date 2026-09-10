@@ -466,6 +466,7 @@ mod tests {
                             materialization: policy.into(),
                             output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 1_000,
+                            pane_origin_ms: Some(0),
                             readout_lookback_ms: Some(1_000),
                         },
                     },
