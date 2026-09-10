@@ -1265,7 +1265,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                     &dp.attrs.keys().cloned().collect(),
                                 )
                             });
-                        if observed_policy != frame.materialization {
+                        if observed_policy != frame.materialization.fingerprint() {
                             unreachable!(
                                 "materialization changed after successful request preflight"
                             );
@@ -1637,7 +1637,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 debug!(
                                     plan_id = frame.plan_id,
                                     plan_version = frame.plan_version,
-                                    materialization = frame.materialization.0,
+                                    materialization = frame.materialization.as_u64(),
                                     producer = %frame.producer_id,
                                     producer_epoch = %frame.producer_epoch,
                                     sequence = frame.sequence,
@@ -1652,7 +1652,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 warn!(
                                     plan_id = frame.plan_id,
                                     plan_version = frame.plan_version,
-                                    materialization = frame.materialization.0,
+                                        materialization = frame.materialization.as_u64(),
                                     producer = %frame.producer_id,
                                     producer_epoch = %frame.producer_epoch,
                                     sequence = frame.sequence,
@@ -2237,10 +2237,10 @@ fn preflight_summary_frames(
                 &dp.attrs.keys().cloned().collect(),
             )
         };
-        if observed != frame.materialization {
+        if observed != frame.materialization.fingerprint() {
             return Err(format!(
                 "summary frame for {metric_name} declares materialization {} but active schema resolves {}",
-                frame.materialization.0, observed.0
+                frame.materialization.as_u64(), observed.0
             ));
         }
         Ok(frame)
@@ -2392,7 +2392,7 @@ fn take_summary_frame_identity(
         plan_id,
         plan_version,
         backend_compat,
-        materialization,
+        materialization: materialization.into(),
         series_identity,
         schema_id,
         producer_id,
@@ -4695,7 +4695,7 @@ mod sid_bucketing_tests {
         let frame = take_summary_frame_identity(&mut attrs, 100, 200).expect("valid identity");
         assert_eq!(frame.plan_id, 42);
         assert_eq!(frame.plan_version, 3);
-        assert_eq!(frame.materialization, asap_types::PolicyFingerprint(99));
+        assert_eq!(frame.materialization, asap_types::PolicyFingerprint(99).into());
         assert_eq!(attrs, HashMap::from([("service".into(), "api".into())]));
     }
 }
