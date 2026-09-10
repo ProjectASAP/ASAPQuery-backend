@@ -301,23 +301,22 @@ pub fn noop_reader_factory() -> ReaderFactory {
 /// * [`BackfillSource::Prometheus`] — routed to
 ///   [`super::prometheus_reader::PrometheusReader`].
 ///
-/// All other variants (`S3Gorilla`, `OtherSketch`) return a clear
+/// Other variants return a clear
 /// "not yet implemented" error, which the worker surfaces on
 /// `BackfillJob::error_message` so the control plane / operator sees
 /// exactly which reader is missing.
 pub fn default_reader_factory() -> ReaderFactory {
-    Arc::new(|source| {
-        match source {
+    Arc::new(|source| match source {
         BackfillSource::Prometheus { url } => {
             let reader = super::prometheus_reader::PrometheusReader::new(url.clone());
             Ok(Arc::new(reader) as Arc<dyn RawSampleReader>)
         }
-        BackfillSource::S3Gorilla { .. }
+        BackfillSource::ClickHouse { .. }
+        | BackfillSource::S3Gorilla { .. }
         | BackfillSource::OtherSketch { .. } => Err(format!(
-            "reader for {source:?} not yet implemented; only Prometheus is wired in-tree as of Phase 5h"
+            "no reader configured for {source:?}; ClickHouse requires its deployment reader factory"
         )
         .into()),
-    }
     })
 }
 

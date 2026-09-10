@@ -317,7 +317,7 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
             "agg_id": config.policy_fp_u64(),
             "start_ms": 0,
             "end_ms": 2000,
-            "source": {"Prometheus": {"url": "clickhouse://configured"}},
+            "source": {"ClickHouse": {"database": "default", "table": "telemetry"}},
             "windows_total": 1
         }))
         .send()

@@ -792,8 +792,9 @@ mod tests {
         let job = registry.create(
             cfg.policy_fp_u64(),
             (0, 2_000),
-            crate::storage_engines::sketch_db::backfill::BackfillSource::Prometheus {
-                url: "clickhouse://configured".into(),
+            crate::storage_engines::sketch_db::backfill::BackfillSource::ClickHouse {
+                database: "asap_e2e".into(),
+                table: "samples".into(),
             },
             2,
         );
