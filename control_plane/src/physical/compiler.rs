@@ -1986,6 +1986,9 @@ fn preserve_native_unsafe_raw_roots(queries: &mut [PlanningQuery]) -> Result<(),
                     reason,
                 }
             })?;
+        if selected.is_empty() {
+            continue;
+        }
         let executable =
             planner_types::post_asap::compile_executable_dag_with_node_ids(&query.post_asap)
                 .map_err(|error| CompileError::Query {
