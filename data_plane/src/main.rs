@@ -1384,24 +1384,19 @@ async fn main() -> Result<()> {
 
     let victoria_task = victoria_server.map(|server| tokio::spawn(server.run()));
 
-    let clickhouse_accelerator = if args.clickhouse_http_port.is_some() {
-        let accelerator = Arc::new(
-            data_plane::query_engines::asap_clickhouse_query_engine::accelerator::CatalogClickHouseAccelerator::with_active_physical_plan(
-                sketch_index.clone(),
-                active_physical_plan.clone(),
-            ),
-        );
-        Some(accelerator)
-    } else {
-        None
-    };
-
     let clickhouse_server_handle = args.clickhouse_http_port.map(|port| {
         let fallback = Arc::new(
             data_plane::query_engines::asap_clickhouse_query_engine::ClickHouseHttpFallback::new(
                 args.clickhouse_url.clone(),
                 args.clickhouse_database.clone(),
             ),
+        );
+        let accelerator = Arc::new(
+            data_plane::query_engines::asap_clickhouse_query_engine::accelerator::CatalogClickHouseAccelerator::with_active_physical_plan(
+                sketch_index.clone(),
+                active_physical_plan.clone(),
+            )
+            .with_exact_backend(fallback.clone()),
         );
         let clickhouse_server =
             data_plane::query_engines::asap_clickhouse_query_engine::ClickHouseHttpServer {
@@ -1410,10 +1405,7 @@ async fn main() -> Result<()> {
             };
         info!("Starting ClickHouse-compatible HTTP proxy on port {port}");
         tokio::spawn(async move {
-            let result = match clickhouse_accelerator {
-                Some(accelerator) => clickhouse_server.run_with_accelerator(accelerator).await,
-                None => clickhouse_server.run().await,
-            };
+            let result = clickhouse_server.run_with_accelerator(accelerator).await;
             if let Err(error) = result {
                 error!("ClickHouse HTTP server error: {error}");
             }

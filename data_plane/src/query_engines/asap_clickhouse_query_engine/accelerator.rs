@@ -299,6 +299,90 @@ mod tests {
         rc::Rc,
     };
 
+    fn mixed_summary_external_entry(mut entry: QueryPlanEntry) -> QueryPlanEntry {
+        let left = QueryNodeId(1);
+        let external = QueryNodeId(6);
+        let join = QueryNodeId(7);
+        let project = QueryNodeId(8);
+        let left_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("value", DataType::Float64),
+        ]);
+        let right_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("divisor", DataType::Float64),
+        ]);
+        let joined_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("value", DataType::Float64),
+            ("timestamp", DataType::Timestamp),
+            ("divisor", DataType::Float64),
+        ]);
+        let output_schema = relation_schema(&[
+            ("timestamp", DataType::Timestamp),
+            ("ratio", DataType::Float64),
+        ]);
+        entry
+            .nodes
+            .retain(|id, _| *id == QueryNodeId(0) || *id == left);
+        entry.nodes.insert(external, QueryPlanNode::ExternalExact {
+            request: ExternalExactRequest {
+                language: QueryLanguage::ClickHouseSql,
+                expression: "SELECT toInt64(2000) AS timestamp, toFloat64(10) AS divisor WHERE {from:UInt64} <= {to:UInt64}".into(),
+                output: ExternalExactOutput::Relation { schema: serde_json::to_value(&right_schema).unwrap() },
+                parameters: BTreeMap::new(),
+                start_parameter: Some("from".into()),
+                end_parameter: Some("to".into()),
+                input_contracts: vec![],
+            },
+            inputs: vec![],
+        });
+        entry.nodes.insert(
+            join,
+            QueryPlanNode::RelationalJoin {
+                inputs: [left, external],
+                join_kind: planner_types::pre_asap::JoinKind::Inner,
+                pred: serde_json::to_value(Predicate(Rc::new(QueryExpr::Compare {
+                    left: Rc::new(QueryExpr::Column(0)),
+                    op: CompareOpKind::Eq,
+                    right: Rc::new(QueryExpr::Column(2)),
+                })))
+                .unwrap(),
+                left_schema,
+                right_schema,
+                output_schema: joined_schema.clone(),
+            },
+        );
+        entry.nodes.insert(
+            project,
+            QueryPlanNode::Relational {
+                input: join,
+                operation: serde_json::to_value(ValueOperation::Project {
+                    cols: vec![
+                        ProjectItem {
+                            alias: Some("timestamp".into()),
+                            expr: QueryExpr::Column(0),
+                        },
+                        ProjectItem {
+                            alias: Some("ratio".into()),
+                            expr: QueryExpr::Arithmetic {
+                                op: ArithmeticOpKind::Div,
+                                left: Rc::new(QueryExpr::Column(1)),
+                                right: Rc::new(QueryExpr::Column(3)),
+                            },
+                        },
+                    ],
+                    qualifier: None,
+                })
+                .unwrap(),
+                input_schema: joined_schema,
+                output_schema,
+            },
+        );
+        entry.root = project;
+        entry
+    }
+
     fn relation_schema(names: &[(&str, DataType)]) -> SummarySchema {
         SummarySchema {
             fields: names
@@ -514,23 +598,23 @@ mod tests {
         store
             .install_summary_catalog(Arc::new(sds.clone()))
             .unwrap();
-        store.register(SketchInstanceMetadata {
-            sid: 7,
-            metric_name: "requests".into(),
-            group_by_keys: BTreeSet::new(),
-            capability: Some(Capability::ExactAgg(AggregationType::Sum)),
-            agg_kind: AggKind::ExactAgg {
-                agg_type: AggregationType::Sum,
-                parameters_canonical: String::new(),
-                spatial_filter_canonical: String::new(),
-            },
-            accuracy: None,
-            first_seen_unix_ms: 0,
-            retired_at_ms: None,
-            expires_at_ms: None,
-            policy_fp: materialization.fingerprint(),
-        });
         if seed {
+            store.register(SketchInstanceMetadata {
+                sid: 7,
+                metric_name: "requests".into(),
+                group_by_keys: BTreeSet::new(),
+                capability: Some(Capability::ExactAgg(AggregationType::Sum)),
+                agg_kind: AggKind::ExactAgg {
+                    agg_type: AggregationType::Sum,
+                    parameters_canonical: String::new(),
+                    spatial_filter_canonical: String::new(),
+                },
+                accuracy: None,
+                first_seen_unix_ms: 0,
+                retired_at_ms: None,
+                expires_at_ms: None,
+                policy_fp: materialization.fingerprint(),
+            });
             store.append_precompute(
                 7,
                 Default::default(),
@@ -635,7 +719,7 @@ mod tests {
             if let Some(user) = &user { request = request.basic_auth(user, password.as_ref()); }
             assert!(request.send().await.unwrap().status().is_success());
         }
-        let cfg = PrecomputeMaterialization::new(
+        let mut cfg = PrecomputeMaterialization::new(
             AggregationType::Sum,
             String::new(),
             Default::default(),
@@ -652,6 +736,7 @@ mod tests {
             None,
             None,
         );
+        cfg.pane_origin_ms = Some(0);
         let hot = crate::storage_engines::types::HotReloadStreamingConfig::from_arc(Arc::new(
             crate::storage_engines::types::StreamingConfig::new(HashMap::from([(
                 cfg.policy_fp_u64(),
@@ -711,10 +796,11 @@ mod tests {
             .series_ids_for_policy(cfg.policy_fingerprint())
             .is_empty());
         let (accelerator, request) = fixture_with_store(2_000, store, false).await;
-        let ClickHouseAccelerationOutcome::Accelerated(response) =
-            accelerator.execute(&request).await
-        else {
-            panic!("published SQL DAG did not read ClickHouse-backfilled SummaryStore state")
+        let response = match accelerator.execute(&request).await {
+            ClickHouseAccelerationOutcome::Accelerated(response) => response,
+            outcome => panic!(
+                "published SQL DAG did not read ClickHouse-backfilled SummaryStore state: {outcome:?}"
+            ),
         };
         assert_eq!(response.body, "1970-01-01T00:00:02\t50.0\n");
         let mut exact = client.post(std::env::var("CLICKHOUSE_URL").unwrap()).body(
@@ -752,87 +838,9 @@ mod tests {
             .as_ref()
             .unwrap()
             .snapshot();
-        let mut entry = physical.query_plan.entries.values().next().unwrap().clone();
-        let left = QueryNodeId(1);
-        let external = QueryNodeId(6);
-        let join = QueryNodeId(7);
-        let project = QueryNodeId(8);
-        let left_schema = relation_schema(&[
-            ("timestamp", DataType::Timestamp),
-            ("value", DataType::Float64),
-        ]);
-        let right_schema = relation_schema(&[
-            ("timestamp", DataType::Timestamp),
-            ("divisor", DataType::Float64),
-        ]);
-        let joined_schema = relation_schema(&[
-            ("timestamp", DataType::Timestamp),
-            ("value", DataType::Float64),
-            ("timestamp", DataType::Timestamp),
-            ("divisor", DataType::Float64),
-        ]);
-        let output_schema = relation_schema(&[
-            ("timestamp", DataType::Timestamp),
-            ("ratio", DataType::Float64),
-        ]);
-        entry
-            .nodes
-            .retain(|id, _| *id == QueryNodeId(0) || *id == left);
-        entry.nodes.insert(external, QueryPlanNode::ExternalExact {
-            request: ExternalExactRequest {
-                language: QueryLanguage::ClickHouseSql,
-                expression: "SELECT toInt64(2000) AS timestamp, toFloat64(10) AS divisor WHERE {from:UInt64} <= {to:UInt64}".into(),
-                output: ExternalExactOutput::Relation { schema: serde_json::to_value(&right_schema).unwrap() },
-                parameters: BTreeMap::new(),
-                start_parameter: Some("from".into()),
-                end_parameter: Some("to".into()),
-                input_contracts: vec![],
-            },
-            inputs: vec![],
-        });
-        entry.nodes.insert(
-            join,
-            QueryPlanNode::RelationalJoin {
-                inputs: [left, external],
-                join_kind: planner_types::pre_asap::JoinKind::Inner,
-                pred: serde_json::to_value(Predicate(Rc::new(QueryExpr::Compare {
-                    left: Rc::new(QueryExpr::Column(0)),
-                    op: CompareOpKind::Eq,
-                    right: Rc::new(QueryExpr::Column(2)),
-                })))
-                .unwrap(),
-                left_schema,
-                right_schema,
-                output_schema: joined_schema.clone(),
-            },
+        let entry = mixed_summary_external_entry(
+            physical.query_plan.entries.values().next().unwrap().clone(),
         );
-        entry.nodes.insert(
-            project,
-            QueryPlanNode::Relational {
-                input: join,
-                operation: serde_json::to_value(ValueOperation::Project {
-                    cols: vec![
-                        ProjectItem {
-                            alias: Some("timestamp".into()),
-                            expr: QueryExpr::Column(0),
-                        },
-                        ProjectItem {
-                            alias: Some("ratio".into()),
-                            expr: QueryExpr::Arithmetic {
-                                op: ArithmeticOpKind::Div,
-                                left: Rc::new(QueryExpr::Column(1)),
-                                right: Rc::new(QueryExpr::Column(3)),
-                            },
-                        },
-                    ],
-                    qualifier: None,
-                })
-                .unwrap(),
-                input_schema: joined_schema,
-                output_schema,
-            },
-        );
-        entry.root = project;
         let accelerator = accelerator.with_exact_backend(Arc::new(FixedExactSubtree));
         let prepared = accelerator
             .prepare_external_exact(&entry, 0, 2_000, &request)
@@ -853,5 +861,56 @@ mod tests {
             String::from_utf8(result.encode(ClickHouseFormat::TabSeparated).unwrap()).unwrap(),
             "1970-01-01T00:00:02\t0.5\n"
         );
+    }
+
+    #[tokio::test]
+    async fn real_clickhouse_external_leaf_matches_exact_query_in_mixed_dag() {
+        let Ok(base_url) = std::env::var("CLICKHOUSE_URL") else {
+            return;
+        };
+        let (accelerator, mut request) = fixture(2_000).await;
+        if let Ok(user) = std::env::var("CLICKHOUSE_USER") {
+            request
+                .headers
+                .insert("x-clickhouse-user", user.parse().unwrap());
+        }
+        if let Ok(password) = std::env::var("CLICKHOUSE_PASSWORD") {
+            request
+                .headers
+                .insert("x-clickhouse-key", password.parse().unwrap());
+        }
+        let physical = accelerator
+            .active_physical_plan
+            .as_ref()
+            .unwrap()
+            .snapshot();
+        let mut query_plan = physical.query_plan.as_ref().clone();
+        let key = query_plan.entries.keys().next().unwrap().clone();
+        let entry = mixed_summary_external_entry(query_plan.entries[&key].clone());
+        query_plan.entries.insert(key, entry);
+        let mut active = physical.as_ref().clone();
+        active.query_plan = Arc::new(query_plan);
+        let exact_backend = Arc::new(super::super::fallback::ClickHouseHttpFallback::new(
+            base_url,
+            "default".into(),
+        ));
+        let accelerator = CatalogClickHouseAccelerator::with_active_physical_plan(
+            accelerator.store.clone(),
+            crate::storage_engines::types::HotReloadActivePhysicalPlan::new(active),
+        )
+        .with_exact_backend(exact_backend.clone());
+        let ClickHouseAccelerationOutcome::Accelerated(response) =
+            accelerator.execute(&request).await
+        else {
+            panic!("real ClickHouse mixed summary/external DAG should accelerate")
+        };
+        let mut exact_request = request;
+        exact_request.method = Method::POST;
+        exact_request.sql = "SELECT formatDateTime(toDateTime(2), '%Y-%m-%dT%H:%i:%S') AS timestamp, toFloat64(5) / toFloat64(10) AS ratio FORMAT TabSeparated".into();
+        exact_request.body = Bytes::from(exact_request.sql.clone());
+        exact_request.parameters.clear();
+        let exact = exact_backend.execute(&exact_request).await.unwrap();
+        assert_eq!(exact.status, StatusCode::OK);
+        assert_eq!(response.body, exact.body);
     }
 }
