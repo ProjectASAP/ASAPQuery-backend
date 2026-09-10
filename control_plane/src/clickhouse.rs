@@ -400,6 +400,7 @@ fn select_materialization<'a>(
 mod tests {
     use super::*;
     use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    use planner_types::pre_asap::{Column, DataType, Schema};
 
     fn materialization(
         agg: AggregationType,
@@ -513,5 +514,88 @@ mod tests {
                 .to_string()
                 .contains("ambiguous")
         );
+    }
+
+    #[tokio::test]
+    async fn compiles_summary_joined_with_exact_table_into_mixed_dag() {
+        let config = materialization(
+            AggregationType::Sum,
+            "value",
+            2,
+            2,
+            ("variant", serde_json::json!(1)),
+        );
+        let sds = SummaryCatalog::from_materializations(71, 1, &[config.clone()]).unwrap();
+        let envelope = crate::physical::compiler::PlanEnvelope {
+            plan_id: 71,
+            plan_version: 1,
+            generated_at_unix_ms: 0,
+            activation_unix_ms: 0,
+            expiry_unix_ms: None,
+            backend_compat: crate::physical::compiler::BACKEND_COMPAT.into(),
+            planner_revision: crate::physical::compiler::PLANNER_REVISION.into(),
+            capability_snapshot_id: "clickhouse-mixed-compile-test".into(),
+        };
+        let mut precompute =
+            PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
+        precompute.summary_catalog = Some(sds.reference().unwrap());
+        let mut transmission =
+            TransmissionPlan::build(envelope, &precompute, &std::collections::BTreeMap::new())
+                .unwrap();
+        transmission.summary_catalog = Some(sds.reference().unwrap());
+        let timestamped = |time_name: &str, value_name: &str| {
+            Schema::with_time_index(
+                vec![
+                    Column::new(time_name, DataType::Timestamp, false),
+                    Column::new(value_name, DataType::Float64, false),
+                ],
+                0,
+                vec![],
+            )
+        };
+        let request = ClickHouseSqlWorkload {
+            sds,
+            precompute_plan: precompute,
+            transmission_plan: transmission,
+            tables: HashMap::from([
+                ("telemetry".into(), timestamped("timestamp_ms", "value")),
+                (
+                    "divisors".into(),
+                    Schema::with_time_index(
+                        vec![
+                            Column::new("timestamp", DataType::Int64, false),
+                            Column::new("divisor", DataType::Float64, false),
+                        ],
+                        0,
+                        vec![],
+                    ),
+                ),
+            ]),
+            accuracy: AccuracyTarget::Exact,
+            queries: vec![ClickHouseSqlWorkloadEntry {
+                sql: "SELECT sums.timestamp, sums.total / divisors.divisor AS ratio FROM (SELECT 2000 AS timestamp, sum(value) AS total FROM telemetry WHERE timestamp_ms >= 0 AND timestamp_ms < 2000) AS sums INNER JOIN divisors ON sums.timestamp = divisors.timestamp".into(),
+                start_ms: 0,
+                end_ms: 2_000,
+                cumulative: true,
+            }],
+        };
+        let publication = compile_clickhouse_workload(&request).await.unwrap();
+        let entry = publication.query_plan.entries.values().next().unwrap();
+        assert!(entry
+            .nodes
+            .values()
+            .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExternalExact { .. })));
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            crate::query_plan::QueryPlanNode::ReadMaterialization { .. }
+        )));
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            crate::query_plan::QueryPlanNode::RelationalJoin { .. }
+        )));
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            crate::query_plan::QueryPlanNode::RelationalProject { .. }
+        )));
     }
 }
