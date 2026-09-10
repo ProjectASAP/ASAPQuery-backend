@@ -14,7 +14,7 @@ pub mod summary_catalog;
 pub mod traits;
 pub mod utils;
 
-pub use accumulator_spec::{AccumulatorSpec, AccumulatorSpecError};
+pub use accumulator_spec::{AccumulatorSpec, AccumulatorSpecError, SampleUpdateRule};
 pub use aggregation_config::*;
 pub use aggregation_type::AggregationType;
 pub use enums::*;

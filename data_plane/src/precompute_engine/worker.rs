@@ -12,6 +12,7 @@ use crate::storage_engines::types::{
 };
 use asap_types::aggregation_config::AggregationConfig;
 use asap_types::PolicyFingerprint;
+use asap_types::SampleUpdateRule;
 use std::collections::{BTreeMap, HashMap};
 // (PolicyFingerprint is used for both `PolicyFingerprint::from_config(...)`
 //  on the emit path and the `policy_fp` field of GroupState below.)
@@ -493,13 +494,10 @@ impl Worker {
                         // Never feed the raw counter value into a membership
                         // heap; the authoritative ExactCounter branch remains
                         // responsible for the visible result.
-                        if state
-                            .config
-                            .parameters
-                            .get("weight_mode")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("counter_delta")
-                        {
+                        if matches!(
+                            state.config.sample_update_rule(),
+                            SampleUpdateRule::CounterDelta { .. }
+                        ) {
                             record_late_input("drop", "counter_delta_membership");
                             continue;
                         }
@@ -529,12 +527,8 @@ impl Worker {
             // only closes an idle pane, not a long-running bulk ingest whose
             // records share one event timestamp.
             state.touch_pane(pane_start, now_ms);
-            let value = if state
-                .config
-                .parameters
-                .get("weight_mode")
-                .and_then(serde_json::Value::as_str)
-                == Some("counter_delta")
+            let value = if let SampleUpdateRule::CounterDelta { .. } =
+                state.config.sample_update_rule()
             {
                 let Some(delta) =
                     reset_aware_counter_delta(&mut state.counter_previous, series_key, *val, *ts)
