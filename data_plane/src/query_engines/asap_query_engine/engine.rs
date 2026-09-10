@@ -3601,7 +3601,7 @@ mod range_stitch_tests {
             ))
             .unwrap();
         let mut plan = snapshot.compile().unwrap();
-        let identity = asap_frontend_metricsql::canonical_metricsql("1 + 2").unwrap();
+        let identity = control_plane::query_plan::canonical_promql("1 + 2").unwrap();
         plan.query_plan.entries.insert(
             control_plane::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity),
             QueryPlanEntry {

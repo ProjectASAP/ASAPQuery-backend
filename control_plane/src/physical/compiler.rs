@@ -2580,16 +2580,14 @@ impl PhysicalCompiler {
             .collect();
         let mut query_entries = BTreeMap::new();
         for (query_index, query) in request.queries.iter().enumerate() {
-            let canonical = if metricsql {
-                asap_frontend_metricsql::canonical_metricsql(&query.query_string).map_err(
-                    |error| CompileError::Query {
-                        query_id: query.query_id.clone(),
-                        reason: format!("frontend.metricsql.identity: {error}"),
-                    },
-                )?
-            } else {
-                canonical_promql(&query.query_string)?
-            };
+            // VictoriaMetrics acceleration accepts only the shared
+            // PromQL-compatible parser contract. MetricsQL-only syntax fails
+            // closed here and remains eligible for exact VM execution.
+            let canonical =
+                canonical_promql(&query.query_string).map_err(|error| CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason: format!("promql-compatible identity: {error}"),
+                })?;
             let binding = |node: &Rc<SummaryNode>, node_family: &SummaryFamilyType| -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
                     summary_agg_metric(node).ok_or_else(|| {
                         crate::query_plan::QueryPlanError::Invalid(
@@ -4613,17 +4611,17 @@ mod tests {
 
     #[test]
     fn metricsql_compilation_publishes_a_language_tagged_query_entry() {
-        let query = "default_rollup(m[1m])";
+        let query = "mad_over_time(m[1m])";
         let mut workload = request("vm-q", "last_over_time(m[1m])");
         let accuracy = workload.queries[0].accuracy.clone();
-        let canonical = asap_frontend_metricsql::lower_metricsql(query, accuracy.clone()).unwrap();
+        let canonical = asap_frontend_promql::lower_promql(query, accuracy.clone()).unwrap();
         workload.queries[0].query_string = query.into();
         workload.queries[0].post_asap =
             crate::planner_selection::keep_pre_asap(&canonical).unwrap();
         let plan = PhysicalCompiler
             .compile_metricsql(workload, environment(10_000))
             .unwrap();
-        let identity = asap_frontend_metricsql::canonical_metricsql(query).unwrap();
+        let identity = canonical_promql(query).unwrap();
         let entry = plan
             .query_plan
             .lookup_canonical(crate::query_plan::QueryLanguage::MetricsQl, &identity)

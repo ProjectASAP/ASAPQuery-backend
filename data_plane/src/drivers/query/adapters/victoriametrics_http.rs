@@ -103,9 +103,9 @@ impl HttpProtocolAdapter for VictoriaMetricsHttpAdapter {
         "VictoriaMetrics HTTP / MetricsQL"
     }
     fn canonical_plan_identity(&self, query: &str) -> Result<Option<String>, AdapterError> {
-        asap_frontend_metricsql::canonical_metricsql(query)
+        control_plane::query_plan::canonical_promql(query)
             .map(Some)
-            .map_err(|error| AdapterError::ParseError(format!("frontend.metricsql: {error}")))
+            .map_err(|error| AdapterError::ParseError(format!("promql-compatible subset: {error}")))
     }
     fn get_runtime_info_path(&self) -> &'static str {
         "/api/v1/status/runtimeinfo"
@@ -156,5 +156,22 @@ mod tests {
     fn exposes_victoriametrics_query_endpoints() {
         assert_eq!(adapter().get_query_endpoint(), "/api/v1/query");
         assert_eq!(adapter().get_range_query_endpoint(), "/api/v1/query_range");
+    }
+
+    #[test]
+    fn identity_tracks_the_shared_parser_boundary() {
+        for query in [
+            "mad_over_time(cpu_usage[5m])",
+            "distinct_over_time(cpu_usage[5m])",
+            "entropy_over_time(cpu_usage[5m])",
+        ] {
+            assert!(adapter().canonical_plan_identity(query).unwrap().is_some());
+        }
+        for query in [
+            "default_rollup(cpu_usage[5m])",
+            "topk_over_time(3, cpu_usage[5m])",
+        ] {
+            assert!(adapter().canonical_plan_identity(query).is_err());
+        }
     }
 }
