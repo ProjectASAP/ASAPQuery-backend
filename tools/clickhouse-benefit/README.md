@@ -42,6 +42,7 @@ python3 tools/clickhouse-benefit/extract_series.py /path/to/data.prom \
 CLICKHOUSE_BENCH_INPUT=/path/to/series.jsonl \
 CLICKHOUSE_BENCH_METRIC=service_cache_refresh_lag_seconds \
 CLICKHOUSE_BENCH_END_MS=1788891296001 \
+CLICKHOUSE_BENCH_REPETITIONS=1000 \
 CLICKHOUSE_BENCH_OUTPUT=/path/to/results/real-series.json \
 CLICKHOUSE_URL=http://127.0.0.1:8123 \
 cargo test --release -p data_plane --test clickhouse_q05_process_e2e -- --nocapture
@@ -68,3 +69,6 @@ are not cold filesystem-cache measurements. Process CPU includes background
 work, and RSS/high-water marks cover the whole process. Input loading and
 backfill happen before the repeated-query phase, and their costs remain in the
 separate build-phase record.
+The reported serial service rate is the reciprocal mean request latency, not a
+concurrent throughput test. `CLICKHOUSE_BENCH_REPETITIONS` defaults to 100 per
+route; longer runs reduce the relative scheduler-tick quantization error.

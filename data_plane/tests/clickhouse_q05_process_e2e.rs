@@ -404,7 +404,12 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
         let clickhouse_pre_query = clickhouse_pid.map(process_snapshot);
         let query_started = std::time::Instant::now();
         let mut requests = Vec::new();
-        for iteration in 0..100 {
+        let iterations = std::env::var("CLICKHOUSE_BENCH_REPETITIONS")
+            .ok()
+            .map(|value| value.parse::<usize>().expect("valid repeat count"))
+            .unwrap_or(100);
+        assert!(iterations > 0);
+        for iteration in 0..iterations {
             for route in if iteration % 2 == 0 {
                 ["warm", "exact"]
             } else {

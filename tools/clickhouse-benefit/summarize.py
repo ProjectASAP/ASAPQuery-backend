@@ -28,6 +28,7 @@ def main():
             )
         routes[route] = {"requests": len(rows), "median_ms": statistics.median(latencies),
                          "p95_ms": latencies[math.ceil(len(latencies) * .95) - 1],
+                         "serial_service_requests_per_second": len(rows) * 1000 / sum(latencies),
                          "all_http_200": all(row["status"] == 200 for row in rows),
                          "execution_modes": sorted({str(row["execution"]) for row in rows}), **cpu}
     summary = {"artifact": str(args.artifact.resolve()), "git_head": data["git_head"],
