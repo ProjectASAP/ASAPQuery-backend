@@ -1,7 +1,7 @@
 """Fail-closed validation for calibrated CandidateTopK artifacts."""
 import unittest
 
-from calibrate_runtime import validate_candidate_topk_artifact
+from calibrate_runtime import validate_candidate_topk_artifact, validate_candidate_topk_execution
 
 
 class CandidateTopKArtifactTests(unittest.TestCase):
@@ -40,6 +40,32 @@ class CandidateTopKArtifactTests(unittest.TestCase):
             "query_plan": {"entries": {"q": {"nodes": {"0": {"op": "exact_fallback"}}}}},
             "precompute_plan": {"schemas": []},
         }})
+
+    def test_rejects_exact_value_fallback(self):
+        artifact = self.artifact({"op": "read_materialization", "binding": {"materialization": 7}})
+        artifact["install_request"]["query_plan"]["entries"]["q"]["nodes"]["3"] = {"op": "exact_fallback"}
+        with self.assertRaisesRegex(ValueError, "contains ExactFallback"):
+            validate_candidate_topk_artifact(artifact)
+
+    def test_rejects_missing_or_cyclic_input_nodes(self):
+        artifact = self.artifact({"op": "summary_estimate", "input": 99})
+        with self.assertRaisesRegex(ValueError, "missing node 99"):
+            validate_candidate_topk_artifact(artifact)
+        artifact = self.artifact({"op": "summary_estimate", "input": 2})
+        with self.assertRaisesRegex(ValueError, "contains a cycle"):
+            validate_candidate_topk_artifact(artifact)
+
+    def test_requires_two_local_summary_readouts_at_runtime(self):
+        artifact = self.artifact({"op": "read_materialization", "binding": {"materialization": 7}})
+        provenance = {"summary_readout_evaluations": 2, "exact_subquery_rpcs": 0,
+                      "exact_subquery_evaluations": 0, "exact_branch_evaluations": 0}
+        validate_candidate_topk_execution(artifact, [{"execution": "warm", "execution_provenance": provenance}])
+        with self.assertRaisesRegex(ValueError, "both summary branches"):
+            validate_candidate_topk_execution(artifact, [{"execution": "warm", "execution_provenance": {
+                **provenance, "summary_readout_evaluations": 1}}])
+        with self.assertRaisesRegex(ValueError, "used exact path"):
+            validate_candidate_topk_execution(artifact, [{"execution": "warm", "execution_provenance": {
+                **provenance, "exact_subquery_rpcs": 1}}])
 
 
 if __name__ == "__main__":
