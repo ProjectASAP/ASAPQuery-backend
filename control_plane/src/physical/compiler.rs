@@ -1920,8 +1920,7 @@ impl BackendLocalPlanningSnapshot {
 /// unless the selected DAG explicitly authorizes pooling the source entities.
 fn has_unsafe_raw_entity_leaf(
     node: &Rc<SummaryNode>,
-    node_ids: &planner_types::post_asap::ExecutableNodeIdentityMap,
-    selected: &BTreeSet<PostAsapNodeId>,
+    selected: &[Rc<SummaryNode>],
     pooling: bool,
 ) -> bool {
     use planner_types::post_asap::ExactKind;
@@ -1933,10 +1932,7 @@ fn has_unsafe_raw_entity_leaf(
             family,
             ..
         } => {
-            if node_ids
-                .node_id(node)
-                .is_some_and(|node_id| selected.contains(&node_id))
-            {
+            if selected.iter().any(|selected| Rc::ptr_eq(selected, node)) {
                 let preserves_series_state = matches!(
                     family,
                     SummaryFamilyType::ExactAggregate(
@@ -1960,18 +1956,18 @@ fn has_unsafe_raw_entity_leaf(
                         ..
                     }
                 );
-            has_unsafe_raw_entity_leaf(child, node_ids, selected, additive_reduction)
+            has_unsafe_raw_entity_leaf(child, selected, additive_reduction)
         }
         SummaryExpr::BinaryOp { lhs, rhs, .. } => {
-            has_unsafe_raw_entity_leaf(lhs, node_ids, selected, false)
-                || has_unsafe_raw_entity_leaf(rhs, node_ids, selected, false)
+            has_unsafe_raw_entity_leaf(lhs, selected, false)
+                || has_unsafe_raw_entity_leaf(rhs, selected, false)
         }
         SummaryExpr::SummaryEstimate { summary_input, .. } => {
-            has_unsafe_raw_entity_leaf(summary_input, node_ids, selected, false)
+            has_unsafe_raw_entity_leaf(summary_input, selected, false)
         }
         SummaryExpr::SummaryMerge { children } => children
             .iter()
-            .any(|child| has_unsafe_raw_entity_leaf(child, node_ids, selected, false)),
+            .any(|child| has_unsafe_raw_entity_leaf(child, selected, false)),
         _ => false,
     }
 }
@@ -1989,30 +1985,11 @@ fn preserve_native_unsafe_raw_roots(queries: &mut [PlanningQuery]) -> Result<(),
         if selected.is_empty() {
             continue;
         }
-        let executable =
-            planner_types::post_asap::compile_executable_dag_with_node_ids(&query.post_asap)
-                .map_err(|error| CompileError::Query {
-                    query_id: query.query_id.clone(),
-                    reason: format!("invalid executable subDAG: {error}"),
-                })?;
-        let selected_ids = selected
+        let selected_nodes = selected
             .iter()
-            .map(|state| {
-                executable
-                    .node_ids
-                    .node_id(&state.node)
-                    .ok_or_else(|| CompileError::Query {
-                        query_id: query.query_id.clone(),
-                        reason: "selected state is absent from executable Planner DAG".into(),
-                    })
-            })
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        let unsafe_entities = has_unsafe_raw_entity_leaf(
-            &query.post_asap,
-            &executable.node_ids,
-            &selected_ids,
-            false,
-        );
+            .map(|state| Rc::clone(&state.node))
+            .collect::<Vec<_>>();
+        let unsafe_entities = has_unsafe_raw_entity_leaf(&query.post_asap, &selected_nodes, false);
         if unsafe_entities {
             let parsed = crate::query_parser::parse_query_expr_canonical(
                 &query.query_string,
@@ -3898,21 +3875,8 @@ fn collect_selected_materializations(
     let mut selected = Vec::new();
     walk(node, None, composable, None, &mut selected)?;
     if composable {
-        let executable = planner_types::post_asap::compile_executable_dag_with_node_ids(node)
-            .map_err(|error| format!("invalid executable subDAG: {error}"))?;
-        selected.retain(|state| {
-            executable
-                .node_ids
-                .node_id(&state.node)
-                .is_some_and(|node_id| {
-                    !has_unsafe_raw_entity_leaf(
-                        node,
-                        &executable.node_ids,
-                        &BTreeSet::from([node_id]),
-                        false,
-                    )
-                })
-        });
+        selected
+            .retain(|state| !has_unsafe_raw_entity_leaf(node, &[Rc::clone(&state.node)], false));
     }
     if !selected.is_empty() {
         validate_executable_subdag(node)?;
