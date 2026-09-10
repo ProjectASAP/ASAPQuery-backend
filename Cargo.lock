@@ -398,7 +398,7 @@ version = "0.1.0"
 source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=a9651cc#a9651cc3705e7c9e50db8ccff68421fd74a91590"
 dependencies = [
  "asap-types",
- "promql-parser 0.10.0",
+ "promql-parser 0.10.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -977,7 +977,7 @@ dependencies = [
  "http-body-util",
  "parking_lot",
  "prometheus",
- "promql-parser 0.9.0",
+ "promql-parser 0.10.0 (git+https://github.com/ProjectASAP/promql-parser?rev=d7606436bde05efe19c5398fe2122faa49062f7d)",
  "prost",
  "prost-build",
  "reqwest 0.12.28",
@@ -1214,7 +1214,7 @@ dependencies = [
  "memmap2",
  "moka",
  "prometheus",
- "promql-parser 0.5.1",
+ "promql-parser 0.10.0 (git+https://github.com/ProjectASAP/promql-parser?rev=d7606436bde05efe19c5398fe2122faa49062f7d)",
  "prost",
  "regex",
  "reqwest 0.11.27",
@@ -3389,22 +3389,9 @@ dependencies = [
 
 [[package]]
 name = "promql-parser"
-version = "0.5.1"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60d851f6523a8215e2fbf86b6cef4548433f8b76092e9ffb607105de52ae63fd"
-dependencies = [
- "cfgrammar",
- "chrono",
- "lazy_static",
- "lrlex",
- "lrpar",
- "regex",
-]
-
-[[package]]
-name = "promql-parser"
-version = "0.9.0"
-source = "git+https://github.com/ProjectASAP/promql-parser?rev=c51beafb361af4cc95ed62ae377862c660ceb757#c51beafb361af4cc95ed62ae377862c660ceb757"
+checksum = "9e8c90c956be4237a93be6f2298302b56974ef862ab11e0f98869d1f27c69f88"
 dependencies = [
  "cfgrammar",
  "chrono",
@@ -3417,8 +3404,7 @@ dependencies = [
 [[package]]
 name = "promql-parser"
 version = "0.10.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9e8c90c956be4237a93be6f2298302b56974ef862ab11e0f98869d1f27c69f88"
+source = "git+https://github.com/ProjectASAP/promql-parser?rev=d7606436bde05efe19c5398fe2122faa49062f7d#d7606436bde05efe19c5398fe2122faa49062f7d"
 dependencies = [
  "cfgrammar",
  "chrono",
