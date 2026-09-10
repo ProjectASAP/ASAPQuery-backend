@@ -140,6 +140,8 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
         "{}/examples/promql/streaming_config.yaml",
         env!("CARGO_MANIFEST_DIR")
     );
+    let output_dir = tempfile::tempdir().unwrap();
+    let output_dir_arg = output_dir.path().to_str().unwrap().to_owned();
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_data_plane"));
     command.args([
         "--http-port",
@@ -160,7 +162,7 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
         "ts_ms",
         "--enable-backfill-worker",
         "--output-dir",
-        "/tmp/asap-q05-process-e2e",
+        &output_dir_arg,
     ]);
     if let Ok(user) = std::env::var("CLICKHOUSE_USER") {
         command.args(["--clickhouse-user", &user]);
@@ -176,8 +178,10 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
             .unwrap(),
     );
     let base = format!("http://127.0.0.1:{http_port}");
+    let mut ready = false;
     for _ in 0..100 {
         if client.get(format!("{base}/health")).send().await.is_ok() {
+            ready = true;
             break;
         }
         if let Some(status) = child.0.try_wait().unwrap() {
@@ -193,6 +197,7 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    assert!(ready, "backend did not become ready before poll deadline");
     let install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
         summary_catalog: sds,
         collector_plans: vec![],
@@ -246,7 +251,9 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
     let job = response["job_id"]
         .as_u64()
         .unwrap_or_else(|| panic!("backfill was not accepted: {response}"));
-    for _ in 0..100 {
+    let mut backfill_complete = false;
+    let mut last_backfill_status = serde_json::Value::Null;
+    for _ in 0..300 {
         let status: serde_json::Value = client
             .get(format!("{base}/api/v1/db/backfill/jobs/{job}"))
             .send()
@@ -255,12 +262,20 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
             .json()
             .await
             .unwrap();
-        match status["status"].as_str() {
-            Some("complete") => break,
+        last_backfill_status = status.clone();
+        match status["job"]["status"].as_str() {
+            Some("complete") => {
+                backfill_complete = true;
+                break;
+            }
             Some("failed") => panic!("backfill failed: {status}"),
             _ => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
+    assert!(
+        backfill_complete,
+        "backfill did not complete before poll deadline: {last_backfill_status}"
+    );
     let warm = client
         .post(format!("http://127.0.0.1:{sql_port}/"))
         .body(sql)
