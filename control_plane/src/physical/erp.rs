@@ -368,8 +368,13 @@ impl ErpPlanningInput {
         let empirical = if request.allowed_sketches.is_empty() {
             Err(asap_aware_mapping::erp::ErpError::NoApplicableConfiguration)
         } else {
-            let selected = match (&self.observed_shape, self.shape_match) {
-                (Some(observed), Some(policy)) => {
+            let custom_dataset = self.distribution.pointer("/workload/external").is_some();
+            let selected = match (custom_dataset, &self.observed_shape, self.shape_match) {
+                // Custom/external datasets intentionally have no portable
+                // shape descriptor. Their complete distribution identity is
+                // the applicability key even if runtime observations exist.
+                (true, _, _) => self.artifact.select(&request),
+                (false, Some(observed), Some(policy)) => {
                     self.artifact.select_nearest(&ErpNearestSelectionRequest {
                         selection: request.clone(),
                         observed: observed.clone(),
@@ -378,7 +383,7 @@ impl ErpPlanningInput {
                         max_parameter_distance: policy.max_parameter_distance,
                     })
                 }
-                (None, None) => self.artifact.select(&request),
+                (false, None, None) => self.artifact.select(&request),
                 _ => Err(asap_aware_mapping::erp::ErpError::Invalid(
                     "observed_shape and shape_match must be supplied together",
                 )),
@@ -764,6 +769,45 @@ mod tests {
         assert!(matches!(
             policy.select(SketchAlgorithm::Cms, 0.01, theory.clone()),
             ErpParameterDecision::TheoreticalFallback { params, .. } if params == theory
+        ));
+    }
+
+    #[test]
+    fn custom_dataset_identity_is_exact_even_with_runtime_shape() {
+        let mut policy = input(ErpAccuracyMode::Hybrid);
+        policy.distribution = serde_json::json!({
+            "workload": {"external": {"dataset": "customer-a"}}
+        });
+        policy.artifact.records[0].distribution = serde_json::json!({
+            "workload": {"external": {"dataset": "customer-b"}},
+            "erp_shape": {
+                "cardinality": 1000,
+                "family": "zipf",
+                "parameters": {"exponent": 1.1},
+                "benchmark_events": 100000
+            }
+        });
+        policy.observed_shape = Some(ErpDataShape {
+            cardinality: 1000,
+            family: "zipf".into(),
+            parameters: BTreeMap::from([("exponent".into(), 1.1)]),
+            benchmark_events: 100000,
+        });
+        policy.shape_match = Some(ErpShapeMatchPolicy {
+            minimum_benchmark_events: 1000,
+            max_log2_cardinality_distance: 1.0,
+            max_parameter_distance: 0.2,
+        });
+        assert!(matches!(
+            policy.select(
+                SketchAlgorithm::Cms,
+                0.01,
+                SketchParams::Cms {
+                    width: 4096,
+                    depth: 5,
+                }
+            ),
+            ErpParameterDecision::TheoreticalFallback { .. }
         ));
     }
 }
