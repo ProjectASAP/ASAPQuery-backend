@@ -801,8 +801,8 @@ impl SketchStore {
     }
 
     /// Build observed SDS inventory from the actual registered SummaryStore
-    /// entries and their in-memory pane coverage. Payload bytes remain in the
-    /// store and are referenced by SID.
+    /// entries across the memory and durable tiers. Payload bytes remain in the
+    /// store and are referenced by their fully-spelled-out series identity.
     pub fn observed_summary_inventory(
         &self,
         reporter_id: &str,
@@ -823,6 +823,7 @@ impl SketchStore {
             snapshot_digest: reference.snapshot_sha256,
         };
         let instances = self.instances.read().unwrap();
+        let durable = self.persistence_read.read().unwrap().clone();
         let mut reported = BTreeMap::new();
         for (series_id, binding) in instances.iter() {
             let summary_definition_id = SummaryDefinitionId::from(binding.metadata.policy_fp);
@@ -842,29 +843,21 @@ impl SketchStore {
                         summary_definition_id.as_u64()
                     )
                 })?;
-            let Some(store) = self
+            let store = self
                 .series
                 .get(series_id)
-                .map(|entry| Arc::clone(entry.value()))
-            else {
-                // A catalog definition or registered materialized series is not
-                // itself a SummaryInstance. Inventory contains only concrete
-                // pane/group payloads that the storage engine can reference.
-                continue;
-            };
-            let store = store.read().map_err(|_| "summary series lock poisoned")?;
+                .map(|entry| Arc::clone(entry.value()));
             let status = match binding.metadata.status() {
                 AggStatus::Active => SummaryInstanceStatus::Ready,
                 AggStatus::Retired | AggStatus::Expired => SummaryInstanceStatus::Retiring,
             };
-            let mut record = |window: TimestampRange, label_id: u32| -> Result<(), String> {
+            let mut record = |window: TimestampRange,
+                              group_values: BTreeMap<String, String>|
+             -> Result<(), String> {
                 let start_ms = i64::try_from(window.0)
                     .map_err(|_| "summary instance start exceeds signed timestamp range")?;
                 let end_ms = i64::try_from(window.1)
                     .map_err(|_| "summary instance end exceeds signed timestamp range")?;
-                let group_values = store.intern.resolve(label_id).cloned().ok_or_else(|| {
-                    "summary instance has an unresolved group identity".to_string()
-                })?;
                 let group_bytes =
                     serde_json::to_vec(&group_values).map_err(|error| error.to_string())?;
                 let group_fingerprint = xxhash_rust::xxh64::xxh64(&group_bytes, 0);
@@ -911,12 +904,49 @@ impl SketchStore {
                 reported.insert(instance_id, instance);
                 Ok(())
             };
-            for (window, label_id, _) in store.current_epoch.iter_entries() {
-                record(window, label_id)?;
+            if let Some(store) = store {
+                let store = store.read().map_err(|_| "summary series lock poisoned")?;
+                for (window, label_id, _) in store.current_epoch.iter_entries() {
+                    let group = store.intern.resolve(label_id).cloned().ok_or_else(|| {
+                        "summary instance has an unresolved group identity".to_string()
+                    })?;
+                    record(window, group)?;
+                }
+                for epoch in store.sealed_epochs.values() {
+                    for (window, label_id, _) in &epoch.entries {
+                        let group = store.intern.resolve(*label_id).cloned().ok_or_else(|| {
+                            "summary instance has an unresolved group identity".to_string()
+                        })?;
+                        record(*window, group)?;
+                    }
+                }
             }
-            for epoch in store.sealed_epochs.values() {
-                for (window, label_id, _) in &epoch.entries {
-                    record(*window, *label_id)?;
+            if let Some(handle) = &durable {
+                let keys: Vec<_> = binding.metadata.group_by_keys.iter().cloned().collect();
+                for part in handle.manifest.live_parts() {
+                    let reader = handle
+                        .part_cache
+                        .get_or_load(part.part_id)
+                        .map_err(|error| format!("load summary part {}: {error}", part.part_id))?;
+                    for index in reader.index_records() {
+                        if index.agg_id != *series_id {
+                            continue;
+                        }
+                        let entry = reader.load_entry(&index).map_err(|error| {
+                            format!("load summary part {} entry: {error}", part.part_id)
+                        })?;
+                        let values = entry.label.map(|label| label.labels).unwrap_or_default();
+                        if values.len() != keys.len() {
+                            return Err(format!(
+                                "summary series {series_id} has {} group keys but durable state has {} values",
+                                keys.len(), values.len()
+                            ));
+                        }
+                        record(
+                            (entry.start_ts, entry.end_ts),
+                            keys.iter().cloned().zip(values).collect(),
+                        )?;
+                    }
                 }
             }
         }
@@ -4131,6 +4161,59 @@ mod tests {
             "recovered disk window missing after restart"
         );
         drop(p2);
+    }
+
+    #[test]
+    fn observed_inventory_includes_durable_instances_after_restart() {
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let definition_id = SummaryDefinitionId::from(fingerprint);
+        let producers = BTreeMap::from([(definition_id, "producer-a".to_string())]);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let disk = tmp.path().to_path_buf();
+        let mut metadata = meta_with_policy(506, fingerprint);
+        metadata.group_by_keys = ["job".to_string()].into_iter().collect();
+
+        {
+            let store = Arc::new(SketchStore::new());
+            store.register(metadata.clone());
+            let mut persistence = store.start_persistence(durable_cfg(disk.clone())).unwrap();
+            for index in 0..4u64 {
+                let start = index * 30_000;
+                store.append_sample(
+                    506,
+                    BTreeMap::from([("job".to_string(), "api".to_string())]),
+                    (start, start + 30_000),
+                    sample((index + 1) as u8),
+                );
+            }
+            assert!(wait_until(
+                || !persistence.manifest.live_parts().is_empty(),
+                std::time::Duration::from_secs(5)
+            ));
+            persistence.shutdown();
+        }
+
+        let recovered = Arc::new(SketchStore::new());
+        recovered
+            .install_summary_catalog(Arc::new(plan.summary_catalog))
+            .unwrap();
+        recovered.register(metadata);
+        let persistence = recovered.start_persistence(durable_cfg(disk)).unwrap();
+        assert!(!persistence.manifest.live_parts().is_empty());
+        let inventory = recovered
+            .observed_summary_inventory("backend-a", "store-a", &producers, 1, 100)
+            .unwrap();
+        assert!(!inventory.instances.is_empty());
+        assert!(inventory.instances.values().all(|instance| {
+            instance.group_values.get("job").map(String::as_str) == Some("api")
+                && instance.state_reference.key.starts_with("series:506:pane:")
+        }));
     }
 
     // ── query-from-recovered-disk (fix/query-from-recovered-disk) ───────
