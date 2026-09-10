@@ -177,6 +177,11 @@ impl PrometheusRemoteWriteReceiver {
         self.inner.stats.clone()
     }
 
+    /// Shared ingest state used by diagnostics and observability tasks.
+    pub fn ingest_state(&self) -> Arc<IngestState> {
+        self.inner.ingest.clone()
+    }
+
     /// Permanently seal this finite source before queuing worker barriers.
     pub async fn drain(&self) -> Result<(), String> {
         {

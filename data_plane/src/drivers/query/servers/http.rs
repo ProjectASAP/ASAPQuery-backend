@@ -9,10 +9,13 @@ use axum::{
 };
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, info, warn};
+
+const INGEST_DIAG_INTERVAL: Duration = Duration::from_secs(30);
 
 use crate::drivers::query::adapters::{create_http_adapter, AdapterConfig, HttpProtocolAdapter};
 use crate::drivers::query::servers::metrics as srv_metrics;
@@ -197,6 +200,36 @@ pub struct HttpServer {
     active_physical_plan: Option<crate::storage_engines::types::HotReloadActivePhysicalPlan>,
     physical_plan_lifecycle: Option<crate::storage_engines::types::PhysicalPlanLifecycle>,
     remote_write: Option<crate::drivers::ingest::PrometheusRemoteWriteReceiver>,
+}
+
+/// Aborts the diagnostics task when the HTTP server exits or is cancelled.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn log_ingest_throughput(state: Arc<crate::precompute_engine::ingest_handler::IngestState>) {
+    let mut interval = tokio::time::interval(INGEST_DIAG_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await;
+    let mut last = Instant::now();
+    loop {
+        interval.tick().await;
+        let now = Instant::now();
+        let elapsed = now.duration_since(last);
+        last = now;
+        let samples = state.samples_ingested.swap(0, Ordering::Relaxed);
+        let secs = elapsed.as_secs_f64();
+        debug!(
+            "[INGEST_DIAG] samples_ingested: {} in {:.1}s ({:.1} samples/sec)",
+            samples,
+            secs,
+            samples as f64 / secs,
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -532,6 +565,12 @@ impl HttpServer {
 
         let listener = TcpListener::bind(format!("0.0.0.0:{}", self.config.port)).await?;
         info!("HTTP server listening on port {}", self.config.port);
+
+        // Bind first so a listener failure cannot leave an orphaned task.
+        // Keep the guard alive through serve so cancellation also aborts it.
+        let _ingest_ticker = self.remote_write.as_ref().map(|receiver| {
+            AbortOnDrop(tokio::spawn(log_ingest_throughput(receiver.ingest_state())))
+        });
 
         axum::serve(listener, app).await?;
         Ok(())
@@ -7113,6 +7152,26 @@ mod logical_provenance_tests {
         // Any observed local raw branch invalidates a deployed plan.
         let mut value = serde_json::json!({"warnings":["asap_execution:asap", "asap_logical_stats:raw=1,summary=1,memo_hits=0"]});
         assert_eq!(extract_logical_provenance(&mut value), Some(Err(())));
+    }
+
+    #[tokio::test]
+    async fn ingest_ticker_is_cancelled_when_guard_is_dropped() {
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task_counter = counter.clone();
+        let guard = AbortOnDrop(tokio::spawn(async move {
+            loop {
+                task_counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }));
+
+        while counter.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        drop(guard);
+        let count_at_drop = counter.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), count_at_drop);
     }
 }
 
