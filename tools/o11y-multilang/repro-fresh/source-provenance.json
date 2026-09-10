@@ -1,0 +1,141 @@
+{
+  "snapshot": "evaluation_query_datasets.snapshot.yaml",
+  "source_sha256": "72c334fab18674746a2cef7c926e81d06a13dc9f11858d080460a99aa5b31ecf",
+  "occurrences": [
+    {
+      "occurrence_index": 0,
+      "id": "q01",
+      "expression": "sort_desc(sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))"
+    },
+    {
+      "occurrence_index": 1,
+      "id": "q02",
+      "expression": "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))"
+    },
+    {
+      "occurrence_index": 2,
+      "id": "q03",
+      "expression": "sum(increase(payment_service_http_5xx_total[1h])) / sum(increase(payment_service_http_requests_total[1h]))"
+    },
+    {
+      "occurrence_index": 3,
+      "id": "q04",
+      "expression": "sum(increase(payment_service_http_5xx_total[1h] offset 6h)) / sum(increase(payment_service_http_requests_total[1h] offset 6h))"
+    },
+    {
+      "occurrence_index": 4,
+      "id": "q05",
+      "expression": "max_over_time(cache_refresh_lag_seconds[12h])"
+    },
+    {
+      "occurrence_index": 5,
+      "id": "q06",
+      "expression": "max_over_time(user_service_cache_refresh_lag_seconds[12h])"
+    },
+    {
+      "occurrence_index": 6,
+      "id": "q07",
+      "expression": "user_service_cache_refresh_lag_seconds"
+    },
+    {
+      "occurrence_index": 7,
+      "id": "q08",
+      "expression": "sum(rate(backend_process_cpu_seconds_total[1h]))"
+    },
+    {
+      "occurrence_index": 8,
+      "id": "q09",
+      "expression": "sum(backend_process_resident_memory_bytes)"
+    },
+    {
+      "occurrence_index": 9,
+      "id": "q10",
+      "expression": "max_over_time((sum(backend_process_resident_memory_bytes))[6h:])"
+    },
+    {
+      "occurrence_index": 10,
+      "id": "q11",
+      "expression": "topk(2, sum by (job) (rate(backend_process_cpu_seconds_total[1h])))"
+    },
+    {
+      "occurrence_index": 11,
+      "id": "q12",
+      "expression": "topk(2, sum by (job) (backend_process_resident_memory_bytes))"
+    },
+    {
+      "occurrence_index": 12,
+      "id": "q13",
+      "expression": "max_over_time((sum(rate(backend_process_cpu_seconds_total[5m])))[6h:])"
+    },
+    {
+      "occurrence_index": 13,
+      "id": "q14",
+      "expression": "sum(rate(backend_http_requests_total[5m]))"
+    },
+    {
+      "occurrence_index": 14,
+      "id": "q15",
+      "expression": "sum by (job) (rate(backend_http_requests_total[5m]))"
+    },
+    {
+      "occurrence_index": 15,
+      "id": "q16",
+      "expression": "sum(increase(backend_http_5xx_total[60m])) / sum(increase(backend_http_requests_total[60m]))"
+    },
+    {
+      "occurrence_index": 16,
+      "id": "q17",
+      "expression": "topk(1, sum by (job) (increase(backend_http_5xx_total[6h])) / sum by (job) (increase(backend_http_requests_total[6h])))"
+    },
+    {
+      "occurrence_index": 17,
+      "id": "q18",
+      "expression": "sum by (job) (increase(backend_http_5xx_total[24h])) > 0"
+    },
+    {
+      "occurrence_index": 18,
+      "id": "q19",
+      "expression": "sum(rate(order_service_http_requests_total[5m]))"
+    },
+    {
+      "occurrence_index": 19,
+      "id": "q20",
+      "expression": "sum(rate(order_service_http_requests_total[5m] offset 1h))"
+    },
+    {
+      "occurrence_index": 20,
+      "id": "q21",
+      "expression": "histogram_quantile(0.95, sum by (le) (rate(order_service_http_request_duration_seconds_bucket[5m])))"
+    },
+    {
+      "occurrence_index": 21,
+      "id": "q22",
+      "expression": "sum(rate(order_service_http_requests_total[5m]))"
+    },
+    {
+      "occurrence_index": 22,
+      "id": "q23",
+      "expression": "topk(2, max_over_time(backend_retry_backlog_depth[6h]))"
+    },
+    {
+      "occurrence_index": 23,
+      "id": "q24",
+      "expression": "max_over_time((sum(rate(order_service_http_5xx_total[5m])) / sum(rate(order_service_http_requests_total[5m])))[6h:])"
+    },
+    {
+      "occurrence_index": 24,
+      "id": "q25",
+      "expression": "topk(1, sum by (job) (increase(backend_http_5xx_total[24h])) / scalar(sum(increase(backend_http_5xx_total[24h]))))"
+    },
+    {
+      "occurrence_index": 25,
+      "id": "q26",
+      "expression": "topk(1, sum by (job) (rate(backend_process_cpu_seconds_total[6h])))"
+    },
+    {
+      "occurrence_index": 26,
+      "id": "q27",
+      "expression": "topk(3, avg_over_time((sum by (job) (backend_process_resident_memory_bytes))[6h:]))"
+    }
+  ]
+}

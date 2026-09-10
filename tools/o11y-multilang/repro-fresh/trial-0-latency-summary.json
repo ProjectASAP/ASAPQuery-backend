@@ -1,40 +1,40 @@
 {
-  "source": "tools/o11y-multilang/repro-fresh/trial-0-raw.json",
+  "source": "/mydata/o11y-repro-clean/trial-0-raw.json",
   "engines": {
     "asap_clickhouse": {
       "attempted": 81,
       "ok": 81,
-      "p50_ms": 59.232694,
-      "p95_ms": 178.693758,
-      "mean_ms": 67.9593735308642
+      "p50_ms": 60.213982,
+      "p95_ms": 185.515115,
+      "mean_ms": 68.4702927037037
     },
     "asap_metricsql": {
       "attempted": 81,
       "ok": 81,
-      "p50_ms": 4.965602,
-      "p95_ms": 5.560061,
-      "mean_ms": 5.0764054691358025
+      "p50_ms": 4.922981,
+      "p95_ms": 5.875802,
+      "mean_ms": 5.163874938271604
     },
     "clickhouse": {
       "attempted": 81,
       "ok": 81,
-      "p50_ms": 50.308769,
-      "p95_ms": 171.976702,
-      "mean_ms": 62.514236518518516
+      "p50_ms": 50.488668,
+      "p95_ms": 163.596736,
+      "mean_ms": 64.99199570370371
     },
     "prometheus": {
       "attempted": 81,
       "ok": 81,
-      "p50_ms": 3.112512,
-      "p95_ms": 6.966838,
-      "mean_ms": 3.503685172839506
+      "p50_ms": 2.812486,
+      "p95_ms": 7.320659,
+      "mean_ms": 3.4506330740740743
     },
     "victoriametrics": {
       "attempted": 81,
       "ok": 81,
-      "p50_ms": 2.428257,
-      "p95_ms": 5.178419,
-      "mean_ms": 2.7528297283950613,
+      "p50_ms": 2.417401,
+      "p95_ms": 3.290796,
+      "mean_ms": 2.5050195802469135,
       "prometheus_differential": {
         "valid": 48,
         "total": 81

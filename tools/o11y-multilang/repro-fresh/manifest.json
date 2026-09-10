@@ -1,53 +1,54 @@
 {
-  "schema_version": 2,
-  "backend_head": "abe19211fb08ee3b10709a35271aa1840939054b",
-  "binary_sha256": "e9c2455d873063f2cb12374798a3b6fee196d9e2829dd139e264a82fa0f843fb",
+  "schema_version": 3,
+  "backend_head": "806945b345de9c90db80285cd5cd14c46f8e6677",
+  "backend_tree_dirty": false,
+  "binary_sha256": "e85126b71fdfdcad0c37a4239e72979a7429c3aa7ddcbaacd82bb30782bc0a2b",
   "fixture_sha256": "b6e05405e9dc46edd268ced39c2dff0505f71f2a3bbce2c50f1a7f4d4b7aa49b",
   "physical_plan_sha256": "f09f08a1181965069a4317282ea4770c3d10dc3cd37185cba1fc9a8858e01bd9",
-  "images": {
-    "prom/prometheus:v2.55.1": "prom/prometheus@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3",
-    "victoriametrics/victoria-metrics:v1.126.0": "victoriametrics/victoria-metrics@sha256:26dfc4ab90cf6fedc8115269adc22d300bcd5eab82ea1ebed3c8e22b49886ce1",
-    "clickhouse/clickhouse-server:latest": "clickhouse/clickhouse-server@sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb"
+  "pinned_images": {
+    "prom": "prom/prometheus@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3",
+    "vm": "victoriametrics/victoria-metrics@sha256:26dfc4ab90cf6fedc8115269adc22d300bcd5eab82ea1ebed3c8e22b49886ce1",
+    "ch": "clickhouse/clickhouse-server@sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb"
   },
   "trials": [
     {
       "trial": 0,
       "seed": 20260910,
-      "lifecycle_seconds": 19.857919584959745,
-      "ingest_seconds": 1.3336594520369545,
-      "query_seconds": 11.824963322025724,
+      "lifecycle_seconds": 20.298696958925575,
+      "ingest_seconds": 1.2140253740362823,
+      "query_seconds": 12.05022633005865,
       "raw": "trial-0-raw.json",
       "phases": {
         "started": {
           "processes": {
             "dp": {
-              "pid": 2662034,
-              "cpu_ticks": 6,
-              "rss_pages": 14665,
-              "vm_hwm": "58660 kB"
+              "pid": 2668382,
+              "cpu_ticks": 5,
+              "rss_pages": 14543,
+              "vm_hwm": "58172 kB"
             },
             "prom": {
-              "pid": 2661317,
-              "cpu_ticks": 19,
-              "rss_pages": 17739,
-              "vm_hwm": "70956 kB"
+              "pid": 2667643,
+              "cpu_ticks": 18,
+              "rss_pages": 18311,
+              "vm_hwm": "73244 kB"
             },
             "vm": {
-              "pid": 2661564,
-              "cpu_ticks": 158,
-              "rss_pages": 21657,
-              "vm_hwm": "86628 kB"
+              "pid": 2667900,
+              "cpu_ticks": 138,
+              "rss_pages": 21924,
+              "vm_hwm": "87696 kB"
             },
             "ch": {
-              "pid": 2661705,
-              "cpu_ticks": 88,
-              "rss_pages": 156527,
-              "vm_hwm": "626108 kB"
+              "pid": 2668052,
+              "cpu_ticks": 92,
+              "rss_pages": 156605,
+              "vm_hwm": "626420 kB"
             }
           },
           "storage_bytes": {
             "prom": 168792,
-            "dp": 8099,
+            "dp": 7963,
             "vm": 81920,
             "ch": 106496
           }
@@ -55,33 +56,33 @@
         "post_ingest": {
           "processes": {
             "dp": {
-              "pid": 2662034,
+              "pid": 2668382,
               "cpu_ticks": 6,
-              "rss_pages": 14665,
-              "vm_hwm": "58660 kB"
+              "rss_pages": 14543,
+              "vm_hwm": "58172 kB"
             },
             "prom": {
-              "pid": 2661317,
-              "cpu_ticks": 19,
-              "rss_pages": 17739,
-              "vm_hwm": "70956 kB"
+              "pid": 2667643,
+              "cpu_ticks": 18,
+              "rss_pages": 18311,
+              "vm_hwm": "73244 kB"
             },
             "vm": {
-              "pid": 2661564,
-              "cpu_ticks": 323,
-              "rss_pages": 39261,
-              "vm_hwm": "157044 kB"
+              "pid": 2667900,
+              "cpu_ticks": 328,
+              "rss_pages": 39765,
+              "vm_hwm": "159060 kB"
             },
             "ch": {
-              "pid": 2661705,
-              "cpu_ticks": 103,
-              "rss_pages": 161239,
-              "vm_hwm": "646056 kB"
+              "pid": 2668052,
+              "cpu_ticks": 110,
+              "rss_pages": 161919,
+              "vm_hwm": "647676 kB"
             }
           },
           "storage_bytes": {
             "prom": 168792,
-            "dp": 8099,
+            "dp": 7963,
             "vm": 90112,
             "ch": 118784
           }
@@ -89,38 +90,44 @@
         "post_query": {
           "processes": {
             "dp": {
-              "pid": 2662034,
+              "pid": 2668382,
               "cpu_ticks": 87,
-              "rss_pages": 16128,
-              "vm_hwm": "64512 kB"
+              "rss_pages": 16125,
+              "vm_hwm": "64500 kB"
             },
             "prom": {
-              "pid": 2661317,
-              "cpu_ticks": 46,
-              "rss_pages": 18659,
-              "vm_hwm": "74636 kB"
+              "pid": 2667643,
+              "cpu_ticks": 43,
+              "rss_pages": 19250,
+              "vm_hwm": "77000 kB"
             },
             "vm": {
-              "pid": 2661564,
-              "cpu_ticks": 374,
-              "rss_pages": 45234,
-              "vm_hwm": "180936 kB"
+              "pid": 2667900,
+              "cpu_ticks": 360,
+              "rss_pages": 41308,
+              "vm_hwm": "165232 kB"
             },
             "ch": {
-              "pid": 2661705,
-              "cpu_ticks": 1544,
-              "rss_pages": 195672,
-              "vm_hwm": "1015172 kB"
+              "pid": 2668052,
+              "cpu_ticks": 1583,
+              "rss_pages": 197168,
+              "vm_hwm": "990928 kB"
             }
           },
           "storage_bytes": {
             "prom": 168792,
-            "dp": 30698,
+            "dp": 30562,
             "vm": 172032,
             "ch": 2957312
           }
         }
-      }
+      },
+      "container_image_ids": {
+        "prom": "sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3",
+        "vm": "sha256:26dfc4ab90cf6fedc8115269adc22d300bcd5eab82ea1ebed3c8e22b49886ce1",
+        "ch": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb"
+      },
+      "resource_scope": "mixed alternating native and ASAP queries; process totals are not attributable to one mode"
     }
   ]
 }

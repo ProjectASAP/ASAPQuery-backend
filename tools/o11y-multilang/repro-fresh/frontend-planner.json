@@ -1,0 +1,429 @@
+{
+  "queries": [
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")",
+        "status": "typed_fallback"
+      },
+      "id": "q01",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: function `sort_desc`",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")",
+        "status": "typed_fallback"
+      },
+      "id": "q02",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: identifier, found: )\")",
+        "status": "typed_fallback"
+      },
+      "id": "q03",
+      "metricsql": {
+        "parser_canonical": {
+          "status": "pass"
+        },
+        "planner": {
+          "status": "pass"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: identifier, found: )\")",
+        "status": "typed_fallback"
+      },
+      "id": "q04",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: offset and @ modifiers",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "physical mapping failed: ASAPPlanner produced no legal summary candidate for the target",
+        "status": "typed_fallback"
+      },
+      "id": "q05",
+      "metricsql": {
+        "parser_canonical": {
+          "status": "pass"
+        },
+        "planner": {
+          "status": "pass"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "physical mapping failed: ASAPPlanner produced no legal summary candidate for the target",
+        "status": "typed_fallback"
+      },
+      "id": "q06",
+      "metricsql": {
+        "parser_canonical": {
+          "status": "pass"
+        },
+        "planner": {
+          "status": "pass"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'mapconcat'.\nDid you mean 'concat'?",
+        "status": "typed_fallback"
+      },
+      "id": "q07",
+      "metricsql": {
+        "parser_canonical": {
+          "status": "pass"
+        },
+        "planner": {
+          "status": "pass"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+        "status": "typed_fallback"
+      },
+      "id": "q08",
+      "metricsql": {
+        "parser_canonical": {
+          "status": "pass"
+        },
+        "planner": {
+          "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+          "status": "typed_fallback"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: Error during planning: Error during planning: map does not support zero arguments. No function matches the given name and argument types 'map()'. You might need to add explicit type casts.\n\tCandidate functions:\n\tmap(Any, .., Any)",
+        "status": "typed_fallback"
+      },
+      "id": "q09",
+      "metricsql": {
+        "parser_canonical": {
+          "status": "pass"
+        },
+        "planner": {
+          "status": "pass"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'todate'?",
+        "status": "typed_fallback"
+      },
+      "id": "q10",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: subquery step or inherited step",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: labels\")",
+        "status": "typed_fallback"
+      },
+      "id": "q11",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: This feature is not implemented: Map Access",
+        "status": "typed_fallback"
+      },
+      "id": "q12",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+        "status": "typed_fallback"
+      },
+      "id": "q13",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: subquery step or inherited step",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+        "status": "typed_fallback"
+      },
+      "id": "q14",
+      "metricsql": {
+        "parser_canonical": {
+          "status": "pass"
+        },
+        "planner": {
+          "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+          "status": "typed_fallback"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: [\")",
+        "status": "typed_fallback"
+      },
+      "id": "q15",
+      "metricsql": {
+        "parser_canonical": {
+          "status": "pass"
+        },
+        "planner": {
+          "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+          "status": "typed_fallback"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: identifier, found: )\")",
+        "status": "typed_fallback"
+      },
+      "id": "q16",
+      "metricsql": {
+        "parser_canonical": {
+          "status": "pass"
+        },
+        "planner": {
+          "status": "pass"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")",
+        "status": "typed_fallback"
+      },
+      "id": "q17",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: labels\")",
+        "status": "typed_fallback"
+      },
+      "id": "q18",
+      "metricsql": {
+        "parser_canonical": {
+          "status": "pass"
+        },
+        "planner": {
+          "status": "pass"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+        "status": "typed_fallback"
+      },
+      "id": "q19",
+      "metricsql": {
+        "parser_canonical": {
+          "status": "pass"
+        },
+        "planner": {
+          "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+          "status": "typed_fallback"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+        "status": "typed_fallback"
+      },
+      "id": "q20",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: offset and @ modifiers",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: ), found: .1\")",
+        "status": "typed_fallback"
+      },
+      "id": "q21",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: function `histogram_quantile`",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+        "status": "typed_fallback"
+      },
+      "id": "q22",
+      "metricsql": {
+        "parser_canonical": {
+          "status": "pass"
+        },
+        "planner": {
+          "reason": "nested sum(rate(...)) has VictoriaMetrics extrapolation semantics that the shared DAG cannot yet preserve",
+          "status": "typed_fallback"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "physical mapping failed: ASAPPlanner produced no legal summary candidate for the target",
+        "status": "typed_fallback"
+      },
+      "id": "q23",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: ,\")",
+        "status": "typed_fallback"
+      },
+      "id": "q24",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: subquery step or inherited step",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: .\")",
+        "status": "typed_fallback"
+      },
+      "id": "q25",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: SQL error: ParserError(\"Expected: joined table, found: labels\")",
+        "status": "typed_fallback"
+      },
+      "id": "q26",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    },
+    {
+      "clickhouse_sql": {
+        "reason": "SQL lowering failed: DataFusion error: Error during planning: Invalid function 'modulo'.\nDid you mean 'todate'?",
+        "status": "typed_fallback"
+      },
+      "id": "q27",
+      "metricsql": {
+        "parser_canonical": {
+          "reason": "unsupported MetricsQL feature: `topk` with 2 arguments; canonical lowering requires exactly 1",
+          "status": "failed"
+        },
+        "planner": {
+          "status": "not_reached"
+        }
+      }
+    }
+  ]
+}

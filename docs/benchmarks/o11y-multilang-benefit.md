@@ -19,8 +19,8 @@ The seed randomizes query order independently for each repetition. Engine order 
 
 The checked-in evidence is one fresh trial with three repetitions and 27 queries, or 81 requests per engine. All five endpoints completed 81/81 requests. Both ASAP listeners reported `exact_fallback` for 81/81, so this result measures fallback overhead and does not establish acceleration benefit.
 
-- VictoriaMetrics median/p95: 2.43/5.18 ms; ASAP MetricsQL fallback: 4.97/5.56 ms.
-- ClickHouse median/p95: 50.31/171.98 ms; ASAP ClickHouse fallback: 59.23/178.69 ms.
+- VictoriaMetrics median/p95: 2.36/9.12 ms; ASAP MetricsQL fallback: 5.03/6.34 ms.
+- ClickHouse median/p95: 49.92/169.56 ms; ASAP ClickHouse fallback: 56.25/179.34 ms.
 - Native ClickHouse versus ASAP ClickHouse: 81/81 structured matches.
 - Native VictoriaMetrics versus ASAP MetricsQL: 81/81 structured matches.
 - Prometheus versus VictoriaMetrics: 48/81 strict matches and 33/81 mismatches.

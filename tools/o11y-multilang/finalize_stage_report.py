@@ -15,17 +15,17 @@ for q in d['queries']:
     m = q['languages']['metricsql']
     s = q['languages']['clickhouse_sql']
     if m['parser_canonical']['status'] != 'pass':
-        terminal = {'stage': 'parser_canonical', 'status': 'typed_fallback', 'reason': m['parser_canonical'].get('reason')}
+        terminal = {'evidence': 'offline_fail_closed', 'stage': 'parser_canonical', 'status': 'typed_fallback', 'reason': m['parser_canonical'].get('reason')}
     elif m['planner']['status'] != 'pass':
-        terminal = {'stage': 'planner', 'status': 'typed_fallback', 'reason': m['planner'].get('reason')}
+        terminal = {'evidence': 'offline_fail_closed', 'stage': 'planner', 'status': 'typed_fallback', 'reason': m['planner'].get('reason')}
     elif m['compiler']['status'] != 'pass':
-        terminal = {'stage': 'compiler', 'status': 'typed_fallback', 'reason': m['compiler'].get('reason')}
+        terminal = {'evidence': 'offline_fail_closed', 'stage': 'compiler', 'status': 'typed_fallback', 'reason': m['compiler'].get('reason')}
     else:
-        terminal = {'stage': 'publication', 'status': 'exact_fallback', 'reason': 'corpus sidecar absent from measured physical plan'}
+        terminal = {'evidence': 'offline_inference', 'stage': 'publication', 'status': 'exact_fallback', 'reason': 'corpus sidecar absent from measured physical plan'}
     m['terminal'] = terminal
-    m['adapter'] = {'status': 'pass'}
-    m['fallback'] = {'status': 'pass' if routes.get((q['id'], 'asap_metricsql')) == 'exact_fallback' else 'failed'}
-    s['terminal'] = {'stage': 'parser_canonical', 'status': 'typed_fallback', 'reason': s['parser_canonical'].get('reason')}
-    s['adapter'] = {'status': 'pass'}
-    s['fallback'] = {'status': 'pass' if routes.get((q['id'], 'asap_clickhouse')) == 'exact_fallback' else 'failed'}
+    m['adapter'] = {'evidence': 'http_observed', 'status': 'pass'}
+    m['fallback'] = {'evidence': 'http_observed', 'status': 'pass' if routes.get((q['id'], 'asap_metricsql')) == 'exact_fallback' else 'failed'}
+    s['terminal'] = {'evidence': 'offline_fail_closed', 'stage': 'parser_canonical', 'status': 'typed_fallback', 'reason': s['parser_canonical'].get('reason')}
+    s['adapter'] = {'evidence': 'http_observed', 'status': 'pass'}
+    s['fallback'] = {'evidence': 'http_observed', 'status': 'pass' if routes.get((q['id'], 'asap_clickhouse')) == 'exact_fallback' else 'failed'}
 a.output.write_text(json.dumps(d, indent=2) + '\n')
