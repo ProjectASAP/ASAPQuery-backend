@@ -741,11 +741,11 @@ async fn process_query_request(
         } else {
             unix_time_ms()
         };
-        if let Ok(query_result) = state
+        let metricsql_result = state
             .query_engine
             .execute_metricsql_at(&identity, evaluation_ms)
-            .await
-        {
+            .await;
+        if let Ok(query_result) = metricsql_result {
             let result = crate::drivers::query::adapters::QueryExecutionResult {
                 query_output_labels: asap_types::KeyByLabelNames::default(),
                 query_result,
@@ -757,6 +757,9 @@ async fn process_query_request(
                 }
                 Err(status) => status.into_response(),
             };
+        }
+        if let Err(error) = &metricsql_result {
+            warn!(identity = %identity, reason = %error, "MetricsQL accelerated execution fell back");
         }
         if let Some(fallback) = &state.fallback {
             return match fallback
