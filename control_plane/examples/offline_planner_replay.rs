@@ -69,6 +69,11 @@ fn inspect(
             inner: rhs,
             ..
         }
+        | SummaryExpr::RelationalJoin {
+            left: lhs,
+            right: rhs,
+            ..
+        }
         | SummaryExpr::SummarySubtract {
             left: lhs,
             right: rhs,
