@@ -365,6 +365,7 @@ impl PrometheusRemoteWriteReceiver {
             .ingest
             .samples_ingested
             .fetch_add(new_samples.len() as u64, Ordering::Relaxed);
+        crate::precompute_engine::metrics::record_accepted_samples(new_samples.len() as u64);
         Ok(())
     }
 }

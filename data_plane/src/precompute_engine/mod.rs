@@ -3,7 +3,7 @@ pub mod config;
 mod engine;
 pub mod frame_lineage;
 pub mod ingest_handler;
-mod metrics;
+pub(crate) mod metrics;
 pub mod operators;
 pub mod output_sink;
 pub mod series_buffer;

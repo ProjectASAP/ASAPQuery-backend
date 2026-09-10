@@ -592,6 +592,7 @@ impl Worker {
             self.output_sink.emit_batch(emit_batch)?;
         }
 
+        crate::precompute_engine::metrics::record_processed_updates(samples.len() as u64);
         Ok(())
     }
 
