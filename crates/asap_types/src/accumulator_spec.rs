@@ -90,6 +90,43 @@ pub struct AccumulatorSpec {
     pub grouping: Option<KeyByLabelNames>,
 }
 
+/// Typed rule for turning an input sample into an accumulator update.
+///
+/// This is execution semantics, separate from the summary family: the same
+/// CMS-with-heap state can count events, sum sample values, or sum reset-aware
+/// counter deltas. Legacy streaming artifacts still encode the rule in
+/// `parameters`; callers use [`AggregationConfig::sample_update_rule`] so the
+/// runtime does not branch on ad-hoc strings.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SampleUpdateRule {
+    Value { scale: f64 },
+    Count,
+    CounterDelta { scale: f64 },
+}
+
+impl AggregationConfig {
+    pub fn sample_update_rule(&self) -> SampleUpdateRule {
+        let scale = self
+            .parameters
+            .get("weight_scale")
+            .and_then(Value::as_f64)
+            .filter(|scale| scale.is_finite() && *scale > 0.0)
+            .unwrap_or(1.0);
+        match self
+            .parameters
+            .get("weight_mode")
+            .or_else(|| self.parameters.get("topk_weight"))
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("count" | "frequency" | "freq") => SampleUpdateRule::Count,
+            Some("counter_delta") => SampleUpdateRule::CounterDelta { scale },
+            _ => SampleUpdateRule::Value { scale },
+        }
+    }
+}
+
 /// Why [`AggregationConfig::accumulator_spec`] couldn't resolve a config
 /// into an [`AccumulatorSpec`]. Each variant matches one of the three
 /// distinct fallback paths `accumulator_factory::create_accumulator_updater`
@@ -764,6 +801,33 @@ mod tests {
             AccumulatorSpecError::UnmappedAggregationType(AggregationType::HLL).to_string(),
             "Unknown aggregation_type 'HLL', defaulting to SingleSubpopulation Sum"
         );
+    }
+
+    #[test]
+    fn sample_update_rule_decodes_legacy_parameters_once() {
+        let mut parameters = HashMap::new();
+        parameters.insert("weight_mode".into(), Value::String("counter_delta".into()));
+        parameters.insert("weight_scale".into(), Value::from(1_000_000.0));
+        let counter = make_config(
+            AggregationType::CountMinSketchWithHeap,
+            "",
+            parameters,
+            vec![],
+        );
+        assert_eq!(
+            counter.sample_update_rule(),
+            SampleUpdateRule::CounterDelta { scale: 1_000_000.0 }
+        );
+
+        let mut count_parameters = HashMap::new();
+        count_parameters.insert("topk_weight".into(), Value::String("frequency".into()));
+        let count = make_config(
+            AggregationType::CountSketchWithHeap,
+            "",
+            count_parameters,
+            vec![],
+        );
+        assert_eq!(count.sample_update_rule(), SampleUpdateRule::Count);
     }
 
     // ---- PolicyFingerprint stability guard ---------------------------

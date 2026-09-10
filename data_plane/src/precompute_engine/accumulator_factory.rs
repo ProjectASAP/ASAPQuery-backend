@@ -910,27 +910,19 @@ pub fn config_is_keyed(config: &AggregationConfig) -> bool {
 /// value-weighting is the semantics `topk(sum_by_key(value))` needs, and
 /// genuine frequency-top-k callers opt in with `weight_mode: count`.
 fn topk_weight_param(config: &AggregationConfig) -> TopkWeight {
-    match config
-        .parameters
-        .get("weight_mode")
-        .or_else(|| config.parameters.get("topk_weight"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("count") | Some("frequency") | Some("freq") => TopkWeight::Count,
-        // "value" / "sum" / unset / anything else → value-weighted default.
-        _ => TopkWeight::Value,
+    match config.sample_update_rule() {
+        asap_types::SampleUpdateRule::Count => TopkWeight::Count,
+        asap_types::SampleUpdateRule::Value { .. }
+        | asap_types::SampleUpdateRule::CounterDelta { .. } => TopkWeight::Value,
     }
 }
 
 fn topk_weight_scale_param(config: &AggregationConfig) -> f64 {
-    config
-        .parameters
-        .get("weight_scale")
-        .and_then(|value| value.as_f64())
-        .filter(|scale| scale.is_finite() && *scale > 0.0)
-        .unwrap_or(1.0)
+    match config.sample_update_rule() {
+        asap_types::SampleUpdateRule::Value { scale } => scale,
+        asap_types::SampleUpdateRule::CounterDelta { scale } => scale,
+        asap_types::SampleUpdateRule::Count => 1.0,
+    }
 }
 
 // ---------------------------------------------------------------------------
