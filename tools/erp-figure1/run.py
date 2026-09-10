@@ -77,7 +77,8 @@ def run_arm(arm, expected_contract, candidate_space, cwd, dataset_path=None):
     proc = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, env=env)
     wall_ns = time.monotonic_ns() - started
     try:
-        resources = json.loads(pathlib.Path(timing_path).read_text())
+        timing_lines = pathlib.Path(timing_path).read_text().splitlines()
+        resources = json.loads(timing_lines[-1])
     finally:
         pathlib.Path(timing_path).unlink(missing_ok=True)
     record = {"name": arm["name"], "command": arm["command"], "exit_code": proc.returncode,
