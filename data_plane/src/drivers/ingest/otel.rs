@@ -660,7 +660,11 @@ async fn route_otlp_to_precompute(
     // alongside the sid in the WorkerMessage so the worker can resolve
     // the source config and render emit-time labels without consulting
     // the sid → attrs reverse mapping.
-    type BucketTuple = (u64, asap_types::PolicyFingerprint, String); // (sid, policy_fp, group_key)
+    type BucketTuple = (
+        u64,
+        asap_types::PolicyFingerprint,
+        Arc<crate::precompute_engine::group_key::GroupKey>,
+    ); // (sid, policy_fp, group_key)
     type SampleTuple = (String, i64, f64);
     let mut by_bucket: HashMap<u64, (BucketTuple, Vec<SampleTuple>)> = HashMap::new();
     let mut raw_matched = 0usize;
@@ -4601,7 +4605,7 @@ mod sid_bucketing_tests {
         let groups: Vec<(
             u64,
             asap_types::PolicyFingerprint,
-            String,
+            Arc<crate::precompute_engine::group_key::GroupKey>,
             Vec<(String, i64, f64)>,
         )> = messages
             .into_iter()

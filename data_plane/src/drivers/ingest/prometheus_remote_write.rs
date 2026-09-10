@@ -524,7 +524,11 @@ fn route_messages(
     ingest: &Arc<IngestState>,
     physical_plan: &crate::storage_engines::types::ActivePhysicalPlan,
 ) -> Vec<WorkerMessage> {
-    type Bucket = (u64, asap_types::PolicyFingerprint, String);
+    type Bucket = (
+        u64,
+        asap_types::PolicyFingerprint,
+        Arc<crate::precompute_engine::group_key::GroupKey>,
+    );
     type RoutedSample = (String, i64, f64);
     let snapshot = physical_plan.runtime_config.clone();
     let _ = crate::storage_engines::sketch_db::lifecycle::reconcile_if_config_changed(
@@ -579,7 +583,14 @@ fn route_messages(
                     .collect()
             };
             let group_key = if series_scoped {
-                sample.population_key.to_string()
+                let mut names = sample.labels.keys().map(String::as_str).collect::<Vec<_>>();
+                names.sort_unstable();
+                crate::precompute_engine::group_key::intern_pairs(names.into_iter().map(|name| {
+                    (
+                        name,
+                        sample.labels.get(name).map(String::as_str).unwrap_or(""),
+                    )
+                }))
             } else {
                 group_key
             };
@@ -1229,7 +1240,7 @@ mod tests {
         else {
             panic!("expected GroupSamples");
         };
-        assert_eq!(group_key, "api");
+        assert_eq!(group_key.values().labels, vec!["api"]);
         assert_eq!(
             samples,
             vec![("requests_total{job=\"api\"}".into(), 100, 4.0)]

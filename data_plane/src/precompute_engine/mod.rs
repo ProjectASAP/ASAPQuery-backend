@@ -2,6 +2,7 @@ pub mod accumulator_factory;
 pub mod config;
 mod engine;
 pub mod frame_lineage;
+pub mod group_key;
 pub mod ingest_handler;
 pub(crate) mod metrics;
 pub mod operators;

@@ -260,7 +260,10 @@ impl IngestState {
     /// Extract the group key for a series key against a given aggregation
     /// config. Re-exports the module-private helper so that out-of-module
     /// ingest sources (e.g. OTLP) can reuse it.
-    pub fn extract_group_key_for(series_key: &str, config: &AggregationConfig) -> String {
+    pub fn extract_group_key_for(
+        series_key: &str,
+        config: &AggregationConfig,
+    ) -> Arc<crate::precompute_engine::group_key::GroupKey> {
         extract_group_key(series_key, config)
     }
 
@@ -274,33 +277,33 @@ impl IngestState {
     pub fn extract_group_key_from_labels(
         labels: &std::collections::HashMap<String, String>,
         config: &AggregationConfig,
-    ) -> String {
-        let mut values = Vec::with_capacity(config.grouping_labels.labels.len());
-        for label_name in &config.grouping_labels.labels {
-            values.push(
-                labels
-                    .get(label_name.as_str())
-                    .map(|s| s.as_str())
-                    .unwrap_or(""),
-            );
-        }
-        values.join(";")
+    ) -> Arc<crate::precompute_engine::group_key::GroupKey> {
+        crate::precompute_engine::group_key::intern_pairs(config.grouping_labels.labels.iter().map(
+            |name| {
+                (
+                    name.as_str(),
+                    labels.get(name).map(String::as_str).unwrap_or(""),
+                )
+            },
+        ))
     }
 }
 
 /// Extract the group key (grouping label values joined by semicolons)
 /// for a given series key and aggregation config.
-fn extract_group_key(series_key: &str, config: &AggregationConfig) -> String {
+fn extract_group_key(
+    series_key: &str,
+    config: &AggregationConfig,
+) -> Arc<crate::precompute_engine::group_key::GroupKey> {
     let labels = parse_labels_from_series_key(series_key);
-    let mut values = Vec::new();
-    for label_name in &config.grouping_labels.labels {
-        if let Some(val) = labels.get(label_name.as_str()) {
-            values.push(*val);
-        } else {
-            values.push("");
-        }
-    }
-    values.join(";")
+    crate::precompute_engine::group_key::intern_pairs(config.grouping_labels.labels.iter().map(
+        |name| {
+            (
+                name.as_str(),
+                labels.get(name.as_str()).copied().unwrap_or(""),
+            )
+        },
+    ))
 }
 
 #[cfg(test)]

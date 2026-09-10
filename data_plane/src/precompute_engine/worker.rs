@@ -2,6 +2,7 @@ use crate::precompute_engine::accumulator_factory::{
     create_accumulator_updater, AccumulatorUpdater,
 };
 use crate::precompute_engine::config::LateDataPolicy;
+use crate::precompute_engine::group_key::GroupKey;
 use crate::precompute_engine::metrics::record_late_input;
 use crate::precompute_engine::operators::sum_accumulator::SumAccumulator;
 use crate::precompute_engine::output_sink::OutputSink;
@@ -20,8 +21,6 @@ use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, debug_span, info, warn};
-
-const POPULATION_GROUP_KEY_PREFIX: &str = "__asap_population__";
 
 /// Per-bucket aggregation state: window manager + active pane accumulators.
 ///
@@ -50,7 +49,7 @@ struct GroupState {
     /// can render the output's `KeyByLabelValues` without consulting the
     /// sid → attrs reverse mapping. Format matches the input messages'
     /// `group_key` field.
-    group_key: String,
+    group_key: Arc<GroupKey>,
     window_manager: WindowManager,
     /// Active panes for raw-sample accumulation, keyed by pane_start_ms.
     active_panes: BTreeMap<i64, Box<dyn AccumulatorUpdater>>,
@@ -389,7 +388,7 @@ impl Worker {
         &mut self,
         sid: u64,
         policy_fp: PolicyFingerprint,
-        group_key: &str,
+        group_key: &Arc<GroupKey>,
     ) -> Option<&mut GroupState> {
         if !self.group_states.contains_key(&sid) {
             let snap = self.hot_reload.snapshot();
@@ -404,7 +403,7 @@ impl Worker {
                 ),
                 config,
                 policy_fp,
-                group_key: group_key.to_string(),
+                group_key: Arc::clone(group_key),
                 active_panes: BTreeMap::new(),
                 counter_previous: HashMap::new(),
                 sketch_panes: BTreeMap::new(),
@@ -431,7 +430,7 @@ impl Worker {
         &mut self,
         sid: u64,
         policy_fp: PolicyFingerprint,
-        group_key: &str,
+        group_key: &Arc<GroupKey>,
         samples: Vec<(String, i64, f64)>, // (series_key, timestamp_ms, value)
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let worker_id = self.id;
@@ -648,7 +647,7 @@ impl Worker {
         &mut self,
         sid: u64,
         policy_fp: PolicyFingerprint,
-        group_key: &str,
+        group_key: &Arc<GroupKey>,
         timestamp_ms: i64,
         incoming: Box<dyn AggregateCore>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1131,17 +1130,13 @@ fn watermark_for_event_time(max_event_time_ms: i64, allowed_lateness_ms: i64) ->
     }
 }
 
-fn build_group_key_label_values(group_key: &str) -> KeyByLabelValues {
-    if let Some(labels) = population_labels_from_group_key(group_key) {
-        return KeyByLabelValues::new_with_labels(labels.into_values().collect());
-    }
-    let labels: Vec<String> = group_key.split(';').map(|s| s.to_string()).collect();
-    KeyByLabelValues::new_with_labels(labels)
+fn build_group_key_label_values(group_key: &GroupKey) -> KeyByLabelValues {
+    group_key.values()
 }
 
-fn population_labels_from_group_key(group_key: &str) -> Option<BTreeMap<String, String>> {
-    let encoded = group_key.strip_prefix(POPULATION_GROUP_KEY_PREFIX)?;
-    serde_json::from_str(encoded).ok()
+fn population_labels_from_group_key(group_key: &GroupKey) -> Option<BTreeMap<String, String>> {
+    let labels = group_key.as_population_labels();
+    (!labels.is_empty()).then_some(labels)
 }
 
 fn precomputed_output_for_group(
@@ -1149,7 +1144,7 @@ fn precomputed_output_for_group(
     end_timestamp: u64,
     key: KeyByLabelValues,
     policy_fp: PolicyFingerprint,
-    group_key: &str,
+    group_key: &GroupKey,
 ) -> PrecomputedOutput {
     PrecomputedOutput::new(start_timestamp, end_timestamp, Some(key), policy_fp)
         .with_population_labels(population_labels_from_group_key(group_key))
@@ -1467,6 +1462,16 @@ fn merge_sketch_panes_for_window(
 mod tests {
     use super::*;
 
+    fn test_group_key(value: &str) -> Arc<GroupKey> {
+        if value.is_empty() {
+            return crate::precompute_engine::group_key::intern_pairs(std::iter::empty::<(
+                &str,
+                &str,
+            )>());
+        }
+        crate::precompute_engine::group_key::intern_pairs([("group", value)])
+    }
+
     #[test]
     fn counter_delta_is_reset_aware_series_local_and_cross_pane_safe() {
         let mut previous = HashMap::new();
@@ -1759,19 +1764,39 @@ mod tests {
         // All go to the same bucket (sid=1, group_key="")
         let pf = PolicyFingerprint(1);
         worker
-            .process_group_samples(1, pf, "", group_samples("cpu", vec![(1000, 1.0)]))
+            .process_group_samples(
+                1,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(1000, 1.0)]),
+            )
             .unwrap();
         worker
-            .process_group_samples(1, pf, "", group_samples("cpu", vec![(5000, 2.0)]))
+            .process_group_samples(
+                1,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(5000, 2.0)]),
+            )
             .unwrap();
         worker
-            .process_group_samples(1, pf, "", group_samples("cpu", vec![(9000, 3.0)]))
+            .process_group_samples(
+                1,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(9000, 3.0)]),
+            )
             .unwrap();
         assert_eq!(sink.len(), 0);
 
         // Sample at t=10000ms closes [0, 10000)
         worker
-            .process_group_samples(1, pf, "", group_samples("cpu", vec![(10000, 100.0)]))
+            .process_group_samples(
+                1,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(10000, 100.0)]),
+            )
             .unwrap();
 
         let captured = sink.drain();
@@ -1826,7 +1851,7 @@ mod tests {
             .process_group_samples(
                 1,
                 pf,
-                "",
+                &test_group_key(""),
                 vec![
                     ("cpu{host=\"A\"}".to_string(), 1000, 10.0),
                     ("cpu{host=\"B\"}".to_string(), 2000, 20.0),
@@ -1840,7 +1865,7 @@ mod tests {
             .process_group_samples(
                 1,
                 pf,
-                "",
+                &test_group_key(""),
                 group_samples("cpu{host=\"A\"}", vec![(10000, 0.0)]),
             )
             .unwrap();
@@ -1898,7 +1923,7 @@ mod tests {
             .process_group_samples(
                 sid_constant,
                 pf,
-                "constant",
+                &test_group_key("constant"),
                 group_samples("cpu{pattern=\"constant\"}", vec![(1000, 5.0)]),
             )
             .unwrap();
@@ -1907,7 +1932,7 @@ mod tests {
             .process_group_samples(
                 sid_sine,
                 pf,
-                "sine",
+                &test_group_key("sine"),
                 group_samples("cpu{pattern=\"sine\"}", vec![(2000, 7.0)]),
             )
             .unwrap();
@@ -1917,7 +1942,7 @@ mod tests {
             .process_group_samples(
                 sid_constant,
                 pf,
-                "constant",
+                &test_group_key("constant"),
                 group_samples("cpu{pattern=\"constant\"}", vec![(10000, 0.0)]),
             )
             .unwrap();
@@ -1925,7 +1950,7 @@ mod tests {
             .process_group_samples(
                 sid_sine,
                 pf,
-                "sine",
+                &test_group_key("sine"),
                 group_samples("cpu{pattern=\"sine\"}", vec![(10000, 0.0)]),
             )
             .unwrap();
@@ -1973,7 +1998,7 @@ mod tests {
             .process_group_samples(
                 1,
                 pf,
-                "constant",
+                &test_group_key("constant"),
                 vec![
                     (
                         "latency{pattern=\"constant\",host=\"a\"}".to_string(),
@@ -1999,7 +2024,7 @@ mod tests {
             .process_group_samples(
                 1,
                 pf,
-                "constant",
+                &test_group_key("constant"),
                 group_samples(
                     "latency{pattern=\"constant\",host=\"a\"}",
                     vec![(10000, 0.0)],
@@ -2051,14 +2076,24 @@ mod tests {
         // Sample at t=15000ms → goes to pane 10000ms
         let pf = PolicyFingerprint(2);
         worker
-            .process_group_samples(2, pf, "", group_samples("cpu", vec![(15_000, 42.0)]))
+            .process_group_samples(
+                2,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(15_000, 42.0)]),
+            )
             .unwrap();
         assert_eq!(sink.len(), 0);
 
         // Sample at t=45000ms → advances watermark to 45000ms
         // Closes windows [0, 30000) and [10000, 40000)
         worker
-            .process_group_samples(2, pf, "", group_samples("cpu", vec![(45_000, 0.0)]))
+            .process_group_samples(
+                2,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(45_000, 0.0)]),
+            )
             .unwrap();
 
         let captured = sink.drain();
@@ -2103,10 +2138,20 @@ mod tests {
         );
 
         worker
-            .process_group_samples(2, policy, "", group_samples("cpu", vec![(15_000, 42.0)]))
+            .process_group_samples(
+                2,
+                policy,
+                &test_group_key(""),
+                group_samples("cpu", vec![(15_000, 42.0)]),
+            )
             .unwrap();
         worker
-            .process_group_samples(2, policy, "", group_samples("cpu", vec![(45_000, 0.0)]))
+            .process_group_samples(
+                2,
+                policy,
+                &test_group_key(""),
+                group_samples("cpu", vec![(45_000, 0.0)]),
+            )
             .unwrap();
 
         let captured = sink.drain();
@@ -2163,7 +2208,7 @@ mod tests {
             .process_group_samples(
                 3,
                 pf,
-                "",
+                &test_group_key(""),
                 vec![
                     ("cpu{host=\"A\"}".to_string(), 1000, 10.0),
                     ("cpu{host=\"B\"}".to_string(), 2000, 20.0),
@@ -2176,7 +2221,7 @@ mod tests {
             .process_group_samples(
                 3,
                 pf,
-                "",
+                &test_group_key(""),
                 group_samples("cpu{host=\"A\"}", vec![(10000, 0.0)]),
             )
             .unwrap();
@@ -2251,13 +2296,23 @@ mod tests {
         // Establish watermark at t=20000ms
         let pf = PolicyFingerprint(4);
         worker
-            .process_group_samples(4, pf, "", group_samples("cpu", vec![(20_000, 1.0)]))
+            .process_group_samples(
+                4,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(20_000, 1.0)]),
+            )
             .unwrap();
         let _ = sink.drain();
 
         // Send a late sample
         worker
-            .process_group_samples(4, pf, "", group_samples("cpu", vec![(5_000, 99.0)]))
+            .process_group_samples(
+                4,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(5_000, 99.0)]),
+            )
             .unwrap();
 
         assert_eq!(sink.len(), 0, "late sample should be dropped");
@@ -2306,16 +2361,31 @@ mod tests {
         // budget permits closing [0, 10s).
         let pf = PolicyFingerprint(5);
         worker
-            .process_group_samples(5, pf, "", group_samples("cpu", vec![(500, 1.0)]))
+            .process_group_samples(
+                5,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(500, 1.0)]),
+            )
             .unwrap();
         worker
-            .process_group_samples(5, pf, "", group_samples("cpu", vec![(30_000, 0.0)]))
+            .process_group_samples(
+                5,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(30_000, 0.0)]),
+            )
             .unwrap();
         let _ = sink.drain();
 
         // Send late sample for evicted pane
         worker
-            .process_group_samples(5, pf, "", group_samples("cpu", vec![(8_000, 55.0)]))
+            .process_group_samples(
+                5,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(8_000, 55.0)]),
+            )
             .unwrap();
 
         let captured = sink.drain();
@@ -2382,7 +2452,7 @@ aggregations:
             .process_group_samples(
                 sid,
                 pf,
-                "",
+                &test_group_key(""),
                 group_samples("requests_total", vec![(1_000, 3.0)]),
             )
             .unwrap();
@@ -2390,7 +2460,7 @@ aggregations:
             .process_group_samples(
                 sid,
                 pf,
-                "",
+                &test_group_key(""),
                 group_samples("requests_total", vec![(5_000, 4.0)]),
             )
             .unwrap();
@@ -2398,7 +2468,7 @@ aggregations:
             .process_group_samples(
                 sid,
                 pf,
-                "",
+                &test_group_key(""),
                 group_samples("requests_total", vec![(9_000, 5.0)]),
             )
             .unwrap();
@@ -2408,7 +2478,7 @@ aggregations:
             .process_group_samples(
                 sid,
                 pf,
-                "",
+                &test_group_key(""),
                 group_samples("requests_total", vec![(10_000, 0.0)]),
             )
             .unwrap();
@@ -2462,19 +2532,29 @@ aggregations:
 
     #[test]
     fn test_build_group_key_label_values() {
-        let key = build_group_key_label_values("constant");
+        let single = test_group_key("constant");
+        let key = build_group_key_label_values(&single);
         assert_eq!(key.labels, vec!["constant".to_string()]);
 
-        let key = build_group_key_label_values("us-east;svc-a");
-        assert_eq!(key.labels, vec!["us-east".to_string(), "svc-a".to_string()]);
+        let delimited = crate::precompute_engine::group_key::intern_pairs([
+            ("region", "us-east;1"),
+            ("service", "svc-a"),
+        ]);
+        let key = build_group_key_label_values(&delimited);
+        assert_eq!(
+            key.labels,
+            vec!["us-east;1".to_string(), "svc-a".to_string()]
+        );
 
-        let key = build_group_key_label_values("");
-        assert_eq!(key.labels, vec!["".to_string()]);
+        let empty = test_group_key("");
+        let key = build_group_key_label_values(&empty);
+        assert!(key.labels.is_empty());
 
-        let group = r#"__asap_population__{"instance":"a","job":"api"}"#;
-        let key = build_group_key_label_values(group);
+        let group =
+            crate::precompute_engine::group_key::intern_pairs([("instance", "a"), ("job", "api")]);
+        let key = build_group_key_label_values(&group);
         assert_eq!(key.labels, vec!["a".to_string(), "api".to_string()]);
-        let output = precomputed_output_for_group(0, 5_000, key, PolicyFingerprint(7), group);
+        let output = precomputed_output_for_group(0, 5_000, key, PolicyFingerprint(7), &group);
         assert_eq!(
             output.population_labels,
             Some(BTreeMap::from([
@@ -2517,7 +2597,7 @@ aggregations:
             .process_group_samples(
                 sid_a,
                 pf,
-                "groupA",
+                &test_group_key("groupA"),
                 group_samples("cpu", vec![(5_000, 1.0)]),
             )
             .unwrap();
@@ -2526,7 +2606,7 @@ aggregations:
             .process_group_samples(
                 sid_b,
                 pf,
-                "groupB",
+                &test_group_key("groupB"),
                 group_samples("cpu", vec![(5_000, 2.0)]),
             )
             .unwrap();
@@ -2537,7 +2617,7 @@ aggregations:
             .process_group_samples(
                 sid_a,
                 pf,
-                "groupA",
+                &test_group_key("groupA"),
                 group_samples("cpu", vec![(100_000, 3.0)]),
             )
             .unwrap();
@@ -2566,7 +2646,7 @@ aggregations:
             .process_group_samples(
                 sid_b,
                 pf,
-                "groupB",
+                &test_group_key("groupB"),
                 group_samples("cpu", vec![(5_000, 4.0)]),
             )
             .unwrap();
@@ -2612,12 +2692,22 @@ aggregations:
         let pf = PolicyFingerprint(1);
 
         worker
-            .process_group_samples(1, pf, "", group_samples("cpu", vec![(0, 1.0)]))
+            .process_group_samples(
+                1,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(0, 1.0)]),
+            )
             .unwrap();
         worker.flush_all().unwrap();
         worker.flush_all().unwrap();
         worker
-            .process_group_samples(1, pf, "", group_samples("cpu", vec![(0, 2.0)]))
+            .process_group_samples(
+                1,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(0, 2.0)]),
+            )
             .unwrap();
         worker.force_close_all().unwrap();
 
@@ -2654,10 +2744,20 @@ aggregations:
         let pf = PolicyFingerprint(1);
 
         worker
-            .process_group_samples(1, pf, "", group_samples("cpu", vec![(5_000, 1.0)]))
+            .process_group_samples(
+                1,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(5_000, 1.0)]),
+            )
             .unwrap();
         worker
-            .process_group_samples(1, pf, "", group_samples("cpu", vec![(10_000, 2.0)]))
+            .process_group_samples(
+                1,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(10_000, 2.0)]),
+            )
             .unwrap();
         assert_eq!(
             sink.len(),
@@ -2666,7 +2766,12 @@ aggregations:
         );
 
         worker
-            .process_group_samples(1, pf, "", group_samples("cpu", vec![(15_000, 3.0)]))
+            .process_group_samples(
+                1,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(15_000, 3.0)]),
+            )
             .unwrap();
         let emitted = sink.drain();
         assert_eq!(emitted.len(), 1);
@@ -2699,7 +2804,7 @@ aggregations:
             .process_group_samples(
                 1,
                 PolicyFingerprint(1),
-                "",
+                &test_group_key(""),
                 group_samples(
                     "cpu",
                     vec![
@@ -2759,7 +2864,12 @@ aggregations:
         // Send data at t=50s
         let pf = PolicyFingerprint(1);
         worker
-            .process_group_samples(1, pf, "", group_samples("cpu", vec![(50_000, 1.0)]))
+            .process_group_samples(
+                1,
+                pf,
+                &test_group_key(""),
+                group_samples("cpu", vec![(50_000, 1.0)]),
+            )
             .unwrap();
 
         // Flush should publish worker watermark
@@ -2835,7 +2945,7 @@ aggregations:
         for i in 0..10 {
             let s = make_ddsketch(0.01, &[1.0 + i as f64, 2.0, 3.0]);
             worker
-                .process_accumulator_input(sid, pf, "us-east", 60_000, Box::new(s))
+                .process_accumulator_input(sid, pf, &test_group_key("us-east"), 60_000, Box::new(s))
                 .expect("first batch must process");
         }
         assert_eq!(
@@ -2851,7 +2961,7 @@ aggregations:
         // and the output is emitted.
         let s2 = make_ddsketch(0.01, &[5.0, 6.0]);
         worker
-            .process_accumulator_input(sid, pf, "us-east", 120_000, Box::new(s2))
+            .process_accumulator_input(sid, pf, &test_group_key("us-east"), 120_000, Box::new(s2))
             .expect("second batch must process");
 
         let captured = sink.drain();
@@ -2930,25 +3040,49 @@ aggregations:
         for i in 0..3 {
             let s = make_ddsketch(0.01, &[100.0 + i as f64]);
             worker
-                .process_accumulator_input(sid_east, pf, "us-east", 60_000, Box::new(s))
+                .process_accumulator_input(
+                    sid_east,
+                    pf,
+                    &test_group_key("us-east"),
+                    60_000,
+                    Box::new(s),
+                )
                 .unwrap();
         }
         // Two sketches in a different zone.
         for i in 0..2 {
             let s = make_ddsketch(0.01, &[200.0 + i as f64]);
             worker
-                .process_accumulator_input(sid_west, pf, "us-west", 60_000, Box::new(s))
+                .process_accumulator_input(
+                    sid_west,
+                    pf,
+                    &test_group_key("us-west"),
+                    60_000,
+                    Box::new(s),
+                )
                 .unwrap();
         }
 
         // Advance the watermark past 90_000 to close window [60_000, 90_000).
         let s = make_ddsketch(0.01, &[1.0]);
         worker
-            .process_accumulator_input(sid_east, pf, "us-east", 120_000, Box::new(s))
+            .process_accumulator_input(
+                sid_east,
+                pf,
+                &test_group_key("us-east"),
+                120_000,
+                Box::new(s),
+            )
             .unwrap();
         let s = make_ddsketch(0.01, &[1.0]);
         worker
-            .process_accumulator_input(sid_west, pf, "us-west", 120_000, Box::new(s))
+            .process_accumulator_input(
+                sid_west,
+                pf,
+                &test_group_key("us-west"),
+                120_000,
+                Box::new(s),
+            )
             .unwrap();
 
         let captured = sink.drain();
@@ -3078,7 +3212,7 @@ aggregations:
         for i in 0..10 {
             let s = make_ddsketch(0.01, &[1.0 + i as f64]);
             worker
-                .process_accumulator_input(sid, pf, "us-east", 0, Box::new(s))
+                .process_accumulator_input(sid, pf, &test_group_key("us-east"), 0, Box::new(s))
                 .expect("ingest must accept frozen-event-time sketches");
         }
         assert_eq!(
@@ -3183,7 +3317,12 @@ aggregations:
             let value = 1.0 + i as f64;
             expected_sum += value;
             worker
-                .process_group_samples(7, pf, "", group_samples("netflow_bytes", vec![(0, value)]))
+                .process_group_samples(
+                    7,
+                    pf,
+                    &test_group_key(""),
+                    group_samples("netflow_bytes", vec![(0, value)]),
+                )
                 .unwrap();
         }
 
@@ -3196,7 +3335,12 @@ aggregations:
         wall_clock.store(1_007_000, Ordering::Relaxed);
         expected_sum += 8.0;
         worker
-            .process_group_samples(7, pf, "", group_samples("netflow_bytes", vec![(0, 8.0)]))
+            .process_group_samples(
+                7,
+                pf,
+                &test_group_key(""),
+                group_samples("netflow_bytes", vec![(0, 8.0)]),
+            )
             .unwrap();
 
         wall_clock.store(1_013_001, Ordering::Relaxed);
@@ -3241,7 +3385,7 @@ aggregations:
                 .process_group_samples(
                     9,
                     pf,
-                    "",
+                    &test_group_key(""),
                     group_samples("netflow_bytes", vec![(0, 1.0 + i as f64)]),
                 )
                 .unwrap();
@@ -3264,7 +3408,12 @@ aggregations:
         // mergeable correction instead of being silently dropped.
         wall_clock.store(3_007_000, Ordering::Relaxed);
         worker
-            .process_group_samples(9, pf, "", group_samples("netflow_bytes", vec![(0, 8.0)]))
+            .process_group_samples(
+                9,
+                pf,
+                &test_group_key(""),
+                group_samples("netflow_bytes", vec![(0, 8.0)]),
+            )
             .unwrap();
         let mut corrections = sink.drain();
         assert_eq!(corrections.len(), 1, "late input must emit a correction");
@@ -3306,7 +3455,7 @@ aggregations:
             .process_group_samples(
                 11,
                 PolicyFingerprint(11),
-                "",
+                &test_group_key(""),
                 group_samples("netflow_bytes", vec![(0, 1.0)]),
             )
             .unwrap();
@@ -3349,7 +3498,7 @@ aggregations:
                 .process_accumulator_input(
                     80,
                     pf,
-                    "us-east",
+                    &test_group_key("us-east"),
                     0,
                     Box::new(make_ddsketch(0.01, &[1.0 + i as f64])),
                 )
@@ -3362,7 +3511,13 @@ aggregations:
 
         wall_clock.store(2_007_000, Ordering::Relaxed);
         worker
-            .process_accumulator_input(80, pf, "us-east", 0, Box::new(make_ddsketch(0.01, &[8.0])))
+            .process_accumulator_input(
+                80,
+                pf,
+                &test_group_key("us-east"),
+                0,
+                Box::new(make_ddsketch(0.01, &[8.0])),
+            )
             .unwrap();
 
         wall_clock.store(2_013_001, Ordering::Relaxed);
@@ -3407,7 +3562,7 @@ aggregations:
                 .process_accumulator_input(
                     100,
                     pf,
-                    "us-east",
+                    &test_group_key("us-east"),
                     0,
                     Box::new(make_ddsketch(0.01, &[1.0 + i as f64])),
                 )
@@ -3422,7 +3577,13 @@ aggregations:
 
         wall_clock.store(4_007_000, Ordering::Relaxed);
         worker
-            .process_accumulator_input(100, pf, "us-east", 0, Box::new(make_ddsketch(0.01, &[8.0])))
+            .process_accumulator_input(
+                100,
+                pf,
+                &test_group_key("us-east"),
+                0,
+                Box::new(make_ddsketch(0.01, &[8.0])),
+            )
             .unwrap();
         let mut corrections = sink.drain();
         assert_eq!(corrections.len(), 1, "late sketch must emit a correction");
@@ -3470,7 +3631,13 @@ aggregations:
 
         let s = make_ddsketch(0.01, &[42.0]);
         worker
-            .process_accumulator_input(1, PolicyFingerprint(1), "us-east", 0, Box::new(s))
+            .process_accumulator_input(
+                1,
+                PolicyFingerprint(1),
+                &test_group_key("us-east"),
+                0,
+                Box::new(s),
+            )
             .unwrap();
 
         // Even after a wall-clock eternity, no emit happens with
@@ -3520,7 +3687,7 @@ aggregations:
             .process_group_samples(
                 1,
                 PolicyFingerprint(1),
-                "",
+                &test_group_key(""),
                 vec![
                     ("gauge{job=\"api\"}".into(), 1000, 10.0),
                     ("gauge{job=\"api\"}".into(), 2000, 30.0),
@@ -3574,7 +3741,7 @@ aggregations:
             .process_group_samples(
                 1,
                 PolicyFingerprint(1),
-                "",
+                &test_group_key(""),
                 vec![
                     ("requests_total{instance=\"a\"}".into(), 1000, 100.0),
                     ("requests_total{instance=\"b\"}".into(), 1000, 50.0),
@@ -3622,7 +3789,7 @@ aggregations:
         tx.send(WorkerMessage::GroupSamples {
             sid: 1,
             policy_fp: PolicyFingerprint(1),
-            group_key: "".into(),
+            group_key: test_group_key(""),
             samples: group_samples("cpu", vec![(1000, 2.0), (2000, 3.0)]),
             ingest_received_at: std::time::Instant::now(),
         })
@@ -3685,7 +3852,7 @@ aggregations:
         tx.send(WorkerMessage::GroupSamples {
             sid: 1,
             policy_fp: PolicyFingerprint(1),
-            group_key: "".into(),
+            group_key: test_group_key(""),
             samples: group_samples("cpu", vec![(1000, 2.0)]),
             ingest_received_at: std::time::Instant::now(),
         })
@@ -3730,7 +3897,7 @@ aggregations:
                 .process_group_samples(
                     1,
                     pf,
-                    "",
+                    &test_group_key(""),
                     group_samples("cpu", vec![(1_000 + i * 100, 1.0)]),
                 )
                 .unwrap();
@@ -3800,7 +3967,7 @@ aggregations:
         for i in 0..10 {
             let s = make_ddsketch(0.01, &[1.0 + i as f64]);
             worker
-                .process_accumulator_input(51, pf, "us-east", 0, Box::new(s))
+                .process_accumulator_input(51, pf, &test_group_key("us-east"), 0, Box::new(s))
                 .unwrap();
         }
 
