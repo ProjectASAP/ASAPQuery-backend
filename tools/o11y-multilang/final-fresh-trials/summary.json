@@ -1,0 +1,277 @@
+{
+  "contract": {
+    "trials": 3,
+    "repetitions": 5,
+    "queries": 27,
+    "attempts_per_engine": 405,
+    "fresh_storage_and_process_each_trial": true,
+    "readiness_note": "trial harness used an unauthenticated ClickHouse ping and therefore waited 30 seconds before each load; readiness time is outside recorded query wall_seconds"
+  },
+  "engines": {
+    "prometheus": {
+      "attempted": 405,
+      "ok": 405,
+      "p50_ms": 3.697262,
+      "p95_ms": 10.157472,
+      "mean_ms": 5.272920355555556,
+      "x_asap_execution": {
+        "None": 405
+      }
+    },
+    "clickhouse": {
+      "attempted": 405,
+      "ok": 405,
+      "p50_ms": 56.720665,
+      "p95_ms": 537.293388,
+      "mean_ms": 130.9923049234568,
+      "x_asap_execution": {
+        "None": 405
+      }
+    },
+    "victoriametrics": {
+      "attempted": 405,
+      "ok": 405,
+      "p50_ms": 2.390508,
+      "p95_ms": 3.402572,
+      "mean_ms": 2.533724266666667,
+      "x_asap_execution": {
+        "None": 405
+      }
+    },
+    "asap_metricsql": {
+      "attempted": 405,
+      "ok": 405,
+      "p50_ms": 5.039775,
+      "p95_ms": 5.783631,
+      "mean_ms": 5.020113943209877,
+      "x_asap_execution": {
+        "exact_fallback": 405
+      }
+    },
+    "asap_clickhouse": {
+      "attempted": 405,
+      "ok": 405,
+      "p50_ms": 59.186897,
+      "p95_ms": 534.371573,
+      "mean_ms": 133.00185938518518,
+      "x_asap_execution": {
+        "exact_fallback": 405
+      }
+    }
+  },
+  "trials": [
+    {
+      "trial": 0,
+      "raw": "tools/o11y-multilang/final-fresh-trials/trial-0-raw.json",
+      "wall_seconds": 37.74626684188843,
+      "before": {
+        "dp": {
+          "pid": 2647287,
+          "cpu_ticks": 6,
+          "rss_pages": 14505
+        },
+        "prom": {
+          "pid": 2646532,
+          "cpu_ticks": 21,
+          "rss_pages": 18663
+        },
+        "vm": {
+          "pid": 2646785,
+          "cpu_ticks": 519,
+          "rss_pages": 78560
+        },
+        "ch": {
+          "pid": 2646929,
+          "cpu_ticks": 827,
+          "rss_pages": 202813
+        }
+      },
+      "after": {
+        "dp": {
+          "pid": 2647287,
+          "cpu_ticks": 147,
+          "rss_pages": 16212
+        },
+        "prom": {
+          "pid": 2646532,
+          "cpu_ticks": 94,
+          "rss_pages": 18969
+        },
+        "vm": {
+          "pid": 2646785,
+          "cpu_ticks": 588,
+          "rss_pages": 80119
+        },
+        "ch": {
+          "pid": 2646929,
+          "cpu_ticks": 5851,
+          "rss_pages": 367255
+        }
+      },
+      "resource_delta": {
+        "dp": {
+          "cpu_ticks": 141,
+          "rss_pages_end": 16212,
+          "rss_pages_delta": 1707
+        },
+        "prom": {
+          "cpu_ticks": 73,
+          "rss_pages_end": 18969,
+          "rss_pages_delta": 306
+        },
+        "vm": {
+          "cpu_ticks": 69,
+          "rss_pages_end": 80119,
+          "rss_pages_delta": 1559
+        },
+        "ch": {
+          "cpu_ticks": 5024,
+          "rss_pages_end": 367255,
+          "rss_pages_delta": 164442
+        }
+      }
+    },
+    {
+      "trial": 1,
+      "raw": "tools/o11y-multilang/final-fresh-trials/trial-1-raw.json",
+      "wall_seconds": 37.567633867263794,
+      "before": {
+        "dp": {
+          "pid": 2648560,
+          "cpu_ticks": 6,
+          "rss_pages": 14520
+        },
+        "prom": {
+          "pid": 2647773,
+          "cpu_ticks": 25,
+          "rss_pages": 18384
+        },
+        "vm": {
+          "pid": 2648031,
+          "cpu_ticks": 534,
+          "rss_pages": 71931
+        },
+        "ch": {
+          "pid": 2648165,
+          "cpu_ticks": 805,
+          "rss_pages": 198432
+        }
+      },
+      "after": {
+        "dp": {
+          "pid": 2648560,
+          "cpu_ticks": 144,
+          "rss_pages": 16273
+        },
+        "prom": {
+          "pid": 2647773,
+          "cpu_ticks": 99,
+          "rss_pages": 18783
+        },
+        "vm": {
+          "pid": 2648031,
+          "cpu_ticks": 602,
+          "rss_pages": 74618
+        },
+        "ch": {
+          "pid": 2648165,
+          "cpu_ticks": 5796,
+          "rss_pages": 370994
+        }
+      },
+      "resource_delta": {
+        "dp": {
+          "cpu_ticks": 138,
+          "rss_pages_end": 16273,
+          "rss_pages_delta": 1753
+        },
+        "prom": {
+          "cpu_ticks": 74,
+          "rss_pages_end": 18783,
+          "rss_pages_delta": 399
+        },
+        "vm": {
+          "cpu_ticks": 68,
+          "rss_pages_end": 74618,
+          "rss_pages_delta": 2687
+        },
+        "ch": {
+          "cpu_ticks": 4991,
+          "rss_pages_end": 370994,
+          "rss_pages_delta": 172562
+        }
+      }
+    },
+    {
+      "trial": 2,
+      "raw": "tools/o11y-multilang/final-fresh-trials/trial-2-raw.json",
+      "wall_seconds": 37.63371729850769,
+      "before": {
+        "dp": {
+          "pid": 2649716,
+          "cpu_ticks": 6,
+          "rss_pages": 14555
+        },
+        "prom": {
+          "pid": 2648976,
+          "cpu_ticks": 22,
+          "rss_pages": 18271
+        },
+        "vm": {
+          "pid": 2649226,
+          "cpu_ticks": 539,
+          "rss_pages": 73569
+        },
+        "ch": {
+          "pid": 2649366,
+          "cpu_ticks": 821,
+          "rss_pages": 201095
+        }
+      },
+      "after": {
+        "dp": {
+          "pid": 2649716,
+          "cpu_ticks": 148,
+          "rss_pages": 16228
+        },
+        "prom": {
+          "pid": 2648976,
+          "cpu_ticks": 95,
+          "rss_pages": 18994
+        },
+        "vm": {
+          "pid": 2649226,
+          "cpu_ticks": 607,
+          "rss_pages": 75278
+        },
+        "ch": {
+          "pid": 2649366,
+          "cpu_ticks": 5823,
+          "rss_pages": 324008
+        }
+      },
+      "resource_delta": {
+        "dp": {
+          "cpu_ticks": 142,
+          "rss_pages_end": 16228,
+          "rss_pages_delta": 1673
+        },
+        "prom": {
+          "cpu_ticks": 73,
+          "rss_pages_end": 18994,
+          "rss_pages_delta": 723
+        },
+        "vm": {
+          "cpu_ticks": 68,
+          "rss_pages_end": 75278,
+          "rss_pages_delta": 1709
+        },
+        "ch": {
+          "cpu_ticks": 5002,
+          "rss_pages_end": 324008,
+          "rss_pages_delta": 122913
+        }
+      }
+    }
+  ]
+}
