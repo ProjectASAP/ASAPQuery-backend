@@ -361,7 +361,14 @@ impl Worker {
     ) -> Option<&mut GroupState> {
         if !self.group_states.contains_key(&sid) {
             let snap = self.hot_reload.snapshot();
-            let cfg = snap.get_aggregation_config(policy_fp.as_u64())?;
+            // Physical-plan runtime configs are keyed by materialization ID,
+            // while worker messages carry the content-derived policy
+            // fingerprint. Resolve through the derived registry instead of
+            // assuming those two identities are numerically equal.
+            let registry = snap.policy_registry();
+            let cfg = registry
+                .get(policy_fp)
+                .or_else(|| snap.get_aggregation_config(policy_fp.as_u64()))?;
             let config = Arc::new(cfg.clone());
             let gs = GroupState {
                 window_manager: WindowManager::with_origin(

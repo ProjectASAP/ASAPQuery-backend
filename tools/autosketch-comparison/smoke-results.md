@@ -1,5 +1,29 @@
 # First fixed-CMS smoke evaluation
 
+## Release baseline after Bloom integration (`d62a37b`)
+
+These runs use the query-semantics filter, a 4 KiB per-sketch payload budget,
+10,000 events, cardinality 1,000, ten independent calibration/held-out seed
+pairs, and an error target of 0.01.
+
+| Workload | AutoSketch / ERP / oracle selection | Held-out pass | Mean payload |
+| --- | --- | ---: | ---: |
+| Frequency, uniform | Count Sketch, all 10 runs | 7/10 | 972.8 B |
+| Frequency, Zipf(1.2) | CMS, all 10 runs | 8/10 | 3123.2 B |
+| Membership, uniform | Bloom 2048 × 4, all 10 runs | 10/10 | 1024 B |
+
+For every run, adapted AutoSketch, same-table ERP, and the grid oracle selected
+the same configuration. This is a selection-contract check, not a superiority
+result. The frequency held-out failures show that one calibration window is not
+enough evidence for a robust accuracy claim and motivate multi-window
+calibration plus Hybrid fallback.
+
+The production repeated-dashboard gate initially exposed two runtime defects:
+worker policy lookup confused materialization IDs with policy fingerprints, and
+right-closed panes were anchored independently to each group's first sample
+instead of the global PromQL time grid. After fixing both, the single-pane and
+shared multi-pane process E2E tests pass.
+
 ## Follow-up: hard budget and family selection
 
 Revision `3a74574118d4bd75b4c6ec174318bcc21b492675` adds a counter-payload memory
