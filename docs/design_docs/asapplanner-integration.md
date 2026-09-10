@@ -302,6 +302,6 @@ backend's scoped consolidation through steps 1–6.
 
 - [Physical compiler](../developer_docs/control-plane/physical-compiler.md)
 - [Plan publication](../developer_docs/control-plane/plan-publication.md)
-- [Catalog-backed physical-plan runtime](../developer_docs/query-engine/backend-plan-runtime.md)
+- [Catalog-backed physical-plan runtime](../developer_docs/query-engine/catalog-physical-plan-runtime.md)
 - [ASAPQuery compatibility profile](asapquery-compatibility-profile.md)
 - [Runtime accuracy feedback](../developer_docs/control-plane/runtime-accuracy-feedback.md)
