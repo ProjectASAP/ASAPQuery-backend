@@ -73,6 +73,34 @@ python3 tools/autosketch-comparison/summarize.py /tmp/cms-uniform.json /tmp/cms-
 See [initial smoke results](smoke-results.md) for the first executed runs,
 including held-out accuracy failures.
 
+## Repeated-window execution slice
+
+`repeated_window_comparison` measures the systems distinction that the
+single-window selector cannot: four recurring `{1m, 5m, 15m, 1h}` frequency
+queries over one-minute panes. It uses one fixed, identical
+`asap_sketchlib::CountMinSketch` configuration for all sketch methods:
+
+- `autosketch_per_query`: the natural query-local deployment, one retained pane
+  collection per query;
+- `asap_no_sharing`: deliberately the same physical layout, to keep sketch
+  configuration separate from sharing benefits;
+- `asap_full_shared`: one retained pane collection shared across all windows;
+- `exact_raw`: retained raw keys and exact scans.
+
+```sh
+cargo test -p data_plane --example repeated_window_comparison
+cargo run --release -p data_plane --example repeated_window_comparison -- \
+  --output /tmp/repeated-window.json --backend-revision "$(git rev-parse HEAD)" \
+  --panes 120 --events-per-pane 5000 --cardinality 1000 \
+  --width 256 --depth 4 --trials 7 --query-repetitions 10
+```
+
+This is a deterministic standalone execution experiment, not a claim that the
+AutoSketch paper implements window sharing, nor an end-to-end Planner/control-
+plane benchmark. Methods execute sequentially, so compare medians and structural
+counts; do not interpret wall time as isolated CPU time. See
+[executed results](repeated-window-results.md).
+
 ## Adaptation boundary
 
 The reference is [AutoSketch Algorithm 4 and Section 5.2](https://www.usenix.org/system/files/nsdi24-sun.pdf).
@@ -121,7 +149,7 @@ baseline yet because its confidence contract must be defined separately.
 1. Lazy real benchmark callbacks and fair first-use/amortized accounting; multiple
    accuracy seeds/windows per profile and stronger search regression fixtures.
 2. CMS ERP accuracy mapping through full Planner and backend execution.
-3. Recurring {1m, 5m, 15m, 1h} workloads, independent query periods, and verified
-   PerQuery/NoSharing/Full physical identities and exact-window answers.
+3. Connect the standalone recurring-window runner to generated Planner physical
+   identities and independently scheduled query periods.
 4. Catalog coverage and sketch-family ablations. No performance or breadth claim
    is established by this starter runner.
