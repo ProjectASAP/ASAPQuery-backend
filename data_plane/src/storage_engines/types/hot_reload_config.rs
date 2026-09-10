@@ -259,6 +259,8 @@ pub enum PhysicalPlanLifecycleError {
         incoming: u64,
         active: u64,
     },
+    #[error("plan activation preparation failed: {0}")]
+    Prepare(String),
 }
 
 #[derive(Clone)]
@@ -358,6 +360,22 @@ impl PhysicalPlanLifecycle {
         plan_version: u64,
         now: u64,
     ) -> Result<Arc<ActivePhysicalPlan>, PhysicalPlanLifecycleError> {
+        self.activate_with_prepare(plan_id, plan_version, now, |_| Ok::<(), String>(()))
+    }
+
+    /// Run generation-scoped preparation before publishing a staged plan.
+    /// A failed preparation leaves both the active and staged generations
+    /// unchanged, so callers can fix the dependency and retry activation.
+    pub fn activate_with_prepare<E>(
+        &self,
+        plan_id: u64,
+        plan_version: u64,
+        now: u64,
+        prepare: impl FnOnce(&ActivePhysicalPlan) -> Result<(), E>,
+    ) -> Result<Arc<ActivePhysicalPlan>, PhysicalPlanLifecycleError>
+    where
+        E: std::fmt::Display,
+    {
         let key = (plan_id, plan_version);
         let mut state = self
             .state
@@ -389,6 +407,7 @@ impl PhysicalPlanLifecycle {
                 active: current.plan_version(),
             });
         }
+        prepare(plan).map_err(|error| PhysicalPlanLifecycleError::Prepare(error.to_string()))?;
         let plan = state.staged.remove(&key).expect("staged plan disappeared");
         let old = self.active.swap(plan.clone());
         if old.plan_id() != 0 {
@@ -822,6 +841,34 @@ mod tests {
         assert_eq!(statuses[1].phase, PhysicalPlanPhase::Active);
         lifecycle.retire_drained(7, 1);
         assert_eq!(lifecycle.statuses()[0].phase, PhysicalPlanPhase::Retired);
+    }
+
+    #[test]
+    fn failed_activation_preparation_keeps_active_and_staged_generations() {
+        let active = HotReloadActivePhysicalPlan::new(physical_plan(7, 1, 100, None));
+        let held_reader = active.snapshot();
+        let lifecycle = PhysicalPlanLifecycle::new(active.clone());
+        lifecycle
+            .stage(physical_plan(7, 2, 200, None), 150)
+            .unwrap();
+
+        let error = lifecycle
+            .activate_with_prepare(7, 2, 200, |_| Err("catalog rejected"))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            PhysicalPlanLifecycleError::Prepare("catalog rejected".into())
+        );
+        assert_eq!(active.snapshot().plan_version(), 1);
+        assert_eq!(held_reader.plan_version(), 1);
+        assert!(lifecycle.statuses().iter().any(|status| {
+            status.plan_version == 2 && status.phase == PhysicalPlanPhase::Staged
+        }));
+
+        lifecycle
+            .activate_with_prepare(7, 2, 200, |_| Ok::<(), String>(()))
+            .unwrap();
+        assert_eq!(active.snapshot().plan_version(), 2);
     }
 
     // Failed publication releases only its staging slot; active readers remain valid.

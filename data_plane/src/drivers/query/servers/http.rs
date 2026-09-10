@@ -468,10 +468,6 @@ impl HttpServer {
             )
             .route("/api/v1/store/metrics", get(handle_store_metrics))
             .route("/api/v1/precompute/drain", post(handle_precompute_drain))
-            .route(
-                "/api/v1/streaming-config",
-                get(handle_get_streaming_config).post(handle_post_streaming_config),
-            )
             .route("/api/v1/physical-plan", post(handle_post_physical_plan))
             .route(
                 "/api/v1/physical-plan/discard",
@@ -509,6 +505,17 @@ impl HttpServer {
                 "/api/v1/db/backfill/jobs/:job_id",
                 get(handle_get_backfill_job).delete(handle_delete_backfill_job),
             );
+        // Legacy partial configuration is available only when the distributed
+        // profile explicitly supplies its hot-reload handle. The ASAPQuery
+        // profile exposes only generation-scoped physical-plan publication.
+        let app = if app_state.hot_reload_config.is_some() {
+            app.route(
+                "/api/v1/streaming-config",
+                get(handle_get_streaming_config).post(handle_post_streaming_config),
+            )
+        } else {
+            app
+        };
         let app = if adapter.adapter_name() == "VictoriaMetrics HTTP / MetricsQL" {
             app.route(
                 "/select/:tenant/prometheus/api/v1/query",
@@ -587,10 +594,6 @@ impl HttpServer {
                 post(handle_prometheus_remote_write)
                     .layer(DefaultBodyLimit::max(request_body_limit)),
             )
-            .route(
-                "/api/v1/streaming-config",
-                get(handle_get_streaming_config).post(handle_post_streaming_config),
-            )
             .route("/api/v1/physical-plan", post(handle_post_physical_plan))
             .route(
                 "/api/v1/physical-plan/discard",
@@ -628,6 +631,14 @@ impl HttpServer {
                 "/api/v1/db/backfill/jobs/:job_id",
                 get(handle_get_backfill_job).delete(handle_delete_backfill_job),
             );
+        let app = if app_state.hot_reload_config.is_some() {
+            app.route(
+                "/api/v1/streaming-config",
+                get(handle_get_streaming_config).post(handle_post_streaming_config),
+            )
+        } else {
+            app
+        };
         let app = if adapter.adapter_name() == "VictoriaMetrics HTTP / MetricsQL" {
             app.route(
                 "/select/:tenant/prometheus/api/v1/query",
@@ -6234,7 +6245,18 @@ async fn handle_activate_physical_plan(
             .into_response();
     };
     let _guard = state.physical_plan_lock.lock().await;
-    let old = match lifecycle.activate(request.plan_id, request.plan_version, unix_time_ms()) {
+    let store = Arc::clone(&state.sketch_index);
+    let old = match lifecycle.activate_with_prepare(
+        request.plan_id,
+        request.plan_version,
+        unix_time_ms(),
+        move |plan| match plan.summary_catalog.as_ref() {
+            Some(catalog) => store
+                .install_summary_catalog(Arc::clone(catalog))
+                .map_err(|error| format!("SummaryCatalog install error: {error}")),
+            None => Err("authoritative SummaryCatalog is unavailable".to_string()),
+        },
+    ) {
         Ok(old) => old,
         Err(error) => {
             return (
@@ -6253,20 +6275,6 @@ async fn handle_activate_physical_plan(
         .values()
         .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::ClickHouseSql)
         .count();
-    if let Some(catalog) = activated.summary_catalog.as_ref() {
-        if let Err(error) = state
-            .sketch_index
-            .install_summary_catalog(Arc::clone(catalog))
-        {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({
-                    "status": "error", "error": format!("SummaryCatalog install error: {error}")
-                })),
-            )
-                .into_response();
-        }
-    }
     if old.plan_id() != 0 {
         let draining_id = old.plan_id();
         let draining_version = old.plan_version();
