@@ -283,7 +283,7 @@ mod tests {
         {
             assert_eq!(
                 request.sql,
-                "SELECT 2000 AS timestamp, 10.0 AS divisor WHERE {from:UInt64} <= {to:UInt64}"
+                "SELECT toInt64(2000) AS timestamp, toFloat64(10) AS divisor WHERE {from:UInt64} <= {to:UInt64}"
             );
             assert_eq!(request.parameters.get("param_from"), Some(&"0".into()));
             assert_eq!(request.parameters.get("param_to"), Some(&"2000".into()));
@@ -623,7 +623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepared_clickhouse_leaf_joins_summary_and_feeds_project() {
+    async fn summary_store_and_clickhouse_leaf_join_project_end_to_end() {
         use control_plane::query_plan::BoundClickHouseQuery;
 
         let (accelerator, _) = fixture(2_000).await;
@@ -662,7 +662,7 @@ mod tests {
             external,
             QueryPlanNode::ExternalSqlLeaf {
                 query: BoundClickHouseQuery {
-                sql: "SELECT 2000 AS timestamp, 10.0 AS divisor WHERE {from:UInt64} <= {to:UInt64}".into(),
+                sql: "SELECT toInt64(2000) AS timestamp, toFloat64(10) AS divisor WHERE {from:UInt64} <= {to:UInt64}".into(),
                     parameters: BTreeMap::new(),
                     start_parameter: Some("from".into()),
                     end_parameter: Some("to".into()),
@@ -733,6 +733,47 @@ mod tests {
             String::from_utf8(result.encode(ClickHouseFormat::TabSeparated).unwrap()).unwrap(),
             "1970-01-01T00:00:02\t0.5\n"
         );
+        // The same published leaf is also exercised against an actual
+        // ClickHouse HTTP endpoint in differential/integration environments.
+        if let Ok(base_url) = std::env::var("CLICKHOUSE_URL") {
+            let real = CatalogClickHouseAccelerator::empty(accelerator.store.clone())
+                .with_exact_backend(Arc::new(
+                    super::super::fallback::ClickHouseHttpFallback::new(base_url, "default".into()),
+                ));
+            let mut headers = HeaderMap::new();
+            if let Ok(user) = std::env::var("CLICKHOUSE_USER") {
+                headers.insert("x-clickhouse-user", user.parse().unwrap());
+            }
+            if let Ok(password) = std::env::var("CLICKHOUSE_PASSWORD") {
+                headers.insert("x-clickhouse-key", password.parse().unwrap());
+            }
+            let context = ClickHouseQueryRequest {
+                method: Method::POST,
+                sql: String::new(),
+                body: Bytes::new(),
+                parameters: BTreeMap::new(),
+                headers,
+            };
+            let prepared = real
+                .prepare_external_sql(&entry, 0, 2_000, Some(&context))
+                .await
+                .unwrap();
+            let ClickHouseDagOutcome::Accelerated(result) = execute_sql_dag_with_external(
+                real.store.as_ref(),
+                &entry,
+                physical.summary_catalog.as_ref().unwrap(),
+                &prepared,
+                0,
+                2_000,
+                true,
+            ) else {
+                panic!("real ClickHouse mixed DAG should execute")
+            };
+            assert_eq!(
+                String::from_utf8(result.encode(ClickHouseFormat::TabSeparated).unwrap()).unwrap(),
+                "1970-01-01T00:00:02\t0.5\n"
+            );
+        }
         let QueryPlanNode::ExternalSqlLeaf { query } = entry.nodes.get_mut(&external).unwrap()
         else {
             unreachable!()

@@ -62,6 +62,28 @@ workload and uses the ordinary physical-plan stage and activate endpoints. The
 data plane has no ClickHouse-specific stage or activate endpoints and no SQL
 plan token or startup sidecar bundle.
 
+### Exact subtree artifacts
+
+ASAPPlanner currently identifies a canonical `KeepPreAsap` cut but does not
+render that cut back to ClickHouse SQL. The workload generator must therefore
+provide an `exact_subtrees` artifact containing the canonical subtree, its
+fingerprint, the equivalent exact SQL, parameter contract, and result schema.
+This is an explicit input to compilation; it is not generated automatically by
+the control plane or inferred at serving time.
+
+The compiler matches the full canonical subtree and fingerprint and consumes
+every artifact exactly once. It also requires the artifact schema to equal the
+Planner cut schema. Missing, duplicate, mismatched, or unused artifacts prevent
+publication of the accelerated SQL entry. Such a workload remains on the
+whole-query ClickHouse fallback path until a complete artifact set is supplied.
+
+For a mixed plan, publication additionally derives every summary child's
+relation schema from its SummaryCatalog `DataDescriptor`, physical grouping,
+and exact readout. The derived schema must exactly equal the corresponding Join
+input schema. If the catalog and readout do not determine a schema, the mixed
+plan is rejected rather than interpreting summary rows using a parent-declared
+schema.
+
 ## Execution and fallback
 
 The accelerated path supports the relational operations represented by the

@@ -153,6 +153,13 @@ impl QueryPlan {
                     ));
                 }
             }
+            if entry
+                .nodes
+                .values()
+                .any(|node| matches!(node, QueryPlanNode::RelationalJoin { .. }))
+            {
+                entry.catalog_relation_schema(entry.root, catalog)?;
+            }
         }
         Ok(())
     }
@@ -201,6 +208,145 @@ impl QueryPlan {
             entry.validate(available)?;
         }
         Ok(())
+    }
+}
+
+impl QueryPlanEntry {
+    /// Derive the relation carried by a mixed SQL subtree from its catalog
+    /// binding and executable readout. A declared parent schema must never be
+    /// used to reinterpret summary rows.
+    fn catalog_relation_schema(
+        &self,
+        id: QueryNodeId,
+        catalog: &crate::physical::summary_catalog::SummaryCatalog,
+    ) -> Result<planner_types::post_asap::SummarySchema, QueryPlanError> {
+        use planner_types::{
+            post_asap::{SummaryField, SummarySchema},
+            pre_asap::DataType,
+        };
+
+        let node = self.nodes.get(&id).ok_or_else(|| {
+            QueryPlanError::Invalid(format!(
+                "mixed SQL subtree references missing node {}",
+                id.0
+            ))
+        })?;
+        match node {
+            QueryPlanNode::ExternalSqlLeaf { query } => Ok(query.output_schema.clone()),
+            QueryPlanNode::ExactReadout { input, .. } => {
+                let Some(QueryPlanNode::ReadMaterialization { binding }) = self.nodes.get(input)
+                else {
+                    return Err(QueryPlanError::Invalid(
+                        "mixed SQL exact readout must directly consume a catalog materialization"
+                            .into(),
+                    ));
+                };
+                let identity = catalog
+                    .materializations
+                    .get(&binding.materialization)
+                    .ok_or_else(|| {
+                        QueryPlanError::Invalid(
+                            "mixed SQL readout references absent catalog materialization".into(),
+                        )
+                    })?;
+                let data = catalog
+                    .data_descriptors
+                    .get(&identity.data_descriptor_id)
+                    .ok_or_else(|| {
+                        QueryPlanError::Invalid(
+                            "mixed SQL readout references absent data descriptor".into(),
+                        )
+                    })?;
+                let labels = match &binding.output_grouping {
+                    PhysicalGrouping::PerEntity => {
+                        data.group_by_keys.iter().cloned().collect::<Vec<_>>()
+                    }
+                    PhysicalGrouping::Reduce(labels) => {
+                        if labels
+                            .iter()
+                            .any(|label| !data.group_by_keys.contains(label))
+                        {
+                            return Err(QueryPlanError::Invalid(
+                                "mixed SQL readout grouping is not provided by its data descriptor"
+                                    .into(),
+                            ));
+                        }
+                        labels.clone()
+                    }
+                };
+                let mut fields = labels
+                    .into_iter()
+                    .map(|name| SummaryField {
+                        name,
+                        dtype: SummaryFamilyType::Plain(DataType::Utf8),
+                        nullable: false,
+                    })
+                    .collect::<Vec<_>>();
+                let time_index = fields.len();
+                fields.push(SummaryField {
+                    name: "timestamp".into(),
+                    dtype: SummaryFamilyType::Plain(DataType::Timestamp),
+                    nullable: false,
+                });
+                fields.push(SummaryField {
+                    name: "value".into(),
+                    dtype: SummaryFamilyType::Plain(DataType::Float64),
+                    nullable: false,
+                });
+                Ok(SummarySchema {
+                    fields,
+                    time_index: Some(time_index),
+                })
+            }
+            QueryPlanNode::Relational {
+                input,
+                input_schema,
+                output_schema,
+                ..
+            } => {
+                let actual = self.catalog_relation_schema(*input, catalog)?;
+                if actual != *input_schema {
+                    return Err(QueryPlanError::Invalid(
+                        "mixed SQL relational input schema differs from its executable child"
+                            .into(),
+                    ));
+                }
+                Ok(output_schema.clone())
+            }
+            QueryPlanNode::RelationalJoin {
+                inputs,
+                left_schema,
+                right_schema,
+                output_schema,
+                ..
+            } => {
+                let left = self.catalog_relation_schema(inputs[0], catalog)?;
+                let right = self.catalog_relation_schema(inputs[1], catalog)?;
+                if left != *left_schema || right != *right_schema {
+                    return Err(QueryPlanError::Invalid(
+                        "mixed SQL join child schema differs from its executable subtree".into(),
+                    ));
+                }
+                let expected_fields = left_schema
+                    .fields
+                    .iter()
+                    .chain(&right_schema.fields)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if output_schema.fields != expected_fields
+                    || output_schema.time_index != left_schema.time_index
+                {
+                    return Err(QueryPlanError::Invalid(
+                        "mixed SQL join output schema is not the strict child concatenation".into(),
+                    ));
+                }
+                Ok(output_schema.clone())
+            }
+            _ => Err(QueryPlanError::Invalid(
+                "mixed SQL summary subtree schema cannot be derived from catalog and readout"
+                    .into(),
+            )),
+        }
     }
 }
 
@@ -1893,6 +2039,120 @@ mod catalog_binding_tests {
             panic!("fixture")
         };
         binding
+    }
+
+    fn relation_schema(
+        names: &[(&str, planner_types::pre_asap::DataType)],
+    ) -> planner_types::post_asap::SummarySchema {
+        use planner_types::post_asap::{SummaryFamilyType, SummaryField, SummarySchema};
+        SummarySchema {
+            fields: names
+                .iter()
+                .map(|(name, dtype)| SummaryField {
+                    name: (*name).into(),
+                    dtype: SummaryFamilyType::Plain(dtype.clone()),
+                    nullable: false,
+                })
+                .collect(),
+            time_index: names
+                .iter()
+                .position(|(_, dtype)| *dtype == planner_types::pre_asap::DataType::Timestamp),
+        }
+    }
+
+    #[test]
+    fn mixed_join_schema_is_derived_from_catalog_readout() {
+        use planner_types::pre_asap::{CompareOpKind, DataType, JoinKind, Predicate, QueryExpr};
+
+        let (mut plan, catalog) = fixture();
+        let entry = plan.entries.values_mut().next().unwrap();
+        entry.language = QueryLanguage::ClickHouseSql;
+        entry.fixed_evaluation = Some(FixedEvaluationRange {
+            start_ms: 0,
+            end_ms: 10_000,
+            cumulative: false,
+        });
+        let readout = QueryNodeId(2);
+        let external = QueryNodeId(3);
+        let join = QueryNodeId(4);
+        let left = relation_schema(&[
+            ("job", DataType::Utf8),
+            ("timestamp", DataType::Timestamp),
+            ("value", DataType::Float64),
+        ]);
+        let right = relation_schema(&[("divisor", DataType::Float64)]);
+        let mut joined = left.clone();
+        joined.fields.extend(right.fields.clone());
+        entry.nodes.insert(
+            readout,
+            QueryPlanNode::ExactReadout {
+                input: QueryNodeId(1),
+                readout: ExactReadout::Sum,
+            },
+        );
+        entry.nodes.insert(
+            external,
+            QueryPlanNode::ExternalSqlLeaf {
+                query: BoundClickHouseQuery {
+                    sql: "SELECT 1.0 AS divisor".into(),
+                    parameters: BTreeMap::new(),
+                    start_parameter: None,
+                    end_parameter: None,
+                    output_schema: right.clone(),
+                },
+            },
+        );
+        entry.nodes.insert(
+            join,
+            QueryPlanNode::RelationalJoin {
+                inputs: [readout, external],
+                join_kind: JoinKind::Inner,
+                pred: serde_json::to_value(Predicate(Rc::new(QueryExpr::Compare {
+                    left: Rc::new(QueryExpr::Column(2)),
+                    op: CompareOpKind::Eq,
+                    right: Rc::new(QueryExpr::Column(3)),
+                })))
+                .unwrap(),
+                left_schema: left,
+                right_schema: right,
+                output_schema: joined,
+            },
+        );
+        entry.root = join;
+        let canonical = entry.canonical_query.clone();
+        let entry = plan.entries.pop_first().unwrap().1;
+        plan.entries.insert(
+            QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &canonical),
+            entry,
+        );
+        plan.clickhouse_context = Some(ClickHousePlanningContext {
+            tables: Default::default(),
+            accuracy: planner_types::types::AccuracyTarget::Exact,
+        });
+        plan.validate_against_catalog(&catalog).unwrap();
+
+        let QueryPlanNode::RelationalJoin {
+            left_schema,
+            output_schema,
+            ..
+        } = plan
+            .entries
+            .values_mut()
+            .next()
+            .unwrap()
+            .nodes
+            .get_mut(&join)
+            .unwrap()
+        else {
+            unreachable!()
+        };
+        left_schema.fields[0].name = "invented_by_parent".into();
+        output_schema.fields[0].name = "invented_by_parent".into();
+        assert!(plan
+            .validate_against_catalog(&catalog)
+            .unwrap_err()
+            .to_string()
+            .contains("executable subtree"));
     }
 
     // One pane ID is compatible with a longer semantic readout window.
