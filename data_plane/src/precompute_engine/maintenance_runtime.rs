@@ -381,6 +381,67 @@ fn merge_inputs(inputs: &[Arc<MaintenanceValue>]) -> Result<MaintenanceValue, St
     })
 }
 
+fn frozen_cohort_lineage(
+    inputs: &[crate::storage_engines::sketch_db::index::FrozenExactWindows],
+    expected: &asap_types::derived_input::DerivedInputIdentity,
+) -> Result<[u8; 32], String> {
+    let generation = &inputs
+        .first()
+        .ok_or("immutable input cohort is empty")?
+        .generation;
+    if inputs
+        .iter()
+        .map(|input| input.definition)
+        .collect::<BTreeSet<_>>()
+        != expected.inputs
+    {
+        return Err("immutable lineage differs from installed input definitions".into());
+    }
+    let mut ordered: Vec<_> = inputs.iter().collect();
+    ordered.sort_by(|left, right| {
+        (left.definition, left.sid, &left.group).cmp(&(right.definition, right.sid, &right.group))
+    });
+    if ordered.windows(2).any(|pair| {
+        (pair[0].definition, pair[0].sid, &pair[0].group)
+            == (pair[1].definition, pair[1].sid, &pair[1].group)
+    }) {
+        return Err("immutable lineage repeats a physical population".into());
+    }
+    let multiple = ordered.len() > 1;
+    let mut lineage = Sha256::new();
+    if multiple {
+        lineage.update(b"immutable-maintenance-input-v2");
+        lineage.update((ordered.len() as u64).to_be_bytes());
+    } else {
+        // Preserve the existing durable single-input receipt identity.
+        lineage.update(b"immutable-maintenance-input-v1");
+    }
+    for input in ordered {
+        if &input.generation != generation || input.windows.is_empty() {
+            return Err("immutable lineage has mixed generations or empty windows".into());
+        }
+        lineage.update(input.sid.to_be_bytes());
+        let metadata =
+            serde_json::to_vec(&(&input.definition, &input.generation, &input.group, expected))
+                .map_err(|error| error.to_string())?;
+        if multiple {
+            lineage.update((metadata.len() as u64).to_be_bytes());
+        }
+        lineage.update(metadata);
+        if multiple {
+            lineage.update((input.windows.len() as u64).to_be_bytes());
+        }
+        for ((start, end), state) in &input.windows {
+            lineage.update(start.to_be_bytes());
+            lineage.update(end.to_be_bytes());
+            let bytes = state.serialize_to_bytes();
+            lineage.update((bytes.len() as u64).to_be_bytes());
+            lineage.update(bytes);
+        }
+    }
+    Ok(lineage.finalize().into())
+}
+
 /// Evaluate one installed maintenance sink over an immutable physical source
 /// incarnation. Durable publication is a separate existing-store transaction;
 /// the in-memory scheduler cache here never claims durable exactly-once writes.
@@ -453,28 +514,12 @@ fn prepare_frozen_maintenance_sink(
     if &actual_input != expected_input {
         return Err("immutable sink input program differs from its catalog identity".into());
     }
-    let mut lineage = Sha256::new();
-    lineage.update(b"immutable-maintenance-input-v1");
-    lineage.update(input.sid.to_be_bytes());
-    lineage.update(
-        serde_json::to_vec(&(
-            &input.definition,
-            &input.generation,
-            &input.group,
-            expected_input,
-        ))
-        .map_err(|error| error.to_string())?,
-    );
-    let mut states = Vec::with_capacity(input.windows.len());
-    for ((start, end), state) in &input.windows {
-        lineage.update(start.to_be_bytes());
-        lineage.update(end.to_be_bytes());
-        let bytes = state.serialize_to_bytes();
-        lineage.update((bytes.len() as u64).to_be_bytes());
-        lineage.update(&bytes);
-        states.push((*end as i64, Arc::clone(state)));
-    }
-    let digest: [u8; 32] = lineage.finalize().into();
+    let digest = frozen_cohort_lineage(std::slice::from_ref(input), expected_input)?;
+    let states = input
+        .windows
+        .iter()
+        .map(|((_, end), state)| (*end as i64, Arc::clone(state)))
+        .collect();
     let key = MaterializationCommitKey {
         plan_id: input.generation.plan_id,
         plan_version: input.generation.plan_version,
@@ -1354,6 +1399,68 @@ mod tests {
 
     fn definition(value: u64) -> asap_types::sds::SummaryDefinitionId {
         asap_types::PolicyFingerprint(value).into()
+    }
+
+    #[test]
+    fn cohort_lineage_is_order_independent_and_binds_every_input() {
+        use crate::storage_engines::sketch_db::index::FrozenExactWindows;
+        let make = |sid, id, value| {
+            let mut state = crate::precompute_engine::operators::SumAccumulator::new();
+            state.update(value);
+            FrozenExactWindows {
+                sid,
+                definition: definition(id),
+                generation: Arc::new(asap_types::sds::CatalogGeneration {
+                    schema_version: 2,
+                    plan_id: 1,
+                    plan_version: 1,
+                    snapshot_sha256: "0".repeat(64),
+                }),
+                group: BTreeMap::from([("instance".into(), sid.to_string())]),
+                windows: BTreeMap::from([((0, 1000), Arc::new(state) as SummaryState)]),
+                singleton_population_complete: false,
+            }
+        };
+        let expected = asap_types::derived_input::DerivedInputIdentity {
+            inputs: BTreeSet::from([definition(1), definition(2)]),
+            program_sha256: "1".repeat(64),
+        };
+        let baseline =
+            frozen_cohort_lineage(&[make(10, 1, 3.0), make(20, 2, 5.0)], &expected).unwrap();
+        assert_eq!(
+            baseline,
+            frozen_cohort_lineage(&[make(20, 2, 5.0), make(10, 1, 3.0)], &expected).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            frozen_cohort_lineage(&[make(10, 1, 3.0), make(20, 2, 6.0)], &expected).unwrap()
+        );
+        assert_ne!(
+            baseline,
+            frozen_cohort_lineage(&[make(10, 1, 3.0), make(21, 2, 5.0)], &expected).unwrap()
+        );
+        let mut changed = make(20, 2, 5.0);
+        changed.group.insert("instance".into(), "other".into());
+        assert_ne!(
+            baseline,
+            frozen_cohort_lineage(&[make(10, 1, 3.0), changed], &expected).unwrap()
+        );
+        let mut changed = make(20, 2, 5.0);
+        let state = changed.windows.remove(&(0, 1000)).unwrap();
+        changed.windows.insert((1000, 2000), state);
+        assert_ne!(
+            baseline,
+            frozen_cohort_lineage(&[make(10, 1, 3.0), changed], &expected).unwrap()
+        );
+        let mut changed = make(20, 2, 5.0);
+        Arc::make_mut(&mut changed.generation).plan_version += 1;
+        assert!(frozen_cohort_lineage(&[make(10, 1, 3.0), changed], &expected).is_err());
+        assert!(frozen_cohort_lineage(&[make(10, 1, 3.0)], &expected).is_err());
+        assert!(frozen_cohort_lineage(
+            &[make(10, 1, 3.0), make(10, 1, 3.0), make(20, 2, 5.0)],
+            &expected
+        )
+        .is_err());
     }
 
     fn node(id: u32) -> ExecutableDagNode {
