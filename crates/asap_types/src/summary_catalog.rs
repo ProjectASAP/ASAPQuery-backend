@@ -120,6 +120,7 @@ impl SummaryCatalog {
                 )
                 .with_grouping_projection(config.grouping_labels.clone())
                 .with_partitioning(config.partitioning)
+                .with_population_key_encoding(config.population_key_encoding)
                 .with_timestamp_column(config.table_timestamp_column.clone());
                 Ok((
                     config.policy_fingerprint(),

@@ -27,7 +27,7 @@ pub use accuracy::{AccuracyKind, AccuracyProfile};
 pub use aggregation_config::*;
 pub use aggregation_type::AggregationType;
 pub use enums::*;
-pub use grouping_projection::GroupingProjection;
+pub use grouping_projection::{GroupingProjection, PopulationKeyEncoding};
 pub use key_by_label_names::KeyByLabelNames;
 pub use monitor_spec::{MonitorFunctional, MonitorSpec};
 pub use policy_fingerprint::PolicyFingerprint;

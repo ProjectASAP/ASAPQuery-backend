@@ -3704,6 +3704,7 @@ aggregations:
         for marker in active_agg_ids {
             let metric = format!("metric_{marker}");
             let cfg = AggregationConfig {
+                population_key_encoding: Default::default(),
                 aggregation_type: AggregationType::Sum,
                 aggregation_sub_type: String::new(),
                 parameters: HashMap::new(),

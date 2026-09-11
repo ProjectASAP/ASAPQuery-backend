@@ -101,6 +101,11 @@ pub struct PrecomputeMaterialization {
     pub parameters: HashMap<String, Value>,
     #[serde(serialize_with = "crate::grouping_projection::serialize_config_grouping")]
     pub grouping_labels: crate::GroupingProjection,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::grouping_projection::PopulationKeyEncoding::is_legacy"
+    )]
+    pub population_key_encoding: crate::grouping_projection::PopulationKeyEncoding,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partitioning: Option<crate::sds::PopulationPartitioning>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -286,6 +291,7 @@ impl PrecomputeMaterialization {
             aggregation_sub_type,
             parameters,
             grouping_labels: grouping_labels.into(),
+            population_key_encoding: Default::default(),
             partitioning: None,
             derived_input: None,
             aggregated_labels,
@@ -433,6 +439,11 @@ impl PrecomputeMaterialization {
             table_name,
             value_column,
         );
+        config.population_key_encoding = data
+            .get("population_key_encoding")
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
         config.derived_input = data
             .get("derived_input")
             .filter(|v| !v.is_null())
@@ -633,6 +644,11 @@ impl PrecomputeMaterialization {
             table_name,
             value_column,
         );
+        config.population_key_encoding = aggregation_data
+            .get("population_key_encoding")
+            .map(|value| serde_yaml::from_value(value.clone()))
+            .transpose()?
+            .unwrap_or_default();
         config.derived_input = aggregation_data
             .get("derived_input")
             .filter(|v| !v.is_null())
@@ -683,6 +699,9 @@ impl SerializableToSink for PrecomputeMaterialization {
             "metric": self.metric,
         });
 
+        if !self.population_key_encoding.is_legacy() {
+            json["population_key_encoding"] = serde_json::json!(self.population_key_encoding);
+        }
         if let Some(input) = &self.derived_input {
             json["derived_input"] = serde_json::json!(input);
         }
