@@ -106,7 +106,7 @@ async fn persisted_summary_restarts_without_live_reregistration() {
         .unwrap();
     assert!(is_warm(&before), "{before}");
     let sidecar = disk.join("sketch_index/sid_metadata.json");
-    for _ in 0..100 {
+    for _ in 0..500 {
         let manifest_path = disk.join("sketch_index");
         if sidecar.exists()
             && manifest_path.join("parts_manifest.log").exists()
@@ -119,8 +119,14 @@ async fn persisted_summary_restarts_without_live_reregistration() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let metadata: Value =
-        serde_json::from_slice(&std::fs::read(&sidecar).expect("flushed metadata")).unwrap();
+    if !sidecar.exists() {
+        let retained = directory.keep();
+        panic!(
+            "missing flushed metadata; retained process artifacts at {}",
+            retained.display()
+        );
+    }
+    let metadata: Value = serde_json::from_slice(&std::fs::read(&sidecar).unwrap()).unwrap();
     assert!(metadata["bindings"]
         .as_object()
         .unwrap()
