@@ -250,6 +250,10 @@ pub struct ProducerContract {
     pub collector_id: String,
     pub materialization: crate::sds::SummaryDefinitionId,
     pub schema_id: String,
+    /// Authoritative partitions for completion barriers. Empty legacy contracts
+    /// authorize state ingestion only, never completion claims.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub partition_ids: BTreeSet<String>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -353,6 +357,7 @@ impl PrecomputePlan {
                     collector_id: producer_id.clone(),
                     materialization: schema.materialization,
                     schema_id: schema.schema_id.clone(),
+                    partition_ids: BTreeSet::new(),
                 })
             })
             .collect();
@@ -416,6 +421,39 @@ impl PrecomputePlan {
             .cloned()
             .map(|materialization| (materialization.policy_fp_u64(), materialization))
             .collect())
+    }
+
+    /// Validate a barrier's installed scope, not authentication, durability or
+    /// monotonic progress. The runtime must enforce those before accepting it.
+    pub fn validate_watermark_scope(
+        &self,
+        materialization: crate::sds::SummaryDefinitionId,
+        barrier: &crate::sds::SummaryWatermarkBarrier,
+    ) -> Result<(), PrecomputePlanError> {
+        self.validate()?;
+        barrier
+            .validate()
+            .map_err(|error| PrecomputePlanError::CatalogContract(error.to_string()))?;
+        if self.summary_catalog.as_ref() != Some(&barrier.catalog_generation)
+            || self.envelope.plan_id != barrier.catalog_generation.plan_id
+            || self.envelope.plan_version != barrier.catalog_generation.plan_version
+        {
+            return Err(PrecomputePlanError::CatalogContract(
+                "watermark catalog generation does not match installed plan".into(),
+            ));
+        }
+        if !self.producers.iter().any(|producer| {
+            producer.materialization == materialization
+                && producer.producer_id == barrier.source.producer_id
+                && producer
+                    .partition_ids
+                    .contains(&barrier.source.partition_id)
+        }) {
+            return Err(PrecomputePlanError::CatalogContract(
+                "watermark source is outside the authoritative partition roster".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), PrecomputePlanError> {
@@ -787,7 +825,10 @@ impl PrecomputePlan {
         let mut producers = BTreeSet::new();
         let mut produced = BTreeSet::new();
         for producer in &self.producers {
-            if !materializations.contains(&producer.materialization)
+            if producer.producer_id.trim().is_empty()
+                || producer.collector_id.trim().is_empty()
+                || producer.partition_ids.iter().any(|id| id.trim().is_empty())
+                || !materializations.contains(&producer.materialization)
                 || schema_by_materialization
                     .get(&producer.materialization)
                     .copied()
@@ -863,6 +904,90 @@ mod source_window_cohort_tests {
         }))
         .unwrap()
     }
+    #[test]
+    fn producer_roster_roundtrip_and_watermark_scope() {
+        let envelope = PlanEnvelope {
+            plan_id: 1,
+            plan_version: 2,
+            generated_at_unix_ms: 0,
+            activation_unix_ms: 0,
+            expiry_unix_ms: None,
+            backend_compat: "test".into(),
+            planner_revision: "test".into(),
+            capability_snapshot_id: "test".into(),
+        };
+        let mut config = full_window();
+        config.slide_interval = config.window_size;
+        config.window_type = crate::WindowKind::Tumbling;
+        let mut plan = PrecomputePlan::build_backend_local(envelope, vec![config]).unwrap();
+        let generation = crate::sds::CatalogGeneration {
+            schema_version: 1,
+            plan_id: 1,
+            plan_version: 2,
+            snapshot_sha256: "snapshot".into(),
+        };
+        plan.summary_catalog = Some(generation.clone());
+        let materialization = plan.schemas[0].materialization;
+        let legacy = serde_json::json!({
+            "producer_id":"p", "collector_id":"c",
+            "materialization":materialization, "schema_id":plan.schemas[0].schema_id,
+        });
+        let producer: ProducerContract = serde_json::from_value(legacy.clone()).unwrap();
+        assert!(producer.partition_ids.is_empty());
+        assert_eq!(serde_json::to_value(&producer).unwrap(), legacy);
+        plan.producers.push(producer);
+        let barrier = crate::sds::SummaryWatermarkBarrier {
+            catalog_generation: generation,
+            source: crate::sds::SummarySourcePartition {
+                producer_id: "p".into(),
+                partition_id: "a".into(),
+                producer_epoch: 1,
+            },
+            sequence: 1,
+            watermark_ms: 100,
+        };
+        assert!(plan
+            .validate_watermark_scope(materialization, &barrier)
+            .is_err());
+        plan.producers[0].partition_ids = BTreeSet::from(["b".into(), "a".into()]);
+        let wire = serde_json::to_value(&plan).unwrap();
+        assert_eq!(
+            wire["producers"][0]["partition_ids"],
+            serde_json::json!(["a", "b"])
+        );
+        let restored: PrecomputePlan = serde_json::from_value(wire).unwrap();
+        assert!(restored
+            .validate_watermark_scope(materialization, &barrier)
+            .is_ok());
+        for case in 0..6 {
+            let mut wrong = barrier.clone();
+            match case {
+                0 => wrong.source.producer_id = "unknown".into(),
+                1 => wrong.source.partition_id = "unknown".into(),
+                2 => wrong.catalog_generation.plan_version += 1,
+                3 => wrong.source.producer_epoch = 0,
+                4 => wrong.sequence = 0,
+                _ => wrong.catalog_generation.snapshot_sha256 = "other".into(),
+            }
+            assert!(restored
+                .validate_watermark_scope(materialization, &wrong)
+                .is_err());
+        }
+        let other_materialization = crate::sds::SummaryDefinitionId(crate::PolicyFingerprint(
+            materialization.as_u64().wrapping_add(1),
+        ));
+        assert!(restored
+            .validate_watermark_scope(other_materialization, &barrier)
+            .is_err());
+        let mut wrong_envelope = restored.clone();
+        wrong_envelope.envelope.plan_version += 1;
+        assert!(wrong_envelope
+            .validate_watermark_scope(materialization, &barrier)
+            .is_err());
+        plan.producers[0].partition_ids.insert(" ".into());
+        assert!(plan.validate().is_err());
+    }
+
     #[test]
     fn maintenance_reduction_requires_matching_explicit_population_contract() {
         use planner_types::post_asap::*;
