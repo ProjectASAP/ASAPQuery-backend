@@ -57,6 +57,65 @@ and [maintenance protocol](docs/developer_docs/maintenance-replay.md).
 
 ## Interfaces and support boundaries
 
+```mermaid
+flowchart TB
+  subgraph planning["Planning and installed contracts"]
+    PL["External ASAPPlanner"] --> CP["Backend control plane"]
+    CP --> CAT["Authoritative SummaryCatalog"]
+    CP --> PP["PrecomputePlan"]
+    CP --> QP["QueryPlan"]
+    CP --> PC["Producer contracts / CollectorPlan"]
+    CP --> TP["TransmissionPlan"]
+  end
+
+  subgraph ingest["Sample and state ingestion"]
+    RW["Prometheus Remote Write v1"] --> RX["RW receiver / bounded queue"]
+    RX --> PD["Precompute DAG"]
+    EP["External producers: modified OTLP / state"] --> PV["Producer / transmission validation"]
+    PV --> PD
+    PD --> SS["SummaryStore: physical series and window/group instances"]
+  end
+
+  subgraph queries["Query adapters and execution"]
+    PQ["PromQL"] --> QD["PromQL query DAG"]
+    MQ["MetricsQL"] --> MA["MetricsQL adapter"]
+    SQL["ClickHouse SQL"] --> SD["Typed SQL query DAG"]
+    QD --> QR["Shared query runtime"]
+    MA --> QR
+    SD --> QR
+    QR -->|"bound state reads"| SS
+    QD -->|"unsupported / unavailable"| PE["Prometheus exact backend"]
+    MA -->|"unsupported / unavailable"| VE["VictoriaMetrics exact backend"]
+    SD -->|"unsupported / unavailable"| CE["ClickHouse exact backend"]
+    QR --> W["Warm: successful summary execution"]
+    QR --> H["Hybrid: summaries plus supported exact dependencies"]
+    PE --> F["Exact fallback result"]
+    VE --> F
+    CE --> F
+    CE -.->|"supported exact SQL subtree"| SD
+  end
+
+  subgraph completion["Independent completion authority"]
+    B["Typed watermark / barrier: installed producer and partition scope"]
+    B --> CC["Continuous coordinator: closure activation gated"]
+    CC -.->|"gated completion contract"| PD
+  end
+
+  PP -.-> PD
+  QP -.-> QR
+  PC -.-> PV
+  TP -.-> PV
+  PC -.-> B
+  CAT -.-> SS
+  CAT -.-> QR
+```
+
+Dotted edges show installed contracts or explicitly gated paths. The barrier is
+independent of Remote Write samples; this figure does not advertise a public
+barrier endpoint or continuous/sliding activation. Warm and hybrid labels apply
+only to successful execution with the corresponding actual summary reads;
+external-only DAG execution is not acceleration.
+
 | Surface | Current path and boundary |
 | --- | --- |
 | Prometheus | `/api/v1/write` accepts Remote Write **v1** scalar samples. PromQL instant/range queries use installed plans with configured Prometheus exact fallback. The collector-free `asapquery` profile is a bounded compatibility profile, not every distributed/persistent deployment option. |
