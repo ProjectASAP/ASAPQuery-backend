@@ -42,7 +42,7 @@ pub(crate) struct FlusherShared {
     /// Per-sid metadata sidecar — upserted on every flush so recovery can
     /// re-register disk-resident sids as queryable instances. See
     /// [`super::metadata`].
-    pub sid_metadata: super::metadata::SidMetadataStore,
+    pub sid_metadata: Arc<super::metadata::SidMetadataStore>,
     pub next_part_id: AtomicU64,
     pub shutdown: AtomicBool,
     /// Woken by the insert path when it hits `hard_cap_bytes` and by
@@ -69,6 +69,19 @@ impl FlusherHandle {
     where
         S: EpochSource + 'static,
     {
+        let metadata = Arc::new(super::metadata::SidMetadataStore::new(&cfg.disk_path));
+        Self::start_with_metadata(cfg, manifest, source, metadata)
+    }
+
+    pub(crate) fn start_with_metadata<S>(
+        cfg: SketchStorePersistenceConfig,
+        manifest: Arc<Manifest>,
+        source: Arc<S>,
+        sid_metadata: Arc<super::metadata::SidMetadataStore>,
+    ) -> PersistResult<Self>
+    where
+        S: EpochSource + 'static,
+    {
         // Pick a starting part_id: one past the max currently in the
         // manifest (so IDs are monotonically increasing across restarts).
         let next_id = manifest
@@ -78,8 +91,6 @@ impl FlusherHandle {
             .max()
             .map(|m| m + 1)
             .unwrap_or(1);
-
-        let sid_metadata = super::metadata::SidMetadataStore::new(&cfg.disk_path);
 
         let shared = Arc::new(FlusherShared {
             cfg: cfg.clone(),
@@ -102,6 +113,10 @@ impl FlusherHandle {
             inner: shared,
             thread: Some(thread),
         })
+    }
+
+    pub(crate) fn metadata_store(&self) -> Arc<super::metadata::SidMetadataStore> {
+        Arc::clone(&self.inner.sid_metadata)
     }
 
     /// Signal shutdown and wait for the thread to finish its current

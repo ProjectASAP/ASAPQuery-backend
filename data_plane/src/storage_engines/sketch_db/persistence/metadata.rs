@@ -302,12 +302,23 @@ impl AggKindRec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SidMetaRecord {
     pub sid: u64,
+    /// Authoritative identity and provenance, absent on legacy sidecars.
+    #[serde(default)]
+    pub summary_definition_id: Option<asap_types::sds::SummaryDefinitionId>,
+    #[serde(default)]
+    pub catalog_generation: Option<std::sync::Arc<asap_types::sds::CatalogGeneration>>,
     pub metric_name: String,
     /// Label KEY set, sorted (a `Vec` so the JSON stays compact; the
     /// store side rebuilds the `BTreeSet`).
     pub group_by_keys: Vec<String>,
     agg_kind: AggKindRec,
     pub first_seen_unix_ms: i64,
+    #[serde(default)]
+    pub retired_at_ms: Option<u64>,
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+    #[serde(default)]
+    pub removed: bool,
 }
 
 impl SidMetaRecord {
@@ -323,10 +334,15 @@ impl SidMetaRecord {
     ) -> Self {
         Self {
             sid,
+            summary_definition_id: None,
+            catalog_generation: None,
             metric_name,
             group_by_keys,
             agg_kind: agg_kind.into(),
             first_seen_unix_ms,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            removed: false,
         }
     }
 
@@ -381,16 +397,28 @@ struct DataDescriptorRec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SidBindingRec {
     sid: u64,
+    #[serde(default)]
+    summary_definition_id: Option<asap_types::sds::SummaryDefinitionId>,
+    #[serde(default)]
+    catalog_generation_sha256: Option<String>,
     summary_descriptor_id: String,
     data_descriptor_id: String,
     first_seen_unix_ms: i64,
+    #[serde(default)]
+    retired_at_ms: Option<u64>,
+    #[serde(default)]
+    expires_at_ms: Option<u64>,
+    #[serde(default)]
+    removed: bool,
 }
 
-/// Version-2 normalized sidecar. Descriptors appear once and SeriesId bindings hold
+/// Version-3 normalized sidecar with authoritative catalog provenance. Descriptors appear once and SeriesId bindings hold
 /// foreign keys, mirroring the in-memory SDS registry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SdsSidecar {
     schema_version: u32,
+    #[serde(default)]
+    catalog_generations: HashMap<String, std::sync::Arc<asap_types::sds::CatalogGeneration>>,
     summary_descriptors: HashMap<String, AggKindRec>,
     data_descriptors: HashMap<String, DataDescriptorRec>,
     bindings: HashMap<String, SidBindingRec>,
@@ -401,7 +429,8 @@ impl SdsSidecar {
         use crate::storage_engines::sketch_db::sds::{data_descriptor_id, summary_descriptor_id};
 
         let mut sidecar = Self {
-            schema_version: 2,
+            schema_version: 3,
+            catalog_generations: HashMap::new(),
             summary_descriptors: HashMap::new(),
             data_descriptors: HashMap::new(),
             bindings: HashMap::new(),
@@ -431,13 +460,26 @@ impl SdsSidecar {
                     population_filter_canonical: filter,
                     group_by_keys: record.group_by_keys,
                 });
+            let generation_sha256 = record.catalog_generation.map(|generation| {
+                let digest = generation.snapshot_sha256.clone();
+                sidecar
+                    .catalog_generations
+                    .entry(digest.clone())
+                    .or_insert(generation);
+                digest
+            });
             sidecar.bindings.insert(
                 record.sid.to_string(),
                 SidBindingRec {
                     sid: record.sid,
+                    summary_definition_id: record.summary_definition_id,
+                    catalog_generation_sha256: generation_sha256,
                     summary_descriptor_id: summary_id,
                     data_descriptor_id: data_id,
                     first_seen_unix_ms: record.first_seen_unix_ms,
+                    retired_at_ms: record.retired_at_ms,
+                    expires_at_ms: record.expires_at_ms,
+                    removed: record.removed,
                 },
             );
         }
@@ -468,10 +510,29 @@ impl SdsSidecar {
                     })?;
                 Ok(SidMetaRecord {
                     sid: binding.sid,
+                    summary_definition_id: binding.summary_definition_id,
+                    catalog_generation: binding
+                        .catalog_generation_sha256
+                        .as_ref()
+                        .map(|digest| {
+                            self.catalog_generations
+                                .get(digest)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    PersistError::Format(format!(
+                                        "SeriesId {} references missing catalog generation",
+                                        binding.sid
+                                    ))
+                                })
+                        })
+                        .transpose()?,
                     metric_name: data.metric_name.clone(),
                     group_by_keys: data.group_by_keys.clone(),
                     agg_kind: operator.with_population_filter(&data.population_filter_canonical),
                     first_seen_unix_ms: binding.first_seen_unix_ms,
+                    retired_at_ms: binding.retired_at_ms,
+                    expires_at_ms: binding.expires_at_ms,
+                    removed: binding.removed,
                 })
             })
             .collect()
@@ -485,6 +546,7 @@ impl SdsSidecar {
 #[derive(Debug)]
 pub struct SidMetadataStore {
     path: PathBuf,
+    writer: std::sync::Mutex<()>,
 }
 
 impl SidMetadataStore {
@@ -493,6 +555,7 @@ impl SidMetadataStore {
     pub fn new(disk_path: &Path) -> Self {
         Self {
             path: disk_path.join(SERIES_ID_METADATA_FILE),
+            writer: std::sync::Mutex::new(()),
         }
     }
 
@@ -526,7 +589,10 @@ impl SidMetadataStore {
                 return Ok(Vec::new());
             }
         };
-        if value.get("schema_version").and_then(|v| v.as_u64()) == Some(2) {
+        if matches!(
+            value.get("schema_version").and_then(|v| v.as_u64()),
+            Some(2 | 3)
+        ) {
             let sidecar: SdsSidecar = match serde_json::from_value(value) {
                 Ok(sidecar) => sidecar,
                 Err(error) => {
@@ -565,6 +631,9 @@ impl SidMetadataStore {
     /// disk (last write wins per sid). Atomic via tmp + rename + dir
     /// fsync, matching the manifest's durability discipline.
     pub fn upsert_all(&self, records: &[SidMetaRecord]) -> PersistResult<()> {
+        let _writer = self.writer.lock().map_err(|_| {
+            PersistError::Io(std::io::Error::other("summary metadata writer poisoned"))
+        })?;
         if records.is_empty() {
             return Ok(());
         }
@@ -576,12 +645,20 @@ impl SidMetadataStore {
         let mut changed = false;
         for r in records {
             let key = r.sid.to_string();
-            match map.get(&key) {
-                Some(existing) if existing == r => {}
-                _ => {
-                    map.insert(key, r.clone());
-                    changed = true;
-                }
+            let mut next = r.clone();
+            if let Some(existing) = map.get(&key) {
+                // Lifecycle is monotone for a SeriesId. An older flush snapshot
+                // must not resurrect a retired or removed persisted instance.
+                next.removed |= existing.removed;
+                next.retired_at_ms = existing.retired_at_ms.or(next.retired_at_ms);
+                next.expires_at_ms = match (existing.expires_at_ms, next.expires_at_ms) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            if map.get(&key) != Some(&next) {
+                map.insert(key, next);
+                changed = true;
             }
         }
         if !changed {
@@ -658,6 +735,37 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_bindings_share_one_persisted_catalog_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SidMetadataStore::new(directory.path());
+        let generation = std::sync::Arc::new(asap_types::sds::CatalogGeneration {
+            schema_version: 1,
+            plan_id: 7,
+            plan_version: 2,
+            snapshot_sha256: "catalog".into(),
+        });
+        let mut first = sketch_meta(1);
+        first.summary_definition_id = Some(asap_types::PolicyFingerprint(7).into());
+        first.catalog_generation = Some(std::sync::Arc::clone(&generation));
+        let mut second = first.clone();
+        second.sid = 2;
+        store.upsert_all(&[first, second]).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
+        assert_eq!(json["catalog_generations"].as_object().unwrap().len(), 1);
+        let records = store.load().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(std::sync::Arc::ptr_eq(
+            records[0].catalog_generation.as_ref().unwrap(),
+            records[1].catalog_generation.as_ref().unwrap()
+        ));
+        assert_eq!(
+            records[0].summary_definition_id,
+            Some(asap_types::PolicyFingerprint(7).into())
+        );
+    }
+
+    #[test]
     fn upsert_then_load_round_trips() {
         let tmp = TempDir::new().unwrap();
         let s = SidMetadataStore::new(tmp.path());
@@ -671,7 +779,7 @@ mod tests {
 
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(s.path()).unwrap()).unwrap();
-        assert_eq!(persisted["schema_version"], 2);
+        assert_eq!(persisted["schema_version"], 3);
         assert_eq!(
             persisted["summary_descriptors"].as_object().unwrap().len(),
             2
@@ -731,7 +839,7 @@ mod tests {
         store.upsert_all(&[exact_meta(2)]).unwrap();
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(store.path()).unwrap()).unwrap();
-        assert_eq!(persisted["schema_version"], 2);
+        assert_eq!(persisted["schema_version"], 3);
         assert_eq!(store.load().unwrap().len(), 2);
     }
 
