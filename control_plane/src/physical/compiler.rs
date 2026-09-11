@@ -838,6 +838,54 @@ fn preserve_invalid_exact_fallback_roots(
     Ok(())
 }
 
+/// A MetricsQL query whose only selected states are Prometheus-specific
+/// counter readouts has no backend materialization to bind. Keep the original
+/// query as one native exact root. Mixed queries retain their other selected
+/// summaries and let residual lowering cut only the counter branches.
+fn preserve_metricsql_counter_only_roots(
+    queries: &mut [PlanningQuery],
+    composable: bool,
+) -> Result<(), CompileError> {
+    for query in queries {
+        let selected =
+            collect_selected_materializations(&query.post_asap, composable).map_err(|reason| {
+                CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason,
+                }
+            })?;
+        if selected.is_empty()
+            || !selected.iter().all(|state| {
+                matches!(
+                    state.family,
+                    SummaryFamilyType::ExactAggregate(
+                        planner_types::post_asap::ExactKind::Rate
+                            | planner_types::post_asap::ExactKind::Increase,
+                        _
+                    )
+                )
+            })
+        {
+            continue;
+        }
+        let parsed = crate::query_parser::parse_query_expr_canonical(
+            &query.query_string,
+            query.accuracy.clone(),
+        )
+        .map_err(|error| CompileError::Query {
+            query_id: query.query_id.clone(),
+            reason: error.to_string(),
+        })?;
+        query.post_asap = crate::planner_selection::keep_pre_asap(&parsed).map_err(|error| {
+            CompileError::Query {
+                query_id: query.query_id.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+    }
+    Ok(())
+}
+
 impl PhysicalCompiler {
     pub fn compile(
         &self,
@@ -905,6 +953,9 @@ impl PhysicalCompiler {
             }
         }
 
+        if metricsql {
+            preserve_metricsql_counter_only_roots(&mut request.queries, request.hybrid_execution)?;
+        }
         preserve_invalid_exact_fallback_roots(&mut request.queries, request.hybrid_execution)?;
 
         if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite
@@ -958,7 +1009,15 @@ impl PhysicalCompiler {
             let selected = selected
                 .into_iter()
                 .filter(|state| {
-                    (!request.hybrid_execution
+                    // Counter readout implements Prometheus extrapolation. Native
+                    // MetricsQL includes boundary samples differently, so retain
+                    // these leaves as external exact dependencies until its
+                    // counter semantics have a dedicated implementation.
+                    !(metricsql && matches!(state.family,
+                        SummaryFamilyType::ExactAggregate(
+                            planner_types::post_asap::ExactKind::Rate
+                                | planner_types::post_asap::ExactKind::Increase, _)))
+                    && (!request.hybrid_execution
                         || state.window_secs.is_none_or(|window| {
                             query
                                 .window_implementations
@@ -1743,6 +1802,53 @@ pub fn select_workload_roots(
     select_workload_roots_with_erp(queries, roots, evidence, exact_costs, None)
 }
 
+fn observed_population_matches_root(
+    policy: &super::erp::ErpPlanningInput,
+    root: &QueryExpr,
+) -> bool {
+    use asap_types::sds::{PopulationPartitioning, ValueProjectionIdentity};
+    use planner_types::pre_asap::{AggIntent, Reduction};
+    let (Some(data), Some(observed)) = (
+        &policy.resolved_data_descriptor,
+        &policy.observed_populations,
+    ) else {
+        return false;
+    };
+    let QueryExpr::Aggregate {
+        reduction: Reduction::PerEntity,
+        measures,
+        having: None,
+        child,
+        ..
+    } = root
+    else {
+        return false;
+    };
+    if measures.is_empty()
+        || !measures.iter().all(|intent| {
+            matches!(
+                intent,
+                AggIntent::Cardinality { col: None, .. }
+                    | AggIntent::FrequencyL2 { col: None, .. }
+                    | AggIntent::FrequencyEntropy { col: None, .. }
+            )
+        })
+    {
+        return false;
+    }
+    let Ok((metric, Some(window), filter)) = raw_time_series_input_contract(child, false) else {
+        return false;
+    };
+    data.time_series_metric() == Some(metric.as_str())
+        && data.population_filter_canonical == filter
+        && data.value_projection == ValueProjectionIdentity::SampleValue
+        && data.partitioning == Some(PopulationPartitioning::PerEntity)
+        && data.group_by_keys.is_empty()
+        && data.observation_semantics == asap_types::sds::TIMESTAMPED_OBSERVATION_SEMANTICS
+        && observed.window_end_ms.checked_sub(observed.window_start_ms)
+            == i64::try_from(window.saturating_mul(1000)).ok()
+}
+
 pub fn select_workload_roots_with_erp(
     queries: &mut [PlanningQuery],
     roots: Vec<Rc<QueryExpr>>,
@@ -1779,6 +1885,17 @@ pub fn select_workload_roots_with_erp(
             let mut policy = policy.clone();
             if !matches!(accuracy, AccuracyTarget::Epsilon(_)) {
                 policy.artifact.records.clear();
+            }
+            if policy.observed_populations.is_some()
+                && !roots
+                    .iter()
+                    .all(|(_, root)| observed_population_matches_root(&policy, root))
+            {
+                if let Some(observed) = &mut policy.observed_populations {
+                    observed.invalid_reason =
+                        Some("candidate input differs from observed catalog data semantics".into());
+                    observed.populations.clear();
+                }
             }
             // A benchmark of a different KLL implementation is not evidence
             // for the collector's sketchlib KLL, even with the same k.
@@ -2381,29 +2498,37 @@ fn select_lifecycle(
 pub(crate) fn materialization_leaf_contract(
     node: &SummaryNode,
 ) -> Result<(String, Option<u64>, String), String> {
-    use planner_types::pre_asap::{CompareOpKind, QueryExpr, ScalarValue};
     let SummaryExpr::SummaryAgg { child, .. } = &node.expr else {
         return Err("materialization requires a SummaryAgg leaf".into());
     };
     let SummaryExpr::KeepPreAsap(expr) = &child.expr else {
         return Err("materialization input is not a raw source".into());
     };
-    let (source, window_secs) = match expr.as_ref() {
+    raw_time_series_input_contract(
+        expr,
+        matches!(
+            &node.expr,
+            SummaryExpr::SummaryAgg {
+                family: SummaryFamilyType::ExactAggregate(..),
+                ..
+            }
+        ),
+    )
+}
+
+fn raw_time_series_input_contract(
+    expr: &QueryExpr,
+    exact: bool,
+) -> Result<(String, Option<u64>, String), String> {
+    use planner_types::pre_asap::{CompareOpKind, ScalarValue};
+    let (source, window_secs) = match expr {
         QueryExpr::TimeRange { child, range } => {
             if range.as_millis() == 0 || range.as_millis() % 1000 != 0 {
                 return Err("warm producer requires a positive whole-second range".into());
             }
             (child.as_ref(), Some(range.as_secs()))
         }
-        QueryExpr::Scan { .. }
-            if matches!(
-                &node.expr,
-                SummaryExpr::SummaryAgg {
-                    family: SummaryFamilyType::ExactAggregate(..),
-                    ..
-                }
-            ) =>
-        {
+        QueryExpr::Scan { .. } if exact => {
             return Err(
                 "instantaneous sample selection is not a temporal accumulator readout".into(),
             );
@@ -3702,6 +3827,59 @@ mod tests {
     }
 
     #[test]
+    fn metricsql_counter_readouts_remain_external_exact() {
+        for text in [
+            "rate(counter_probe{case=\"reset\"}[5s])",
+            "increase(counter_probe{case=\"reset\"}[5s])",
+        ] {
+            let mut workload = request("counter", text);
+            workload.hybrid_execution = true;
+            let mut deployment = environment(10_000);
+            deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+            deployment.collector_ids.clear();
+            let plan = PhysicalCompiler
+                .compile_metricsql(workload, deployment)
+                .unwrap();
+            assert!(plan.precompute_plan.materializations.is_empty());
+            let entry = plan.query_plan.entries.values().next().unwrap();
+            assert!(entry.materialization_bindings().is_empty());
+            assert_eq!(entry.language, crate::query_plan::QueryLanguage::MetricsQl);
+        }
+    }
+
+    #[test]
+    fn metricsql_counter_gate_preserves_an_independent_summary_sibling() {
+        let mut workload = request("mixed", "max_over_time(m[1m]) + rate(m[1m])");
+        workload.hybrid_execution = true;
+        let mut deployment = environment(10_000);
+        deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        deployment.collector_ids.clear();
+        let plan = PhysicalCompiler
+            .compile_metricsql(workload, deployment)
+            .unwrap();
+        assert!(!plan.precompute_plan.materializations.is_empty());
+        assert!(plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .all(|m| !matches!(
+                m.aggregation_type,
+                asap_types::AggregationType::Increase
+                    | asap_types::AggregationType::MultipleIncrease
+            )));
+        let entry = plan.query_plan.entries.values().next().unwrap();
+        assert!(!entry.materialization_bindings().is_empty());
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            crate::query_plan::QueryPlanNode::ExternalExact { .. }
+                | crate::query_plan::QueryPlanNode::Logical {
+                    operator: crate::query_plan::logical::LogicalOperator::ExactSubquery { .. },
+                    ..
+                }
+        )));
+    }
+
+    #[test]
     fn metricsql_compilation_publishes_a_language_tagged_query_entry() {
         let query = "mad_over_time(m[1m])";
         let mut workload = request("vm-q", "last_over_time(m[1m])");
@@ -3750,6 +3928,8 @@ mod tests {
             byte_second_weight: 1e-9,
             mode: super::super::erp::ErpAccuracyMode::Hybrid,
             observed_shape: None,
+            observed_populations: None,
+            resolved_data_descriptor: None,
             observed_shape_source: None,
             shape_match: None,
             runtime: super::super::erp::ErpRuntimeCapabilities {
@@ -3799,6 +3979,8 @@ mod tests {
             byte_second_weight: 1e-9,
             mode: ErpAccuracyMode::Hybrid,
             observed_shape: None,
+            observed_populations: None,
+            resolved_data_descriptor: None,
             observed_shape_source: None,
             shape_match: None,
             runtime: ErpRuntimeCapabilities {

@@ -155,6 +155,7 @@ impl fmt::Debug for WorkerMessage {
 
 /// Routes incoming samples to one of N workers based on a consistent hash.
 pub struct SeriesRouter {
+    erp_observer: std::sync::OnceLock<std::sync::Arc<super::erp_observer::RuntimeErpObserver>>,
     senders: Vec<mpsc::Sender<WorkerMessage>>,
     num_workers: usize,
 }
@@ -163,9 +164,25 @@ impl SeriesRouter {
     pub fn new(senders: Vec<mpsc::Sender<WorkerMessage>>) -> Self {
         let num_workers = senders.len();
         Self {
+            erp_observer: std::sync::OnceLock::new(),
             senders,
             num_workers,
         }
+    }
+
+    pub fn enable_erp_observation(
+        &self,
+        endpoint: String,
+        generation: asap_types::sds::CatalogGeneration,
+    ) -> Result<(), String> {
+        self.erp_observer
+            .set(super::erp_observer::RuntimeErpObserver::new(
+                endpoint, generation,
+            ))
+            .map_err(|_| "ERP observer already configured".into())
+    }
+    pub fn erp_observer(&self) -> Option<std::sync::Arc<super::erp_observer::RuntimeErpObserver>> {
+        self.erp_observer.get().cloned()
     }
 
     /// Route a pre-grouped batch of group messages to workers concurrently.

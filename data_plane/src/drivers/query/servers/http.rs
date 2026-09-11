@@ -6314,14 +6314,23 @@ async fn handle_activate_physical_plan(
     };
     let _guard = state.physical_plan_lock.lock().await;
     let store = Arc::clone(&state.sketch_index);
+    let remote_write = state.remote_write.clone();
     let old = match lifecycle.activate_with_prepare(
         request.plan_id,
         request.plan_version,
         unix_time_ms(),
         move |plan| match plan.summary_catalog.as_ref() {
-            Some(catalog) => store
-                .install_summary_catalog(Arc::clone(catalog))
-                .map_err(|error| format!("SummaryCatalog install error: {error}")),
+            Some(catalog) => {
+                store
+                    .install_summary_catalog(Arc::clone(catalog))
+                    .map_err(|error| format!("SummaryCatalog install error: {error}"))?;
+                if let Some(receiver) = &remote_write {
+                    receiver.install_erp_observation_generation(
+                        catalog.reference().map_err(|error| error.to_string())?,
+                    );
+                }
+                Ok(())
+            }
             None => Err("authoritative SummaryCatalog is unavailable".to_string()),
         },
     ) {

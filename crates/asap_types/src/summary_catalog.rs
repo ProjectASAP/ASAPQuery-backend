@@ -115,7 +115,7 @@ impl SummaryCatalog {
                     if config.table_name.is_some() && !config.grouping_labels.is_empty() {
                         crate::grouping_projection::TABLE_GROUP_OBSERVATION_SEMANTICS
                     } else {
-                        "asap.timestamped-observations.v2"
+                        crate::sds::TIMESTAMPED_OBSERVATION_SEMANTICS
                     },
                 )
                 .with_grouping_projection(config.grouping_labels.clone())

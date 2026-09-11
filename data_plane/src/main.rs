@@ -44,6 +44,9 @@ fn unix_time_ms() -> u64 {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    /// Publish bounded materialization-input ERP observations after a verified finite-source drain.
+    #[arg(long)]
+    erp_runtime_samples_endpoint: Option<String>,
     /// Runtime component profile. `asapquery` enables backend ingest-time
     /// materialization and rejects Collector/OTLP-only components.
     #[arg(long, value_enum, default_value = "distributed")]
@@ -874,6 +877,20 @@ async fn main() -> Result<()> {
             series_resolver.clone(),
             sketch_index.clone(),
         );
+        if let Some(endpoint) = args.erp_runtime_samples_endpoint.clone() {
+            let generation = engine
+                .ingest_state()
+                .physical_plan_snapshot()
+                .and_then(|plan| plan.precompute_plan.summary_catalog.clone())
+                .ok_or_else(|| {
+                    std::io::Error::other("ERP observation requires an installed catalog")
+                })?;
+            engine
+                .ingest_state()
+                .router
+                .enable_erp_observation(endpoint, generation)
+                .map_err(std::io::Error::other)?;
+        }
         let worker_diagnostics = engine.diagnostics();
         let ingest_state = engine.ingest_state();
         info!("Starting precompute engine (ingest adapters share its bounded worker queues)");

@@ -69,6 +69,10 @@ struct AppState {
     /// agents' `sketch-runtime::PushExporter`. Read by decision
     /// loops in the replanner.
     runtime_samples: Arc<runtime_samples::RuntimeSamplesStore>,
+    /// The successfully activated typed catalog is authoritative for live ERP
+    /// input identity; incoming telemetry cannot supply its own descriptors.
+    active_summary_catalog:
+        Arc<tokio::sync::Mutex<Option<Arc<asap_types::summary_catalog::SummaryCatalog>>>>,
     /// Phase C (MVP v6): shared `BackendClient` for posting
     /// `StreamingConfig` JSON / YAML to the ASAPQuery-backend's
     /// `POST /api/v1/streaming-config` endpoint. Phase B had this
@@ -487,6 +491,7 @@ async fn main() {
         opamp_endpoint: opamp_ep,
         workload_registry: Arc::clone(&workload_registry),
         runtime_samples: Arc::clone(&runtime_samples_store),
+        active_summary_catalog: Arc::new(tokio::sync::Mutex::new(None)),
         backend_client: backend_client_shared,
         backend_routing_cache: Arc::clone(&backend_routing_cache),
     };
@@ -611,6 +616,8 @@ struct PhysicalPlanQueryRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompileAndPublishPhysicalPlanRequest {
+    #[serde(default = "default_physical_deployment_target")]
+    target: physical::compiler::PhysicalDeploymentTarget,
     #[serde(default)]
     workload_cost_evidence: Option<physical::workload_cost::WorkloadCostEvidence>,
     queries: Vec<PhysicalPlanQueryRequest>,
@@ -633,6 +640,10 @@ struct CompileAndPublishPhysicalPlanRequest {
     backend_compat: String,
     #[serde(default = "default_physical_plan_timeout_ms")]
     apply_timeout_ms: u64,
+}
+
+fn default_physical_deployment_target() -> physical::compiler::PhysicalDeploymentTarget {
+    physical::compiler::PhysicalDeploymentTarget::DistributedCollectors
 }
 
 fn default_physical_plan_timeout_ms() -> u64 {
@@ -704,10 +715,15 @@ async fn compile_and_publish_physical_plan(
     mut request: CompileAndPublishPhysicalPlanRequest,
     frontend: PhysicalQueryFrontend,
 ) -> Response {
+    // Serialize typed activations so an older response cannot overwrite the
+    // catalog recorded after a newer backend activation.
+    let mut active_catalog = st.active_summary_catalog.lock().await;
     if let Some(erp) = &mut request.erp {
         if let Err(error) = erp.hydrate_observed_shape(&st.runtime_samples) {
             return (StatusCode::UNPROCESSABLE_ENTITY, error).into_response();
         }
+        let catalog = active_catalog.clone();
+        erp.resolve_population_data_descriptor(catalog.as_deref());
     }
     let (bundle, collector_ids, apply_timeout, adaptation_evidence, _) =
         match compile_physical_plan_request(request, false, frontend) {
@@ -802,6 +818,8 @@ async fn compile_and_publish_physical_plan(
             .into_response();
     }
 
+    *active_catalog = Some(Arc::new(bundle.summary_catalog));
+
     Json(CompileAndPublishPhysicalPlanResponse {
         cost_comparison: bundle.cost_comparison,
         plan_id: bundle.envelope.plan_id,
@@ -842,6 +860,7 @@ async fn publish_clickhouse_plan(
     publication: physical::publication::PhysicalPlanPublication,
     selection_trace: Option<serde_json::Value>,
 ) -> axum::response::Response {
+    let mut active_catalog = state.active_summary_catalog.lock().await;
     let plan_id = publication.summary_catalog.plan_id;
     let plan_version = publication.summary_catalog.plan_version;
     let Some(client) = state.backend_client.as_ref() else {
@@ -863,6 +882,7 @@ async fn publish_clickhouse_plan(
             .await;
         return (StatusCode::BAD_GATEWAY, error.to_string()).into_response();
     }
+    *active_catalog = Some(Arc::new(publication.summary_catalog));
     Json(serde_json::json!({
         "plan_id": plan_id,
         "plan_version": plan_version,
@@ -888,10 +908,15 @@ fn compile_physical_plan_request(
     ),
     (StatusCode, String),
 > {
-    if request.queries.is_empty() || request.collector_ids.is_empty() {
+    if request.queries.is_empty()
+        || (request.target == physical::compiler::PhysicalDeploymentTarget::DistributedCollectors
+            && request.collector_ids.is_empty())
+        || (request.target == physical::compiler::PhysicalDeploymentTarget::BackendLocalRemoteWrite
+            && !request.collector_ids.is_empty())
+    {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            "queries and collector_ids must both be non-empty".to_string(),
+            "queries must be non-empty; distributed deployment requires collectors and backend-local deployment requires none".to_string(),
         ));
     }
     if request.max_evidence_age_ms == 0 || request.apply_timeout_ms == 0 {
@@ -967,7 +992,8 @@ fn compile_physical_plan_request(
     let planning_request = physical::compiler::PlanningRequest {
         query_workload: None,
         queries,
-        hybrid_execution: false,
+        hybrid_execution: request.target
+            == physical::compiler::PhysicalDeploymentTarget::BackendLocalRemoteWrite,
         materialization_policy: None,
         evidence: request.evidence,
         exact_composition_costs: request.exact_composition_costs,
@@ -978,7 +1004,7 @@ fn compile_physical_plan_request(
         retained_summary_memory_budget_bytes: None,
     };
     let environment = physical::compiler::DeploymentEnvironment {
-        target: physical::compiler::PhysicalDeploymentTarget::DistributedCollectors,
+        target: request.target,
         collector_ids: request.collector_ids.clone(),
         capability_snapshot_id: request.capability_snapshot_id,
         observed_at_unix_ms: now,
@@ -2242,6 +2268,7 @@ fn test_app_with_backend(backend_url: Option<String>) -> (AppState, axum::Router
         opamp_endpoint: "ws://ctrl:4320/v1/opamp".into(),
         workload_registry: Arc::new(WorkloadRegistry::empty()),
         runtime_samples: runtime_samples::RuntimeSamplesStore::new(64),
+        active_summary_catalog: Arc::new(tokio::sync::Mutex::new(None)),
         backend_client,
         backend_routing_cache: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -2307,6 +2334,58 @@ mod api_tests {
         assert_eq!(response.status(), StatusCode::OK);
         let manifests = body_json(response).await;
         assert_eq!(manifests.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn backend_local_typed_request_compiles_without_collectors() {
+        let snapshot: physical::compiler::BackendLocalPlanningSnapshot = serde_json::from_str(
+            include_str!("../../docs/examples/asapquery-compatibility-demo-snapshot.json"),
+        )
+        .unwrap();
+        let (planning, _) = snapshot.planning_request().unwrap();
+        let mut query = planning.queries[0].clone();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        query.lifecycle.evidence_observed_at_unix_ms = now;
+        for implementation in &mut query.window_implementations {
+            implementation.cost.observed_at_unix_ms = now;
+        }
+        let planner_types::pre_asap::Source::TimeSeries { metric } = &query.source else {
+            panic!("expected time series fixture");
+        };
+        let value = serde_json::json!({
+            "target": "backend_local_remote_write",
+            "queries": [{
+                "query_id": query.query_id, "query_string": query.query_string,
+                "metric": metric, "window_secs": query.window_secs, "accuracy": query.accuracy,
+                "lifecycle": query.lifecycle, "window_implementations": query.window_implementations
+            }],
+            "collector_ids": [], "capability_snapshot_id": "test",
+            "planner_revision": physical::compiler::PLANNER_REVISION,
+            "max_evidence_age_ms": 60000, "plan_version": 1,
+            "activation_unix_ms": now, "backend_compat": physical::compiler::BACKEND_COMPAT
+        });
+        let request = serde_json::from_value(value.clone()).unwrap();
+        let (plan, collectors, _, _, _) =
+            compile_physical_plan_request(request, false, PhysicalQueryFrontend::PromQl).unwrap();
+        let plan = plan.unwrap();
+        assert!(collectors.is_empty());
+        assert!(plan.collector_plans.is_empty());
+        assert_eq!(
+            plan.precompute_plan.ingest.protocol,
+            physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
+        );
+        assert!(!plan.precompute_plan.materializations.is_empty());
+        let mut distributed = value;
+        distributed["target"] = serde_json::json!("distributed_collectors");
+        assert!(compile_physical_plan_request(
+            serde_json::from_value(distributed).unwrap(),
+            false,
+            PhysicalQueryFrontend::PromQl
+        )
+        .is_err());
     }
 
     async fn body_json(resp: axum::response::Response) -> serde_json::Value {
