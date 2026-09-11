@@ -57,3 +57,21 @@ numeric-distribution observation. Equal frequencies produce the canonical
 uniform fit only: Zipf exponent zero describes the same distribution and must
 not create a false ambiguity. Near-uniform, genuinely distinct fits still pass
 through the normal ambiguity policy.
+
+### Population isolation in backend-local execution
+
+A temporal scalar summary has one state per source series when its selected
+`SummaryAgg` uses `Reduction::PerEntity`. An explicit reduction with no grouping
+keys has one pooled population. These are different materializations even when
+source, sketch parameters, and the visible grouping-key list are identical.
+
+The compiler records shared `PopulationPartitioning` metadata in the runtime
+configuration and DataDescriptor. Both identities include the partitioning;
+installation checks it against the bound Planner DAG. Raw ingestion uses the
+full source labels for per-entity routing and the configured grouping for pooled
+routing. Memory estimates count per-entity states against source cardinality.
+Legacy configurations without this metadata retain their existing routing rules.
+
+This is a source-isolation contract, not permission to skip a maintenance update
+expression. Only already-supported scalar update expressions pass the compiler's
+per-entity admission check; other subDAG updates still require a real evaluator.

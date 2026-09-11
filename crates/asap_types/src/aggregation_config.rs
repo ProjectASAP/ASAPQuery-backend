@@ -190,6 +190,15 @@ impl PrecomputeMaterialization {
             .unwrap_or(&crate::sds::ValueProjectionIdentity::SampleValue)
     }
 
+    /// Temporal extent of one stored base state, independent of emission cadence.
+    pub fn stored_window_ms(&self) -> u64 {
+        match &self.window_layout {
+            WindowMaterializationLayout::FullWindow => self.window_size,
+            layout => layout.base_pane_secs(),
+        }
+        .saturating_mul(1_000)
+    }
+
     pub fn population_filter_canonical(&self) -> Result<String, String> {
         self.effective_value_projection().validate()?;
         if self.value_projection.is_some() && self.table_name.is_none() {
