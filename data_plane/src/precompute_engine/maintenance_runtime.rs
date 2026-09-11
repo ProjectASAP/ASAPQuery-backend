@@ -697,7 +697,7 @@ mod tests {
             ActivePhysicalPlan, HotReloadActivePhysicalPlan, StreamingConfig,
         };
         use control_plane::physical::executable_binding::{
-            InstalledPostAsapDag, PostAsapDagDocument,
+            InstalledPostAsapDag, OwnedPostAsapDag,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -774,7 +774,7 @@ mod tests {
         bundle.precompute_plan.executable_dags = BTreeMap::from([(
             "retry".into(),
             InstalledPostAsapDag {
-                document: PostAsapDagDocument::from_executable("retry".into(), &dag).unwrap(),
+                document: OwnedPostAsapDag::from_executable("retry".into(), &dag).unwrap(),
                 binding,
             },
         )]);
