@@ -115,6 +115,20 @@ pub struct SummaryInstanceCoordinates {
     pub group_values: BTreeMap<String, String>,
 }
 
+impl SummaryInstanceCoordinates {
+    pub fn instance_id(&self) -> Result<SummaryInstanceId, SdsError> {
+        let bytes =
+            serde_json::to_vec(&self.group_values).map_err(|error| SdsError(error.to_string()))?;
+        SummaryInstanceId::new(format!(
+            "summary-instance:v1:{}:{}:{}:{}",
+            self.summary_definition_id.as_u64(),
+            self.time_range.start_ms,
+            self.time_range.end_ms,
+            xxhash_rust::xxh64::xxh64(&bytes, 0)
+        ))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SummaryWindowCompletion {
