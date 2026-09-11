@@ -81,6 +81,23 @@ fn measure(
         }
         return Ok(Cell::Int64(sum));
     }
+    if matches!(intent, AggIntent::Avg { .. }) && *dtype == DataType::Int64 {
+        let mut sum = 0i128;
+        for value in values {
+            let Cell::Int64(value) = value else {
+                return Err(unsupported("integer average received noninteger"));
+            };
+            sum = sum
+                .checked_add(i128::from(*value))
+                .ok_or_else(|| unsupported("integer average sum overflow"))?;
+        }
+        let average = sum as f64 / rows.len() as f64;
+        return if average.is_finite() {
+            Ok(Cell::Float64(average))
+        } else {
+            Err(unsupported("empty integer average"))
+        };
+    }
     let mut sum = 0.0;
     for value in values {
         sum += match value {
@@ -235,5 +252,18 @@ mod tests {
             overflow
         )
         .is_err());
+    }
+
+    #[test]
+    fn integer_average_preserves_cancellation_before_float_conversion() {
+        let fields = vec![("value".into(), DataType::Int64, false)];
+        let rows = vec![
+            vec![Cell::Int64(9_007_199_254_740_993)],
+            vec![Cell::Int64(-9_007_199_254_740_992)],
+        ];
+        assert_eq!(
+            measure(&AggIntent::Avg { col: Some(0) }, &rows, &fields).unwrap(),
+            Cell::Float64(0.5)
+        );
     }
 }
