@@ -1,270 +1,226 @@
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Build](https://github.com/ProjectASAP/ASAPQuery-backend/actions/workflows/rust.yml/badge.svg)](https://github.com/ProjectASAP/ASAPQuery-backend/actions/workflows/rust.yml)
+[![MVP CI](https://github.com/ProjectASAP/ASAPQuery-backend/actions/workflows/mvp-ci.yml/badge.svg)](https://github.com/ProjectASAP/ASAPQuery-backend/actions/workflows/mvp-ci.yml)
 
 # ASAPQuery-backend
 
-The query backend of the **ASAP** observability system.
+ASAPQuery-backend compiles and executes planned observability queries using
+materialized exact accumulators and sketches, with configured exact backends
+for unsupported or unavailable results. It contains the backend control plane,
+summary storage, precompute runtime and query adapters. Query semantics and
+post-ASAP candidate generation come from the external
+[ASAPPlanner](https://github.com/ProjectASAP/ASAPPlanner) dependency.
 
-Design documents, developer workflows, and user guides are indexed in the
-[ASAPQuery-backend documentation](docs/README.md).
+Start with the [E2E physical-DAG walkthrough](docs/evaluation/e2e-physical-dag.md)
+for workload inputs, ERP evidence, selected plans, sample ingestion, storage
+inspection and query execution. The [documentation index](docs/README.md) links
+the detailed guides. This README describes the repository entry points; it does
+not promise a universal latency improvement or a single accuracy bound across
+summary families.
 
-Start with the [E2E physical-DAG walkthrough for Milind](docs/evaluation/e2e-physical-dag.md)
-for workload/ERP inputs, selected plans, remote-write replay, instance identity
-and query inspection.
+## Planning, state and execution
 
-ASAPQuery-backend exposes a **single PromQL HTTP surface** that
-internally dispatches to one of two engines based on the control plane's
-plan and the query's shape:
-
-- **Warm tier** — in-process `ASAPQueryEngine` over a sketch precompute
-  store (DDSketch / KLL / HLL / CountSketch / Count-Min Sketch).
-  Sub-millisecond responses with bounded `(ε, δ)` accuracy for
-  control-plane-planned query shapes.
-- **Archive tier** — Prometheus `promql.Engine` (via Thanos
-  store-gateway and thanos-query) over Gorilla-XOR-compressed raw
-  chunks on object storage. Exact PromQL surface for ad-hoc and
-  post-hoc queries the ASAP tier cannot answer.
-
-```
-                    PromQL HTTP request
-                            │
-                            ▼
-                    ASAPQuery-backend
-                  ┌───────────────────────┐
-                  │  EngineRouter         │
-                  │  (BackendStorage-     │
-                  │   Routing + query     │
-                  │   shape dispatch)     │
-                  └─────────┬─────────────┘
-                            │
-            ┌───────────────┴───────────────┐
-            │                               │
-            ▼                               ▼
-   ┌─────────────────┐             ┌────────────────────┐
-   │   ASAP tier     │             │   archive tier     │
-   │ ASAPQueryEngine │             │   thanos-query     │
-   │   (sketch state │             │   (Prometheus      │
-   │   in RAM)       │             │    promql.Engine   │
-   │                 │             │    over Gorilla    │
-   │   ε > 0,        │             │    chunks on S3)   │
-   │   sub-ms        │             │                    │
-   │                 │             │   ε = 0, exact     │
-   └─────────────────┘             └────────────────────┘
+```text
+Workload + capabilities + cost/accuracy evidence
+                    |
+          external ASAPPlanner
+          selected post-ASAP DAG
+                    |
+       backend PhysicalCompiler
+                    |
+       authoritative SummaryCatalog
+       + shared physical-plan publication
+           /                        \
+   PrecomputePlan                 QueryPlan
+   producer/input subDAGs         query/readout subDAGs
+           |                        |
+    SummaryStore <---- bound state reads
+           |                        |
+   physical instances       result or exact fallback
 ```
 
-## Why two engines?
+The backend compiler consumes the selected Planner DAG and places supported
+operations. It preserves semantic nodes and bindings rather than rediscovering
+query intent from metric names. ERP evidence can influence eligible choices;
+its presence alone does not prove selection or measured benefit.
 
-| | Warm sketch tier | Archive tier (Thanos + Gorilla on S3) |
-|---|---|---|
-| What it serves | Control-plane-planned shapes (planned `(metric, W, L, agg_type)` triples) | Anything PromQL — ad-hoc, post-hoc, un-planned shapes |
-| Accuracy | bounded ε per sketch family | exact (`ε=0, δ=0, kind=exact`) |
-| Latency | µs–ms (RAM lookup) | 10s–100s of ms (object-store reads) |
-| Cost | sketch state RAM at the backend | object-store storage + per-query S3 GETs |
-| Implementation | this repo | this repo (HTTP forwarder) + [Thanos](https://thanos.io/) |
+| Contract or component | Responsibility |
+| --- | --- |
+| `SummaryCatalog` | Authoritative generation and descriptors for data, summary semantics, population, windows and materialization identity. Sibling plans validate against the same catalog. |
+| `PrecomputePlan` | Materializations, input schemas, producer bindings and installed precompute subDAGs. Window size, slide, layout and origin are explicit contracts. |
+| `ProducerContract`, `CollectorPlan`, `TransmissionPlan` | Producer/materialization authorization, external collector work and state-frame encoding/sequence rules. They are shared producer/consumer contracts; backend-local Remote Write does not require ASAPCollector. |
+| `QueryPlan` | Language-tagged query entries, exact dependencies, typed operations and materialization/readout bindings. Query subDAGs execute against the active installed snapshot. |
+| SummaryStore (`SketchStore`) | Physical state, indexes, lifecycle and persistence. A `SummaryDefinitionId` identifies the planned materialization. SID identifies a physical stored series/lifetime; `SummaryInstanceId` identifies a concrete definition/window/group instance. Planner node IDs are not storage IDs. |
+| Physical-plan publication | Publishes catalog, precompute, query, collector and transmission views together; invalid bindings reject installation rather than silently selecting replacement state. |
 
-The split is explicit — every PromQL response carries a
-`data_source: <warm|archive>` annotation plus the answer's accuracy
-envelope, so callers can decide whether to act on the value or
-escalate.
+See the [physical compiler](docs/developer_docs/control-plane/physical-compiler.md),
+[catalog/runtime design](docs/developer_docs/query-engine/catalog-physical-plan-runtime.md)
+and [maintenance protocol](docs/developer_docs/maintenance-replay.md).
 
-## Repository layout
+## Interfaces and support boundaries
 
-```
-ASAPQuery-backend/                 # Cargo workspace
-├── crates/                        # Shared workspace libraries
-│   ├── asap_types/                  # StorageBackend enum, accuracy envelopes
-│   ├── promql_utilities/            # PromQL AST helpers
-│   └── asap_otel_proto/             # OTLP protobuf bindings
-├── data_plane/                    # The query backend (binary; src/main.rs)
-│   └── src/
-│       ├── main.rs                  # Entrypoint; wires engines and routing
-│       ├── query_engines/
-│       │   ├── asap_query_engine/     # warm/ASAP tier — ASAPQueryEngine
-│       │   ├── thanos_query_engine/   # archive tier — ThanosQueryEngine
-│       │   │                          #   (forward.rs HTTP-forwards to thanos-query)
-│       │   └── routing/               # EngineRouter + BackendStorageRouting
-│       ├── storage_engines/
-│       │   ├── sketch_db/             # SketchStore — warm sketch state
-│       │   │                          #   (index/ data/ query/ lifecycle/
-│       │   │                          #    persistence/ backfill/)
-│       │   ├── gorilla_object_store/  # GorillaS3Store + GorillaQueryEngine
-│       │   │                          #   (in-process archive fallback)
-│       │   └── types/                 # shared storage types
-│       ├── precompute_engine/         # Streaming pipeline (+ operators/)
-│       └── drivers/                   # ingest/, query/ (PromQL HTTP API),
-│                                      #   control_plane_client/
-├── control_plane/                 # In-repo control plane / planner (binary)
-│   └── src/
-│       ├── query_parser/            # PromQL/SQL parsing → intent algebra
-│       ├── intent_algebra/          # shared intent representation
-│       ├── physical/post_asap/      # physical adapters for Planner post-ASAP IR
-│       ├── optimizer/               # plan optimization (cost/ + rules/)
-│       ├── physical/                # physical plan (colored_dag/)
-│       ├── emit/                    # per-runtime config emission
-│       └── opamp/                   # OpAMP server — pushes plans to runtimes
-└── docs/                          # Design docs
-```
+```mermaid
+flowchart TB
+  subgraph planning["Planning and installed contracts"]
+    PL["External ASAPPlanner"] --> CP["Backend control plane"]
+    CP --> CAT["Authoritative SummaryCatalog"]
+    CP --> PP["PrecomputePlan"]
+    CP --> QP["QueryPlan"]
+    CP --> PC["Producer contracts / CollectorPlan"]
+    CP --> TP["TransmissionPlan"]
+  end
 
-## Where the planner lives
+  subgraph ingest["Sample and state ingestion"]
+    RW["Prometheus Remote Write v1"] --> RX["RW receiver / bounded queue"]
+    RX --> PD["Precompute DAG"]
+    EP["External producers: modified OTLP / state"] --> PV["Producer / transmission validation"]
+    PV --> PD
+    PD --> SS["SummaryStore: physical series and window/group instances"]
+  end
 
-**The planner — the "control plane" — now lives in this repo at
-[`control_plane/`](control_plane/).** It was moved in-tree (Phase 9)
-from its former `ASAPCollector/controller/` location; `data_plane/`
-(the query backend) and `control_plane/` (the planner) are now
-workspace siblings.
+  subgraph queries["Query adapters and execution"]
+    PQ["PromQL"] --> QD["PromQL query DAG"]
+    MQ["MetricsQL"] --> MA["MetricsQL adapter"]
+    SQL["ClickHouse SQL"] --> SD["Typed SQL query DAG"]
+    QD --> QR["Shared query runtime"]
+    MA --> QR
+    SD --> QR
+    QR -->|"bound state reads"| SS
+    QD -->|"unsupported / unavailable"| PE["Prometheus exact backend"]
+    MA -->|"unsupported / unavailable"| VE["VictoriaMetrics exact backend"]
+    SD -->|"unsupported / unavailable"| CE["ClickHouse exact backend"]
+    QR --> W["Warm: successful summary execution"]
+    QR --> H["Hybrid: summaries plus supported exact dependencies"]
+    PE --> F["Exact fallback result"]
+    VE --> F
+    CE --> F
+    CE -->|"supported exact SQL subtree"| SD
+  end
 
-The control plane is the single authority for:
+  subgraph completion["Independent completion authority"]
+    B["Typed watermark / barrier: installed producer and partition scope"]
+    B --> CC["Continuous coordinator: closure activation gated"]
+    CC -.->|"gated completion contract"| PD
+  end
 
-1. Which sketches to compute, and where (SDK / agent / gateway / backend)
-2. Per-metric `BackendStorageRouting` (which engine answers which query shape)
-3. Per-runtime configuration (agent YAML, gateway YAML, backend
-   StreamingConfig + StorageRouting JSON)
-
-It pushes its plan to all runtimes via OpAMP. The data plane hot-loads
-the new `BackendStorageRouting` and `StreamingConfig` on each push
-without restart, so it is mostly an **executor** — it ingests
-sketches, evaluates queries, and dispatches based on the
-control-plane-emitted routing table.
-
-The legacy `asap-planner-rs` workspace member (library + CLI) was
-deleted in Phase γ; its PromQL pattern-matching and archive-only
-intents now live in `control_plane/`'s query-lowering stages.
-
-## Quick start
-
-ASAPQuery-backend is the query backend; the runnable demos — which
-spin up ASAPCollector + ASAPQuery-backend + Grafana together — live in
-[ASAPCollector](https://github.com/ProjectASAP/ASAPCollector). The
-full multi-stage MVP demo (10 producers / 2 agents / 1 gateway / 1
-backend / Thanos store-gateway / MinIO) is documented in its
-[`mvp-demo-runbook.md`](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/user_guide/mvp-demo-runbook.md).
-
-To build and run just this backend, see **Building from source** below.
-
-## Building from source
-
-This repo path-deps `asap-precompute-rs` and `asap-gorilla` from
-[ASAPCollector](https://github.com/ProjectASAP/ASAPCollector), and
-`asap_sketchlib` from
-[asap_sketchlib](https://github.com/ProjectASAP/asap_sketchlib).
-Clone all three repos as siblings under `~/repos/`:
-
-```
-~/repos/
-├── ASAPCollector/         # path-dep'd by this repo
-├── ASAPQuery-backend/     # this repo
-└── asap_sketchlib/        # path-dep'd by both
+  PP -.-> PD
+  QP -.-> QR
+  PC -.-> PV
+  TP -.-> PV
+  PC -.-> B
+  CAT -.-> SS
+  CAT -.-> QR
 ```
 
-Then:
+Dotted edges show installed contracts or explicitly gated paths. The barrier is
+independent of Remote Write samples; this figure does not advertise a public
+barrier endpoint or continuous/sliding activation. Warm and hybrid labels apply
+only to successful execution with the corresponding actual summary reads;
+external-only DAG execution is not acceleration.
+
+| Surface | Current path and boundary |
+| --- | --- |
+| Prometheus | `/api/v1/write` accepts Remote Write **v1** scalar samples. PromQL instant/range queries use installed plans with configured Prometheus exact fallback. The collector-free `asapquery` profile is a bounded compatibility profile, not every distributed/persistent deployment option. |
+| VictoriaMetrics | A separate MetricsQL adapter and listener lower supported expressions through Planner and the shared runtime. Unsupported syntax or unavailable coverage retains VictoriaMetrics exact fallback. See [MetricsQL support](docs/developer_docs/query-engine/victoriametrics-metricsql-support.md). |
+| ClickHouse | An optional SQL HTTP adapter uses the same catalog/publication with typed relational and mixed exact/summary DAG execution. Supported collection/scalar operations are explicit; arbitrary SQL, lambdas and counter queries are not implied. External-only DAG execution is not summary acceleration. See [SQL support](docs/developer_docs/query-engine/clickhouse-sql-support.md). |
+| External producers | The distributed path accepts configured collector/state input, including modified OTLP. It is distinct from standard Prometheus Remote Write and uses the shared producer/transmission contracts. |
+
+Remote Write `204` acknowledges atomic bounded queue admission, **not** durable
+accumulator publication or a raw write-ahead log. Deduplication is in memory;
+there is no durable raw-WAL replay guarantee. Stale markers are recognized and
+excluded from numeric aggregation, not propagated as general lifecycle events.
+Native histograms and exemplars are rejected in this v1 path.
+
+Remote Write does not carry an authoritative completion watermark. Installed
+producer partition rosters and typed barriers define a separate completion
+scope; roster membership alone does not provide authentication, durable progress
+or continuous scheduling. Finite immutable maintenance has explicit source,
+population, window and operator gates. Continuous/sliding activation must not be
+inferred from available metadata or a successful ingest response.
+
+Fallback and execution provenance must reflect the path that actually produced
+a successful result. Missing coverage and unsupported operations must not be
+reported as warm success. Accuracy and benefit claims need the selected family's
+contract and workload-specific evidence. Thanos/object-store integrations are
+optional deployment paths, not the default architecture or a required quickstart.
+
+## Build and inspect
+
+Use a current Rust toolchain with `rustfmt`/`clippy` and a protobuf compiler
+(`protoc`). The workspace has sibling path dependencies on
+[ASAPCollector](https://github.com/ProjectASAP/ASAPCollector) and
+[asap_sketchlib](https://github.com/ProjectASAP/asap_sketchlib):
+
+```text
+parent/
+├── ASAPQuery-backend/
+├── ASAPCollector/
+└── asap_sketchlib/
+```
+
+Use compatible dependency revisions; [MVP CI](.github/workflows/mvp-ci.yml)
+records the tested checkout/build setup. ASAPPlanner is a pinned Git dependency
+in the Cargo manifests, not an in-tree planner directory.
+
+From this repository root:
 
 ```bash
-cd ~/repos/ASAPQuery-backend
-cargo build --release
-cargo test --release --lib
+cargo build --locked -p control_plane -p data_plane
+cargo run --locked -p control_plane --example inspect_physical_dag -- \
+  docs/examples/asapquery-compatibility-demo-snapshot.json \
+  > selected.json
 ```
 
-The production binary is at
-`target/release/precompute_engine`. For the Docker image, see
-ASAPCollector's `deploy/docker/Dockerfile.backend`.
+The backend executable is `target/debug/data_plane` (or
+`target/release/data_plane` with `--release`). The inspector runs the ordinary
+snapshot compiler and emits the catalog and execution plans under
+`install_request`. Its output is labeled `inspection_only`; the demo costs are
+not measurements. See the [walkthrough](docs/evaluation/e2e-physical-dag.md) for
+candidate inspection and `jq` examples.
 
-## Configuration
+## Run and verify
 
-All runtime configuration is **controller-emitted via OpAMP push**;
-manual YAML is only the bootstrap when no controller has connected
-yet (or in dev / standalone deployments).
+For the included real Prometheus/Pushgateway demonstration, install Docker,
+curl, Python 3 and jq, then run:
 
-The backend reads three environment variables to gate its operating
-mode:
-
-| Env var | Purpose | Default |
-|---|---|---|
-| `ASAP_THANOS_QUERY_URL` | Path A2 — when set, archive-tier queries forward to thanos-query | unset (legacy in-process engine) |
-| `ASAP_GORILLA_S3_*` | Legacy in-process `GorillaQueryEngine` config (endpoint, bucket, credentials) | unset (warm-only mode) |
-| `CONTROLLER_BACKEND_ENDPOINT` | URL the controller pushes plans to | unset (static-config mode) |
-
-When `ASAP_THANOS_QUERY_URL` is set, the backend registers the
-`ThanosQueryEngine` and `BackendStorageRouting` can dispatch
-archive queries to it. When unset, the backend falls back to the
-in-process curated-subset `GorillaQueryEngine`.
-
-## Wire format
-
-Ingest is **modified-OTLP** with five new typed `Metric.data` variants
-(tags 13–17): `DDSketch`, `KLLSketch`, `HLLSketch`, `CountSketch`,
-`CountMinSketch`. Each carries a `SketchEnvelope.Payload` with
-sketch parameters and an accuracy envelope `(ε, δ, kind)` that the
-backend surfaces in every response's `infos` field.
-
-The wire format is documented in
-[`asap_otel_proto`](crates/asap_otel_proto/) and
-the cross-language byte-parity gate is described in
-[ASAPCollector's system design](https://github.com/ProjectASAP/ASAPCollector/blob/main/docs/design_docs/system-overview.md).
-
-## Query response shape
-
-Every PromQL response carries `infos[]` annotations that tell the
-caller how to interpret the answer:
-
-```json
-{
-  "status": "success",
-  "data": { "resultType": "vector", "result": [...] },
-  "infos": [
-    "data_source: warm",
-    "accuracy: ε=0.01, δ=0, kind=relative_quantile",
-    "query_latency_ms: 2"
-  ]
-}
+```bash
+./scripts/e2e.sh asapquery-demo
 ```
 
-| Annotation | What it says |
-|---|---|
-| `data_source: warm` | answered by the in-process warm sketch tier |
-| `data_source: gorilla_archive` | answered by the archive tier (legacy in-process engine) |
-| `data_source: thanos_archive` | answered by the archive tier via thanos-query |
-| `accuracy: ε=…, δ=…, kind=…` | the sketch's theoretical bound on this answer |
-| `query_latency_ms: …` | wall time the backend spent answering |
+The [demo runner](demos/asapquery/run.sh) documents its lifecycle and evidence
+output. To connect an existing Prometheus and run the backend directly, follow
+the [compatibility-profile guide](docs/user_guide/asapquery-profile.md); it
+includes the planning snapshot, healthy exact-upstream requirement, Remote Write
+configuration and startup arguments. Other deployment modes are covered by
+[running and verifying](docs/user_guide/running-and-verifying.md).
 
-A request can force a specific engine via the `X-ASAP-Engine` header
-or `?engine=` query parameter (used for ground-truth queries during
-accuracy verification).
+The focused production-path regression is:
 
-## What's NOT in this repo
+```bash
+cargo test --locked -p data_plane --test asapquery_compatibility_process_e2e \
+  collector_free_profile_serves_complete_matrix_and_falls_back_exactly -- --exact
+```
 
-These were intentionally moved or deleted as part of the consolidation
-that produced the current architecture:
+This test uses a **mock exact upstream**, not a running Prometheus server, and
+removes its temporary artifacts. The broader suite is
+`./scripts/e2e.sh asapquery`. For recorded datasets, use the
+[replay guide](docs/user_guide/o11y-replay.md) and
+[execution calibration](tools/o11y-execution/CALIBRATION.md). Report correctness,
+fallbacks, build/update cost and whole-deployment resources separately from
+query latency.
 
-- **Sketch placement planner** — moved into [`ASAPCollector/controller/`](https://github.com/ProjectASAP/ASAPCollector/tree/main/controller)
-- **PromQL pattern matchers for the planner** — migrated into the
-  ASAPPlanner's post-ASAP IR plus backend physical placement
-- **JSONL cold-fallback path** — deleted; the configured exact backend is the
-  explicit fallback described by
-  [query-engine implementation design](docs/developer_docs/query-engine/query-engine.md).
-- **`StorageBackend::ColdJsonlFallback`** enum variant — removed
-- **Backend-local cost-model line item for cold-tier scan bytes** —
-  removed (controller's tier-spanning cost model is the source of
-  truth)
+## Repository map
 
-## What's still planned
-
-- **Phase δ — backend pure executor**: drop the in-process
-  curated-subset `GorillaQueryEngine` once Path A2 (Thanos) is
-  verified at scale. The backend then becomes a thin ASAP-tier
-  evaluator + HTTP forwarder.
-- **Per-tenant routing**: `BackendStorageRouting` is global today;
-  multi-tenant deployments will need per-tenant routing tables.
-- **Hot-reload signal-driven** (not just controller-pushed): so
-  operators can rotate the static-YAML bootstrap without restart.
-
-Tracked in [issues](https://github.com/ProjectASAP/ASAPQuery-backend/issues).
-
-## Related repos
-
-- [ASAPCollector](https://github.com/ProjectASAP/ASAPCollector) —
-  edge runtimes, controller, gorillas3processor, MVP demo
-- [asap_sketchlib](https://github.com/ProjectASAP/asap_sketchlib) —
-  cross-language byte-identical sketch library (Rust + Go)
+| Path | Contents |
+| --- | --- |
+| [control_plane/](control_plane/) | Planner adapters, physical compilation, placement/cost evaluation, publication and runtime configuration. |
+| [crates/asap_types/](crates/asap_types/) | Shared catalog, SDS identities, plan, grouping, window and producer contracts. |
+| [crates/asap_otel_proto/](crates/asap_otel_proto/) | Modified OTLP protobuf bindings for supported external state ingestion. |
+| [data_plane/src/precompute_engine/](data_plane/src/precompute_engine/) | Ingest-time operators, coordination and immutable maintenance execution. |
+| [data_plane/src/storage_engines/sketch_db/](data_plane/src/storage_engines/sketch_db/) | SummaryStore implementation, physical indexes, lifecycle, backfill and persistence. |
+| [data_plane/src/query_engines/](data_plane/src/query_engines/) | Summary readout, shared DAG execution, protocol adapters and exact routing. |
+| [data_plane/src/drivers/](data_plane/src/drivers/) | HTTP, ingestion and control-plane interfaces. |
+| [data_plane/tests/](data_plane/tests/) | Runtime and process integration tests. |
+| [demos/](demos/), [scripts/](scripts/), [tools/](tools/) | Runnable demonstrations, validation and workload/evaluation tooling. |
+| [docs/](docs/README.md) | Architecture, operator guides, support boundaries and evaluation evidence. |
 
 ## License
 
