@@ -2590,9 +2590,9 @@ fn raw_time_series_input_contract(
     }
 }
 
-/// The first immutable-input capability accepts one exact accumulator readout.
-/// Population/window closure is checked by the installed runtime, not inferred
-/// from the presence of this syntax.
+/// Immutable inputs may combine explicit exact accumulator readouts using
+/// maintenance-time arithmetic. Population and window closure are checked by
+/// the installed runtime, not inferred from the presence of this syntax.
 fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<SummaryNode>>> {
     use planner_types::post_asap::{ExactKind, ExecutionTiming, SummaryInputExpr};
     let SummaryExpr::SummaryAgg {
