@@ -426,7 +426,9 @@ jq '{selection_trace, catalog: .publication.summary_catalog}' \
   target/readme-evidence/clickhouse/planning.json
 ```
 
-Without `CLICKHOUSE_URL` the real-server test skips; that is not a successful
+The fixture runs SUM, COUNT and MAX scenarios. `planning.json` is overwritten
+per scenario and retains the last publication; keep `process.log` for the complete
+run. Without `CLICKHOUSE_URL` the real-server test skips; that is not a successful
 native test. See [SQL support](docs/developer_docs/query-engine/clickhouse-sql-support.md)
 for the typed backfill and format boundaries.
 
