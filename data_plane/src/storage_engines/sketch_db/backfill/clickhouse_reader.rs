@@ -452,6 +452,20 @@ mod tests {
                 planner_types::pre_asap::DataType::Int64,
                 false,
             )]);
+        assert!(factory(
+            &BackfillSource::ClickHouse {
+                database: "metrics".into(),
+                table: "another_table".into()
+            },
+            &typed,
+        )
+        .is_ok());
+        typed.grouping_labels =
+            asap_types::GroupingProjection::new(vec![planner_types::pre_asap::Column::new(
+                "tenant",
+                planner_types::pre_asap::DataType::Int64,
+                true,
+            )]);
         let rejected = factory(
             &BackfillSource::ClickHouse {
                 database: "metrics".into(),
