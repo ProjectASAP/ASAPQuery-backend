@@ -42,7 +42,7 @@ async fn single_source_maintenance_is_automatic_and_durable() {
     // choice and use its actual value contract for this singleton oracle.
     let max_relative_error = match derived.aggregation_type {
         asap_types::AggregationType::DDSketch => derived.parameters["alpha"].as_f64().unwrap(),
-        asap_types::AggregationType::KLL => 0.0,
+        asap_types::AggregationType::DatasketchesKLL => 0.0,
         ref other => panic!("singleton quantile oracle missing for {other:?}"),
     };
     eprintln!(
