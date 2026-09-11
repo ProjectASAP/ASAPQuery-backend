@@ -126,6 +126,19 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
     ) -> Result<MaintenanceValue, Self::Error> {
         match &node.payload {
             ExecutableOperatorPayload::SummaryMerge => merge_inputs(inputs),
+            ExecutableOperatorPayload::Binary {
+                operator,
+                timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
+            } => {
+                if !matches!(&self.inputs, MaintenanceInputs::Frozen(_))
+                    || node.output_state
+                        != planner_types::post_asap::ExecutionDataState::MAINTENANCE_ROWS
+                {
+                    return Err("maintenance binary requires immutable completed row inputs".into());
+                }
+                evaluate_aligned_binary(node, operator, inputs)
+            }
+
             ExecutableOperatorPayload::Value {
                 operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
                 timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
@@ -2537,6 +2550,44 @@ mod tests {
             panic!("expected rows")
         };
         assert_eq!(values, vec![(1_000, 3.0), (2_000, 4.0)]);
+        let binding = BackendExecutableBinding {
+            nodes: BTreeMap::new(),
+            query_sink: PostAsapNodeId(10),
+            query_plan_sink: asap_types::query_plan::QueryNodeId(10),
+            precompute_sinks: vec![],
+        };
+        let frozen = OperatorAdapter {
+            binding: &binding,
+            inputs: MaintenanceInputs::Frozen(&[]),
+            configs: &[],
+        };
+        operation.payload = ExecutableOperatorPayload::Binary {
+            operator: operator.clone(),
+            timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
+        };
+        operation.output_state = planner_types::post_asap::ExecutionDataState::MAINTENANCE_ROWS;
+        assert!(frozen
+            .execute(&operation, &[left.clone(), right.clone()])
+            .is_ok());
+        let live = OperatorAdapter {
+            binding: &binding,
+            inputs: MaintenanceInputs::Live {
+                definition: definition(1),
+                state: sum(1.0),
+            },
+            configs: &[],
+        };
+        assert!(live
+            .execute(&operation, &[left.clone(), right.clone()])
+            .is_err());
+        operation.payload = ExecutableOperatorPayload::Binary {
+            operator: operator.clone(),
+            timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+        };
+        assert!(frozen
+            .execute(&operation, &[left.clone(), right.clone()])
+            .is_err());
+
         for invalid in [
             rows(vec![]),
             rows(vec![(1_000, 2.0)]),

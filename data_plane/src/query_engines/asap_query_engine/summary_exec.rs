@@ -544,6 +544,7 @@ mod tests {
         let child = logical_node();
         let tree = SummaryNode {
             expr: SummaryExpr::BinaryOp {
+                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
                 lhs: child.clone(),
                 rhs: child.clone(),
                 operator: planner_types::post_asap::BinaryOperator {

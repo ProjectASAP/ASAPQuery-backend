@@ -97,6 +97,11 @@ where
     for edge in &dag.edges {
         incoming.entry(edge.consumer.0).or_default().push(edge);
     }
+    for node in &dag.nodes {
+        if matches!(node.payload, ExecutableOperatorPayload::Binary { .. }) {
+            incoming.entry(node.id.0).or_default();
+        }
+    }
     let mut inputs = BTreeMap::<u32, Vec<u32>>::new();
     for (consumer, edges) in incoming {
         let ordered = if nodes
@@ -321,6 +326,7 @@ mod tests {
         let mut binary = node(3);
         binary.operator = ExecutableOperator::Binary;
         binary.payload = ExecutableOperatorPayload::Binary {
+            timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
             operator: BinaryOperator {
                 kind: BinaryOpKind::Arithmetic(ArithmeticOpKind::Sub),
                 vector_match: None,
@@ -355,6 +361,8 @@ mod tests {
         dag.edges[1].role = EdgeRole::Left;
         assert!(matches!(execute(&dag), Err(ScheduleError::Invalid(_))));
         dag.edges.pop();
+        assert!(matches!(execute(&dag), Err(ScheduleError::Invalid(_))));
+        dag.edges.clear();
         assert!(matches!(execute(&dag), Err(ScheduleError::Invalid(_))));
     }
 
