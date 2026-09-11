@@ -285,7 +285,7 @@ where
         if let SummaryExpr::ValueOperation {
             child,
             operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
-            timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+            ..
         } = &node.expr
         {
             // SummaryAgg lowering already emits the family-specific ExactReadout.
@@ -887,6 +887,28 @@ fn scalar_literal(expr: &planner_types::pre_asap::QueryExpr) -> Option<f64> {
     value.is_finite().then_some(value)
 }
 
+/// A value edge may explicitly finalize an exact accumulator at either
+/// execution time. Inspect only this typed boundary; other value operations
+/// cannot be treated as transparent producer identity.
+pub(crate) fn exact_accumulator_value_source(node: &SummaryNode) -> Option<&SummaryNode> {
+    let source = match &node.expr {
+        SummaryExpr::ValueOperation {
+            child,
+            operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+            ..
+        } => child.as_ref(),
+        _ => node,
+    };
+    matches!(
+        source.expr,
+        SummaryExpr::SummaryAgg {
+            family: SummaryFamilyType::ExactAggregate(..),
+            ..
+        }
+    )
+    .then_some(source)
+}
+
 /// The current exact arithmetic adapter is deliberately narrower than PromQL:
 /// default vector matching, scalar literals and additive temporal readouts.
 /// Unsupported operands make the complete expression fall back.
@@ -900,6 +922,9 @@ pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
         return false;
     }
     match &node.expr {
+        SummaryExpr::ValueOperation { .. } => {
+            exact_accumulator_value_source(node).is_some_and(exact_value_executable)
+        }
         SummaryExpr::KeepPreAsap(expr) => scalar_literal(expr).is_some(),
         SummaryExpr::BinaryOp { lhs, rhs, operator } => {
             matches!(
@@ -931,7 +956,7 @@ pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
                 // Raw producer grouping may move through additive reductions,
                 // but never through division or other value arithmetic.
                 matches!(kind, ExactKind::Sum)
-                    && matches!(child.expr, SummaryExpr::SummaryAgg { .. })
+                    && exact_accumulator_value_source(child).is_some()
                     && exact_value_executable(child)
             }
         }
@@ -940,6 +965,11 @@ pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
 }
 
 fn value_grouping(node: &SummaryNode) -> Result<Option<PhysicalGrouping>, QueryPlanError> {
+    if matches!(node.expr, SummaryExpr::ValueOperation { .. }) {
+        if let Some(source) = exact_accumulator_value_source(node) {
+            return value_grouping(source);
+        }
+    }
     match &node.expr {
         SummaryExpr::KeepPreAsap(_) => Ok(None),
         SummaryExpr::SummaryAgg {
@@ -965,6 +995,9 @@ fn value_grouping(node: &SummaryNode) -> Result<Option<PhysicalGrouping>, QueryP
 // selectors/windows need per-operand time binding before they can be warm.
 fn value_source(node: &SummaryNode) -> Option<&planner_types::pre_asap::QueryExpr> {
     match &node.expr {
+        SummaryExpr::ValueOperation { .. } => {
+            exact_accumulator_value_source(node).and_then(value_source)
+        }
         SummaryExpr::SummaryAgg { child, .. } => match &child.expr {
             SummaryExpr::KeepPreAsap(expr) => Some(expr),
             _ => value_source(child),
