@@ -566,7 +566,13 @@ pub fn execute_completed_maintenance(
         .as_slice()
         .try_into()
         .map_err(|_| "invalid input digest")?;
-    if store.lookup_frozen_maintenance_output(target_sid, target_config, &frozen, digest, window)? {
+    if store.recover_frozen_maintenance_output(
+        target_sid,
+        target_config,
+        &frozen,
+        digest,
+        window,
+    )? {
         return Ok(false);
     }
     let state = execute_prepared_frozen_sink(installed, configs, sink, &frozen, &dag, key, states)?;
@@ -1400,7 +1406,7 @@ mod tests {
             config
         };
         let expected = BTreeSet::from([(0, 1000), (1000, 2000)]);
-        let store = Arc::new(SketchStore::new());
+        let mut store = Arc::new(SketchStore::new());
         store.install_summary_catalog(Arc::clone(&catalog)).unwrap();
         let mut persistence = store.start_persistence(persistence_config()).unwrap();
         let generation = store.active_catalog_generation().unwrap();
@@ -1475,6 +1481,10 @@ mod tests {
         let mut output =
             PrecomputedOutput::new(0, 2000, None, durable_configs[1].policy_fingerprint());
         output.catalog_generation = Some(Arc::clone(&generation));
+        let log = persistence.manifest.log_path();
+        let backup = log.with_extension("saved");
+        std::fs::rename(&log, &backup).unwrap();
+        std::fs::create_dir(&log).unwrap();
         assert!(execute_completed_maintenance(
             &store,
             &installed,
@@ -1484,6 +1494,26 @@ mod tests {
             601,
             (0, 2000),
             &BTreeMap::new()
+        )
+        .is_err());
+        std::fs::remove_dir(&log).unwrap();
+        std::fs::rename(&backup, &log).unwrap();
+        persistence.shutdown();
+        drop(store);
+        store = Arc::new(SketchStore::new());
+        store.install_summary_catalog(Arc::clone(&catalog)).unwrap();
+        persistence = store.start_persistence(persistence_config()).unwrap();
+        // The already durable pending KLL part is completed before a new
+        // randomized sketch can be built after restart.
+        assert!(!execute_completed_maintenance(
+            &store,
+            &installed,
+            &durable_configs,
+            PostAsapNodeId(3),
+            600,
+            601,
+            (0, 2000),
+            &BTreeMap::new(),
         )
         .unwrap());
         assert!(!execute_completed_maintenance(
@@ -1528,7 +1558,7 @@ mod tests {
                 &BTreeMap::new(),
             )
             .unwrap();
-        let (result, replay_digest) = evaluate_frozen_maintenance_sink(
+        let (_result, replay_digest) = evaluate_frozen_maintenance_sink(
             &installed,
             &durable_configs,
             PostAsapNodeId(3),

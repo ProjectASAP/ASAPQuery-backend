@@ -497,13 +497,13 @@ a query fallback helper might.
 
 The existing maintenance operator registry preserves a collection of source
 states until the DAG explicitly merges or finalizes it. Exact Sum/Count
-finalization produces one row per source window; an unkeyed SummaryAgg consumes
+finalization with a declared Float64 output produces one row per source window; an unkeyed SummaryAgg consumes
 those rows together. Consequently `Finalize -> SummaryAgg` does not accidentally
 become one complete DAG evaluation per correction fragment. Live worker fragments
 remain ineligible for finalization.
 
-The engine looks up the stored input digest before computing a potentially
-randomized sketch. The existing flusher publishes a new result through its part
+The engine resumes a matching durable pending part and looks up the stored input
+digest before computing a potentially randomized sketch. The existing flusher publishes a new result through its part
 reservation protocol; SummaryStore fences query reads and physical lifetime
 changes during publication. A concurrent identical completion reuses the durable
 result instead of comparing newly randomized bytes. The latest committed window

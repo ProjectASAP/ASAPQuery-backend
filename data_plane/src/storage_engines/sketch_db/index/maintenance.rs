@@ -116,7 +116,7 @@ impl SketchStore {
 }
 
 impl SketchStore {
-    pub(crate) fn lookup_frozen_maintenance_output(
+    pub(crate) fn recover_frozen_maintenance_output(
         &self,
         sid: u64,
         config: &asap_types::PrecomputeMaterialization,
@@ -147,6 +147,22 @@ impl SketchStore {
             .map_err(|_| "publisher registry poisoned")?
             .upgrade()
             .ok_or("immutable publication requires active persistence")?;
+        let _mutation = self.begin_state_mutation();
+        let mut completed = self
+            .completed_windows
+            .write()
+            .map_err(|_| "completion registry poisoned")?;
+        if publisher
+            .resume_matching_immutable_window(&record, digest, window.0, window.1)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            completed
+                .entry(sid)
+                .and_modify(|end| *end = (*end).max(window.1))
+                .or_insert(window.1);
+            return Ok(true);
+        }
         Ok(publisher
             .lookup_immutable_window(&record, digest, window.0, window.1)
             .map_err(|error| error.to_string())?
