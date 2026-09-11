@@ -78,6 +78,7 @@ fn scalar(expr: &QueryExpr, schema: &Schema) -> Result<String, String> {
                 "map" => "map",
                 "mapconcat" => "mapConcat",
                 "asap_map_access" | "asap_element_access" => "arrayElement",
+                "asap_struct_field" => "tupleElement",
                 _ => return Err(format!("unsupported exact scalar function {name}")),
             };
             expr.scalar_type(schema).map_err(|e| e.to_string())?;
