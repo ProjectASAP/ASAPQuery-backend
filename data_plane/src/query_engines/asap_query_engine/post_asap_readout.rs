@@ -253,6 +253,18 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                 Ok(PhysicalQueryOutput::Value(values, coverage))
             }
             QueryPlanNode::ExactReadout { readout, .. } => {
+                if self.language == control_plane::query_plan::QueryLanguage::MetricsQl
+                    && matches!(
+                        readout,
+                        control_plane::query_plan::ExactReadout::Rate
+                            | control_plane::query_plan::ExactReadout::Increase
+                    )
+                {
+                    return Err(PhysicalNodeError::Fallback(
+                        "native MetricsQL counter semantics require external exact execution"
+                            .into(),
+                    ));
+                }
                 let [PhysicalQueryOutput::State { groups, .. }] = inputs else {
                     return Err(PhysicalNodeError::ExpectedState);
                 };
@@ -1328,6 +1340,12 @@ mod tests {
             .expect("execute exact rate DAG");
         let value = outcome.series[0].1[0].1;
         assert!((value - 0.575).abs() < 1e-12, "reset-aware rate={value}");
+        let mut native_vm_entry = entry.clone();
+        native_vm_entry.language = control_plane::query_plan::QueryLanguage::MetricsQl;
+        assert!(
+            execute_query_plan_readout(&idx, &native_vm_entry, 0, 60_000, true).is_err(),
+            "previously installed MetricsQL counter state must request exact fallback"
+        );
         assert!(
             execute_query_plan_readout(&idx, &entry, 1, 60_000, true).is_err(),
             "a partial leading counter pane needs Prometheus boundary samples"
