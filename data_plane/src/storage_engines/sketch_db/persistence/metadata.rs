@@ -277,6 +277,9 @@ pub struct SidMetaRecord {
     pub expires_at_ms: Option<u64>,
     #[serde(default)]
     pub removed: bool,
+    /// No further publication may change a window ending at or before this bound.
+    #[serde(default)]
+    pub completed_through_ms: Option<u64>,
 }
 
 impl SidMetaRecord {
@@ -301,6 +304,7 @@ impl SidMetaRecord {
             retired_at_ms: None,
             expires_at_ms: None,
             removed: false,
+            completed_through_ms: None,
         }
     }
 
@@ -368,6 +372,8 @@ struct SidBindingRec {
     expires_at_ms: Option<u64>,
     #[serde(default)]
     removed: bool,
+    #[serde(default)]
+    completed_through_ms: Option<u64>,
 }
 
 /// Version-3 normalized sidecar with authoritative catalog provenance. Descriptors appear once and SeriesId bindings hold
@@ -438,6 +444,7 @@ impl SdsSidecar {
                     retired_at_ms: record.retired_at_ms,
                     expires_at_ms: record.expires_at_ms,
                     removed: record.removed,
+                    completed_through_ms: record.completed_through_ms,
                 },
             );
         }
@@ -491,6 +498,7 @@ impl SdsSidecar {
                     retired_at_ms: binding.retired_at_ms,
                     expires_at_ms: binding.expires_at_ms,
                     removed: binding.removed,
+                    completed_through_ms: binding.completed_through_ms,
                 })
             })
             .collect()
@@ -608,6 +616,8 @@ impl SidMetadataStore {
                 // Lifecycle is monotone for a SeriesId. An older flush snapshot
                 // must not resurrect a retired or removed persisted instance.
                 next.removed |= existing.removed;
+                next.completed_through_ms =
+                    existing.completed_through_ms.max(next.completed_through_ms);
                 next.retired_at_ms = existing.retired_at_ms.or(next.retired_at_ms);
                 next.expires_at_ms = match (existing.expires_at_ms, next.expires_at_ms) {
                     (Some(a), Some(b)) => Some(a.min(b)),
