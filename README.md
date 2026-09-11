@@ -417,7 +417,8 @@ and cleans up its child backend. The native server remains yours to manage.
 ```bash
 mkdir -p target/readme-evidence/clickhouse
 export CLICKHOUSE_URL=http://127.0.0.1:8123
-curl -fsS "$CLICKHOUSE_URL/ping"
+curl -fsS --user "${CLICKHOUSE_USER:-default}:${CLICKHOUSE_PASSWORD:-}" \
+  "$CLICKHOUSE_URL/ping"
 CLICKHOUSE_PLANNING_ARTIFACT="$PWD/target/readme-evidence/clickhouse/planning.json" \
   cargo +1.98.0 test --locked -p data_plane --test clickhouse_differential_e2e \
   compiled_publication_executes_mixed_dag_in_data_plane_process \
@@ -486,6 +487,7 @@ for attempt in $(seq 1 60); do
 done
 curl -fsS http://127.0.0.1:19082/api/v1/health
 curl -sS -D target/readme-evidence/clickhouse/query.headers --get \
+  --user "${CLICKHOUSE_USER:-default}:${CLICKHOUSE_PASSWORD:-}" \
   http://127.0.0.1:19083/ --data-urlencode 'query=SELECT 1 FORMAT JSON' \
   > target/readme-evidence/clickhouse/query.json
 jq . target/readme-evidence/clickhouse/query.json
@@ -493,9 +495,12 @@ curl -fsS http://127.0.0.1:19082/api/v1/physical-plan/status | jq .
 kill "$(cat target/readme-evidence/clickhouse/backend.pid)"
 ```
 
-For authenticated deployments also pass the existing `--clickhouse-user` and
-`--clickhouse-password` flags to the adapter; the test fixture uses the matching
-environment variables. Retain planning/selection artifacts, response headers,
+For authenticated requests, set `CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD`
+for the curl commands above, or send `X-ClickHouse-User` and `X-ClickHouse-Key`
+headers. The proxy forwards incoming authentication headers. Backend
+`--clickhouse-user` and `--clickhouse-password` configure backfill access; they
+do not automatically authenticate proxy fallback requests. The process fixture
+uses its matching environment variables. Retain planning/selection artifacts, response headers,
 JSON and process logs. A successful SQL response can be exact fallback or an
 external-only DAG; only actual summary reads establish ASAP/hybrid execution.
 The fixture's mixed-DAG assertions are stronger than a successful `SELECT 1`.
