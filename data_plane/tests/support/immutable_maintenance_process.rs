@@ -3,13 +3,27 @@ use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_source_maintenance_is_automatic_and_durable() {
-    const QUERY: &str = "quantile(0.9, sum_over_time(immutable_value[1m]))";
+    run_maintenance_process(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_source_maintenance_is_automatic_and_durable() {
+    run_maintenance_process(true).await;
+}
+
+async fn run_maintenance_process(multi_source: bool) {
+    let query = if multi_source {
+        "quantile(0.9, sum_over_time(immutable_value[1m]) + sum_over_time(immutable_other[1m]))"
+    } else {
+        "quantile(0.9, sum_over_time(immutable_value[1m]))"
+    };
+    let expected = if multi_source { 20.0 } else { 10.0 };
     let mut fixture: Value = serde_json::from_str(include_str!(
         "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
     ))
     .unwrap();
     let mut entry = fixture["query_workload"]["repeating_queries"][3].clone();
-    entry["query"] = QUERY.into();
+    entry["query"] = query.into();
     entry["demand"]["fixed_interval_at"]["interval"] = 60_000.into();
     entry["demand"]["fixed_interval_at"]["evaluation_phase"] = 0.into();
     entry["time_selection"]["lookback"] = 60_000.into();
@@ -17,7 +31,10 @@ async fn single_source_maintenance_is_automatic_and_durable() {
     let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
         serde_json::from_value(fixture.clone()).unwrap();
     let plan = snapshot.compile().unwrap();
-    assert_eq!(plan.precompute_plan.materializations.len(), 2);
+    assert_eq!(
+        plan.precompute_plan.materializations.len(),
+        if multi_source { 3 } else { 2 }
+    );
     let source = plan
         .precompute_plan
         .materializations
@@ -36,7 +53,12 @@ async fn single_source_maintenance_is_automatic_and_durable() {
     assert_eq!(derived.pane_origin_ms, Some(0));
     assert_eq!(
         derived.derived_input.as_ref().unwrap().inputs,
-        std::collections::BTreeSet::from([source.policy_fingerprint().into()])
+        plan.precompute_plan
+            .materializations
+            .iter()
+            .filter(|m| m.derived_input.is_none())
+            .map(|m| m.policy_fingerprint().into())
+            .collect()
     );
     // The production cost model may choose DDSketch or KLL. Preserve that
     // choice and use its actual value contract for this singleton oracle.
@@ -63,7 +85,10 @@ async fn single_source_maintenance_is_automatic_and_durable() {
     };
     // Two independent deployments: singleton is supported; a second physical
     // input series must never be mistaken for a complete singleton population.
-    for count in [1, 2] {
+    for (count, missing_source) in [(1, false), (2, false), (1, true)] {
+        if missing_source && !multi_source {
+            continue;
+        }
         let mut directory = tempfile::tempdir().unwrap();
         eprintln!("IMMUTABLE_PROCESS_ARTIFACT {}", directory.path().display());
         directory.disable_cleanup(true);
@@ -113,7 +138,7 @@ async fn single_source_maintenance_is_automatic_and_durable() {
         let backend = format!("http://127.0.0.1:{port}");
         let mut first = spawn(port);
         wait_until_ready(&client, &format!("{backend}/api/v1/health"), &mut first.0).await;
-        let series = (0..count)
+        let mut series: Vec<_> = (0..count)
             .map(|i| {
                 series_with_labels(
                     "immutable_value",
@@ -125,6 +150,18 @@ async fn single_source_maintenance_is_automatic_and_durable() {
                 )
             })
             .collect();
+        if multi_source && !missing_source {
+            for i in 0..count {
+                series.push(series_with_labels(
+                    "immutable_other",
+                    &[
+                        ("instance", if i == 0 { "a" } else { "b" }),
+                        ("job", "worker"),
+                    ],
+                    &[(1_000, 2.0), (2_000, 3.0), (60_000, 5.0)],
+                ));
+            }
+        }
         assert_eq!(
             remote_write(&client, &backend, &WriteRequest { timeseries: series }).await,
             204
@@ -134,7 +171,7 @@ async fn single_source_maintenance_is_automatic_and_durable() {
             .send()
             .await
             .unwrap();
-        if count == 1 {
+        if count == 1 && !missing_source {
             assert!(
                 drain.status().is_success(),
                 "{}",
@@ -143,14 +180,14 @@ async fn single_source_maintenance_is_automatic_and_durable() {
         }
         let response: Value = client
             .get(format!("{backend}/api/v1/query"))
-            .query(&[("query", QUERY), ("time", "60")])
+            .query(&[("query", query), ("time", "60")])
             .send()
             .await
             .unwrap()
             .json()
             .await
             .unwrap();
-        if count == 2 {
+        if count == 2 || missing_source {
             assert!(
                 !is_warm(&response),
                 "multi-series population was incorrectly admitted: {response}"
@@ -173,7 +210,7 @@ async fn single_source_maintenance_is_automatic_and_durable() {
             .parse::<f64>()
             .unwrap();
         assert!(
-            estimate.is_finite() && (estimate - 10.0).abs() / 10.0 <= max_relative_error,
+            estimate.is_finite() && (estimate - expected).abs() / expected <= max_relative_error,
             "selected singleton quantile exceeded its value contract: {response}"
         );
         drop(first);
@@ -188,7 +225,7 @@ async fn single_source_maintenance_is_automatic_and_durable() {
         .await;
         let after: Value = client
             .get(format!("{backend}/api/v1/query"))
-            .query(&[("query", QUERY), ("time", "60")])
+            .query(&[("query", query), ("time", "60")])
             .send()
             .await
             .unwrap()
@@ -245,7 +282,7 @@ async fn single_source_maintenance_is_automatic_and_durable() {
         .await;
         let stale: Value = client
             .get(format!("{backend}/api/v1/query"))
-            .query(&[("query", QUERY), ("time", "60")])
+            .query(&[("query", query), ("time", "60")])
             .send()
             .await
             .unwrap()

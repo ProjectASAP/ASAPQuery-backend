@@ -1204,7 +1204,7 @@ impl PhysicalCompiler {
                     query_id: query.query_id.clone(),
                     reason,
                 })?;
-                if let Some(source) = immutable_materialization_source(&selected.node) {
+                if let Some(source) = immutable_materialization_sources(&selected.node) {
                     if environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite {
                         return Err(CompileError::Query {
                             query_id: query.query_id.clone(),
@@ -1213,24 +1213,24 @@ impl PhysicalCompiler {
                         });
                     }
                     let compiled = executable_dags[query_index].as_ref().expect("compiled DAG");
-                    let source_node =
-                        compiled
-                            .node_ids
-                            .node_id(&source)
-                            .ok_or_else(|| CompileError::Query {
+                    let mut frontiers = BTreeMap::new();
+                    let mut source_configs = Vec::new();
+                    for source in source {
+                        let source_node = compiled.node_ids.node_id(&source).ok_or_else(|| {
+                            CompileError::Query {
                                 query_id: query.query_id.clone(),
                                 reason: "derived source absent from selected DAG".into(),
-                            })?;
-                    let source_id = node_bindings
-                        .get(&(query_index, source_node))
-                        .copied()
-                        .ok_or_else(|| CompileError::Query {
-                            query_id: query.query_id.clone(),
-                            reason: "derived input source was not installed before its consumer"
-                                .into(),
+                            }
                         })?;
-                    let source_config: &asap_types::PrecomputeMaterialization =
-                        compiled_materializations
+                        let source_id = node_bindings
+                            .get(&(query_index, source_node))
+                            .copied()
+                            .ok_or_else(|| CompileError::Query {
+                                query_id: query.query_id.clone(),
+                                reason: "derived source was not installed before consumer".into(),
+                            })?;
+                        frontiers.insert(source_node, source_id.into());
+                        let config = compiled_materializations
                             .iter()
                             .find(|config: &&asap_types::PrecomputeMaterialization| {
                                 config.policy_fingerprint() == source_id
@@ -1239,9 +1239,17 @@ impl PhysicalCompiler {
                                 query_id: query.query_id.clone(),
                                 reason: "derived source config missing".into(),
                             })?;
+                        if !source_configs.iter().any(
+                            |existing: &&asap_types::PrecomputeMaterialization| {
+                                existing.policy_fingerprint() == source_id
+                            },
+                        ) {
+                            source_configs.push(config);
+                        }
+                    }
                     asap_types::precompute_plan::validated_source_window_cohort(
                         &runtime_materialization,
-                        &[source_config],
+                        &source_configs,
                     )
                     .map_err(|error| CompileError::Query {
                         query_id: query.query_id.clone(),
@@ -1269,9 +1277,7 @@ impl PhysicalCompiler {
                     })?;
                     runtime_materialization.derived_input = Some(
                         asap_types::derived_input::DerivedInputIdentity::from_dag(
-                            &document,
-                            input_node,
-                            &BTreeMap::from([(source_node, source_id.into())]),
+                            &document, input_node, &frontiers,
                         )
                         .map_err(|reason| CompileError::Query {
                             query_id: query.query_id.clone(),
@@ -1435,11 +1441,13 @@ impl PhysicalCompiler {
                     reason: format!("promql-compatible identity: {error}"),
                 })?;
             let binding = |node: &Rc<SummaryNode>, node_family: &SummaryFamilyType| -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
-                    summary_agg_metric(node).ok_or_else(|| {
-                        crate::query_plan::QueryPlanError::Invalid(
-                            "materialized node has no unique time-series source".into(),
-                        )
-                    })?;
+                    if immutable_materialization_sources(node).is_none() {
+                        summary_agg_metric(node).ok_or_else(|| {
+                            crate::query_plan::QueryPlanError::Invalid(
+                                "materialized node has no unique time-series source".into(),
+                            )
+                        })?;
+                    }
                     let node_id = executable_dags[query_index]
                         .as_ref()
                         .ok_or_else(|| {
@@ -2585,7 +2593,7 @@ fn raw_time_series_input_contract(
 /// The first immutable-input capability accepts one exact accumulator readout.
 /// Population/window closure is checked by the installed runtime, not inferred
 /// from the presence of this syntax.
-fn immutable_materialization_source(node: &SummaryNode) -> Option<Rc<SummaryNode>> {
+fn immutable_materialization_sources(node: &SummaryNode) -> Option<Vec<Rc<SummaryNode>>> {
     use planner_types::post_asap::{ExactKind, ExecutionTiming, SummaryInputExpr};
     let SummaryExpr::SummaryAgg {
         child,
@@ -2607,27 +2615,46 @@ fn immutable_materialization_source(node: &SummaryNode) -> Option<Rc<SummaryNode
     {
         return None;
     }
-    let SummaryExpr::ValueOperation {
-        child: source,
-        operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
-        timing: ExecutionTiming::MaintenanceTime,
-    } = &child.expr
-    else {
-        return None;
-    };
-    if !matches!(&source.expr, SummaryExpr::SummaryAgg {
-        family: SummaryFamilyType::ExactAggregate(ExactKind::Sum | ExactKind::Count, _),
-        child, ..
-    } if matches!(child.expr, SummaryExpr::KeepPreAsap(_)))
-    {
-        return None;
+    fn collect(node: &Rc<SummaryNode>, sources: &mut Vec<Rc<SummaryNode>>) -> Option<()> {
+        match &node.expr {
+            SummaryExpr::BinaryOp {
+                lhs,
+                rhs,
+                operator,
+                timing: ExecutionTiming::MaintenanceTime,
+            } if operator.vector_match.is_none()
+                && matches!(
+                    operator.kind,
+                    planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
+                ) =>
+            {
+                collect(lhs, sources)?;
+                collect(rhs, sources)?;
+            }
+            SummaryExpr::ValueOperation {
+                child: source,
+                operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+                timing: ExecutionTiming::MaintenanceTime,
+            } if matches!(&source.expr,
+                    SummaryExpr::SummaryAgg { family: SummaryFamilyType::ExactAggregate(ExactKind::Sum | ExactKind::Count, _), child, .. }
+                    if matches!(child.expr, SummaryExpr::KeepPreAsap(_))) =>
+            {
+                if !sources.iter().any(|old| Rc::ptr_eq(old, source)) {
+                    sources.push(source.clone());
+                }
+            }
+            _ => return None,
+        }
+        Some(())
     }
-    Some(Rc::clone(source))
+    let mut sources = Vec::new();
+    collect(child, &mut sources)?;
+    Some(sources)
 }
 
 fn selected_input_contract(node: &SummaryNode) -> Result<(String, Option<u64>, String), String> {
-    if let Some(source) = immutable_materialization_source(node) {
-        materialization_leaf_contract(&source)
+    if let Some(source) = immutable_materialization_sources(node) {
+        materialization_leaf_contract(&source[0])
     } else {
         materialization_leaf_contract(node)
     }
@@ -2778,7 +2805,7 @@ fn materialization_consumers(
                 &state.node,
             )?;
             let program =
-                immutable_materialization_source(&state.node).map(|_| Rc::as_ptr(&state.node));
+                immutable_materialization_sources(&state.node).map(|_| Rc::as_ptr(&state.node));
             if let Some(previous) = cohort_programs.insert(config.policy_fingerprint(), program) {
                 if previous != program && (previous.is_some() || program.is_some()) {
                     return Err(CompileError::Query {
@@ -2894,8 +2921,10 @@ fn collect_selected_materializations(
         } else {
             None
         };
-        if let Some(source) = immutable_materialization_source(node) {
-            walk(&source, None, composable, None, selected)?;
+        if let Some(source) = immutable_materialization_sources(node) {
+            for source in source {
+                walk(&source, None, composable, None, selected)?;
+            }
         }
         match &node.expr {
             SummaryExpr::CandidateTopK {
@@ -2936,7 +2965,7 @@ fn collect_selected_materializations(
             }
             SummaryExpr::SummaryAgg { child, .. }
                 if !matches!(child.expr, SummaryExpr::KeepPreAsap(_))
-                    && immutable_materialization_source(node).is_none() => {}
+                    && immutable_materialization_sources(node).is_none() => {}
             SummaryExpr::SummaryAgg {
                 family:
                     SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _),
@@ -3714,8 +3743,8 @@ mod tests {
         let states =
             collect_selected_materializations(&workload.queries[0].post_asap, true).unwrap();
         assert_eq!(states.len(), 2, "source and consumer must both be selected");
-        assert!(immutable_materialization_source(&states[0].node).is_none());
-        assert!(immutable_materialization_source(&states[1].node).is_some());
+        assert!(immutable_materialization_sources(&states[0].node).is_none());
+        assert!(immutable_materialization_sources(&states[1].node).is_some());
         let mut deployment = environment(10_000);
         deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         deployment.collector_ids.clear();
@@ -3737,6 +3766,48 @@ mod tests {
             derived.derived_input.as_ref().unwrap().inputs,
             BTreeSet::from([source.policy_fingerprint().into()])
         );
+        let entry = plan.query_plan.entries.values().next().unwrap();
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            crate::query_plan::QueryPlanNode::ReadMaterialization { .. }
+        )));
+        assert!(!entry
+            .nodes
+            .values()
+            .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExactFallback { .. })));
+    }
+    #[test]
+    fn immutable_two_sources_keep_actual_frontiers_and_bindings() {
+        let mut workload = request(
+            "nested",
+            "quantile(0.9, sum_over_time(m[1m]) + sum_over_time(n[1m]))",
+        );
+        workload.hybrid_execution = true;
+        let states =
+            collect_selected_materializations(&workload.queries[0].post_asap, true).unwrap();
+        assert_eq!(states.len(), 3, "source and consumer must both be selected");
+        assert!(immutable_materialization_sources(&states[0].node).is_none());
+        assert!(immutable_materialization_sources(&states[2].node).is_some());
+        let mut deployment = environment(10_000);
+        deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        deployment.collector_ids.clear();
+        let plan = PhysicalCompiler.compile(workload, deployment).unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 3);
+        let derived = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|m| m.derived_input.is_some())
+            .unwrap();
+        let sources = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .filter(|m| m.derived_input.is_none())
+            .map(|m| m.policy_fingerprint().into())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(derived.derived_input.as_ref().unwrap().inputs, sources);
+        assert_eq!(sources.len(), 2);
         let entry = plan.query_plan.entries.values().next().unwrap();
         assert!(entry.nodes.values().any(|node| matches!(
             node,

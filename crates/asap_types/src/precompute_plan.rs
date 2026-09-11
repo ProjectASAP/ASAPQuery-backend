@@ -420,21 +420,30 @@ impl PrecomputePlan {
                 )
             };
             if self.ingest.protocol != IngestProtocol::PrometheusRemoteWriteV1
-                || derived.inputs.len() != 1
+                || derived.inputs.is_empty()
             {
                 return Err(invalid());
             }
-            let source_id = *derived.inputs.first().unwrap();
-            let source = self
-                .materializations
+            let sources = derived
+                .inputs
                 .iter()
-                .find(|candidate| candidate.policy_fingerprint() == source_id.fingerprint())
-                .ok_or_else(invalid)?;
-            validated_source_window_cohort(config, &[source])?;
-            // Current installed runtime capability remains nonoverlapping.
-            // The shared cohort contract also describes explicit full-window
-            // sliding for consumers which separately prove its completion.
-            if source.window_size != source.slide_interval {
+                .map(|id| {
+                    self.materializations
+                        .iter()
+                        .find(|candidate| candidate.policy_fingerprint() == id.fingerprint())
+                        .ok_or_else(invalid)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            validated_source_window_cohort(config, &sources)?;
+            if sources.iter().any(|source| {
+                !matches!(
+                    source.aggregation_type,
+                    crate::AggregationType::Sum
+                )
+            }) {
+                return Err(invalid());
+            }
+            if config.window_size != config.slide_interval {
                 return Err(invalid());
             }
             let mut matched = false;
@@ -458,10 +467,19 @@ impl PrecomputePlan {
                     let [edge] = inputs.as_slice() else {
                         return Err(invalid());
                     };
-                    let frontiers = installed.binding.nodes.iter().filter_map(|(node,binding)| {
-                        matches!(binding, crate::executable_plan::BackendNodeBinding::Materialization { summary_definition }
-                            if *summary_definition == source_id).then_some((*node,source_id))
-                    }).collect();
+                    let frontiers = installed
+                        .binding
+                        .nodes
+                        .iter()
+                        .filter_map(|(node, binding)| match binding {
+                            crate::executable_plan::BackendNodeBinding::Materialization {
+                                summary_definition,
+                            } if derived.inputs.contains(summary_definition) => {
+                                Some((*node, *summary_definition))
+                            }
+                            _ => None,
+                        })
+                        .collect();
                     let actual = crate::derived_input::DerivedInputIdentity::from_dag(
                         &installed.document,
                         edge.producer,
@@ -471,20 +489,64 @@ impl PrecomputePlan {
                     if &actual != derived {
                         return Err(invalid());
                     }
-                    let input = dag
-                        .nodes
-                        .iter()
-                        .find(|node| node.id == edge.producer)
-                        .ok_or_else(invalid)?;
-                    if !matches!(
-                        input.payload,
-                        planner_types::post_asap::ExecutableOperatorPayload::Value {
-                            operation:
-                                planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
-                            timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
+                    let mut pending = vec![edge.producer];
+                    let mut visited = BTreeSet::new();
+                    while let Some(id) = pending.pop() {
+                        if !visited.insert(id) {
+                            continue;
                         }
-                    ) {
-                        return Err(invalid());
+                        let node = dag
+                            .nodes
+                            .iter()
+                            .find(|node| node.id == id)
+                            .ok_or_else(invalid)?;
+                        let children: Vec<_> = dag
+                            .edges
+                            .iter()
+                            .filter(|edge| edge.consumer == id)
+                            .collect();
+                        use planner_types::post_asap::{
+                            ExecutableOperatorPayload as Payload, ExecutionTiming, ValueOperation,
+                        };
+                        if node.output_state
+                            != planner_types::post_asap::ExecutionDataState::MAINTENANCE_ROWS
+                        {
+                            return Err(invalid());
+                        }
+                        match &node.payload {
+                            Payload::Value {
+                                operation: ValueOperation::FinalizeExactAccumulator,
+                                timing: ExecutionTiming::MaintenanceTime,
+                            } if children.len() == 1
+                                && frontiers.contains_key(&children[0].producer) => {}
+                            Payload::Binary {
+                                operator,
+                                timing: ExecutionTiming::MaintenanceTime,
+                            } if children.len() == 2
+                                && children
+                                    .iter()
+                                    .filter(|edge| {
+                                        edge.role == planner_types::post_asap::EdgeRole::Left
+                                    })
+                                    .count()
+                                    == 1
+                                && children
+                                    .iter()
+                                    .filter(|edge| {
+                                        edge.role == planner_types::post_asap::EdgeRole::Right
+                                    })
+                                    .count()
+                                    == 1
+                                && operator.vector_match.is_none()
+                                && matches!(
+                                    operator.kind,
+                                    planner_types::pre_asap::BinaryOpKind::Arithmetic(_)
+                                ) =>
+                            {
+                                pending.extend(children.iter().map(|edge| edge.producer));
+                            }
+                            _ => return Err(invalid()),
+                        }
                     }
                     matched = true;
                 }
