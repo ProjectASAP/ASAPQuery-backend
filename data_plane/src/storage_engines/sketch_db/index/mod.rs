@@ -690,6 +690,7 @@ pub struct SketchStore {
     /// flush-then-evict loop is the memory bound).
     persistence_read: RwLock<Option<Arc<PersistenceReadHandle>>>,
     persistence_metadata: RwLock<Option<Arc<persistence::metadata::SidMetadataStore>>>,
+    removed_sids: RwLock<BTreeSet<u64>>,
     /// Seal cadence in distinct windows, applied to every per-sid
     /// `SidStoreData` once persistence is enabled. `0` (the default)
     /// disables cadence sealing. Set by [`Self::enable_persistence_mode`].
@@ -782,6 +783,10 @@ impl SketchStore {
             .map(str::to_owned);
         // Fixed lock order: instances → policy_to_series_ids → metric_to_series_ids.
         let mut instances = self.instances.write().unwrap();
+        if self.removed_sids.read().unwrap().contains(&sid) {
+            tracing::warn!(sid, "rejecting reuse of a removed summary instance ID");
+            return;
+        }
         let mut policy_idx = self.policy_to_series_ids.write().unwrap();
         let mut metric_idx = self.metric_to_series_ids.write().unwrap();
         instances.insert(sid, instance);
@@ -2475,8 +2480,8 @@ impl SketchStore {
         let mut next = instance.clone();
         let meta = Arc::make_mut(&mut next.metadata);
         let now = now_ms();
-        meta.retired_at_ms = Some(now);
-        meta.expires_at_ms = Some(now);
+        meta.retired_at_ms = Some(meta.retired_at_ms.unwrap_or(now).min(now));
+        meta.expires_at_ms = Some(meta.expires_at_ms.unwrap_or(now).min(now));
         self.persist_lifecycle(&next, false).ok()?;
         *instance = next;
         Some(Arc::clone(&instance.metadata))
@@ -2504,6 +2509,7 @@ impl SketchStore {
             let mut instances = self.instances.write().ok()?;
             if let Some(instance) = instances.get(&sid) {
                 self.persist_lifecycle(instance, true).ok()?;
+                self.removed_sids.write().ok()?.insert(sid);
             }
             let mut policy_idx = self.policy_to_series_ids.write().unwrap();
             let mut metric_idx = self.metric_to_series_ids.write().unwrap();
@@ -2770,9 +2776,8 @@ impl SketchStore {
 /// impl on `SketchStore` and writes parts under `disk_path/parts/`.
 ///
 /// Drop or call [`Self::shutdown`] to stop the flusher cleanly. The
-/// `part_cache` field is exposed so the query path can be wired up to
-/// read-back from disk in a subsequent sub-PR; today it sits idle
-/// because the in-memory `query_range` doesn't yet consult it.
+/// `part_cache` backs disk reads; `query_range` combines durable parts with
+/// live in-memory state through the installed persistence read handle.
 pub struct SketchIndexPersistence {
     pub manifest: Arc<crate::storage_engines::sketch_db::index::persistence::Manifest>,
     pub part_cache: crate::storage_engines::sketch_db::index::persistence::cache::PartCache,
@@ -2803,6 +2808,22 @@ impl SketchStore {
             cache::PartCache, flusher::FlusherHandle, recovery, Manifest,
         };
 
+        // Publish the writer before recovery or any background work so a
+        // concurrent lifecycle operation cannot succeed without persistence.
+        let metadata_writer =
+            Arc::new(persistence::metadata::SidMetadataStore::new(&cfg.disk_path));
+        {
+            // Registration and lifecycle changes take this lock first too.
+            let _instances = self.instances.write().unwrap();
+            *self.persistence_metadata.write().unwrap() = Some(Arc::clone(&metadata_writer));
+            self.removed_sids.write().unwrap().extend(
+                metadata_writer
+                    .load()?
+                    .into_iter()
+                    .filter(|record| record.removed)
+                    .map(|record| record.sid),
+            );
+        }
         let (_loaded_manifest, report) = recovery::recover(&cfg.disk_path)?;
         tracing::info!(
             live = report.live_parts,
@@ -2847,8 +2868,12 @@ impl SketchStore {
             }),
         );
 
-        let flusher = FlusherHandle::start(cfg, Arc::clone(&manifest), Arc::clone(self))?;
-        *self.persistence_metadata.write().unwrap() = Some(flusher.metadata_store());
+        let flusher = FlusherHandle::start_with_metadata(
+            cfg,
+            Arc::clone(&manifest),
+            Arc::clone(self),
+            metadata_writer,
+        )?;
 
         Ok(SketchIndexPersistence {
             manifest,
@@ -4526,6 +4551,18 @@ mod tests {
     }
 
     #[test]
+    fn force_expire_never_extends_existing_lifecycle_deadlines() {
+        let store = SketchStore::new();
+        let mut metadata = meta(799);
+        metadata.retired_at_ms = Some(1);
+        metadata.expires_at_ms = Some(2);
+        store.register(metadata);
+        let expired = store.force_expire(799).unwrap();
+        assert_eq!(expired.retired_at_ms, Some(1));
+        assert_eq!(expired.expires_at_ms, Some(2));
+    }
+
+    #[test]
     fn failed_durable_lifecycle_write_preserves_live_instance() {
         let store = SketchStore::new();
         store.register(meta(800));
@@ -4589,6 +4626,11 @@ mod tests {
             expected_retirement = store.force_retire(801, Duration::from_secs(3600)).unwrap();
             assert!(store.force_expire(802).is_some());
             assert!(store.remove_instance(803).is_some());
+            store.register(meta_with_policy(803, fingerprint));
+            assert!(
+                store.instance(803).is_none(),
+                "removed SID reused before restart"
+            );
             // This models a flush that captured metadata before the lifecycle
             // operation and reaches the shared writer afterward.
             persistence
@@ -4613,6 +4655,11 @@ mod tests {
         assert!(
             recovered.instance(803).is_none(),
             "removed state resurrected"
+        );
+        recovered.register(meta_with_policy(803, fingerprint));
+        assert!(
+            recovered.instance(803).is_none(),
+            "removed SID reused after restart"
         );
     }
 

@@ -69,6 +69,19 @@ impl FlusherHandle {
     where
         S: EpochSource + 'static,
     {
+        let metadata = Arc::new(super::metadata::SidMetadataStore::new(&cfg.disk_path));
+        Self::start_with_metadata(cfg, manifest, source, metadata)
+    }
+
+    pub(crate) fn start_with_metadata<S>(
+        cfg: SketchStorePersistenceConfig,
+        manifest: Arc<Manifest>,
+        source: Arc<S>,
+        sid_metadata: Arc<super::metadata::SidMetadataStore>,
+    ) -> PersistResult<Self>
+    where
+        S: EpochSource + 'static,
+    {
         // Pick a starting part_id: one past the max currently in the
         // manifest (so IDs are monotonically increasing across restarts).
         let next_id = manifest
@@ -78,8 +91,6 @@ impl FlusherHandle {
             .max()
             .map(|m| m + 1)
             .unwrap_or(1);
-
-        let sid_metadata = Arc::new(super::metadata::SidMetadataStore::new(&cfg.disk_path));
 
         let shared = Arc::new(FlusherShared {
             cfg: cfg.clone(),
