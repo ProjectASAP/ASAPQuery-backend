@@ -325,8 +325,8 @@ mod tests {
                 Field::new("label", DataType::Utf8, true),
             ])),
             vec![
-                Arc::new(Float64Array::from(vec![Some(1.25), None])),
-                Arc::new(StringArray::from(vec![Some(""), None])),
+                Arc::new(Float64Array::from(vec![Some(1.25), None, Some(2.5)])),
+                Arc::new(StringArray::from(vec![Some(""), None, Some("\\N")])),
             ],
         )
         .unwrap();
@@ -337,7 +337,7 @@ mod tests {
             serde_json::from_slice(&result.encode(ClickHouseFormat::Json).unwrap()).unwrap();
         assert_eq!(
             json["data"],
-            serde_json::json!([{ "value":1.25,"label":"" }, { "value":null,"label":null }])
+            serde_json::json!([{ "value":1.25,"label":"" }, { "value":null,"label":null }, {"value":2.5,"label":"\\N"}])
         );
         let lines = result.encode(ClickHouseFormat::JsonEachRow).unwrap();
         let null_row: serde_json::Value =
@@ -345,7 +345,7 @@ mod tests {
         assert_eq!(null_row, serde_json::json!({"value":null,"label":null}));
         assert_eq!(
             result.encode(ClickHouseFormat::TabSeparated).unwrap(),
-            b"1.25\t\n\\N\t\\N\n"
+            b"1.25\t\n\\N\t\\N\n2.5\t\\\\N\n"
         );
     }
 
