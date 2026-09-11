@@ -1,10 +1,13 @@
 //! ClickHouse row semantics for planner-owned relational wrappers.
 
+mod aggregate;
+
 use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMillisecondArray,
+        ArrayRef, BooleanArray, Float64Array, Int64Array, MapArray, NullArray, StringArray,
+        StructArray, TimestampMillisecondArray,
     },
     datatypes::{DataType as ArrowDataType, Field, Schema},
     record_batch::RecordBatch,
@@ -45,6 +48,7 @@ enum Cell {
     Utf8(String),
     Bool(bool),
     Timestamp(i64),
+    Map(Vec<(Cell, Cell)>),
 }
 
 fn json_cell(
@@ -62,6 +66,11 @@ fn json_cell(
         ))
     };
     match dtype {
+        DataType::Null if value.is_null() => Ok(Cell::Null),
+        DataType::Null => Err(invalid()),
+        DataType::List { .. } | DataType::Struct { .. } => Err(
+            ClickHouseRelationalError::Unsupported("collection value transport".into()),
+        ),
         DataType::Int64 => value.as_i64().map(Cell::Int64).ok_or_else(invalid),
         DataType::Float64 => value.as_f64().map(Cell::Float64).ok_or_else(invalid),
         DataType::Utf8 => value
@@ -69,6 +78,26 @@ fn json_cell(
             .map(|value| Cell::Utf8(value.into()))
             .ok_or_else(invalid),
         DataType::Bool => value.as_bool().map(Cell::Bool).ok_or_else(invalid),
+        DataType::Map {
+            key,
+            value: value_type,
+            value_nullable,
+        } => {
+            let (key_type, item_type) = map_type_parts(clickhouse_type).ok_or_else(invalid)?;
+            let entries = value.as_array().ok_or_else(invalid)?;
+            let mut result = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let pair = entry
+                    .as_array()
+                    .filter(|pair| pair.len() == 2)
+                    .ok_or_else(invalid)?;
+                result.push((
+                    json_cell(&pair[0], key, false, key_type)?,
+                    json_cell(&pair[1], value_type, *value_nullable, item_type)?,
+                ));
+            }
+            Ok(Cell::Map(result))
+        }
         DataType::Timestamp => parse_clickhouse_timestamp(value, clickhouse_type)
             .map(Cell::Timestamp)
             .ok_or_else(invalid),
@@ -251,6 +280,24 @@ impl ClickHouseRelation {
     }
 }
 
+fn map_type_parts(actual: &str) -> Option<(&str, &str)> {
+    let inner = actual.trim().strip_prefix("Map(")?.strip_suffix(')')?;
+    let mut depth = 0_i32;
+    let mut quoted = false;
+    for (index, ch) in inner.char_indices() {
+        match ch {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth -= 1,
+            ',' if !quoted && depth == 0 => {
+                return Some((inner[..index].trim(), inner[index + 1..].trim()))
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: bool) -> bool {
     let Some(mut actual) = actual else {
         return false;
@@ -267,10 +314,20 @@ fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: 
         return false;
     }
     match expected {
+        DataType::Null => actual == "Nothing",
+        DataType::List { .. } | DataType::Struct { .. } => false,
         DataType::Int64 => actual == "Int64",
         DataType::Float64 => actual == "Float64",
         DataType::Utf8 => actual == "String",
         DataType::Bool => actual == "Bool",
+        DataType::Map {
+            key,
+            value,
+            value_nullable,
+        } => map_type_parts(actual).is_some_and(|(key_type, value_type)| {
+            clickhouse_type_matches(Some(key_type), key, false)
+                && clickhouse_type_matches(Some(value_type), value, *value_nullable)
+        }),
         DataType::Timestamp => {
             actual == "Int64"
                 || actual == "DateTime"
@@ -298,13 +355,16 @@ impl ClickHouseRelationalAdapter {
             }
             _ => None,
         };
+        let mut fields = left.fields.clone();
+        fields.extend(right.fields.clone());
+        let schema = scalar_schema(&fields);
         let mut rows = Vec::new();
         for left_row in &left.rows {
             for right_row in &right.rows {
                 let mut joined = Vec::with_capacity(left_row.len() + right_row.len());
                 joined.extend(left_row.iter().cloned());
                 joined.extend(right_row.iter().cloned());
-                if matches!(eval(&pred.0, &joined)?, Cell::Bool(true)) {
+                if matches!(eval(&pred.0, &joined, &schema)?, Cell::Bool(true)) {
                     rows.push(joined);
                 }
             }
@@ -321,10 +381,11 @@ impl ClickHouseRelationalAdapter {
         pred: &planner_types::pre_asap::Predicate,
         mut input: ClickHouseRelation,
     ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
+        let schema = scalar_schema(&input.fields);
         input.rows = input
             .rows
             .into_iter()
-            .filter_map(|row| match eval(&pred.0, &row) {
+            .filter_map(|row| match eval(&pred.0, &row, &schema) {
                 Ok(Cell::Bool(true)) => Some(Ok(row)),
                 Ok(_) => None,
                 Err(error) => Some(Err(error)),
@@ -339,13 +400,28 @@ impl ClickHouseRelationalAdapter {
         output_schema: &SummarySchema,
         mut input: ClickHouseRelation,
     ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
+        let schema = scalar_schema(&input.fields);
         match operation {
+            ValueOperation::Exact(planner_types::post_asap::ExactOperation::Aggregate {
+                reduction,
+                measures,
+                having,
+                ..
+            }) => {
+                return aggregate::apply(
+                    reduction,
+                    measures,
+                    having.as_ref(),
+                    output_schema,
+                    input,
+                );
+            }
             ValueOperation::Project { cols, .. } => {
                 let mut rows = Vec::with_capacity(input.rows.len());
                 for row in &input.rows {
                     rows.push(
                         cols.iter()
-                            .map(|item| eval(&item.expr, row))
+                            .map(|item| eval(&item.expr, row, &schema))
                             .collect::<Result<Vec<_>, _>>()?,
                     );
                 }
@@ -360,12 +436,16 @@ impl ClickHouseRelationalAdapter {
                 }
                 for row in &input.rows {
                     for key in keys {
-                        eval(&key.expr, row)?;
+                        if contains_nan(&eval(&key.expr, row, &schema)?) {
+                            return Err(ClickHouseRelationalError::Unsupported(
+                                "NaN sort key".into(),
+                            ));
+                        }
                     }
                 }
                 input
                     .rows
-                    .sort_by(|left, right| compare_sort_keys(left, right, keys));
+                    .sort_by(|left, right| compare_sort_keys(left, right, keys, &schema));
             }
             ValueOperation::Limit { n, offset } => {
                 input.rows = input.rows.into_iter().skip(*offset).take(*n).collect();
@@ -490,7 +570,17 @@ fn row_from_value(
         .iter()
         .map(|(name, dtype, nullable)| {
             if let Some(value) = group.get(name) {
-                return Ok(Cell::Utf8(value.clone()));
+                let encoded = asap_types::grouping_projection::decode_table_group_value(value)
+                    .map_err(|error| {
+                        ClickHouseRelationalError::Invalid(format!(
+                            "invalid typed group {name}: {error}"
+                        ))
+                    })?;
+                let column_type = super::clickhouse_result_adapter::clickhouse_type(
+                    &arrow_type(dtype),
+                    *nullable,
+                );
+                return json_cell(&encoded, dtype, *nullable, &column_type);
             }
             if *dtype == DataType::Timestamp {
                 return Ok(Cell::Timestamp(timestamp));
@@ -513,7 +603,22 @@ fn row_from_value(
         .collect()
 }
 
-fn eval(expr: &QueryExpr, row: &[Cell]) -> Result<Cell, ClickHouseRelationalError> {
+fn scalar_schema(fields: &[(String, DataType, bool)]) -> planner_types::pre_asap::Schema {
+    planner_types::pre_asap::Schema::new(
+        fields
+            .iter()
+            .map(|(name, dtype, nullable)| {
+                planner_types::pre_asap::Column::new(name.clone(), dtype.clone(), *nullable)
+            })
+            .collect(),
+    )
+}
+
+fn eval(
+    expr: &QueryExpr,
+    row: &[Cell],
+    schema: &planner_types::pre_asap::Schema,
+) -> Result<Cell, ClickHouseRelationalError> {
     match expr {
         QueryExpr::Column(index) => {
             row.get(*index)
@@ -531,17 +636,113 @@ fn eval(expr: &QueryExpr, row: &[Cell]) -> Result<Cell, ClickHouseRelationalErro
             ScalarValue::Null => Cell::Null,
         }),
         QueryExpr::Compare { left, op, right } => {
-            let left = eval(left, row)?;
-            let right = eval(right, row)?;
+            let left = eval(left, row, schema)?;
+            let right = eval(right, row, schema)?;
             compare(op, left, right)
         }
         QueryExpr::Arithmetic { op, left, right } => {
-            arithmetic(op, eval(left, row)?, eval(right, row)?)
+            arithmetic(op, eval(left, row, schema)?, eval(right, row, schema)?)
+        }
+        QueryExpr::FunctionCall { name, args } => {
+            use planner_types::pre_asap::scalar_signature::MapScalarFunction;
+            let function = MapScalarFunction::from_name(name).ok_or_else(|| {
+                ClickHouseRelationalError::Unsupported(format!("scalar function {name}"))
+            })?;
+            expr.scalar_type(schema)
+                .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?;
+            let values = args
+                .iter()
+                .map(|arg| eval(arg, row, schema))
+                .collect::<Result<Vec<_>, _>>()?;
+            match function {
+                MapScalarFunction::Construct => {
+                    let mut values = values.into_iter();
+                    let mut entries = Vec::new();
+                    while let Some(key) = values.next() {
+                        if !matches!(key, Cell::Int64(_) | Cell::Utf8(_) | Cell::Bool(_)) {
+                            return Err(ClickHouseRelationalError::Unsupported(
+                                "map key value type".into(),
+                            ));
+                        }
+                        entries.push((
+                            key,
+                            values.next().ok_or_else(|| {
+                                ClickHouseRelationalError::Invalid("odd map argument count".into())
+                            })?,
+                        ));
+                    }
+                    Ok(Cell::Map(entries))
+                }
+                MapScalarFunction::Concat => {
+                    let mut entries = Vec::new();
+                    for value in values {
+                        let Cell::Map(mut next) = value else {
+                            return Err(ClickHouseRelationalError::Invalid(
+                                "map concat argument".into(),
+                            ));
+                        };
+                        entries.append(&mut next);
+                    }
+                    Ok(Cell::Map(entries))
+                }
+                MapScalarFunction::Access => {
+                    let [Cell::Map(entries), key] = values.as_slice() else {
+                        return Err(ClickHouseRelationalError::Invalid(
+                            "map access arguments".into(),
+                        ));
+                    };
+                    if matches!(key, Cell::Null) {
+                        return Ok(Cell::Null);
+                    }
+                    if !matches!(key, Cell::Int64(_) | Cell::Utf8(_) | Cell::Bool(_)) {
+                        return Err(ClickHouseRelationalError::Unsupported(
+                            "map lookup key type".into(),
+                        ));
+                    }
+                    if let Some((_, value)) = entries.iter().find(|(candidate, _)| candidate == key)
+                    {
+                        return Ok(value.clone());
+                    }
+                    let (
+                        DataType::Map {
+                            value,
+                            value_nullable,
+                            ..
+                        },
+                        _,
+                    ) = args[0]
+                        .scalar_type(schema)
+                        .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?
+                    else {
+                        unreachable!()
+                    };
+                    default_map_value(&value, value_nullable)
+                }
+            }
         }
         other => Err(ClickHouseRelationalError::Unsupported(format!(
             "scalar expression {other:?}"
         ))),
     }
+}
+
+fn default_map_value(dtype: &DataType, nullable: bool) -> Result<Cell, ClickHouseRelationalError> {
+    if nullable {
+        return Ok(Cell::Null);
+    }
+    Ok(match dtype {
+        DataType::Null => Cell::Null,
+        DataType::Int64 => Cell::Int64(0),
+        DataType::Float64 => Cell::Float64(0.0),
+        DataType::Utf8 => Cell::Utf8(String::new()),
+        DataType::Bool => Cell::Bool(false),
+        DataType::Map { .. } => Cell::Map(Vec::new()),
+        _ => {
+            return Err(ClickHouseRelationalError::Unsupported(
+                "map missing-key default type".into(),
+            ))
+        }
+    })
 }
 
 fn compare(op: &CompareOpKind, left: Cell, right: Cell) -> Result<Cell, ClickHouseRelationalError> {
@@ -575,6 +776,22 @@ fn arithmetic(
     if matches!(left, Cell::Null) || matches!(right, Cell::Null) {
         return Ok(Cell::Null);
     }
+    if let (Cell::Int64(left), Cell::Int64(right)) = (&left, &right) {
+        let integer = match op {
+            ArithmeticOpKind::Add => Some(left.checked_add(*right)),
+            ArithmeticOpKind::Sub => Some(left.checked_sub(*right)),
+            ArithmeticOpKind::Mul => Some(left.checked_mul(*right)),
+            ArithmeticOpKind::Mod => Some(left.checked_rem(*right)),
+            _ => None,
+        };
+        if let Some(value) = integer {
+            return value.map(Cell::Int64).ok_or_else(|| {
+                ClickHouseRelationalError::Invalid(
+                    "integer arithmetic overflow or zero divisor".into(),
+                )
+            });
+        }
+    }
     let (left, right) = match (left, right) {
         (Cell::Int64(left), Cell::Int64(right)) => (left as f64, right as f64),
         (Cell::Int64(left), Cell::Float64(right)) => (left as f64, right),
@@ -602,12 +819,17 @@ fn arithmetic(
     Ok(Cell::Float64(value))
 }
 
-fn compare_sort_keys(left: &[Cell], right: &[Cell], keys: &[SortKey]) -> Ordering {
+fn compare_sort_keys(
+    left: &[Cell],
+    right: &[Cell],
+    keys: &[SortKey],
+    schema: &planner_types::pre_asap::Schema,
+) -> Ordering {
     for key in keys {
-        let Ok(left) = eval(&key.expr, left) else {
+        let Ok(left) = eval(&key.expr, left, schema) else {
             return Ordering::Equal;
         };
-        let Ok(right) = eval(&key.expr, right) else {
+        let Ok(right) = eval(&key.expr, right, schema) else {
             return Ordering::Equal;
         };
         let (ordering, order_depends_on_direction) = match (&left, &right) {
@@ -640,15 +862,63 @@ fn compare_sort_keys(left: &[Cell], right: &[Cell], keys: &[SortKey]) -> Orderin
     Ordering::Equal
 }
 
+fn contains_nan(value: &Cell) -> bool {
+    match value {
+        Cell::Float64(value) => value.is_nan(),
+        Cell::Map(entries) => entries
+            .iter()
+            .any(|(key, value)| contains_nan(key) || contains_nan(value)),
+        _ => false,
+    }
+}
+
+fn integer_float_cmp(integer: i64, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+    // These bounds are powers of two, exactly representable as Float64.
+    if float >= 9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Less);
+    }
+    if float < -9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Greater);
+    }
+    let integral = float as i64;
+    match integer.cmp(&integral) {
+        Ordering::Equal => 0.0_f64.partial_cmp(&float.fract()),
+        other => Some(other),
+    }
+}
+
 fn cell_cmp(left: &Cell, right: &Cell) -> Option<Ordering> {
     match (left, right) {
         (Cell::Int64(left), Cell::Int64(right)) => Some(left.cmp(right)),
         (Cell::Float64(left), Cell::Float64(right)) => left.partial_cmp(right),
-        (Cell::Int64(left), Cell::Float64(right)) => (*left as f64).partial_cmp(right),
-        (Cell::Float64(left), Cell::Int64(right)) => left.partial_cmp(&(*right as f64)),
+        (Cell::Int64(left), Cell::Float64(right)) => integer_float_cmp(*left, *right),
+        (Cell::Float64(left), Cell::Int64(right)) => {
+            integer_float_cmp(*right, *left).map(Ordering::reverse)
+        }
         (Cell::Utf8(left), Cell::Utf8(right)) => Some(left.cmp(right)),
         (Cell::Bool(left), Cell::Bool(right)) => Some(left.cmp(right)),
         (Cell::Timestamp(left), Cell::Timestamp(right)) => Some(left.cmp(right)),
+        (Cell::Map(left), Cell::Map(right)) => {
+            for ((left_key, left_value), (right_key, right_value)) in left.iter().zip(right) {
+                let order = cell_cmp(left_key, right_key)?;
+                if order != Ordering::Equal {
+                    return Some(order);
+                }
+                let order = match (left_value, right_value) {
+                    (Cell::Null, Cell::Null) => Ordering::Equal,
+                    (Cell::Null, _) => Ordering::Greater,
+                    (_, Cell::Null) => Ordering::Less,
+                    _ => cell_cmp(left_value, right_value)?,
+                };
+                if order != Ordering::Equal {
+                    return Some(order);
+                }
+            }
+            Some(left.len().cmp(&right.len()))
+        }
         _ => None,
     }
 }
@@ -663,10 +933,41 @@ fn intersect_coverage(current: Option<(u64, u64)>, next: Option<(u64, u64)>) -> 
 
 fn arrow_type(dtype: &DataType) -> ArrowDataType {
     match dtype {
+        DataType::Null => ArrowDataType::Null,
+        DataType::List { element } => ArrowDataType::List(Arc::new(Field::new(
+            &element.name,
+            arrow_type(&element.dtype),
+            element.nullable,
+        ))),
+        DataType::Struct { fields } => ArrowDataType::Struct(
+            fields
+                .iter()
+                .map(|field| Field::new(&field.name, arrow_type(&field.dtype), field.nullable))
+                .collect::<Vec<_>>()
+                .into(),
+        ),
         DataType::Int64 => ArrowDataType::Int64,
         DataType::Float64 => ArrowDataType::Float64,
         DataType::Utf8 => ArrowDataType::Utf8,
         DataType::Bool => ArrowDataType::Boolean,
+        DataType::Map {
+            key,
+            value,
+            value_nullable,
+        } => ArrowDataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                ArrowDataType::Struct(
+                    vec![
+                        Field::new("key", arrow_type(key), false),
+                        Field::new("value", arrow_type(value), *value_nullable),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        ),
         DataType::Timestamp => {
             ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None)
         }
@@ -692,10 +993,77 @@ fn build_array(
         }};
     }
     Ok(match dtype {
+        DataType::Null => {
+            if rows
+                .iter()
+                .any(|row| !matches!(row.get(column), Some(Cell::Null)))
+            {
+                return Err(ClickHouseRelationalError::Invalid(
+                    "non-null value in bottom-typed column".into(),
+                ));
+            }
+            Arc::new(NullArray::new(rows.len())) as ArrayRef
+        }
+        DataType::List { .. } | DataType::Struct { .. } => {
+            return Err(ClickHouseRelationalError::Unsupported(
+                "collection value transport".into(),
+            ))
+        }
         DataType::Int64 => Arc::new(Int64Array::from(values!(Int64))) as ArrayRef,
         DataType::Float64 => Arc::new(Float64Array::from(values!(Float64))) as ArrayRef,
         DataType::Utf8 => Arc::new(StringArray::from(values!(Utf8))) as ArrayRef,
         DataType::Bool => Arc::new(BooleanArray::from(values!(Bool))) as ArrayRef,
+        DataType::Map { key, value, .. } => {
+            let mut offsets = vec![0_i32];
+            let mut valid = Vec::with_capacity(rows.len());
+            let mut entries = Vec::new();
+            for row in rows {
+                match row.get(column) {
+                    Some(Cell::Map(pairs)) => {
+                        valid.push(true);
+                        entries.extend(
+                            pairs
+                                .iter()
+                                .map(|(key, value)| vec![key.clone(), value.clone()]),
+                        );
+                    }
+                    Some(Cell::Null) => valid.push(false),
+                    _ => {
+                        return Err(ClickHouseRelationalError::Invalid(
+                            "incompatible map value".into(),
+                        ))
+                    }
+                }
+                offsets.push(i32::try_from(entries.len()).map_err(|_| {
+                    ClickHouseRelationalError::Invalid("map offset exceeds Arrow limit".into())
+                })?);
+            }
+            let ArrowDataType::Map(field, ordered) = arrow_type(dtype) else {
+                unreachable!()
+            };
+            let ArrowDataType::Struct(fields) = field.data_type() else {
+                unreachable!()
+            };
+            let values = StructArray::try_new(
+                fields.clone(),
+                vec![
+                    build_array(&entries, 0, key)?,
+                    build_array(&entries, 1, value)?,
+                ],
+                None,
+            )
+            .map_err(|error| ClickHouseRelationalError::Arrow(error.to_string()))?;
+            Arc::new(
+                MapArray::try_new(
+                    field,
+                    arrow::buffer::OffsetBuffer::new(offsets.into()),
+                    values,
+                    Some(arrow::buffer::NullBuffer::from(valid)),
+                    ordered,
+                )
+                .map_err(|error| ClickHouseRelationalError::Arrow(error.to_string()))?,
+            ) as ArrayRef
+        }
         DataType::Timestamp => {
             Arc::new(TimestampMillisecondArray::from(values!(Timestamp))) as ArrayRef
         }
@@ -785,6 +1153,49 @@ mod tests {
         })
     }
 
+    /// Map entries remain ordered pairs, including duplicate keys and null values.
+    #[test]
+    fn map_transport_retains_duplicate_keys_and_null_values() {
+        use super::super::clickhouse_result_adapter::{ClickHouseFormat, ClickHouseQueryResult};
+        let dtype = DataType::Map {
+            key: Box::new(DataType::Utf8),
+            value: Box::new(DataType::Utf8),
+            value_nullable: true,
+        };
+        let cell = json_cell(
+            &serde_json::json!([["job", "a"], ["job", "b"], ["zone", null]]),
+            &dtype,
+            false,
+            "Map(String, Nullable(String))",
+        )
+        .unwrap();
+        let Cell::Map(entries) = &cell else {
+            panic!("expected map")
+        };
+        assert_eq!(entries.len(), 3);
+        let array = build_array(&[vec![cell]], 0, &dtype).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "labels",
+                arrow_type(&dtype),
+                false,
+            )])),
+            vec![array],
+        )
+        .unwrap();
+        let result = ClickHouseQueryResult {
+            batches: vec![batch],
+        };
+        let body = String::from_utf8(result.encode(ClickHouseFormat::Json).unwrap()).unwrap();
+        assert!(body.contains("Map(String, Nullable(String))"), "{body}");
+        assert!(body.contains("\"job\":\"a\",\"job\":\"b\""), "{body}");
+        assert!(body.contains("\"zone\":null"), "{body}");
+        assert_eq!(
+            String::from_utf8(result.encode(ClickHouseFormat::TabSeparated).unwrap()).unwrap(),
+            "{'job':'a','job':'b','zone':NULL}\n"
+        );
+    }
+
     #[test]
     fn executes_filter_project_arithmetic_sort_and_limit_chain() {
         let input_schema = schema(&[("ts", DataType::Timestamp), ("sum", DataType::Float64)]);
@@ -866,7 +1277,12 @@ mod tests {
     #[test]
     fn unsupported_scalar_expression_fails_closed() {
         let row = vec![Cell::Float64(1.0)];
-        let error = eval(&QueryExpr::BoolAnd(vec![]), &row).unwrap_err();
+        let error = eval(
+            &QueryExpr::BoolAnd(vec![]),
+            &row,
+            &planner_types::pre_asap::Schema::new(vec![]),
+        )
+        .unwrap_err();
         assert!(matches!(error, ClickHouseRelationalError::Unsupported(_)));
     }
 
@@ -934,5 +1350,182 @@ mod tests {
                 .value(0),
             0.2
         );
+    }
+}
+
+#[cfg(test)]
+mod scalar_contract_tests {
+    use super::*;
+    use planner_types::pre_asap::{Column, Schema};
+
+    fn function(name: &str, args: Vec<QueryExpr>) -> QueryExpr {
+        QueryExpr::FunctionCall {
+            name: name.into(),
+            args,
+        }
+    }
+    fn text(value: &str) -> QueryExpr {
+        QueryExpr::Literal(ScalarValue::Utf8(value.into()))
+    }
+
+    #[test]
+    fn map_access_uses_declared_default_and_first_duplicate() {
+        let dtype = DataType::Map {
+            key: Box::new(DataType::Utf8),
+            value: Box::new(DataType::Int64),
+            value_nullable: false,
+        };
+        let schema = Schema::new(vec![Column::new("m", dtype, false)]);
+        let access = function("asap_map_access", vec![QueryExpr::Column(0), text("a")]);
+        assert_eq!(
+            eval(&access, &[Cell::Map(vec![])], &schema).unwrap(),
+            Cell::Int64(0)
+        );
+        assert_eq!(
+            eval(
+                &access,
+                &[Cell::Map(vec![
+                    (Cell::Utf8("a".into()), Cell::Int64(7)),
+                    (Cell::Utf8("a".into()), Cell::Int64(9))
+                ])],
+                &schema
+            )
+            .unwrap(),
+            Cell::Int64(7)
+        );
+        let nullable = Schema::new(vec![Column::new(
+            "m",
+            DataType::Map {
+                key: Box::new(DataType::Utf8),
+                value: Box::new(DataType::Int64),
+                value_nullable: true,
+            },
+            false,
+        )]);
+        assert_eq!(
+            eval(&access, &[Cell::Map(vec![])], &nullable).unwrap(),
+            Cell::Null
+        );
+        let null_key = function(
+            "asap_map_access",
+            vec![QueryExpr::Column(0), QueryExpr::Literal(ScalarValue::Null)],
+        );
+        assert_eq!(
+            eval(&null_key, &[Cell::Map(vec![])], &schema).unwrap(),
+            Cell::Null
+        );
+    }
+
+    #[test]
+    fn map_concat_preserves_duplicates_and_empty_map() {
+        let map = |value| {
+            function(
+                "map",
+                vec![text("a"), QueryExpr::Literal(ScalarValue::Int64(value))],
+            )
+        };
+        let concat = function("mapConcat", vec![function("map", vec![]), map(7), map(9)]);
+        let schema = Schema::new(vec![]);
+        assert_eq!(
+            eval(&concat, &[], &schema).unwrap(),
+            Cell::Map(vec![
+                (Cell::Utf8("a".into()), Cell::Int64(7)),
+                (Cell::Utf8("a".into()), Cell::Int64(9))
+            ])
+        );
+        let mixed = function(
+            "map",
+            vec![
+                text("a"),
+                QueryExpr::Literal(ScalarValue::Int64(1)),
+                text("b"),
+                QueryExpr::Literal(ScalarValue::Float64(2.5)),
+            ],
+        );
+        assert!(eval(&mixed, &[], &schema).is_err());
+    }
+
+    #[test]
+    fn sorting_nested_nan_fails_before_comparator_can_treat_it_as_equal() {
+        let dtype = DataType::Map {
+            key: Box::new(DataType::Utf8),
+            value: Box::new(DataType::Float64),
+            value_nullable: false,
+        };
+        let input = ClickHouseRelation {
+            rows: vec![vec![Cell::Map(vec![(
+                Cell::Utf8("a".into()),
+                Cell::Float64(f64::NAN),
+            )])]],
+            fields: vec![("m".into(), dtype.clone(), false)],
+            coverage: None,
+        };
+        let schema = SummarySchema {
+            fields: vec![planner_types::post_asap::SummaryField {
+                name: "m".into(),
+                dtype: SummaryFamilyType::Plain(dtype),
+                nullable: false,
+            }],
+            time_index: None,
+        };
+        let operation = ValueOperation::Sort {
+            keys: vec![SortKey {
+                expr: QueryExpr::Column(0),
+                ascending: true,
+                nulls_first: false,
+            }],
+            partition_by: planner_types::pre_asap::GroupKeys::none(),
+        };
+        assert!(ClickHouseRelationalAdapter
+            .apply_operation(&operation, &schema, input)
+            .is_err());
+    }
+
+    #[test]
+    fn mixed_comparison_preserves_integer_precision_and_boundaries() {
+        assert_eq!(
+            integer_float_cmp(9_007_199_254_740_993, 9_007_199_254_740_992.0),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            integer_float_cmp(i64::MAX, 9_223_372_036_854_775_808.0),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            integer_float_cmp(i64::MIN, -9_223_372_036_854_775_808.0),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(integer_float_cmp(-1, -1.5), Some(Ordering::Greater));
+        assert_eq!(integer_float_cmp(1, 1.5), Some(Ordering::Less));
+        assert_eq!(integer_float_cmp(0, f64::INFINITY), Some(Ordering::Less));
+        assert_eq!(
+            integer_float_cmp(0, f64::NEG_INFINITY),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(integer_float_cmp(0, f64::NAN), None);
+    }
+
+    #[test]
+    fn integer_modulo_never_rounds_through_float() {
+        assert_eq!(
+            arithmetic(
+                &ArithmeticOpKind::Mod,
+                Cell::Int64(9_007_199_254_740_993),
+                Cell::Int64(2)
+            )
+            .unwrap(),
+            Cell::Int64(1)
+        );
+        assert_eq!(
+            arithmetic(&ArithmeticOpKind::Mod, Cell::Int64(-7), Cell::Int64(3)).unwrap(),
+            Cell::Int64(-1)
+        );
+        assert!(arithmetic(&ArithmeticOpKind::Mod, Cell::Int64(7), Cell::Int64(0)).is_err());
+        assert!(arithmetic(
+            &ArithmeticOpKind::Mod,
+            Cell::Int64(i64::MIN),
+            Cell::Int64(-1)
+        )
+        .is_err());
     }
 }
