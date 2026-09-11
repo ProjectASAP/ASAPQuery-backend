@@ -69,3 +69,10 @@ The three queries need different physical configurations in this fixture; they
 do not demonstrate a single shared state. Planner may share compatible equal-
 parameter states. The finite replay barrier also does not establish continuous
 multi-worker population completeness, which is a separate publication contract.
+
+Finite runtime observations carry bounded empirical frequency counts and temporal
+interval counts through the shared metadata contract. The data plane does not
+classify distributions or depend on Planner fitting types; the control plane
+fits these counts before profile matching. Raw keys are absent from feedback.
+An accepted catalog activation establishes the observer generation. Delayed
+samples from another generation are ignored and cannot reset current counts.

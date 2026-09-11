@@ -139,8 +139,12 @@ pub struct StateSchemaContract {
     pub materialization: crate::sds::SummaryDefinitionId,
     pub family: StateFamilyContract,
     pub source: Source,
-    pub value_column: planner_types::pre_asap::ColumnRef,
-    pub group_by: Vec<String>,
+    #[serde(
+        alias = "value_column",
+        deserialize_with = "crate::sds::deserialize_state_value_projection"
+    )]
+    pub value_projection: crate::sds::ValueProjectionIdentity,
+    pub group_by: crate::GroupingProjection,
     pub window: StateWindowContract,
     pub encodings: Vec<StateEncoding>,
 }
@@ -222,19 +226,15 @@ impl PrecomputePlan {
                         table_ref: table_ref.clone(),
                     },
                 );
-                let value_column = materialization
-                    .value_column
-                    .clone()
-                    .map(planner_types::pre_asap::ColumnRef::Named)
-                    .unwrap_or(planner_types::pre_asap::ColumnRef::SampleValue);
+                let value_projection = materialization.effective_value_projection().clone();
                 Ok(StateSchemaContract {
                     schema_id: state_schema_id(fingerprint),
                     schema_version: 1,
                     materialization: fingerprint.into(),
                     family,
                     source,
-                    value_column,
-                    group_by: materialization.grouping_labels.labels.clone(),
+                    value_projection,
+                    group_by: materialization.grouping_labels.clone(),
                     window: StateWindowContract {
                         kind: materialization.window_type,
                         size_ms: materialization.window_size.saturating_mul(1_000),
@@ -417,6 +417,18 @@ impl PrecomputePlan {
         }
         let mut materializations = BTreeSet::new();
         for materialization in &self.materializations {
+            if materialization.table_name.is_none()
+                && !materialization.grouping_labels.is_legacy_labels()
+            {
+                return Err(PrecomputePlanError::CatalogContract(
+                    "time-series grouping requires non-null string labels".into(),
+                ));
+            }
+
+            materialization
+                .grouping_labels
+                .validate()
+                .map_err(PrecomputePlanError::CatalogContract)?;
             materialization
                 .window_layout
                 .validate(materialization.window_size, materialization.slide_interval)
@@ -488,16 +500,12 @@ impl PrecomputePlan {
                     table_ref: table_ref.clone(),
                 },
             );
-            let value_column = materialization
-                .value_column
-                .clone()
-                .map(planner_types::pre_asap::ColumnRef::Named)
-                .unwrap_or(planner_types::pre_asap::ColumnRef::SampleValue);
+            let value_projection = materialization.effective_value_projection().clone();
             if schema.schema_id != state_schema_id(schema.materialization.fingerprint())
                 || schema.family != family
                 || schema.source != source
-                || schema.value_column != value_column
-                || schema.group_by != materialization.grouping_labels.labels
+                || schema.value_projection != value_projection
+                || schema.group_by != materialization.grouping_labels
                 || schema.window.kind != materialization.window_type
                 || schema.window.size_ms != materialization.window_size.saturating_mul(1_000)
                 || schema.window.slide_ms

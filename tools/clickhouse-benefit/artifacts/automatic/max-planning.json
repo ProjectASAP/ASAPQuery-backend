@@ -1,0 +1,733 @@
+{
+  "publication": {
+    "collector_plans": [],
+    "precompute_plan": {
+      "envelope": {
+        "activation_unix_ms": 0,
+        "backend_compat": "asap-query-backend.v1",
+        "capability_snapshot_id": "test",
+        "expiry_unix_ms": null,
+        "generated_at_unix_ms": 0,
+        "plan_id": 73,
+        "plan_version": 1,
+        "planner_revision": "0deceda3e776216c5542d638d958b159f22e27ce"
+      },
+      "executable_dags": {
+        "SELECT max(value) AS value FROM q05_samples WHERE ts_ms>=1788848096001 AND ts_ms<1788891296001": {
+          "binding": {
+            "nodes": {
+              "0": {
+                "placement": "maintenance_input"
+              },
+              "1": {
+                "placement": "materialization",
+                "summary_definition": 11497701252531036795
+              },
+              "2": {
+                "placement": "query",
+                "query_node": 0
+              }
+            },
+            "precompute_sinks": [
+              1
+            ],
+            "query_plan_sink": 0,
+            "query_sink": 2
+          },
+          "document": {
+            "edges": [
+              {
+                "consumer": 1,
+                "data_state": {
+                  "primitive": "Raw",
+                  "timing": "MaintenanceTime"
+                },
+                "grouping": "NotApplicable",
+                "intermediate_schema": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "metric",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "labels",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts_ms",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 2
+                },
+                "producer": 0,
+                "role": "Input",
+                "window": "RequiresAlignedPanePhaseOrExactBoundaryResidual"
+              },
+              {
+                "consumer": 2,
+                "data_state": {
+                  "primitive": "SummaryState",
+                  "timing": "MaintenanceTime"
+                },
+                "grouping": "NotApplicable",
+                "intermediate_schema": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "ExactAggregate": [
+                          "MinMax",
+                          "MinMax"
+                        ]
+                      },
+                      "name": "max(q05_samples.value)",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": null
+                },
+                "producer": 1,
+                "role": "Input",
+                "window": "NotApplicable"
+              }
+            ],
+            "nodes": [
+              {
+                "guarantee": {
+                  "bound": {
+                    "op": "zero"
+                  },
+                  "failure_probability": {
+                    "op": "zero"
+                  },
+                  "metric": "absolute_value",
+                  "provenance": [
+                    {
+                      "kind": "exact",
+                      "reason": "KeepPreAsap"
+                    }
+                  ]
+                },
+                "id": 0,
+                "operator": "Fallback",
+                "output_schema": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "metric",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "utf8"
+                      },
+                      "name": "labels",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "timestamp"
+                      },
+                      "name": "ts_ms",
+                      "nullable": false
+                    },
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": 2
+                },
+                "output_state": {
+                  "primitive": "Raw",
+                  "timing": "MaintenanceTime"
+                },
+                "payload": {
+                  "expression": {
+                    "Scan": {
+                      "predicates": [
+                        {
+                          "BoolAnd": [
+                            {
+                              "Compare": {
+                                "left": {
+                                  "Column": 2
+                                },
+                                "op": "Ge",
+                                "right": {
+                                  "Literal": {
+                                    "Int64": 1788848096001
+                                  }
+                                }
+                              }
+                            },
+                            {
+                              "Compare": {
+                                "left": {
+                                  "Column": 2
+                                },
+                                "op": "Lt",
+                                "right": {
+                                  "Literal": {
+                                    "Int64": 1788891296001
+                                  }
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      ],
+                      "schema": {
+                        "closed": true,
+                        "columns": [
+                          {
+                            "dtype": "utf8",
+                            "name": "metric",
+                            "nullable": false,
+                            "table": "q05_samples"
+                          },
+                          {
+                            "dtype": "utf8",
+                            "name": "labels",
+                            "nullable": false,
+                            "table": "q05_samples"
+                          },
+                          {
+                            "dtype": "timestamp",
+                            "name": "ts_ms",
+                            "nullable": false,
+                            "table": "q05_samples"
+                          },
+                          {
+                            "dtype": "float64",
+                            "name": "value",
+                            "nullable": false,
+                            "table": "q05_samples"
+                          }
+                        ],
+                        "time_index": 2,
+                        "unique_keys": []
+                      },
+                      "source": {
+                        "Table": {
+                          "table_ref": "q05_samples"
+                        }
+                      }
+                    }
+                  },
+                  "kind": "fallback"
+                }
+              },
+              {
+                "guarantee": {
+                  "bound": {
+                    "op": "zero"
+                  },
+                  "failure_probability": {
+                    "op": "zero"
+                  },
+                  "metric": "absolute_value",
+                  "provenance": [
+                    {
+                      "kind": "exact",
+                      "reason": "ExactAggregate(MinMax)"
+                    },
+                    {
+                      "guarantee": {
+                        "bound": {
+                          "op": "zero"
+                        },
+                        "failure_probability": {
+                          "op": "zero"
+                        },
+                        "metric": "absolute_value",
+                        "provenance": [
+                          {
+                            "kind": "exact",
+                            "reason": "KeepPreAsap"
+                          }
+                        ]
+                      },
+                      "input_index": 0,
+                      "kind": "child_guarantee"
+                    },
+                    {
+                      "kind": "composition_step",
+                      "operator": {
+                        "op": "exact_extremum"
+                      },
+                      "rule": "exact_input"
+                    }
+                  ]
+                },
+                "id": 1,
+                "operator": "SummaryAgg",
+                "output_schema": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "ExactAggregate": [
+                          "MinMax",
+                          "MinMax"
+                        ]
+                      },
+                      "name": "max(q05_samples.value)",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": null
+                },
+                "output_state": {
+                  "primitive": "SummaryState",
+                  "timing": "MaintenanceTime"
+                },
+                "payload": {
+                  "family": {
+                    "ExactAggregate": [
+                      "MinMax",
+                      "MinMax"
+                    ]
+                  },
+                  "grouping": "PerSubpopulationInstance",
+                  "input": {
+                    "item": null,
+                    "weight": {
+                      "Column": {
+                        "Qualified": {
+                          "name": "value",
+                          "table": "q05_samples"
+                        }
+                      }
+                    },
+                    "weight_domain": {
+                      "kind": "unknown_or_signed"
+                    }
+                  },
+                  "kind": "summary_agg",
+                  "reduction": {
+                    "Reduce": []
+                  }
+                }
+              },
+              {
+                "guarantee": {
+                  "bound": {
+                    "op": "zero"
+                  },
+                  "failure_probability": {
+                    "op": "zero"
+                  },
+                  "metric": "absolute_value",
+                  "provenance": [
+                    {
+                      "kind": "exact",
+                      "reason": "ExactAggregate(MinMax)"
+                    },
+                    {
+                      "guarantee": {
+                        "bound": {
+                          "op": "zero"
+                        },
+                        "failure_probability": {
+                          "op": "zero"
+                        },
+                        "metric": "absolute_value",
+                        "provenance": [
+                          {
+                            "kind": "exact",
+                            "reason": "KeepPreAsap"
+                          }
+                        ]
+                      },
+                      "input_index": 0,
+                      "kind": "child_guarantee"
+                    },
+                    {
+                      "kind": "composition_step",
+                      "operator": {
+                        "op": "exact_extremum"
+                      },
+                      "rule": "exact_input"
+                    }
+                  ]
+                },
+                "id": 2,
+                "operator": "Value",
+                "output_schema": {
+                  "fields": [
+                    {
+                      "dtype": {
+                        "Plain": "float64"
+                      },
+                      "name": "value",
+                      "nullable": false
+                    }
+                  ],
+                  "time_index": null
+                },
+                "output_state": {
+                  "primitive": "Raw",
+                  "timing": "ReadTime"
+                },
+                "payload": {
+                  "kind": "value",
+                  "operation": {
+                    "Project": {
+                      "cols": [
+                        {
+                          "alias": "value",
+                          "expr": {
+                            "Column": 0
+                          }
+                        }
+                      ],
+                      "qualifier": null
+                    }
+                  },
+                  "timing": "ReadTime"
+                }
+              }
+            ],
+            "query_id": "SELECT max(value) AS value FROM q05_samples WHERE ts_ms>=1788848096001 AND ts_ms<1788891296001",
+            "root": 2,
+            "schema_version": 1
+          }
+        }
+      },
+      "ingest": {
+        "endpoint_path": "/api/v1/write",
+        "protocol": "prometheus_remote_write_v1",
+        "require_plan_identity": false,
+        "require_registered_producer": false,
+        "require_summary_definition_identity": false,
+        "timestamp_unit": "unix_milliseconds"
+      },
+      "materializations": [
+        {
+          "aggregated_labels": {
+            "labels": []
+          },
+          "aggregation_sub_type": "max",
+          "aggregation_type": "MinMax",
+          "grouping_labels": {
+            "labels": []
+          },
+          "metric": "q05_samples.value",
+          "num_aggregates_to_retain": 2,
+          "original_yaml": "",
+          "pane_origin_ms": 1788848096001,
+          "parameters": {},
+          "partitioning": "grouped",
+          "rollup_labels": {
+            "labels": []
+          },
+          "slide_interval": 43200,
+          "spatial_filter": "",
+          "spatial_filter_normalized": "",
+          "table_name": "q05_samples",
+          "table_population": {
+            "predicates": []
+          },
+          "table_timestamp_column": "ts_ms",
+          "value_column": "value",
+          "window_layout": {
+            "kind": "pane",
+            "pane_secs": 43200
+          },
+          "window_size": 43200,
+          "window_type": "tumbling"
+        }
+      ],
+      "producers": [],
+      "schemas": [
+        {
+          "encodings": [
+            "exact_accumulator_v1"
+          ],
+          "family": {
+            "family": "exact",
+            "kind": "min_max"
+          },
+          "group_by": [],
+          "materialization": 11497701252531036795,
+          "schema_id": "asap-query-backend.v1:summary-state:v1:11497701252531036795",
+          "schema_version": 1,
+          "source": {
+            "Table": {
+              "table_ref": "q05_samples"
+            }
+          },
+          "value_column": {
+            "Named": "value"
+          },
+          "window": {
+            "kind": "tumbling",
+            "pane_origin_ms": 1788848096001,
+            "size_ms": 43200000,
+            "slide_ms": null
+          }
+        }
+      ],
+      "summary_catalog": {
+        "plan_id": 73,
+        "plan_version": 1,
+        "schema_version": 2,
+        "snapshot_sha256": "642bd91f4dd5c5bb54f59fe86705a01ec2691b825730a36a5ac878ee7dfa621b"
+      }
+    },
+    "query_plan": {
+      "clickhouse_context": {
+        "accuracy": "Exact",
+        "tables": {
+          "q05_samples": {
+            "closed": false,
+            "columns": [
+              {
+                "dtype": "utf8",
+                "name": "metric",
+                "nullable": false,
+                "table": null
+              },
+              {
+                "dtype": "utf8",
+                "name": "labels",
+                "nullable": false,
+                "table": null
+              },
+              {
+                "dtype": "timestamp",
+                "name": "ts_ms",
+                "nullable": false,
+                "table": null
+              },
+              {
+                "dtype": "float64",
+                "name": "value",
+                "nullable": false,
+                "table": null
+              }
+            ],
+            "time_index": 2,
+            "unique_keys": []
+          }
+        }
+      },
+      "entries": {
+        "clickhouse:Project { cols: [ProjectItem { alias: Some(\"value\"), expr: Column(0) }], qualifier: None, child: Aggregate { reduction: Reduce(GroupKeys { keys: [], without: false }), measures: [Max { col: Some(3) }], output_names: [\"max(q05_samples.value)\"], having: None, child: Scan { source: Table { table_ref: \"q05_samples\" }, predicates: [Predicate(BoolAnd([Compare { left: Column(2), op: Ge, right: Literal(Int64(1788848096001)) }, Compare { left: Column(2), op: Lt, right: Literal(Int64(1788891296001)) }]))], schema: Schema { columns: [Column { name: \"metric\", dtype: Utf8, nullable: false, table: Some(\"q05_samples\") }, Column { name: \"labels\", dtype: Utf8, nullable: false, table: Some(\"q05_samples\") }, Column { name: \"ts_ms\", dtype: Timestamp, nullable: false, table: Some(\"q05_samples\") }, Column { name: \"value\", dtype: Float64, nullable: false, table: Some(\"q05_samples\") }], time_index: Some(2), unique_keys: [], closed: true } } } }": {
+          "canonical_query": "Project { cols: [ProjectItem { alias: Some(\"value\"), expr: Column(0) }], qualifier: None, child: Aggregate { reduction: Reduce(GroupKeys { keys: [], without: false }), measures: [Max { col: Some(3) }], output_names: [\"max(q05_samples.value)\"], having: None, child: Scan { source: Table { table_ref: \"q05_samples\" }, predicates: [Predicate(BoolAnd([Compare { left: Column(2), op: Ge, right: Literal(Int64(1788848096001)) }, Compare { left: Column(2), op: Lt, right: Literal(Int64(1788891296001)) }]))], schema: Schema { columns: [Column { name: \"metric\", dtype: Utf8, nullable: false, table: Some(\"q05_samples\") }, Column { name: \"labels\", dtype: Utf8, nullable: false, table: Some(\"q05_samples\") }, Column { name: \"ts_ms\", dtype: Timestamp, nullable: false, table: Some(\"q05_samples\") }, Column { name: \"value\", dtype: Float64, nullable: false, table: Some(\"q05_samples\") }], time_index: Some(2), unique_keys: [], closed: true } } } }",
+          "fallback": "exact_backend",
+          "fixed_evaluation": {
+            "cumulative": true,
+            "end_ms": 1788891296001,
+            "start_ms": 1788848096001
+          },
+          "instant": {
+            "cumulative_readout": true,
+            "full_history": false,
+            "lookback_ms": 43200000
+          },
+          "language": "click_house_sql",
+          "nodes": {
+            "0": {
+              "input": 1,
+              "input_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "ExactAggregate": [
+                        "MinMax",
+                        "MinMax"
+                      ]
+                    },
+                    "name": "max(q05_samples.value)",
+                    "nullable": false
+                  }
+                ],
+                "time_index": null
+              },
+              "op": "relational",
+              "operation": {
+                "Project": {
+                  "cols": [
+                    {
+                      "alias": "value",
+                      "expr": {
+                        "Column": 0
+                      }
+                    }
+                  ],
+                  "qualifier": null
+                }
+              },
+              "output_schema": {
+                "fields": [
+                  {
+                    "dtype": {
+                      "Plain": "float64"
+                    },
+                    "name": "value",
+                    "nullable": false
+                  }
+                ],
+                "time_index": null
+              }
+            },
+            "1": {
+              "input": 2,
+              "op": "exact_readout",
+              "readout": "max"
+            },
+            "2": {
+              "binding": {
+                "materialization": 11497701252531036795,
+                "output_grouping": {
+                  "keys": [],
+                  "mode": "reduce"
+                },
+                "pane_origin_ms": 1788848096001,
+                "readout_lookback_ms": 43200000,
+                "window_ms": 43200000
+              },
+              "op": "read_materialization"
+            }
+          },
+          "query_id": "SELECT max(value) AS value FROM q05_samples WHERE ts_ms>=1788848096001 AND ts_ms<1788891296001",
+          "root": 0
+        }
+      },
+      "plan_id": 73,
+      "plan_version": 1
+    },
+    "summary_catalog": {
+      "data_descriptors": {
+        "data:v2|37:{\"table\":{\"table_ref\":\"q05_samples\"}}|27:{\"column\":{\"name\":\"value\"}}|0:|partition:Grouped|timestamp-ms:5:ts_ms|32:asap.timestamped-observations.v2": {
+          "group_by_keys": [],
+          "id": "data:v2|37:{\"table\":{\"table_ref\":\"q05_samples\"}}|27:{\"column\":{\"name\":\"value\"}}|0:|partition:Grouped|timestamp-ms:5:ts_ms|32:asap.timestamped-observations.v2",
+          "observation_semantics": "asap.timestamped-observations.v2",
+          "partitioning": "grouped",
+          "population_filter_canonical": "",
+          "source": {
+            "table": {
+              "table_ref": "q05_samples"
+            }
+          },
+          "timestamp_column": "ts_ms",
+          "value_projection": {
+            "column": {
+              "name": "value"
+            }
+          }
+        }
+      },
+      "materializations": {
+        "11497701252531036795": {
+          "data_descriptor_id": "data:v2|37:{\"table\":{\"table_ref\":\"q05_samples\"}}|27:{\"column\":{\"name\":\"value\"}}|0:|partition:Grouped|timestamp-ms:5:ts_ms|32:asap.timestamped-observations.v2",
+          "pane_origin_ms": 1788848096001,
+          "summary_descriptor_id": "summary:v2:{\"fidelity\":{\"kind\":\"exact\"},\"operator\":{\"aggregation_sub_type\":\"max\",\"aggregation_type\":\"MinMax\",\"kind\":\"configured\",\"parameters\":{}},\"state_schema_version\":1}",
+          "window_layout": {
+            "kind": "pane",
+            "pane_secs": 43200
+          }
+        }
+      },
+      "plan_id": 73,
+      "plan_version": 1,
+      "schema_version": 2,
+      "summary_descriptors": {
+        "summary:v2:{\"fidelity\":{\"kind\":\"exact\"},\"operator\":{\"aggregation_sub_type\":\"max\",\"aggregation_type\":\"MinMax\",\"kind\":\"configured\",\"parameters\":{}},\"state_schema_version\":1}": {
+          "fidelity": {
+            "kind": "exact"
+          },
+          "id": "summary:v2:{\"fidelity\":{\"kind\":\"exact\"},\"operator\":{\"aggregation_sub_type\":\"max\",\"aggregation_type\":\"MinMax\",\"kind\":\"configured\",\"parameters\":{}},\"state_schema_version\":1}",
+          "operator": {
+            "aggregation_sub_type": "max",
+            "aggregation_type": "MinMax",
+            "kind": "configured",
+            "parameters": {}
+          },
+          "state_schema_version": 1
+        }
+      }
+    },
+    "transmission_plan": {
+      "envelope": {
+        "activation_unix_ms": 0,
+        "backend_compat": "asap-query-backend.v1",
+        "capability_snapshot_id": "test",
+        "expiry_unix_ms": null,
+        "generated_at_unix_ms": 0,
+        "plan_id": 73,
+        "plan_version": 1,
+        "planner_revision": "0deceda3e776216c5542d638d958b159f22e27ce"
+      },
+      "frame_identity": {
+        "identity_version": 1,
+        "require_base_checkpoint_for_delta": true,
+        "require_checkpoint_for_full": true,
+        "sequence_scope": "materialization_series_producer_epoch"
+      },
+      "rules": [],
+      "summary_catalog": {
+        "plan_id": 73,
+        "plan_version": 1,
+        "schema_version": 2,
+        "snapshot_sha256": "642bd91f4dd5c5bb54f59fe86705a01ec2691b825730a36a5ac878ee7dfa621b"
+      }
+    }
+  },
+  "selection_trace": {
+    "Project { cols: [ProjectItem { alias: Some(\"value\"), expr: Column(0) }], qualifier: None, child: Aggregate { reduction: Reduce(GroupKeys { keys: [], without: false }), measures: [Max { col: Some(3) }], output_names: [\"max(q05_samples.value)\"], having: None, child: Scan { source: Table { table_ref: \"q05_samples\" }, predicates: [Predicate(BoolAnd([Compare { left: Column(2), op: Ge, right: Literal(Int64(1788848096001)) }, Compare { left: Column(2), op: Lt, right: Literal(Int64(1788891296001)) }]))], schema: Schema { columns: [Column { name: \"metric\", dtype: Utf8, nullable: false, table: Some(\"q05_samples\") }, Column { name: \"labels\", dtype: Utf8, nullable: false, table: Some(\"q05_samples\") }, Column { name: \"ts_ms\", dtype: Timestamp, nullable: false, table: Some(\"q05_samples\") }, Column { name: \"value\", dtype: Float64, nullable: false, table: Some(\"q05_samples\") }], time_index: Some(2), unique_keys: [], closed: true } } } }": {
+      "group_id_scope": "this_selection",
+      "groups": [
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 0
+        },
+        {
+          "candidates": [
+            {
+              "estimated_cost": null,
+              "estimated_cost_status": "not_reported_by_cost_model",
+              "provenance": "SummaryImplementation",
+              "rank": 0,
+              "rationale": "Max { col: Some(3) } realizes as an exact MinMax accumulator \u2014 the only realization implementations_for_with produces for this intent (no approximate candidate applies)",
+              "replacement_kind": "summary",
+              "selected": true,
+              "strategy": "SketchAlgorithmStrategy"
+            }
+          ],
+          "consumer_count": 1,
+          "group_id": 1
+        },
+        {
+          "candidates": [],
+          "consumer_count": 1,
+          "group_id": 2
+        }
+      ],
+      "schema_version": 1
+    }
+  }
+}

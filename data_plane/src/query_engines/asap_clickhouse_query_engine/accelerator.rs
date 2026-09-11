@@ -102,6 +102,15 @@ impl CatalogClickHouseAccelerator {
                 parameters.insert(format!("param_{name}"), end_ms.to_string());
             }
             parameters.insert("default_format".into(), "JSONCompact".into());
+            parameters.insert(
+                "output_format_json_map_as_array_of_tuples".into(),
+                "1".into(),
+            );
+            parameters.insert(
+                "output_format_json_named_tuples_as_objects".into(),
+                "0".into(),
+            );
+            parameters.insert("output_format_json_quote_64bit_integers".into(), "0".into());
             if let Some(database) = request_context.database() {
                 parameters.insert("database".into(), database.into());
             }
@@ -135,6 +144,13 @@ impl CatalogClickHouseAccelerator {
 }
 
 fn requested_format(request: &ClickHouseQueryRequest) -> Result<ClickHouseFormat, String> {
+    if let Some(setting) = request
+        .parameters
+        .keys()
+        .find(|key| key.starts_with("output_format_"))
+    {
+        return Err(format!("unsupported output setting {setting}"));
+    }
     match request
         .format()
         .unwrap_or("TabSeparated")
@@ -236,7 +252,9 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                             }
                         }),
                     );
-                    let (execution, detail) = if prepared.is_empty() {
+                    let (execution, detail) = if entry.materialization_bindings().is_empty() {
+                        ("exact_fallback", "external_dag")
+                    } else if prepared.is_empty() {
                         ("warm", "asap")
                     } else {
                         ("hybrid", "hybrid")
@@ -268,6 +286,26 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_output_settings_cannot_silently_change_warm_format() {
+        let mut request = ClickHouseQueryRequest {
+            method: axum::http::Method::GET,
+            sql: "SELECT labels FROM samples".into(),
+            body: Bytes::new(),
+            parameters: BTreeMap::from([("default_format".into(), "JSON".into())]),
+            headers: HeaderMap::new(),
+        };
+        assert!(requested_format(&request).is_ok());
+        for setting in [
+            "output_format_json_map_as_array_of_tuples",
+            "output_format_json_quote_64bit_integers",
+        ] {
+            request.parameters.insert(setting.into(), "1".into());
+            assert!(requested_format(&request).is_err());
+            request.parameters.remove(setting);
+        }
+    }
+
     use crate::{
         precompute_engine::operators::SumAccumulator,
         storage_engines::sketch_db::index::{AggKind, Capability, SketchInstanceMetadata},
@@ -759,7 +797,9 @@ mod tests {
         cfg.pane_origin_ms = Some(0);
         cfg.table_name = Some("asap_e2e.samples".into());
         cfg.table_timestamp_column = Some("timestamp_ms".into());
-        cfg.value_column = Some("value".into());
+        cfg.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
+            name: "value".into(),
+        });
         let hot = crate::storage_engines::types::HotReloadStreamingConfig::from_arc(Arc::new(
             crate::storage_engines::types::StreamingConfig::new(HashMap::from([(
                 cfg.policy_fp_u64(),

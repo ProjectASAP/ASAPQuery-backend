@@ -1,8 +1,7 @@
 //! Optional OS-process E2E for a q05-class bounded SQL max query.
 //! Run with `CLICKHOUSE_URL=http://127.0.0.1:8123 cargo test -p data_plane --test clickhouse_q05_process_e2e`.
 
-use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
-use control_plane::physical::compiler::{PlanEnvelope, PrecomputePlan, TransmissionPlan};
+use control_plane::physical::compiler::{PlanEnvelope, BACKEND_COMPAT, PLANNER_REVISION};
 use planner_types::pre_asap::{Column, DataType, Schema};
 use std::io::Read;
 use std::{collections::HashMap, process::Stdio, time::Duration};
@@ -146,49 +145,21 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
     let source_load_elapsed_ns = experiment_started.elapsed().as_nanos();
     let clickhouse_post_load = clickhouse_pid.map(process_snapshot);
 
+    let aggregate = std::env::var("CLICKHOUSE_BENCH_AGGREGATE").unwrap_or_else(|_| "max".into());
+    assert!(matches!(aggregate.as_str(), "max" | "sum"));
     let sql = format!(
-        "SELECT max(value) AS value FROM q05_samples WHERE ts_ms>={start_ms} AND ts_ms<{end_ms}"
+        "SELECT {aggregate}(value) AS value FROM q05_samples WHERE ts_ms>={start_ms} AND ts_ms<{end_ms}"
     );
-    let mut config = PrecomputeMaterialization::new(
-        AggregationType::MinMax,
-        "max".into(),
-        Default::default(),
-        KeyByLabelNames::empty(),
-        KeyByLabelNames::empty(),
-        KeyByLabelNames::empty(),
-        String::new(),
-        43_200,
-        43_200,
-        WindowKind::Tumbling,
-        String::new(),
-        metric.clone(),
-        None,
-        Some("q05_samples".into()),
-        Some("value".into()),
-    );
-    config.pane_origin_ms = Some(start_ms as i64);
-    let sds = control_plane::physical::summary_catalog::SummaryCatalog::from_materializations(
-        73,
-        1,
-        &[config.clone()],
-    )
-    .unwrap();
     let envelope = PlanEnvelope {
         plan_id: 73,
         plan_version: 1,
         generated_at_unix_ms: 0,
         activation_unix_ms: 0,
         expiry_unix_ms: None,
-        backend_compat: "test".into(),
-        planner_revision: "test".into(),
+        backend_compat: BACKEND_COMPAT.into(),
+        planner_revision: PLANNER_REVISION.into(),
         capability_snapshot_id: "test".into(),
     };
-    let mut precompute =
-        PrecomputePlan::build_backend_local(envelope.clone(), vec![config.clone()]).unwrap();
-    precompute.summary_catalog = Some(sds.reference().unwrap());
-    let mut transmission =
-        TransmissionPlan::build(envelope, &precompute, &Default::default()).unwrap();
-    transmission.summary_catalog = precompute.summary_catalog.clone();
     let schema = Schema::with_time_index(
         vec![
             Column::new("metric", DataType::Utf8, false),
@@ -199,24 +170,27 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
         2,
         vec![],
     );
-    let compiled = control_plane::clickhouse::compile_clickhouse_workload(
-        &control_plane::clickhouse::ClickHouseSqlWorkload {
-            sds: sds.clone(),
-            precompute_plan: precompute.clone(),
-            transmission_plan: transmission.clone(),
-            tables: HashMap::from([("q05_samples".into(), schema)]),
-            accuracy: planner_types::types::AccuracyTarget::Exact,
-            queries: vec![control_plane::clickhouse::ClickHouseSqlWorkloadEntry {
-                sql: sql.clone(),
-                start_ms,
-                end_ms,
-                cumulative: true,
-            }],
-        },
-    )
-    .await
-    .unwrap();
+    let (compiled, selection_trace) =
+        control_plane::clickhouse::compile_automatic_clickhouse_workload(
+            &control_plane::clickhouse::ClickHouseSqlAutomaticWorkload {
+                envelope,
+                tables: HashMap::from([("q05_samples".into(), schema)]),
+                accuracy: planner_types::types::AccuracyTarget::Exact,
+                queries: vec![control_plane::clickhouse::ClickHouseSqlWorkloadEntry {
+                    sql: sql.clone(),
+                    start_ms,
+                    end_ms,
+                    cumulative: true,
+                }],
+            },
+        )
+        .await
+        .unwrap();
 
+    assert_eq!(compiled.precompute_plan.materializations.len(), 1);
+    let config = compiled.precompute_plan.materializations[0].clone();
+    let planning =
+        serde_json::json!({"selection_trace": selection_trace, "publication": &compiled});
     let http_port = free_port();
     let mut sql_port = free_port();
     while sql_port == http_port {
@@ -380,13 +354,13 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
     let first_warm_ns = first_warm_started.elapsed().as_nanos();
     let first_exact_started = std::time::Instant::now();
     let exact_value: f64 = clickhouse_auth(client.post(&clickhouse))
-        .body(format!("SELECT max(value) FROM asap_q05_e2e.q05_samples WHERE ts_ms>={start_ms} AND ts_ms<{end_ms} FORMAT TabSeparated"))
+        .body(format!("SELECT {aggregate}(value) FROM asap_q05_e2e.q05_samples WHERE ts_ms>={start_ms} AND ts_ms<{end_ms} FORMAT TabSeparated"))
         .send().await.unwrap().text().await.unwrap().trim().parse().unwrap();
     let first_exact_ns = first_exact_started.elapsed().as_nanos();
     assert_eq!(warm_value, exact_value);
 
     if let Ok(output) = std::env::var("CLICKHOUSE_BENCH_OUTPUT") {
-        let exact_sql = format!("SELECT max(value) FROM asap_q05_e2e.q05_samples WHERE ts_ms>={start_ms} AND ts_ms<{end_ms} FORMAT TabSeparated");
+        let exact_sql = format!("SELECT {aggregate}(value) FROM asap_q05_e2e.q05_samples WHERE ts_ms>={start_ms} AND ts_ms<{end_ms} FORMAT TabSeparated");
         for _ in 0..10 {
             let _ = client
                 .post(format!("http://127.0.0.1:{sql_port}/"))
@@ -474,7 +448,8 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
             "clock_ticks_per_second": std::process::Command::new("getconf").arg("CLK_TCK").output().ok().and_then(|value| String::from_utf8(value.stdout).ok()).and_then(|value| value.trim().parse::<u64>().ok()),
             "query": sql,
             "input": {"path":input_path,"metric":metric,"samples":input_samples,"series":series,"start_ms":start_ms,"end_ms":end_ms},
-            "planning_scope": "Planner chooses query DAG against a predeclared MinMax catalog; materialization sizing/selection is not measured",
+            "planning_scope": "Real Planner selects the DAG and automatic control-plane binding constructs the catalog; fixed-window layout is not cost-optimized",
+            "planning": planning,
             "classification_required": "warm",
             "build_phase": {"elapsed_ns":build_elapsed_ns,"backend":post_build,"backend_output_bytes":directory_bytes(output_dir.path()),"clickhouse_before":clickhouse_initial,"clickhouse_after":clickhouse_post_build},
             "source_load_phase": {"elapsed_ns":source_load_elapsed_ns,"clickhouse_before":clickhouse_initial,"clickhouse_after":clickhouse_post_load},
@@ -483,7 +458,7 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
             "query_phase": {"elapsed_ns":query_elapsed_ns,"backend_before":pre_query,"backend_after":post_query,"backend_output_bytes":directory_bytes(output_dir.path()),"clickhouse_before":clickhouse_pre_query,"clickhouse_after":clickhouse_post_query,"clickhouse_storage_bytes":clickhouse_storage_bytes},
             "clickhouse_table": table_stats,
             "requests": requests,
-            "limitations": ["single q05 max workload", "CPU uses Linux scheduler ticks", "RSS is whole-process", "ClickHouse server is externally managed"],
+            "limitations": ["bounded single-series aggregate sensitivity; not full original o11y workload coverage", "CPU uses Linux scheduler ticks", "RSS is whole-process", "ClickHouse server is externally managed"],
         });
         std::fs::write(output, serde_json::to_vec_pretty(&artifact).unwrap()).unwrap();
     }

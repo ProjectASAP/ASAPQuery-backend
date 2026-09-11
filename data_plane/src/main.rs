@@ -878,10 +878,17 @@ async fn main() -> Result<()> {
             sketch_index.clone(),
         );
         if let Some(endpoint) = args.erp_runtime_samples_endpoint.clone() {
+            let generation = engine
+                .ingest_state()
+                .physical_plan_snapshot()
+                .and_then(|plan| plan.precompute_plan.summary_catalog.clone())
+                .ok_or_else(|| {
+                    std::io::Error::other("ERP observation requires an installed catalog")
+                })?;
             engine
                 .ingest_state()
                 .router
-                .enable_erp_observation(endpoint)
+                .enable_erp_observation(endpoint, generation)
                 .map_err(std::io::Error::other)?;
         }
         let worker_diagnostics = engine.diagnostics();

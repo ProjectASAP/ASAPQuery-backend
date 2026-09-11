@@ -2,7 +2,6 @@
 //! an explicit finite-source completion barrier. No worker timestamp is a seal.
 use asap_types::erp_observation::*;
 use asap_types::sds::*;
-use control_plane::physical::erp::{ErpObservedShape, ErpShapeObserver};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +15,7 @@ struct Population {
     source: String,
     sketch: String,
     implementation: String,
-    observer: ErpShapeObserver,
+    observer: BoundedFrequencyObserver<u64>,
 }
 #[derive(Default)]
 struct Observations {
@@ -33,12 +32,26 @@ pub struct RuntimeErpObserver {
     observations: Mutex<Observations>,
 }
 impl RuntimeErpObserver {
-    pub fn new(endpoint: String) -> Arc<Self> {
+    pub fn new(endpoint: String, generation: CatalogGeneration) -> Arc<Self> {
         Arc::new(Self {
             endpoint,
-            observations: Mutex::new(Observations::default()),
+            observations: Mutex::new(Observations {
+                generation: Some(generation),
+                ..Default::default()
+            }),
         })
     }
+    /// Only the accepted catalog activation path may reset an observation epoch.
+    pub(crate) fn install_generation(&self, generation: CatalogGeneration) {
+        let mut state = self.observations.lock().unwrap();
+        if state.generation.as_ref() != Some(&generation) {
+            *state = Observations {
+                generation: Some(generation),
+                ..Default::default()
+            };
+        }
+    }
+
     pub fn observe(
         &self,
         generation: &CatalogGeneration,
@@ -62,11 +75,10 @@ impl RuntimeErpObserver {
             _ => return,
         };
         let mut state = self.observations.lock().unwrap();
+        // Catalog installation establishes identity. Delayed old worker input
+        // cannot reset the current generation or create a partial replacement fit.
         if state.generation.as_ref() != Some(generation) {
-            *state = Observations {
-                generation: Some(generation.clone()),
-                ..Default::default()
-            };
+            return;
         }
         if state.invalid.is_some() {
             return;
@@ -79,7 +91,7 @@ impl RuntimeErpObserver {
         {
             state.invalid = Some("unsupported non-finite or transformed summary input".into());
             for population in state.populations.values_mut() {
-                population.observer = ErpShapeObserver::new(1).unwrap();
+                population.observer = BoundedFrequencyObserver::new(1, 64).unwrap();
             }
             return;
         }
@@ -95,7 +107,7 @@ impl RuntimeErpObserver {
         if !state.populations.contains_key(&id) && state.populations.len() >= MAX_POPULATIONS {
             state.invalid = Some("ERP population observation budget exceeded".into());
             for population in state.populations.values_mut() {
-                population.observer = ErpShapeObserver::new(1).unwrap();
+                population.observer = BoundedFrequencyObserver::new(1, 64).unwrap();
             }
             return;
         }
@@ -112,7 +124,7 @@ impl RuntimeErpObserver {
             if total.is_none_or(|bytes| bytes > MAX_POPULATION_METADATA_BYTES) {
                 state.invalid = Some("ERP population metadata budget exceeded".into());
                 for population in state.populations.values_mut() {
-                    population.observer = ErpShapeObserver::new(1).unwrap();
+                    population.observer = BoundedFrequencyObserver::new(1, 64).unwrap();
                 }
                 return;
             }
@@ -127,18 +139,18 @@ impl RuntimeErpObserver {
             semantics,
             sketch: sketch.into(),
             implementation: implementation.into(),
-            observer: ErpShapeObserver::new(MAX_KEYS).unwrap(),
+            observer: BoundedFrequencyObserver::new(MAX_KEYS, 64).unwrap(),
         });
         let before = population.observer.observed_key_count();
         // Canonical fixed-width numeric identity; no raw sample or arbitrary label copy.
-        let key = format!("{:016x}", if value == 0.0 { 0 } else { value.to_bits() });
+        let key = if value == 0.0 { 0 } else { value.to_bits() };
         let range = population.coordinates.time_range;
         let duration = range.end_ms.saturating_sub(range.start_ms).max(1);
         let offset = timestamp_ms
             .saturating_sub(range.start_ms)
             .clamp(0, duration);
         let interval = ((offset as u128 * 64) / duration as u128).min(63) as usize;
-        let result = population.observer.observe(&key, interval);
+        let result = population.observer.observe(key, interval);
         let added = population
             .observer
             .observed_key_count()
@@ -147,7 +159,7 @@ impl RuntimeErpObserver {
         if result.is_err() || state.total_keys > MAX_KEYS {
             state.invalid = Some("ERP key observation budget exceeded".into());
             for population in state.populations.values_mut() {
-                population.observer = ErpShapeObserver::new(1).unwrap();
+                population.observer = BoundedFrequencyObserver::new(1, 64).unwrap();
             }
         }
     }
@@ -171,7 +183,7 @@ impl RuntimeErpObserver {
                     String,
                     String,
                     String,
-                    ErpPopulationObservations<ErpObservedShape>,
+                    ErpPopulationObservations<EmpiricalFrequencyObservation>,
                 ),
             > = BTreeMap::new();
             for (id, population) in &state.populations {
@@ -292,8 +304,8 @@ mod tests {
     }
     #[test]
     fn observations_keep_partitions_separate_and_invalidate_on_overflow() {
-        let observer = RuntimeErpObserver::new("http://127.0.0.1:1".into());
         let (generation, config) = fixture();
+        let observer = RuntimeErpObserver::new("http://127.0.0.1:1".into(), generation.clone());
         observer.observe(&generation, coordinate(0), &config, 1, 1.0);
         observer.observe(&generation, coordinate(0), &config, 2, 1.0);
         observer.observe(&generation, coordinate(1), &config, 3, 2.0);
@@ -317,15 +329,33 @@ mod tests {
             .all(|p| p.observer.snapshot().is_none()));
     }
     #[test]
-    fn changed_catalog_resets_invalid_observation_without_cross_generation_counts() {
-        let observer = RuntimeErpObserver::new("http://127.0.0.1:1".into());
-        let (mut generation, config) = fixture();
-        observer.observe(&generation, coordinate(0), &config, 1, f64::NAN);
-        generation.plan_version = 2;
-        observer.observe(&generation, coordinate(0), &config, 2, 9.0);
+    fn delayed_generation_cannot_reset_current_population_counts() {
+        let (generation, config) = fixture();
+        let observer = RuntimeErpObserver::new("http://127.0.0.1:1".into(), generation.clone());
+        let mut previous = generation.clone();
+        previous.plan_version = 0;
+        observer.install_generation(previous.clone());
+        observer.observe(&previous, coordinate(0), &config, 0, 77.0);
+        observer.install_generation(generation.clone());
+        observer.observe(&generation, coordinate(0), &config, 1, 1.0);
+        let mut stale = generation.clone();
+        stale.plan_version = 0;
+        observer.observe(&stale, coordinate(0), &config, 2, 99.0);
+        observer.observe(&generation, coordinate(0), &config, 3, 2.0);
         let state = observer.observations.lock().unwrap();
-        assert!(state.invalid.is_none());
-        assert_eq!(state.total_keys, 1);
+        assert_eq!(state.total_keys, 2);
         assert_eq!(state.generation.as_ref(), Some(&generation));
+        assert_eq!(
+            state
+                .populations
+                .values()
+                .next()
+                .unwrap()
+                .observer
+                .snapshot()
+                .unwrap()
+                .sorted_counts,
+            vec![1, 1]
+        );
     }
 }

@@ -1,0 +1,56 @@
+{
+  "scope": "fresh process startup, summary construction and 1000 queries; excludes common source ingestion and offline planning",
+  "pairs": [
+    {
+      "trial": 1,
+      "asap": {
+        "requests": {
+          "warm": 1000,
+          "equal": 1000,
+          "failed": 0
+        },
+        "cpu_seconds": 12.3,
+        "combined_end_rss_bytes": 906338304
+      },
+      "native": {
+        "requests_equal": 1000,
+        "cpu_seconds": 98.86,
+        "end_rss_bytes": 878465024
+      }
+    },
+    {
+      "trial": 2,
+      "asap": {
+        "requests": {
+          "warm": 1000,
+          "equal": 1000,
+          "failed": 0
+        },
+        "cpu_seconds": 11.16,
+        "combined_end_rss_bytes": 878211072
+      },
+      "native": {
+        "requests_equal": 1000,
+        "cpu_seconds": 97.49,
+        "end_rss_bytes": 837402624
+      }
+    },
+    {
+      "trial": 3,
+      "asap": {
+        "requests": {
+          "warm": 1000,
+          "equal": 1000,
+          "failed": 0
+        },
+        "cpu_seconds": 12.33,
+        "combined_end_rss_bytes": 909520896
+      },
+      "native": {
+        "requests_equal": 1000,
+        "cpu_seconds": 96.67,
+        "end_rss_bytes": 862224384
+      }
+    }
+  ]
+}

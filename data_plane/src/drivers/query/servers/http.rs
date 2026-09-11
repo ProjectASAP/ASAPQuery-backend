@@ -2694,12 +2694,20 @@ mod tests {
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
+        let catalog = Arc::new(
+            asap_types::summary_catalog::SummaryCatalog::from_materializations(7, 1, &[]).unwrap(),
+        );
+        let generation = catalog.reference().unwrap();
+        let sketch_index = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+        sketch_index
+            .install_summary_catalog(Arc::clone(&catalog))
+            .unwrap();
         let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(
             crate::storage_engines::types::ActivePhysicalPlan {
                 envelope: envelope.clone(),
-                summary_catalog: None,
+                summary_catalog: Some(Arc::clone(&catalog)),
                 precompute_plan: PrecomputePlan {
-                    summary_catalog: None,
+                    summary_catalog: Some(generation.clone()),
                     envelope: envelope.clone(),
                     ingest: IngestContract {
                         protocol: IngestProtocol::PrometheusRemoteWriteV1,
@@ -2715,7 +2723,7 @@ mod tests {
                     materializations: Vec::new(),
                 },
                 transmission_plan: TransmissionPlan {
-                    summary_catalog: None,
+                    summary_catalog: Some(generation),
                     envelope,
                     frame_identity: FrameIdentityContract {
                         identity_version: 1,
@@ -2747,7 +2755,7 @@ mod tests {
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(crate::drivers::ingest::SeriesIdResolver::new()),
-            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            sketch_index: Arc::clone(&sketch_index),
             observability: IngestObservability::default(),
         });
         let receiver =
@@ -2760,7 +2768,7 @@ mod tests {
                 adapter_config,
             },
             Arc::new(ASAPQueryEngine::new(15_000)),
-            Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            sketch_index,
         )
         .with_active_physical_plan(active)
         .with_remote_write(receiver.clone());
@@ -3657,7 +3665,7 @@ aggregations:
                 aggregation_type: AggregationType::Sum,
                 aggregation_sub_type: String::new(),
                 parameters: HashMap::new(),
-                grouping_labels: KeyByLabelNames::empty(),
+                grouping_labels: KeyByLabelNames::empty().into(),
                 aggregated_labels: KeyByLabelNames::empty(),
                 rollup_labels: KeyByLabelNames::empty(),
                 original_yaml: String::new(),
@@ -3671,7 +3679,7 @@ aggregations:
                 metric: metric.clone(),
                 num_aggregates_to_retain: None,
                 table_name: None,
-                value_column: None,
+                value_projection: None,
                 table_population: None,
                 table_timestamp_column: None,
                 partitioning: None,
@@ -6263,14 +6271,23 @@ async fn handle_activate_physical_plan(
     };
     let _guard = state.physical_plan_lock.lock().await;
     let store = Arc::clone(&state.sketch_index);
+    let remote_write = state.remote_write.clone();
     let old = match lifecycle.activate_with_prepare(
         request.plan_id,
         request.plan_version,
         unix_time_ms(),
         move |plan| match plan.summary_catalog.as_ref() {
-            Some(catalog) => store
-                .install_summary_catalog(Arc::clone(catalog))
-                .map_err(|error| format!("SummaryCatalog install error: {error}")),
+            Some(catalog) => {
+                store
+                    .install_summary_catalog(Arc::clone(catalog))
+                    .map_err(|error| format!("SummaryCatalog install error: {error}"))?;
+                if let Some(receiver) = &remote_write {
+                    receiver.install_erp_observation_generation(
+                        catalog.reference().map_err(|error| error.to_string())?,
+                    );
+                }
+                Ok(())
+            }
             None => Err("authoritative SummaryCatalog is unavailable".to_string()),
         },
     ) {

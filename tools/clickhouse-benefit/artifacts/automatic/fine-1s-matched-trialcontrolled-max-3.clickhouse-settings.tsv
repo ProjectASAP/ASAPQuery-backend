@@ -1,0 +1,2 @@
+max_threads	auto(2)
+use_query_cache	0

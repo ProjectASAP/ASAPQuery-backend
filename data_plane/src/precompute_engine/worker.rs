@@ -37,6 +37,8 @@ use tracing::{debug, debug_span, info, warn};
 /// producing one output per (sid, window) — exactly like Arroyo's
 /// `GROUP BY window, key`.
 struct GroupState {
+    series_id: u64,
+    catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
     input_revisions: BTreeMap<i64, Arc<crate::storage_engines::types::SummaryInputRevision>>,
     config: Arc<AggregationConfig>,
     /// Source policy fingerprint that minted this sid. Held so
@@ -150,6 +152,7 @@ pub struct WorkerRuntimeConfig {
 pub struct Worker {
     erp_observer: Option<Arc<super::erp_observer::RuntimeErpObserver>>,
     current_input_revision: Option<Arc<crate::storage_engines::types::SummaryInputRevision>>,
+    current_catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
     id: usize,
     receiver: mpsc::Receiver<WorkerMessage>,
     output_sink: Arc<dyn OutputSink>,
@@ -213,6 +216,7 @@ impl Worker {
         Self {
             erp_observer: None,
             current_input_revision: None,
+            current_catalog_generation: None,
             id,
             receiver,
             output_sink,
@@ -247,17 +251,31 @@ impl Worker {
         let mut processing_error: Option<String> = None;
         while let Some(msg) = self.receiver.recv().await {
             let msg = match msg {
-                WorkerMessage::Admitted { input, revision } => {
-                    self.current_input_revision = Some(revision);
+                WorkerMessage::BoundInput {
+                    input,
+                    generation,
+                    revision,
+                } => {
+                    if revision
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.generation != generation)
+                    {
+                        processing_error =
+                            Some("input receipt differs from captured generation".into());
+                        continue;
+                    }
+                    self.current_catalog_generation = Some(generation);
+                    self.current_input_revision = revision;
                     *input
                 }
                 message => {
                     self.current_input_revision = None;
+                    self.current_catalog_generation = None;
                     message
                 }
             };
             match msg {
-                WorkerMessage::Admitted { .. } => {
+                WorkerMessage::BoundInput { .. } => {
                     processing_error = Some("nested admission receipt".into());
                 }
                 WorkerMessage::GroupSamples {
@@ -413,6 +431,8 @@ impl Worker {
             let cfg = snap.get_aggregation_config(policy_fp.as_u64())?;
             let config = Arc::new(cfg.clone());
             let gs = GroupState {
+                series_id: sid,
+                catalog_generation: self.current_catalog_generation.clone(),
                 input_revisions: BTreeMap::new(),
                 window_manager: WindowManager::with_layout(
                     config.window_size,
@@ -608,6 +628,8 @@ impl Worker {
                                 PolicyFingerprint::from_config(&state.config),
                                 group_key,
                                 &state.input_revisions,
+                                state.series_id,
+                                state.catalog_generation.as_ref(),
                             );
                             emit_batch.push((output, updater.take_accumulator()));
                             debug!(
@@ -673,6 +695,8 @@ impl Worker {
                     PolicyFingerprint::from_config(&state.config),
                     group_key,
                     &state.input_revisions,
+                    state.series_id,
+                    state.catalog_generation.as_ref(),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -802,6 +826,8 @@ impl Worker {
                             PolicyFingerprint::from_config(&state.config),
                             group_key,
                             &state.input_revisions,
+                            state.series_id,
+                            state.catalog_generation.as_ref(),
                         );
                         emit_batch.push((output, incoming.clone_boxed_core()));
                     }
@@ -848,6 +874,8 @@ impl Worker {
                     PolicyFingerprint::from_config(&state.config),
                     group_key,
                     &state.input_revisions,
+                    state.series_id,
+                    state.catalog_generation.as_ref(),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -864,6 +892,8 @@ impl Worker {
                     PolicyFingerprint::from_config(&state.config),
                     group_key,
                     &state.input_revisions,
+                    state.series_id,
+                    state.catalog_generation.as_ref(),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -1054,6 +1084,8 @@ impl Worker {
                         PolicyFingerprint::from_config(&state.config),
                         &group_key,
                         &state.input_revisions,
+                        state.series_id,
+                        state.catalog_generation.as_ref(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1069,6 +1101,8 @@ impl Worker {
                         PolicyFingerprint::from_config(&state.config),
                         &group_key,
                         &state.input_revisions,
+                        state.series_id,
+                        state.catalog_generation.as_ref(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1156,6 +1190,8 @@ impl Worker {
                         PolicyFingerprint::from_config(&state.config),
                         &group_key,
                         &state.input_revisions,
+                        state.series_id,
+                        state.catalog_generation.as_ref(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1171,6 +1207,8 @@ impl Worker {
                         PolicyFingerprint::from_config(&state.config),
                         &group_key,
                         &state.input_revisions,
+                        state.series_id,
+                        state.catalog_generation.as_ref(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1291,9 +1329,13 @@ fn precomputed_output_for_group(
     policy_fp: PolicyFingerprint,
     group_key: &GroupKey,
     input_revisions: &BTreeMap<i64, Arc<crate::storage_engines::types::SummaryInputRevision>>,
+    series_id: u64,
+    catalog_generation: Option<&Arc<asap_types::sds::CatalogGeneration>>,
 ) -> PrecomputedOutput {
     let mut output = PrecomputedOutput::new(start_timestamp, end_timestamp, Some(key), policy_fp)
         .with_population_labels(population_labels_from_group_key(group_key));
+    output.series_id = Some(series_id);
+    output.catalog_generation = catalog_generation.cloned();
     output.input_revision = i64::try_from(start_timestamp)
         .ok()
         .and_then(|start| input_revisions.get(&start).cloned());
@@ -1316,7 +1358,7 @@ pub fn extract_key_from_series(series_key: &str, config: &AggregationConfig) -> 
     let labels = parse_labels_from_series_key(series_key);
     let mut values = Vec::new();
 
-    for label_name in &config.grouping_labels.labels {
+    for label_name in &config.grouping_labels.names() {
         if let Some(val) = labels.get(label_name.as_str()) {
             values.push(val.to_string());
         } else {
@@ -2792,6 +2834,8 @@ aggregations:
             PolicyFingerprint(7),
             &group,
             &BTreeMap::new(),
+            1,
+            None,
         );
         assert_eq!(
             output.population_labels,

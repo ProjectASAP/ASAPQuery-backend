@@ -1,0 +1,743 @@
+{
+  "scope": "fixed-window repeated queries; excludes common source ingestion and offline planning cost",
+  "trials": [
+    {
+      "query": "q05",
+      "trial": "trial-1-q05",
+      "numeric_pairs_equal": 1000,
+      "warm_requests": 1000,
+      "latency_speedup": 21.573089315157763,
+      "routes": {
+        "backend": {
+          "requests": 1000,
+          "median_ms": 2.3571194999999996,
+          "p95_ms": 2.797406,
+          "request_time_rate_per_second": 422.34594680611144,
+          "backend_cpu_s_during_requests": 1.31,
+          "clickhouse_cpu_s_during_requests": 0.18,
+          "max_observed_backend_rss_bytes": 113074176,
+          "max_observed_clickhouse_rss_bytes": 1029861376
+        },
+        "exact": {
+          "requests": 1000,
+          "median_ms": 50.8503495,
+          "p95_ms": 72.84543,
+          "request_time_rate_per_second": 18.953400238689348,
+          "backend_cpu_s_during_requests": 0.04,
+          "clickhouse_cpu_s_during_requests": 88.92,
+          "max_observed_backend_rss_bytes": 113074176,
+          "max_observed_clickhouse_rss_bytes": 1029861376
+        }
+      },
+      "install_and_backfill_s": 4.289933355,
+      "build_cpu_s": {
+        "backend": 2.75,
+        "clickhouse": 1.29
+      },
+      "process_after_build": {
+        "backend": {
+          "cpu_ticks": 278,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 118611968,
+          "VmRSS": 93077504
+        },
+        "clickhouse": {
+          "cpu_ticks": 756,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 928849920,
+          "VmRSS": 865157120
+        }
+      },
+      "process_after_queries": {
+        "backend": {
+          "cpu_ticks": 413,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 118611968,
+          "VmRSS": 113074176
+        },
+        "clickhouse": {
+          "cpu_ticks": 9696,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 1029861376,
+          "VmRSS": 868360192
+        }
+      },
+      "state_directory_bytes_at_build": 5238,
+      "state_directory_bytes_after_stop": 7008,
+      "first_post_build_request_ms": {
+        "backend": 5.247254,
+        "exact": 72.45841
+      },
+      "backend_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "clickhouse_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "raw_trace": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-1-q05/q05/requests.jsonl",
+      "raw_sha256": "6d6f7c36aa924d1c52d533a023d304169bf8179d09340f120d55337fcd3c7f99"
+    },
+    {
+      "query": "q06",
+      "trial": "trial-1-q06",
+      "numeric_pairs_equal": 1000,
+      "warm_requests": 1000,
+      "latency_speedup": 8.966121744078176,
+      "routes": {
+        "backend": {
+          "requests": 1000,
+          "median_ms": 2.2706895,
+          "p95_ms": 2.743556,
+          "request_time_rate_per_second": 434.58155879595193,
+          "backend_cpu_s_during_requests": 1.26,
+          "clickhouse_cpu_s_during_requests": 0.39,
+          "max_observed_backend_rss_bytes": 63422464,
+          "max_observed_clickhouse_rss_bytes": 1027055616
+        },
+        "exact": {
+          "requests": 1000,
+          "median_ms": 20.359278500000002,
+          "p95_ms": 34.012472,
+          "request_time_rate_per_second": 45.640250449306194,
+          "backend_cpu_s_during_requests": 0.01,
+          "clickhouse_cpu_s_during_requests": 31.92,
+          "max_observed_backend_rss_bytes": 63422464,
+          "max_observed_clickhouse_rss_bytes": 1027338240
+        }
+      },
+      "install_and_backfill_s": 1.771135748,
+      "build_cpu_s": {
+        "backend": 0.55,
+        "clickhouse": 0.24
+      },
+      "process_after_build": {
+        "backend": {
+          "cpu_ticks": 59,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 48328704,
+          "VmRSS": 43794432
+        },
+        "clickhouse": {
+          "cpu_ticks": 561,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 825528320,
+          "VmRSS": 801665024
+        }
+      },
+      "process_after_queries": {
+        "backend": {
+          "cpu_ticks": 186,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 63422464,
+          "VmRSS": 63422464
+        },
+        "clickhouse": {
+          "cpu_ticks": 3806,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 1031806976,
+          "VmRSS": 1005379584
+        }
+      },
+      "state_directory_bytes_at_build": 5238,
+      "state_directory_bytes_after_stop": 5238,
+      "first_post_build_request_ms": {
+        "backend": 5.141876,
+        "exact": 35.229285
+      },
+      "backend_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "clickhouse_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "raw_trace": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-1-q06/q06/requests.jsonl",
+      "raw_sha256": "f671c3032885973cb521e4b7af450f5698391dc004a82fbc6d611c1dd7037724"
+    },
+    {
+      "query": "q23",
+      "trial": "trial-1-q23",
+      "numeric_pairs_equal": 1000,
+      "warm_requests": 1000,
+      "latency_speedup": 13.844018231429525,
+      "routes": {
+        "backend": {
+          "requests": 1000,
+          "median_ms": 2.4299795,
+          "p95_ms": 2.933214,
+          "request_time_rate_per_second": 400.44073885234246,
+          "backend_cpu_s_during_requests": 1.33,
+          "clickhouse_cpu_s_during_requests": 0.35,
+          "max_observed_backend_rss_bytes": 85598208,
+          "max_observed_clickhouse_rss_bytes": 1049919488
+        },
+        "exact": {
+          "requests": 1000,
+          "median_ms": 33.6406805,
+          "p95_ms": 48.905244,
+          "request_time_rate_per_second": 27.98093622395067,
+          "backend_cpu_s_during_requests": 0.07,
+          "clickhouse_cpu_s_during_requests": 52.32,
+          "max_observed_backend_rss_bytes": 85598208,
+          "max_observed_clickhouse_rss_bytes": 1049587712
+        }
+      },
+      "install_and_backfill_s": 2.782158745,
+      "build_cpu_s": {
+        "backend": 1.35,
+        "clickhouse": 0.84
+      },
+      "process_after_build": {
+        "backend": {
+          "cpu_ticks": 139,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 74645504,
+          "VmRSS": 66084864
+        },
+        "clickhouse": {
+          "cpu_ticks": 597,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 868454400,
+          "VmRSS": 867385344
+        }
+      },
+      "process_after_queries": {
+        "backend": {
+          "cpu_ticks": 279,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 85598208,
+          "VmRSS": 85598208
+        },
+        "clickhouse": {
+          "cpu_ticks": 5889,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 1050730496,
+          "VmRSS": 838840320
+        }
+      },
+      "state_directory_bytes_at_build": 5238,
+      "state_directory_bytes_after_stop": 6122,
+      "first_post_build_request_ms": {
+        "backend": 6.238476,
+        "exact": 37.060582
+      },
+      "backend_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "clickhouse_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "raw_trace": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-1-q23/q23/requests.jsonl",
+      "raw_sha256": "ee05883c651673b36df8608dc31d421d51e37c597f5d8a47cd0d2ea434bf53ba"
+    },
+    {
+      "query": "q05",
+      "trial": "trial-2-q05",
+      "numeric_pairs_equal": 1000,
+      "warm_requests": 1000,
+      "latency_speedup": 21.037893332050977,
+      "routes": {
+        "backend": {
+          "requests": 1000,
+          "median_ms": 2.433027,
+          "p95_ms": 2.870542,
+          "request_time_rate_per_second": 399.68444625195576,
+          "backend_cpu_s_during_requests": 1.38,
+          "clickhouse_cpu_s_during_requests": 0.39,
+          "max_observed_backend_rss_bytes": 112373760,
+          "max_observed_clickhouse_rss_bytes": 1034268672
+        },
+        "exact": {
+          "requests": 1000,
+          "median_ms": 51.185762499999996,
+          "p95_ms": 77.391198,
+          "request_time_rate_per_second": 18.836641733699338,
+          "backend_cpu_s_during_requests": 0.03,
+          "clickhouse_cpu_s_during_requests": 89.05,
+          "max_observed_backend_rss_bytes": 112373760,
+          "max_observed_clickhouse_rss_bytes": 1034608640
+        }
+      },
+      "install_and_backfill_s": 4.291561459,
+      "build_cpu_s": {
+        "backend": 2.8,
+        "clickhouse": 1.0
+      },
+      "process_after_build": {
+        "backend": {
+          "cpu_ticks": 284,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 119218176,
+          "VmRSS": 93425664
+        },
+        "clickhouse": {
+          "cpu_ticks": 640,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 920530944,
+          "VmRSS": 868999168
+        }
+      },
+      "process_after_queries": {
+        "backend": {
+          "cpu_ticks": 427,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 119218176,
+          "VmRSS": 112373760
+        },
+        "clickhouse": {
+          "cpu_ticks": 9629,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 1034608640,
+          "VmRSS": 844017664
+        }
+      },
+      "state_directory_bytes_at_build": 5238,
+      "state_directory_bytes_after_stop": 7008,
+      "first_post_build_request_ms": {
+        "backend": 5.668682,
+        "exact": 84.462201
+      },
+      "backend_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "clickhouse_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "raw_trace": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-2-q05/q05/requests.jsonl",
+      "raw_sha256": "65fc261c415cc3485a58bf301e0a7ffef2bb2c8a4c22e69122ed63a25555c53f"
+    },
+    {
+      "query": "q06",
+      "trial": "trial-2-q06",
+      "numeric_pairs_equal": 1000,
+      "warm_requests": 1000,
+      "latency_speedup": 8.373888984752382,
+      "routes": {
+        "backend": {
+          "requests": 1000,
+          "median_ms": 2.3789615,
+          "p95_ms": 2.744391,
+          "request_time_rate_per_second": 419.6522049931427,
+          "backend_cpu_s_during_requests": 1.29,
+          "clickhouse_cpu_s_during_requests": 0.39,
+          "max_observed_backend_rss_bytes": 63205376,
+          "max_observed_clickhouse_rss_bytes": 1022054400
+        },
+        "exact": {
+          "requests": 1000,
+          "median_ms": 19.9211595,
+          "p95_ms": 32.514515,
+          "request_time_rate_per_second": 46.399180384610496,
+          "backend_cpu_s_during_requests": 0.01,
+          "clickhouse_cpu_s_during_requests": 30.98,
+          "max_observed_backend_rss_bytes": 63205376,
+          "max_observed_clickhouse_rss_bytes": 1022054400
+        }
+      },
+      "install_and_backfill_s": 1.770374337,
+      "build_cpu_s": {
+        "backend": 0.55,
+        "clickhouse": 0.42
+      },
+      "process_after_build": {
+        "backend": {
+          "cpu_ticks": 58,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 48218112,
+          "VmRSS": 43552768
+        },
+        "clickhouse": {
+          "cpu_ticks": 598,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 811405312,
+          "VmRSS": 798826496
+        }
+      },
+      "process_after_queries": {
+        "backend": {
+          "cpu_ticks": 188,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 63205376,
+          "VmRSS": 63205376
+        },
+        "clickhouse": {
+          "cpu_ticks": 3765,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 1022054400,
+          "VmRSS": 916492288
+        }
+      },
+      "state_directory_bytes_at_build": 5238,
+      "state_directory_bytes_after_stop": 5238,
+      "first_post_build_request_ms": {
+        "backend": 4.364995,
+        "exact": 40.993606
+      },
+      "backend_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "clickhouse_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "raw_trace": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-2-q06/q06/requests.jsonl",
+      "raw_sha256": "c4345d24793e863c2e9af41901854e6ce0145c626c1e44f5e1e6df7310c37b33"
+    },
+    {
+      "query": "q23",
+      "trial": "trial-2-q23",
+      "numeric_pairs_equal": 1000,
+      "warm_requests": 1000,
+      "latency_speedup": 14.663263235615045,
+      "routes": {
+        "backend": {
+          "requests": 1000,
+          "median_ms": 2.414867,
+          "p95_ms": 2.883722,
+          "request_time_rate_per_second": 407.0072293824753,
+          "backend_cpu_s_during_requests": 1.37,
+          "clickhouse_cpu_s_during_requests": 0.34,
+          "max_observed_backend_rss_bytes": 84406272,
+          "max_observed_clickhouse_rss_bytes": 1030189056
+        },
+        "exact": {
+          "requests": 1000,
+          "median_ms": 35.4098305,
+          "p95_ms": 51.677955,
+          "request_time_rate_per_second": 27.23270500509498,
+          "backend_cpu_s_during_requests": 0.04,
+          "clickhouse_cpu_s_during_requests": 53.73,
+          "max_observed_backend_rss_bytes": 84406272,
+          "max_observed_clickhouse_rss_bytes": 1030373376
+        }
+      },
+      "install_and_backfill_s": 2.777689036,
+      "build_cpu_s": {
+        "backend": 1.38,
+        "clickhouse": 0.6
+      },
+      "process_after_build": {
+        "backend": {
+          "cpu_ticks": 142,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 75399168,
+          "VmRSS": 65105920
+        },
+        "clickhouse": {
+          "cpu_ticks": 611,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 861368320,
+          "VmRSS": 844075008
+        }
+      },
+      "process_after_queries": {
+        "backend": {
+          "cpu_ticks": 283,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 84406272,
+          "VmRSS": 84406272
+        },
+        "clickhouse": {
+          "cpu_ticks": 6045,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 1030373376,
+          "VmRSS": 854810624
+        }
+      },
+      "state_directory_bytes_at_build": 5238,
+      "state_directory_bytes_after_stop": 6122,
+      "first_post_build_request_ms": {
+        "backend": 5.632831,
+        "exact": 36.710725
+      },
+      "backend_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "clickhouse_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "raw_trace": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-2-q23/q23/requests.jsonl",
+      "raw_sha256": "8fa00d84d1d2f5264d13168e39825cd97419cfa9c903a604d56ceb6651694d7c"
+    },
+    {
+      "query": "q05",
+      "trial": "trial-3-q05",
+      "numeric_pairs_equal": 1000,
+      "warm_requests": 1000,
+      "latency_speedup": 21.741075496175057,
+      "routes": {
+        "backend": {
+          "requests": 1000,
+          "median_ms": 2.3618680000000003,
+          "p95_ms": 2.857925,
+          "request_time_rate_per_second": 417.6474853349689,
+          "backend_cpu_s_during_requests": 1.36,
+          "clickhouse_cpu_s_during_requests": 0.25,
+          "max_observed_backend_rss_bytes": 112996352,
+          "max_observed_clickhouse_rss_bytes": 1061302272
+        },
+        "exact": {
+          "requests": 1000,
+          "median_ms": 51.3495505,
+          "p95_ms": 77.297097,
+          "request_time_rate_per_second": 18.608955117751,
+          "backend_cpu_s_during_requests": 0.06,
+          "clickhouse_cpu_s_during_requests": 89.79,
+          "max_observed_backend_rss_bytes": 112996352,
+          "max_observed_clickhouse_rss_bytes": 1061408768
+        }
+      },
+      "install_and_backfill_s": 4.29229429,
+      "build_cpu_s": {
+        "backend": 2.73,
+        "clickhouse": 1.07
+      },
+      "process_after_build": {
+        "backend": {
+          "cpu_ticks": 277,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 119361536,
+          "VmRSS": 93249536
+        },
+        "clickhouse": {
+          "cpu_ticks": 724,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 991547392,
+          "VmRSS": 802988032
+        }
+      },
+      "process_after_queries": {
+        "backend": {
+          "cpu_ticks": 419,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 119361536,
+          "VmRSS": 112996352
+        },
+        "clickhouse": {
+          "cpu_ticks": 9789,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 1061408768,
+          "VmRSS": 891162624
+        }
+      },
+      "state_directory_bytes_at_build": 5238,
+      "state_directory_bytes_after_stop": 7008,
+      "first_post_build_request_ms": {
+        "backend": 4.985173,
+        "exact": 146.821824
+      },
+      "backend_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "clickhouse_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "raw_trace": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-3-q05/q05/requests.jsonl",
+      "raw_sha256": "58046878910dbf4d93d4d3ff569e1f40423086260237cbaa23845993e44ff2a0"
+    },
+    {
+      "query": "q06",
+      "trial": "trial-3-q06",
+      "numeric_pairs_equal": 1000,
+      "warm_requests": 1000,
+      "latency_speedup": 8.72838994110124,
+      "routes": {
+        "backend": {
+          "requests": 1000,
+          "median_ms": 2.2988600000000003,
+          "p95_ms": 2.744593,
+          "request_time_rate_per_second": 428.3359654378522,
+          "backend_cpu_s_during_requests": 1.25,
+          "clickhouse_cpu_s_during_requests": 0.5,
+          "max_observed_backend_rss_bytes": 64716800,
+          "max_observed_clickhouse_rss_bytes": 1071005696
+        },
+        "exact": {
+          "requests": 1000,
+          "median_ms": 20.0653465,
+          "p95_ms": 33.411354,
+          "request_time_rate_per_second": 46.06321649971232,
+          "backend_cpu_s_during_requests": 0.02,
+          "clickhouse_cpu_s_during_requests": 31.53,
+          "max_observed_backend_rss_bytes": 64716800,
+          "max_observed_clickhouse_rss_bytes": 1071005696
+        }
+      },
+      "install_and_backfill_s": 1.772314251,
+      "build_cpu_s": {
+        "backend": 0.52,
+        "clickhouse": 0.3
+      },
+      "process_after_build": {
+        "backend": {
+          "cpu_ticks": 55,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 48406528,
+          "VmRSS": 43905024
+        },
+        "clickhouse": {
+          "cpu_ticks": 586,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 828514304,
+          "VmRSS": 806227968
+        }
+      },
+      "process_after_queries": {
+        "backend": {
+          "cpu_ticks": 183,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 64716800,
+          "VmRSS": 64716800
+        },
+        "clickhouse": {
+          "cpu_ticks": 3817,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 1071005696,
+          "VmRSS": 866656256
+        }
+      },
+      "state_directory_bytes_at_build": 5238,
+      "state_directory_bytes_after_stop": 5238,
+      "first_post_build_request_ms": {
+        "backend": 4.753846,
+        "exact": 36.319163
+      },
+      "backend_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "clickhouse_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "raw_trace": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-3-q06/q06/requests.jsonl",
+      "raw_sha256": "212c6e2c61640348dd362e3f9bc5744cff9e7ef54c10545f6221b7bae43c4e7d"
+    },
+    {
+      "query": "q23",
+      "trial": "trial-3-q23",
+      "numeric_pairs_equal": 1000,
+      "warm_requests": 1000,
+      "latency_speedup": 14.699514293456742,
+      "routes": {
+        "backend": {
+          "requests": 1000,
+          "median_ms": 2.369126,
+          "p95_ms": 2.858031,
+          "request_time_rate_per_second": 414.0231017330702,
+          "backend_cpu_s_during_requests": 1.36,
+          "clickhouse_cpu_s_during_requests": 0.37,
+          "max_observed_backend_rss_bytes": 84619264,
+          "max_observed_clickhouse_rss_bytes": 1056153600
+        },
+        "exact": {
+          "requests": 1000,
+          "median_ms": 34.8250015,
+          "p95_ms": 54.463904,
+          "request_time_rate_per_second": 27.23789216168408,
+          "backend_cpu_s_during_requests": 0.03,
+          "clickhouse_cpu_s_during_requests": 53.69,
+          "max_observed_backend_rss_bytes": 84619264,
+          "max_observed_clickhouse_rss_bytes": 1056423936
+        }
+      },
+      "install_and_backfill_s": 2.782497867,
+      "build_cpu_s": {
+        "backend": 1.37,
+        "clickhouse": 0.65
+      },
+      "process_after_build": {
+        "backend": {
+          "cpu_ticks": 141,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 74371072,
+          "VmRSS": 65110016
+        },
+        "clickhouse": {
+          "cpu_ticks": 623,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 868835328,
+          "VmRSS": 863690752
+        }
+      },
+      "process_after_queries": {
+        "backend": {
+          "cpu_ticks": 281,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 84619264,
+          "VmRSS": 84619264
+        },
+        "clickhouse": {
+          "cpu_ticks": 6053,
+          "clock_ticks_per_second": 100,
+          "VmHWM": 1056423936,
+          "VmRSS": 862023680
+        }
+      },
+      "state_directory_bytes_at_build": 5238,
+      "state_directory_bytes_after_stop": 6122,
+      "first_post_build_request_ms": {
+        "backend": 4.921386,
+        "exact": 47.286535
+      },
+      "backend_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "clickhouse_budget": {
+        "image": "sha256:fa394da808cc53f76d0344429421d6c422a6ee85fe7450135c0e3cff4df9bcbb",
+        "cpu_affinity": "60,61",
+        "nano_cpus": 2000000000,
+        "memory_limit_bytes": 4294967296
+      },
+      "raw_trace": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-3-q23/q23/requests.jsonl",
+      "raw_sha256": "5a0554274d325f6ddec93830e7af7f28798e9e893ed4b5868e984cc67d87b1e7"
+    }
+  ]
+}

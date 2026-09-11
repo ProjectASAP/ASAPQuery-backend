@@ -121,11 +121,27 @@ impl PolicyFingerprint {
 
         // 5. grouping_labels (already sorted at construction per
         //    KeyByLabelNames invariant; encode as `,`-joined list)
-        for l in &cfg.grouping_labels.labels {
+        for l in &cfg.grouping_labels.names() {
             buf.extend_from_slice(l.as_bytes());
             buf.push(b',');
         }
         buf.push(0);
+
+        if cfg.table_name.is_some() && !cfg.grouping_labels.is_empty() {
+            buf.extend_from_slice(
+                crate::grouping_projection::TABLE_GROUP_OBSERVATION_SEMANTICS.as_bytes(),
+            );
+            buf.push(0);
+        }
+        if !cfg.grouping_labels.is_legacy_labels() {
+            buf.extend_from_slice(b"typed-grouping:");
+            buf.extend_from_slice(
+                serde_json::to_string(&cfg.grouping_labels)
+                    .expect("group projection serializes")
+                    .as_bytes(),
+            );
+            buf.push(0);
+        }
 
         // 6. aggregated_labels
         for l in &cfg.aggregated_labels.labels {
@@ -180,8 +196,19 @@ impl PolicyFingerprint {
             buf.extend_from_slice(b"\0sql-source-v1\0");
             buf.extend_from_slice(table.as_bytes());
             buf.push(0);
-            if let Some(column) = &cfg.value_column {
+            if let Some(column) = cfg.effective_value_projection().column() {
                 buf.extend_from_slice(column.as_bytes());
+            }
+            if matches!(
+                cfg.effective_value_projection(),
+                crate::sds::ValueProjectionIdentity::Constant { .. }
+            ) {
+                buf.extend_from_slice(b"\0constant-projection-v1\0");
+                buf.extend_from_slice(
+                    serde_json::to_string(cfg.effective_value_projection())
+                        .expect("finite validated projection serializes")
+                        .as_bytes(),
+                );
             }
         }
         if let Some(population) = &cfg.table_population {

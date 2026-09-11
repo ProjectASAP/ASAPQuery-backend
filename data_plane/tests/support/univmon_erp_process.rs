@@ -284,7 +284,7 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
     for key in keys {
         let record = runtime_samples.latest(&key).unwrap();
         let observed: asap_types::erp_observation::ErpPopulationObservations<
-            control_plane::physical::erp::ErpObservedShape,
+            asap_types::erp_observation::EmpiricalFrequencyObservation,
         > = serde_json::from_value(record.payload["erp_population_observations"].clone()).unwrap();
         assert!(observed.invalid_reason.is_none(), "{observed:?}");
         assert!(!observed.populations.is_empty());

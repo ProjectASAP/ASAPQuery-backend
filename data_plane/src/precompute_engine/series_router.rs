@@ -25,10 +25,12 @@ use xxhash_rust::xxh64::xxh64;
 /// by sid without losing the data the legacy `(agg_id, group_key)` shape
 /// carried.
 pub enum WorkerMessage {
-    /// Receipt allocated after queue reservation and before any input is visible.
-    Admitted {
+    /// Immutable producer generation captured before routing. The optional
+    /// receipt proves atomic admission; absent receipts are never fabricated.
+    BoundInput {
         input: Box<WorkerMessage>,
-        revision: Arc<crate::storage_engines::types::SummaryInputRevision>,
+        generation: Arc<asap_types::sds::CatalogGeneration>,
+        revision: Option<Arc<crate::storage_engines::types::SummaryInputRevision>>,
     },
     /// A batch of samples for the same series, routed by series key.
     /// Used in `pass_raw_samples` mode where no aggregation is needed.
@@ -101,10 +103,15 @@ pub enum WorkerMessage {
 impl fmt::Debug for WorkerMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Admitted { input, revision } => f
-                .debug_struct("Admitted")
+            Self::BoundInput {
+                input,
+                generation,
+                revision,
+            } => f
+                .debug_struct("BoundInput")
                 .field("input", input)
-                .field("revision", &revision.revision)
+                .field("generation", generation)
+                .field("revision", &revision.as_ref().map(|value| value.revision))
                 .finish(),
             Self::RawSamples {
                 series_key,
@@ -163,9 +170,15 @@ impl SeriesRouter {
         }
     }
 
-    pub fn enable_erp_observation(&self, endpoint: String) -> Result<(), String> {
+    pub fn enable_erp_observation(
+        &self,
+        endpoint: String,
+        generation: asap_types::sds::CatalogGeneration,
+    ) -> Result<(), String> {
         self.erp_observer
-            .set(super::erp_observer::RuntimeErpObserver::new(endpoint))
+            .set(super::erp_observer::RuntimeErpObserver::new(
+                endpoint, generation,
+            ))
             .map_err(|_| "ERP observer already configured".into())
     }
     pub fn erp_observer(&self) -> Option<std::sync::Arc<super::erp_observer::RuntimeErpObserver>> {
@@ -182,12 +195,13 @@ impl SeriesRouter {
         &self,
         messages: Vec<WorkerMessage>,
         _ingest_received_at: Instant,
+        generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Group messages by target worker index
         let mut per_worker: HashMap<usize, Vec<WorkerMessage>> = HashMap::new();
         for msg in messages {
             let worker_idx = match &msg {
-                WorkerMessage::Admitted { .. } => {
+                WorkerMessage::BoundInput { .. } => {
                     return Err("input must be admitted by the router".into())
                 }
                 WorkerMessage::GroupSamples { sid, .. } => self.worker_for_sid(*sid),
@@ -195,7 +209,15 @@ impl SeriesRouter {
                 WorkerMessage::RawSamples { series_key, .. } => self.worker_for(series_key),
                 _ => 0,
             };
-            per_worker.entry(worker_idx).or_default().push(msg);
+            let message = match &generation {
+                Some(generation) => WorkerMessage::BoundInput {
+                    input: Box::new(msg),
+                    generation: Arc::clone(generation),
+                    revision: None,
+                },
+                None => msg,
+            };
+            per_worker.entry(worker_idx).or_default().push(message);
         }
 
         // Send to each worker concurrently
@@ -245,7 +267,7 @@ impl SeriesRouter {
                 WorkerMessage::GroupSamples { sid, .. }
                 | WorkerMessage::AccumulatorInput { sid, .. } => self.worker_for_sid(*sid),
                 WorkerMessage::RawSamples { series_key, .. } => self.worker_for(series_key),
-                WorkerMessage::Admitted { .. } => {
+                WorkerMessage::BoundInput { .. } => {
                     return Err(TryRouteError::Admission("input already admitted".into()))
                 }
                 WorkerMessage::Flush | WorkerMessage::Drain(_) | WorkerMessage::Shutdown => 0,
@@ -262,9 +284,10 @@ impl SeriesRouter {
         let revision = admit().map_err(TryRouteError::Admission)?;
         for (permit, message) in pending {
             permit.send(match &revision {
-                Some(revision) => WorkerMessage::Admitted {
+                Some(revision) => WorkerMessage::BoundInput {
                     input: Box::new(message),
-                    revision: Arc::clone(revision),
+                    generation: Arc::clone(&revision.generation),
+                    revision: Some(Arc::clone(revision)),
                 },
                 None => message,
             });
