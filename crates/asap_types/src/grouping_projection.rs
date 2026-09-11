@@ -337,3 +337,103 @@ mod codec_tests {
         assert!(decode_table_group_value("not base64").is_err());
     }
 }
+
+/// Canonical label-population identity. This codec does not replace any
+/// persisted routing key implicitly: consumers must select its version as part
+/// of their contract. This key remains scoped by the existing summary/data
+/// definition; it does not replace source identity, partitioning or schema.
+/// Typed table values retain their existing value codec.
+pub const LABEL_POPULATION_KEY_PREFIX: &str = "asap.label-population.v1:";
+
+pub fn encode_label_population_key(
+    labels: &std::collections::BTreeMap<String, String>,
+) -> Result<String, String> {
+    use base64::Engine;
+    let pairs: Vec<_> = labels.iter().collect();
+    let bytes = serde_json::to_vec(&pairs).map_err(|error| error.to_string())?;
+    Ok(format!(
+        "{LABEL_POPULATION_KEY_PREFIX}{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+/// Reject legacy, unknown-version, duplicate-name and noncanonical encodings.
+/// In particular, decoding must never silently collapse duplicate populations.
+pub fn decode_label_population_key(
+    encoded: &str,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    use base64::Engine;
+    let payload = encoded
+        .strip_prefix(LABEL_POPULATION_KEY_PREFIX)
+        .ok_or("unsupported label population key version")?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .map_err(|error| error.to_string())?;
+    let pairs: Vec<(String, String)> =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    let mut labels = std::collections::BTreeMap::new();
+    for (key, value) in pairs {
+        if labels.insert(key, value).is_some() {
+            return Err("duplicate label population key".into());
+        }
+    }
+    if encode_label_population_key(&labels)? != encoded {
+        return Err("noncanonical label population key".into());
+    }
+    Ok(labels)
+}
+
+#[cfg(test)]
+mod population_key_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    #[test]
+    fn delimiter_collisions_and_order_are_unambiguous() {
+        let one = BTreeMap::from([("a".into(), "b;c=d".into())]);
+        let two = BTreeMap::from([("a".into(), "b".into()), ("c".into(), "d".into())]);
+        assert_ne!(
+            encode_label_population_key(&one).unwrap(),
+            encode_label_population_key(&two).unwrap()
+        );
+        let reversed = [("c".into(), "d".into()), ("a".into(), "b".into())]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            encode_label_population_key(&two),
+            encode_label_population_key(&reversed)
+        );
+        for labels in [
+            one,
+            two,
+            BTreeMap::new(),
+            BTreeMap::from([("=;\0雪".into(), "\"\\\n\0".into())]),
+        ] {
+            let key = encode_label_population_key(&labels).unwrap();
+            assert_eq!(decode_label_population_key(&key).unwrap(), labels);
+            let serialized = serde_json::to_string(&key).unwrap();
+            assert_eq!(serde_json::from_str::<String>(&serialized).unwrap(), key);
+        }
+    }
+    #[test]
+    fn unknown_legacy_duplicate_and_noncanonical_keys_fail_closed() {
+        use base64::Engine;
+        for json in [
+            r#"[["a","1"],["a","2"]]"#,
+            r#"[["z","1"],["a","2"]]"#,
+            r#"[ ["a","1"] ]"#,
+        ] {
+            let key = format!(
+                "{LABEL_POPULATION_KEY_PREFIX}{}",
+                base64::engine::general_purpose::STANDARD.encode(json)
+            );
+            assert!(decode_label_population_key(&key).is_err());
+        }
+        for key in [
+            "a=b;",
+            "asap.label-population.v2:W10=",
+            "asap.label-population.v1:!",
+        ] {
+            assert!(decode_label_population_key(key).is_err());
+        }
+    }
+}
