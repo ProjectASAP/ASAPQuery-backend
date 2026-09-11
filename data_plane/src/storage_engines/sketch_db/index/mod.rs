@@ -1266,6 +1266,27 @@ impl SketchStore {
         window: TimestampRange,
         sample: SketchSampleState,
     ) -> bool {
+        let instances = self.instances.read().unwrap();
+        if instances.get(&sid).is_some_and(|binding| {
+            matches!(
+                binding.data_descriptor.source,
+                asap_types::sds::DataSourceIdentity::Derived { .. }
+            )
+        }) {
+            return false;
+        }
+        self.append_sample_with_binding(sid, series_label_values, window, sample)
+    }
+
+    // Caller retains the existing metadata guard and has rejected derived
+    // definitions. Avoid recursively acquiring it when a writer is waiting.
+    fn append_sample_with_binding(
+        &self,
+        sid: u64,
+        series_label_values: BTreeMap<String, String>,
+        window: TimestampRange,
+        sample: SketchSampleState,
+    ) -> bool {
         let completed = self.completed_windows.read().unwrap();
         if completed.get(&sid).is_some_and(|end| window.1 <= *end) {
             return false;
@@ -1308,6 +1329,27 @@ impl SketchStore {
     /// guard against (it'll crash the reducer at runtime, not silently
     /// corrupt).
     pub fn append_precompute(
+        &self,
+        sid: u64,
+        series_label_values: BTreeMap<String, String>,
+        window: TimestampRange,
+        payload: Box<dyn crate::storage_engines::types::AggregateCore>,
+    ) -> bool {
+        let instances = self.instances.read().unwrap();
+        if instances.get(&sid).is_some_and(|binding| {
+            matches!(
+                binding.data_descriptor.source,
+                asap_types::sds::DataSourceIdentity::Derived { .. }
+            )
+        }) {
+            return false;
+        }
+        self.append_precompute_with_binding(sid, series_label_values, window, payload)
+    }
+
+    // Caller retains the existing metadata guard and has rejected derived
+    // definitions. Avoid recursively acquiring it when a writer is waiting.
+    fn append_precompute_with_binding(
         &self,
         sid: u64,
         series_label_values: BTreeMap<String, String>,
@@ -2844,7 +2886,13 @@ impl SketchStore {
         // recreate orphan payload after the tombstone commits.
         let instances = self.instances.read().ok()?;
         let binding = instances.get(&sid)?;
-        if !binding.metadata.is_writable() || binding.metadata.policy_fp != output.policy_fp {
+        if !binding.metadata.is_writable()
+            || binding.metadata.policy_fp != output.policy_fp
+            || matches!(
+                binding.data_descriptor.source,
+                asap_types::sds::DataSourceIdentity::Derived { .. }
+            )
+        {
             return None;
         }
         if binding.catalog_generation.is_some() && output.catalog_generation.is_none() {
@@ -2883,7 +2931,7 @@ impl SketchStore {
 
         let window = (output.start_timestamp, output.end_timestamp);
         let accepted = match crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg) {
-            AggKind::Sketch { .. } => self.append_sample(
+            AggKind::Sketch { .. } => self.append_sample_with_binding(
                 sid,
                 label_values_map,
                 window,
@@ -2892,7 +2940,7 @@ impl SketchStore {
                     encoding: SketchEncoding::MsgpackFull,
                 },
             ),
-            AggKind::ExactAgg { .. } => self.append_precompute(
+            AggKind::ExactAgg { .. } => self.append_precompute_with_binding(
                 sid,
                 label_values_map,
                 window,

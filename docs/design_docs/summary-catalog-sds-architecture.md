@@ -506,8 +506,11 @@ The engine resumes a matching durable pending part and looks up the stored input
 digest before computing a potentially randomized sketch. The existing flusher publishes a new result through its part
 reservation protocol; SummaryStore fences query reads and physical lifetime
 changes during publication. A concurrent identical completion reuses the durable
-result instead of comparing newly randomized bytes. The latest committed window
-can be retried after restart without adding another part.
+result instead of comparing newly randomized bytes. Both pending recovery and a
+committed lookup restore the live completion boundary. Catalog-derived definitions
+reject additive sketch/precompute writes even beyond that boundary; only reserved
+publication may create their output state. The latest committed window can be
+retried after restart without adding another part.
 
 This is an explicit maintenance entry point, not automatic workload coverage.
 The initial consumer supports one source definition and population, complete

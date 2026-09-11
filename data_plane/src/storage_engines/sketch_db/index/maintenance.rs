@@ -163,10 +163,17 @@ impl SketchStore {
                 .or_insert(window.1);
             return Ok(true);
         }
-        Ok(publisher
+        let found = publisher
             .lookup_immutable_window(&record, digest, window.0, window.1)
             .map_err(|error| error.to_string())?
-            .is_some())
+            .is_some();
+        if found {
+            completed
+                .entry(sid)
+                .and_modify(|end| *end = (*end).max(window.1))
+                .or_insert(window.1);
+        }
+        Ok(found)
     }
 
     /// Publish a derived result without passing it through additive hot-state
@@ -273,5 +280,110 @@ impl SketchStore {
             crate::precompute_engine::metrics::record_materialized_outputs(1);
         }
         Ok(!published.already_published)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::precompute_engine::operators::SumAccumulator;
+    use crate::storage_engines::types::PrecomputedOutput;
+    use asap_types::traits::SerializableToSink;
+
+    #[test]
+    fn committed_recovery_restores_live_seal_and_rejects_additive_derived_writes() {
+        // A durable sidecar may survive an I/O error before the caller updates
+        // its live seal. Recovery must repair admission, not only return a hit.
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-planning-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let mut source_config = plan.precompute_plan.materializations[0].clone();
+        source_config.aggregation_type = asap_types::AggregationType::Sum;
+        source_config.aggregation_sub_type = "sum".into();
+        let source_id = source_config.policy_fingerprint().into();
+        let mut target = source_config.clone();
+        target.derived_input = Some(asap_types::derived_input::DerivedInputIdentity {
+            inputs: BTreeSet::from([source_id]),
+            program_sha256: "0".repeat(64),
+        });
+        let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
+            1,
+            1,
+            &[source_config, target.clone()],
+        )
+        .unwrap();
+        let store = Arc::new(SketchStore::new());
+        store.install_summary_catalog(Arc::new(catalog)).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = persistence::config::SketchStorePersistenceConfig::with_memory_limit(
+            1 << 24,
+            directory.path().to_path_buf(),
+        );
+        config.delete_older_than_ms = None;
+        config.hot_window_ms = None;
+        let mut persistence = store.start_persistence(config).unwrap();
+        let generation = store.active_catalog_generation().unwrap();
+        let mut output = PrecomputedOutput::new(0, 1000, None, target.policy_fingerprint());
+        output.catalog_generation = Some(Arc::clone(&generation));
+        store
+            .register_precompute_output(601, &target, &output)
+            .unwrap();
+        let record = store
+            .metadata_record(&store.instances.read().unwrap()[&601])
+            .unwrap();
+        let state = SumAccumulator::new();
+        let snapshot = persistence::source::EpochSnapshot {
+            agg_id: 601,
+            epoch_id: 0,
+            min_ts: 0,
+            max_ts: 1000,
+            approx_bytes: 0,
+            entries: vec![persistence::source::EpochSnapshotEntry {
+                start_ts: 0,
+                end_ts: 1000,
+                label: None,
+                sketch_type_name: state.type_name().into(),
+                encoding_tag: 0,
+                sketch_bytes: state.serialize_to_bytes(),
+            }],
+        };
+        persistence
+            .flusher
+            .publish_immutable_window(&record, [7; 32], &snapshot)
+            .unwrap();
+        assert!(!store.completed_windows.read().unwrap().contains_key(&601));
+        let input = FrozenExactWindows {
+            sid: 600,
+            definition: source_id,
+            generation,
+            group: BTreeMap::new(),
+            windows: BTreeMap::new(),
+        };
+        assert!(store
+            .recover_frozen_maintenance_output(601, &target, &input, [7; 32], (0, 1000))
+            .unwrap());
+        assert_eq!(
+            store.completed_windows.read().unwrap().get(&601),
+            Some(&1000)
+        );
+        assert!(!store.append_precompute(
+            601,
+            BTreeMap::new(),
+            (2000, 3000),
+            Box::new(SumAccumulator::new())
+        ));
+        assert!(!store.append_sample(
+            601,
+            BTreeMap::new(),
+            (2000, 3000),
+            SketchSampleState {
+                bytes: vec![],
+                encoding: SketchEncoding::MsgpackFull,
+            }
+        ));
+        persistence.shutdown();
     }
 }
