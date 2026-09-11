@@ -462,6 +462,7 @@ Installation currently rejects derived inputs so they cannot accidentally receiv
 raw samples through the legacy metric router. Enabling them requires the immutable
 maintenance consumer and durable output deduplication protocol; neither raw-table
 substitution nor treating late correction fragments as new observations is valid.
+
 ### Immutable completed windows
 
 Finite Remote Write completion now fences the SummaryStore append boundary,
