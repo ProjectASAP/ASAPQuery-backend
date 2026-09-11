@@ -63,3 +63,63 @@ The backend currently exposes its Planner-selected forest and a whole-workload
 exact alternative. This workflow does not claim exhaustive algorithm or lifecycle
 search, and its unit discovery seed can influence which forest becomes available.
 A calibrated comparison is only between the candidates actually exported.
+
+## VictoriaMetrics and readout-specific checks
+
+Use `calibration_candidates SNAPSHOT --metricsql` and
+`compile_workload_artifact SNAPSHOT --metricsql` to compile the shared parser
+subset through the existing MetricsQL serving path. This preserves language-tagged
+query entries and exact edges; do not change an emitted install artifact by hand.
+`BackendLocalPlanningSnapshot::compile_metricsql()` exposes the same operation.
+
+`calibrate_runtime.py --victoriametrics BINARY` starts a fresh VictoriaMetrics
+fallback instead of Prometheus. Ingestion and drain use the normal backend port;
+queries use `--metricsql-port`. `--exact-cache-bytes` controls VictoriaMetrics cache
+allocation, not process RSS. Record the binary version, cache budget and CPU set.
+`--disable-result-cache` sets VictoriaMetrics `-search.disableCache` (including
+its use through backend exact edges) and sends `nocache=1` to both query endpoints, so repeated
+identical timestamps measure query execution instead of the exact server's result
+cache. Declare that policy in the comparison report.
+
+A corpus occurrence may contain `accuracy_validation` with a `metric` and
+`bound`. Supported validation units are `relative`, `absolute_bits`, and `exact`
+(the last requires zero bound). In particular, entropy absolute bits cannot
+borrow a relative tolerance. A rank-error contract needs a rank oracle and is
+intentionally rejected by this scalar comparison helper; do not use value error
+to certify KLL rank accuracy. Native unsupported exact functions remain failed
+comparisons and cannot obtain an executable cost quote.
+
+For offline UnivMon error evidence, `cargo run --release -p data_plane --example
+univmon_erp_artifact -- samples.jsonl` measures two-pane merged readouts on the
+first ten source populations. It requires equal observed shapes; differing
+populations must be calibrated separately. The tool retains samples offline,
+records observed maxima and serialized state bytes, and does not measure CPU or
+calibrate a failure probability. Use a zero CPU objective weight for that artifact;
+whole-candidate CPU comes from the independent runtime calibration above. Keep
+held-out source populations and performance runs separate from these training
+populations. This tool does not select a plan.
+
+For the finite integer-valued distinct study, the offline artifact tool measures
+HLL precisions 10, 12, and 14 as a predeclared grid, alongside the UnivMon grid.
+It uses the first ten source series and shifts their values by 1e12 into a disjoint
+hash namespace; inputs outside its documented integer domain are rejected. The
+held-out query uses groups 3–9 with original values. Neither a training maximum
+nor HLL's theoretical relative standard error is a probabilistic per-query error
+bound. The held-out 5% target remains fixed, and failed configurations stay in the
+measurement history. A second optional argument writes the actual observed shape
+for bounded ERP matching. CPU fields in this offline artifact remain excluded;
+production process calibration measures CPU separately.
+
+Finite VictoriaMetrics replays call `/internal/force_flush` once after ingestion
+and charge it to build CPU. Accepted imports may otherwise remain invisible to
+queries for several seconds. This is a test barrier, not a production ingestion
+policy; see the [VictoriaMetrics forced-flush contract](https://docs.victoriametrics.com/victoriametrics/#forced-flush).
+
+`measure_native_exact.py` runs a separate fresh VictoriaMetrics process with no
+backend proxy. Use the same input, query corpus, CPU affinity, cache budget and
+cache policy as the candidate run. It records native query latencies, process
+CPU/RSS, lifecycle CPU and storage after shutdown. Report backend-only analytical
+resources separately from the candidate's combined backend + fallback service;
+retaining an exact service does not make its raw storage or memory disappear.
+Visibility validation scans can warm native data caches, so the first reported
+request is a first workload query after validation, not a cold-storage query.

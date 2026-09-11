@@ -318,7 +318,24 @@ impl<F: FnMut(QueryNodeId, u64) -> Result<QueryResult, EngineError>> Evaluator<'
                                     }))
                                 }
                             };
-                            value.map(|v| (no_name(labels), v))
+                            value.map(|v| {
+                                let preserve_name = self.entry.language
+                                    == control_plane::query_plan::QueryLanguage::MetricsQl
+                                    && matches!(
+                                        operation,
+                                        TemporalOperation::Min
+                                            | TemporalOperation::Max
+                                            | TemporalOperation::Avg
+                                    );
+                                (
+                                    if preserve_name {
+                                        labels
+                                    } else {
+                                        no_name(labels)
+                                    },
+                                    v,
+                                )
+                            })
                         })
                         .collect(),
                 ))
@@ -847,6 +864,93 @@ mod topk_tests {
         assert_eq!(stats.remote_branch_evaluations, 1);
         assert_eq!(stats.remote_rpcs, 1);
         assert_eq!(stats.raw_scan_evaluations, 0);
+    }
+
+    // A temporal operator over an external subquery follows the same language
+    // policy as a summary readout; changing execution placement cannot drop names.
+    #[test]
+    fn metricsql_temporal_subdag_preserves_names_only_for_value_rollups() {
+        use control_plane::query_plan::QueryLanguage;
+        for language in [QueryLanguage::PromQl, QueryLanguage::MetricsQl] {
+            for operation in [
+                TemporalOperation::Max,
+                TemporalOperation::Min,
+                TemporalOperation::Avg,
+                TemporalOperation::Sum,
+                TemporalOperation::Count,
+                TemporalOperation::Rate,
+            ] {
+                let entry = QueryPlanEntry {
+                    language,
+                    query_id: "labels".into(),
+                    canonical_query: "test".into(),
+                    fixed_evaluation: None,
+                    root: QueryNodeId(1),
+                    nodes: BTreeMap::from([
+                        (
+                            QueryNodeId(0),
+                            QueryPlanNode::Logical {
+                                operator: LogicalOperator::ExactSubquery {
+                                    query: "m[1s]".into(),
+                                },
+                                inputs: vec![],
+                            },
+                        ),
+                        (
+                            QueryNodeId(1),
+                            QueryPlanNode::Logical {
+                                operator: LogicalOperator::Temporal { operation },
+                                inputs: vec![QueryNodeId(0)],
+                            },
+                        ),
+                    ]),
+                    instant: InstantExecution {
+                        lookback_ms: 1000,
+                        full_history: false,
+                        cumulative_readout: true,
+                    },
+                    fallback: FallbackPolicy::ExactBackend,
+                };
+                let leaves = BTreeMap::from([(
+                    (QueryNodeId(0), 1000),
+                    PreparedLeaf {
+                        value: Value::Matrix(
+                            vec![(
+                                labels(&[("__name__", "m"), ("job", "api")]),
+                                vec![(100, 1.), (900, 3.)],
+                            )],
+                            0,
+                            1000,
+                        ),
+                        remote: true,
+                        remote_evaluations: 1,
+                        remote_rpcs: 1,
+                    },
+                )]);
+                let (result, _) = execute_installed(&entry, &leaves, 1000, |_, _| {
+                    panic!("external child supplied")
+                })
+                .unwrap();
+                let QueryResult::Vector(result) = result else {
+                    panic!("vector required")
+                };
+                let expected = language == QueryLanguage::MetricsQl
+                    && matches!(
+                        operation,
+                        TemporalOperation::Max | TemporalOperation::Min | TemporalOperation::Avg
+                    );
+                assert_eq!(
+                    result.values[0]
+                        .label_keys_override
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .any(|name| name == "__name__"),
+                    expected,
+                    "{language:?} {operation:?}"
+                );
+            }
+        }
     }
 
     #[test]

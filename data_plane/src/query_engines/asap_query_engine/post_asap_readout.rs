@@ -154,6 +154,8 @@ enum PhysicalNodeError {
 }
 
 struct PhysicalQueryRuntime<'a> {
+    language: control_plane::query_plan::QueryLanguage,
+    catalog: Option<std::sync::Arc<asap_types::summary_catalog::SummaryCatalog>>,
     context: QueryExecutionContext<'a>,
 }
 
@@ -182,10 +184,37 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                 reduce_sum_values(grouping, values, *coverage)
             }
             QueryPlanNode::ReadMaterialization { binding } => {
-                let groups = self
+                let mut groups = self
                     .context
                     .read_bound_materialization(binding)
                     .map_err(PhysicalNodeError::Store)?;
+                // Metric identity belongs to the shared DataDescriptor, not to
+                // the population labels or a reconstructed query string.
+                if self.language == control_plane::query_plan::QueryLanguage::MetricsQl
+                    && binding.output_grouping
+                        == control_plane::query_plan::PhysicalGrouping::PerEntity
+                {
+                    let metric = self
+                        .catalog
+                        .as_ref()
+                        .and_then(|catalog| {
+                            let definition =
+                                catalog.materializations.get(&binding.materialization)?;
+                            catalog
+                                .data_descriptors
+                                .get(&definition.data_descriptor_id)?
+                                .time_series_metric()
+                        })
+                        .ok_or_else(|| {
+                            PhysicalNodeError::Fallback(
+                                "MetricsQL per-series readout requires catalog metric identity"
+                                    .into(),
+                            )
+                        })?;
+                    for (labels, _) in &mut groups {
+                        labels.insert("__name__".into(), metric.into());
+                    }
+                }
                 Ok(PhysicalQueryOutput::State {
                     groups,
                     item_labels: binding.item_labels.clone(),
@@ -207,7 +236,17 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                         .context
                         .readout_bound(state, &query)
                         .map_err(PhysicalNodeError::Store)?;
-                    let (rows, row_coverage) = expand_item_readout(key, value, item_labels)?;
+                    let (mut rows, row_coverage) = expand_item_readout(key, value, item_labels)?;
+                    if self.language == control_plane::query_plan::QueryLanguage::MetricsQl
+                        && !matches!(
+                            query,
+                            planner_types::post_asap::SketchQuery::Quantile { .. }
+                        )
+                    {
+                        for (labels, _) in &mut rows {
+                            labels.remove("__name__");
+                        }
+                    }
                     fold_coverage(&mut coverage, row_coverage);
                     values.extend(rows);
                 }
@@ -231,7 +270,17 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                             )
                             .map(|value| {
                                 (
-                                    key.clone(),
+                                    {
+                                        let mut labels = key.clone();
+                                        if self.language
+                                            == control_plane::query_plan::QueryLanguage::MetricsQl
+                                            && *readout
+                                                != control_plane::query_plan::ExactReadout::Max
+                                        {
+                                            labels.remove("__name__");
+                                        }
+                                        labels
+                                    },
                                     SummaryValue::Points(
                                         vec![(self.context.t1_ms as i64, value)],
                                         state.exact_coverage(),
@@ -538,6 +587,8 @@ fn execute_physical_query_payload(
     let revision = index.summary_update_revision();
     let result = (|| {
         let runtime = PhysicalQueryRuntime {
+            language: entry.language,
+            catalog: index.summary_catalog_snapshot(),
             context: QueryExecutionContext {
                 index,
                 t0_ms,
@@ -898,6 +949,90 @@ mod tests {
             },
         );
         idx
+    }
+
+    // The same installed summary follows each language's metric-name semantics;
+    // spatial reduction must not invent a source metric on the aggregate.
+    #[test]
+    fn metricsql_quantile_preserves_catalog_metric_name_only_per_entity() {
+        use control_plane::query_plan::*;
+        let config: asap_types::PrecomputeMaterialization =
+            serde_json::from_value(serde_json::json!({
+                "aggregation_type": "DDSketch", "aggregation_sub_type": "",
+                "metric": "latency_ms", "window_size": 1, "slide_interval": 1,
+                "window_type": "tumbling", "num_aggregates_to_retain": 3,
+                "parameters": {"alpha": 0.01}, "pane_origin_ms": 0,
+                "partitioning": "per_entity", "window_layout": {"kind": "pane", "pane_secs": 1},
+                "grouping_labels": {"labels": []}, "aggregated_labels": {"labels": []},
+                "rollup_labels": {"labels": []}, "spatial_filter": "",
+                "spatial_filter_normalized": "", "original_yaml": ""
+            }))
+            .unwrap();
+        let idx = ddsketch_fixture();
+        let mut metadata = (*idx.instance(1).unwrap()).clone();
+        metadata.policy_fp = config.policy_fingerprint();
+        idx.install_summary_catalog(std::sync::Arc::new(
+            asap_types::summary_catalog::SummaryCatalog::from_materializations(
+                1,
+                1,
+                &[config.clone()],
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+        idx.register(metadata);
+        let mut entry = QueryPlanEntry {
+            language: QueryLanguage::MetricsQl,
+            query_id: "quantile".into(),
+            canonical_query: "quantile_over_time(0.9, latency_ms[1s])".into(),
+            fixed_evaluation: None,
+            root: QueryNodeId(0),
+            nodes: BTreeMap::from([
+                (
+                    QueryNodeId(0),
+                    QueryPlanNode::SummaryEstimate {
+                        input: QueryNodeId(1),
+                        query: QueryReadout::Quantile { q: 0.9 },
+                    },
+                ),
+                (
+                    QueryNodeId(1),
+                    QueryPlanNode::ReadMaterialization {
+                        binding: MaterializationBinding {
+                            materialization: config.policy_fingerprint().into(),
+                            output_grouping: PhysicalGrouping::PerEntity,
+                            item_labels: vec![],
+                            window_ms: 1000,
+                            pane_origin_ms: Some(0),
+                            readout_lookback_ms: Some(1000),
+                        },
+                    },
+                ),
+            ]),
+            instant: InstantExecution {
+                lookback_ms: 1000,
+                full_history: false,
+                cumulative_readout: true,
+            },
+            fallback: FallbackPolicy::ExactBackend,
+        };
+        let result = execute_query_plan_readout(&idx, &entry, 1000, 2000, true).unwrap();
+        assert_eq!(
+            result.series[0].0.get("__name__").map(String::as_str),
+            Some("latency_ms")
+        );
+        entry.language = QueryLanguage::PromQl;
+        let result = execute_query_plan_readout(&idx, &entry, 1000, 2000, true).unwrap();
+        assert!(!result.series[0].0.contains_key("__name__"));
+        entry.language = QueryLanguage::MetricsQl;
+        let QueryPlanNode::ReadMaterialization { binding } =
+            entry.nodes.get_mut(&QueryNodeId(1)).unwrap()
+        else {
+            unreachable!()
+        };
+        binding.output_grouping = PhysicalGrouping::Reduce(vec![]);
+        let result = execute_query_plan_readout(&idx, &entry, 1000, 2000, true).unwrap();
+        assert!(!result.series[0].0.contains_key("__name__"));
     }
 
     #[test]
