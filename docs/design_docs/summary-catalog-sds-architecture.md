@@ -375,3 +375,35 @@ creates a new Data Descriptor. Advancing the time range creates a new Summary
 Instance. Merge compatibility additionally requires the operator's merge rules,
 compatible data scopes and valid instance coverage; sharing descriptors alone
 does not authorize merging overlapping observations.
+
+### Catalog-scoped runtime ERP evidence
+
+A runtime observation describes the input of one allocated summary, not an
+entire deployment. `ErpPopulationObservations` identifies its catalog generation,
+summary definition, observation time, input window and separate summary-instance
+populations. The control plane resolves the `DataDescriptor` from its successfully
+activated catalog; a telemetry payload cannot provide replacement descriptors.
+Alternative sketch parameters may use this evidence only when the compiler
+verifies the same data and update semantics.
+
+The typed physical-plan HTTP endpoints accept `target: backend_local_remote_write`
+with an empty `collector_ids` list. Omitting `target` preserves the distributed
+collector deployment. Both paths use catalog publication and activation. Typed
+activations are serialized, and the accepted catalog is retained only after the
+backend acknowledges activation, including ClickHouse publications.
+
+An ERP `observed_shape_source.population_scope` supplies the expected catalog
+and definition, input semantics, and explicit `max_age_ms` /
+`max_future_skew_ms` bounds. Each compilation reads the latest runtime record
+again. Missing, stale, malformed, foreign or incomplete observations invalidate
+all population fits. This is an ERP miss handled by theoretical sizing or exact
+execution; it must not restore an older fit or match the artifact's legacy
+distribution descriptor. Offline single-shape inputs remain a separate path.
+
+The initial eligibility is deliberately limited to verified raw per-series
+frequency/cardinality readouts over a complete matching window. A 30-second pane
+observation does not certify a one-hour input distribution. These checks do not
+implement an autonomous drift-triggered replan scheduler, continuous source
+completion, or durable restoration of the control plane's active catalog. After
+a control-plane restart, live evidence remains ineligible until an authoritative
+catalog has been activated again.
