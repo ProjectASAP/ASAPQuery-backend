@@ -113,3 +113,46 @@ class CandidateTopKArtifactTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PerQueryAccuracyTests(unittest.TestCase):
+    def test_entropy_absolute_error_does_not_accept_relative_tolerance(self):
+        from types import SimpleNamespace
+        from calibrate_runtime import comparison_tolerances
+        from compare import compare_results
+        args = SimpleNamespace(relative_tolerance=.9, absolute_tolerance=.9)
+        relative, absolute = comparison_tolerances({"accuracy_validation": {"metric": "absolute_bits", "bound": .1}}, args)
+        actual = {"status": "success", "data": {"resultType": "vector", "result": [{"metric": {}, "value": [0, "10.2"]}]}}
+        exact = {"status": "success", "data": {"resultType": "vector", "result": [{"metric": {}, "value": [0, "10"]}]}}
+        self.assertEqual((relative, absolute), (0, .1))
+        self.assertFalse(compare_results(actual, exact, relative, absolute)["equal"])
+
+    def test_unknown_metric_and_invalid_bound_are_rejected(self):
+        from types import SimpleNamespace
+        from calibrate_runtime import comparison_tolerances
+        for metric, bound in [("rank", .1), ("relative", float("nan")), ("absolute_bits", -1), ("exact", .1)]:
+            with self.assertRaises(ValueError):
+                comparison_tolerances({"accuracy_validation": {"metric": metric, "bound": bound}}, SimpleNamespace())
+
+    def test_result_cache_policy_is_explicit_on_both_query_endpoints(self):
+        from urllib.parse import parse_qs
+        from calibrate_runtime import query_parameters
+        row = {"query": "count_over_time(m[1h])", "eval_timestamp_ms": 1234}
+        self.assertNotIn("nocache", parse_qs(query_parameters(row, False)))
+        self.assertEqual(parse_qs(query_parameters(row, True))["nocache"], ["1"])
+
+class VictoriaMetricsVisibilityTests(unittest.TestCase):
+    def test_incomplete_counts_are_retried_before_queries(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from calibrate_runtime import verify_vm_visibility
+        key = (("__name__", "m"),)
+        def answer(value):
+            return {"http_status":200,"response":{"data":{"result":[{"metric":dict(key),"value":[2,str(value)]}]}},"headers":{},"elapsed_ns":1}
+        with tempfile.TemporaryDirectory() as folder, patch("calibrate_runtime.runner._http_request", side_effect=[answer(1),answer(2),answer(2),answer(2)]) as request, patch("calibrate_runtime.time.sleep"):
+            verify_vm_visibility("http://test", ({key:2},{key:2000},1000,2000), Path(folder))
+            self.assertEqual(request.call_count, 4)
+            import json
+            report = json.loads((Path(folder)/"exact-visibility.json").read_text())
+            self.assertTrue(report["complete"])
+            self.assertFalse(report["attempts"][0]["matched"])

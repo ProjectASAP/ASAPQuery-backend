@@ -5,7 +5,7 @@ use serde_json::json;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
-        .ok_or("usage: compile_workload_artifact SNAPSHOT.json")?;
+        .ok_or("usage: compile_workload_artifact SNAPSHOT.json [--metricsql]")?;
     let snapshot: BackendLocalPlanningSnapshot = serde_json::from_slice(&std::fs::read(path)?)?;
     if snapshot.snapshot_version != 2 {
         return Err(
@@ -13,7 +13,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let start = std::time::Instant::now();
-    let plan = snapshot.compile()?;
+    let plan = if std::env::args().skip(2).any(|arg| arg == "--metricsql") {
+        snapshot.compile_metricsql()?
+    } else {
+        snapshot.compile()?
+    };
     let elapsed = start.elapsed().as_nanos();
     let comparison = plan
         .cost_comparison

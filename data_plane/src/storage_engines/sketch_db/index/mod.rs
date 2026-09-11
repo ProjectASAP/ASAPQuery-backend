@@ -985,6 +985,13 @@ impl SketchStore {
             .has_pending(definition, range)
     }
 
+    /// Share the installed metadata snapshot without copying descriptors or state.
+    pub(crate) fn summary_catalog_snapshot(
+        &self,
+    ) -> Option<Arc<asap_types::summary_catalog::SummaryCatalog>> {
+        self.descriptors.authoritative_catalog()
+    }
+
     /// Record that `sid` is a per-item (item_label-mode) frequency sketch
     /// keyed by the data-point attribute `label` (e.g. "service"). The
     /// query engine consults this to decide whether a keyed selector like
