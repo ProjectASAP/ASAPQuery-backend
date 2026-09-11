@@ -605,6 +605,9 @@ impl Drop for StateMutation<'_> {
 
 #[derive(Default)]
 pub struct SketchStore {
+    /// Held through each state append; completion takes the exclusive guard.
+    completed_windows: RwLock<HashMap<u64, u64>>,
+    completion_flush_before: std::sync::atomic::AtomicU64,
     admission: RwLock<admission::AdmissionInventory>,
     mutation_revision: std::sync::atomic::AtomicU64,
     active_mutations: std::sync::atomic::AtomicUsize,
@@ -879,17 +882,65 @@ impl SketchStore {
     pub(crate) fn seal_finite_summary_input(
         &self,
         generation: &CatalogGeneration,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         use std::sync::atomic::Ordering::SeqCst;
+        // Same order as admitted publication: admission -> metadata -> append fence.
+        // Closing a receiver alone is insufficient: the fence also rejects writes
+        // from every other producer once these physical windows are complete.
+        let mut inventory = self.admission.write().unwrap();
+        let frontiers = inventory.published_frontiers().clone();
+        let instances = self.instances.read().unwrap();
+        let mut records = Vec::new();
+        for (sid, end) in &frontiers {
+            let instance = instances
+                .get(sid)
+                .ok_or("completed series has no identity")?;
+            let mut record = self
+                .metadata_record(instance)
+                .ok_or("completed series has no catalog provenance")?;
+            record.completed_through_ms = record.completed_through_ms.max(Some(*end));
+            records.push(record);
+        }
+        let mut completed = self.completed_windows.write().unwrap();
         let mutation = self.mutation_revision.load(SeqCst);
         if self.active_mutations.load(SeqCst) != 0
             || mutation != self.admitted_mutations.load(SeqCst)
         {
             return Err("finite summary completion cannot certify untracked state writes".into());
         }
-        self.admission.write().unwrap().seal_finite(generation)?;
+        inventory.validate_finite(generation)?;
+        if self.persistence_read.read().unwrap().is_some() {
+            if let Some(end) = frontiers.values().max() {
+                self.completion_flush_before
+                    .fetch_max(end.saturating_add(1), SeqCst);
+            }
+            // The flusher evicts an epoch only after its payload and manifest
+            // are durable. Until then a restart must remain able to replay it.
+            let pending = frontiers.iter().any(|(sid, end)| {
+                self.series.get(sid).is_some_and(|data| {
+                    data.read()
+                        .unwrap()
+                        .contains_window_ending_at_or_before(*end)
+                })
+            });
+            if pending {
+                return Ok(false);
+            }
+        }
+        if let Some(writer) = self.persistence_metadata.read().unwrap().as_ref() {
+            writer
+                .upsert_all(&records)
+                .map_err(|error| error.to_string())?;
+        }
+        inventory.seal_finite(generation)?;
+        for (sid, end) in frontiers {
+            completed
+                .entry(sid)
+                .and_modify(|value| *value = (*value).max(end))
+                .or_insert(end);
+        }
         self.finite_mutation_revision.store(mutation, SeqCst);
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn summary_window_known_empty(
@@ -1058,6 +1109,12 @@ impl SketchStore {
                 .series
                 .get(series_id)
                 .map(|entry| Arc::clone(entry.value()));
+            let completed_through = self
+                .completed_windows
+                .read()
+                .unwrap()
+                .get(series_id)
+                .copied();
             let status = match binding.metadata.status() {
                 AggStatus::Active => SummaryInstanceStatus::Ready,
                 AggStatus::Retired | AggStatus::Expired => SummaryInstanceStatus::Retiring,
@@ -1104,10 +1161,11 @@ impl SketchStore {
                         checksum: None,
                     },
                     status: status.clone(),
-                    // The current payload row does not distinguish a normal
-                    // pane close from a late standalone correction. Report the
-                    // concrete instance without inventing a completeness proof.
-                    completeness: InstanceCompleteness::Unknown,
+                    completeness: if completed_through.is_some_and(|end| window.1 <= end) {
+                        InstanceCompleteness::Complete
+                    } else {
+                        InstanceCompleteness::Unknown
+                    },
                     lifecycle: InstanceLifecycle::Persistent,
                     observed_at_ms,
                 };
@@ -1206,7 +1264,11 @@ impl SketchStore {
         series_label_values: BTreeMap<String, String>,
         window: TimestampRange,
         sample: SketchSampleState,
-    ) {
+    ) -> bool {
+        let completed = self.completed_windows.read().unwrap();
+        if completed.get(&sid).is_some_and(|end| window.1 <= *end) {
+            return false;
+        }
         let _mutation = self.begin_state_mutation();
         let store = self
             .series
@@ -1216,6 +1278,7 @@ impl SketchStore {
         let mut guard = store.write().unwrap();
         guard.insert(window, series_label_values, AggPayload::Sketch(sample));
         guard.last_write_unix_ms = now_ms();
+        true
     }
 
     /// Build a `SidStoreData` pre-configured for the store's current
@@ -1249,7 +1312,11 @@ impl SketchStore {
         series_label_values: BTreeMap<String, String>,
         window: TimestampRange,
         payload: Box<dyn crate::storage_engines::types::AggregateCore>,
-    ) {
+    ) -> bool {
+        let completed = self.completed_windows.read().unwrap();
+        if completed.get(&sid).is_some_and(|end| window.1 <= *end) {
+            return false;
+        }
         let _mutation = self.begin_state_mutation();
         let max_value = payload
             .as_any()
@@ -1280,6 +1347,7 @@ impl SketchStore {
                 retention_horizon_ms,
             );
         }
+        true
     }
 
     /// Read a category through the derived in-memory rollup. Returns `None`
@@ -2416,6 +2484,7 @@ impl SketchStore {
             record.summary_definition_id = Some(SummaryDefinitionId::from(m.policy_fp));
             record.catalog_generation = Some(Arc::clone(m.catalog_generation.as_ref()?));
         }
+        record.completed_through_ms = self.completed_windows.read().unwrap().get(&m.sid).copied();
         record.retired_at_ms = m.retired_at_ms;
         record.expires_at_ms = m.expires_at_ms;
         Some(record)
@@ -2793,7 +2862,7 @@ impl SketchStore {
         }
 
         let window = (output.start_timestamp, output.end_timestamp);
-        match crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg) {
+        let accepted = match crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg) {
             AggKind::Sketch { .. } => self.append_sample(
                 sid,
                 label_values_map,
@@ -2809,8 +2878,8 @@ impl SketchStore {
                 window,
                 accumulator.clone_boxed_core(),
             ),
-        }
-        Some(sid)
+        };
+        accepted.then_some(sid)
     }
 
     /// Phase 5 M2.3.6d — eviction-side helper. Removes every sid in the
@@ -3005,6 +3074,14 @@ impl SketchStore {
 
         let mut registered = 0usize;
         for rec in records {
+            if let Some(end) = rec.completed_through_ms {
+                self.completed_windows
+                    .write()
+                    .unwrap()
+                    .entry(rec.sid)
+                    .and_modify(|current| *current = (*current).max(end))
+                    .or_insert(end);
+            }
             if rec.removed || rec.expires_at_ms.is_some_and(|expiry| expiry <= now_ms()) {
                 continue;
             }
@@ -3102,6 +3179,13 @@ impl SketchStore {
 // the trait keeps the historical name so the flusher / manifest /
 // part-writer stay untouched.
 impl crate::storage_engines::sketch_db::index::persistence::EpochSource for SketchStore {
+    fn flush_before_ms(&self) -> Option<u64> {
+        let cutoff = self
+            .completion_flush_before
+            .load(std::sync::atomic::Ordering::SeqCst);
+        (cutoff != 0).then_some(cutoff)
+    }
+
     fn list_sealed_epochs(
         &self,
     ) -> Vec<crate::storage_engines::sketch_db::index::persistence::SealedEpochRef> {
@@ -4742,6 +4826,168 @@ mod tests {
         let expired = store.force_expire(799).unwrap();
         assert_eq!(expired.retired_at_ms, Some(1));
         assert_eq!(expired.expires_at_ms, Some(2));
+    }
+
+    #[test]
+    fn completed_windows_reject_late_updates_after_restart() {
+        // Completion is a storage admission rule, including legacy producers,
+        // and survives restart without allowing a correction into consumed state.
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let directory = tempfile::tempdir().unwrap();
+        let store = SketchStore::new();
+        store
+            .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
+            .unwrap();
+        store.register(meta_with_policy(850, fingerprint));
+        let generation = store.active_catalog_generation().unwrap();
+        let writer = Arc::new(persistence::metadata::SidMetadataStore::new(
+            directory.path(),
+        ));
+        *store.persistence_metadata.write().unwrap() = Some(writer.clone());
+        let coordinate = asap_types::sds::SummaryInstanceCoordinates {
+            summary_definition_id: fingerprint.into(),
+            time_range: HalfOpenTimeRange {
+                start_ms: 0,
+                end_ms: 30_000,
+            },
+            group_values: BTreeMap::new(),
+        };
+        let revision = store
+            .admit_summary_updates(&generation, [coordinate.clone()].into())
+            .unwrap();
+        assert!(store.seal_finite_summary_input(&generation).is_err());
+        store
+            .publish_admitted_summary_update(
+                &generation,
+                &coordinate,
+                revision,
+                revision,
+                120_000,
+                || {
+                    store
+                        .append_sample(850, BTreeMap::new(), (0, 30_000), sample(1))
+                        .then_some(850)
+                },
+            )
+            .unwrap();
+        let stale_record = store
+            .metadata_record(&store.instances.read().unwrap()[&850])
+            .unwrap();
+        let before_failed_seal = store.summary_update_revision();
+        std::fs::create_dir(writer.path()).unwrap();
+        assert!(store.seal_finite_summary_input(&generation).is_err());
+        assert!(store.summary_update_revision().matches(before_failed_seal));
+        assert!(!store.completed_windows.read().unwrap().contains_key(&850));
+        std::fs::remove_dir(writer.path()).unwrap();
+        store.seal_finite_summary_input(&generation).unwrap();
+        let producers = BTreeMap::from([(fingerprint.into(), "producer".to_string())]);
+        let inventory = store
+            .observed_summary_inventory("backend", "store", &producers, 1, 30_000)
+            .unwrap();
+        assert_eq!(inventory.instances.len(), 1);
+        assert_eq!(
+            inventory.instances.values().next().unwrap().completeness,
+            InstanceCompleteness::Complete
+        );
+        assert!(!store.append_sample(850, BTreeMap::new(), (0, 30_000), sample(2)));
+        assert!(!store.append_precompute(
+            850,
+            BTreeMap::new(),
+            (0, 30_000),
+            Box::new(crate::precompute_engine::operators::SumAccumulator::new())
+        ));
+        // A flusher that captured metadata before completion cannot reopen it.
+        writer.upsert_all(&[stale_record]).unwrap();
+        assert_eq!(writer.load().unwrap()[0].completed_through_ms, Some(30_000));
+        let restored = SketchStore::new();
+        restored
+            .install_summary_catalog(Arc::new(plan.summary_catalog))
+            .unwrap();
+        restored.register_recovered_disk_series(directory.path());
+        assert!(!restored.append_sample(850, BTreeMap::new(), (0, 30_000), sample(3)));
+        assert!(restored.append_sample(850, BTreeMap::new(), (30_000, 60_000), sample(4)));
+    }
+
+    #[test]
+    fn finite_completion_flushes_payload_before_persisting_immutability() {
+        // With neither memory pressure nor a hot-tier deadline, completion must
+        // explicitly flush its payload before persisting a non-replayable window.
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let store = Arc::new(SketchStore::new());
+            store
+                .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
+                .unwrap();
+            store.register(meta_with_policy(851, fingerprint));
+            let mut config = durable_cfg(directory.path().to_path_buf());
+            config.hot_window_ms = None;
+            config.seal_window_count = 100;
+            let mut persistence = store.start_persistence(config).unwrap();
+            let generation = store.active_catalog_generation().unwrap();
+            let coordinate = asap_types::sds::SummaryInstanceCoordinates {
+                summary_definition_id: fingerprint.into(),
+                time_range: HalfOpenTimeRange {
+                    start_ms: 0,
+                    end_ms: 30_000,
+                },
+                group_values: BTreeMap::new(),
+            };
+            let revision = store
+                .admit_summary_updates(&generation, [coordinate.clone()].into())
+                .unwrap();
+            store
+                .publish_admitted_summary_update(
+                    &generation,
+                    &coordinate,
+                    revision,
+                    revision,
+                    120_000,
+                    || {
+                        store
+                            .append_sample(851, BTreeMap::new(), (0, 30_000), sample(1))
+                            .then_some(851)
+                    },
+                )
+                .unwrap();
+            assert!(!store.seal_finite_summary_input(&generation).unwrap());
+            assert!(!store.completed_windows.read().unwrap().contains_key(&851));
+            assert!(wait_until(
+                || store.seal_finite_summary_input(&generation).unwrap(),
+                Duration::from_secs(5)
+            ));
+            assert!(!persistence.manifest.live_parts().is_empty());
+            persistence.shutdown();
+        }
+        let restored = Arc::new(SketchStore::new());
+        restored
+            .install_summary_catalog(Arc::new(plan.summary_catalog))
+            .unwrap();
+        let _persistence = restored
+            .start_persistence(durable_cfg(directory.path().to_path_buf()))
+            .unwrap();
+        assert!(!restored.append_sample(851, BTreeMap::new(), (0, 30_000), sample(2)));
+        let rows = restored.query_range(851, 0, 30_000);
+        assert_eq!(rows.len(), 1);
+        let payloads: Vec<_> = rows
+            .iter()
+            .flat_map(|row| row.samples.values())
+            .flatten()
+            .collect();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].bytes, vec![1]);
     }
 
     #[test]
