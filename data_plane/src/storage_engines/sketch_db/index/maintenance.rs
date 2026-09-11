@@ -15,6 +15,33 @@ pub(crate) struct FrozenExactWindows {
     pub(crate) singleton_population_complete: bool,
 }
 
+/// Store-issued evidence that every durable raw population contributes the
+/// same window. This is deliberately not serializable or caller-constructible.
+pub(crate) struct CompleteRawMaintenanceCohort {
+    inputs: Vec<FrozenExactWindows>,
+    window: (u64, u64),
+}
+
+impl CompleteRawMaintenanceCohort {
+    pub(crate) fn inputs(&self) -> &[FrozenExactWindows] {
+        &self.inputs
+    }
+}
+
+enum FrozenPublicationInputs<'a> {
+    Requested(&'a [FrozenExactWindows]),
+    Complete(&'a CompleteRawMaintenanceCohort),
+}
+
+impl FrozenPublicationInputs<'_> {
+    fn inputs(&self) -> &[FrozenExactWindows] {
+        match self {
+            Self::Requested(inputs) => inputs,
+            Self::Complete(cohort) => cohort.inputs(),
+        }
+    }
+}
+
 impl SketchStore {
     /// Acquire a complete immutable read set before any output is reserved.
     /// Individual payloads are immutable; checking the shared generation again
@@ -57,6 +84,31 @@ impl SketchStore {
             .collect::<Result<Vec<_>, _>>()?;
         self.validate_routed_catalog_generation(Some(generation.as_ref()))?;
         Ok(inputs)
+    }
+
+    pub(crate) fn read_complete_raw_maintenance_cohort(
+        &self,
+        generation: &Arc<CatalogGeneration>,
+        definitions: &BTreeSet<SummaryDefinitionId>,
+        window: (u64, u64),
+    ) -> Result<CompleteRawMaintenanceCohort, String> {
+        if definitions.is_empty() || window.0 >= window.1 {
+            return Err("complete raw cohort has an empty definition set or window".into());
+        }
+        let mut requests = Vec::new();
+        for definition in definitions {
+            let populations = self.complete_raw_maintenance_population(*definition, generation)?;
+            for (sid, groups) in populations {
+                for (group, windows) in groups {
+                    if !windows.contains(&window) {
+                        return Err("complete raw cohort is missing a population window".into());
+                    }
+                    requests.push((sid, *definition, BTreeSet::from([window]), group));
+                }
+            }
+        }
+        let inputs = self.read_frozen_exact_cohort(generation, definitions, &requests)?;
+        Ok(CompleteRawMaintenanceCohort { inputs, window })
     }
 
     fn durable_maintenance_population_ids(
@@ -374,6 +426,40 @@ impl SketchStore {
         Ok(generation)
     }
 
+    fn validate_complete_raw_cohort_locked(
+        &self,
+        cohort: &CompleteRawMaintenanceCohort,
+        instances: &HashMap<u64, SdsBinding>,
+        finite_complete: bool,
+    ) -> Result<(), String> {
+        if !finite_complete {
+            return Err("complete raw publication requires the original finite closure".into());
+        }
+        let mut supplied = BTreeMap::<SummaryDefinitionId, BTreeSet<u64>>::new();
+        for input in cohort.inputs() {
+            supplied
+                .entry(input.definition)
+                .or_default()
+                .insert(input.sid);
+        }
+        for (definition, supplied_sids) in supplied {
+            let mut current = self.durable_maintenance_population_ids(definition)?;
+            current.extend(
+                instances
+                    .iter()
+                    .filter(|(_, binding)| binding.metadata.policy_fp == definition.fingerprint())
+                    .map(|(sid, _)| *sid),
+            );
+            if current != supplied_sids {
+                return Err("complete raw population changed before publication".into());
+            }
+        }
+        // The caller holds admission through commit. A finite closure rejects
+        // all raw additive entry points, so the stored group payload set cannot
+        // grow between inventory capture and this transaction.
+        Ok(())
+    }
+
     pub(crate) fn recover_frozen_maintenance_output(
         &self,
         sid: u64,
@@ -382,6 +468,41 @@ impl SketchStore {
         digest: [u8; 32],
         window: (u64, u64),
     ) -> Result<bool, String> {
+        self.recover_frozen_output(
+            sid,
+            config,
+            FrozenPublicationInputs::Requested(sources),
+            digest,
+            window,
+        )
+    }
+
+    pub(crate) fn recover_complete_raw_maintenance_output(
+        &self,
+        sid: u64,
+        config: &asap_types::PrecomputeMaterialization,
+        cohort: &CompleteRawMaintenanceCohort,
+        digest: [u8; 32],
+        window: (u64, u64),
+    ) -> Result<bool, String> {
+        self.recover_frozen_output(
+            sid,
+            config,
+            FrozenPublicationInputs::Complete(cohort),
+            digest,
+            window,
+        )
+    }
+
+    fn recover_frozen_output(
+        &self,
+        sid: u64,
+        config: &asap_types::PrecomputeMaterialization,
+        proof: FrozenPublicationInputs<'_>,
+        digest: [u8; 32],
+        window: (u64, u64),
+    ) -> Result<bool, String> {
+        let sources = proof.inputs();
         let _admission = self
             .admission
             .read()
@@ -391,6 +512,17 @@ impl SketchStore {
             .read()
             .map_err(|_| "instance registry poisoned")?;
         let generation = self.validate_frozen_cohort_bindings(config, sources, &instances)?;
+        if let FrozenPublicationInputs::Complete(cohort) = &proof {
+            if cohort.window != window {
+                return Err("complete raw cohort window differs from output".into());
+            }
+            self.validate_complete_raw_cohort_locked(
+                cohort,
+                &instances,
+                _admission.is_finite_complete(),
+            )?;
+        }
+
         let Some(binding) = instances.get(&sid) else {
             return Ok(false);
         };
@@ -449,6 +581,45 @@ impl SketchStore {
         sources: &[FrozenExactWindows],
         input_digest: [u8; 32],
     ) -> Result<bool, String> {
+        self.publish_frozen_output(
+            sid,
+            config,
+            output,
+            state,
+            FrozenPublicationInputs::Requested(sources),
+            input_digest,
+        )
+    }
+
+    pub(crate) fn publish_complete_raw_maintenance_output(
+        &self,
+        sid: u64,
+        config: &asap_types::PrecomputeMaterialization,
+        output: &crate::storage_engines::types::PrecomputedOutput,
+        state: &dyn AggregateCore,
+        cohort: &CompleteRawMaintenanceCohort,
+        input_digest: [u8; 32],
+    ) -> Result<bool, String> {
+        self.publish_frozen_output(
+            sid,
+            config,
+            output,
+            state,
+            FrozenPublicationInputs::Complete(cohort),
+            input_digest,
+        )
+    }
+
+    fn publish_frozen_output(
+        &self,
+        sid: u64,
+        config: &asap_types::PrecomputeMaterialization,
+        output: &crate::storage_engines::types::PrecomputedOutput,
+        state: &dyn AggregateCore,
+        proof: FrozenPublicationInputs<'_>,
+        input_digest: [u8; 32],
+    ) -> Result<bool, String> {
+        let sources = proof.inputs();
         use persistence::source::{EpochSnapshot, EpochSnapshotEntry};
         // One guard excludes source retirement through target registration
         // and commit; admission excludes catalog transitions in the same span.
@@ -461,6 +632,17 @@ impl SketchStore {
             .write()
             .map_err(|_| "instance registry poisoned")?;
         let generation = self.validate_frozen_cohort_bindings(config, sources, &instances)?;
+        if let FrozenPublicationInputs::Complete(cohort) = &proof {
+            if cohort.window != (output.start_timestamp, output.end_timestamp) {
+                return Err("complete raw cohort window differs from output".into());
+            }
+            self.validate_complete_raw_cohort_locked(
+                cohort,
+                &instances,
+                _admission.is_finite_complete(),
+            )?;
+        }
+
         if output.policy_fp != config.policy_fingerprint()
             || output.catalog_generation.as_deref() != Some(generation.as_ref())
         {
@@ -736,6 +918,41 @@ mod tests {
                 BTreeMap::new(),
             ));
         }
+        // Only the first population has the next window: completeness must
+        // reject the partial cohort even after all writes are durably sealed.
+        let extra_coordinate = asap_types::sds::SummaryInstanceCoordinates {
+            summary_definition_id: configs[0].policy_fingerprint().into(),
+            time_range: HalfOpenTimeRange {
+                start_ms: 1000,
+                end_ms: 2000,
+            },
+            group_values: BTreeMap::new(),
+        };
+        let extra_revision = store
+            .admit_summary_updates(&generation, BTreeSet::from([extra_coordinate.clone()]))
+            .unwrap();
+        let mut extra_window =
+            PrecomputedOutput::new(1000, 2000, None, configs[0].policy_fingerprint());
+        extra_window.catalog_generation = Some(Arc::clone(&generation));
+        let mut extra_sum = SumAccumulator::new();
+        extra_sum.update(99.0);
+        store
+            .publish_admitted_summary_update(
+                &generation,
+                &extra_coordinate,
+                extra_revision,
+                extra_revision,
+                3000,
+                |writer| {
+                    writer.ingest_precompute_with_series_id(
+                        900,
+                        &configs[0],
+                        &extra_window,
+                        &extra_sum,
+                    )
+                },
+            )
+            .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !store.seal_finite_summary_input(&generation).unwrap() {
             assert!(std::time::Instant::now() < deadline);
@@ -743,6 +960,13 @@ mod tests {
         }
         let definitions = requests.iter().map(|request| request.1).collect();
         let parts = persistence.manifest.live_parts().len();
+        let complete = store
+            .read_complete_raw_maintenance_cohort(&generation, &definitions, (0, 1000))
+            .unwrap();
+        assert_eq!(complete.inputs().len(), 2);
+        assert!(store
+            .read_complete_raw_maintenance_cohort(&generation, &definitions, (1000, 2000))
+            .is_err());
         let cohort = store
             .read_frozen_exact_cohort(&generation, &definitions, &requests)
             .unwrap();
@@ -759,12 +983,38 @@ mod tests {
         let mut sum = SumAccumulator::new();
         sum.update(11.0);
         assert!(store
-            .publish_frozen_maintenance_output(902, target, &output, &sum, &cohort, [42; 32])
+            .publish_complete_raw_maintenance_output(
+                902, target, &output, &sum, &complete, [42; 32]
+            )
             .unwrap());
         assert!(store
-            .recover_frozen_maintenance_output(902, target, &cohort, [42; 32], (0, 1000))
+            .recover_complete_raw_maintenance_output(902, target, &complete, [42; 32], (0, 1000))
             .unwrap());
         let published_parts = persistence.manifest.live_parts().len();
+        assert!(store
+            .recover_complete_raw_maintenance_output(902, target, &complete, [42; 32], (1000, 2000))
+            .is_err());
+        // A retained proof cannot authorize a subset after even an empty raw
+        // lifetime is registered. No new target reservation may be created.
+        let mut extra = PrecomputedOutput::new(0, 1000, None, configs[0].policy_fingerprint());
+        extra.catalog_generation = Some(Arc::clone(&generation));
+        assert!(store
+            .register_precompute_output(904, &configs[0], &extra)
+            .is_some());
+        assert!(store
+            .publish_complete_raw_maintenance_output(
+                905, target, &output, &sum, &complete, [42; 32]
+            )
+            .is_err());
+        assert!(!store.instances.read().unwrap().contains_key(&905));
+        assert_eq!(persistence.manifest.live_parts().len(), published_parts);
+        assert!(!persistence
+            .flusher
+            .metadata_store()
+            .load_strict()
+            .unwrap()
+            .iter()
+            .any(|record| record.sid == 905));
         store.force_expire(901).unwrap();
         assert!(store
             .publish_frozen_maintenance_output(903, target, &output, &sum, &cohort, [42; 32])
