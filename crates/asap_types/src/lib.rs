@@ -2,6 +2,7 @@ pub mod accumulator_spec;
 pub mod accuracy;
 pub mod aggregation_config;
 pub mod aggregation_type;
+pub mod derived_input;
 pub mod enums;
 pub mod executable_plan;
 pub mod grouping_projection;
