@@ -1714,7 +1714,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 crate::precompute_engine::frame_lineage::FrameLineageDecision::Apply,
                             ) => {
                                 if frame.kind
-                                    == control_plane::physical::compiler::SummaryFrameKind::Full
+                                    == asap_types::producer_plan::SummaryFrameKind::Full
                                 {
                                     ingest_state
                                         .sketch_index
@@ -1754,15 +1754,6 @@ async fn route_modified_otlp_sketches_to_precompute(
                         }
                     }
 
-                    ingest_state.sketch_snapshots.insert(
-                        series_key.clone(),
-                        crate::precompute_engine::ingest_handler::SnapshotCacheEntry {
-                            core: accumulator.clone_boxed_core(),
-                            window_start: dp.start_time_unix_nano,
-                        },
-                    );
-                    ingest_state.note_window_and_sweep(dp.start_time_unix_nano);
-
                     use crate::storage_engines::sketch_db::index::{
                         SketchEncoding, SketchSampleState,
                     };
@@ -1778,7 +1769,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                     );
                     let encoding =
                         encoding_to_handle(dp.encoding).unwrap_or(SketchEncoding::ProtoFull);
-                    ingest_state.sketch_index.append_sample(
+                    if !ingest_state.sketch_index.append_sample(
                         sid,
                         label_values,
                         window,
@@ -1786,7 +1777,18 @@ async fn route_modified_otlp_sketches_to_precompute(
                             bytes: dp.sketch.clone(),
                             encoding,
                         },
+                    ) {
+                        return Err("summary window is immutable after completion".into());
+                    }
+
+                    ingest_state.sketch_snapshots.insert(
+                        series_key.clone(),
+                        crate::precompute_engine::ingest_handler::SnapshotCacheEntry {
+                            core: accumulator.clone_boxed_core(),
+                            window_start: dp.start_time_unix_nano,
+                        },
                     );
+                    ingest_state.note_window_and_sweep(dp.start_time_unix_nano);
 
                     // Collect the configs whose metric matches this DP.
                     // Detection is independent of the legacy dual-write
@@ -2251,7 +2253,7 @@ fn preflight_summary_frames(
         mut dp: ModifiedOtlpSketchDp,
         ingest_state: &IngestState,
         active: &crate::storage_engines::types::ActivePhysicalPlan,
-    ) -> Result<control_plane::physical::compiler::SummaryFrameIdentity, String> {
+    ) -> Result<asap_types::producer_plan::SummaryFrameIdentity, String> {
         let canonical_name = canonical_sketch_metric_name(metric_name, dp.algorithm.clone());
         let frame =
             take_summary_frame_identity(&mut dp.attrs, dp.start_time_unix_nano, dp.time_unix_nano)?;
@@ -2294,7 +2296,7 @@ fn preflight_summary_frames(
 
         // A malformed full snapshot must not be discovered after an earlier
         // frame in the request has already reached SketchStore.
-        if frame.kind == control_plane::physical::compiler::SummaryFrameKind::Full {
+        if frame.kind == asap_types::producer_plan::SummaryFrameKind::Full {
             decode_modified_otlp_sketch_bytes(dp.algorithm.clone(), dp.encoding, &dp.sketch)
                 .map_err(|error| format!("invalid full frame for {metric_name}: {error}"))?;
         } else {
@@ -2452,10 +2454,9 @@ fn take_summary_frame_identity(
     attrs: &mut HashMap<String, String>,
     window_start_unix_nano: u64,
     window_end_unix_nano: u64,
-) -> Result<control_plane::physical::compiler::SummaryFrameIdentity, String> {
-    use control_plane::physical::compiler::{
-        StateEncoding, SummaryFrameIdentity, SummaryFrameKind,
-    };
+) -> Result<asap_types::producer_plan::SummaryFrameIdentity, String> {
+    use asap_types::producer_plan::{SummaryFrameIdentity, SummaryFrameKind};
+    use control_plane::physical::compiler::StateEncoding;
 
     fn required(attrs: &mut HashMap<String, String>, key: &str) -> Result<String, String> {
         attrs

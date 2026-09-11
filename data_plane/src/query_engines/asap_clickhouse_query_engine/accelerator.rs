@@ -64,14 +64,14 @@ impl CatalogClickHouseAccelerator {
 
     async fn prepare_external_exact(
         &self,
-        entry: &control_plane::query_plan::QueryPlanEntry,
+        entry: &asap_types::query_plan::QueryPlanEntry,
         start_ms: u64,
         end_ms: u64,
         request_context: &ClickHouseQueryRequest,
     ) -> Result<PreparedExternalLeaves, String> {
         let mut prepared = PreparedExternalLeaves::new();
         let leaves = entry.nodes.iter().filter_map(|(id, node)| match node {
-            control_plane::query_plan::QueryPlanNode::ExternalExact { request, inputs }
+            asap_types::query_plan::QueryPlanNode::ExternalExact { request, inputs }
                 if request.language == asap_types::QueryLanguage::ClickHouseSql
                     && inputs.is_empty() =>
             {
@@ -85,7 +85,7 @@ impl CatalogClickHouseAccelerator {
                 .as_ref()
                 .ok_or_else(|| "ClickHouse exact subtree endpoint unavailable".to_owned())?;
             let schema = match &bound.output {
-                control_plane::query_plan::ExternalExactOutput::Relation { schema } => {
+                asap_types::query_plan::ExternalExactOutput::Relation { schema } => {
                     serde_json::from_value(schema.clone()).map_err(|error| error.to_string())?
                 }
                 _ => return Err("ClickHouse exact subtree must produce a relation".into()),
@@ -111,6 +111,9 @@ impl CatalogClickHouseAccelerator {
                 "0".into(),
             );
             parameters.insert("output_format_json_quote_64bit_integers".into(), "0".into());
+            // Preserve the distinction between NULL and unsupported NaN/Inf.
+            // The typed decoder rejects quoted non-finite values and falls back.
+            parameters.insert("output_format_json_quote_denormals".into(), "1".into());
             if let Some(database) = request_context.database() {
                 parameters.insert("database".into(), database.into());
             }
@@ -144,11 +147,9 @@ impl CatalogClickHouseAccelerator {
 }
 
 fn requested_format(request: &ClickHouseQueryRequest) -> Result<ClickHouseFormat, String> {
-    if let Some(setting) = request
-        .parameters
-        .keys()
-        .find(|key| key.starts_with("output_format_"))
-    {
+    if let Some(setting) = request.parameters.keys().find(|key| {
+        key.starts_with("output_format_") || key.as_str() == "format_tsv_null_representation"
+    }) {
         return Err(format!("unsupported output setting {setting}"));
     }
     match request
@@ -299,6 +300,7 @@ mod tests {
         for setting in [
             "output_format_json_map_as_array_of_tuples",
             "output_format_json_quote_64bit_integers",
+            "format_tsv_null_representation",
         ] {
             request.parameters.insert(setting.into(), "1".into());
             assert!(requested_format(&request).is_err());
@@ -310,14 +312,14 @@ mod tests {
         precompute_engine::operators::SumAccumulator,
         storage_engines::sketch_db::index::{AggKind, Capability, SketchInstanceMetadata},
     };
-    use asap_types::summary_catalog::SummaryCatalog;
-    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
-    use axum::http::Method;
-    use control_plane::query_plan::{
+    use asap_types::query_plan::{
         ClickHousePlanningContext, ExactReadout, ExternalExactOutput, ExternalExactRequest,
         FallbackPolicy, FixedEvaluationRange, InstantExecution, MaterializationBinding,
         PhysicalGrouping, QueryLanguage, QueryNodeId, QueryPlan, QueryPlanEntry, QueryPlanNode,
     };
+    use asap_types::summary_catalog::SummaryCatalog;
+    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    use axum::http::Method;
 
     struct FixedExactSubtree;
 
@@ -328,6 +330,10 @@ mod tests {
             request: &ClickHouseQueryRequest,
         ) -> Result<ClickHouseRawResponse, super::super::fallback::ClickHouseFallbackError>
         {
+            assert_eq!(
+                request.parameters.get("output_format_json_quote_denormals"),
+                Some(&"1".into())
+            );
             assert_eq!(request.parameters.get("param_from"), Some(&"0".into()));
             assert_eq!(request.parameters.get("param_to"), Some(&"2000".into()));
             Ok(ClickHouseRawResponse {
@@ -703,7 +709,7 @@ mod tests {
         )
         .unwrap();
         precompute.summary_catalog = Some(sds.reference().unwrap());
-        let mut transmission = control_plane::physical::compiler::TransmissionPlan::build(
+        let mut transmission = control_plane::physical::compiler::compile_transmission_plan(
             envelope.clone(),
             &precompute,
             &BTreeMap::new(),

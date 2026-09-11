@@ -34,7 +34,12 @@ pub fn recover(disk_path: &Path) -> PersistResult<(Manifest, RecoveryReport)> {
 
     // Validate every live part by reading its meta.bin header.
     let mut to_drop: Vec<PartId> = Vec::new();
-    let mut referenced: HashSet<PartId> = HashSet::new();
+    let pending: HashSet<PartId> = super::metadata::SidMetadataStore::new(disk_path)
+        .load_strict()?
+        .into_iter()
+        .filter_map(|record| record.pending_immutable.map(|pending| pending.part_id))
+        .collect();
+    let mut referenced = pending.clone();
     for entry in manifest.live_parts() {
         referenced.insert(entry.part_id);
         let part_dir = super::part::part_dir_path(&parts_root, entry.part_id);
@@ -61,6 +66,11 @@ pub fn recover(disk_path: &Path) -> PersistResult<(Manifest, RecoveryReport)> {
         }
     }
 
+    if to_drop.iter().any(|part_id| pending.contains(part_id)) {
+        return Err(super::PersistError::Format(
+            "corrupt reserved immutable part".into(),
+        ));
+    }
     for part_id in to_drop {
         manifest.append_delete(part_id)?;
         let dir = super::part::part_dir_path(&parts_root, part_id);
