@@ -630,6 +630,43 @@ pub fn execute_completed_maintenance(
     window: (u64, u64),
     group: &BTreeMap<String, String>,
 ) -> Result<bool, String> {
+    let target = match installed.binding.node(sink) {
+        Some(BackendNodeBinding::Materialization { summary_definition }) => *summary_definition,
+        _ => return Err("maintenance sink lacks an installed output identity".into()),
+    };
+    let derived = configs
+        .iter()
+        .find(|config| config.policy_fingerprint() == target.fingerprint())
+        .and_then(|config| config.derived_input.as_ref())
+        .ok_or("maintenance output has no derived input")?;
+    if derived.inputs.len() != 1 {
+        return Err("maintenance execution requires synchronized multi-source scheduling".into());
+    }
+    execute_completed_maintenance_cohort(
+        store,
+        installed,
+        configs,
+        sink,
+        &BTreeMap::from([(*derived.inputs.first().unwrap(), source_sid)]),
+        target_sid,
+        window,
+        group,
+    )
+}
+
+/// Execute one completed population per input definition at matching full
+/// windows. All source populations must share the same explicit label map.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_completed_maintenance_cohort(
+    store: &crate::storage_engines::sketch_db::index::SketchStore,
+    installed: &asap_types::executable_plan::InstalledPostAsapDag,
+    configs: &[asap_types::PrecomputeMaterialization],
+    sink: PostAsapNodeId,
+    source_sids: &BTreeMap<asap_types::sds::SummaryDefinitionId, u64>,
+    target_sid: u64,
+    window: (u64, u64),
+    group: &BTreeMap<String, String>,
+) -> Result<bool, String> {
     use asap_types::executable_plan::BackendNodeBinding;
     let target = match installed.binding.node(sink) {
         Some(BackendNodeBinding::Materialization { summary_definition }) => *summary_definition,
@@ -643,61 +680,73 @@ pub fn execute_completed_maintenance(
         .derived_input
         .as_ref()
         .ok_or("maintenance output has no derived input")?;
-    if derived.inputs.len() != 1 {
-        return Err("maintenance execution requires synchronized multi-source scheduling".into());
+    if derived.inputs != source_sids.keys().copied().collect() {
+        return Err("maintenance source set differs from installed input definitions".into());
     }
-    let source = *derived.inputs.first().unwrap();
-    let source_config = configs
-        .iter()
-        .find(|config| config.policy_fingerprint() == source.fingerprint())
-        .ok_or("maintenance source configuration is absent")?;
-    let source_width = source_config.stored_window_ms();
-    let target_width = target_config.stored_window_ms();
-    let origin = source_config.pane_origin_ms.unwrap_or(0);
-    if source_width == 0
-        || target_width == 0
-        || window.0 >= window.1
-        || window.1 - window.0 != target_width
-        || target_width % source_width != 0
-        || target_width / source_width > 65_536
-        || source_config
-            .slide_interval
-            .checked_mul(1000)
-            .is_none_or(|slide| slide < source_width)
-        || target_config
-            .slide_interval
-            .checked_mul(1000)
-            .is_none_or(|slide| slide < target_width)
-        || window.1 > i64::MAX as u64
-        || (window.0 as i128 - origin as i128).rem_euclid(source_width as i128) != 0
-        || (window.0 as i128 - target_config.pane_origin_ms.unwrap_or(0) as i128)
-            .rem_euclid(target_width as i128)
-            != 0
-    {
-        return Err("maintenance window requires unsupported overlap, phase, or extent".into());
-    }
-    let expected = (0..target_width / source_width)
-        .map(|index| {
-            let start = window.0 + index * source_width;
-            (start, start + source_width)
+    let source_configs = source_sids
+        .keys()
+        .map(|source| {
+            configs
+                .iter()
+                .find(|config| config.policy_fingerprint() == source.fingerprint())
+                .ok_or("maintenance source configuration is absent")
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
+    if source_configs.len() > 1 {
+        asap_types::precompute_plan::validated_source_window_cohort(target_config, &source_configs)
+            .map_err(|error| error.to_string())?;
+    }
+    let mut requests = Vec::with_capacity(source_sids.len());
+    for source_config in &source_configs {
+        let source = source_config.policy_fingerprint().into();
+        let source_sid = source_sids[&source];
+        let source_width = source_config.stored_window_ms();
+        let target_width = target_config.stored_window_ms();
+        let origin = source_config.pane_origin_ms.unwrap_or(0);
+        if source_width == 0
+            || target_width == 0
+            || window.0 >= window.1
+            || window.1 - window.0 != target_width
+            || target_width % source_width != 0
+            || target_width / source_width > 65_536
+            || source_config
+                .slide_interval
+                .checked_mul(1000)
+                .is_none_or(|slide| slide < source_width)
+            || target_config
+                .slide_interval
+                .checked_mul(1000)
+                .is_none_or(|slide| slide < target_width)
+            || window.1 > i64::MAX as u64
+            || (window.0 as i128 - origin as i128).rem_euclid(source_width as i128) != 0
+            || (window.0 as i128 - target_config.pane_origin_ms.unwrap_or(0) as i128)
+                .rem_euclid(target_width as i128)
+                != 0
+        {
+            return Err("maintenance window requires unsupported overlap, phase, or extent".into());
+        }
+        let expected = (0..target_width / source_width)
+            .map(|index| {
+                let start = window.0 + index * source_width;
+                (start, start + source_width)
+            })
+            .collect();
+        requests.push((source_sid, source, expected, group.clone()));
+    }
     let generation = store
         .active_catalog_generation()
         .ok_or("maintenance requires an authoritative catalog")?;
-    let mut cohort = store.read_frozen_exact_cohort(
-        &generation,
-        &derived.inputs,
-        &[(source_sid, source, expected, group.clone())],
-    )?;
-    let frozen = cohort.pop().ok_or("immutable input cohort is empty")?;
-    let (dag, key) = prepare_frozen_maintenance_sink(
-        installed,
-        configs,
-        sink,
-        std::slice::from_ref(&frozen),
-        window,
-    )?;
+    let cohort = store.read_frozen_exact_cohort(&generation, &derived.inputs, &requests)?;
+    if cohort.len() > 1
+        && cohort
+            .iter()
+            .any(|source| !source.singleton_population_complete)
+    {
+        return Err(
+            "multi-source maintenance requires a complete single population per source".into(),
+        );
+    }
+    let (dag, key) = prepare_frozen_maintenance_sink(installed, configs, sink, &cohort, window)?;
     let digest = key
         .input_lineage
         .as_slice()
@@ -708,29 +757,28 @@ pub fn execute_completed_maintenance(
         .iter()
         .find(|node| node.id == sink)
         .ok_or("maintenance target node is absent")?;
-    validate_maintenance_grouping(
-        target_config,
-        source_config,
-        target_node,
-        frozen.singleton_population_complete,
-    )?;
+    for frozen in &cohort {
+        let source_config = source_configs
+            .iter()
+            .find(|config| config.policy_fingerprint() == frozen.definition.fingerprint())
+            .ok_or("maintenance source configuration is absent")?;
+        validate_maintenance_grouping(
+            target_config,
+            source_config,
+            target_node,
+            frozen.singleton_population_complete,
+        )?;
+    }
     if store.recover_frozen_maintenance_output(
         target_sid,
         target_config,
-        std::slice::from_ref(&frozen),
+        &cohort,
         digest,
         window,
     )? {
         return Ok(false);
     }
-    let state = execute_prepared_frozen_sink(
-        installed,
-        configs,
-        sink,
-        std::slice::from_ref(&frozen),
-        &dag,
-        key,
-    )?;
+    let state = execute_prepared_frozen_sink(installed, configs, sink, &cohort, &dag, key)?;
     let mut output = crate::storage_engines::types::PrecomputedOutput::new(
         window.0,
         window.1,
@@ -754,7 +802,7 @@ pub fn execute_completed_maintenance(
         target_config,
         &output,
         state.as_ref(),
-        std::slice::from_ref(&frozen),
+        &cohort,
         digest,
     )
 }
@@ -2115,12 +2163,257 @@ mod tests {
             .series_ids_for_policy(durable_configs[1].policy_fingerprint())
             .is_empty());
         persistence.shutdown();
+        exercise_two_source_completed_sink(&dag, &configs, &scheduled_binding);
         assert!(evaluate_weight(
             &SummaryInputExpr::Column(planner_types::pre_asap::ColumnRef::Named("missing".into())),
             7.0,
             "value"
         )
         .is_err());
+    }
+
+    fn exercise_two_source_completed_sink(
+        template: &ExecutableDag,
+        configs: &[asap_types::PrecomputeMaterialization],
+        binding: &BackendExecutableBinding,
+    ) {
+        // A bound operator fixture, not a claim that a frontend selected this
+        // composition. Both actual durable sources are required before output.
+        use crate::storage_engines::sketch_db::index::{
+            persistence::config::SketchStorePersistenceConfig, SketchStore,
+        };
+        use asap_types::executable_plan::{InstalledPostAsapDag, OwnedPostAsapDag};
+        let mut first = configs[0].clone();
+        first.window_layout = asap_types::WindowMaterializationLayout::FullWindow;
+        let mut second = first.clone();
+        second.metric = "second_maintenance_source".into();
+        let first_id = first.policy_fingerprint().into();
+        let second_id = second.policy_fingerprint().into();
+        let mut dag = template.clone();
+        let mut second_node = dag
+            .nodes
+            .iter()
+            .find(|node| node.id == PostAsapNodeId(1))
+            .unwrap()
+            .clone();
+        second_node.id = PostAsapNodeId(5);
+        let mut merge = second_node.clone();
+        merge.id = PostAsapNodeId(6);
+        merge.operator = ExecutableOperator::SummaryMerge;
+        merge.payload = ExecutableOperatorPayload::SummaryMerge;
+        dag.nodes.extend([second_node, merge]);
+        let original = dag
+            .edges
+            .iter()
+            .find(|edge| edge.producer == PostAsapNodeId(1) && edge.consumer == PostAsapNodeId(2))
+            .unwrap()
+            .clone();
+        dag.edges.retain(|edge| {
+            !(edge.producer == PostAsapNodeId(1) && edge.consumer == PostAsapNodeId(2))
+        });
+        for (producer, consumer) in [(1, 6), (5, 6), (6, 2)] {
+            let mut edge = original.clone();
+            edge.producer = PostAsapNodeId(producer);
+            edge.consumer = PostAsapNodeId(consumer);
+            dag.edges.push(edge);
+        }
+        if let ExecutableOperatorPayload::SummaryAgg { input, .. } = &mut dag
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == PostAsapNodeId(3))
+            .unwrap()
+            .payload
+        {
+            input.weight = planner_types::post_asap::SummaryInputExpr::Column(
+                planner_types::pre_asap::ColumnRef::SampleValue,
+            );
+        }
+        let document =
+            OwnedPostAsapDag::from_executable("two-source-fixture".into(), &dag).unwrap();
+        let mut target = configs[1].clone();
+        target.derived_input = Some(
+            asap_types::derived_input::DerivedInputIdentity::from_dag(
+                &document,
+                PostAsapNodeId(2),
+                &BTreeMap::from([
+                    (PostAsapNodeId(1), first_id),
+                    (PostAsapNodeId(5), second_id),
+                ]),
+            )
+            .unwrap(),
+        );
+        let mut binding = binding.clone();
+        for (node, summary_definition) in [
+            (1, first_id),
+            (5, second_id),
+            (3, target.policy_fingerprint().into()),
+        ] {
+            binding.nodes.insert(
+                PostAsapNodeId(node),
+                BackendNodeBinding::Materialization { summary_definition },
+            );
+        }
+        binding
+            .nodes
+            .insert(PostAsapNodeId(6), BackendNodeBinding::MaintenanceInput);
+        let installed = InstalledPostAsapDag { document, binding };
+        let configs = [first, second, target];
+        let catalog = Arc::new(
+            asap_types::summary_catalog::SummaryCatalog::from_materializations(2, 1, &configs)
+                .unwrap(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let persistence_config = || {
+            let mut config =
+                SketchStorePersistenceConfig::with_memory_limit(1 << 24, directory.path().into());
+            config.delete_older_than_ms = None;
+            config.hot_window_ms = None;
+            config
+        };
+        let store = Arc::new(SketchStore::new());
+        store.install_summary_catalog(Arc::clone(&catalog)).unwrap();
+        let mut persistence = store.start_persistence(persistence_config()).unwrap();
+        let generation = store.active_catalog_generation().unwrap();
+        let sources = BTreeMap::from([(first_id, 800), (second_id, 801)]);
+        for (index, value) in [2.0, 7.0].into_iter().enumerate() {
+            let config = &configs[index];
+            let coordinate = asap_types::sds::SummaryInstanceCoordinates {
+                summary_definition_id: config.policy_fingerprint().into(),
+                time_range: asap_types::sds::HalfOpenTimeRange {
+                    start_ms: 0,
+                    end_ms: 2000,
+                },
+                group_values: BTreeMap::new(),
+            };
+            let revision = store
+                .admit_summary_updates(&generation, BTreeSet::from([coordinate.clone()]))
+                .unwrap();
+            let mut output = PrecomputedOutput::new(0, 2000, None, config.policy_fingerprint());
+            output.catalog_generation = Some(Arc::clone(&generation));
+            store
+                .publish_admitted_summary_update(
+                    &generation,
+                    &coordinate,
+                    revision,
+                    revision,
+                    4000,
+                    |writer| {
+                        writer.ingest_precompute_with_series_id(
+                            800 + index as u64,
+                            config,
+                            &output,
+                            sum(value).as_ref(),
+                        )
+                    },
+                )
+                .unwrap();
+        }
+        assert!(execute_completed_maintenance_cohort(
+            &store,
+            &installed,
+            &configs,
+            PostAsapNodeId(3),
+            &sources,
+            802,
+            (0, 2000),
+            &BTreeMap::new()
+        )
+        .is_err());
+        assert!(store
+            .series_ids_for_policy(configs[2].policy_fingerprint())
+            .is_empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !store.seal_finite_summary_input(&generation).unwrap() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let requests = sources
+            .iter()
+            .map(|(definition, sid)| {
+                (
+                    *sid,
+                    *definition,
+                    BTreeSet::from([(0, 2000)]),
+                    BTreeMap::new(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let cohort = store
+            .read_frozen_exact_cohort(
+                &generation,
+                &configs[2].derived_input.as_ref().unwrap().inputs,
+                &requests,
+            )
+            .unwrap();
+        let (dag, key) = prepare_frozen_maintenance_sink(
+            &installed,
+            &configs,
+            PostAsapNodeId(3),
+            &cohort,
+            (0, 2000),
+        )
+        .unwrap();
+        let result = execute_prepared_frozen_sink(
+            &installed,
+            &configs,
+            PostAsapNodeId(3),
+            &cohort,
+            &dag,
+            key,
+        )
+        .unwrap();
+        assert_eq!(
+            result
+                .query_statistic(
+                    asap_types::Statistic::Quantile,
+                    &None,
+                    &std::collections::HashMap::from([("quantile".into(), "0.5".into())])
+                )
+                .unwrap(),
+            9.0
+        );
+        assert!(execute_completed_maintenance_cohort(
+            &store,
+            &installed,
+            &configs,
+            PostAsapNodeId(3),
+            &sources,
+            802,
+            (0, 2000),
+            &BTreeMap::new()
+        )
+        .unwrap());
+        let parts = persistence.manifest.live_parts().len();
+        assert!(!execute_completed_maintenance_cohort(
+            &store,
+            &installed,
+            &configs,
+            PostAsapNodeId(3),
+            &sources,
+            802,
+            (0, 2000),
+            &BTreeMap::new()
+        )
+        .unwrap());
+        assert_eq!(persistence.manifest.live_parts().len(), parts);
+        persistence.shutdown();
+        drop(store);
+        let restored = Arc::new(SketchStore::new());
+        restored.install_summary_catalog(catalog).unwrap();
+        let mut persistence = restored.start_persistence(persistence_config()).unwrap();
+        assert!(!execute_completed_maintenance_cohort(
+            &restored,
+            &installed,
+            &configs,
+            PostAsapNodeId(3),
+            &sources,
+            802,
+            (0, 2000),
+            &BTreeMap::new()
+        )
+        .unwrap());
+        assert_eq!(persistence.manifest.live_parts().len(), parts);
+        persistence.shutdown();
     }
 
     #[test]
