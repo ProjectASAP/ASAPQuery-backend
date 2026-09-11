@@ -3681,6 +3681,7 @@ aggregations:
                 table_name: None,
                 value_projection: None,
                 table_population: None,
+                derived_input: None,
                 table_timestamp_column: None,
                 partitioning: None,
             };

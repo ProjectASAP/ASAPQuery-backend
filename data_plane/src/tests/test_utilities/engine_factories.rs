@@ -109,6 +109,7 @@ pub fn create_engine_single_pop_with_aggregated(
         table_name: None,
         value_projection: None,
         table_population: None,
+        derived_input: None,
         table_timestamp_column: None,
         partitioning: None,
     };
@@ -206,6 +207,7 @@ pub fn create_engine_dual_input(
         table_name: None,
         value_projection: None,
         table_population: None,
+        derived_input: None,
         table_timestamp_column: None,
         partitioning: None,
     };
@@ -233,6 +235,7 @@ pub fn create_engine_dual_input(
         table_name: None,
         value_projection: None,
         table_population: None,
+        derived_input: None,
         table_timestamp_column: None,
         partitioning: None,
     };
@@ -325,6 +328,7 @@ pub fn create_engine_two_metrics(
         table_name: None,
         value_projection: None,
         table_population: None,
+        derived_input: None,
         table_timestamp_column: None,
         partitioning: None,
     };
@@ -351,6 +355,7 @@ pub fn create_engine_two_metrics(
         table_name: None,
         value_projection: None,
         table_population: None,
+        derived_input: None,
         table_timestamp_column: None,
         partitioning: None,
     };
@@ -453,6 +458,7 @@ pub fn create_engine_three_metrics(
             table_name: None,
             value_projection: None,
             table_population: None,
+            derived_input: None,
             table_timestamp_column: None,
             partitioning: None,
         };
@@ -532,6 +538,7 @@ pub fn create_engine_multi_timestamp(
         table_name: None,
         value_projection: None,
         table_population: None,
+        derived_input: None,
         table_timestamp_column: None,
         partitioning: None,
     };
@@ -603,6 +610,7 @@ pub fn create_engine_multi_timestamp_with_window(
         table_name: None,
         value_projection: None,
         table_population: None,
+        derived_input: None,
         table_timestamp_column: None,
         partitioning: None,
     };

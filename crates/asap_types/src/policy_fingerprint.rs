@@ -90,7 +90,14 @@ impl PolicyFingerprint {
         let mut buf: Vec<u8> = Vec::with_capacity(512);
 
         // 1. metric name
-        buf.extend_from_slice(cfg.metric.as_bytes());
+        if cfg.derived_input.is_some() {
+            buf.extend_from_slice(b"derived-input-v1:");
+            buf.extend_from_slice(
+                &serde_json::to_vec(&cfg.source_identity()).expect("typed source identity"),
+            );
+        } else {
+            buf.extend_from_slice(cfg.metric.as_bytes());
+        }
         buf.push(0);
 
         // 2. aggregation_type (Serialize impl is the stable form)

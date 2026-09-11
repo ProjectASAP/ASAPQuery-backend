@@ -729,8 +729,15 @@ impl FidelityGuarantee {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub enum DataSourceIdentity {
-    TimeSeries { metric: String },
-    Table { table_ref: String },
+    TimeSeries {
+        metric: String,
+    },
+    Table {
+        table_ref: String,
+    },
+    Derived {
+        input: crate::derived_input::DerivedInputIdentity,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -829,7 +836,7 @@ impl DataDescriptor {
     pub fn time_series_metric(&self) -> Option<&str> {
         match &self.source {
             DataSourceIdentity::TimeSeries { metric } => Some(metric),
-            DataSourceIdentity::Table { .. } => None,
+            DataSourceIdentity::Table { .. } | DataSourceIdentity::Derived { .. } => None,
         }
     }
 
@@ -929,6 +936,9 @@ impl DataDescriptor {
         &self.id
     }
     pub fn validate(&self) -> Result<(), SdsError> {
+        if let DataSourceIdentity::Derived { input } = &self.source {
+            input.validate().map_err(SdsError)?;
+        }
         self.value_projection.validate().map_err(SdsError)?;
         self.group_by_keys.validate().map_err(SdsError)?;
         if matches!(self.source, DataSourceIdentity::TimeSeries { .. })
