@@ -27,10 +27,15 @@ fn planner_forest(queries: &[control_plane::physical::compiler::PlanningQuery]) 
                 vec![],
                 json!({"query_expr_debug":format!("{expr:#?}")}),
             ),
-            SummaryExpr::BinaryOp { lhs, rhs, operator } => (
+            SummaryExpr::BinaryOp {
+                lhs,
+                rhs,
+                operator,
+                timing,
+            } => (
                 "BinaryOp",
                 vec![lhs, rhs],
-                json!({"operator_debug":format!("{operator:?}")}),
+                json!({"operator_debug":format!("{operator:?}"),"timing_debug":format!("{timing:?}")}),
             ),
             SummaryExpr::CandidateTopK {
                 candidates,
