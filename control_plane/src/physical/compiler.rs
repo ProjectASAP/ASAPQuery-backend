@@ -4351,6 +4351,7 @@ mod tests {
             mode: super::super::erp::ErpAccuracyMode::Hybrid,
             observed_shape: None,
             observed_populations: None,
+            resolved_data_descriptor: None,
             observed_shape_source: None,
             shape_match: None,
             runtime: super::super::erp::ErpRuntimeCapabilities {
@@ -4401,6 +4402,7 @@ mod tests {
             mode: ErpAccuracyMode::Hybrid,
             observed_shape: None,
             observed_populations: None,
+            resolved_data_descriptor: None,
             observed_shape_source: None,
             shape_match: None,
             runtime: ErpRuntimeCapabilities {
