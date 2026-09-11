@@ -142,70 +142,377 @@ reported as warm success. Accuracy and benefit claims need the selected family's
 contract and workload-specific evidence. Thanos/object-store integrations are
 optional deployment paths, not the default architecture or a required quickstart.
 
-## Build and inspect
+## Build and inspect: shared setup
 
-Use a current Rust toolchain with `rustfmt`/`clippy` and a protobuf compiler
-(`protoc`). The workspace has sibling path dependencies on
-[ASAPCollector](https://github.com/ProjectASAP/ASAPCollector) and
-[asap_sketchlib](https://github.com/ProjectASAP/asap_sketchlib):
+Run these steps in Bash on Linux. The Docker commands below use host networking;
+other platforms need equivalent port/address configuration. Each backend runbook
+has its own ports and artifacts and can be run independently after this setup.
 
-```text
-parent/
-├── ASAPQuery-backend/
-├── ASAPCollector/
-└── asap_sketchlib/
-```
-
-Use compatible dependency revisions; [MVP CI](.github/workflows/mvp-ci.yml)
-records the tested checkout/build setup. ASAPPlanner is a pinned Git dependency
-in the Cargo manifests, not an in-tree planner directory.
-
-From this repository root:
+### 1. Check out the backend and its sibling dependencies
 
 ```bash
-cargo build --locked -p control_plane -p data_plane
-cargo run --locked -p control_plane --example inspect_physical_dag -- \
+mkdir -p asap-workspace
+cd asap-workspace
+git clone https://github.com/ProjectASAP/ASAPQuery-backend.git
+git clone https://github.com/ProjectASAP/ASAPCollector.git
+git clone https://github.com/ProjectASAP/asap_sketchlib.git
+cd ASAPQuery-backend
+# Follow this backend revision's CI dependency pin, rather than a copied SHA.
+ASAP_SKETCH_REF="$(awk '/repository: ProjectASAP\/asap_sketchlib/{found=1;next} found && /^[[:space:]]*ref:/{print $2;exit}' .github/workflows/mvp-ci.yml)"
+git -C ../asap_sketchlib checkout "${ASAP_SKETCH_REF:-main}"
+git -C ../ASAPCollector checkout main
+```
+
+[MVP CI](.github/workflows/mvp-ci.yml) is the source for compatible dependency
+checkouts; currently Collector uses its default branch. For reproducible runs,
+record all three exact revisions. ASAPPlanner is fetched at the revision pinned
+in Cargo manifests; do not substitute an unrelated local planner checkout.
+
+### 2. Check prerequisites and build
+
+Install Rust through rustup and install `protoc`, `curl`, `jq`, Python 3 and Git
+using your system package manager. Docker is needed only for the real
+Prometheus/Pushgateway demo below. Rust 1.98.0 is the toolchain used for these
+local command checks.
+
+```bash
+rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+rustc +1.98.0 --version
+protoc --version
+curl --version
+jq --version
+python3 --version
+# For Docker-backed demos only:
+docker version
+
+cargo +1.98.0 fetch --locked
+cargo +1.98.0 build --locked -p control_plane -p data_plane
+cargo +1.98.0 build --locked -p control_plane \
+  --example calibration_candidates --example inspect_physical_dag \
+  --example compile_clickhouse_workload
+target/debug/data_plane --help
+mkdir -p target/readme-evidence
+{
+  git rev-parse HEAD
+  git -C ../ASAPCollector rev-parse HEAD
+  git -C ../asap_sketchlib rev-parse HEAD
+} > target/readme-evidence/revisions.txt
+```
+
+The executable is `target/debug/data_plane`, or `target/release/data_plane` if
+you build with `--release`. Access to the pinned Git dependencies is required.
+
+### 3. Export candidates and inspect the ordinary selected plan
+
+```bash
+target/debug/examples/calibration_candidates \
   docs/examples/asapquery-compatibility-demo-snapshot.json \
-  > selected.json
+  > target/readme-evidence/candidates.json
+jq '.candidates[] | {candidate_index, unavailable_reason}' \
+  target/readme-evidence/candidates.json
+
+target/debug/examples/inspect_physical_dag \
+  docs/examples/asapquery-compatibility-demo-snapshot.json \
+  > target/readme-evidence/selected.json
+jq '.purpose' target/readme-evidence/selected.json
+jq '.install_request.summary_catalog' target/readme-evidence/selected.json
+jq '.install_request.precompute_plan | {materializations, executable_dags}' \
+  target/readme-evidence/selected.json
+jq '.install_request.query_plan.entries' target/readme-evidence/selected.json
+jq '.install_request.precompute_plan.schemas[] | {materialization, schema_id}' \
+  target/readme-evidence/selected.json
 ```
 
-The backend executable is `target/debug/data_plane` (or
-`target/release/data_plane` with `--release`). The inspector runs the ordinary
-snapshot compiler and emits the catalog and execution plans under
-`install_request`. Its output is labeled `inspection_only`; the demo costs are
-not measurements. See the [walkthrough](docs/evaluation/e2e-physical-dag.md) for
-candidate inspection and `jq` examples.
+Expect `inspection_only`, catalog/plan objects and explicit candidate rejection
+reasons where unsupported. One verified demo export contained five candidate
+entries (one installable), five selected materializations and six query entries;
+these are inspection evidence, not a permanent optimizer-count contract.
+Materialization IDs are definitions, not physical SIDs. Demo costs are not
+measurements. The [E2E walkthrough](docs/evaluation/e2e-physical-dag.md) explains
+ERP evidence and the version-2 measured-cost workflow.
 
-## Run and verify
+## Prometheus runbook
 
-For the included real Prometheus/Pushgateway demonstration, install Docker,
-curl, Python 3 and jq, then run:
+### Start real Prometheus and Pushgateway, then the backend
+
+The checked-in [Prometheus YAML](demos/asapquery/prometheus.yml) scrapes
+Pushgateway at `127.0.0.1:19092` every second and includes:
+
+```yaml
+remote_write:
+  - url: http://127.0.0.1:19091/api/v1/write
+    queue_config:
+      min_shards: 1
+      max_shards: 1
+      batch_send_deadline: 1s
+```
+
+Use unused ports 19090–19092 and container names below. Prometheus must be healthy
+before the `asapquery` profile starts. Initial Remote Write retries while the
+backend starts are expected.
 
 ```bash
+mkdir -p target/readme-evidence/prometheus
+docker run -d --name asap-readme-pushgateway --network host \
+  prom/pushgateway:v1.9.0 --web.listen-address=:19092
+docker run -d --name asap-readme-prometheus --network host \
+  -v "$PWD/demos/asapquery/prometheus.yml:/etc/prometheus/prometheus.yml:ro" \
+  prom/prometheus:v2.55.1 --config.file=/etc/prometheus/prometheus.yml \
+  --storage.tsdb.path=/prometheus --web.listen-address=:19090
+for attempt in $(seq 1 60); do
+  curl -fsS http://127.0.0.1:19090/-/healthy && break
+  sleep 1
+done
+curl -fsS http://127.0.0.1:19090/-/healthy
+
+target/debug/data_plane --profile asapquery \
+  --planning-snapshot docs/examples/asapquery-compatibility-demo-snapshot.json \
+  --prometheus-server http://127.0.0.1:19090 \
+  --forward-unsupported-queries --http-port 19091 \
+  --output-dir target/readme-evidence/prometheus/runtime \
+  > target/readme-evidence/prometheus/backend.log 2>&1 &
+echo $! > target/readme-evidence/prometheus/backend.pid
+for attempt in $(seq 1 60); do
+  curl -fsS http://127.0.0.1:19091/api/v1/health && break
+  sleep 1
+done
+curl -fsS http://127.0.0.1:19091/api/v1/health
+```
+
+### Send samples and inspect execution
+
+Pushgateway accepts exposition text; Prometheus performs the real scrape and
+Snappy/protobuf Remote Write encoding. Do not post this text to `/api/v1/write`.
+
+```bash
+for sample in $(seq 1 15); do
+  printf '# TYPE asap_demo_gauge gauge\nasap_demo_gauge %s\n' "$sample" |
+    curl -fsS --data-binary @- http://127.0.0.1:19092/metrics/job/asapquery-demo
+  sleep 1
+done
+curl -fsS http://127.0.0.1:19091/api/v1/physical-plan/status \
+  | tee target/readme-evidence/prometheus/status.json | jq .
+curl -fsS http://127.0.0.1:19091/api/v1/summary-inventory \
+  | tee target/readme-evidence/prometheus/inventory.json | jq .
+curl -sS -D target/readme-evidence/prometheus/query.headers --get \
+  http://127.0.0.1:19091/api/v1/query \
+  --data-urlencode 'query=sum(sum_over_time(asap_demo_gauge[5s]))' \
+  > target/readme-evidence/prometheus/query.json
+jq '{status, data, infos}' target/readme-evidence/prometheus/query.json
+cat target/readme-evidence/prometheus/query.headers
+```
+
+Check actual response provenance and window coverage; a successful HTTP response
+alone is not warm execution. For **a separately completed finite replay only**,
+after every input has been delivered, the closure operation is:
+
+```bash
+curl -fsS -X POST http://127.0.0.1:19091/api/v1/precompute/drain | jq .
+```
+
+Do not run that command against the live scraping setup above: it closes that
+receiver generation and later writes are rejected. It is not a periodic flush
+or an implicit continuous watermark. The real finite maintenance process test
+is available separately:
+
+```bash
+cargo +1.98.0 test --locked -p data_plane --test asapquery_compatibility_process_e2e \
+  immutable_maintenance_process::complete_group_maintenance_is_automatic_and_durable \
+  -- --exact --nocapture
+```
+
+### Validate and clean up
+
+The focused protocol matrix uses the real backend process with a **mock exact
+upstream**, and removes temporary artifacts. The second command runs the
+separate **real Prometheus/Pushgateway** demo and handles its own cleanup.
+Stop the manual setup before the real demo because it uses the same ports.
+
+```bash
+kill "$(cat target/readme-evidence/prometheus/backend.pid)"
+docker rm -f asap-readme-prometheus asap-readme-pushgateway
+cargo +1.98.0 test --locked -p data_plane --test asapquery_compatibility_process_e2e \
+  collector_free_profile_serves_complete_matrix_and_falls_back_exactly -- --exact
 ./scripts/e2e.sh asapquery-demo
 ```
 
-The [demo runner](demos/asapquery/run.sh) documents its lifecycle and evidence
-output. To connect an existing Prometheus and run the backend directly, follow
-the [compatibility-profile guide](docs/user_guide/asapquery-profile.md); it
-includes the planning snapshot, healthy exact-upstream requirement, Remote Write
-configuration and startup arguments. Other deployment modes are covered by
-[running and verifying](docs/user_guide/running-and-verifying.md).
+Keep `target/readme-evidence/prometheus/` and
+`target/asapquery-demo-evidence/` for inspection; delete them yourself only after
+you no longer need the logs, outputs and runtime state.
 
-The focused production-path regression is:
+## VictoriaMetrics / MetricsQL runbook
+
+This repository has a real backend-process MetricsQL fixture, but not a bundled
+self-contained native VictoriaMetrics deployment demo. The fixture starts the
+backend, installs an actual MetricsQL plan, sends Remote Write samples, checks
+labeled results, and shuts down its child process. Its exact upstream is a
+health-only test service, **not native VictoriaMetrics**.
 
 ```bash
-cargo test --locked -p data_plane --test asapquery_compatibility_process_e2e \
-  collector_free_profile_serves_complete_matrix_and_falls_back_exactly -- --exact
+mkdir -p target/readme-evidence/victoriametrics
+cargo +1.98.0 test --locked -p data_plane --test asapquery_compatibility_process_e2e \
+  distinct_planning_process::distinct_range_uses_planner_selected_hll_and_source_labels \
+  -- --exact --nocapture \
+  > target/readme-evidence/victoriametrics/process.log 2>&1
 ```
 
-This test uses a **mock exact upstream**, not a running Prometheus server, and
-removes its temporary artifacts. The broader suite is
-`./scripts/e2e.sh asapquery`. For recorded datasets, use the
-[replay guide](docs/user_guide/o11y-replay.md) and
+`DISTINCT_PLANNED` and `DISTINCT_INSTALLED` in the log expose selection and the
+shared installed publication. The fixture checks the actual MetricsQL listener;
+it is not a native differential or a performance benchmark.
+
+For an **existing native VM service** at port 8428, the following independently
+starts an exact-fallback adapter. Load the intended dataset into that service
+using its normal ingestion setup first. The empty bootstrap deliberately has
+no accelerated bindings; this smoke request must not be called warm.
+
+```bash
+printf 'aggregations: []\n' > target/readme-evidence/victoriametrics/bootstrap.yaml
+target/debug/data_plane \
+  --streaming-config target/readme-evidence/victoriametrics/bootstrap.yaml \
+  --http-port 19080 --victoriametrics-http-port 19081 \
+  --victoriametrics-url http://127.0.0.1:8428 \
+  --output-dir target/readme-evidence/victoriametrics/runtime \
+  > target/readme-evidence/victoriametrics/backend.log 2>&1 &
+echo $! > target/readme-evidence/victoriametrics/backend.pid
+for attempt in $(seq 1 60); do
+  curl -fsS http://127.0.0.1:19080/api/v1/health && break
+  sleep 1
+done
+curl -fsS http://127.0.0.1:19080/api/v1/health
+curl -sS -D target/readme-evidence/victoriametrics/query.headers --get \
+  http://127.0.0.1:19081/api/v1/query \
+  --data-urlencode 'query=default_rollup(asap_demo_gauge[5s])' \
+  > target/readme-evidence/victoriametrics/query.json
+jq . target/readme-evidence/victoriametrics/query.json
+curl -fsS http://127.0.0.1:19080/api/v1/physical-plan/status | jq .
+kill "$(cat target/readme-evidence/victoriametrics/backend.pid)"
+```
+
+To inspect supported MetricsQL planning independently:
+
+```bash
+target/debug/examples/inspect_physical_dag \
+  docs/examples/asapquery-compatibility-demo-snapshot.json --metricsql \
+  > target/readme-evidence/victoriametrics/selected.json
+jq '.install_request.query_plan.entries' \
+  target/readme-evidence/victoriametrics/selected.json
+```
+
+This does not install or ingest the artifact by itself. Use the fixture's normal
+stage/activate path for an integrated example. Keep the logs, headers and JSON
+under `target/readme-evidence/victoriametrics/`; see
+[MetricsQL support](docs/developer_docs/query-engine/victoriametrics-metricsql-support.md)
+for tenant paths and unsupported constructs.
+
+## ClickHouse / SQL runbook
+
+Use a **dedicated test ClickHouse server** at `http://127.0.0.1:8123`, with
+credentials supplied through `CLICKHOUSE_USER`/`CLICKHOUSE_PASSWORD` if needed.
+The real process fixture drops and recreates `default.telemetry` and
+`default.divisors` at the start of each scenario, and leaves the final tables
+on the dedicated server; do not point it at a production database. It loads samples,
+compiles an actual mixed query, publishes the shared plans, queries the backend,
+and cleans up its child backend. The native server remains yours to manage.
+
+```bash
+mkdir -p target/readme-evidence/clickhouse
+export CLICKHOUSE_URL=http://127.0.0.1:8123
+curl -fsS --user "${CLICKHOUSE_USER:-default}:${CLICKHOUSE_PASSWORD:-}" \
+  "$CLICKHOUSE_URL/ping"
+CLICKHOUSE_PLANNING_ARTIFACT="$PWD/target/readme-evidence/clickhouse/planning.json" \
+  cargo +1.98.0 test --locked -p data_plane --test clickhouse_differential_e2e \
+  compiled_publication_executes_mixed_dag_in_data_plane_process \
+  -- --exact --nocapture \
+  > target/readme-evidence/clickhouse/process.log 2>&1
+jq '{selection_trace, catalog: .publication.summary_catalog}' \
+  target/readme-evidence/clickhouse/planning.json
+```
+
+The fixture runs SUM, COUNT and MAX scenarios. `planning.json` is overwritten
+per scenario and retains the last publication; keep `process.log` for the complete
+run. Without `CLICKHOUSE_URL` the real-server test skips; that is not a successful
+native test. See [SQL support](docs/developer_docs/query-engine/clickhouse-sql-support.md)
+for the typed backfill and format boundaries.
+
+### Compile a concrete SQL input without preset materializations
+
+The example reads `ClickHouseSqlAutomaticWorkload` JSON from stdin, not a
+Prometheus snapshot. Reuse the current compiler envelope from the shared setup
+and provide a typed table schema plus a fixed evaluation interval:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+root = Path('target/readme-evidence')
+envelope = json.loads((root / 'selected.json').read_text())['install_request']['precompute_plan']['envelope']
+envelope['plan_id'] = 9001
+envelope['plan_version'] = 1
+workload = {
+    'envelope': envelope,
+    'tables': {'telemetry': {
+        'columns': [
+            {'name': 'timestamp_ms', 'dtype': 'timestamp', 'nullable': False},
+            {'name': 'value', 'dtype': 'float64', 'nullable': False},
+            {'name': 'metric', 'dtype': 'utf8', 'nullable': False}],
+        'time_index': 0, 'unique_keys': [], 'closed': True}},
+    'accuracy': 'Exact',
+    'queries': [{'sql': 'SELECT sum(value) FROM telemetry WHERE timestamp_ms >= 0 AND timestamp_ms < 2000',
+                 'start_ms': 0, 'end_ms': 2000, 'cumulative': True}]}
+(root / 'clickhouse/workload.json').write_text(json.dumps(workload, indent=2))
+PY
+target/debug/examples/compile_clickhouse_workload \
+  < target/readme-evidence/clickhouse/workload.json \
+  > target/readme-evidence/clickhouse/compiled.json
+jq '{selection_trace, catalog: .install.summary_catalog, query: .install.query_plan}' \
+  target/readme-evidence/clickhouse/compiled.json
+```
+
+The fixture above supplies real table data and exercises publication/execution;
+this offline command alone does neither. For a standalone **exact-fallback**
+listener against that native service:
+
+```bash
+printf 'aggregations: []\n' > target/readme-evidence/clickhouse/bootstrap.yaml
+target/debug/data_plane \
+  --streaming-config target/readme-evidence/clickhouse/bootstrap.yaml \
+  --http-port 19082 --clickhouse-http-port 19083 \
+  --clickhouse-url "$CLICKHOUSE_URL" --clickhouse-database default \
+  --output-dir target/readme-evidence/clickhouse/runtime \
+  > target/readme-evidence/clickhouse/backend.log 2>&1 &
+echo $! > target/readme-evidence/clickhouse/backend.pid
+for attempt in $(seq 1 60); do
+  curl -fsS http://127.0.0.1:19082/api/v1/health && break
+  sleep 1
+done
+curl -fsS http://127.0.0.1:19082/api/v1/health
+curl -sS -D target/readme-evidence/clickhouse/query.headers --get \
+  --user "${CLICKHOUSE_USER:-default}:${CLICKHOUSE_PASSWORD:-}" \
+  http://127.0.0.1:19083/ --data-urlencode 'query=SELECT 1 FORMAT JSON' \
+  > target/readme-evidence/clickhouse/query.json
+jq . target/readme-evidence/clickhouse/query.json
+curl -fsS http://127.0.0.1:19082/api/v1/physical-plan/status | jq .
+kill "$(cat target/readme-evidence/clickhouse/backend.pid)"
+```
+
+For authenticated requests, set `CLICKHOUSE_USER` and `CLICKHOUSE_PASSWORD`
+for the curl commands above, or send `X-ClickHouse-User` and `X-ClickHouse-Key`
+headers. The proxy forwards incoming authentication headers. Backend
+`--clickhouse-user` and `--clickhouse-password` configure backfill access; they
+do not automatically authenticate proxy fallback requests. The process fixture
+uses its matching environment variables. Retain planning/selection artifacts, response headers,
+JSON and process logs. A successful SQL response can be exact fallback or an
+external-only DAG; only actual summary reads establish ASAP/hybrid execution.
+The fixture's mixed-DAG assertions are stronger than a successful `SELECT 1`.
+
+For recorded datasets, see the [replay guide](docs/user_guide/o11y-replay.md) and
 [execution calibration](tools/o11y-execution/CALIBRATION.md). Report correctness,
 fallbacks, build/update cost and whole-deployment resources separately from
-query latency.
+query latency. Manual examples leave evidence directories intact; remove them
+only when no longer needed. PID-file cleanup commands apply only to the
+still-running backend started by that manual run. The ClickHouse fixture leaves
+its final tables on your dedicated native server; remove those test tables or
+discard that test server separately after collecting evidence.
 
 ## Repository map
 
