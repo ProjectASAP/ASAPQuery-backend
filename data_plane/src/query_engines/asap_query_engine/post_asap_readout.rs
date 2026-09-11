@@ -1340,12 +1340,26 @@ mod tests {
             .expect("execute exact rate DAG");
         let value = outcome.series[0].1[0].1;
         assert!((value - 0.575).abs() < 1e-12, "reset-aware rate={value}");
-        let mut native_vm_entry = entry.clone();
-        native_vm_entry.language = control_plane::query_plan::QueryLanguage::MetricsQl;
-        assert!(
-            execute_query_plan_readout(&idx, &native_vm_entry, 0, 60_000, true).is_err(),
-            "previously installed MetricsQL counter state must request exact fallback"
-        );
+        let native_runtime = PhysicalQueryRuntime {
+            language: control_plane::query_plan::QueryLanguage::MetricsQl,
+            catalog: None,
+            context: QueryExecutionContext {
+                index: &idx,
+                t0_ms: 0,
+                t1_ms: 60_000,
+                is_cumulative: true,
+                allowed_materializations: None,
+            },
+        };
+        for readout in [
+            control_plane::query_plan::ExactReadout::Rate,
+            control_plane::query_plan::ExactReadout::Increase,
+        ] {
+            assert!(matches!(native_runtime.execute_node(QueryNodeId(0),
+                &QueryPlanNode::ExactReadout { input:QueryNodeId(1),readout }, &[]),
+                Err(PhysicalNodeError::Fallback(reason))
+                    if reason.contains("native MetricsQL counter semantics require external exact execution")));
+        }
         assert!(
             execute_query_plan_readout(&idx, &entry, 1, 60_000, true).is_err(),
             "a partial leading counter pane needs Prometheus boundary samples"

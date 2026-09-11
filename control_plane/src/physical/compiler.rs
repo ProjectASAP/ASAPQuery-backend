@@ -4331,6 +4331,38 @@ mod tests {
     }
 
     #[test]
+    fn metricsql_counter_gate_preserves_an_independent_summary_sibling() {
+        let mut workload = request("mixed", "max_over_time(m[1m]) + rate(m[1m])");
+        workload.hybrid_execution = true;
+        let mut deployment = environment(10_000);
+        deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        deployment.collector_ids.clear();
+        let plan = PhysicalCompiler
+            .compile_metricsql(workload, deployment)
+            .unwrap();
+        assert!(!plan.precompute_plan.materializations.is_empty());
+        assert!(plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .all(|m| !matches!(
+                m.aggregation_type,
+                asap_types::AggregationType::Increase
+                    | asap_types::AggregationType::MultipleIncrease
+            )));
+        let entry = plan.query_plan.entries.values().next().unwrap();
+        assert!(!entry.materialization_bindings().is_empty());
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            crate::query_plan::QueryPlanNode::ExternalExact { .. }
+                | crate::query_plan::QueryPlanNode::Logical {
+                    operator: crate::query_plan::logical::LogicalOperator::ExactSubquery { .. },
+                    ..
+                }
+        )));
+    }
+
+    #[test]
     fn metricsql_compilation_publishes_a_language_tagged_query_entry() {
         let query = "mad_over_time(m[1m])";
         let mut workload = request("vm-q", "last_over_time(m[1m])");
