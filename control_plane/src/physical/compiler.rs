@@ -3190,7 +3190,8 @@ fn scoped_materialization(
     aggregation: &BackendAggregation,
     node: &SummaryNode,
 ) -> anyhow::Result<asap_types::PrecomputeMaterialization> {
-    let mut config = aggregation_config_for_materialization(aggregation, asap_types::QueryLanguage::PromQl)?;
+    let mut config =
+        aggregation_config_for_materialization(aggregation, asap_types::QueryLanguage::PromQl)?;
     if !matches!(aggregation.aggregation_input, AggregationInput::Raw) {
         return Ok(config);
     }
