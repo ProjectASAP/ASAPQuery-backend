@@ -127,8 +127,8 @@ external-only DAG execution is not acceleration.
 
 Planning input and serving traffic are separate. Sending a PromQL request from
 Grafana does not declare that it is a recurring dashboard query. Declare known
-query classes and demand through the control plane; send each evaluation to the
-data-plane query endpoint.
+query classes through the control plane; send each evaluation to the data-plane
+query endpoint.
 
 At startup, set `CONTROLLER_WORKLOADS` to a YAML registry containing the query
 text and deployment hints:
@@ -147,9 +147,9 @@ grouping and range-window semantics. Optional registry fields include
 and `monitor`. `accuracy_sla` is the legacy success fraction: `1.0` requests
 exact results and `0.99` permits epsilon `0.01`.
 
-The startup registry does not currently carry dashboard recurrence. To provide
-an evaluation cadence, submit the workload to the control plane's
-`POST /api/v1/plan` endpoint (`CONTROLLER_ADDR`, default port `8080`):
+The startup registry does not currently carry dashboard recurrence. The legacy
+planning API accepts an evaluation cadence at `POST /api/v1/plan`
+(`CONTROLLER_ADDR`, default port `8080`):
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/plan \
@@ -170,11 +170,17 @@ curl -X POST http://localhost:8080/api/v1/plan \
   }'
 ```
 
-`repeat_every` describes expected demand—for example, a dashboard panel
-refreshed every 30 seconds—but does not schedule evaluations. The `workload`
-object describes the incoming data stream and may be omitted to use conservative
-defaults. The API also accepts explicit `metric_name`, `aggregations`,
-`time_window`, `group_by_labels` and `label_filters` instead of a query string.
+`repeat_every` describes an expected cadence—for example, a dashboard panel
+refreshed every 30 seconds—but does not schedule evaluations. Its current use is
+narrow: the legacy deployment cost path uses it as the flush-period proxy for
+batch-mode plans. Window-mode plans use their configured window duration, and
+the canonical physical-plan request does not yet model general query recurrence.
+Do not assume that changing `repeat_every` will change summary selection.
+
+The `workload` object describes the incoming data stream and may be omitted to
+use conservative defaults. The API also accepts explicit `metric_name`,
+`aggregations`, `time_window`, `group_by_labels` and `label_filters` instead of
+a query string.
 
 Once the matching physical plan is installed and its state is ready, clients
 execute the query through the data plane's Prometheus-compatible API:
@@ -185,9 +191,10 @@ curl -G http://localhost:8088/api/v1/query \
 ```
 
 Range evaluations use `/api/v1/query_range` with `query`, `start`, `end` and
-`step`. Serving requests do not currently update `repeat_every` automatically;
-observed traffic needs an external workload observer to submit normalized
-demand to the control plane.
+`step`. Serving requests do not update `repeat_every` automatically. End-to-end
+dashboard-frequency-aware planning still requires a typed recurrence field on
+the canonical workload/publication path and an observer or explicit workload
+registration to populate it.
 
 Remote Write `204` acknowledges atomic bounded queue admission, **not** durable
 accumulator publication or a raw write-ahead log. Deduplication is in memory;
