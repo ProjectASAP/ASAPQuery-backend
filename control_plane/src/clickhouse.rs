@@ -461,6 +461,26 @@ fn bind_selected_node(
     })
 }
 
+/// Evaluate only exact integer constant arithmetic at the installation boundary.
+/// No SQL text rewrite, floating coercion, or runtime-column evaluation is allowed.
+fn constant_int64(expr: &QueryExpr) -> Option<i64> {
+    use planner_types::pre_asap::{ArithmeticOpKind, ScalarValue};
+    match expr {
+        QueryExpr::Literal(ScalarValue::Int64(value)) => Some(*value),
+        QueryExpr::Arithmetic { op, left, right } => {
+            let left = constant_int64(left)?;
+            let right = constant_int64(right)?;
+            match op {
+                ArithmeticOpKind::Add => left.checked_add(right),
+                ArithmeticOpKind::Sub => left.checked_sub(right),
+                ArithmeticOpKind::Mul => left.checked_mul(right),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn clickhouse_materialization_leaf_contract(
     node: &planner_types::post_asap::SummaryNode,
     evaluation_start_ms: u64,
@@ -594,7 +614,10 @@ fn clickhouse_materialization_leaf_contract(
             .ok_or_else(|| {
                 "SQL materialization predicate references an unknown column".to_string()
             })?;
-        match (name, op, right.as_ref()) {
+        let folded =
+            constant_int64(right).map(|value| QueryExpr::Literal(ScalarValue::Int64(value)));
+        let right = folded.as_ref().unwrap_or(right.as_ref());
+        match (name, op, right) {
             (
                 name,
                 CompareOpKind::Gt | CompareOpKind::Ge,
@@ -925,6 +948,33 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("ambiguous"));
+    }
+
+    #[test]
+    fn constant_integer_boundaries_reject_overflow_and_dynamic_values() {
+        use planner_types::pre_asap::{ArithmeticOpKind, ScalarValue};
+        let literal = |value| QueryExpr::Literal(ScalarValue::Int64(value));
+        let subtract = |left, right| QueryExpr::Arithmetic {
+            op: ArithmeticOpKind::Sub,
+            left: std::rc::Rc::new(left),
+            right: std::rc::Rc::new(right),
+        };
+        assert_eq!(
+            constant_int64(&subtract(literal(1_788_891_296_000), literal(43_200_000))),
+            Some(1_788_848_096_000)
+        );
+        assert_eq!(
+            constant_int64(&subtract(literal(i64::MIN), literal(1))),
+            None
+        );
+        assert_eq!(
+            constant_int64(&subtract(QueryExpr::Column(0), literal(1))),
+            None
+        );
+        assert_eq!(
+            constant_int64(&QueryExpr::Literal(ScalarValue::Float64(1.0))),
+            None
+        );
     }
 
     #[test]

@@ -169,7 +169,7 @@ async fn run_mixed_aggregate(aggregate: &str) {
     let sql = format!("SELECT sums.timestamp, sums.total / divisors.divisor AS ratio FROM (SELECT 2000 AS timestamp, {aggregate} AS total FROM telemetry WHERE metric = 'requests' AND timestamp_ms >= 0 AND timestamp_ms < 2000) AS sums INNER JOIN divisors ON sums.timestamp = divisors.timestamp");
     let grouped = aggregate == "max(value)";
     let sql = if grouped {
-        "SELECT labels, max(value) AS value FROM telemetry WHERE metric = 'requests' AND timestamp_ms >= 0 AND timestamp_ms < 2000 GROUP BY labels ORDER BY labels".to_string()
+        "SELECT labels, max(value) AS value FROM telemetry WHERE metric = 'requests' AND timestamp_ms > 1999 - 2000 AND timestamp_ms <= 1999 GROUP BY labels ORDER BY labels".to_string()
     } else {
         sql
     };
