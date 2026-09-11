@@ -266,4 +266,26 @@ mod tests {
             Cell::Float64(0.5)
         );
     }
+
+    #[test]
+    fn numeric_reductions_and_nullable_rejection_are_explicit() {
+        let fields = vec![("value".into(), DataType::Float64, false)];
+        let rows = vec![vec![Cell::Float64(2.0)], vec![Cell::Float64(8.0)]];
+        for (intent, expected) in [
+            (AggIntent::Sum { col: Some(0) }, Cell::Float64(10.0)),
+            (AggIntent::Avg { col: Some(0) }, Cell::Float64(5.0)),
+            (AggIntent::Min { col: Some(0) }, Cell::Float64(2.0)),
+            (AggIntent::Max { col: Some(0) }, Cell::Float64(8.0)),
+            (
+                AggIntent::Count {
+                    accuracy: planner_types::types::AccuracyTarget::Exact,
+                },
+                Cell::Int64(2),
+            ),
+        ] {
+            assert_eq!(measure(&intent, &rows, &fields).unwrap(), expected);
+        }
+        let nullable = vec![("value".into(), DataType::Float64, true)];
+        assert!(measure(&AggIntent::Sum { col: Some(0) }, &rows, &nullable).is_err());
+    }
 }
