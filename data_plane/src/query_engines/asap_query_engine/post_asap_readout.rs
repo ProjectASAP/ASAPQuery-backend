@@ -253,6 +253,18 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                 Ok(PhysicalQueryOutput::Value(values, coverage))
             }
             QueryPlanNode::ExactReadout { readout, .. } => {
+                if self.language == control_plane::query_plan::QueryLanguage::MetricsQl
+                    && matches!(
+                        readout,
+                        control_plane::query_plan::ExactReadout::Rate
+                            | control_plane::query_plan::ExactReadout::Increase
+                    )
+                {
+                    return Err(PhysicalNodeError::Fallback(
+                        "native MetricsQL counter semantics require external exact execution"
+                            .into(),
+                    ));
+                }
                 let [PhysicalQueryOutput::State { groups, .. }] = inputs else {
                     return Err(PhysicalNodeError::ExpectedState);
                 };
@@ -1328,6 +1340,26 @@ mod tests {
             .expect("execute exact rate DAG");
         let value = outcome.series[0].1[0].1;
         assert!((value - 0.575).abs() < 1e-12, "reset-aware rate={value}");
+        let native_runtime = PhysicalQueryRuntime {
+            language: control_plane::query_plan::QueryLanguage::MetricsQl,
+            catalog: None,
+            context: QueryExecutionContext {
+                index: &idx,
+                t0_ms: 0,
+                t1_ms: 60_000,
+                is_cumulative: true,
+                allowed_materializations: None,
+            },
+        };
+        for readout in [
+            control_plane::query_plan::ExactReadout::Rate,
+            control_plane::query_plan::ExactReadout::Increase,
+        ] {
+            assert!(matches!(native_runtime.execute_node(QueryNodeId(0),
+                &QueryPlanNode::ExactReadout { input:QueryNodeId(1),readout }, &[]),
+                Err(PhysicalNodeError::Fallback(reason))
+                    if reason.contains("native MetricsQL counter semantics require external exact execution")));
+        }
         assert!(
             execute_query_plan_readout(&idx, &entry, 1, 60_000, true).is_err(),
             "a partial leading counter pane needs Prometheus boundary samples"

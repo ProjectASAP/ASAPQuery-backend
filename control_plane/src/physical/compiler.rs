@@ -838,6 +838,54 @@ fn preserve_invalid_exact_fallback_roots(
     Ok(())
 }
 
+/// A MetricsQL query whose only selected states are Prometheus-specific
+/// counter readouts has no backend materialization to bind. Keep the original
+/// query as one native exact root. Mixed queries retain their other selected
+/// summaries and let residual lowering cut only the counter branches.
+fn preserve_metricsql_counter_only_roots(
+    queries: &mut [PlanningQuery],
+    composable: bool,
+) -> Result<(), CompileError> {
+    for query in queries {
+        let selected =
+            collect_selected_materializations(&query.post_asap, composable).map_err(|reason| {
+                CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason,
+                }
+            })?;
+        if selected.is_empty()
+            || !selected.iter().all(|state| {
+                matches!(
+                    state.family,
+                    SummaryFamilyType::ExactAggregate(
+                        planner_types::post_asap::ExactKind::Rate
+                            | planner_types::post_asap::ExactKind::Increase,
+                        _
+                    )
+                )
+            })
+        {
+            continue;
+        }
+        let parsed = crate::query_parser::parse_query_expr_canonical(
+            &query.query_string,
+            query.accuracy.clone(),
+        )
+        .map_err(|error| CompileError::Query {
+            query_id: query.query_id.clone(),
+            reason: error.to_string(),
+        })?;
+        query.post_asap = crate::planner_selection::keep_pre_asap(&parsed).map_err(|error| {
+            CompileError::Query {
+                query_id: query.query_id.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+    }
+    Ok(())
+}
+
 impl PhysicalCompiler {
     pub fn compile(
         &self,
@@ -905,6 +953,9 @@ impl PhysicalCompiler {
             }
         }
 
+        if metricsql {
+            preserve_metricsql_counter_only_roots(&mut request.queries, request.hybrid_execution)?;
+        }
         preserve_invalid_exact_fallback_roots(&mut request.queries, request.hybrid_execution)?;
 
         if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite
@@ -958,7 +1009,15 @@ impl PhysicalCompiler {
             let selected = selected
                 .into_iter()
                 .filter(|state| {
-                    (!request.hybrid_execution
+                    // Counter readout implements Prometheus extrapolation. Native
+                    // MetricsQL includes boundary samples differently, so retain
+                    // these leaves as external exact dependencies until its
+                    // counter semantics have a dedicated implementation.
+                    !(metricsql && matches!(state.family,
+                        SummaryFamilyType::ExactAggregate(
+                            planner_types::post_asap::ExactKind::Rate
+                                | planner_types::post_asap::ExactKind::Increase, _)))
+                    && (!request.hybrid_execution
                         || state.window_secs.is_none_or(|window| {
                             query
                                 .window_implementations
@@ -3558,6 +3617,59 @@ mod tests {
             CompileError::Snapshot(reason)
                 if reason == "planning query IDs must be unique within a plan generation"
         ));
+    }
+
+    #[test]
+    fn metricsql_counter_readouts_remain_external_exact() {
+        for text in [
+            "rate(counter_probe{case=\"reset\"}[5s])",
+            "increase(counter_probe{case=\"reset\"}[5s])",
+        ] {
+            let mut workload = request("counter", text);
+            workload.hybrid_execution = true;
+            let mut deployment = environment(10_000);
+            deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+            deployment.collector_ids.clear();
+            let plan = PhysicalCompiler
+                .compile_metricsql(workload, deployment)
+                .unwrap();
+            assert!(plan.precompute_plan.materializations.is_empty());
+            let entry = plan.query_plan.entries.values().next().unwrap();
+            assert!(entry.materialization_bindings().is_empty());
+            assert_eq!(entry.language, crate::query_plan::QueryLanguage::MetricsQl);
+        }
+    }
+
+    #[test]
+    fn metricsql_counter_gate_preserves_an_independent_summary_sibling() {
+        let mut workload = request("mixed", "max_over_time(m[1m]) + rate(m[1m])");
+        workload.hybrid_execution = true;
+        let mut deployment = environment(10_000);
+        deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        deployment.collector_ids.clear();
+        let plan = PhysicalCompiler
+            .compile_metricsql(workload, deployment)
+            .unwrap();
+        assert!(!plan.precompute_plan.materializations.is_empty());
+        assert!(plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .all(|m| !matches!(
+                m.aggregation_type,
+                asap_types::AggregationType::Increase
+                    | asap_types::AggregationType::MultipleIncrease
+            )));
+        let entry = plan.query_plan.entries.values().next().unwrap();
+        assert!(!entry.materialization_bindings().is_empty());
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            crate::query_plan::QueryPlanNode::ExternalExact { .. }
+                | crate::query_plan::QueryPlanNode::Logical {
+                    operator: crate::query_plan::logical::LogicalOperator::ExactSubquery { .. },
+                    ..
+                }
+        )));
     }
 
     #[test]
