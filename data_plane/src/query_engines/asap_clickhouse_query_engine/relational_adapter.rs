@@ -41,6 +41,7 @@ enum Cell {
     Bool(bool),
     Timestamp(i64),
     Map(Vec<(Cell, Cell)>),
+    List(Arc<[Cell]>),
 }
 
 fn json_cell(
@@ -60,9 +61,23 @@ fn json_cell(
     match dtype {
         DataType::Null if value.is_null() => Ok(Cell::Null),
         DataType::Null => Err(invalid()),
-        DataType::List { .. } | DataType::Struct { .. } => Err(
-            ClickHouseRelationalError::Unsupported("collection value transport".into()),
-        ),
+        DataType::List { element } => {
+            let item_type = clickhouse_type
+                .strip_prefix("Array(")
+                .and_then(|inner| inner.strip_suffix(')'))
+                .ok_or_else(invalid)?;
+            let items = value.as_array().ok_or_else(invalid)?;
+            Ok(Cell::List(
+                items
+                    .iter()
+                    .map(|item| json_cell(item, &element.dtype, element.nullable, item_type))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into(),
+            ))
+        }
+        DataType::Struct { .. } => Err(ClickHouseRelationalError::Unsupported(
+            "struct value transport".into(),
+        )),
         DataType::Int64 => value.as_i64().map(Cell::Int64).ok_or_else(invalid),
         DataType::Float64 => value.as_f64().map(Cell::Float64).ok_or_else(invalid),
         DataType::Utf8 => value
@@ -307,7 +322,16 @@ fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: 
     }
     match expected {
         DataType::Null => actual == "Nothing",
-        DataType::List { .. } | DataType::Struct { .. } => false,
+        DataType::List { element } => {
+            !nullable
+                && actual
+                    .strip_prefix("Array(")
+                    .and_then(|inner| inner.strip_suffix(')'))
+                    .is_some_and(|inner| {
+                        clickhouse_type_matches(Some(inner), &element.dtype, element.nullable)
+                    })
+        }
+        DataType::Struct { .. } => false,
         DataType::Int64 => actual == "Int64",
         DataType::Float64 => actual == "Float64",
         DataType::Utf8 => actual == "String",
@@ -428,9 +452,15 @@ impl ClickHouseRelationalAdapter {
                 }
                 for row in &input.rows {
                     for key in keys {
-                        if contains_nan(&eval(&key.expr, row, &schema)?) {
+                        let value = eval(&key.expr, row, &schema)?;
+                        if contains_nan(&value) {
                             return Err(ClickHouseRelationalError::Unsupported(
                                 "NaN sort key".into(),
+                            ));
+                        }
+                        if !matches!(value, Cell::Null) && cell_cmp(&value, &value).is_none() {
+                            return Err(ClickHouseRelationalError::Unsupported(
+                                "unsupported sort key value type".into(),
                             ));
                         }
                     }
@@ -548,7 +578,50 @@ fn eval(
         }
         QueryExpr::FunctionCall { name, args } => {
             use planner_types::pre_asap::scalar_signature::MapScalarFunction;
-            let function = MapScalarFunction::from_name(name).ok_or_else(|| {
+            if name.eq_ignore_ascii_case("asap_element_access") {
+                let (output_type, _) = expr
+                    .scalar_type(schema)
+                    .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?;
+                if let DataType::List { element } = args[0]
+                    .scalar_type(schema)
+                    .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?
+                    .0
+                {
+                    let Cell::List(values) = eval(&args[0], row, schema)? else {
+                        return Err(ClickHouseRelationalError::Invalid(
+                            "array access input".into(),
+                        ));
+                    };
+                    let index = match eval(&args[1], row, schema)? {
+                        Cell::Null => return Ok(Cell::Null),
+                        Cell::Int64(index) => index,
+                        _ => {
+                            return Err(ClickHouseRelationalError::Invalid(
+                                "array access index".into(),
+                            ))
+                        }
+                    };
+                    let offset = if index > 0 {
+                        usize::try_from(index - 1).ok()
+                    } else if index < 0 {
+                        usize::try_from(index.unsigned_abs())
+                            .ok()
+                            .and_then(|distance| values.len().checked_sub(distance))
+                    } else {
+                        None
+                    };
+                    return match offset.and_then(|offset| values.get(offset)) {
+                        Some(value) => Ok(value.clone()),
+                        None => default_collection_element(&output_type, element.nullable),
+                    };
+                }
+            }
+            let function = (if name.eq_ignore_ascii_case("asap_element_access") {
+                Some(MapScalarFunction::Access)
+            } else {
+                MapScalarFunction::from_name(name)
+            })
+            .ok_or_else(|| {
                 ClickHouseRelationalError::Unsupported(format!("scalar function {name}"))
             })?;
             expr.scalar_type(schema)
@@ -619,7 +692,7 @@ fn eval(
                     else {
                         unreachable!()
                     };
-                    default_map_value(&value, value_nullable)
+                    default_collection_element(&value, value_nullable)
                 }
             }
         }
@@ -629,7 +702,7 @@ fn eval(
     }
 }
 
-fn default_map_value(dtype: &DataType, nullable: bool) -> Result<Cell, ClickHouseRelationalError> {
+fn default_collection_element(dtype: &DataType, nullable: bool) -> Result<Cell, ClickHouseRelationalError> {
     if nullable {
         return Ok(Cell::Null);
     }
@@ -640,9 +713,10 @@ fn default_map_value(dtype: &DataType, nullable: bool) -> Result<Cell, ClickHous
         DataType::Utf8 => Cell::Utf8(String::new()),
         DataType::Bool => Cell::Bool(false),
         DataType::Map { .. } => Cell::Map(Vec::new()),
+        DataType::List { .. } => Cell::List(Arc::from([])),
         _ => {
             return Err(ClickHouseRelationalError::Unsupported(
-                "map missing-key default type".into(),
+                "collection missing-element default type".into(),
             ))
         }
     })
@@ -768,6 +842,7 @@ fn compare_sort_keys(
 fn contains_nan(value: &Cell) -> bool {
     match value {
         Cell::Float64(value) => value.is_nan(),
+        Cell::List(values) => values.iter().any(contains_nan),
         Cell::Map(entries) => entries
             .iter()
             .any(|(key, value)| contains_nan(key) || contains_nan(value)),
@@ -973,6 +1048,107 @@ mod tests {
         pre_asap::{GroupKeys, Predicate, ProjectItem},
     };
     use std::rc::Rc;
+
+    #[test]
+    fn decodes_declared_array_elements_without_losing_nullability() {
+        use planner_types::pre_asap::Column;
+        let dtype = DataType::List {
+            element: Box::new(Column {
+                name: "item".into(),
+                dtype: DataType::Int64,
+                nullable: true,
+                table: None,
+            }),
+        };
+        assert!(clickhouse_type_matches(
+            Some("Array(Nullable(Int64))"),
+            &dtype,
+            false
+        ));
+        assert!(!clickhouse_type_matches(
+            Some("Array(Int64)"),
+            &dtype,
+            false
+        ));
+        assert!(!clickhouse_type_matches(
+            Some("Nullable(Array(Nullable(Int64)))"),
+            &dtype,
+            true
+        ));
+        let value = json_cell(
+            &serde_json::json!([9007199254740993_i64, null, -7]),
+            &dtype,
+            false,
+            "Array(Nullable(Int64))",
+        )
+        .unwrap();
+        let Cell::List(items) = &value else {
+            panic!("expected list")
+        };
+        assert_eq!(
+            items.as_ref(),
+            &[Cell::Int64(9007199254740993), Cell::Null, Cell::Int64(-7)]
+        );
+        let Cell::List(copy) = value.clone() else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(items, &copy));
+        assert!(json_cell(
+            &serde_json::json!(["wrong"]),
+            &dtype,
+            false,
+            "Array(Nullable(Int64))"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn array_access_uses_signed_indices_and_element_defaults() {
+        use planner_types::pre_asap::{Column, Schema};
+        let function = |name: &str, args| QueryExpr::FunctionCall {
+            name: name.into(),
+            args,
+        };
+        let dtype = DataType::List {
+            element: Box::new(Column::new("item", DataType::Int64, false)),
+        };
+        let schema = Schema::new(vec![
+            Column::new("items", dtype, false),
+            Column::new("index", DataType::Int64, true),
+        ]);
+        let access = function(
+            "asap_element_access",
+            vec![QueryExpr::Column(0), QueryExpr::Column(1)],
+        );
+        let items = Cell::List(vec![Cell::Int64(10), Cell::Int64(20)].into());
+        for (index, expected) in [
+            (1, 10),
+            (2, 20),
+            (-1, 20),
+            (-2, 10),
+            (0, 0),
+            (3, 0),
+            (i64::MIN, 0),
+            (i64::MAX, 0),
+        ] {
+            assert_eq!(
+                eval(&access, &[items.clone(), Cell::Int64(index)], &schema).unwrap(),
+                Cell::Int64(expected)
+            );
+        }
+        assert_eq!(
+            eval(&access, &[items, Cell::Null], &schema).unwrap(),
+            Cell::Null
+        );
+        let zero = function(
+            "asap_element_access",
+            vec![
+                QueryExpr::Column(0),
+                QueryExpr::Literal(ScalarValue::Int64(0)),
+            ],
+        );
+        assert!(eval(&zero, &[Cell::List(Arc::from([])), Cell::Int64(0)], &schema).is_err());
+    }
 
     fn schema(fields: &[(&str, DataType)]) -> SummarySchema {
         SummarySchema {
