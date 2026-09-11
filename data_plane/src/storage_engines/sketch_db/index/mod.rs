@@ -564,6 +564,28 @@ pub(crate) struct SummaryReadRevision {
     in_flight: usize,
 }
 impl SummaryReadRevision {
+    fn capture(
+        admission: u64,
+        mutation: &std::sync::atomic::AtomicU64,
+        active: &std::sync::atomic::AtomicUsize,
+        between_reads: impl FnOnce(),
+    ) -> Self {
+        use std::sync::atomic::Ordering::SeqCst;
+        let before = mutation.load(SeqCst);
+        between_reads();
+        let in_flight = active.load(SeqCst);
+        let after = mutation.load(SeqCst);
+        Self {
+            admission,
+            mutation: after,
+            in_flight: if before == after {
+                in_flight
+            } else {
+                in_flight.max(1)
+            },
+        }
+    }
+
     pub(crate) fn matches(self, other: Self) -> bool {
         self.in_flight == 0
             && other.in_flight == 0
@@ -873,12 +895,12 @@ impl SketchStore {
     }
 
     pub(crate) fn summary_update_revision(&self) -> SummaryReadRevision {
-        use std::sync::atomic::Ordering::SeqCst;
-        SummaryReadRevision {
-            admission: self.admission.read().unwrap().revision(),
-            mutation: self.mutation_revision.load(SeqCst),
-            in_flight: self.active_mutations.load(SeqCst),
-        }
+        SummaryReadRevision::capture(
+            self.admission.read().unwrap().revision(),
+            &self.mutation_revision,
+            &self.active_mutations,
+            || {},
+        )
     }
 
     fn begin_state_mutation(&self) -> StateMutation<'_> {
@@ -3102,6 +3124,21 @@ mod tests {
             expires_at_ms: None,
             policy_fp,
         }
+    }
+
+    #[test]
+    fn completing_writer_between_revision_loads_cannot_certify_a_snapshot() {
+        let store = SketchStore::new();
+        let before = store.summary_update_revision();
+        let writer = store.begin_state_mutation();
+        let after = SummaryReadRevision::capture(
+            0,
+            &store.mutation_revision,
+            &store.active_mutations,
+            || drop(writer),
+        );
+        assert!(!before.matches(after));
+        assert!(!after.matches(after), "capture crossed a writer completion");
     }
 
     #[test]
