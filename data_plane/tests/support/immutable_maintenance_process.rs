@@ -38,6 +38,13 @@ async fn single_source_maintenance_is_automatic_and_durable() {
         derived.derived_input.as_ref().unwrap().inputs,
         std::collections::BTreeSet::from([source.policy_fingerprint().into()])
     );
+    // The production cost model may choose DDSketch or KLL. Preserve that
+    // choice and use its actual value contract for this singleton oracle.
+    let max_relative_error = match derived.aggregation_type {
+        asap_types::AggregationType::DDSketch => derived.parameters["alpha"].as_f64().unwrap(),
+        asap_types::AggregationType::KLL => 0.0,
+        ref other => panic!("singleton quantile oracle missing for {other:?}"),
+    };
     eprintln!(
         "IMMUTABLE_SELECTED {}",
         serde_json::json!({
@@ -154,7 +161,15 @@ async fn single_source_maintenance_is_automatic_and_durable() {
             response["data"]["result"][0]["metric"],
             serde_json::json!({})
         );
-        assert_eq!(response["data"]["result"][0]["value"][1], "10");
+        let estimate = response["data"]["result"][0]["value"][1]
+            .as_str()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
+        assert!(
+            estimate.is_finite() && (estimate - 10.0).abs() / 10.0 <= max_relative_error,
+            "selected singleton quantile exceeded its value contract: {response}"
+        );
         drop(first);
         let port = unused_port();
         let backend = format!("http://127.0.0.1:{port}");
