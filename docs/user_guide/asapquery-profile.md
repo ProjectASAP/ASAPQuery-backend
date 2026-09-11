@@ -59,6 +59,13 @@ batch before enqueueing it. Invalid batches return `400` or `413`; exhausted
 deduplication or worker-queue capacity returns retryable `503`; accepted batches
 return `204`.
 
+`204` acknowledges bounded queue admission, not a durable accumulator or raw-WAL
+commit. Deduplication is in memory and is not recovered on restart. Stale markers
+are counted/deduplicated and excluded from numeric aggregation; they are not
+forwarded as lifecycle events. Native histograms and exemplars are rejected.
+For plan/SID inspection and finite-replay boundaries, use the
+[E2E physical-DAG walkthrough](../evaluation/e2e-physical-dag.md).
+
 The deduplication horizon must cover allowed lateness plus the deployment's
 maximum expected Prometheus retry interval. Configure those assumptions with
 `--precompute-allowed-lateness-ms`,

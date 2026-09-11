@@ -1,6 +1,6 @@
 # ASAPQuery compatibility profile
 
-> Status: implemented by the compatibility stack (pending merge)
+> Status: implemented; wider maintenance capabilities retain separate admission gates
 >
 > Reference: [ProjectASAP/ASAPQuery at `9fb051a`](https://github.com/ProjectASAP/ASAPQuery/tree/9fb051aa798361fca8e3012835412cb6fa338a0c)
 >
@@ -189,31 +189,30 @@ their historical patches touched precompute code. Compatibility tests preserve
 both migrated ASAPQuery fixes and newer backend fixes, and expose any remaining
 semantic mismatch rather than weakening the expected results.
 
-The exact Prometheus stale-NaN bit pattern is a series-staleness event, not a
-numeric accumulator input. Other unsupported NaN encodings are rejected by the
-profile's documented invalid-sample policy.
+The exact Prometheus stale-NaN bit pattern is recognized, deduplicated and
+counted, then excluded from numeric aggregation. It is not currently propagated
+as a worker lifecycle event. Other non-finite values, native histograms and
+exemplars are rejected. Only Remote Write v1 is supported.
 
-Prometheus Remote Write retries can repeat a whole request. Accepted samples
-must not be double-counted. The MVP uses canonical series identity plus
-timestamp as its idempotency key. An identical value is a duplicate and a
-no-op; a conflicting value at the same timestamp is rejected deterministically
-and is never aggregated twice. Deduplication state and accumulator mutation
-share one warm-state failure domain and are committed before success is
-returned. The bounded deduplication horizon is an explicit receiver setting and
-must cover the configured maximum lateness plus the deployment's expected
-Remote Write retry interval; the receiver cannot infer that interval from the
-v1 request.
+Within the configured in-memory deduplication horizon, an identical canonical
+series/timestamp/value is a duplicate; a conflicting value is rejected. The
+receiver validates the batch and reserves all bounded worker-queue capacity
+before exposing messages. A `204` acknowledges that queue admission and
+in-memory dedup bookkeeping, not completed accumulator mutation or durable
+commit. There is no durable raw-sample WAL or receiver dedup recovery after a
+process restart. Summary persistence is a separate later stage.
 
-Batch handling is retry-safe. A response that may cause the sender to retry the
-whole request must not leave untracked partial mutations. The implementation
-either validates and applies the batch atomically or records enough per-sample
-idempotency state for a replay to converge to the same result. Invalid requests
-return a non-retryable response; overload and internal failures return the
-documented retryable response.
+Invalid batches fail before enqueueing. Queue/dedup capacity exhaustion returns
+a retryable `503`; body/decoded size limits return `413`. The dedup horizon must
+cover configured lateness and expected retry duration, but it does not provide
+crash-safe exactly-once delivery. Prometheus remains the raw-data authority.
 
-Backpressure is visible. If a bounded queue or memory limit prevents durable
-acceptance, `/api/v1/write` returns a retryable non-success response; it must not
-return success after silently dropping input.
+Remote Write carries neither a producer-partition roster nor an authoritative
+watermark. Finite `POST /api/v1/precompute/drain` closes the input generation;
+it is not continuous completion. Existing typed `SummaryWatermarkBarrier` and
+coordinator APIs need registered producer/partition identity and publication
+ordering before they can establish continuous closure. There is no public HTTP
+barrier endpoint in this profile.
 
 ### SummaryStore
 
@@ -320,7 +319,7 @@ stronger activation and retry contracts.
 | --- | --- | --- |
 | Startup/profile | Collector-free startup, excluded-component validation, fallback health gate | `data_plane` profile tests and production-process E2E |
 | Physical planning | Canonical workload snapshot to one atomic SummaryCatalog/PrecomputePlan/QueryPlan bundle | `compatibility_demo_snapshot_compiles_the_complete_query_matrix` |
-| Remote Write | Strict v1 decoding, stale handling, limits, retry-safe deduplication and backpressure | receiver unit tests plus process E2E replay/corrupt-batch assertions |
+| Remote Write | Strict v1 decoding, stale-marker exclusion, limits, bounded in-memory deduplication and backpressure | receiver unit tests plus process E2E replay/corrupt-batch assertions |
 | Precompute/store | Raw samples use the planned family; first catch-up batches close all complete windows; sketch and exact payloads share canonical SID semantics | worker/store tests and four-family process matrix |
 | Query execution | QueryPlan-only serving-time lookup, node-level materialization binding, generic DAG traversal, exact fallback | instant/range process matrix and fallback request capture |
 | Atomic activation | Versioned stage/activate snapshot and materialization readiness state | physical-plan endpoint tests and `/physical-plan/status` assertions |
@@ -346,7 +345,7 @@ marker handling, bounded deduplication/retry behavior, visible backpressure, and
 routing into the existing raw-sample precompute input.
 
 Acceptance: valid Snappy/protobuf batches produce the same canonical samples and
-staleness events as a reference decoder; replayed whole or partial batches
+stale-marker recognition as a reference decoder; replayed whole or partial batches
 converge without double-counting; corrupt, oversized, conflicting, and
 overloaded requests cannot leave untracked mutations while returning success.
 
