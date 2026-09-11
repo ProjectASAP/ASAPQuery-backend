@@ -343,6 +343,49 @@ impl PrecomputePlan {
             installed
                 .validate()
                 .map_err(PrecomputePlanError::CatalogContract)?;
+            let dag = installed
+                .document
+                .decode()
+                .map_err(PrecomputePlanError::CatalogContract)?;
+            for node in &dag.nodes {
+                let Some(crate::executable_plan::BackendNodeBinding::Materialization {
+                    summary_definition,
+                }) = installed.binding.node(node.id)
+                else {
+                    continue;
+                };
+                let Some(config) = self
+                    .materializations
+                    .iter()
+                    .find(|config| config.policy_fingerprint() == summary_definition.fingerprint())
+                else {
+                    return Err(PrecomputePlanError::CatalogContract(
+                        "DAG materialization has no runtime configuration".into(),
+                    ));
+                };
+                if let Some(partitioning) = config.partitioning {
+                    if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+                        reduction,
+                        ..
+                    } = &node.payload
+                    {
+                        let expected = match reduction {
+                            planner_types::pre_asap::Reduction::PerEntity => {
+                                crate::sds::PopulationPartitioning::PerEntity
+                            }
+                            planner_types::pre_asap::Reduction::Reduce(_) => {
+                                crate::sds::PopulationPartitioning::Grouped
+                            }
+                        };
+                        if partitioning != expected {
+                            return Err(PrecomputePlanError::CatalogContract(
+                                "runtime population partition disagrees with Planner reduction"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            }
         }
         let mut materializations = BTreeSet::new();
         for materialization in &self.materializations {
