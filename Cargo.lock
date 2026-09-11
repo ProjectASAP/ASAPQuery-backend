@@ -373,7 +373,7 @@ dependencies = [
 [[package]]
 name = "asap-aware-mapping"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc#7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=0402384e589df6e087d6d2d22b463ddc2eea0774#0402384e589df6e087d6d2d22b463ddc2eea0774"
 dependencies = [
  "asap-types",
  "serde",
@@ -384,7 +384,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc#7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=0402384e589df6e087d6d2d22b463ddc2eea0774#0402384e589df6e087d6d2d22b463ddc2eea0774"
 dependencies = [
  "asap-types",
  "promql-parser",
@@ -393,7 +393,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-sql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc#7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=0402384e589df6e087d6d2d22b463ddc2eea0774#0402384e589df6e087d6d2d22b463ddc2eea0774"
 dependencies = [
  "asap-sql-function-catalog",
  "asap-types",
@@ -415,12 +415,12 @@ dependencies = [
 [[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc#7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=0402384e589df6e087d6d2d22b463ddc2eea0774#0402384e589df6e087d6d2d22b463ddc2eea0774"
 
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc#7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=0402384e589df6e087d6d2d22b463ddc2eea0774#0402384e589df6e087d6d2d22b463ddc2eea0774"
 dependencies = [
  "serde",
  "serde_json",
@@ -460,6 +460,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "asap-types",
+ "base64 0.21.7",
  "clap 4.6.1",
  "promql-parser",
  "serde",

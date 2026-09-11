@@ -127,6 +127,12 @@ impl PolicyFingerprint {
         }
         buf.push(0);
 
+        if cfg.table_name.is_some() && !cfg.grouping_labels.is_empty() {
+            buf.extend_from_slice(
+                crate::grouping_projection::TABLE_GROUP_OBSERVATION_SEMANTICS.as_bytes(),
+            );
+            buf.push(0);
+        }
         if !cfg.grouping_labels.is_legacy_labels() {
             buf.extend_from_slice(b"typed-grouping:");
             buf.extend_from_slice(

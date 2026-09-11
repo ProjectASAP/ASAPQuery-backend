@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 promql-parser.workspace = true
+base64 = "0.21"
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -33,4 +34,4 @@ sha2 = "0.10"
 # exactly (`control_plane/Cargo.toml`) -- two different revs of the same
 # git dependency in one workspace resolve to two distinct Rust types that
 # won't unify.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "0402384e589df6e087d6d2d22b463ddc2eea0774" }

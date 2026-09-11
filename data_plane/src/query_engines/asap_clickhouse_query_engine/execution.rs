@@ -320,13 +320,17 @@ fn execute_sql_dag_with_external_unfenced(
                 ))
             }
         };
-        let pane_ms = entry
-            .materialization_bindings()
+        let bindings = entry.materialization_bindings();
+        let pane_ms = bindings
             .iter()
             .map(|binding| binding.window_ms)
             .max()
             .unwrap_or(0);
-        if !complete_pane_coverage(relation.coverage, (t0_ms, t1_ms), pane_ms) {
+        // External-only DAGs have no summary panes to cover. Their source
+        // population is defined by the independently bound exact requests.
+        if !bindings.is_empty()
+            && !complete_pane_coverage(relation.coverage, (t0_ms, t1_ms), pane_ms)
+        {
             return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::IncompleteCoverage {
                 requested: (t0_ms, t1_ms),
                 observed: relation.coverage,
