@@ -62,6 +62,7 @@ struct OperatorAdapter<'a> {
     source: SummaryState,
     configs: &'a [asap_types::aggregation_config::AggregationConfig],
     immutable_windows: Option<Arc<[(i64, SummaryState)]>>,
+    singleton_population_complete: bool,
 }
 
 impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
@@ -150,14 +151,12 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                         config.policy_fingerprint() == self.source_definition.fingerprint()
                     })
                     .ok_or("maintenance input lacks installed source configuration")?;
-                if config.grouping_labels != source_config.grouping_labels
-                    || config.partitioning != source_config.partitioning
-                {
-                    return Err(
-                        "maintenance transform requires explicit target window/group routing"
-                            .into(),
-                    );
-                }
+                validate_maintenance_grouping(
+                    config,
+                    source_config,
+                    node,
+                    self.singleton_population_complete,
+                )?;
                 if config.accumulator_spec().map_err(|e| e.to_string())?.family != *family {
                     return Err(
                         "maintenance SummaryAgg family differs from installed configuration".into(),
@@ -192,6 +191,31 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
             )),
         }
     }
+}
+
+fn validate_maintenance_grouping(
+    target: &asap_types::PrecomputeMaterialization,
+    source: &asap_types::PrecomputeMaterialization,
+    node: &ExecutableDagNode,
+    singleton_population_complete: bool,
+) -> Result<(), String> {
+    if target.grouping_labels == source.grouping_labels
+        && target.partitioning == source.partitioning
+    {
+        return Ok(());
+    }
+    if singleton_population_complete
+        && target.grouping_labels.is_empty()
+        && target.partitioning == Some(asap_types::sds::PopulationPartitioning::Grouped)
+        && source.partitioning == Some(asap_types::sds::PopulationPartitioning::PerEntity)
+        && target.stored_window_ms() == source.stored_window_ms()
+        && matches!(&node.payload, ExecutableOperatorPayload::SummaryAgg {
+            reduction: planner_types::pre_asap::Reduction::Reduce(keys), ..
+        } if keys.is_empty())
+    {
+        return Ok(());
+    }
+    Err("maintenance population reduction requires a complete singleton source or synchronized grouping".into())
 }
 
 fn evaluate_weight(
@@ -454,6 +478,7 @@ fn execute_prepared_frozen_sink(
         source: Arc::clone(&first.1),
         configs,
         immutable_windows: Some(states.into()),
+        singleton_population_complete: input.singleton_population_complete,
     };
     let value = execute_precompute_sink(
         dag,
@@ -566,6 +591,17 @@ pub fn execute_completed_maintenance(
         .as_slice()
         .try_into()
         .map_err(|_| "invalid input digest")?;
+    let target_node = dag
+        .nodes
+        .iter()
+        .find(|node| node.id == sink)
+        .ok_or("maintenance target node is absent")?;
+    validate_maintenance_grouping(
+        target_config,
+        source_config,
+        target_node,
+        frozen.singleton_population_complete,
+    )?;
     if store.recover_frozen_maintenance_output(
         target_sid,
         target_config,
@@ -665,7 +701,18 @@ pub(crate) fn execute_finite_maintenance(
                 .completed_maintenance_coordinates(*target, generation)?;
             for (source_sid, populations) in sources {
                 for (group, windows) in populations {
-                    let pairs: Vec<_> = group
+                    let output_group: BTreeMap<_, _> = config
+                        .grouping_labels
+                        .iter()
+                        .map(|key| {
+                            group
+                                .get(key)
+                                .cloned()
+                                .map(|value| (key.clone(), value))
+                                .ok_or("maintenance output grouping key is absent")
+                        })
+                        .collect::<Result<_, _>>()?;
+                    let pairs: Vec<_> = output_group
                         .iter()
                         .map(|(key, value)| (key.as_str(), value.as_str()))
                         .collect();
@@ -712,7 +759,7 @@ pub(crate) fn execute_finite_maintenance(
                         }
                         if existing
                             .get(&target_sid)
-                            .and_then(|groups| groups.get(&group))
+                            .and_then(|groups| groups.get(&output_group))
                             .is_some_and(|present| present.contains(&(*start, end)))
                         {
                             continue;
@@ -1016,6 +1063,7 @@ impl MaintenanceDagSink {
                 source: Arc::clone(&source),
                 configs: &plan.precompute_plan.materializations,
                 immutable_windows: None,
+                singleton_population_complete: false,
             };
             for sink_node in &installed.binding.precompute_sinks {
                 // Derived summaries consume complete immutable windows at the
@@ -1382,6 +1430,7 @@ mod tests {
             source: sum(7.0),
             configs: &configs,
             immutable_windows: Some(vec![(1000, sum(7.0))].into()),
+            singleton_population_complete: false,
         };
         let mut read = node(2);
         read.payload = ExecutableOperatorPayload::Value {
@@ -1577,8 +1626,8 @@ mod tests {
                     revision,
                     revision,
                     120_000,
-                    || {
-                        store.ingest_precompute_with_series_id(
+                    |writer| {
+                        writer.ingest_precompute_with_series_id(
                             600,
                             &durable_configs[0],
                             &output,
@@ -1602,6 +1651,24 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        let mut rejected_output =
+            PrecomputedOutput::new(2000, 3000, None, durable_configs[0].policy_fingerprint());
+        rejected_output.catalog_generation = Some(Arc::clone(&generation));
+        rejected_output.input_revision = Some(Arc::new(
+            crate::storage_engines::types::precomputed_output::SummaryInputRevision {
+                generation: Arc::clone(&generation),
+                first_revision: 1,
+                revision: 1,
+            },
+        ));
+        assert!(store
+            .ingest_precompute_with_series_id(
+                600,
+                &durable_configs[0],
+                &rejected_output,
+                sum(99.0).as_ref()
+            )
+            .is_none());
         assert_eq!(
             store
                 .completed_maintenance_coordinates(source_definition, &generation)
@@ -1751,6 +1818,38 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(target_entries, 1);
+        let next_catalog = Arc::new(
+            asap_types::summary_catalog::SummaryCatalog::from_materializations(
+                1,
+                2,
+                &durable_configs,
+            )
+            .unwrap(),
+        );
+        restored.install_summary_catalog(next_catalog).unwrap();
+        let next_generation = restored.active_catalog_generation().unwrap();
+        assert!(restored
+            .series_ids_for_policy(durable_configs[1].policy_fingerprint())
+            .is_empty());
+        assert!(restored
+            .authorize_series_reactivation(601, durable_configs[1].policy_fingerprint().into())
+            .unwrap()
+            .is_some());
+        let mut new_population =
+            PrecomputedOutput::new(0, 1000, None, durable_configs[0].policy_fingerprint());
+        new_population.catalog_generation = Some(next_generation);
+        assert_eq!(
+            restored.ingest_precompute_with_series_id(
+                602,
+                &durable_configs[0],
+                &new_population,
+                sum(20.0).as_ref()
+            ),
+            Some(602)
+        );
+        assert!(restored
+            .series_ids_for_policy(durable_configs[1].policy_fingerprint())
+            .is_empty());
         persistence.shutdown();
         assert!(evaluate_weight(
             &SummaryInputExpr::Column(planner_types::pre_asap::ColumnRef::Named("missing".into())),
@@ -1821,6 +1920,7 @@ mod tests {
             source: sum(7.0),
             configs: &[],
             immutable_windows: None,
+            singleton_population_complete: false,
         };
         let mut aggregate = node(1);
         aggregate.operator = ExecutableOperator::SummaryAgg;
@@ -2145,6 +2245,7 @@ mod tests {
             source,
             configs: &[],
             immutable_windows: None,
+            singleton_population_complete: false,
         };
         let commits = CommitRegistry::default();
         let key = MaterializationCommitKey {
@@ -2219,6 +2320,7 @@ mod tests {
             source: sum(2.0),
             configs: &[],
             immutable_windows: None,
+            singleton_population_complete: false,
         };
         let commits = CommitRegistry::default();
         let key = MaterializationCommitKey {

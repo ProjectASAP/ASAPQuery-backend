@@ -457,11 +457,10 @@ input definition or transformation creates a new identity. Existing raw-source
 identities retain their previous byte representation. Catalog validation rejects
 missing input definitions and dependency cycles.
 
-Installation still rejects derived inputs so they cannot accidentally receive
-raw samples through the legacy metric router. The explicit immutable maintenance
-entry point below must be wired into compiler construction and automatic
-scheduling before this guard is removed. Neither raw-table substitution nor
-treating late correction fragments as new observations is valid.
+Typed installation accepts the bounded immutable maintenance contract below
+only when the complete installed DAG matches the catalog input identity. Legacy
+raw YAML still rejects derived inputs; raw routing excludes them. Neither raw-table
+substitution nor treating late correction fragments as new observations is valid.
 
 ### Immutable completed windows
 
@@ -512,13 +511,34 @@ reject additive sketch/precompute writes even beyond that boundary; only reserve
 publication may create their output state. The latest committed window can be
 retried after restart without adding another part.
 
-This is an explicit maintenance entry point, not automatic workload coverage.
-The initial consumer supports one source definition and population, complete
-non-overlapping base panes, Sum/Count finalization, and unkeyed aggregate updates.
-Compiler construction and automatic scheduling must use this entry point before
-derived installation is enabled. Cross-population reductions, synchronized
-multiple sources, general row operators, overlapping output-window replacement,
-and continuous producer watermarks remain unsupported. In particular, the SQL
+Backend-local remote-write plans can bind a selected exact accumulator followed
+by an explicit maintenance-time Finalize and outer unkeyed SummaryAgg. Initial
+automatic installation requires one raw source definition and identical full,
+non-overlapping source/output windows. The finite drain barrier flushes source
+state and schedules complete retained windows through this same entry point;
+raw routing never feeds samples directly into the derived accumulator.
+
+Finite completion closes all raw store writes for that catalog generation, not
+only its HTTP receiver. The existing admission lock issues a private publication
+writer; a receipt carried in an output is not evidence that this lock is held.
+The metadata writer persists one generation checkpoint before completion becomes
+usable, and restores it before accepting writes after restart. A failed close
+stays closed to writers until its persistence retry succeeds. Installing a new
+catalog generation starts a new admission lifetime. Derived state from a previous
+generation is excluded from query candidates and inventory; recomputation receives
+a fresh physical SID through the existing resolver. Raw state remains independently
+reusable, and retained old source populations cannot be omitted from a singleton proof.
+
+A per-entity source can feed global Reduce([]) only when the store proves that
+its entire finite population contains exactly one physical source SID. The
+reduction then removes source labels according to the installed output grouping.
+Multiple source SIDs fail closed; this is not general shuffle support. Physical
+SID metadata retains observed per-entity label names for durable decoding while
+the catalog retains the logical partitioning contract. SQL backfill job status
+alone is not this all-producer completion proof and does not trigger this path.
+
+Synchronized multiple sources, general row operators, overlapping output-window
+replacement, and continuous producer watermarks remain unsupported. In particular, the SQL
 subquery's timestamp grouping and sampling predicate must not be replaced with an
 arbitrary tumbling aggregate. Historical completion-metadata GC and pinning source
 parts for recovery before a reserved output part exists remain lifecycle work.

@@ -12,6 +12,7 @@ pub(crate) struct FrozenExactWindows {
     pub(crate) generation: Arc<CatalogGeneration>,
     pub(crate) group: BTreeMap<String, String>,
     pub(crate) windows: BTreeMap<(u64, u64), Arc<dyn AggregateCore>>,
+    pub(crate) singleton_population_complete: bool,
 }
 
 impl SketchStore {
@@ -101,7 +102,11 @@ impl SketchStore {
         self.validate_routed_catalog_generation(Some(generation.as_ref()))?;
         // Do not retain either lock while opening parts. The immutable frontier
         // is monotone, and final publication rechecks the catalog incarnation.
-        let keys = {
+        let admission = self
+            .admission
+            .read()
+            .map_err(|_| "admission registry poisoned")?;
+        let (keys, singleton_population_complete) = {
             let bindings = self
                 .instances
                 .read()
@@ -113,8 +118,15 @@ impl SketchStore {
             {
                 return Err("immutable input identity or lifetime differs".into());
             }
-            binding.metadata.group_by_keys.clone()
+            let singleton = admission.is_finite_complete()
+                && bindings
+                    .values()
+                    .filter(|candidate| candidate.metadata.policy_fp == definition.fingerprint())
+                    .count()
+                    == 1;
+            (binding.metadata.group_by_keys.clone(), singleton)
         };
+        drop(admission);
         if group.keys().cloned().collect::<BTreeSet<_>>() != keys {
             return Err("immutable input population does not match its descriptor".into());
         }
@@ -173,6 +185,7 @@ impl SketchStore {
             generation: Arc::clone(generation),
             group: group.clone(),
             windows,
+            singleton_population_complete,
         })
     }
 }
@@ -423,6 +436,7 @@ mod tests {
             generation,
             group: BTreeMap::new(),
             windows: BTreeMap::new(),
+            singleton_population_complete: false,
         };
         assert!(store
             .recover_frozen_maintenance_output(601, &target, &input, [7; 32], (0, 1000))

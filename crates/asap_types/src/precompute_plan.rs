@@ -334,16 +334,92 @@ impl PrecomputePlan {
         if !valid_ingest {
             return Err(PrecomputePlanError::UnsupportedIngestEndpoint);
         }
-        // Derived input identity is portable, but raw ingress cannot execute it.
-        // Installation stays closed until the immutable maintenance consumer is wired.
-        if self
-            .materializations
-            .iter()
-            .any(|config| config.derived_input.is_some())
-        {
-            return Err(PrecomputePlanError::CatalogContract(
-                "derived summary input requires an immutable maintenance consumer".into(),
-            ));
+        for config in &self.materializations {
+            let Some(derived) = &config.derived_input else {
+                continue;
+            };
+            let invalid = || {
+                PrecomputePlanError::CatalogContract(
+                    "derived summary input requires an installed aligned immutable maintenance DAG"
+                        .into(),
+                )
+            };
+            if self.ingest.protocol != IngestProtocol::PrometheusRemoteWriteV1
+                || derived.inputs.len() != 1
+            {
+                return Err(invalid());
+            }
+            let source_id = *derived.inputs.first().unwrap();
+            let source = self
+                .materializations
+                .iter()
+                .find(|candidate| candidate.policy_fingerprint() == source_id.fingerprint())
+                .ok_or_else(invalid)?;
+            if source.derived_input.is_some()
+                || source.window_size != config.window_size
+                || source.slide_interval != config.slide_interval
+                || source.window_size != source.slide_interval
+                || source.pane_origin_ms != config.pane_origin_ms
+                || source.stored_window_ms() != config.stored_window_ms()
+                || source.window_size.checked_mul(1000) != Some(source.stored_window_ms())
+            {
+                return Err(invalid());
+            }
+            let mut matched = false;
+            for installed in self.executable_dags.values() {
+                let dag = installed
+                    .document
+                    .decode()
+                    .map_err(PrecomputePlanError::CatalogContract)?;
+                for sink in &installed.binding.precompute_sinks {
+                    if !matches!(installed.binding.node(*sink),
+                        Some(crate::executable_plan::BackendNodeBinding::Materialization { summary_definition })
+                        if summary_definition.fingerprint() == config.policy_fingerprint())
+                    {
+                        continue;
+                    }
+                    let inputs: Vec<_> = dag
+                        .edges
+                        .iter()
+                        .filter(|edge| edge.consumer == *sink)
+                        .collect();
+                    let [edge] = inputs.as_slice() else {
+                        return Err(invalid());
+                    };
+                    let frontiers = installed.binding.nodes.iter().filter_map(|(node,binding)| {
+                        matches!(binding, crate::executable_plan::BackendNodeBinding::Materialization { summary_definition }
+                            if *summary_definition == source_id).then_some((*node,source_id))
+                    }).collect();
+                    let actual = crate::derived_input::DerivedInputIdentity::from_dag(
+                        &installed.document,
+                        edge.producer,
+                        &frontiers,
+                    )
+                    .map_err(PrecomputePlanError::CatalogContract)?;
+                    if &actual != derived {
+                        return Err(invalid());
+                    }
+                    let input = dag
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == edge.producer)
+                        .ok_or_else(invalid)?;
+                    if !matches!(
+                        input.payload,
+                        planner_types::post_asap::ExecutableOperatorPayload::Value {
+                            operation:
+                                planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+                            timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
+                        }
+                    ) {
+                        return Err(invalid());
+                    }
+                    matched = true;
+                }
+            }
+            if !matched {
+                return Err(invalid());
+            }
         }
         for (query_id, installed) in &self.executable_dags {
             if query_id != &installed.document.query_id {
