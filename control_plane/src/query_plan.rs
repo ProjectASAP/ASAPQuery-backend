@@ -288,6 +288,11 @@ where
             ..
         } = &node.expr
         {
+            if exact_accumulator_value_source(node).is_none() {
+                return Err(QueryPlanError::UnsupportedNode(
+                    "exact finalization requires a direct exact accumulator".into(),
+                ));
+            }
             // SummaryAgg lowering already emits the family-specific ExactReadout.
             // Preserve the Planner's explicit state boundary without adding a
             // second runtime readout node.
