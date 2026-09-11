@@ -135,7 +135,6 @@ async fn observed_shape_selects_installed_parameters_and_executes_remote_write()
         let port = unused_port();
         let mut child = ChildGuard(
             Command::new(env!("CARGO_BIN_EXE_data_plane"))
-                .env("RUST_LOG", "data_plane=debug")
                 .args([
                     "--forward-unsupported-queries",
                     "--prometheus-server",
@@ -153,7 +152,7 @@ async fn observed_shape_selects_installed_parameters_and_executes_remote_write()
                     "--precompute-flush-interval-ms",
                     "25",
                 ])
-                .stdout(Stdio::inherit())
+                .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
                 .spawn()
                 .unwrap(),
@@ -227,6 +226,7 @@ async fn observed_shape_selects_installed_parameters_and_executes_remote_write()
             .await,
             204
         );
+        drain_precompute(&client, &backend).await;
         let result = wait_for_warm_instant(
             &client,
             &backend,

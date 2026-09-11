@@ -164,6 +164,15 @@ impl AggregationIdInfo {
 pub type AggregationConfig = PrecomputeMaterialization;
 
 impl PrecomputeMaterialization {
+    /// Temporal extent of one stored base state, independent of emission cadence.
+    pub fn stored_window_ms(&self) -> u64 {
+        match &self.window_layout {
+            WindowMaterializationLayout::FullWindow => self.window_size,
+            layout => layout.base_pane_secs(),
+        }
+        .saturating_mul(1_000)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         aggregation_type: AggregationType,

@@ -97,6 +97,19 @@ async fn remote_write(client: &reqwest::Client, base: &str, request: &WriteReque
         .as_u16()
 }
 
+async fn drain_precompute(client: &reqwest::Client, backend: &str) {
+    let response = client
+        .post(format!("{backend}/api/v1/precompute/drain"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "drain failed: {}",
+        response.text().await.unwrap()
+    );
+}
+
 fn first_value(response: &Value, field: &str) -> Option<f64> {
     let samples = response["data"]["result"]
         .as_array()?
@@ -567,6 +580,7 @@ async fn registered_temporal_topk(algorithm: planner_types::post_asap::SketchAlg
     };
     assert_eq!(remote_write(&client, &backend, &watermark).await, 204);
     assert_eq!(remote_write(&client, &backend, &samples).await, 204);
+    drain_precompute(&client, &backend).await;
     let timestamp = (base + 5000) as f64 / 1000.0;
     let instant = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
@@ -1235,6 +1249,7 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     );
     // A normal Prometheus retry must be accepted without changing sketches.
     assert_eq!(remote_write(&client, &backend, &request).await, 204);
+    drain_precompute(&client, &backend).await;
     let corrupt = client
         .post(format!("{backend}/api/v1/write"))
         .header("content-encoding", "snappy")
@@ -1271,40 +1286,22 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
         assert_eq!(range["status"], "success", "{query}: {range}");
         assert!(is_warm(&range), "{query}: {range}");
     }
-    // The bare per-series quantile has no producer binding and must forward
-    // the complete request to the exact backend.
-    for query in ["quantile_over_time(0.5, asap_demo_latency_ms[5s])"] {
-        let instant: Value = client
-            .get(format!("{backend}/api/v1/query"))
-            .query(&[
-                ("query", query.to_string()),
-                ("time", first_eval.to_string()),
-            ])
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(instant["data"]["result"][0]["metric"]["fallback"], "true");
-        assert!(!is_warm(&instant));
-        let range: Value = client
-            .get(format!("{backend}/api/v1/query_range"))
-            .query(&[
-                ("query", query.to_string()),
-                ("start", first_eval.to_string()),
-                ("end", second_eval.to_string()),
-                ("step", "5".into()),
-            ])
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(range["data"]["result"][0]["metric"]["fallback"], "true");
-        assert!(!is_warm(&range));
-    }
+    // Per-series quantile now has a population-isolated producer.
+    let quantile_query = "quantile_over_time(0.5, asap_demo_latency_ms[5s])";
+    let quantile =
+        wait_for_warm_instant(&client, &backend, quantile_query, first_eval, &backend_log).await;
+    assert!(is_warm(&quantile));
+    let quantile_range = wait_for_warm_range(
+        &client,
+        &backend,
+        quantile_query,
+        first_eval,
+        second_eval,
+        5,
+        &backend_log,
+    )
+    .await;
+    assert!(is_warm(&quantile_range));
     let sum = wait_for_warm_instant(
         &client,
         &backend,

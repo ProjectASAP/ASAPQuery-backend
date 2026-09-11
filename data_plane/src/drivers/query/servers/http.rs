@@ -6070,7 +6070,7 @@ pub fn build_active_physical_plan(
                 .iter()
                 .find(|config| config.policy_fingerprint() == binding.materialization.fingerprint())
                 .ok_or_else(|| "query binding has no precompute definition".to_string())?;
-            if binding.window_ms != materialization.slide_interval.saturating_mul(1_000) {
+            if binding.window_ms != materialization.stored_window_ms() {
                 return Err(
                     "query physical pane duration differs from installed precompute definition"
                         .into(),

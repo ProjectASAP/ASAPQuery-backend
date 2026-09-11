@@ -2162,13 +2162,7 @@ impl PhysicalCompiler {
                         .materializations
                         .iter()
                         .find(|candidate| candidate.policy_fingerprint() == fingerprint)
-                        .map(|candidate| match &candidate.window_layout {
-                            asap_types::WindowMaterializationLayout::FullWindow => {
-                                candidate.window_size
-                            }
-                            layout => layout.base_pane_secs(),
-                        }
-                        .saturating_mul(1_000))
+                        .map(asap_types::PrecomputeMaterialization::stored_window_ms)
                         .ok_or_else(|| {
                             crate::query_plan::QueryPlanError::Invalid(format!(
                                 "compiled binding {} has no precompute materialization",
