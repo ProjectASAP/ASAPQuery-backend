@@ -821,12 +821,25 @@ impl SketchStore {
         self.descriptors
             .install_catalog(Arc::clone(&catalog))
             .map_err(|error| error.to_string())?;
-        inventory.install(CatalogGeneration {
+        let generation = CatalogGeneration {
             schema_version: reference.schema_version,
             plan_id: reference.plan_id,
             plan_version: reference.plan_version,
             snapshot_sha256: reference.snapshot_sha256,
-        });
+        };
+        let closed = self
+            .persistence_metadata
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|writer| writer.load_finite_closure())
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        inventory.install(generation.clone());
+        if closed.as_ref() == Some(&generation) {
+            inventory.seal_finite(&generation)?;
+        }
         Ok(())
     }
 
@@ -889,6 +902,10 @@ impl SketchStore {
         // Closing a receiver alone is insufficient: the fence also rejects writes
         // from every other producer once these physical windows are complete.
         let mut inventory = self.admission.write().unwrap();
+        inventory.validate_finite(generation)?;
+        if inventory.is_finite_complete() {
+            return Ok(true);
+        }
         let frontiers = inventory.published_frontiers().clone();
         let instances = self.instances.read().unwrap();
         let mut records = Vec::new();
@@ -928,9 +945,15 @@ impl SketchStore {
                 return Ok(false);
             }
         }
+        // A failed durable close remains closed to raw writers but is not a
+        // usable completion proof. Retrying the barrier finishes persistence.
+        inventory.begin_finite_close();
         if let Some(writer) = self.persistence_metadata.read().unwrap().as_ref() {
             writer
                 .upsert_all(&records)
+                .map_err(|error| error.to_string())?;
+            writer
+                .persist_finite_closure(generation)
                 .map_err(|error| error.to_string())?;
         }
         inventory.seal_finite(generation)?;
@@ -1266,6 +1289,12 @@ impl SketchStore {
         window: TimestampRange,
         sample: SketchSampleState,
     ) -> bool {
+        // Hold the existing admission guard through append so the global
+        // finite barrier cannot race an unadmitted producer's last write.
+        let admission = self.admission.read().unwrap();
+        if admission.is_finite_closed() {
+            return false;
+        }
         let instances = self.instances.read().unwrap();
         if instances.get(&sid).is_some_and(|binding| {
             matches!(
@@ -1335,6 +1364,12 @@ impl SketchStore {
         window: TimestampRange,
         payload: Box<dyn crate::storage_engines::types::AggregateCore>,
     ) -> bool {
+        // Hold the existing admission guard through append so the global
+        // finite barrier cannot race an unadmitted producer's last write.
+        let admission = self.admission.read().unwrap();
+        if admission.is_finite_closed() {
+            return false;
+        }
         let instances = self.instances.read().unwrap();
         if instances.get(&sid).is_some_and(|binding| {
             matches!(
@@ -2879,6 +2914,19 @@ impl SketchStore {
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
+        // Admitted publication already holds the inventory exclusively. Its
+        // receipt validation rejects new writes after finite completion.
+        let admission = if output.input_revision.is_none() {
+            Some(self.admission.read().ok()?)
+        } else {
+            None
+        };
+        if admission
+            .as_ref()
+            .is_some_and(|state| state.is_finite_closed())
+        {
+            return None;
+        }
         let label_values_map = self.register_precompute_output(sid, agg_cfg, output)?;
 
         // Keep the physical lifetime alive through publication. Removal takes
@@ -3041,6 +3089,17 @@ impl SketchStore {
         // concurrent lifecycle operation cannot succeed without persistence.
         let metadata_writer =
             Arc::new(persistence::metadata::SidMetadataStore::new(&cfg.disk_path));
+        // Restore the generation-wide raw admission barrier before exposing
+        // recovered state or accepting another producer after restart.
+        if let Some(closed) = metadata_writer.load_finite_closure()? {
+            if self.active_catalog_generation().as_deref() == Some(&closed) {
+                self.admission
+                    .write()
+                    .unwrap()
+                    .seal_finite(&closed)
+                    .map_err(persistence::PersistError::Internal)?;
+            }
+        }
         {
             // Registration and lifecycle changes take this lock first too.
             let _instances = self.instances.write().unwrap();
