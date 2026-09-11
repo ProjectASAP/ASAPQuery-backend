@@ -838,6 +838,54 @@ fn preserve_invalid_exact_fallback_roots(
     Ok(())
 }
 
+/// A MetricsQL query whose only selected states are Prometheus-specific
+/// counter readouts has no backend materialization to bind. Keep the original
+/// query as one native exact root. Mixed queries retain their other selected
+/// summaries and let residual lowering cut only the counter branches.
+fn preserve_metricsql_counter_only_roots(
+    queries: &mut [PlanningQuery],
+    composable: bool,
+) -> Result<(), CompileError> {
+    for query in queries {
+        let selected =
+            collect_selected_materializations(&query.post_asap, composable).map_err(|reason| {
+                CompileError::Query {
+                    query_id: query.query_id.clone(),
+                    reason,
+                }
+            })?;
+        if selected.is_empty()
+            || !selected.iter().all(|state| {
+                matches!(
+                    state.family,
+                    SummaryFamilyType::ExactAggregate(
+                        planner_types::post_asap::ExactKind::Rate
+                            | planner_types::post_asap::ExactKind::Increase,
+                        _
+                    )
+                )
+            })
+        {
+            continue;
+        }
+        let parsed = crate::query_parser::parse_query_expr_canonical(
+            &query.query_string,
+            query.accuracy.clone(),
+        )
+        .map_err(|error| CompileError::Query {
+            query_id: query.query_id.clone(),
+            reason: error.to_string(),
+        })?;
+        query.post_asap = crate::planner_selection::keep_pre_asap(&parsed).map_err(|error| {
+            CompileError::Query {
+                query_id: query.query_id.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+    }
+    Ok(())
+}
+
 impl PhysicalCompiler {
     pub fn compile(
         &self,
@@ -905,6 +953,9 @@ impl PhysicalCompiler {
             }
         }
 
+        if metricsql {
+            preserve_metricsql_counter_only_roots(&mut request.queries, request.hybrid_execution)?;
+        }
         preserve_invalid_exact_fallback_roots(&mut request.queries, request.hybrid_execution)?;
 
         if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite
