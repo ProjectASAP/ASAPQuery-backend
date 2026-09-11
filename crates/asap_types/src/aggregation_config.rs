@@ -439,6 +439,18 @@ impl PrecomputeMaterialization {
             table_name,
             value_column,
         );
+        if data.get("windowLayout").is_some() && data.get("window_layout").is_some() {
+            return Err("multiple window layout fields are not allowed".into());
+        }
+        if let Some(layout) = data
+            .get("windowLayout")
+            .or_else(|| data.get("window_layout"))
+        {
+            config.window_layout = serde_json::from_value(layout.clone())?;
+            config
+                .window_layout
+                .validate(config.window_size, config.slide_interval)?;
+        }
         config.population_key_encoding = data
             .get("population_key_encoding")
             .map(|value| serde_json::from_value(value.clone()))
@@ -644,6 +656,21 @@ impl PrecomputeMaterialization {
             table_name,
             value_column,
         );
+        if aggregation_data.get("windowLayout").is_some()
+            && aggregation_data.get("window_layout").is_some()
+        {
+            anyhow::bail!("multiple window layout fields are not allowed");
+        }
+        if let Some(layout) = aggregation_data
+            .get("windowLayout")
+            .or_else(|| aggregation_data.get("window_layout"))
+        {
+            config.window_layout = serde_yaml::from_value(layout.clone())?;
+            config
+                .window_layout
+                .validate(config.window_size, config.slide_interval)
+                .map_err(anyhow::Error::msg)?;
+        }
         config.population_key_encoding = aggregation_data
             .get("population_key_encoding")
             .map(|value| serde_yaml::from_value(value.clone()))
@@ -694,6 +721,7 @@ impl SerializableToSink for PrecomputeMaterialization {
             "originalYaml": self.original_yaml,
             "windowSize": self.window_size,
             "slideInterval": self.slide_interval,
+            "windowLayout": self.window_layout,
             "windowType": self.window_type.to_string(),
             "spatialFilter": self.spatial_filter,
             "metric": self.metric,
@@ -811,6 +839,48 @@ mod tests {
             0,
             "fingerprint is never the 0 sentinel for a real config",
         );
+    }
+
+    #[test]
+    fn explicit_window_layout_survives_custom_json_and_yaml_transport() {
+        use super::WindowMaterializationLayout;
+        let mut yaml = sample_yaml(false);
+        yaml["windowSize"] = serde_yaml::to_value(60).unwrap();
+        yaml["slideInterval"] = serde_yaml::to_value(10).unwrap();
+        for layout in [
+            WindowMaterializationLayout::FullWindow,
+            WindowMaterializationLayout::Pane { pane_secs: 5 },
+            WindowMaterializationLayout::HierarchicalRollup {
+                base_pane_secs: 5,
+                levels_secs: vec![10, 30],
+            },
+        ] {
+            yaml["windowLayout"] = serde_yaml::to_value(&layout).unwrap();
+            let config =
+                AggregationConfig::from_yaml_data(&yaml, None, QueryLanguage::PromQl).unwrap();
+            assert_eq!(config.window_layout, layout);
+            let mut wire = config.serialize_to_json();
+            wire["groupingLabels"] = serde_json::to_value(&config.grouping_labels).unwrap();
+            wire["aggregatedLabels"] =
+                serde_json::to_value(&config.aggregated_labels.labels).unwrap();
+            wire["rollupLabels"] = serde_json::to_value(&config.rollup_labels.labels).unwrap();
+            let decoded = AggregationConfig::deserialize_from_json(&wire).unwrap();
+            assert_eq!(decoded.window_layout, layout);
+            assert_eq!(decoded.stored_window_ms(), config.stored_window_ms());
+            assert_eq!(decoded.policy_fingerprint(), config.policy_fingerprint());
+            wire["window_layout"] = wire["windowLayout"].clone();
+            assert!(AggregationConfig::deserialize_from_json(&wire).is_err());
+        }
+        yaml.as_mapping_mut()
+            .unwrap()
+            .remove(serde_yaml::Value::from("windowLayout"));
+        let legacy = AggregationConfig::from_yaml_data(&yaml, None, QueryLanguage::PromQl).unwrap();
+        assert_eq!(
+            legacy.window_layout,
+            WindowMaterializationLayout::Pane { pane_secs: 10 }
+        );
+        yaml["window_layout"] = serde_yaml::from_str("{kind: pane, pane_secs: 7}").unwrap();
+        assert!(AggregationConfig::from_yaml_data(&yaml, None, QueryLanguage::PromQl).is_err());
     }
 
     #[test]
