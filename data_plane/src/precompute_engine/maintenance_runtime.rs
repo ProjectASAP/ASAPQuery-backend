@@ -738,8 +738,12 @@ pub fn execute_completed_maintenance(
     if derived.inputs.len() != 1 {
         return Err("maintenance execution requires synchronized multi-source scheduling".into());
     }
+    let generation = store
+        .active_catalog_generation()
+        .ok_or("maintenance requires an authoritative catalog")?;
     execute_completed_maintenance_cohort(
         store,
+        &generation,
         installed,
         configs,
         sink,
@@ -755,6 +759,7 @@ pub fn execute_completed_maintenance(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_completed_maintenance_cohort(
     store: &crate::storage_engines::sketch_db::index::SketchStore,
+    generation: &Arc<asap_types::sds::CatalogGeneration>,
     installed: &asap_types::executable_plan::InstalledPostAsapDag,
     configs: &[asap_types::PrecomputeMaterialization],
     sink: PostAsapNodeId,
@@ -829,10 +834,7 @@ pub(crate) fn execute_completed_maintenance_cohort(
             .collect();
         requests.push((source_sid, source, expected, group.clone()));
     }
-    let generation = store
-        .active_catalog_generation()
-        .ok_or("maintenance requires an authoritative catalog")?;
-    let cohort = store.read_frozen_exact_cohort(&generation, &derived.inputs, &requests)?;
+    let cohort = store.read_frozen_exact_cohort(generation, &derived.inputs, &requests)?;
     if cohort.len() > 1
         && cohort
             .iter()
@@ -892,7 +894,7 @@ pub(crate) fn execute_completed_maintenance_cohort(
         }),
         target.fingerprint(),
     );
-    output.catalog_generation = Some(generation);
+    output.catalog_generation = Some(Arc::clone(generation));
     store.publish_frozen_maintenance_output(
         target_sid,
         target_config,
@@ -901,6 +903,165 @@ pub(crate) fn execute_completed_maintenance_cohort(
         &cohort,
         digest,
     )
+}
+
+/// Schedule a complete common population across all raw input definitions.
+/// Missing windows are unavailable; they are never interpreted as zero values.
+fn execute_finite_source_cohort(
+    store: &crate::storage_engines::sketch_db::index::SketchStore,
+    resolver: &crate::drivers::ingest::series_resolver::SeriesIdResolver,
+    plan: &asap_types::precompute_plan::PrecomputePlan,
+    installed: &asap_types::executable_plan::InstalledPostAsapDag,
+    sink: PostAsapNodeId,
+) -> Result<(), String> {
+    let generation = plan
+        .summary_catalog
+        .as_ref()
+        .ok_or("finite maintenance requires a catalog generation")?;
+    let Some(BackendNodeBinding::Materialization {
+        summary_definition: target,
+    }) = installed.binding.node(sink)
+    else {
+        return Err("finite maintenance sink has no installed definition".into());
+    };
+    let config = plan
+        .materializations
+        .iter()
+        .find(|config| config.policy_fingerprint() == target.fingerprint())
+        .ok_or("finite maintenance target configuration is absent")?;
+    let derived = config
+        .derived_input
+        .as_ref()
+        .ok_or("finite maintenance target has no input program")?;
+    let source_configs = derived
+        .inputs
+        .iter()
+        .map(|source| {
+            plan.materializations
+                .iter()
+                .find(|config| config.policy_fingerprint() == source.fingerprint())
+                .ok_or("finite maintenance source configuration is absent")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    asap_types::precompute_plan::validated_source_window_cohort(config, &source_configs)
+        .map_err(|error| error.to_string())?;
+    let width = config.stored_window_ms();
+    if config.slide_interval.checked_mul(1000) != Some(width) {
+        return Err("finite source cohorts currently require non-overlapping full windows".into());
+    }
+    let active_generation = store
+        .active_catalog_generation()
+        .ok_or("finite source cohort requires an active catalog")?;
+    if active_generation.as_ref() != generation {
+        return Err("finite source cohort catalog generation changed".into());
+    }
+    let mut source_sids = BTreeMap::new();
+    let mut common_group = None;
+    let mut common_windows: Option<BTreeSet<(u64, u64)>> = None;
+    for source in &derived.inputs {
+        let populations = store.completed_maintenance_coordinates(*source, generation)?;
+        if populations.is_empty() {
+            return Ok(());
+        }
+        if populations.len() != 1 || populations.values().any(|groups| groups.len() != 1) {
+            return Err(
+                "finite source cohort requires one physical population per definition".into(),
+            );
+        }
+        let (sid, groups) = populations.into_iter().next().unwrap();
+        let (group, windows) = groups.into_iter().next().unwrap();
+        if common_group
+            .as_ref()
+            .is_some_and(|expected| expected != &group)
+        {
+            return Err("finite source cohort requires matching explicit populations".into());
+        }
+        if windows
+            .iter()
+            .any(|(start, end)| end.checked_sub(*start) != Some(width))
+        {
+            return Err("finite source cohort contains a non-full source window".into());
+        }
+        common_group = Some(group);
+        source_sids.insert(*source, sid);
+        match &mut common_windows {
+            Some(common) => common.retain(|window| windows.contains(window)),
+            None => common_windows = Some(windows),
+        }
+    }
+    let Some(group) = common_group else {
+        return Ok(());
+    };
+    let output_group: BTreeMap<_, _> = config
+        .grouping_labels
+        .iter()
+        .map(|key| {
+            group
+                .get(key)
+                .cloned()
+                .map(|value| (key.clone(), value))
+                .ok_or("finite maintenance output grouping key is absent")
+        })
+        .collect::<Result<_, _>>()?;
+    let existing = store.completed_maintenance_coordinates(*target, generation)?;
+    for window in common_windows.unwrap_or_default() {
+        if (window.0 as i128 - config.pane_origin_ms.unwrap_or(0) as i128).rem_euclid(width as i128)
+            != 0
+        {
+            continue;
+        }
+        // All definitions and populations are proven before resolving any
+        // target. The publication transaction revalidates every lifetime.
+        let requests = source_sids
+            .iter()
+            .map(|(definition, sid)| (*sid, *definition, BTreeSet::from([window]), group.clone()))
+            .collect::<Vec<_>>();
+        let cohort =
+            store.read_frozen_exact_cohort(&active_generation, &derived.inputs, &requests)?;
+        if cohort
+            .iter()
+            .any(|input| !input.singleton_population_complete)
+        {
+            return Err("finite source cohort has incomplete population proof".into());
+        }
+        let pairs = output_group
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let attrs = crate::drivers::ingest::canonical_attrs_fingerprint(&pairs);
+        let kind = crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
+        let target_sid =
+            resolver.resolve_with_reactivation(&config.metric, &attrs, &kind, |sid| {
+                store.validate_routed_catalog_generation(Some(generation))?;
+                let activation = store.authorize_series_reactivation(sid, *target)?;
+                if activation
+                    .as_deref()
+                    .is_some_and(|actual| actual != generation)
+                {
+                    return Err("finite maintenance generation changed".into());
+                }
+                Ok(activation)
+            })?;
+        if existing
+            .get(&target_sid)
+            .and_then(|groups| groups.get(&output_group))
+            .is_some_and(|windows| windows.contains(&window))
+        {
+            continue;
+        }
+        execute_completed_maintenance_cohort(
+            store,
+            &active_generation,
+            installed,
+            &plan.materializations,
+            sink,
+            &source_sids,
+            target_sid,
+            window,
+            &group,
+        )?;
+    }
+    Ok(())
 }
 
 /// Schedule retained, aligned completed windows from the installed DAG after
@@ -914,6 +1075,12 @@ pub(crate) fn execute_finite_maintenance(
         .summary_catalog
         .as_ref()
         .ok_or("finite maintenance requires a catalog generation")?;
+    let active_generation = store
+        .active_catalog_generation()
+        .ok_or("finite maintenance requires an active catalog")?;
+    if active_generation.as_ref() != generation {
+        return Err("finite maintenance catalog generation changed".into());
+    }
     for installed in plan.executable_dags.values() {
         for sink in &installed.binding.precompute_sinks {
             let Some(BackendNodeBinding::Materialization {
@@ -930,8 +1097,12 @@ pub(crate) fn execute_finite_maintenance(
             let Some(derived) = &config.derived_input else {
                 continue;
             };
-            if derived.inputs.len() != 1 {
-                return Err("finite maintenance requires one source definition".into());
+            if derived.inputs.len() > 1 {
+                execute_finite_source_cohort(store, resolver, plan, installed, *sink)?;
+                continue;
+            }
+            if derived.inputs.is_empty() {
+                return Err("finite maintenance requires a source definition".into());
             }
             let source = *derived.inputs.first().unwrap();
             let source_config = plan
@@ -1017,12 +1188,13 @@ pub(crate) fn execute_finite_maintenance(
                         {
                             continue;
                         }
-                        execute_completed_maintenance(
-                            &store,
+                        execute_completed_maintenance_cohort(
+                            store,
+                            &active_generation,
                             installed,
                             &plan.materializations,
                             *sink,
-                            source_sid,
+                            &BTreeMap::from([(source, source_sid)]),
                             target_sid,
                             (*start, end),
                             &group,
@@ -2259,7 +2431,8 @@ mod tests {
             .series_ids_for_policy(durable_configs[1].policy_fingerprint())
             .is_empty());
         persistence.shutdown();
-        exercise_two_source_completed_sink(&dag, &configs, &scheduled_binding);
+        exercise_two_source_completed_sink(&dag, &configs, &scheduled_binding, true);
+        exercise_two_source_completed_sink(&dag, &configs, &scheduled_binding, false);
         assert!(evaluate_weight(
             &SummaryInputExpr::Column(planner_types::pre_asap::ColumnRef::Named("missing".into())),
             7.0,
@@ -2272,6 +2445,7 @@ mod tests {
         template: &ExecutableDag,
         configs: &[asap_types::PrecomputeMaterialization],
         binding: &BackendExecutableBinding,
+        matching_windows: bool,
     ) {
         // A bound operator fixture, not a claim that a frontend selected this
         // composition. Both actual durable sources are required before output.
@@ -2371,20 +2545,53 @@ mod tests {
         let mut persistence = store.start_persistence(persistence_config()).unwrap();
         let generation = store.active_catalog_generation().unwrap();
         let sources = BTreeMap::from([(first_id, 800), (second_id, 801)]);
+        // A bound scheduler fixture; actual frontend selection is tested separately.
+        let mut plan = asap_types::precompute_plan::PrecomputePlan::build_backend_local(
+            asap_types::precompute_plan::PlanEnvelope {
+                plan_id: 2,
+                plan_version: 1,
+                generated_at_unix_ms: 0,
+                activation_unix_ms: 0,
+                expiry_unix_ms: None,
+                backend_compat: asap_types::precompute_plan::BACKEND_COMPAT.into(),
+                planner_revision: "scheduler-fixture".into(),
+                capability_snapshot_id: "scheduler-fixture".into(),
+            },
+            configs[..2].to_vec(),
+        )
+        .unwrap();
+        plan.materializations = configs.to_vec();
+        plan.summary_catalog = Some(generation.as_ref().clone());
+        plan.executable_dags = BTreeMap::from([("cohort-fixture".into(), installed.clone())]);
+        let resolver_path = directory.path().join("resolver.wal");
+        let resolver =
+            crate::drivers::ingest::series_resolver::SeriesIdResolver::open(resolver_path.clone())
+                .unwrap();
+
         for (index, value) in [2.0, 7.0].into_iter().enumerate() {
             let config = &configs[index];
+            let start = if !matching_windows && index == 1 {
+                2000
+            } else {
+                0
+            };
             let coordinate = asap_types::sds::SummaryInstanceCoordinates {
                 summary_definition_id: config.policy_fingerprint().into(),
                 time_range: asap_types::sds::HalfOpenTimeRange {
-                    start_ms: 0,
-                    end_ms: 2000,
+                    start_ms: start,
+                    end_ms: start + 2000,
                 },
                 group_values: BTreeMap::new(),
             };
             let revision = store
                 .admit_summary_updates(&generation, BTreeSet::from([coordinate.clone()]))
                 .unwrap();
-            let mut output = PrecomputedOutput::new(0, 2000, None, config.policy_fingerprint());
+            let mut output = PrecomputedOutput::new(
+                start as u64,
+                (start + 2000) as u64,
+                None,
+                config.policy_fingerprint(),
+            );
             output.catalog_generation = Some(Arc::clone(&generation));
             store
                 .publish_admitted_summary_update(
@@ -2406,11 +2613,12 @@ mod tests {
         }
         assert!(execute_completed_maintenance_cohort(
             &store,
+            &generation,
             &installed,
             &configs,
             PostAsapNodeId(3),
             &sources,
-            802,
+            1,
             (0, 2000),
             &BTreeMap::new()
         )
@@ -2423,6 +2631,28 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        let source_parts = persistence.manifest.live_parts().len();
+        execute_finite_maintenance(&store, &resolver, &plan).unwrap();
+        if !matching_windows {
+            // Complete inputs at different windows cannot create any target.
+            assert!(store
+                .series_ids_for_policy(configs[2].policy_fingerprint())
+                .is_empty());
+            assert_eq!(persistence.manifest.live_parts().len(), source_parts);
+            assert!(persistence
+                .flusher
+                .metadata_store()
+                .load_strict()
+                .unwrap()
+                .iter()
+                .all(|record| record.sid != 1));
+            persistence.shutdown();
+            return;
+        }
+        assert_eq!(
+            store.series_ids_for_policy(configs[2].policy_fingerprint()),
+            vec![1]
+        );
         let requests = sources
             .iter()
             .map(|(definition, sid)| {
@@ -2468,13 +2698,14 @@ mod tests {
                 .unwrap(),
             9.0
         );
-        assert!(execute_completed_maintenance_cohort(
+        assert!(!execute_completed_maintenance_cohort(
             &store,
+            &generation,
             &installed,
             &configs,
             PostAsapNodeId(3),
             &sources,
-            802,
+            1,
             (0, 2000),
             &BTreeMap::new()
         )
@@ -2482,11 +2713,12 @@ mod tests {
         let parts = persistence.manifest.live_parts().len();
         assert!(!execute_completed_maintenance_cohort(
             &store,
+            &generation,
             &installed,
             &configs,
             PostAsapNodeId(3),
             &sources,
-            802,
+            1,
             (0, 2000),
             &BTreeMap::new()
         )
@@ -2497,18 +2729,54 @@ mod tests {
         let restored = Arc::new(SketchStore::new());
         restored.install_summary_catalog(catalog).unwrap();
         let mut persistence = restored.start_persistence(persistence_config()).unwrap();
+        drop(resolver);
+        let resolver =
+            crate::drivers::ingest::series_resolver::SeriesIdResolver::open(resolver_path).unwrap();
+        execute_finite_maintenance(&restored, &resolver, &plan).unwrap();
+
         assert!(!execute_completed_maintenance_cohort(
             &restored,
+            &generation,
             &installed,
             &configs,
             PostAsapNodeId(3),
             &sources,
-            802,
+            1,
             (0, 2000),
             &BTreeMap::new()
         )
         .unwrap());
         assert_eq!(persistence.manifest.live_parts().len(), parts);
+        let next_catalog = Arc::new(
+            asap_types::summary_catalog::SummaryCatalog::from_materializations(2, 2, &configs)
+                .unwrap(),
+        );
+        restored.install_summary_catalog(next_catalog).unwrap();
+        assert_ne!(generation, restored.active_catalog_generation().unwrap());
+        // Stale scheduling fails at the captured catalog boundary, before any
+        // new generation's completion state or payload can be substituted.
+        let stale = execute_completed_maintenance_cohort(
+            &restored,
+            &generation,
+            &installed,
+            &configs,
+            PostAsapNodeId(3),
+            &sources,
+            2,
+            (0, 2000),
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(stale.contains("stale producer"), "{stale}");
+        assert!(execute_finite_maintenance(&restored, &resolver, &plan).is_err());
+        assert_eq!(persistence.manifest.live_parts().len(), parts);
+        assert!(persistence
+            .flusher
+            .metadata_store()
+            .load_strict()
+            .unwrap()
+            .iter()
+            .all(|record| record.sid != 2));
         persistence.shutdown();
     }
 
