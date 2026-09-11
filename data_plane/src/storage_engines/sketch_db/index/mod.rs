@@ -6088,7 +6088,7 @@ mod tests {
 // alongside the store that uses it.
 mod admission;
 mod maintenance;
-pub(crate) use maintenance::FrozenExactWindows;
+pub(crate) use maintenance::{CompleteRawMaintenanceCohort, FrozenExactWindows};
 pub mod epoch_columnar;
 
 // `persistence` moved up to `sketch_db::persistence`. Re-exported here
