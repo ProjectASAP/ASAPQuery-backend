@@ -2,7 +2,7 @@
 
 > Status: active
 
-This page describes the distributed Collector profile. The proposed
+This page describes the distributed Collector profile. The implemented
 [ASAPQuery compatibility profile](../design_docs/asapquery-compatibility-profile.md)
 is a smaller, collector-free mode that ingests raw samples only through
 Prometheus Remote Write.
@@ -105,3 +105,13 @@ and [series identity](https://github.com/ProjectASAP/ASAPCollector/blob/main/doc
 
 The system fails closed at every boundary where a plausible but incorrect
 answer could otherwise be produced.
+
+## Backend-local inspection and completion
+
+The [E2E physical-DAG walkthrough](../evaluation/e2e-physical-dag.md) traces
+Planner/ERP inputs through shared SDS descriptors, PrecomputePlan, physical
+instances and QueryPlan. Remote-write queue admission is not durable raw-data
+commit. Finite drain and typed producer-watermark completion are different
+protocols; the sample stream does not supply an authoritative watermark.
+See [maintenance replay](../developer_docs/maintenance-replay.md) for the
+current durable and continuous boundaries.
