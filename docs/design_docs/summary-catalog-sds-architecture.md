@@ -417,9 +417,12 @@ before recovered identities become writable. A stale background metadata flush
 cannot reopen a completed window. The guard belongs to the physical lifetime;
 a catalog-authorized replacement SeriesId has its own boundary.
 
-This is an immutability guarantee, not a promise that every payload has reached
-disk. Maintenance consumers must separately verify durable state availability and
-atomically publish their output identity before claiming replay-safe consumption.
+With persistence enabled, completion explicitly requests the existing flusher to
+make the completed prefix durable, even if it is still inside the hot tier.
+Completion waits until the corresponding epochs have been evicted after part and
+manifest publication; only then does it persist the immutable boundary. An
+in-memory deployment provides no restart guarantee. Maintenance consumers still
+must atomically publish their output identity before claiming replay-safe consumption.
 The existing finite-source completeness proof still rejects untracked writes or
 pending admitted work. Continuous producer watermarks and derived-state commit
 transactions are separate from this finite-input boundary.

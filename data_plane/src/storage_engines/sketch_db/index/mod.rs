@@ -607,6 +607,7 @@ impl Drop for StateMutation<'_> {
 pub struct SketchStore {
     /// Held through each state append; completion takes the exclusive guard.
     completed_windows: RwLock<HashMap<u64, u64>>,
+    completion_flush_before: std::sync::atomic::AtomicU64,
     admission: RwLock<admission::AdmissionInventory>,
     mutation_revision: std::sync::atomic::AtomicU64,
     active_mutations: std::sync::atomic::AtomicUsize,
@@ -881,7 +882,7 @@ impl SketchStore {
     pub(crate) fn seal_finite_summary_input(
         &self,
         generation: &CatalogGeneration,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         use std::sync::atomic::Ordering::SeqCst;
         // Same order as admitted publication: admission -> metadata -> append fence.
         // Closing a receiver alone is insufficient: the fence also rejects writes
@@ -908,6 +909,24 @@ impl SketchStore {
             return Err("finite summary completion cannot certify untracked state writes".into());
         }
         inventory.validate_finite(generation)?;
+        if self.persistence_read.read().unwrap().is_some() {
+            if let Some(end) = frontiers.values().max() {
+                self.completion_flush_before
+                    .fetch_max(end.saturating_add(1), SeqCst);
+            }
+            // The flusher evicts an epoch only after its payload and manifest
+            // are durable. Until then a restart must remain able to replay it.
+            let pending = frontiers.iter().any(|(sid, end)| {
+                self.series.get(sid).is_some_and(|data| {
+                    data.read()
+                        .unwrap()
+                        .contains_window_ending_at_or_before(*end)
+                })
+            });
+            if pending {
+                return Ok(false);
+            }
+        }
         if let Some(writer) = self.persistence_metadata.read().unwrap().as_ref() {
             writer
                 .upsert_all(&records)
@@ -921,7 +940,7 @@ impl SketchStore {
                 .or_insert(end);
         }
         self.finite_mutation_revision.store(mutation, SeqCst);
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn summary_window_known_empty(
@@ -3154,6 +3173,13 @@ impl SketchStore {
 // the trait keeps the historical name so the flusher / manifest /
 // part-writer stay untouched.
 impl crate::storage_engines::sketch_db::index::persistence::EpochSource for SketchStore {
+    fn flush_before_ms(&self) -> Option<u64> {
+        let cutoff = self
+            .completion_flush_before
+            .load(std::sync::atomic::Ordering::SeqCst);
+        (cutoff != 0).then_some(cutoff)
+    }
+
     fn list_sealed_epochs(
         &self,
     ) -> Vec<crate::storage_engines::sketch_db::index::persistence::SealedEpochRef> {
@@ -4872,6 +4898,82 @@ mod tests {
         restored.register_recovered_disk_series(directory.path());
         assert!(!restored.append_sample(850, BTreeMap::new(), (0, 30_000), sample(3)));
         assert!(restored.append_sample(850, BTreeMap::new(), (30_000, 60_000), sample(4)));
+    }
+
+    #[test]
+    fn finite_completion_flushes_payload_before_persisting_immutability() {
+        // With neither memory pressure nor a hot-tier deadline, completion must
+        // explicitly flush its payload before persisting a non-replayable window.
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let store = Arc::new(SketchStore::new());
+            store
+                .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
+                .unwrap();
+            store.register(meta_with_policy(851, fingerprint));
+            let mut config = durable_cfg(directory.path().to_path_buf());
+            config.hot_window_ms = None;
+            config.seal_window_count = 100;
+            let mut persistence = store.start_persistence(config).unwrap();
+            let generation = store.active_catalog_generation().unwrap();
+            let coordinate = asap_types::sds::SummaryInstanceCoordinates {
+                summary_definition_id: fingerprint.into(),
+                time_range: HalfOpenTimeRange {
+                    start_ms: 0,
+                    end_ms: 30_000,
+                },
+                group_values: BTreeMap::new(),
+            };
+            let revision = store
+                .admit_summary_updates(&generation, [coordinate.clone()].into())
+                .unwrap();
+            store
+                .publish_admitted_summary_update(
+                    &generation,
+                    &coordinate,
+                    revision,
+                    revision,
+                    120_000,
+                    || {
+                        store
+                            .append_sample(851, BTreeMap::new(), (0, 30_000), sample(1))
+                            .then_some(851)
+                    },
+                )
+                .unwrap();
+            assert!(!store.seal_finite_summary_input(&generation).unwrap());
+            assert!(!store.completed_windows.read().unwrap().contains_key(&851));
+            assert!(wait_until(
+                || store.seal_finite_summary_input(&generation).unwrap(),
+                Duration::from_secs(5)
+            ));
+            assert!(!persistence.manifest.live_parts().is_empty());
+            persistence.shutdown();
+        }
+        let restored = Arc::new(SketchStore::new());
+        restored
+            .install_summary_catalog(Arc::new(plan.summary_catalog))
+            .unwrap();
+        let _persistence = restored
+            .start_persistence(durable_cfg(directory.path().to_path_buf()))
+            .unwrap();
+        assert!(!restored.append_sample(851, BTreeMap::new(), (0, 30_000), sample(2)));
+        let rows = restored.query_range(851, 0, 30_000);
+        assert_eq!(rows.len(), 1);
+        let payloads: Vec<_> = rows
+            .iter()
+            .flat_map(|row| row.samples.values())
+            .flatten()
+            .collect();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].bytes, vec![1]);
     }
 
     #[test]

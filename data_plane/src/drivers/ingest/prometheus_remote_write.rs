@@ -199,10 +199,23 @@ impl PrometheusRemoteWriteReceiver {
             .and_then(|plan| plan.precompute_plan.summary_catalog.clone())
             .ok_or("finite completion requires a catalog generation")?;
         self.inner.ingest.router.drain().await?;
-        self.inner
-            .ingest
-            .sketch_index
-            .seal_finite_summary_input(&generation)?;
+        let flush_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if self
+                .inner
+                .ingest
+                .sketch_index
+                .seal_finite_summary_input(&generation)?
+            {
+                break;
+            }
+            if tokio::time::Instant::now() >= flush_deadline {
+                return Err(
+                    "finite completion is waiting for durable summary payloads; retry drain".into(),
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         trim_process_allocator();
         Ok(())
     }

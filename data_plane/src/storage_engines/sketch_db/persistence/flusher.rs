@@ -296,8 +296,11 @@ fn run_tick<S: EpochSource>(shared: &Arc<FlusherShared>, source: &S) -> PersistR
     // it becomes flushable this same tick. (Without `hot_window_ms` the
     // durable tier is purely memory-pressure driven and phase 1 below
     // handles eviction.)
-    if let Some(hot) = cfg.hot_window_ms {
-        let cutoff = now.saturating_sub(hot);
+    let flush_cutoff = cfg
+        .hot_window_ms
+        .map(|hot| now.saturating_sub(hot))
+        .max(source.flush_before_ms());
+    if let Some(cutoff) = flush_cutoff {
         source.seal_aged_epochs(cutoff);
     }
 
@@ -325,8 +328,7 @@ fn run_tick<S: EpochSource>(shared: &Arc<FlusherShared>, source: &S) -> PersistR
     }
 
     // Phase 2: time watermark (any epoch older than now - hot_window).
-    if let Some(hot) = cfg.hot_window_ms {
-        let cutoff = now.saturating_sub(hot);
+    if let Some(cutoff) = flush_cutoff {
         for r in &all {
             if r.end_ts < cutoff
                 && !selected

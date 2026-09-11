@@ -1753,15 +1753,6 @@ async fn route_modified_otlp_sketches_to_precompute(
                         }
                     }
 
-                    ingest_state.sketch_snapshots.insert(
-                        series_key.clone(),
-                        crate::precompute_engine::ingest_handler::SnapshotCacheEntry {
-                            core: accumulator.clone_boxed_core(),
-                            window_start: dp.start_time_unix_nano,
-                        },
-                    );
-                    ingest_state.note_window_and_sweep(dp.start_time_unix_nano);
-
                     use crate::storage_engines::sketch_db::index::{
                         SketchEncoding, SketchSampleState,
                     };
@@ -1777,7 +1768,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                     );
                     let encoding =
                         encoding_to_handle(dp.encoding).unwrap_or(SketchEncoding::ProtoFull);
-                    ingest_state.sketch_index.append_sample(
+                    if !ingest_state.sketch_index.append_sample(
                         sid,
                         label_values,
                         window,
@@ -1785,7 +1776,18 @@ async fn route_modified_otlp_sketches_to_precompute(
                             bytes: dp.sketch.clone(),
                             encoding,
                         },
+                    ) {
+                        return Err("summary window is immutable after completion".into());
+                    }
+
+                    ingest_state.sketch_snapshots.insert(
+                        series_key.clone(),
+                        crate::precompute_engine::ingest_handler::SnapshotCacheEntry {
+                            core: accumulator.clone_boxed_core(),
+                            window_start: dp.start_time_unix_nano,
+                        },
                     );
+                    ingest_state.note_window_and_sweep(dp.start_time_unix_nano);
 
                     // Collect the configs whose metric matches this DP.
                     // Detection is independent of the legacy dual-write
