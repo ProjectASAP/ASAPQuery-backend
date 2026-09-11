@@ -1359,45 +1359,9 @@ impl PhysicalCompiler {
                 .entry(materialization.policy_fingerprint())
                 .or_insert(materialization);
         }
-        let materializations = materializations_by_fingerprint.into_values().collect();
-        let mut precompute_plan = match environment.target {
-            PhysicalDeploymentTarget::DistributedCollectors => {
-                PrecomputePlan::build(envelope.clone(), materializations, &producer_ids)
-            }
-            PhysicalDeploymentTarget::BackendLocalRemoteWrite => {
-                PrecomputePlan::build_backend_local(envelope.clone(), materializations)
-            }
-        }
-        .map_err(|error| CompileError::Query {
-            query_id: "precompute-plan".into(),
-            reason: error.to_string(),
-        })?;
-        let mut transmission_plan = crate::physical::compiler::compile_transmission_plan(
-            envelope.clone(),
-            &precompute_plan,
-            &runtime_policies,
-        )
-        .map_err(|error| CompileError::Query {
-            query_id: "transmission-plan".into(),
-            reason: error.to_string(),
-        })?;
-        let mut collector_plans = producer_ids
-            .into_iter()
-            .map(|collector_id| CollectorPlan {
-                summary_catalog: transmission_plan.summary_catalog.clone(),
-                transmission_rules: transmission_plan
-                    .rules
-                    .iter()
-                    .filter(|rule| rule.producer_id == collector_id)
-                    .cloned()
-                    .collect(),
-                collector_id,
-                envelope: envelope.clone(),
-                materializations: collector_materializations.clone(),
-            })
-            .collect::<Vec<_>>();
-        let materialization_fingerprints: BTreeSet<_> = precompute_plan
-            .materializations
+        let mut materializations: Vec<asap_types::PrecomputeMaterialization> =
+            materializations_by_fingerprint.into_values().collect();
+        let materialization_fingerprints: BTreeSet<_> = materializations
             .iter()
             .map(asap_types::PrecomputeMaterialization::policy_fingerprint)
             .collect();
@@ -1439,8 +1403,7 @@ impl PhysicalCompiler {
                                 "post-ASAP node has no compiled physical binding for {node_family:?}"
                             ))
                         })?;
-                    let materialization = precompute_plan
-                        .materializations
+                    let materialization = materializations
                         .iter()
                         .find(|candidate| candidate.policy_fingerprint() == fingerprint)
                         .ok_or_else(|| {
@@ -1449,8 +1412,7 @@ impl PhysicalCompiler {
                                 fingerprint.0
                             ))
                         })?;
-                    let stored_interval_ms = precompute_plan
-                        .materializations
+                    let stored_interval_ms = materializations
                         .iter()
                         .find(|candidate| candidate.policy_fingerprint() == fingerprint)
                         .map(asap_types::PrecomputeMaterialization::stored_window_ms)
@@ -1460,7 +1422,7 @@ impl PhysicalCompiler {
                                 fingerprint.0
                             ))
                         })?;
-                    let (_, source_window, _) = materialization_leaf_contract(node)
+                    let (_, source_window, _) = selected_input_contract(node)
                         .map_err(crate::query_plan::QueryPlanError::Invalid)?;
                     let materialization_family = materialization.accumulator_spec()
                         .map_err(|error| crate::query_plan::QueryPlanError::Invalid(error.to_string()))?
@@ -1550,6 +1512,7 @@ impl PhysicalCompiler {
             clickhouse_context: None,
             entries: query_entries,
         };
+        let mut installed_dags = BTreeMap::new();
         for (query_index, compiled) in executable_dags.iter().enumerate() {
             let Some(compiled) = compiled else { continue };
             let query_id = request.queries[query_index].query_id.clone();
@@ -1575,9 +1538,9 @@ impl PhysicalCompiler {
                 query_id: query_id.clone(),
                 reason,
             })?;
-            precompute_plan.executable_dags.insert(query_id, installed);
+            installed_dags.insert(query_id, installed);
         }
-        for materialization in &mut precompute_plan.materializations {
+        for materialization in &mut materializations {
             let fingerprint = materialization.policy_fingerprint();
             let max_lookback_ms = query_plan
                 .entries
@@ -1596,7 +1559,7 @@ impl PhysicalCompiler {
             }
         }
         validate_retained_summary_footprint(
-            &precompute_plan.materializations,
+            &materializations,
             request
                 .query_workload
                 .as_ref()
@@ -1611,7 +1574,7 @@ impl PhysicalCompiler {
                 .unwrap_or(DEFAULT_RETAINED_SUMMARY_MEMORY_BUDGET_BYTES),
         )?;
         query_plan.validate(&materialization_fingerprints)?;
-        for (query_id, installed) in &precompute_plan.executable_dags {
+        for (query_id, installed) in &installed_dags {
             let entry = query_plan
                 .entries
                 .values()
@@ -1627,6 +1590,52 @@ impl PhysicalCompiler {
                 }
             })?;
         }
+        let mut precompute_plan = match environment.target {
+            PhysicalDeploymentTarget::DistributedCollectors => {
+                PrecomputePlan::build(envelope.clone(), materializations, &producer_ids).and_then(
+                    |mut plan| {
+                        plan.executable_dags = installed_dags;
+                        plan.validate()?;
+                        Ok(plan)
+                    },
+                )
+            }
+            PhysicalDeploymentTarget::BackendLocalRemoteWrite => {
+                PrecomputePlan::build_backend_local_with_dags(
+                    envelope.clone(),
+                    materializations,
+                    installed_dags,
+                )
+            }
+        }
+        .map_err(|error| CompileError::Query {
+            query_id: "precompute-plan".into(),
+            reason: error.to_string(),
+        })?;
+        let mut transmission_plan = crate::physical::compiler::compile_transmission_plan(
+            envelope.clone(),
+            &precompute_plan,
+            &runtime_policies,
+        )
+        .map_err(|error| CompileError::Query {
+            query_id: "transmission-plan".into(),
+            reason: error.to_string(),
+        })?;
+        let mut collector_plans = producer_ids
+            .into_iter()
+            .map(|collector_id| CollectorPlan {
+                summary_catalog: transmission_plan.summary_catalog.clone(),
+                transmission_rules: transmission_plan
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.producer_id == collector_id)
+                    .cloned()
+                    .collect(),
+                collector_id,
+                envelope: envelope.clone(),
+                materializations: collector_materializations.clone(),
+            })
+            .collect::<Vec<_>>();
         let summary_catalog = super::summary_catalog::SummaryCatalog::from_materializations(
             envelope.plan_id,
             envelope.plan_version,
