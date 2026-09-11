@@ -1,10 +1,7 @@
-//! Language-independent execution of ASAPPlanner's post-ASAP DAG.
+//! Compatibility re-exports for the existing summary executor.
 //!
-//! The implementation remains in its compatibility location while PromQL
-//! callers migrate. These re-exports give SQL and PromQL one execution API
-//! without changing the existing PromQL types or behavior.
-
-pub mod relational;
+//! Installed SQL serving executes QueryPlan nodes through its typed relational
+//! adapter. These aliases remain for callers of the summary execution API.
 
 pub mod executor {
     pub use crate::query_engines::asap_query_engine::summary_exec::{

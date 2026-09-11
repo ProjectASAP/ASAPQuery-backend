@@ -185,12 +185,12 @@ mod tests {
                 .chain([(
                     PostAsapNodeId(4),
                     BackendNodeBinding::Query {
-                        query_node: control_plane::query_plan::QueryNodeId(9),
+                        query_node: asap_types::query_plan::QueryNodeId(9),
                     },
                 )])
                 .collect(),
             query_sink: PostAsapNodeId(4),
-            query_plan_sink: control_plane::query_plan::QueryNodeId(9),
+            query_plan_sink: asap_types::query_plan::QueryNodeId(9),
             precompute_sinks: vec![PostAsapNodeId(3)],
         }
     }
@@ -376,7 +376,7 @@ mod tests {
                 (
                     PostAsapNodeId(0),
                     BackendNodeBinding::Query {
-                        query_node: control_plane::query_plan::QueryNodeId(1),
+                        query_node: asap_types::query_plan::QueryNodeId(1),
                     },
                 ),
                 (
@@ -389,7 +389,7 @@ mod tests {
             .into_iter()
             .collect(),
             query_sink: PostAsapNodeId(0),
-            query_plan_sink: control_plane::query_plan::QueryNodeId(1),
+            query_plan_sink: asap_types::query_plan::QueryNodeId(1),
             precompute_sinks: vec![PostAsapNodeId(1)],
         };
         assert!(matches!(

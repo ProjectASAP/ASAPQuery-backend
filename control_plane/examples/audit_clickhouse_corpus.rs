@@ -4,7 +4,7 @@ use asap_frontend_sql::SqlCatalog;
 use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
 use control_plane::clickhouse::{ClickHouseSqlWorkload, ClickHouseSqlWorkloadEntry};
 use control_plane::physical::compiler::{
-    PlanEnvelope, PrecomputePlan, TransmissionPlan, BACKEND_COMPAT, PLANNER_REVISION,
+    PlanEnvelope, PrecomputePlan, BACKEND_COMPAT, PLANNER_REVISION,
 };
 use planner_types::pre_asap::{Column, DataType, Schema};
 use planner_types::types::AccuracyTarget;
@@ -56,8 +56,12 @@ fn publication_inputs(schema: &Schema, sql: String) -> ClickHouseSqlWorkload {
     let mut precompute_plan =
         PrecomputePlan::build_backend_local(envelope.clone(), vec![materialization.clone()])
             .unwrap();
-    let mut transmission_plan =
-        TransmissionPlan::build(envelope, &precompute_plan, &Default::default()).unwrap();
+    let mut transmission_plan = control_plane::physical::compiler::compile_transmission_plan(
+        envelope,
+        &precompute_plan,
+        &Default::default(),
+    )
+    .unwrap();
     let sds = asap_types::summary_catalog::SummaryCatalog::from_materializations(
         27,
         1,

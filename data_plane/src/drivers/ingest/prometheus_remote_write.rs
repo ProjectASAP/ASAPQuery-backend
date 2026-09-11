@@ -895,9 +895,10 @@ mod tests {
     }
 
     fn physical_config(streaming: StreamingConfig) -> HotReloadStreamingConfig {
+        use asap_types::producer_plan::{FrameIdentityContract, SequenceScope, TransmissionPlan};
         use control_plane::physical::compiler::{
-            FrameIdentityContract, IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan,
-            SequenceScope, TimestampUnit, TransmissionPlan, PLANNER_REVISION,
+            IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan, TimestampUnit,
+            PLANNER_REVISION,
         };
         let envelope = PlanEnvelope {
             plan_id: 7,
@@ -956,7 +957,7 @@ mod tests {
                 rules: Vec::new(),
             },
             runtime_config: Arc::new(streaming),
-            query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
+            query_plan: Arc::new(asap_types::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(BackendStorageRouting::empty()),
         };
         HotReloadStreamingConfig::from_active(HotReloadActivePhysicalPlan::new(active))
@@ -1498,11 +1499,9 @@ mod tests {
             .keys()
             .next()
             .unwrap();
-        let binding = control_plane::query_plan::MaterializationBinding {
+        let binding = asap_types::query_plan::MaterializationBinding {
             materialization: asap_types::PolicyFingerprint(policy).into(),
-            output_grouping: control_plane::query_plan::PhysicalGrouping::Reduce(
-                vec!["job".into()],
-            ),
+            output_grouping: asap_types::query_plan::PhysicalGrouping::Reduce(vec!["job".into()]),
             item_labels: vec![],
             window_ms: 60_000,
             pane_origin_ms: Some(0),

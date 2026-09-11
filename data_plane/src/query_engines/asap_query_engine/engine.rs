@@ -10,7 +10,7 @@ struct QueryReadinessRequirement {
 }
 
 fn readiness_requirement(
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &asap_types::query_plan::QueryPlanEntry,
 ) -> QueryReadinessRequirement {
     let bindings = entry.materialization_bindings();
     let mut materializations = bindings
@@ -128,10 +128,7 @@ impl ASAPQueryEngine {
         })?;
         let planned = physical
             .query_plan
-            .lookup_canonical(
-                control_plane::query_plan::QueryLanguage::MetricsQl,
-                identity,
-            )
+            .lookup_canonical(asap_types::query_plan::QueryLanguage::MetricsQl, identity)
             .map_err(|error| {
                 crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
             })?;
@@ -160,10 +157,7 @@ impl ASAPQueryEngine {
         })?;
         let planned = physical
             .query_plan
-            .lookup_canonical(
-                control_plane::query_plan::QueryLanguage::MetricsQl,
-                identity,
-            )
+            .lookup_canonical(asap_types::query_plan::QueryLanguage::MetricsQl, identity)
             .map_err(|error| {
                 crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
             })?;
@@ -201,7 +195,7 @@ impl ASAPQueryEngine {
     async fn prepare_logical(
         &self,
         physical: &crate::storage_engines::types::ActivePhysicalPlan,
-        entry: &control_plane::query_plan::QueryPlanEntry,
+        entry: &asap_types::query_plan::QueryPlanEntry,
         times: &[u64],
     ) -> Result<super::logical_dag::PreparedLeaves, crate::query_engines::EngineError> {
         super::catalog_resolver::validate_entry(
@@ -266,7 +260,7 @@ impl ASAPQueryEngine {
     fn execute_logical_entry(
         &self,
         physical: &crate::storage_engines::types::ActivePhysicalPlan,
-        entry: &control_plane::query_plan::QueryPlanEntry,
+        entry: &asap_types::query_plan::QueryPlanEntry,
         leaves: &super::logical_dag::PreparedLeaves,
         at: u64,
     ) -> Result<
@@ -410,7 +404,7 @@ impl ASAPQueryEngine {
     async fn execute_logical_range(
         &self,
         physical: &crate::storage_engines::types::ActivePhysicalPlan,
-        entry: &control_plane::query_plan::QueryPlanEntry,
+        entry: &asap_types::query_plan::QueryPlanEntry,
         start: u64,
         end: u64,
         step: u64,
@@ -667,10 +661,7 @@ impl ASAPQueryEngine {
         if let Some(physical) = self.physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
                 if entry.nodes.values().any(|node| {
-                    matches!(
-                        node,
-                        control_plane::query_plan::QueryPlanNode::Logical { .. }
-                    )
+                    matches!(node, asap_types::query_plan::QueryPlanNode::Logical { .. })
                 }) {
                     return self
                         .execute_logical_range(&physical, entry, start_ms, end_ms, step_ms)
@@ -3622,7 +3613,7 @@ mod range_stitch_tests {
 
     #[tokio::test]
     async fn active_metricsql_entry_reaches_the_shared_dag_executor() {
-        use control_plane::query_plan::{
+        use asap_types::query_plan::{
             FallbackPolicy, InstantExecution, QueryLanguage, QueryNodeId, QueryPlanEntry,
             QueryPlanNode,
         };
@@ -3632,9 +3623,9 @@ mod range_stitch_tests {
             ))
             .unwrap();
         let mut plan = snapshot.compile().unwrap();
-        let identity = control_plane::query_plan::canonical_promql("1 + 2").unwrap();
+        let identity = asap_types::query_plan::canonical_promql("1 + 2").unwrap();
         plan.query_plan.entries.insert(
-            control_plane::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity),
+            asap_types::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity),
             QueryPlanEntry {
                 language: QueryLanguage::MetricsQl,
                 query_id: "vm-scalar".into(),

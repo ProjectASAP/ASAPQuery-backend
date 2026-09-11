@@ -4,12 +4,10 @@ use crate::query_engines::{
     EngineError,
 };
 use crate::storage_engines::types::KeyByLabelValues;
-use control_plane::query_plan::logical::{
+use asap_types::query_plan::logical::{
     Aggregation, BinaryOperation, Grouping, LogicalOperator, TemporalOperation,
 };
-use control_plane::query_plan::{
-    CandidateCompleteness, QueryNodeId, QueryPlanEntry, QueryPlanNode,
-};
+use asap_types::query_plan::{CandidateCompleteness, QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use std::collections::{BTreeMap, BTreeSet};
 
 type Labels = BTreeMap<String, String>;
@@ -713,7 +711,7 @@ fn bucket_quantile(q: f64, mut b: Vec<(f64, f64)>) -> f64 {
 #[cfg(test)]
 mod topk_tests {
     use super::*;
-    use control_plane::query_plan::{FallbackPolicy, InstantExecution};
+    use asap_types::query_plan::{FallbackPolicy, InstantExecution};
 
     fn labels(items: &[(&str, &str)]) -> Labels {
         items
@@ -789,7 +787,7 @@ mod topk_tests {
 
     #[test]
     fn installed_topk_combines_with_prometheus_exact_child() {
-        let mut entry = QueryPlanEntry::compile_logical(
+        let mut entry = control_plane::query_plan::logical::compile_logical(
             "hybrid-topk".into(),
             "topk(2, m)".into(),
             InstantExecution {
@@ -856,7 +854,7 @@ mod topk_tests {
         let summary = QueryNodeId(0);
         let root = QueryNodeId(1);
         let entry = QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
+            language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "summary-rate-topk".into(),
             canonical_query: "topk(2, rate(requests_total[5m]))".into(),
             fixed_evaluation: None,
@@ -866,7 +864,7 @@ mod topk_tests {
                     summary,
                     QueryPlanNode::ExactReadout {
                         input: QueryNodeId(99),
-                        readout: control_plane::query_plan::ExactReadout::Rate,
+                        readout: asap_types::query_plan::ExactReadout::Rate,
                     },
                 ),
                 (
@@ -985,7 +983,7 @@ mod topk_tests {
         let value_id = QueryNodeId(1);
         let root = QueryNodeId(2);
         let entry = QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
+            language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "candidate-topk".into(),
             canonical_query: "topk(1, rate(requests_total[5m]))".into(),
             fixed_evaluation: None,

@@ -162,8 +162,19 @@ bindings against QueryPlan; precompute execution consumes the shared contract.
 `PrecomputePlan`, its envelope, ingest, producer, state schema, and catalog
 consistency checks live in `asap_types::precompute_plan`. The compiler chooses
 materializations and placement; data-plane installation uses the shared
-contract. `QueryPlan` definitions still reside in the control-plane
-crate while their remaining compilation methods are separated from wire types.
+contract. `asap_types::query_plan` owns QueryPlan, materialization bindings,
+logical operator DTOs, and activation validation. The control plane reexports
+those types for existing callers and owns the `compile_bound*` and
+`logical::compile_logical` functions; Planner traversal and AST lowering do not
+move into the shared contract. Data-plane engines import the shared types
+directly. No wrapper plan or second wire definition is introduced.
+
+`asap_types::producer_plan` owns the installed collector and transmission
+contracts, frame identities, runtime policy bounds and their validation. The
+control plane allocates sampling/GOS budgets and constructs transmission rules
+through `sampling_policy_from_accuracy_budget`, `gos_policy_from_accuracy_budget`
+and `compile_transmission_plan`. Producers and the data plane import the shared
+contracts directly; compilation is not a runtime dependency of those contracts.
 
 The implemented ownership split is:
 
@@ -429,6 +440,28 @@ This is an explicit lifetime transition, not cross-generation recovery of arbitr
 summary state. Legacy records without trustworthy catalog provenance remain
 unbound. Tombstone reclamation still requires coordinated removal of old physical
 parts and is not implemented by this transition.
+
+### Derived summary input identity
+
+A summary computed from another summary has a different data source from the
+original raw table or metric. `PrecomputeMaterialization.derived_input` and
+`DataSourceIdentity::Derived` use the same `DerivedInputIdentity`: the referenced
+`SummaryDefinitionId`s and a SHA-256 of the maintenance program. The executable
+program remains in `OwnedPostAsapDag`; the catalog does not retain another copy.
+
+The signature replaces materialized input frontiers with stable summary IDs and
+hashes the remaining node payloads, schemas, guarantees, and edge semantics. It
+excludes query names, plan-local node numbering, and catalog generations. Literal
+leaves are hashed directly; raw input leaves still require catalog frontiers. A changed
+input definition or transformation creates a new identity. Existing raw-source
+identities retain their previous byte representation. Catalog validation rejects
+missing input definitions and dependency cycles.
+
+This contract is a prerequisite, not enabled summary-over-summary execution.
+Installation currently rejects derived inputs so they cannot accidentally receive
+raw samples through the legacy metric router. Enabling them requires the immutable
+maintenance consumer and durable output deduplication protocol; neither raw-table
+substitution nor treating late correction fragments as new observations is valid.
 
 ### Immutable completed windows
 

@@ -77,7 +77,7 @@ fn scalar(expr: &QueryExpr, schema: &Schema) -> Result<String, String> {
             let function = match name.as_str() {
                 "map" => "map",
                 "mapconcat" => "mapConcat",
-                "asap_map_access" => "arrayElement",
+                "asap_map_access" | "asap_element_access" => "arrayElement",
                 _ => return Err(format!("unsupported exact scalar function {name}")),
             };
             expr.scalar_type(schema).map_err(|e| e.to_string())?;
@@ -302,6 +302,28 @@ mod tests {
         assert!(!sql.contains("{to:"));
     }
     #[test]
+    fn typed_list_access_renders_native_element_lookup() {
+        let schema = Schema::new(vec![Column::new(
+            "samples",
+            DataType::List {
+                element: Box::new(Column::new("item", DataType::Float64, false)),
+            },
+            false,
+        )]);
+        let expr = QueryExpr::FunctionCall {
+            name: "asap_element_access".into(),
+            args: vec![
+                QueryExpr::Column(0),
+                QueryExpr::Literal(ScalarValue::Int64(-1)),
+            ],
+        };
+        assert_eq!(
+            scalar(&expr, &schema).unwrap(),
+            "arrayElement(`samples`, -1)"
+        );
+    }
+
+    #[test]
     fn unsupported_scalar_is_not_forwarded_as_arbitrary_native_code() {
         let schema = Schema::new(vec![]);
         let expr = QueryExpr::FunctionCall {
@@ -361,8 +383,8 @@ mod original_tests {
             if sql.contains("sum(value)") && sql.contains("argMax") {
                 use crate::physical::post_asap::{PhysicalExpr, PostAsapPlan};
                 use crate::query_plan::{
-                    FallbackPolicy, FixedEvaluationRange, InstantExecution, QueryPlanEntry,
-                    QueryPlanError, QueryPlanNode,
+                    FallbackPolicy, FixedEvaluationRange, InstantExecution, QueryPlanError,
+                    QueryPlanNode,
                 };
                 let planned =
                     crate::clickhouse::plan_clickhouse_sql(sql, &catalog, AccuracyTarget::Exact)
@@ -371,7 +393,7 @@ mod original_tests {
                 let PhysicalExpr::Committed(PostAsapPlan::Summary(root)) = planned.physical else {
                     panic!("missing selected SQL DAG")
                 };
-                let entry = QueryPlanEntry::compile_bound_relational(
+                let entry = crate::query_plan::compile_bound_relational(
                     "test".into(),
                     planned.canonical_sql,
                     &root,

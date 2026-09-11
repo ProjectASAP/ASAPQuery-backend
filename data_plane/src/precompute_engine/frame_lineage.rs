@@ -5,7 +5,7 @@
 //! the wire contract: deltas are only safe to apply after an observed full
 //! checkpoint, in sequence, within the exact producer/window lineage.
 
-use control_plane::physical::compiler::{SummaryFrameIdentity, SummaryFrameKind};
+use asap_types::producer_plan::{SummaryFrameIdentity, SummaryFrameKind};
 use dashmap::mapref::entry::Entry;
 use thiserror::Error;
 

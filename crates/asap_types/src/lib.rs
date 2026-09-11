@@ -8,8 +8,10 @@ pub mod executable_plan;
 pub mod grouping_projection;
 pub mod key_by_label_names;
 pub mod monitor_spec;
+pub mod plan_publication;
 pub mod policy_fingerprint;
 pub mod policy_registry;
+pub mod producer_plan;
 pub mod query_requirements;
 pub mod routing_index;
 pub mod sds;
@@ -34,3 +36,5 @@ pub use routing_index::RoutingIndex;
 pub use storage_backend::*;
 
 pub mod precompute_plan;
+
+pub mod query_plan;
