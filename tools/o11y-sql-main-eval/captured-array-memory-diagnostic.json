@@ -1,0 +1,22 @@
+[
+  {
+    "query_duration_ms": 1863,
+    "memory_usage": 2050188539,
+    "query": "SELECT g,arraySum(i -> if(samples[i].2 < samples[i-1].2, samples[i-1].2, 0), range(2,length(samples)+1)) FROM (SELECT number%2 g,groupArray(tuple(number,toFloat64(number))) samples FROM numbers(16000) GROUP BY g) FORMAT JSON"
+  },
+  {
+    "query_duration_ms": 442,
+    "memory_usage": 513765627,
+    "query": "SELECT g,arraySum(i -> if(samples[i].2 < samples[i-1].2, samples[i-1].2, 0), range(2,length(samples)+1)) FROM (SELECT number%2 g,groupArray(tuple(number,toFloat64(number))) samples FROM numbers(8000) GROUP BY g) FORMAT JSON"
+  },
+  {
+    "query_duration_ms": 124,
+    "memory_usage": 129554299,
+    "query": "SELECT g,arraySum(i -> if(samples[i].2 < samples[i-1].2, samples[i-1].2, 0), range(2,length(samples)+1)) FROM (SELECT number%2 g,groupArray(tuple(number,toFloat64(number))) samples FROM numbers(4000) GROUP BY g) FORMAT JSON"
+  },
+  {
+    "query_duration_ms": 47,
+    "memory_usage": 33448587,
+    "query": "SELECT g,arraySum(i -> if(samples[i].2 < samples[i-1].2, samples[i-1].2, 0), range(2,length(samples)+1)) FROM (SELECT number%2 g,groupArray(tuple(number,toFloat64(number))) samples FROM numbers(2000) GROUP BY g) FORMAT JSON"
+  }
+]
