@@ -1,5 +1,6 @@
 //! Measure readout-specific ERP evidence from finite JSONL evaluation data.
 //! This offline tool retains samples; the production backend does not.
+use data_plane::precompute_engine::operators::hll_sketch_accumulator::HllSketchAccumulator;
 use data_plane::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator;
 use data_plane::storage_engines::types::{AggregateCore, SerializableToSink};
 use serde_json::{json, Value};
@@ -37,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 samples
                     .iter()
                     .filter(|(ts, _)| *ts > start && *ts <= end)
-                    .map(|(_, v)| *v)
+                    .map(|(_, v)| *v + 1_000_000_000_000.0)
                     .collect::<Vec<_>>(),
             )
         })
@@ -45,7 +46,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if populations.len() < 2 {
         return Err("need at least two independent populations".into());
     }
+    // Calibration hashes a disjoint numeric key namespace. The shift preserves
+    // frequencies/cardinality for this integer-valued finite fixture; reject
+    // inputs for which floating-point rounding could silently merge values.
+    if series.values().flatten().any(|(_, value)| {
+        !value.is_finite() || value.fract() != 0.0 || !(0.0..1_000_000_000_000.0).contains(value)
+    }) {
+        return Err(
+            "calibration namespace requires finite nonnegative integer values below 1e12".into(),
+        );
+    }
     let mut records = Vec::new();
+    let mut observed_shape = None;
     for (heap, cols, layers) in [(64, 512, 8), (512, 2048, 8), (4096, 8192, 16)] {
         let mut max_errors = [0.0f64; 3];
         let mut bytes = 0;
@@ -117,6 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         let observed = observed.unwrap();
+        observed_shape = Some(observed.observation.clone());
         let fit = observed
             .observation
             .fits
@@ -129,6 +142,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "error_metrics":{"max_cardinality_relative_error":max_errors[0],"max_frequency_l2_relative_error":max_errors[1],"max_frequency_entropy_absolute_bits_error":max_errors[2]},
             "resources":{"memory_bytes":bytes,"update_cpu_seconds":0.0,"merge_cpu_seconds":0.0,"query_cpu_seconds":0.0}}));
         eprintln!("measured heap={heap} cols={cols} layers={layers}: {max_errors:?}");
+    }
+    // Predeclared precision grid; validation uses disjoint source populations.
+    let observation = observed_shape.as_ref().ok_or("no observation")?;
+    let fit = observation
+        .fits
+        .iter()
+        .min_by(|a, b| a.goodness_of_fit.total_cmp(&b.goodness_of_fit))
+        .ok_or("no fit")?;
+    for precision in [10, 12, 14] {
+        let mut max_error = 0.0f64;
+        let mut bytes = 0;
+        for (_, raw) in &populations {
+            let mut left =
+                HllSketchAccumulator::new(asap_sketchlib::HllVariant::Regular, precision);
+            let mut right = left.clone();
+            let mut distinct = std::collections::HashSet::new();
+            for (i, value) in raw.iter().enumerate() {
+                let bits = if *value == 0.0 { 0 } else { value.to_bits() };
+                distinct.insert(bits);
+                if i % 2 == 0 { &mut left } else { &mut right }
+                    .inner
+                    .update(&bits.to_le_bytes());
+            }
+            let merged = left.merge_with(&right).map_err(|e| e.to_string())?;
+            let merged = merged
+                .as_any()
+                .downcast_ref::<HllSketchAccumulator>()
+                .ok_or("HLL merge type")?;
+            let estimate = merged
+                .query_statistic(
+                    asap_types::Statistic::Cardinality,
+                    &None,
+                    &Default::default(),
+                )
+                .map_err(|e| e.to_string())?;
+            max_error =
+                max_error.max((estimate - distinct.len() as f64).abs() / distinct.len() as f64);
+            bytes = bytes.max(merged.serialize_to_bytes().len());
+        }
+        records.push(json!({"id":format!("hll-p{precision}"),"sketch":"hll","implementation":"asap-sketchlib-hll-regular-v1",
+            "parameters":{"precision":precision},"trials":populations.len(),
+            "distribution":{"erp_shape":{"family":fit.family,"parameters":fit.parameters,"cardinality":observation.cardinality,"benchmark_events":observation.observed_events}},
+            "error_metrics":{"max_cardinality_relative_error":max_error},
+            "resources":{"memory_bytes":bytes,"update_cpu_seconds":0.0,"merge_cpu_seconds":0.0,"query_cpu_seconds":0.0}}));
+        eprintln!("measured HLL precision={precision}: max relative cardinality error={max_error}");
+    }
+    if let Some(path) = std::env::args().nth(2) {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&observed_shape.ok_or("no observation")?)?,
+        )?;
     }
     println!(
         "{}",

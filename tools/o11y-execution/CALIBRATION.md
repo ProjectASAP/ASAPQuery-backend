@@ -98,3 +98,14 @@ calibrate a failure probability. Use a zero CPU objective weight for that artifa
 whole-candidate CPU comes from the independent runtime calibration above. Keep
 held-out source populations and performance runs separate from these training
 populations. This tool does not select a plan.
+
+For the finite integer-valued distinct study, the offline artifact tool measures
+HLL precisions 10, 12, and 14 as a predeclared grid, alongside the UnivMon grid.
+It uses the first ten source series and shifts their values by 1e12 into a disjoint
+hash namespace; inputs outside its documented integer domain are rejected. The
+held-out query uses groups 3–9 with original values. Neither a training maximum
+nor HLL's theoretical relative standard error is a probabilistic per-query error
+bound. The held-out 5% target remains fixed, and failed configurations stay in the
+measurement history. A second optional argument writes the actual observed shape
+for bounded ERP matching. CPU fields in this offline artifact remain excluded;
+production process calibration measures CPU separately.

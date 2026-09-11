@@ -190,6 +190,12 @@ def measure(args, artifact, corpus, snapshot, folder):
             child.terminate()
         for child in children.values():
             child.wait(timeout=30)
+        row["resources"]["storage_before_shutdown_bytes"] = row["resources"]["storage_bytes"]
+        row["resources"]["storage_after_shutdown"] = {
+            "exact_bytes": file_bytes(folder / "exact-data"),
+            "backend_bytes": file_bytes(folder / "backend-data"),
+        }
+        row["resources"]["storage_bytes"] = sum(row["resources"]["storage_after_shutdown"].values())
         usage = resource.getrusage(resource.RUSAGE_CHILDREN)
         total_cpu = int((usage.ru_utime + usage.ru_stime - children_cpu_before.ru_utime - children_cpu_before.ru_stime) * 1e9)
         retirement = folder / "phase-retirement.json"

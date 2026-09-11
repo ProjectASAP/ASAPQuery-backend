@@ -72,13 +72,17 @@ def main():
         if args.interval_ms % frequencies[query]:
             raise ValueError("base interval must divide exactly by query occurrence frequency")
         interval = args.interval_ms // frequencies[query]
-        registrations.append({"query": query, "demand": {"fixed_interval": interval},
+        phases = {row["eval_timestamp_ms"] % interval for row in corpus["queries"] if row["query"] == query}
+        if len(phases) != 1:
+            raise ValueError("query occurrences require one explicit evaluation phase")
+        phase = phases.pop()
+        registrations.append({"query": query, "demand": {"fixed_interval_at": {"interval": interval, "evaluation_phase": phase}},
                               "requirements": {"accuracy": {"explicit": "Exact"}, "response_latency": "unspecified"},
                               "predictability": {"predictable": {"known_at": None}},
                               "time_selection": {"scope": "real_time", "lookback": lookback, "as_of": None}})
         query_audit.append({"query": query, "window_lookback_ms": lookback,
                             "occurrence_count": frequencies[query], "expected_evaluations": frequencies[query] * args.repetitions,
-                            "declared_interval_ms": interval,
+                            "declared_interval_ms": interval, "evaluation_phase_ms": phase,
                             "lookback_method": "largest explicit range; instant selector defaults to Prometheus 5m; original offsets/subqueries preserved in query"})
     snapshot["query_workload"].update(repeating_queries=registrations, data_workload=data, query_batch=None)
     snapshot["snapshot_version"] = 2
