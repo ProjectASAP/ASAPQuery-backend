@@ -676,11 +676,22 @@ impl ErpPlanningInput {
                     let mut policy = self.clone();
                     policy.observed_populations = None;
                     policy.mode = ErpAccuracyMode::Empirical;
+                    let total_events: f64 = populations
+                        .populations
+                        .iter()
+                        .map(|p| p.shape.observation.observed_events as f64)
+                        .sum();
                     let mut errors: f64 = 0.0;
                     let mut cost = 0.0;
                     let mut evidence = Vec::new();
                     let valid = populations.populations.iter().all(|population| {
                         policy.observed_shape = Some(population.shape.observation.clone());
+                        // expected_updates is the definition-wide demand; distribute
+                        // it across partitions instead of charging it once per series.
+                        policy.expected_updates = self.expected_updates
+                            * population.shape.observation.observed_events as f64
+                            / total_events;
+
                         match policy.select_metric(
                             algorithm.clone(),
                             error_metric,
