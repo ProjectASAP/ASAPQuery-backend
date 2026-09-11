@@ -152,6 +152,12 @@ async fn exact_proxy_matches_clickhouse_for_sql_and_grafana_smoke_queries() {
 
 #[tokio::test]
 async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
+    for aggregate in ["sum(value)", "count(*)"] {
+        run_mixed_aggregate(aggregate).await;
+    }
+}
+
+async fn run_mixed_aggregate(aggregate: &str) {
     let Ok(clickhouse_url) = std::env::var("CLICKHOUSE_URL") else {
         eprintln!("skipping mixed process E2E because CLICKHOUSE_URL is unset");
         return;
@@ -159,21 +165,37 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
     let user = std::env::var("CLICKHOUSE_USER").ok();
     let password = std::env::var("CLICKHOUSE_PASSWORD").ok();
     let client = reqwest::Client::new();
-    let sql = "SELECT sums.timestamp, sums.total / divisors.divisor AS ratio FROM (SELECT 2000 AS timestamp, sum(value) AS total FROM telemetry WHERE metric = 'requests' AND timestamp_ms >= 0 AND timestamp_ms < 2000) AS sums INNER JOIN divisors ON sums.timestamp = divisors.timestamp";
+    eprintln!("checking mixed aggregate {aggregate}");
+    let sql = format!("SELECT sums.timestamp, sums.total / divisors.divisor AS ratio FROM (SELECT 2000 AS timestamp, {aggregate} AS total FROM telemetry WHERE metric = 'requests' AND timestamp_ms >= 0 AND timestamp_ms < 2000) AS sums INNER JOIN divisors ON sums.timestamp = divisors.timestamp");
+    let value_type = if aggregate == "count(*)" {
+        "Nullable(Float64)"
+    } else {
+        "Float64"
+    };
+    let create_telemetry = format!("CREATE TABLE default.telemetry(metric String, labels Map(String,String), timestamp_ms Int64, value {value_type}, wrong_value Float64) ENGINE=Memory");
     for statement in [
         "DROP TABLE IF EXISTS default.telemetry",
         "DROP TABLE IF EXISTS default.divisors",
-        "CREATE TABLE default.telemetry(metric String, labels Map(String,String), timestamp_ms Int64, value Float64, wrong_value Float64) ENGINE=Memory",
+        create_telemetry.as_str(),
         "CREATE TABLE default.divisors(timestamp Int64, divisor Float64) ENGINE=Memory",
         "INSERT INTO default.telemetry VALUES ('requests',map('member','a'),0,2,10000),('requests',map('member','b'),1100,3,10000),('errors',map('member','c'),1100,99999,10000),('requests',map('member','a'),2000,88888,10000)",
         "INSERT INTO default.divisors VALUES (2000,10)",
     ] {
-        let mut request = client.post(&clickhouse_url).body(statement);
+        let mut request = client.post(&clickhouse_url).body(statement.to_owned());
         if let Some(user) = &user {
             request = request.basic_auth(user, password.as_ref());
         }
         let response = request.send().await.unwrap();
         assert!(response.status().is_success(), "ClickHouse setup: {statement}");
+    }
+    if aggregate == "count(*)" {
+        let mut request = client.post(&clickhouse_url).body(
+            "INSERT INTO default.telemetry VALUES ('requests',map('member','nullable'),1200,NULL,10000)",
+        );
+        if let Some(user) = &user {
+            request = request.basic_auth(user, password.as_ref());
+        }
+        assert!(request.send().await.unwrap().status().is_success());
     }
     let mut exact_request = client
         .post(&clickhouse_url)
@@ -183,7 +205,8 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
     }
     let exact = exact_request.send().await.unwrap().bytes().await.unwrap();
 
-    let workload = mixed_workload(sql);
+    let mut workload = mixed_workload(&sql);
+    workload.tables.get_mut("telemetry").unwrap().columns[1].nullable = aggregate == "count(*)";
     let (publication, selection_trace) =
         control_plane::clickhouse::compile_automatic_clickhouse_workload(&workload)
             .await
@@ -200,6 +223,14 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
     }
     assert_eq!(publication.precompute_plan.materializations.len(), 1);
     let config = publication.precompute_plan.materializations[0].clone();
+    if aggregate == "count(*)" {
+        assert_eq!(
+            config.effective_value_projection(),
+            &asap_types::sds::ValueProjectionIdentity::Constant {
+                value: planner_types::pre_asap::ScalarValue::Int64(1),
+            }
+        );
+    }
     let entry = publication.query_plan.entries.values().next().unwrap();
     assert!(entry.nodes.values().any(|node| matches!(
         node,
@@ -323,7 +354,7 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
     );
 
     let mut mutate = client.post(&clickhouse_url).body(
-        "ALTER TABLE default.telemetry UPDATE value = 999 WHERE 1 SETTINGS mutations_sync = 2",
+        "ALTER TABLE default.telemetry DELETE WHERE metric = 'requests' AND timestamp_ms = 0 SETTINGS mutations_sync = 2",
     );
     if let Some(user) = &user {
         mutate = mutate.basic_auth(user, password.as_ref());
@@ -347,7 +378,7 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
 
     let mut mixed = client
         .get(format!("http://127.0.0.1:{sql_port}/"))
-        .query(&[("query", sql)]);
+        .query(&[("query", sql.as_str())]);
     if let Some(user) = &user {
         mixed = mixed.header("x-clickhouse-user", user);
     }

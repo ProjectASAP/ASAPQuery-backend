@@ -1396,13 +1396,18 @@ where
                     reason: "unsupported exact operation over summary output".into(),
                 }
             }
+            // Relational count bindings validate their row population and value
+            // projection in the SQL compiler; the temporal restriction belongs
+            // to the PromQL observation-count path.
             SummaryExpr::SummaryAgg {
                 family:
                     SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _),
                 ..
-            } if !exact_value_executable(node) => QueryPlanNode::ExactFallback {
-                reason: "only temporal observation counts are supported".into(),
-            },
+            } if !self.preserve_relational && !exact_value_executable(node) => {
+                QueryPlanNode::ExactFallback {
+                    reason: "only temporal observation counts are supported".into(),
+                }
+            }
             SummaryExpr::BinaryOp { .. } => QueryPlanNode::ExactFallback {
                 reason: "summary binary operation is not executable by the warm tier".into(),
             },
