@@ -108,6 +108,8 @@ pub fn create_engine_single_pop_with_aggregated(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None,
+        table_population: None,
+        table_timestamp_column: None,
         partitioning: None,
     };
     let agg_id = agg_config.policy_fp_u64();
@@ -203,6 +205,8 @@ pub fn create_engine_dual_input(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None,
+        table_population: None,
+        table_timestamp_column: None,
         partitioning: None,
     };
     let value_id = value_agg_config.policy_fp_u64();
@@ -228,6 +232,8 @@ pub fn create_engine_dual_input(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None,
+        table_population: None,
+        table_timestamp_column: None,
         partitioning: None,
     };
     let keys_id = keys_agg_config.policy_fp_u64();
@@ -318,6 +324,8 @@ pub fn create_engine_two_metrics(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None,
+        table_population: None,
+        table_timestamp_column: None,
         partitioning: None,
     };
     let id_a = agg_config_a.policy_fp_u64();
@@ -342,6 +350,8 @@ pub fn create_engine_two_metrics(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None,
+        table_population: None,
+        table_timestamp_column: None,
         partitioning: None,
     };
     let id_b = agg_config_b.policy_fp_u64();
@@ -442,6 +452,8 @@ pub fn create_engine_three_metrics(
             num_aggregates_to_retain: None,
             table_name: None,
             value_column: None,
+            table_population: None,
+            table_timestamp_column: None,
             partitioning: None,
         };
         let id = cfg.policy_fp_u64();
@@ -519,6 +531,8 @@ pub fn create_engine_multi_timestamp(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None,
+        table_population: None,
+        table_timestamp_column: None,
         partitioning: None,
     };
     let agg_id = agg_config.policy_fp_u64();
@@ -588,6 +602,8 @@ pub fn create_engine_multi_timestamp_with_window(
         num_aggregates_to_retain: None,
         table_name: None,
         value_column: None,
+        table_population: None,
+        table_timestamp_column: None,
         partitioning: None,
     };
     let agg_id = agg_config.policy_fp_u64();

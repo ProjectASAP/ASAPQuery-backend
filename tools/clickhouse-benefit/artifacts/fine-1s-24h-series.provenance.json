@@ -1,0 +1,10 @@
+{
+  "source": "/mydata/o11y-scale-study/datasets/fine-1s-24h.prom",
+  "source_sha256": "6297663470b92bba012d6c63b072ae2e534c4caa9d6de5082b882fd163436769",
+  "output": "/mydata/clickhouse-o11y-main-results/fine-1s-24h-series.jsonl",
+  "series": "service_cache_refresh_lag_seconds{job=\"user-service\",instance=\"user-service:8082\"}",
+  "samples": 86371,
+  "start_ms": 1788804926000,
+  "end_ms": 1788891296000,
+  "transformation": "one exact series selection; unchanged values and timestamps"
+}
