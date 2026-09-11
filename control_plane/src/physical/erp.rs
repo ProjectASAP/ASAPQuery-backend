@@ -838,7 +838,7 @@ mod tests {
             ProbabilityExpr::Unknown { .. }
         ));
         assert_eq!(
-            ReadoutEvidence::for_query(SketchAlgorithm::Hll, &SketchQuery::FrequencyEntropy),
+            ReadoutEvidence::for_query(&SketchAlgorithm::Hll, &SketchQuery::FrequencyEntropy),
             None
         );
     }

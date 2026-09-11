@@ -19,6 +19,41 @@ import replay as runner
 from compare import compare_results, process_delta, process_snapshot
 
 
+def input_inventory(path):
+    counts, last = {}, {}
+    first = None
+    with path.open() as stream:
+        for labels, _, timestamp in runner.iter_samples(stream):
+            key = tuple(sorted(labels.items()))
+            counts[key] = counts.get(key, 0) + 1
+            last[key] = max(last.get(key, timestamp), timestamp)
+            first = timestamp if first is None else min(first, timestamp)
+    return counts, last, first, max(last.values())
+
+
+def verify_vm_visibility(url, inventory, folder):
+    counts, last, first, end = inventory
+    expected = [counts, {key: timestamp / 1000 for key, timestamp in last.items()}]
+    attempts = []
+    deadline = time.monotonic() + 60
+    while True:
+        valid = True
+        for index, function in enumerate(("count_over_time", "tlast_over_time")):
+            query = function + '({__name__!=""}[' + str(end - first + 1) + 'ms]) keep_metric_names'
+            response = runner._http_request(url + "/api/v1/query?" + urllib.parse.urlencode({"query":query,"time":end/1000,"nocache":1}))
+            rows = response["response"].get("data", {}).get("result", [])
+            actual = {tuple(sorted(row["metric"].items())): float(row["value"][1]) for row in rows}
+            matched = response["http_status"] == 200 and actual == expected[index]
+            attempts.append({"query":query,"matched":matched,**response})
+            valid = valid and matched
+        if valid or time.monotonic() >= deadline:
+            runner.write_json(folder / "exact-visibility.json", {"complete":valid,"attempts":attempts})
+            if not valid:
+                raise RuntimeError("VictoriaMetrics input counts/last timestamps are incomplete")
+            return
+        time.sleep(.1)
+
+
 def wait_ready(url, child):
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
@@ -134,6 +169,14 @@ def measure(args, artifact, corpus, snapshot, folder):
         runner.write_json(folder / "drain.json", drained)
         if drained["http_status"] != 200 or drained["response"].get("complete") is not True:
             raise RuntimeError("precompute drain did not complete")
+        if args.victoriametrics:
+            # Finite replay barrier, charged to build: imported samples may still
+            # be buffered and invisible to queries after the write is accepted.
+            flushed = runner._http_request(fallback + "/internal/force_flush")
+            runner.write_json(folder / "exact-flush.json", flushed)
+            if flushed["http_status"] != 200:
+                raise RuntimeError("VictoriaMetrics finite replay flush failed")
+            verify_vm_visibility(fallback, args.input_inventory, folder)
         after = snapshots(children)
         row["horizon_phases"]["ingest_and_build"] = phase(folder, "ingest_and_build", before, after, time.perf_counter_ns() - start)
         before, start = after, time.perf_counter_ns()
@@ -353,7 +396,8 @@ def main():
     if len({args.backend_port, args.fallback_port, args.metricsql_port}) != 3 or args.exact_cache_bytes <= 0:
         parser.error("distinct listener ports and positive exact cache budget required")
     args.output.mkdir(parents=True, exist_ok=False)
-    sample_count = runner.validate_sample_file(args.metrics)
+    args.input_inventory = input_inventory(args.metrics) if args.victoriametrics else None
+    sample_count = sum(args.input_inventory[0].values()) if args.input_inventory else runner.validate_sample_file(args.metrics)
     corpus, snapshot = json.loads(args.queries.read_text()), json.loads(args.snapshot.read_text())
     runner.validate_workload(snapshot, corpus)
     candidate_document = json.loads(args.candidates.read_text())

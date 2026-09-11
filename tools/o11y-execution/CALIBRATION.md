@@ -109,3 +109,8 @@ bound. The held-out 5% target remains fixed, and failed configurations stay in t
 measurement history. A second optional argument writes the actual observed shape
 for bounded ERP matching. CPU fields in this offline artifact remain excluded;
 production process calibration measures CPU separately.
+
+Finite VictoriaMetrics replays call `/internal/force_flush` once after ingestion
+and charge it to build CPU. Accepted imports may otherwise remain invisible to
+queries for several seconds. This is a test barrier, not a production ingestion
+policy; see the [VictoriaMetrics forced-flush contract](https://docs.victoriametrics.com/victoriametrics/#forced-flush).
