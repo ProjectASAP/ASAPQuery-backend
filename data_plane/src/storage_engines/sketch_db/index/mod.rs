@@ -1062,6 +1062,10 @@ impl SketchStore {
                     .map_err(|_| "summary instance start exceeds signed timestamp range")?;
                 let end_ms = i64::try_from(window.1)
                     .map_err(|_| "summary instance end exceeds signed timestamp range")?;
+                let group_fingerprint = xxhash_rust::xxh64::xxh64(
+                    &serde_json::to_vec(&group_values).map_err(|error| error.to_string())?,
+                    0,
+                );
                 let instance_id = asap_types::sds::SummaryInstanceCoordinates {
                     summary_definition_id,
                     time_range: asap_types::sds::HalfOpenTimeRange { start_ms, end_ms },

@@ -3159,7 +3159,6 @@ fn select_lifecycle(
 pub(crate) fn materialization_leaf_contract(
     node: &SummaryNode,
 ) -> Result<(String, Option<u64>, String), String> {
-    use planner_types::pre_asap::{CompareOpKind, QueryExpr, ScalarValue};
     let SummaryExpr::SummaryAgg { child, .. } = &node.expr else {
         return Err("materialization requires a SummaryAgg leaf".into());
     };

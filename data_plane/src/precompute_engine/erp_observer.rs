@@ -242,7 +242,7 @@ mod tests {
             String::new(),
             60,
             60,
-            planner_types::pre_asap::WindowKind::Tumbling,
+            asap_types::enums::WindowKind::Tumbling,
             String::new(),
             "m".into(),
             None,

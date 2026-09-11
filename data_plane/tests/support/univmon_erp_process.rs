@@ -195,12 +195,26 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
         .await
         .unwrap();
     });
+    let runtime_samples = control_plane::runtime_samples::RuntimeSamplesStore::new(8);
+    let runtime_port = unused_port();
+    let runtime_endpoint = format!("http://127.0.0.1:{runtime_port}");
+    let runtime_service =
+        control_plane::runtime_samples::RuntimeSamplesService::new(runtime_samples.clone())
+            .into_server();
+    let runtime_task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(runtime_service)
+            .serve(([127, 0, 0, 1], runtime_port).into())
+            .await
+            .unwrap();
+    });
     let output = tempfile::tempdir().unwrap();
     let path = output.path().join("planning.json");
     std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
     let port = unused_port();
     let mut child = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_data_plane"))
+            .args(["--erp-runtime-samples-endpoint", &runtime_endpoint])
             .args(["--profile", "asapquery", "--planning-snapshot"])
             .arg(&path)
             .args([
@@ -231,11 +245,14 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
         .unwrap()
         .as_millis() as i64;
     let base = now - now.rem_euclid(5000) - 20_000;
-    let samples: Vec<_> = raw
+    let mut samples: Vec<_> = raw
         .iter()
         .enumerate()
         .map(|(i, v)| (base + 1 + i as i64, *v))
         .collect();
+    // Declared finite source includes the preceding boundary; this sample is
+    // outside the query's left-open range and does not alter its truth.
+    samples.insert(0, (base, 0.0));
     assert_eq!(
         remote_write(
             &client,
@@ -259,6 +276,69 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
         204
     );
     drain_precompute(&client, &backend).await;
+    let keys = runtime_samples.keys();
+    assert!(
+        !keys.is_empty(),
+        "real worker inputs must reach RuntimeSamples after finite drain"
+    );
+    for key in keys {
+        let record = runtime_samples.latest(&key).unwrap();
+        let observed: asap_types::erp_observation::ErpPopulationObservations<
+            control_plane::physical::erp::ErpObservedShape,
+        > = serde_json::from_value(record.payload["erp_population_observations"].clone()).unwrap();
+        assert!(observed.invalid_reason.is_none(), "{observed:?}");
+        assert!(!observed.populations.is_empty());
+        assert_eq!(observed.window_end_ms - observed.window_start_ms, 5000);
+        assert!(plan
+            .summary_catalog
+            .materializations
+            .contains_key(&observed.summary_definition_id));
+        assert_eq!(
+            observed.catalog_generation,
+            plan.summary_catalog.reference().unwrap()
+        );
+        if key.sketch == "univmon" {
+            let mut live_snapshot: BackendLocalPlanningSnapshot =
+                serde_json::from_value(fixture.clone()).unwrap();
+            let policy = live_snapshot.implementation.erp.as_mut().unwrap();
+            policy.observed_shape_source =
+                Some(control_plane::physical::erp::ErpObservedShapeSource {
+                    source: key.source.clone(),
+                    sketch: key.sketch.clone(),
+                    implementation: key.impl_name.clone(),
+                    population_scope: Some(
+                        control_plane::physical::erp::ErpPopulationObservationScope {
+                            catalog_generation: observed.catalog_generation.clone(),
+                            summary_definition_id: observed.summary_definition_id,
+                            input_semantics: observed.input_semantics,
+                            freshness: asap_types::erp_observation::ErpObservationFreshness {
+                                max_age_ms: 60_000,
+                                max_future_skew_ms: 1000,
+                            },
+                        },
+                    ),
+                });
+            policy.hydrate_observed_shape(&runtime_samples).unwrap();
+            policy.resolve_population_data_descriptor(Some(&plan.summary_catalog));
+            assert!(policy
+                .observed_populations
+                .as_ref()
+                .unwrap()
+                .invalid_reason
+                .is_none());
+            let replanned = live_snapshot.compile().unwrap();
+            assert!(
+                replanned
+                    .precompute_plan
+                    .materializations
+                    .iter()
+                    .any(|m| m.aggregation_type == asap_types::AggregationType::UnivMon),
+                "actual producer evidence should reach normal Planner selection"
+            );
+        }
+    }
+    runtime_task.abort();
+
     for (i, query) in queries.iter().enumerate() {
         let result = wait_for_warm_instant(
             &client,
