@@ -114,3 +114,12 @@ Finite VictoriaMetrics replays call `/internal/force_flush` once after ingestion
 and charge it to build CPU. Accepted imports may otherwise remain invisible to
 queries for several seconds. This is a test barrier, not a production ingestion
 policy; see the [VictoriaMetrics forced-flush contract](https://docs.victoriametrics.com/victoriametrics/#forced-flush).
+
+`measure_native_exact.py` runs a separate fresh VictoriaMetrics process with no
+backend proxy. Use the same input, query corpus, CPU affinity, cache budget and
+cache policy as the candidate run. It records native query latencies, process
+CPU/RSS, lifecycle CPU and storage after shutdown. Report backend-only analytical
+resources separately from the candidate's combined backend + fallback service;
+retaining an exact service does not make its raw storage or memory disappear.
+Visibility validation scans can warm native data caches, so the first reported
+request is a first workload query after validation, not a cold-storage query.

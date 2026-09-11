@@ -402,6 +402,8 @@ def main():
     runner.validate_workload(snapshot, corpus)
     candidate_document = json.loads(args.candidates.read_text())
     result = {"units": "cpu_ns", "compiler_identity": candidate_document.get("compiler_identity"), "data_snapshot_id": "sha256:" + hashlib.sha256(args.metrics.read_bytes()).hexdigest(),
+              "runtime_binary_sha256": hashlib.sha256(args.data_plane.read_bytes()).hexdigest(),
+              "exact_binary_sha256": hashlib.sha256((args.victoriametrics or args.prometheus).read_bytes()).hexdigest(),
               "exact_engine": "victoriametrics" if args.victoriametrics else "prometheus", "result_cache_disabled": args.disable_result_cache,
               "scope": "accelerated finite-input calibration; measured wall residency is not full logical-horizon residency", "validated_sample_count": sample_count, "candidates": []}
     candidates = candidate_document["candidates"]
