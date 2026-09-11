@@ -3055,9 +3055,8 @@ aggregations:
     }
 
     #[tokio::test]
-    async fn test_streaming_config_hot_reload_missing_handle_503() {
-        // setup_test_server() passes `None` for hot_reload → both
-        // endpoints should return 503 with a clear error message.
+    async fn test_streaming_config_route_is_absent_without_legacy_handle() {
+        // A server without a legacy hot-reload handle does not expose this route.
         let server_port = setup_test_server().await;
         let client = Client::new();
 
@@ -3068,7 +3067,7 @@ aggregations:
             .send()
             .await
             .unwrap();
-        assert_eq!(get_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(get_resp.status(), reqwest::StatusCode::NOT_FOUND);
 
         let post_resp = client
             .post(format!(
@@ -3078,7 +3077,7 @@ aggregations:
             .send()
             .await
             .unwrap();
-        assert_eq!(post_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(post_resp.status(), reqwest::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -7278,7 +7277,8 @@ mod catalog_install_tests {
     #[test]
     fn catalog_install_applies_pane_origin_validation_to_metricsql_entries() {
         let mut request = request();
-        let entry = request.query_plan.entries.values_mut().next().unwrap();
+        let key = request.query_plan.entries.keys().next().unwrap().clone();
+        let mut entry = request.query_plan.entries.remove(&key).unwrap();
         entry.language = control_plane::query_plan::QueryLanguage::MetricsQl;
         let binding = entry
             .nodes
@@ -7291,6 +7291,12 @@ mod catalog_install_tests {
             })
             .expect("demo has maintained summaries");
         binding.pane_origin_ms = Some(1);
-        assert!(install(request).unwrap_err().contains("pane origin"));
+        let key = control_plane::query_plan::QueryPlan::catalog_key(
+            entry.language,
+            &entry.canonical_query,
+        );
+        request.query_plan.entries.insert(key, entry);
+        let error = install(request).unwrap_err();
+        assert!(error.contains("pane origin"), "{error}");
     }
 }
