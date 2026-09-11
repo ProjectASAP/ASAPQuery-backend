@@ -71,21 +71,28 @@ impl MultiSourceCoordinator {
             .lock()
             .map_err(|_| io::Error::other("multi-source coordinator lock poisoned"))?;
         self.validate_input(&input)?;
-        let already_staged = self
-            .checkpoint_store
-            .staged()?
+        let staged = self.checkpoint_store.staged()?;
+        let watermarks = self.checkpoint_store.watermarks()?;
+        let already_staged = staged
             .iter()
             .any(|existing| same_input_identity(existing, &input));
-        if !already_staged
-            && self.checkpoint_store.watermarks()?.iter().any(|barrier| {
+        if !already_staged {
+            if self
+                .active_epochs(&staged, &watermarks)
+                .get(&logical(&input.source))
+                .is_some_and(|epoch| input.source.producer_epoch < *epoch)
+            {
+                return Err(invalid("new input belongs to a superseded producer epoch"));
+            }
+            if watermarks.iter().any(|barrier| {
                 barrier.catalog_generation == input.catalog_generation
                     && barrier.source == input.source
                     && barrier.watermark_ms >= input.coordinates.time_range.end_ms
-            })
-        {
-            return Err(invalid(
-                "new input arrived after its source epoch completed the window",
-            ));
+            }) {
+                return Err(invalid(
+                    "new input arrived after its source epoch completed the window",
+                ));
+            }
         }
         self.checkpoint_store.stage_if_absent(input)
     }
@@ -114,13 +121,16 @@ impl MultiSourceCoordinator {
             .map_err(|_| io::Error::other("multi-source coordinator lock poisoned"))?;
         let staged = self.checkpoint_store.staged()?;
         let watermarks = self.checkpoint_store.watermarks()?;
+        let active_epochs = self.active_epochs(&staged, &watermarks);
         let mut buckets =
             BTreeMap::<(i64, i64, Vec<(String, String)>), Vec<StagedSummaryInput>>::new();
         for input in staged.into_iter().filter(|input| {
             input.catalog_generation == self.spec.catalog_generation
                 && input.dag_id == self.spec.dag_id
                 && input.consumer_node_id == self.spec.consumer_node_id
+                && active_epochs.get(&logical(&input.source)) == Some(&input.source.producer_epoch)
         }) {
+            self.validate_input(&input)?;
             let projected =
                 project_group(&input.coordinates.group_values, &self.spec.output_grouping)?;
             buckets
@@ -135,7 +145,7 @@ impl MultiSourceCoordinator {
 
         let mut ready = Vec::new();
         for ((start_ms, end_ms, group), inputs) in buckets {
-            if self.complete(&inputs, &watermarks, end_ms) {
+            if self.complete(&inputs, &watermarks, &active_epochs, end_ms) {
                 let mut ordered = Vec::new();
                 for requirement in &self.spec.inputs {
                     let mut matching = inputs
@@ -212,22 +222,46 @@ impl MultiSourceCoordinator {
             .collect()
     }
 
+    /// A staged input already observes a new epoch; waiting until its first
+    /// watermark would allow the previous epoch's barrier to authorize work.
+    /// Historical staged metadata remains available for audit/idempotent retry.
+    fn active_epochs(
+        &self,
+        staged: &[StagedSummaryInput],
+        watermarks: &[SummaryWatermarkBarrier],
+    ) -> BTreeMap<LogicalSourcePartition, u64> {
+        let partitions = self.logical_partitions();
+        let mut active = BTreeMap::<LogicalSourcePartition, u64>::new();
+        let sources = staged
+            .iter()
+            .filter(|input| input.catalog_generation == self.spec.catalog_generation)
+            .map(|input| &input.source)
+            .chain(
+                watermarks
+                    .iter()
+                    .filter(|barrier| barrier.catalog_generation == self.spec.catalog_generation)
+                    .map(|barrier| &barrier.source),
+            );
+        for source in sources {
+            let partition = logical(source);
+            if partitions.contains(&partition) {
+                let epoch = active.entry(partition).or_default();
+                *epoch = (*epoch).max(source.producer_epoch);
+            }
+        }
+        active
+    }
+
     fn complete(
         &self,
         inputs: &[StagedSummaryInput],
         watermarks: &[SummaryWatermarkBarrier],
+        active_epochs: &BTreeMap<LogicalSourcePartition, u64>,
         end_ms: i64,
     ) -> bool {
         self.spec.inputs.iter().all(|requirement| {
             requirement.partitions.iter().all(|partition| {
-                let active_epoch = watermarks
-                    .iter()
-                    .filter(|barrier| {
-                        barrier.catalog_generation == self.spec.catalog_generation
-                            && logical(&barrier.source) == *partition
-                    })
-                    .map(|barrier| barrier.source.producer_epoch)
-                    .max();
+                let active_epoch = active_epochs.get(partition).copied();
                 active_epoch.is_some_and(|epoch| {
                     let source = SummarySourcePartition {
                         producer_id: partition.producer_id.clone(),
@@ -490,6 +524,65 @@ mod tests {
         coordinator.advance_watermark(barrier("0", 2, 10)).unwrap();
         coordinator.advance_watermark(barrier("1", 2, 10)).unwrap();
         assert_eq!(coordinator.ready_batches().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn restarted_partitions_wait_for_new_barriers_and_exclude_old_epoch_inputs() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("checkpoint.json");
+        let coordinator = MultiSourceCoordinator::new(
+            spec(),
+            SummaryCoordinationCheckpointStore::open(path.clone()).unwrap(),
+        )
+        .unwrap();
+        for (node, definition, partition) in [("left", 1, "0"), ("right", 2, "1")] {
+            coordinator
+                .stage(input(node, definition, partition, 1))
+                .unwrap();
+            coordinator
+                .advance_watermark(barrier(partition, 1, 10))
+                .unwrap();
+        }
+        assert_eq!(coordinator.ready_batches().unwrap()[0].inputs.len(), 2);
+        for (node, definition, partition) in [("left", 1, "0"), ("right", 2, "1")] {
+            coordinator
+                .stage(input(node, definition, partition, 2))
+                .unwrap();
+        }
+        // Observing a restarted partition invalidates its old completion proof
+        // even before the new epoch has emitted its first barrier.
+        assert!(coordinator.ready_batches().unwrap().is_empty());
+        coordinator.advance_watermark(barrier("0", 2, 10)).unwrap();
+        assert!(coordinator.ready_batches().unwrap().is_empty());
+        coordinator.advance_watermark(barrier("1", 2, 10)).unwrap();
+        let ready = coordinator.ready_batches().unwrap();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].inputs.len(), 2);
+        assert!(ready[0]
+            .inputs
+            .iter()
+            .all(|input| input.source.producer_epoch == 2));
+        drop(coordinator);
+        let coordinator = MultiSourceCoordinator::new(
+            spec(),
+            SummaryCoordinationCheckpointStore::open(path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(coordinator.ready_batches().unwrap(), ready);
+        let before = coordinator.checkpoint_store.staged().unwrap();
+        // Retain old metadata for replay/audit; do not turn an identical retry
+        // into a new contribution or erase uncommitted historical inputs.
+        assert_eq!(before.len(), 4);
+        assert!(!coordinator.stage(input("left", 1, "0", 1)).unwrap());
+        let mut late = input("left", 1, "0", 1);
+        late.instance_id = SummaryInstanceId::new("late-old-epoch").unwrap();
+        late.coordinates.time_range = HalfOpenTimeRange {
+            start_ms: 20,
+            end_ms: 30,
+        };
+        assert!(coordinator.stage(late).is_err());
+        assert_eq!(coordinator.checkpoint_store.staged().unwrap(), before);
+        assert_eq!(coordinator.ready_batches().unwrap(), ready);
     }
 
     #[test]
