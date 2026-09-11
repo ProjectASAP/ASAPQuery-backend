@@ -2,7 +2,7 @@ use super::fallback::ClickHouseRawResponse;
 use arrow::{
     array::{Array, Float64Array, StringArray, TimestampMillisecondArray},
     datatypes::{DataType, Field, Schema},
-    json::LineDelimitedWriter,
+    json::{LineDelimitedWriter, WriterBuilder},
     record_batch::RecordBatch,
     util::display::array_value_to_string,
 };
@@ -118,6 +118,10 @@ impl ClickHouseQueryResult {
                             if column > 0 {
                                 output.push(b'\t');
                             }
+                            if batch.column(column).is_null(row) {
+                                output.extend_from_slice(b"\\N");
+                                continue;
+                            }
                             if matches!(batch.column(column).data_type(), DataType::Map(..)) {
                                 output.extend_from_slice(
                                     map_literal(batch.column(column).as_ref(), row)?.as_bytes(),
@@ -145,7 +149,9 @@ impl ClickHouseQueryResult {
                         }
 
                         let row = batch.slice(row, 1);
-                        let mut writer = LineDelimitedWriter::new(&mut output);
+                        let mut writer: LineDelimitedWriter<_> = WriterBuilder::new()
+                            .with_explicit_nulls(true)
+                            .build(&mut output);
                         writer
                             .write_batches(&[&row])
                             .map_err(|error| ClickHouseResultError::Arrow(error.to_string()))?;
@@ -204,7 +210,9 @@ impl ClickHouseQueryResult {
         let mut rows = Vec::new();
         for batch in &self.batches {
             let mut encoded = Vec::new();
-            let mut writer = LineDelimitedWriter::new(&mut encoded);
+            let mut writer: LineDelimitedWriter<_> = WriterBuilder::new()
+                .with_explicit_nulls(true)
+                .build(&mut encoded);
             writer
                 .write_batches(&[batch])
                 .map_err(|error| ClickHouseResultError::Arrow(error.to_string()))?;
@@ -308,6 +316,38 @@ mod tests {
         datatypes::{DataType, Field, Schema},
     };
     use std::sync::Arc;
+
+    #[test]
+    fn nullable_fields_remain_explicit_in_json_and_tsv() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Float64, true),
+                Field::new("label", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Float64Array::from(vec![Some(1.25), None, Some(2.5)])),
+                Arc::new(StringArray::from(vec![Some(""), None, Some("\\N")])),
+            ],
+        )
+        .unwrap();
+        let result = ClickHouseQueryResult {
+            batches: vec![batch],
+        };
+        let json: serde_json::Value =
+            serde_json::from_slice(&result.encode(ClickHouseFormat::Json).unwrap()).unwrap();
+        assert_eq!(
+            json["data"],
+            serde_json::json!([{ "value":1.25,"label":"" }, { "value":null,"label":null }, {"value":2.5,"label":"\\N"}])
+        );
+        let lines = result.encode(ClickHouseFormat::JsonEachRow).unwrap();
+        let null_row: serde_json::Value =
+            serde_json::from_slice(lines.split(|byte| *byte == b'\n').nth(1).unwrap()).unwrap();
+        assert_eq!(null_row, serde_json::json!({"value":null,"label":null}));
+        assert_eq!(
+            result.encode(ClickHouseFormat::TabSeparated).unwrap(),
+            b"1.25\t\n\\N\t\\N\n2.5\t\\\\N\n"
+        );
+    }
 
     #[test]
     fn empty_map_bottom_type_uses_clickhouse_nothing() {
