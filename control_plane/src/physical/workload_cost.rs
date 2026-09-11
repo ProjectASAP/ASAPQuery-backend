@@ -446,7 +446,7 @@ fn alternative_description(candidate: &PlanningRequest) -> AlternativeCost {
         }),
         logical_root_ids,
         identity_unavailable_reason: (!complete)
-            .then(|| "canonical executable export unavailable for a logical root".into()),
+            .then(|| "lossless canonical executable export unavailable for a logical root".into()),
         physical_alternative_id: None,
         status: "bind_failed".into(),
         plan_id: None,

@@ -4,7 +4,7 @@ The compiler preserves diagnostic associations from the original Planner search 
 
 `logical_selection` contains the original ranked groups, legal candidates, accuracy rejections, and selected roots. Group ordinals and `query_index` are local to that invocation. `target_id`, `candidate_id`, and `logical_root_id` use versioned semantic digests instead. Post-ASAP digests reuse Planner's canonical executable exporter, including operator payloads, schemas, guarantees, edge roles and execution states. They exclude assigned executable node IDs and incidental `Rc` sharing. The Planner revision is part of the digest domain.
 
-The trace's `roots` describe Planner selection. `committed_roots` and `deployment_overrides` describe any subsequent ERP exact fallback. Physical alternatives reference their own `logical_root_ids`; the added native alternative therefore does not masquerade as a selected summary candidate. No identity is fabricated when canonical export is unavailable: the corresponding identity is null, and physical explanations include `identity_unavailable_reason`.
+The trace's `roots` describe Planner selection. `committed_roots` and `deployment_overrides` describe any subsequent ERP exact fallback. Physical alternatives reference their own `logical_root_ids`; the added native alternative therefore does not masquerade as a selected summary candidate. Canonical values must round-trip without loss, so non-finite floats cannot alias through JSON null. No identity is fabricated when lossless canonical export is unavailable: the corresponding identity is null, and physical explanations include `identity_unavailable_reason`.
 
 `AlternativeCost` retains an `alternative_id`, concrete `physical_alternative_id` once binding succeeds, and status:
 

@@ -56,10 +56,28 @@ pub(crate) fn explain_identity(kind: &str, value: &impl serde::Serialize) -> Str
     format!("asap-explain-v1:{kind}:{:x}", Sha256::digest(bytes))
 }
 
+// serde_json maps non-finite floats to null. A lossy encoding must never
+// become a semantic identity, even when the runtime keeps an exact fallback.
+fn lossless_json<T: serde::Serialize + serde::de::DeserializeOwned + PartialEq>(
+    value: &T,
+) -> Option<serde_json::Value> {
+    let encoded = serde_json::to_value(value).ok()?;
+    let restored: T = serde_json::from_value(encoded.clone()).ok()?;
+    (restored == *value).then_some(encoded)
+}
+
+fn target_identity(target: &QueryExpr, accuracy: &AccuracyTarget) -> Option<String> {
+    Some(explain_identity(
+        "target",
+        &(lossless_json(target)?, lossless_json(accuracy)?),
+    ))
+}
+
 fn summary_identity(node: &SummaryNode) -> Option<String> {
     // Canonical exporter owns operator payloads and edge semantics. Hash its
     // structure, not assigned node IDs or the incidental sharing of Rc values.
     let dag = planner_types::post_asap::compile_executable_dag(&Rc::new(node.clone())).ok()?;
+    lossless_json(&dag)?;
     fn visit(
         dag: &planner_types::post_asap::ExecutableDag,
         id: planner_types::post_asap::PostAsapNodeId,
@@ -92,7 +110,10 @@ fn summary_identity(node: &SummaryNode) -> Option<String> {
 }
 
 pub(crate) fn explained_root_id(node: &SummaryNode, accuracy: &AccuracyTarget) -> Option<String> {
-    summary_identity(node).map(|node| explain_identity("root", &(node, accuracy)))
+    Some(explain_identity(
+        "root",
+        &(summary_identity(node)?, lossless_json(accuracy)?),
+    ))
 }
 
 fn replacement_identity(
@@ -100,12 +121,14 @@ fn replacement_identity(
     replacement: &Replacement,
     accuracy: &AccuracyTarget,
 ) -> Option<String> {
+    let target = lossless_json(target)?;
+    let accuracy = lossless_json(accuracy)?;
     let value = match replacement {
         Replacement::Summary(node) => serde_json::json!({"summary": summary_identity(node)?}),
-        Replacement::Rewrite(node) => serde_json::json!({"rewrite": node}),
+        Replacement::Rewrite(node) => serde_json::json!({"rewrite": lossless_json(node.as_ref())?}),
         Replacement::ExactComposition(composition) => serde_json::json!({
             "exact_composition": {"placement": format!("{:?}", composition.placement),
-                "operation": composition.op, "child": composition.child_target, "schema": composition.schema}}),
+                "operation": lossless_json(&composition.op)?, "child": lossless_json(composition.child_target.as_ref())?, "schema": lossless_json(&composition.schema)?}}),
     };
     Some(explain_identity("candidate", &(target, accuracy, value)))
 }
@@ -357,7 +380,7 @@ fn select_workload_impl(
                     "description": candidate.description, "reason": candidate.error.to_string()
                 })).collect::<Vec<_>>();
             serde_json::json!({ "group_id": index,
-                "target_id": explain_identity("target", &(group.target, &accuracy)),
+                "target_id": target_identity(group.target, &accuracy),
                 "consumer_count": group.consumer_count, "candidates": candidates, "rejected": rejected })
         }).collect::<Vec<_>>();
         *trace = serde_json::json!({ "schema_version": 1, "group_id_scope": "this_selection", "groups": groups });
@@ -488,6 +511,51 @@ mod workload_tests {
             a["roots"][0]["logical_root_id"],
             trace(AccuracyTarget::Epsilon(0.1))["roots"][0]["logical_root_id"]
         );
+    }
+
+    // JSON must not alias NaN and infinity through its null representation.
+    #[test]
+    fn explain_nonfinite_identity_is_unavailable() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let root = QueryExpr::Literal(planner_types::pre_asap::ScalarValue::Float64(value));
+            assert!(replacement_identity(
+                &root,
+                &Replacement::Rewrite(Rc::new(root.clone())),
+                &AccuracyTarget::Exact
+            )
+            .is_none());
+        }
+    }
+
+    // Hashing excludes incidental allocation sharing but retains operand roles.
+    #[test]
+    fn explain_summary_identity_preserves_roles_and_ignores_rc_sharing() {
+        let root = plan(
+            &["sum_over_time(m[1m]) - sum_over_time(n[1m])"],
+            AccuracyTarget::Exact,
+        )[0]
+        .1
+        .clone();
+        let id = summary_identity(&root).expect("canonical binary exports");
+        let mut reversed = (*root).clone();
+        let SummaryExpr::BinaryOp { lhs, rhs, .. } = &mut reversed.expr else {
+            panic!("binary expected")
+        };
+        std::mem::swap(lhs, rhs);
+        assert_ne!(Some(id), summary_identity(&reversed));
+        let root = plan(
+            &["sum_over_time(m[1m]) + sum_over_time(m[1m])"],
+            AccuracyTarget::Exact,
+        )[0]
+        .1
+        .clone();
+        let id = summary_identity(&root).expect("canonical shared binary exports");
+        let mut unshared = (*root).clone();
+        let SummaryExpr::BinaryOp { rhs, .. } = &mut unshared.expr else {
+            panic!("binary expected")
+        };
+        *rhs = Rc::new((**rhs).clone());
+        assert_eq!(Some(id), summary_identity(&unshared));
     }
 
     // Distinct quantile roots retain their readouts while sharing one selected sketch.
