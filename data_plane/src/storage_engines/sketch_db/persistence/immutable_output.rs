@@ -29,6 +29,22 @@ fn invalid(message: &str) -> PersistError {
     PersistError::Format(message.into())
 }
 
+fn validate_identity(current: &SidMetaRecord, record: &SidMetaRecord) -> PersistResult<()> {
+    if current.sid != record.sid
+        || current.removed
+        || current.retired_at_ms.is_some()
+        || current.expires_at_ms.is_some()
+        || current.summary_definition_id != record.summary_definition_id
+        || current.catalog_generation != record.catalog_generation
+        || current.metric_name != record.metric_name
+        || current.group_by_keys != record.group_by_keys
+        || !current.same_kind(record)
+    {
+        return Err(invalid("immutable publication metadata identity changed"));
+    }
+    Ok(())
+}
+
 fn fingerprint(snapshot: &EpochSnapshot) -> PersistResult<[u8; 32]> {
     if snapshot.entries.is_empty() || snapshot.min_ts >= snapshot.max_ts {
         return Err(invalid("immutable publication requires a nonempty window"));
@@ -100,6 +116,45 @@ impl FlusherHandle {
 }
 
 impl FlusherShared {
+    /// Find the latest committed result before evaluating a potentially
+    /// randomized sketch again. This never creates or replaces a payload.
+    pub fn lookup_immutable_window(
+        &self,
+        record: &SidMetaRecord,
+        input_digest: [u8; 32],
+        start_ms: u64,
+        end_ms: u64,
+    ) -> PersistResult<Option<ImmutableWindowPublication>> {
+        self.sid_metadata.transaction(|records, _| {
+            let Some(current) = records.get(&record.sid.to_string()) else {
+                return Ok(None);
+            };
+            validate_identity(current, record)?;
+            let Some(previous) = &current.last_immutable else {
+                return Ok(None);
+            };
+            if previous.start_ms != start_ms || previous.end_ms != end_ms {
+                return Ok(None);
+            }
+            if previous.input_digest != input_digest {
+                return Err(invalid("immutable lookup input lineage differs"));
+            }
+            self.validate_reserved_part(record.sid, previous)?;
+            if !self
+                .manifest
+                .live_parts()
+                .iter()
+                .any(|part| part.part_id == previous.part_id)
+            {
+                return Err(invalid("completed immutable part is no longer published"));
+            }
+            Ok(Some(ImmutableWindowPublication {
+                part_id: previous.part_id,
+                already_published: true,
+            }))
+        })
+    }
+
     /// Publish a finalized window. A retry must present exactly the reserved
     /// input and payload. This does not guarantee source availability after GC.
     pub fn publish_immutable_window(
@@ -115,17 +170,7 @@ impl FlusherShared {
         self.sid_metadata.transaction(|records, metadata| {
             let key = record.sid.to_string();
             let mut current = records.get(&key).cloned().unwrap_or_else(|| record.clone());
-            if current.removed
-                || current.retired_at_ms.is_some()
-                || current.expires_at_ms.is_some()
-                || current.summary_definition_id != record.summary_definition_id
-                || current.catalog_generation != record.catalog_generation
-                || current.metric_name != record.metric_name
-                || current.group_by_keys != record.group_by_keys
-                || !current.same_kind(record)
-            {
-                return Err(invalid("immutable publication metadata identity changed"));
-            }
+            validate_identity(&current, record)?;
             if current
                 .completed_through_ms
                 .is_some_and(|end| snapshot.min_ts < end)
@@ -521,5 +566,34 @@ mod tests {
         let published = handle.resume_pending_immutable_window(1).unwrap().unwrap();
         assert_eq!(published.part_id, pending.part_id);
         assert_eq!(handle.manifest().live_parts().len(), 1);
+    }
+    #[test]
+    fn committed_lookup_reuses_payload_without_recomputing_randomized_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut first = handle(temp.path());
+        let publication = first
+            .publish_immutable_window(&record(), [7; 32], &snapshot())
+            .unwrap();
+        first.shutdown();
+        drop(first);
+        let reopened = handle(temp.path());
+        let found = reopened
+            .inner
+            .lookup_immutable_window(&record(), [7; 32], 10, 20)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.part_id, publication.part_id);
+        assert!(reopened
+            .inner
+            .lookup_immutable_window(&record(), [8; 32], 10, 20)
+            .is_err());
+        reopened
+            .manifest()
+            .append_delete(publication.part_id)
+            .unwrap();
+        assert!(reopened
+            .inner
+            .lookup_immutable_window(&record(), [7; 32], 10, 20)
+            .is_err());
     }
 }
