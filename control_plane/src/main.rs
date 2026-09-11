@@ -915,7 +915,7 @@ fn compile_physical_plan_request(
             Vec<serde_json::Value>,
         ),
     ),
-    (StatusCode, String),
+    (StatusCode, serde_json::Value),
 > {
     if request.queries.is_empty()
         || (request.target == physical::compiler::PhysicalDeploymentTarget::DistributedCollectors
@@ -925,13 +925,15 @@ fn compile_physical_plan_request(
     {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            "queries must be non-empty; distributed deployment requires collectors and backend-local deployment requires none".to_string(),
+            "queries must be non-empty; distributed deployment requires collectors and backend-local deployment requires none".to_string().into(),
         ));
     }
     if request.max_evidence_age_ms == 0 || request.apply_timeout_ms == 0 {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            "max_evidence_age_ms and apply_timeout_ms must be non-zero".to_string(),
+            "max_evidence_age_ms and apply_timeout_ms must be non-zero"
+                .to_string()
+                .into(),
         ));
     }
     if request.plan_version == 0
@@ -943,7 +945,9 @@ fn compile_physical_plan_request(
     {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            "plan_version, activation_unix_ms, backend_compat and expiry are invalid".to_string(),
+            "plan_version, activation_unix_ms, backend_compat and expiry are invalid"
+                .to_string()
+                .into(),
         ));
     }
 
@@ -960,16 +964,18 @@ fn compile_physical_plan_request(
         {
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "query_id, metric, and window_secs must be non-empty/non-zero".to_string(),
+                "query_id, metric, and window_secs must be non-empty/non-zero"
+                    .to_string()
+                    .into(),
             ));
         }
         let expr = match frontend.parse(&query.query_string, query.accuracy.clone()) {
             Ok(expr) => expr,
-            Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
+            Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
         };
         let post_asap = match control_plane::planner_selection::keep_pre_asap(&expr) {
             Ok(plan) => plan,
-            Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
+            Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
         };
         canonical_roots.push(std::rc::Rc::new(expr));
         queries.push(physical::compiler::PlanningQuery {
@@ -996,7 +1002,7 @@ fn compile_physical_plan_request(
         request.erp.as_ref(),
     ) {
         Ok(trace) => trace,
-        Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
+        Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
     };
 
     let planning_request = physical::compiler::PlanningRequest {
@@ -1026,7 +1032,7 @@ fn compile_physical_plan_request(
         backend_compat: request.backend_compat,
     };
     let candidates = physical::workload_cost::with_exact_alternative(planning_request.clone())
-        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?;
+        .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into()))?;
     let logical_selection = planning_request.logical_selection.clone();
     let (manifests, alternatives) = physical::workload_cost::prepare_manifests(
         candidates.clone(),
@@ -1041,8 +1047,7 @@ fn compile_physical_plan_request(
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 serde_json::json!({"status": "all_infeasible", "alternatives": alternatives,
-                    "logical_selection": planning_request.logical_selection})
-                .to_string(),
+                    "logical_selection": planning_request.logical_selection}),
             ));
         }
         return Ok((
@@ -1067,9 +1072,9 @@ fn compile_physical_plan_request(
     let bundle = match compiled {
         Ok(bundle) => bundle,
         Err(physical::compiler::CompileError::Alternatives(report)) => {
-            return Err((StatusCode::UNPROCESSABLE_ENTITY, report.to_string()))
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, report))
         }
-        Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
+        Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string().into())),
     };
     Ok((
         Some(bundle),
@@ -1093,13 +1098,11 @@ async fn handle_metricsql_workload_cost_manifests(
     workload_cost_manifests(request, PhysicalQueryFrontend::MetricsQl)
 }
 
-fn physical_compile_failure((status, message): (StatusCode, String)) -> Response {
-    if let Ok(report) = serde_json::from_str::<serde_json::Value>(&message) {
-        if report.get("status").and_then(|value| value.as_str()) == Some("all_infeasible") {
-            return (status, Json(report)).into_response();
-        }
+fn physical_compile_failure((status, report): (StatusCode, serde_json::Value)) -> Response {
+    match report {
+        serde_json::Value::String(message) => (status, message).into_response(),
+        report => (status, Json(report)).into_response(),
     }
-    (status, message).into_response()
 }
 
 fn workload_cost_manifests(
@@ -2381,6 +2384,21 @@ mod api_tests {
                 assert_eq!(manifests.as_array().unwrap().len(), 1);
             }
         }
+        request_body["planner_revision"] = serde_json::json!("unavailable-compiler");
+        let response =
+            handle_workload_cost_manifests(Json(serde_json::from_value(request_body).unwrap()))
+                .await
+                .into_response();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(response.headers()["content-type"], "application/json");
+        let report = body_json(response).await;
+        assert_eq!(report["status"], "all_infeasible");
+        assert_eq!(report["alternatives"].as_array().unwrap().len(), 2);
+        assert!(report["alternatives"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["status"] == "bind_failed"));
     }
 
     #[test]
