@@ -78,6 +78,7 @@ fn scalar(expr: &QueryExpr, schema: &Schema) -> Result<String, String> {
                 "map" => "map",
                 "mapconcat" => "mapConcat",
                 "asap_map_access" | "asap_element_access" => "arrayElement",
+                "asap_struct_field" => "tupleElement",
                 _ => return Err(format!("unsupported exact scalar function {name}")),
             };
             expr.scalar_type(schema).map_err(|e| e.to_string())?;
@@ -320,6 +321,31 @@ mod tests {
         assert_eq!(
             scalar(&expr, &schema).unwrap(),
             "arrayElement(`samples`, -1)"
+        );
+    }
+
+    #[test]
+    fn typed_struct_field_renders_native_lookup() {
+        let schema = Schema::new(vec![Column::new(
+            "sample",
+            DataType::Struct {
+                fields: vec![
+                    Column::new("ts", DataType::Int64, false),
+                    Column::new("value", DataType::Float64, true),
+                ],
+            },
+            false,
+        )]);
+        let expr = QueryExpr::FunctionCall {
+            name: "asap_struct_field".into(),
+            args: vec![
+                QueryExpr::Column(0),
+                QueryExpr::Literal(ScalarValue::Utf8("value".into())),
+            ],
+        };
+        assert_eq!(
+            scalar(&expr, &schema).unwrap(),
+            "tupleElement(`sample`, 'value')"
         );
     }
 
