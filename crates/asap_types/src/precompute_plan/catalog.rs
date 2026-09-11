@@ -1,10 +1,8 @@
 //! Catalog consistency checks for the precompute execution plan.
 use super::*;
-use crate::sds::{
-    DataSourceIdentity, SummaryDefinitionId, SummaryDescriptor, ValueProjectionIdentity,
-};
+use crate::sds::{DataSourceIdentity, SummaryDefinitionId, SummaryDescriptor};
 use crate::summary_catalog::SummaryCatalog;
-use planner_types::pre_asap::{ColumnRef, Source};
+use planner_types::pre_asap::Source;
 use std::collections::BTreeSet;
 fn invalid(reason: impl Into<String>) -> PrecomputePlanError {
     PrecomputePlanError::CatalogContract(reason.into())
@@ -80,19 +78,29 @@ impl PrecomputePlan {
                     table_ref: table_ref.clone(),
                 },
             );
-            let expected_projection = config
-                .value_column
-                .as_ref()
-                .map_or(ValueProjectionIdentity::SampleValue, |name| {
-                    ValueProjectionIdentity::Column { name: name.clone() }
-                });
+            if config.table_name.is_some()
+                && !config.grouping_labels.is_empty()
+                && data.observation_semantics
+                    != crate::grouping_projection::TABLE_GROUP_OBSERVATION_SEMANTICS
+            {
+                return Err(invalid(
+                    "table grouping codec differs from installed contract",
+                ));
+            }
+            if config.table_name.is_some() {
+                config
+                    .grouping_labels
+                    .validate_table_group_codec()
+                    .map_err(invalid)?;
+            }
+            let expected_projection = config.effective_value_projection();
             if data.partitioning != config.partitioning
                 || data.timestamp_column != config.table_timestamp_column
                 || data.source != expected_source
-                || data.value_projection != expected_projection
+                || &data.value_projection != expected_projection
                 || data.population_filter_canonical
                     != config.population_filter_canonical().map_err(invalid)?
-                || data.group_by_keys != config.grouping_labels.labels.iter().cloned().collect()
+                || data.group_by_keys != config.grouping_labels
             {
                 return Err(invalid("source/population/grouping differs from catalog"));
             }
@@ -121,11 +129,7 @@ impl PrecomputePlan {
                     metric: config.metric.clone(),
                 }
             };
-            let col = if let Some(column) = &config.value_column {
-                ColumnRef::Named(column.clone())
-            } else {
-                ColumnRef::SampleValue
-            };
+            let projection = config.effective_value_projection();
             let size = config
                 .window_size
                 .checked_mul(1000)
@@ -146,8 +150,8 @@ impl PrecomputePlan {
             if schema.schema_id != state_schema_id(id.fingerprint())
                 || schema.family != expected_family
                 || schema.source != source
-                || schema.value_column != col
-                || schema.group_by != config.grouping_labels.labels
+                || &schema.value_projection != projection
+                || schema.group_by != config.grouping_labels
                 || schema.window.kind != config.window_type
                 || schema.window.size_ms != size
                 || schema.window.slide_ms != expected_slide

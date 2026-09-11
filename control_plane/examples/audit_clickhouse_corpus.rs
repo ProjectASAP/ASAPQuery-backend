@@ -1,3 +1,5 @@
+#[path = "support/automatic_clickhouse_corpus.rs"]
+mod automatic;
 use asap_frontend_sql::SqlCatalog;
 use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
 use control_plane::clickhouse::{ClickHouseSqlWorkload, ClickHouseSqlWorkloadEntry};
@@ -82,6 +84,10 @@ fn publication_inputs(schema: &Schema, sql: String) -> ClickHouseSqlWorkload {
 
 #[tokio::main]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--automatic") {
+        automatic::run().await;
+        return;
+    }
     let path = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)

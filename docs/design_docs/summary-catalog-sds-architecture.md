@@ -37,9 +37,13 @@ operator-specific stores beside `SketchStore`.
 
 The target model has descriptor registries plus pane instances. Descriptor IDs
 are derived from canonical semantic content; display names and runtime SIDs are
-not descriptor identities. The current implementation uses the canonical string
-itself as the ID. A future hashed representation must preserve the same content
-identity and handle collisions explicitly.
+not descriptor identities. `SummaryDescriptorId` and `DataDescriptorId` currently
+contain versioned canonical semantic strings. `SummaryDefinitionId` is a distinct
+typed policy fingerprint, and `CatalogGeneration` identifies a publication using
+its digest and plan version. A physical `SeriesId` identifies one storage lifetime
+of a definition/group; it is neither a descriptor ID nor a pane instance ID.
+Changing descriptor encoding to a hash must preserve content identity and handle
+collisions explicitly.
 
 ```rust
 struct SummaryDescriptor {
@@ -184,13 +188,35 @@ compatibility DTO while older sidecars are read.
 
 The implemented `SummaryDescriptor` currently contains one `SummaryOperator`,
 one derived `FidelityGuarantee`, and a numeric state-schema version. The
-implemented `DataDescriptor` contains metric name, canonical population filter,
-grouping keys and versioned observation semantics. The shared contract now also
+implemented `DataDescriptor` contains typed source and value projections, a
+canonical population filter, typed grouping columns and versioned observation
+semantics. The shared contract now also
 defines `SummaryInstance`, `ObservedSummaryInventory`, placement, completeness,
 state references, catalog generation and ephemeral leases. The control-plane
 reconciler emits create, update, recover, retire, garbage-collect, promote and
 expire actions. Summary payloads and the application of those actions remain in
 the SummaryStore runtime.
+
+The same `GroupingProjection` supplies source columns to precompute configuration,
+`DataDescriptor` and the state-schema contract. Each column retains the Planner's
+name, type and nullability; routing derives names without storing a second list.
+Legacy label lists decode as non-null UTF-8 columns and keep their existing
+identities. A changed type or nullability changes catalog and policy identity.
+A SQL map column is one grouping value, not a set of PromQL labels. Typed
+ClickHouse group transport remains a separate execution capability: the current
+reader rejects non-label projections until that transport is implemented.
+
+`DataDescriptor`, precompute configuration and state-schema validation share
+`ValueProjectionIdentity`: sample value, named column, or a finite numeric
+constant using the Planner's `ScalarValue`. A constant input such as `1` does
+not masquerade as a table column. Projection identity participates in catalog
+and policy identity; existing column identities remain unchanged. Older
+`value_column` config and state-schema fields are accepted only by wire adapters
+and become the same typed projection in memory. ClickHouse backfill binds a
+constant as a typed query parameter and applies the installed table population
+and timestamp projection. Its Float64 ingest boundary rejects integer constants
+outside the exactly representable range. This contract enables literal inputs;
+query lowering must still establish each aggregate's null and row semantics.
 
 The durable `sid_metadata.json` format is versioned independently. Version 2
 contains `summary_descriptors`, `data_descriptors`, and `bindings` tables. A
@@ -407,3 +433,30 @@ implement an autonomous drift-triggered replan scheduler, continuous source
 completion, or durable restoration of the control plane's active catalog. After
 a control-plane restart, live evidence remains ineligible until an authoritative
 catalog has been activated again.
+
+### Retired physical series and catalog reactivation
+
+A persisted removal tombstone prevents late fragments and stale metadata flushes
+from reopening the same physical `SeriesId`. A later installed catalog generation
+may authorize a fresh physical series for the same logical definition/group.
+The resolver writes that rotation and its catalog provenance before changing its
+cache; ordinary writes from the original generation cannot authorize rotation.
+The original physical ID remains tombstoned so old disk parts cannot enter the
+replacement's readout.
+
+Queued precompute inputs carry their captured catalog generation and physical
+series ID separately from an optional admission receipt. Workers preserve both
+on publication. A delayed output writes its original physical series, never a
+newly resolved replacement. Derived materializations resolve their own target
+series while retaining the source generation proof. Backfill processors capture
+the catalog generation when attached to the store; old jobs cannot authorize a
+new catalog's rotation. An older queued input that has not yet published its
+first storage instance is conservatively rejected after a catalog change. Already
+registered retained series can drain their birth generation or accept the current
+generation. Seamless re-planning of unpublished old inputs requires additional
+first-mint provenance; it is not guaranteed by this transition.
+
+This is an explicit lifetime transition, not cross-generation recovery of arbitrary
+summary state. Legacy records without trustworthy catalog provenance remain
+unbound. Tombstone reclamation still requires coordinated removal of old physical
+parts and is not implemented by this transition.

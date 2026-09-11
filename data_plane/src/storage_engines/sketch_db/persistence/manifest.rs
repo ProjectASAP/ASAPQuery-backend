@@ -101,6 +101,7 @@ pub struct Manifest {
     /// past `live.len() * 4`, we rewrite the snapshot and truncate the
     /// log. The threshold is arbitrary; re-tune if it bites.
     log_records_since_snapshot: std::sync::Mutex<u64>,
+    io_uncertain: std::sync::atomic::AtomicBool,
 }
 
 impl Manifest {
@@ -129,6 +130,7 @@ impl Manifest {
             disk_path: disk_path.to_path_buf(),
             live: Arc::new(RwLock::new(Vec::new())),
             log_records_since_snapshot: std::sync::Mutex::new(0),
+            io_uncertain: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -168,6 +170,7 @@ impl Manifest {
             disk_path: disk_path.to_path_buf(),
             live: Arc::new(RwLock::new(live)),
             log_records_since_snapshot: std::sync::Mutex::new(0),
+            io_uncertain: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -197,51 +200,58 @@ impl Manifest {
             .collect()
     }
 
-    /// Append an add-part record to the log and make it durable.
-    /// Updates in-memory state first, then writes to disk, then fsyncs.
+    /// Publish only after the part's manifest record is durable.
     /// The caller must have already fsync'd the part's own files.
     pub fn append_add(&self, entry: PartEntry) -> PersistResult<()> {
-        {
-            let mut live = self.live.write().unwrap();
-            live.push(entry);
-            live.sort_unstable_by_key(|e| e.part_id);
-        }
         self.append_record(Record::Add(entry))
     }
 
-    /// Append a delete-part record. In-memory removal happens before
-    /// disk write, same as add.
+    /// Remove visibility only after the deletion record is durable.
     pub fn append_delete(&self, part_id: PartId) -> PersistResult<()> {
-        {
-            let mut live = self.live.write().unwrap();
-            live.retain(|e| e.part_id != part_id);
-        }
         self.append_record(Record::Delete(part_id))
     }
 
     fn append_record(&self, rec: Record) -> PersistResult<()> {
+        // Serialize log writes and compaction, including live publication.
+        let mut counter = self.log_records_since_snapshot.lock().unwrap();
+        self.check_io_state()?;
         let mut buf = [0u8; RECORD_SIZE];
         encode_record(rec, &mut buf);
         {
             let mut f = OpenOptions::new().append(true).open(self.log_path())?;
-            f.write_all(&buf)?;
-            f.sync_data()?;
+            let original_len = f.metadata()?.len();
+            if let Err(error) = f.write_all(&buf).and_then(|_| f.sync_data()) {
+                // A complete but unacknowledged record must not survive a retry
+                // that assigns the same source epochs a different part ID.
+                if let Err(rollback) = f.set_len(original_len).and_then(|_| f.sync_all()) {
+                    self.io_uncertain
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(PersistError::Manifest(format!(
+                        "manifest append failed ({error}); rollback failed ({rollback}); reopen required"
+                    )));
+                }
+                return Err(error.into());
+            }
         }
         // fsync the parent directory for the log-file size update.
         if let Ok(dir) = File::open(&self.disk_path) {
             let _ = dir.sync_all();
         }
 
-        // Maybe compact the log into a fresh snapshot.
-        let mut counter = self.log_records_since_snapshot.lock().unwrap();
+        {
+            let mut live = self.live.write().unwrap();
+            apply_record(&mut live, rec);
+            live.sort_unstable_by_key(|entry| entry.part_id);
+        }
+        // Compaction failure cannot turn a committed append into a failed append.
+
         *counter += 1;
         let live_len = self.live.read().unwrap().len() as u64;
         let threshold = live_len.saturating_mul(4).max(64);
         if *counter >= threshold {
-            drop(counter);
-            self.compact()?;
-            let mut counter = self.log_records_since_snapshot.lock().unwrap();
-            *counter = 0;
+            if self.compact_locked().is_ok() {
+                *counter = 0;
+            }
         }
         Ok(())
     }
@@ -250,6 +260,23 @@ impl Manifest {
     /// truncate the log. Atomic: the new snapshot goes to a tmp file
     /// first, then rename, then the log is truncated.
     pub fn compact(&self) -> PersistResult<()> {
+        let mut counter = self.log_records_since_snapshot.lock().unwrap();
+        self.compact_locked()?;
+        *counter = 0;
+        Ok(())
+    }
+
+    fn check_io_state(&self) -> PersistResult<()> {
+        if self.io_uncertain.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(PersistError::Manifest(
+                "manifest durability is uncertain; reopen required".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn compact_locked(&self) -> PersistResult<()> {
+        self.check_io_state()?;
         let live = self.live.read().unwrap().clone();
         write_snapshot_atomic(&self.snapshot_path(), &live)?;
         // Truncate log.
@@ -386,6 +413,83 @@ mod tests {
             max_ts,
             size_bytes: 1024,
         }
+    }
+
+    #[test]
+    fn failed_log_open_does_not_publish_add_or_delete() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = Manifest::init(tmp.path()).unwrap();
+        manifest.append_add(entry(1, 0, 10)).unwrap();
+        let saved = tmp.path().join("saved-log");
+        std::fs::rename(manifest.log_path(), &saved).unwrap();
+        std::fs::create_dir(manifest.log_path()).unwrap();
+        assert!(manifest.append_add(entry(2, 10, 20)).is_err());
+        assert!(manifest.append_delete(1).is_err());
+        assert_eq!(
+            manifest
+                .live_parts()
+                .iter()
+                .map(|e| e.part_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        std::fs::remove_dir(manifest.log_path()).unwrap();
+        std::fs::rename(saved, manifest.log_path()).unwrap();
+        let reopened = Manifest::open_or_init(tmp.path()).unwrap();
+        assert_eq!(reopened.live_parts().len(), 1);
+        assert_eq!(reopened.live_parts()[0].part_id, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ambiguous_write_blocks_further_publication_and_compaction() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = Manifest::init(tmp.path()).unwrap();
+        let saved = tmp.path().join("saved-log");
+        std::fs::rename(manifest.log_path(), &saved).unwrap();
+        std::os::unix::fs::symlink("/dev/full", manifest.log_path()).unwrap();
+        assert!(manifest.append_add(entry(1, 0, 10)).is_err());
+        assert!(manifest.live_parts().is_empty());
+        std::fs::remove_file(manifest.log_path()).unwrap();
+        std::fs::rename(saved, manifest.log_path()).unwrap();
+        assert!(manifest.append_add(entry(2, 10, 20)).is_err());
+        assert!(manifest.compact().is_err());
+        let reopened = Manifest::open_or_init(tmp.path()).unwrap();
+        reopened.append_add(entry(2, 10, 20)).unwrap();
+        assert_eq!(reopened.live_parts().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_compaction_preserves_committed_appends_on_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let manifest = Arc::new(Manifest::init(tmp.path()).unwrap());
+        std::thread::scope(|scope| {
+            for worker in 0..3 {
+                let manifest = manifest.clone();
+                scope.spawn(move || {
+                    for index in 1..=24 {
+                        let id = worker * 24 + index;
+                        manifest.append_add(entry(id, id, id + 1)).unwrap();
+                    }
+                });
+            }
+            let manifest = manifest.clone();
+            scope.spawn(move || {
+                for _ in 0..12 {
+                    manifest.compact().unwrap();
+                }
+            });
+        });
+        assert_eq!(manifest.live_parts().len(), 72);
+        let reopened = Manifest::open_or_init(tmp.path()).unwrap();
+        assert_eq!(
+            reopened
+                .live_parts()
+                .iter()
+                .map(|e| e.part_id)
+                .collect::<Vec<_>>(),
+            (1..=72).collect::<Vec<_>>()
+        );
     }
 
     #[test]

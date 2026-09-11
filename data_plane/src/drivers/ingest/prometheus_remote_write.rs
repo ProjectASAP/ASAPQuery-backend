@@ -142,6 +142,8 @@ pub enum RemoteWriteError {
     DedupCapacity(usize),
     #[error("Remote Write requires an active PrometheusRemoteWriteV1 PhysicalPlan")]
     InactivePhysicalPlan,
+    #[error("series identity admission failed: {0}")]
+    SeriesIdentity(String),
     #[error(transparent)]
     Backpressure(#[from] TryRouteError),
 }
@@ -347,7 +349,7 @@ impl PrometheusRemoteWriteReceiver {
             return Err(RemoteWriteError::DedupCapacity(config.max_dedup_entries));
         }
 
-        let messages = route_messages(&new_samples, &self.inner.ingest, &physical_plan);
+        let messages = route_messages(&new_samples, &self.inner.ingest, &physical_plan)?;
         let generation = Arc::new(
             physical_plan
                 .precompute_plan
@@ -380,7 +382,6 @@ impl PrometheusRemoteWriteReceiver {
             if labels.is_empty() {
                 labels = config
                     .grouping_labels
-                    .labels
                     .iter()
                     .cloned()
                     .zip(group_key.values().labels)
@@ -634,7 +635,7 @@ fn route_messages(
     samples: &[CanonicalSample],
     ingest: &Arc<IngestState>,
     physical_plan: &crate::storage_engines::types::ActivePhysicalPlan,
-) -> Vec<WorkerMessage> {
+) -> Result<Vec<WorkerMessage>, RemoteWriteError> {
     type Bucket = (
         u64,
         asap_types::PolicyFingerprint,
@@ -686,7 +687,6 @@ fn route_messages(
             } else {
                 config
                     .grouping_labels
-                    .labels
                     .iter()
                     .map(|name| {
                         (
@@ -722,10 +722,25 @@ fn route_messages(
             // value-weighted Top-K). Keep those states on distinct SIDs.
             let materialization_kind =
                 crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
-            let sid =
-                ingest
-                    .series_resolver
-                    .resolve(&config.metric, attrs_fp, &materialization_kind);
+            let sid = ingest
+                .series_resolver
+                .resolve_with_reactivation(&config.metric, attrs_fp, &materialization_kind, |sid| {
+                    ingest.sketch_index.validate_routed_catalog_generation(
+                        physical_plan.precompute_plan.summary_catalog.as_ref(),
+                    )?;
+                    let activation = ingest
+                        .sketch_index
+                        .authorize_series_reactivation(sid, policy_fp.into())?;
+                    if let Some(generation) = &activation {
+                        if physical_plan.precompute_plan.summary_catalog.as_ref()
+                            != Some(generation.as_ref())
+                        {
+                            return Err("stale routed generation cannot reactivate series".into());
+                        }
+                    }
+                    Ok(activation)
+                })
+                .map_err(RemoteWriteError::SeriesIdentity)?;
             buckets
                 .entry(sid)
                 .or_insert_with(|| ((sid, policy_fp, group_key), Vec::new()))
@@ -734,7 +749,7 @@ fn route_messages(
         }
     }
     let received_at = Instant::now();
-    buckets
+    Ok(buckets
         .into_values()
         .map(
             |((sid, policy_fp, group_key), samples)| WorkerMessage::GroupSamples {
@@ -745,7 +760,7 @@ fn route_messages(
                 ingest_received_at: received_at,
             },
         )
-        .collect()
+        .collect())
 }
 
 #[derive(Debug)]
@@ -973,7 +988,7 @@ mod tests {
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
             parameters: HashMap::new(),
-            grouping_labels: KeyByLabelNames::new(vec!["job".into()]),
+            grouping_labels: KeyByLabelNames::new(vec!["job".into()]).into(),
             aggregated_labels: KeyByLabelNames::empty(),
             rollup_labels: KeyByLabelNames::empty(),
             original_yaml: String::new(),
@@ -987,7 +1002,7 @@ mod tests {
             metric: "requests_total".into(),
             num_aggregates_to_retain: None,
             table_name: None,
-            value_column: None,
+            value_projection: None,
             table_population: None,
             table_timestamp_column: None,
             partitioning: None,
@@ -1044,7 +1059,7 @@ mod tests {
                     }
                     _ => HashMap::new(),
                 },
-                grouping_labels: KeyByLabelNames::new(grouping),
+                grouping_labels: KeyByLabelNames::new(grouping).into(),
                 aggregated_labels: KeyByLabelNames::new(aggregated),
                 rollup_labels: KeyByLabelNames::empty(),
                 original_yaml: String::new(),
@@ -1058,7 +1073,7 @@ mod tests {
                 metric: "cpu_seconds_total".into(),
                 num_aggregates_to_retain: Some(80),
                 table_name: None,
-                value_column: None,
+                value_projection: None,
                 table_population: None,
                 table_timestamp_column: None,
                 partitioning: None,
@@ -1098,6 +1113,10 @@ mod tests {
             sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
             observability: IngestObservability::default(),
         });
+        ingest
+            .sketch_index
+            .install_summary_catalog(physical_plan.summary_catalog.as_ref().unwrap().clone())
+            .unwrap();
         let request = WriteRequest {
             timeseries: ["api", "order", "payment", "user", "webapp"]
                 .into_iter()
@@ -1129,7 +1148,7 @@ mod tests {
         };
         let samples = canonicalize_request(&request, &PrometheusRemoteWriteConfig::default())
             .expect("canonical samples");
-        let messages = route_messages(&samples, &ingest, &physical_plan);
+        let messages = route_messages(&samples, &ingest, &physical_plan).unwrap();
         let mut cms_buckets = 0;
         let mut counter_buckets = 0;
         let mut cms_samples = 0;
@@ -1220,7 +1239,7 @@ mod tests {
         let drain = tokio::spawn(async move { handle.drain().await });
         assert!(matches!(
             worker.recv().await.unwrap(),
-            WorkerMessage::Admitted { .. }
+            WorkerMessage::BoundInput { .. }
         ));
         let WorkerMessage::Drain(reply) = worker.recv().await.unwrap() else {
             panic!("expected barrier")
@@ -1522,11 +1541,15 @@ mod tests {
         let (receiver, mut worker) = configured_receiver();
         receiver.accept(&one_sample(4.0)).unwrap();
         let message = worker.recv().await.expect("routed worker message");
-        let WorkerMessage::Admitted { input, revision } = message else {
+        let WorkerMessage::BoundInput {
+            input, revision, ..
+        } = message
+        else {
             panic!("missing admission receipt")
         };
-        assert!(revision.revision > 0);
+        assert!(revision.as_ref().unwrap().revision > 0);
         let message = *input;
+        let revision = revision.expect("remote-write input carries admission receipt");
         let WorkerMessage::GroupSamples {
             group_key, samples, ..
         } = message
