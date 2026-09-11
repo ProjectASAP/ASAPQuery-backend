@@ -180,8 +180,19 @@ impl PolicyFingerprint {
             buf.extend_from_slice(b"\0sql-source-v1\0");
             buf.extend_from_slice(table.as_bytes());
             buf.push(0);
-            if let Some(column) = &cfg.value_column {
+            if let Some(column) = cfg.effective_value_projection().column() {
                 buf.extend_from_slice(column.as_bytes());
+            }
+            if matches!(
+                cfg.effective_value_projection(),
+                crate::sds::ValueProjectionIdentity::Constant { .. }
+            ) {
+                buf.extend_from_slice(b"\0constant-projection-v1\0");
+                buf.extend_from_slice(
+                    serde_json::to_string(cfg.effective_value_projection())
+                        .expect("finite validated projection serializes")
+                        .as_bytes(),
+                );
             }
         }
         if let Some(population) = &cfg.table_population {

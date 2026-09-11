@@ -161,14 +161,57 @@ impl SketchStoreSink {
         };
         let agg_cfg = &agg_cfg;
         let resolver = self.series_resolver.clone();
-        self.sketch_index
-            .ingest_precompute_for_agg_config(
-                |metric, fp, ak| resolver.resolve(metric, fp, ak),
-                agg_cfg,
-                output,
-                accumulator,
-            )
-            .is_some()
+        let persist = || {
+            self.sketch_index
+                .ingest_precompute_for_agg_config(
+                    |metric, fp, ak| resolver.resolve(metric, fp, ak),
+                    agg_cfg,
+                    output,
+                    accumulator,
+                )
+                .inspect(|_| crate::precompute_engine::metrics::record_materialized_outputs(1))
+        };
+        if let Some(revision) = &output.input_revision {
+            let group_values = output.population_labels.clone().unwrap_or_else(|| {
+                agg_cfg
+                    .grouping_labels
+                    .labels
+                    .iter()
+                    .cloned()
+                    .zip(output.key.clone().unwrap_or_default().labels)
+                    .collect()
+            });
+            let (Ok(start_ms), Ok(end_ms)) = (
+                i64::try_from(output.start_timestamp),
+                i64::try_from(output.end_timestamp),
+            ) else {
+                return false;
+            };
+            let coordinate = asap_types::sds::SummaryInstanceCoordinates {
+                summary_definition_id: output.policy_fp.into(),
+                time_range: asap_types::sds::HalfOpenTimeRange { start_ms, end_ms },
+                group_values,
+            };
+            if let Err(error) = self.sketch_index.publish_admitted_summary_update(
+                &revision.generation,
+                &coordinate,
+                revision.first_revision,
+                revision.revision,
+                agg_cfg
+                    .num_aggregates_to_retain
+                    .unwrap_or(1)
+                    .saturating_mul(agg_cfg.slide_interval)
+                    .max(agg_cfg.window_size)
+                    .saturating_mul(1_000),
+                persist,
+            ) {
+                warn!(%error, "summary input revision publication failed");
+                return false;
+            }
+            true
+        } else {
+            persist().is_some()
+        }
     }
 }
 
@@ -343,7 +386,7 @@ mod tests {
             metric: metric.to_string(),
             num_aggregates_to_retain: None,
             table_name: None,
-            value_column: None,
+            value_projection: None,
             table_population: None,
             table_timestamp_column: None,
             partitioning: None,

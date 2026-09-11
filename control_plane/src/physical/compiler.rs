@@ -2267,52 +2267,25 @@ impl PhysicalCompiler {
         for (query_index, compiled) in executable_dags.iter().enumerate() {
             let Some(compiled) = compiled else { continue };
             let query_id = request.queries[query_index].query_id.clone();
-            let mut placements = BTreeMap::new();
-            let mut precompute_sinks = Vec::new();
-            for node in &compiled.dag.nodes {
-                let placement =
-                    if let Some(definition) = node_bindings.get(&(query_index, node.id)).copied() {
-                        precompute_sinks.push(node.id);
-                        crate::physical::executable_binding::BackendNodeBinding::Materialization {
-                            summary_definition: definition.into(),
-                        }
-                    } else if node.output_state.timing
-                        == planner_types::post_asap::ExecutionTiming::MaintenanceTime
-                    {
-                        super::executable_binding::BackendNodeBinding::MaintenanceInput
-                    } else {
-                        match query_node_bindings.get(&(query_index, node.id)).copied() {
-                            Some(query_node) => {
-                                super::executable_binding::BackendNodeBinding::Query { query_node }
-                            }
-                            None => super::executable_binding::BackendNodeBinding::QueryInput,
-                        }
-                    };
-                placements.insert(node.id, placement);
-            }
-            precompute_sinks.sort();
-            let installed = crate::physical::executable_binding::InstalledPostAsapDag {
-                document: super::executable_binding::OwnedPostAsapDag::from_executable(
-                    query_id.clone(),
-                    &compiled.dag,
-                )
-                .map_err(|reason| CompileError::Query {
-                    query_id: query_id.clone(),
-                    reason,
-                })?,
-                binding: super::executable_binding::BackendExecutableBinding {
-                    nodes: placements,
-                    query_sink: compiled.dag.root,
-                    query_plan_sink: query_plan
-                        .entries
-                        .values()
-                        .find(|entry| entry.query_id == query_id)
-                        .expect("compiled query entry exists")
-                        .root,
-                    precompute_sinks,
+            let query_plan_sink = query_plan
+                .entries
+                .values()
+                .find(|entry| entry.query_id == query_id)
+                .expect("compiled query entry exists")
+                .root;
+            let installed = super::executable_binding::install_selected_dag(
+                query_id.clone(),
+                &compiled.dag,
+                query_plan_sink,
+                |id| {
+                    node_bindings
+                        .get(&(query_index, id))
+                        .copied()
+                        .map(Into::into)
                 },
-            };
-            installed.validate().map_err(|reason| CompileError::Query {
+                |id| query_node_bindings.get(&(query_index, id)).copied(),
+            )
+            .map_err(|reason| CompileError::Query {
                 query_id: query_id.clone(),
                 reason,
             })?;
@@ -3255,7 +3228,8 @@ fn scoped_materialization(
     aggregation: &BackendAggregation,
     node: &SummaryNode,
 ) -> anyhow::Result<asap_types::PrecomputeMaterialization> {
-    let mut config = aggregation_config_for_materialization(aggregation)?;
+    let mut config =
+        aggregation_config_for_materialization(aggregation, asap_types::QueryLanguage::PromQl)?;
     if !matches!(aggregation.aggregation_input, AggregationInput::Raw) {
         return Ok(config);
     }
@@ -3275,12 +3249,22 @@ fn scoped_materialization(
 
 pub(crate) fn aggregation_config_for_materialization(
     aggregation: &BackendAggregation,
+    language: asap_types::QueryLanguage,
 ) -> anyhow::Result<asap_types::PrecomputeMaterialization> {
     use anyhow::Context as _;
-    let json = crate::emit::stage_config::build_backend_aggregation_json(aggregation);
-    let text = serde_json::to_string(&json).context("serialize synthesized aggregation JSON")?;
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str(&text).context("parse synthesized aggregation JSON as YAML")?;
+    let mut json = crate::emit::stage_config::build_backend_aggregation_json(aggregation);
+    // The selected physical duration is authoritative. The legacy edge emitter's
+    // 5..60 second clamp must not silently change a backend materialization.
+    json["windowSize"] = serde_json::json!(aggregation.window_secs);
+    if language == asap_types::QueryLanguage::ClickHouseSql {
+        // Raw input does not imply PromQL's (start,end] convention. SQL bounds
+        // are normalized and bound explicitly by the SQL compiler.
+        json["parameters"]
+            .as_object_mut()
+            .expect("emitter parameters are an object")
+            .remove("promql_right_closed");
+    }
+    let yaml = serde_yaml::to_value(json).context("convert physical aggregation fields")?;
     asap_types::PrecomputeMaterialization::from_yaml_data(
         &yaml,
         None,
@@ -5326,6 +5310,13 @@ mod tests {
         let roundtrip: PrecomputePlan =
             serde_json::from_slice(&serde_json::to_vec(original).unwrap()).unwrap();
         roundtrip.validate_against_catalog(catalog).unwrap();
+        let mut legacy = serde_json::to_value(original).unwrap();
+        for schema in legacy["schemas"].as_array_mut().unwrap() {
+            schema.as_object_mut().unwrap().remove("value_projection");
+            schema["value_column"] = serde_json::json!("SampleValue");
+        }
+        let decoded: PrecomputePlan = serde_json::from_value(legacy).unwrap();
+        decoded.validate_against_catalog(catalog).unwrap();
         let reject =
             |mutated: PrecomputePlan| assert!(mutated.validate_against_catalog(catalog).is_err());
         let mut bad = original.clone();
@@ -5334,7 +5325,9 @@ mod tests {
         };
         reject(bad);
         let mut bad = original.clone();
-        bad.schemas[0].value_column = planner_types::pre_asap::ColumnRef::Named("other".into());
+        bad.schemas[0].value_projection = asap_types::sds::ValueProjectionIdentity::Column {
+            name: "other".into(),
+        };
         reject(bad);
         let mut bad = original.clone();
         bad.schemas[0].group_by.push("other".into());
