@@ -10,14 +10,14 @@ pub enum ErpObservationInputSemantics {
     UnitSampleFrequency,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErpPopulationObservation<Shape> {
     pub population_id: SummaryInstanceId,
     pub shape: Shape,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErpPopulationObservations<Shape> {
     pub schema_version: u32,
