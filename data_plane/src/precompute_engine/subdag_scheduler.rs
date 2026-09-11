@@ -21,6 +21,11 @@ pub struct MaterializationCommitKey {
 
 pub trait PrecomputeOperatorRegistry<V> {
     type Error;
+    /// A materialized input is an execution frontier: its absorbed semantic
+    /// dependencies have already run and must not be evaluated again.
+    fn materialized_input(&self, _node: &ExecutableDagNode) -> Result<Option<V>, Self::Error> {
+        Ok(None)
+    }
     fn execute(&self, node: &ExecutableDagNode, inputs: &[Arc<V>]) -> Result<V, Self::Error>;
 }
 
@@ -119,6 +124,14 @@ where
             return Err(ScheduleError::Invalid(format!(
                 "query-time node {id} in precompute dependency path"
             )));
+        }
+        if let Some(value) = registry
+            .materialized_input(node)
+            .map_err(ScheduleError::Operator)?
+        {
+            values.insert(id, Arc::new(value));
+            active.remove(&id);
+            return Ok(());
         }
         let child_ids = inputs.get(&id).cloned().unwrap_or_default();
         for child in &child_ids {
@@ -299,6 +312,52 @@ mod tests {
         .unwrap();
         assert!(Arc::ptr_eq(&first, &replay));
         assert_eq!(registry.0.lock().unwrap().values().sum::<usize>(), 4);
+    }
+
+    #[test]
+    fn supplied_materialization_cuts_absorbed_dependencies_and_is_shared() {
+        struct FrontierRegistry(Registry);
+        impl PrecomputeOperatorRegistry<u32> for FrontierRegistry {
+            type Error = String;
+            fn materialized_input(&self, node: &ExecutableDagNode) -> Result<Option<u32>, String> {
+                Ok((node.id == PostAsapNodeId(1)).then_some(10))
+            }
+            fn execute(
+                &self,
+                node: &ExecutableDagNode,
+                inputs: &[Arc<u32>],
+            ) -> Result<u32, String> {
+                assert_ne!(
+                    node.id,
+                    PostAsapNodeId(0),
+                    "absorbed source subtree must not execute"
+                );
+                self.0.execute(node, inputs)
+            }
+        }
+        let mut raw = node(0);
+        raw.output_state = ExecutionDataState::READ_ROWS;
+        let mut query = node(4);
+        query.output_state = ExecutionDataState::READ_ROWS;
+        let dag = ExecutableDag {
+            nodes: vec![raw, node(1), node(2), node(3), query],
+            edges: vec![edge(0, 1), edge(1, 2), edge(1, 3), edge(2, 3), edge(3, 4)],
+            root: PostAsapNodeId(4),
+        };
+        let mut bindings = binding();
+        bindings
+            .nodes
+            .insert(PostAsapNodeId(0), BackendNodeBinding::QueryInput);
+        let registry = FrontierRegistry(Registry::default());
+        let sink = Sink::default();
+        let result =
+            execute_precompute_sink(&dag, &bindings, PostAsapNodeId(3), key(3), &registry, &sink)
+                .unwrap();
+        assert_eq!(*result, 25);
+        assert_eq!(
+            *registry.0 .0.lock().unwrap(),
+            BTreeMap::from([(2, 1), (3, 1)])
+        );
     }
 
     #[test]
