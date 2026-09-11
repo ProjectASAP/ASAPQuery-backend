@@ -39,8 +39,8 @@ sha2 = "0.10"
 # reduction: Reduction, .. }`) are `pre_asap` types, in the same crate now
 # (not a separate `asap-ir` import). Query serving consumes the compiled
 # QueryPlan; these types are used at physical-plan compilation boundaries.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc" }
-asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "e17a53715b445ab490f9c5f07d25fda730d252ec" }
+asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "e17a53715b445ab490f9c5f07d25fda730d252ec" }
 
 # Shared external (workspace)
 serde.workspace = true
@@ -133,7 +133,7 @@ fs2 = "0.4"
 # none of them.
 
 [dev-dependencies]
-asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "7e7931b581f4941ad02e4c6d90d41f2e95b2d7fc" }
+asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "e17a53715b445ab490f9c5f07d25fda730d252ec" }
 tempfile = "3.20.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 tokio-tungstenite = "0.21"
