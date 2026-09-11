@@ -177,7 +177,9 @@ impl DDSketchAccumulator {
             buckets,
             ..Default::default()
         };
-        self.inner.apply_delta(&delta);
+        self.inner
+            .apply_delta(&delta)
+            .map_err(|error| format!("apply DDSketchDelta: {error}"))?;
         Ok(())
     }
 }
@@ -481,6 +483,25 @@ mod tests {
         assert_eq!(acc.inner.store_counts, vec![11, 2, 23]);
         // `count` recomputed from the merged buckets: 11 + 2 + 23 = 36.
         assert_eq!(acc.inner.total_count(), 36);
+    }
+
+    /// A valid protobuf with an inadmissible span must not acknowledge a dropped update.
+    #[test]
+    fn test_apply_proto_delta_rejects_span_without_mutating_state() {
+        use asap_otel_proto::sketchlib::v1::{DdSketchBucketDelta, DdSketchDelta as PbDelta};
+        use prost::Message;
+        let mut acc = DDSketchAccumulator::new(0.01);
+        acc.inner = DdSketch::from_raw(0.01, vec![1, 2, 3], 0);
+        let bytes = PbDelta {
+            buckets: vec![DdSketchBucketDelta {
+                index: i32::MAX,
+                d_count: 1,
+            }],
+        }
+        .encode_to_vec();
+        assert!(acc.apply_proto_delta_bytes(&bytes).is_err());
+        assert_eq!(acc.inner.store_counts, vec![1, 2, 3]);
+        assert_eq!(acc.inner.store_offset, 0);
     }
 
     #[test]

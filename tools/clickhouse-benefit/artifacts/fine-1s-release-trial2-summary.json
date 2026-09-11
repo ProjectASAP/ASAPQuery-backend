@@ -1,0 +1,164 @@
+{
+  "artifact": "/mydata/clickhouse-o11y-main-results/fine-1s-release-trial2.json",
+  "git_head": "a618e4e19f02167d95a461fb33a6b8d62b5bcd1d",
+  "input": {
+    "end_ms": 1788891296001,
+    "metric": "service_cache_refresh_lag_seconds",
+    "path": "/mydata/clickhouse-o11y-main-results/fine-1s-24h-series.jsonl",
+    "samples": 86371,
+    "series": [
+      "service_cache_refresh_lag_seconds{job=\"user-service\",instance=\"user-service:8082\"}"
+    ],
+    "start_ms": 1788848096001
+  },
+  "planning_scope": "Planner chooses query DAG against a predeclared MinMax catalog; materialization sizing/selection is not measured",
+  "routes": {
+    "warm": {
+      "requests": 1000,
+      "median_ms": 0.852957,
+      "p95_ms": 1.017016,
+      "serial_service_requests_per_second": 1178.7970774022772,
+      "all_http_200": true,
+      "execution_modes": [
+        "warm"
+      ],
+      "backend_cpu_ms": 770.0,
+      "clickhouse_cpu_ms": 80.0
+    },
+    "exact": {
+      "requests": 1000,
+      "median_ms": 6.831614999999999,
+      "p95_ms": 15.355809,
+      "serial_service_requests_per_second": 130.18295633571148,
+      "all_http_200": true,
+      "execution_modes": [
+        "None"
+      ],
+      "backend_cpu_ms": 0.0,
+      "clickhouse_cpu_ms": 8410.0
+    }
+  },
+  "latency_speedup": 8.009331068271905,
+  "first_query": {
+    "exact_elapsed_ns": 7978286,
+    "warm_elapsed_ns": 5680973
+  },
+  "build_phase": {
+    "backend": {
+      "cpu_ticks": 20,
+      "pid": 3945895,
+      "rss_pages": 9062,
+      "vm_hwm": "VmHWM:\t   39320 kB",
+      "vm_rss": "VmRSS:\t   36248 kB"
+    },
+    "backend_output_bytes": 5721,
+    "clickhouse_after": {
+      "cpu_ticks": 913,
+      "pid": 3945404,
+      "rss_pages": 212022,
+      "vm_hwm": "VmHWM:\t  889284 kB",
+      "vm_rss": "VmRSS:\t  848088 kB"
+    },
+    "clickhouse_before": {
+      "cpu_ticks": 859,
+      "pid": 3945404,
+      "rss_pages": 201560,
+      "vm_hwm": "VmHWM:\t  889284 kB",
+      "vm_rss": "VmRSS:\t  806240 kB"
+    },
+    "elapsed_ns": 1999108917
+  },
+  "source_load_phase": {
+    "clickhouse_after": {
+      "cpu_ticks": 890,
+      "pid": 3945404,
+      "rss_pages": 217917,
+      "vm_hwm": "VmHWM:\t  889284 kB",
+      "vm_rss": "VmRSS:\t  871668 kB"
+    },
+    "clickhouse_before": {
+      "cpu_ticks": 859,
+      "pid": 3945404,
+      "rss_pages": 201560,
+      "vm_hwm": "VmHWM:\t  889284 kB",
+      "vm_rss": "VmRSS:\t  806240 kB"
+    },
+    "elapsed_ns": 621697688
+  },
+  "backfill_phase": {
+    "backend_after": {
+      "cpu_ticks": 20,
+      "pid": 3945895,
+      "rss_pages": 9062,
+      "vm_hwm": "VmHWM:\t   39320 kB",
+      "vm_rss": "VmRSS:\t   36248 kB"
+    },
+    "backend_before": {
+      "cpu_ticks": 1,
+      "pid": 3945895,
+      "rss_pages": 6158,
+      "vm_hwm": "VmHWM:\t   24632 kB",
+      "vm_rss": "VmRSS:\t   24632 kB"
+    },
+    "clickhouse_after": {
+      "cpu_ticks": 913,
+      "pid": 3945404,
+      "rss_pages": 212022,
+      "vm_hwm": "VmHWM:\t  889284 kB",
+      "vm_rss": "VmRSS:\t  848088 kB"
+    },
+    "clickhouse_before": {
+      "cpu_ticks": 890,
+      "pid": 3945404,
+      "rss_pages": 216543,
+      "vm_hwm": "VmHWM:\t  889284 kB",
+      "vm_rss": "VmRSS:\t  866172 kB"
+    },
+    "elapsed_ns": 1319154418
+  },
+  "query_phase": {
+    "backend_after": {
+      "cpu_ticks": 99,
+      "pid": 3945895,
+      "rss_pages": 13187,
+      "vm_hwm": "VmHWM:\t   52748 kB",
+      "vm_rss": "VmRSS:\t   52748 kB"
+    },
+    "backend_before": {
+      "cpu_ticks": 22,
+      "pid": 3945895,
+      "rss_pages": 13187,
+      "vm_hwm": "VmHWM:\t   52748 kB",
+      "vm_rss": "VmRSS:\t   52748 kB"
+    },
+    "backend_output_bytes": 5721,
+    "clickhouse_after": {
+      "cpu_ticks": 1781,
+      "pid": 3945404,
+      "rss_pages": 200633,
+      "vm_hwm": "VmHWM:\t  889284 kB",
+      "vm_rss": "VmRSS:\t  802532 kB"
+    },
+    "clickhouse_before": {
+      "cpu_ticks": 930,
+      "pid": 3945404,
+      "rss_pages": 211535,
+      "vm_hwm": "VmHWM:\t  889284 kB",
+      "vm_rss": "VmRSS:\t  846140 kB"
+    },
+    "clickhouse_storage_bytes": null,
+    "elapsed_ns": 9001513338
+  },
+  "clickhouse_table": {
+    "bytes_on_disk": 507146,
+    "compressed_bytes": 499358,
+    "rows": 86371
+  },
+  "limitations": [
+    "single q05 max workload",
+    "CPU uses Linux scheduler ticks",
+    "RSS is whole-process",
+    "ClickHouse server is externally managed",
+    "CPU counters include server background work and have scheduler-tick precision"
+  ]
+}
