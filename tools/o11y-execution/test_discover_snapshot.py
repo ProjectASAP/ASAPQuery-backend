@@ -24,6 +24,7 @@ class DiscoverSnapshotTests(unittest.TestCase):
                 "--template", str(template), "--output", str(output), "--repetitions", "1",
             ], check=True)
             snapshot = json.loads(output.read_text())
+            self.assertEqual(snapshot["query_workload"]["repeating_queries"][0]["demand"], {"fixed_interval_at": {"interval": 60000, "evaluation_phase": 0}})
             environment = snapshot["environment"]
             self.assertEqual(environment["activation_unix_ms"], environment["observed_at_unix_ms"])
             provenance = json.loads(output.with_suffix(".provenance.json").read_text())

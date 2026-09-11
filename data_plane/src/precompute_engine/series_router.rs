@@ -25,6 +25,13 @@ use xxhash_rust::xxh64::xxh64;
 /// by sid without losing the data the legacy `(agg_id, group_key)` shape
 /// carried.
 pub enum WorkerMessage {
+    /// Immutable producer generation captured before routing. The optional
+    /// receipt proves atomic admission; absent receipts are never fabricated.
+    BoundInput {
+        input: Box<WorkerMessage>,
+        generation: Arc<asap_types::sds::CatalogGeneration>,
+        revision: Option<Arc<crate::storage_engines::types::SummaryInputRevision>>,
+    },
     /// A batch of samples for the same series, routed by series key.
     /// Used in `pass_raw_samples` mode where no aggregation is needed.
     RawSamples {
@@ -96,6 +103,16 @@ pub enum WorkerMessage {
 impl fmt::Debug for WorkerMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::BoundInput {
+                input,
+                generation,
+                revision,
+            } => f
+                .debug_struct("BoundInput")
+                .field("input", input)
+                .field("generation", generation)
+                .field("revision", &revision.as_ref().map(|value| value.revision))
+                .finish(),
             Self::RawSamples {
                 series_key,
                 samples,
@@ -161,17 +178,29 @@ impl SeriesRouter {
         &self,
         messages: Vec<WorkerMessage>,
         _ingest_received_at: Instant,
+        generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Group messages by target worker index
         let mut per_worker: HashMap<usize, Vec<WorkerMessage>> = HashMap::new();
         for msg in messages {
             let worker_idx = match &msg {
+                WorkerMessage::BoundInput { .. } => {
+                    return Err("input must be admitted by the router".into())
+                }
                 WorkerMessage::GroupSamples { sid, .. } => self.worker_for_sid(*sid),
                 WorkerMessage::AccumulatorInput { sid, .. } => self.worker_for_sid(*sid),
                 WorkerMessage::RawSamples { series_key, .. } => self.worker_for(series_key),
                 _ => 0,
             };
-            per_worker.entry(worker_idx).or_default().push(msg);
+            let message = match &generation {
+                Some(generation) => WorkerMessage::BoundInput {
+                    input: Box::new(msg),
+                    generation: Arc::clone(generation),
+                    revision: None,
+                },
+                None => msg,
+            };
+            per_worker.entry(worker_idx).or_default().push(message);
         }
 
         // Send to each worker concurrently
@@ -204,12 +233,26 @@ impl SeriesRouter {
         &self,
         messages: Vec<WorkerMessage>,
     ) -> Result<(), TryRouteError> {
+        self.try_route_group_batch_with_admission(messages, || Ok(None))
+    }
+
+    pub fn try_route_group_batch_with_admission(
+        &self,
+        messages: Vec<WorkerMessage>,
+        admit: impl FnOnce() -> Result<
+            Option<Arc<crate::storage_engines::types::SummaryInputRevision>>,
+            String,
+        >,
+    ) -> Result<(), TryRouteError> {
         let mut pending = Vec::with_capacity(messages.len());
         for message in messages {
             let worker_idx = match &message {
                 WorkerMessage::GroupSamples { sid, .. }
                 | WorkerMessage::AccumulatorInput { sid, .. } => self.worker_for_sid(*sid),
                 WorkerMessage::RawSamples { series_key, .. } => self.worker_for(series_key),
+                WorkerMessage::BoundInput { .. } => {
+                    return Err(TryRouteError::Admission("input already admitted".into()))
+                }
                 WorkerMessage::Flush | WorkerMessage::Drain(_) | WorkerMessage::Shutdown => 0,
             };
             let permit = self.senders[worker_idx]
@@ -221,8 +264,16 @@ impl SeriesRouter {
                 })?;
             pending.push((permit, message));
         }
+        let revision = admit().map_err(TryRouteError::Admission)?;
         for (permit, message) in pending {
-            permit.send(message);
+            permit.send(match &revision {
+                Some(revision) => WorkerMessage::BoundInput {
+                    input: Box::new(message),
+                    generation: Arc::clone(&revision.generation),
+                    revision: Some(Arc::clone(revision)),
+                },
+                None => message,
+            });
         }
         Ok(())
     }
@@ -283,8 +334,10 @@ impl SeriesRouter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TryRouteError {
+    #[error("summary admission rejected: {0}")]
+    Admission(String),
     #[error("precompute queue is full")]
     Full,
     #[error("precompute worker is unavailable")]
@@ -343,9 +396,17 @@ mod tests {
                 ingest_received_at: Instant::now(),
             },
         ];
+        let mut admitted = false;
         assert_eq!(
-            router.try_route_group_batch_atomic(messages),
+            router.try_route_group_batch_with_admission(messages, || {
+                admitted = true;
+                Ok(None)
+            }),
             Err(TryRouteError::Full)
+        );
+        assert!(
+            !admitted,
+            "failed queue reservation must not mutate admission"
         );
         assert!(matches!(
             receiver.try_recv(),

@@ -956,6 +956,19 @@ impl<K: Eq + std::hash::Hash + Clone, P> SidStoreData<K, P> {
         }
     }
 
+    /// Whether any hot or queued-for-flush state belongs to this completion prefix.
+    pub(crate) fn contains_window_ending_at_or_before(&self, end_ms: u64) -> bool {
+        self.current_epoch
+            .iter_entries()
+            .any(|(window, _, _)| window.1 <= end_ms)
+            || self.sealed_epochs.values().any(|epoch| {
+                epoch
+                    .entries
+                    .iter()
+                    .any(|(window, _, _)| window.1 <= end_ms)
+            })
+    }
+
     /// Time-driven seal for the persistence tier: roll every window in
     /// `current_epoch` whose END is at or before `cutoff_end` into a
     /// freshly-sealed epoch, leaving the more-recent windows in
@@ -1370,6 +1383,21 @@ mod tests {
         assert_eq!(sealed, 3, "all three aged windows should seal");
         assert_eq!(s.sealed_epochs.len(), 1);
         assert_eq!(s.current_epoch.distinct_windows(), 0);
+    }
+
+    #[test]
+    fn completion_prefix_does_not_wait_for_future_windows() {
+        let mut store = SidStoreData::<Vec<String>, i32>::new();
+        store.insert((30, 60), vec![], 1);
+        assert!(!store.contains_window_ending_at_or_before(30));
+        store.insert((0, 30), vec![], 2);
+        assert!(store.contains_window_ending_at_or_before(30));
+        store.persistence_enabled = true;
+        store.seal_aged_windows(31);
+        assert!(store.contains_window_ending_at_or_before(30));
+        store.sealed_epochs.clear();
+        assert!(!store.contains_window_ending_at_or_before(30));
+        assert!(store.contains_window_ending_at_or_before(60));
     }
 
     #[test]

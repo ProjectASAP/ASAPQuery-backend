@@ -104,7 +104,7 @@ impl HttpProtocolAdapter for VictoriaMetricsHttpAdapter {
         "VictoriaMetrics HTTP / MetricsQL"
     }
     fn canonical_plan_identity(&self, query: &str) -> Result<Option<String>, AdapterError> {
-        control_plane::query_plan::canonical_promql(query)
+        asap_types::query_plan::canonical_promql(query)
             .map(Some)
             .map_err(|error| AdapterError::ParseError(format!("promql-compatible subset: {error}")))
     }

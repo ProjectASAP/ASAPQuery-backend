@@ -37,6 +37,9 @@ use tracing::{debug, debug_span, info, warn};
 /// producing one output per (sid, window) — exactly like Arroyo's
 /// `GROUP BY window, key`.
 struct GroupState {
+    series_id: u64,
+    catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
+    input_revisions: BTreeMap<i64, Arc<crate::storage_engines::types::SummaryInputRevision>>,
     config: Arc<AggregationConfig>,
     /// Source policy fingerprint that minted this sid. Held so
     /// `evict_orphaned_groups` can check liveness against the streaming
@@ -91,11 +94,7 @@ impl GroupState {
     }
 
     fn bucket_starts_for(&self, timestamp_ms: i64) -> Vec<i64> {
-        if self.stores_full_windows() {
-            self.window_manager.window_starts_containing(timestamp_ms)
-        } else {
-            vec![self.window_manager.pane_start_for(timestamp_ms)]
-        }
+        self.window_manager.stored_bucket_starts(timestamp_ms)
     }
 
     fn closed_buckets(&self, previous_ms: i64, current_ms: i64) -> Vec<i64> {
@@ -107,11 +106,7 @@ impl GroupState {
     }
 
     fn bucket_bounds(&self, start_ms: i64) -> (i64, i64) {
-        if self.stores_full_windows() {
-            self.window_manager.window_bounds(start_ms)
-        } else {
-            self.window_manager.pane_bounds(start_ms)
-        }
+        self.window_manager.stored_bucket_bounds(start_ms)
     }
 
     fn touch_pane(&mut self, pane_start_ms: i64, now_ms: i64) {
@@ -128,6 +123,8 @@ impl GroupState {
         let active = &self.active_panes;
         let sketch = &self.sketch_panes;
         self.pane_wall_clock
+            .retain(|ps, _| active.contains_key(ps) || sketch.contains_key(ps));
+        self.input_revisions
             .retain(|ps, _| active.contains_key(ps) || sketch.contains_key(ps));
     }
 }
@@ -153,6 +150,8 @@ pub struct WorkerRuntimeConfig {
 /// `(metric, attrs_fingerprint, agg_kind_canonical)` identity contract on
 /// `SeriesIdResolver`, so one sid uniquely names one bucket.
 pub struct Worker {
+    current_input_revision: Option<Arc<crate::storage_engines::types::SummaryInputRevision>>,
+    current_catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
     id: usize,
     receiver: mpsc::Receiver<WorkerMessage>,
     output_sink: Arc<dyn OutputSink>,
@@ -208,6 +207,8 @@ impl Worker {
             wall_clock_max_open_grace_period_ms,
         } = runtime_config;
         Self {
+            current_input_revision: None,
+            current_catalog_generation: None,
             id,
             receiver,
             output_sink,
@@ -241,7 +242,34 @@ impl Worker {
 
         let mut processing_error: Option<String> = None;
         while let Some(msg) = self.receiver.recv().await {
+            let msg = match msg {
+                WorkerMessage::BoundInput {
+                    input,
+                    generation,
+                    revision,
+                } => {
+                    if revision
+                        .as_ref()
+                        .is_some_and(|receipt| receipt.generation != generation)
+                    {
+                        processing_error =
+                            Some("input receipt differs from captured generation".into());
+                        continue;
+                    }
+                    self.current_catalog_generation = Some(generation);
+                    self.current_input_revision = revision;
+                    *input
+                }
+                message => {
+                    self.current_input_revision = None;
+                    self.current_catalog_generation = None;
+                    message
+                }
+            };
             match msg {
+                WorkerMessage::BoundInput { .. } => {
+                    processing_error = Some("nested admission receipt".into());
+                }
                 WorkerMessage::GroupSamples {
                     sid,
                     policy_fp,
@@ -395,6 +423,9 @@ impl Worker {
             let cfg = snap.get_aggregation_config(policy_fp.as_u64())?;
             let config = Arc::new(cfg.clone());
             let gs = GroupState {
+                series_id: sid,
+                catalog_generation: self.current_catalog_generation.clone(),
+                input_revisions: BTreeMap::new(),
                 window_manager: WindowManager::with_layout(
                     config.window_size,
                     config.slide_interval,
@@ -433,6 +464,7 @@ impl Worker {
         group_key: &Arc<GroupKey>,
         samples: Vec<(String, i64, f64)>, // (series_key, timestamp_ms, value)
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let input_revision = self.current_input_revision.clone();
         let worker_id = self.id;
         let allowed_lateness_ms = self.allowed_lateness_ms;
         let late_data_policy = self.late_data_policy;
@@ -497,19 +529,26 @@ impl Worker {
             let too_late = previous_event_time != i64::MIN
                 && pane_timestamp(*ts)
                     < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
-            let value = if let SampleUpdateRule::CounterDelta { .. } =
-                state.config.sample_update_rule()
-            {
-                let Some(delta) =
+            let value =
+                if let SampleUpdateRule::CounterDelta { .. } = state.config.sample_update_rule() {
                     reset_aware_counter_delta(&mut state.counter_previous, series_key, *val, *ts)
-                else {
-                    continue;
+                } else {
+                    Some(*val)
                 };
-                delta
-            } else {
-                *val
-            };
             for bucket_start in state.bucket_starts_for(pane_timestamp(*ts)) {
+                if let Some(revision) = &input_revision {
+                    state
+                        .input_revisions
+                        .entry(bucket_start)
+                        .and_modify(|existing| {
+                            if existing.revision < revision.revision {
+                                let mut combined = (**revision).clone();
+                                combined.first_revision = existing.first_revision;
+                                *existing = Arc::new(combined);
+                            }
+                        })
+                        .or_insert_with(|| Arc::clone(revision));
+                }
                 let (_, bucket_end) = state.bucket_bounds(bucket_start);
                 let bucket_closed = !state.active_panes.contains_key(&bucket_start)
                     && previous_closure_watermark >= bucket_end;
@@ -519,6 +558,9 @@ impl Worker {
                     let window_end = bucket_end;
                     match late_data_policy {
                         LateDataPolicy::Drop => {
+                            if let Some(input) = state.input_revisions.get_mut(&bucket_start) {
+                                Arc::make_mut(input).first_revision = 0;
+                            }
                             record_late_input("drop", "raw_sample");
                             debug!(
                                 "Worker {} dropping late sample for sid={} (group={}): \
@@ -543,6 +585,9 @@ impl Worker {
                                 state.config.sample_update_rule(),
                                 SampleUpdateRule::CounterDelta { .. }
                             ) {
+                                if let Some(input) = state.input_revisions.get_mut(&bucket_start) {
+                                    Arc::make_mut(input).first_revision = 0;
+                                }
                                 record_late_input("drop", "counter_delta_membership");
                                 continue;
                             }
@@ -556,6 +601,9 @@ impl Worker {
                                 key,
                                 PolicyFingerprint::from_config(&state.config),
                                 group_key,
+                                &state.input_revisions,
+                                state.series_id,
+                                state.catalog_generation.as_ref(),
                             );
                             emit_batch.push((output, updater.take_accumulator()));
                             debug!(
@@ -576,7 +624,9 @@ impl Worker {
                     .active_panes
                     .entry(bucket_start)
                     .or_insert_with(|| create_accumulator_updater(&state.config));
-                apply_sample(&mut **updater, series_key, value, *ts, &state.config);
+                if let Some(value) = value {
+                    apply_sample(&mut **updater, series_key, value, *ts, &state.config);
+                }
             }
         }
 
@@ -601,6 +651,9 @@ impl Worker {
                     key,
                     PolicyFingerprint::from_config(&state.config),
                     group_key,
+                    &state.input_revisions,
+                    state.series_id,
+                    state.catalog_generation.as_ref(),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -609,6 +662,19 @@ impl Worker {
         state.max_event_time_ms = current_event_time;
         if event_watermark > state.closure_watermark_ms {
             state.closure_watermark_ms = event_watermark;
+        }
+        // A skipped admitted sample makes this coordinate incomplete, including
+        // corrections prepared earlier in this same batch.
+        for (output, _) in &mut emit_batch {
+            if state
+                .input_revisions
+                .get(&(output.start_timestamp as i64))
+                .is_some_and(|input| input.first_revision == 0)
+            {
+                if let Some(input) = &mut output.input_revision {
+                    Arc::make_mut(input).first_revision = 0;
+                }
+            }
         }
         state.prune_pane_wall_clock();
 
@@ -621,7 +687,8 @@ impl Worker {
                 sid,
                 group_key
             );
-            self.output_sink.emit_batch(emit_batch)?;
+            self.output_sink
+                .emit_batch(coalesce_admitted_outputs(emit_batch)?)?;
         }
 
         crate::precompute_engine::metrics::record_processed_updates(samples.len() as u64);
@@ -715,6 +782,9 @@ impl Worker {
                             key,
                             PolicyFingerprint::from_config(&state.config),
                             group_key,
+                            &state.input_revisions,
+                            state.series_id,
+                            state.catalog_generation.as_ref(),
                         );
                         emit_batch.push((output, incoming.clone_boxed_core()));
                     }
@@ -760,6 +830,9 @@ impl Worker {
                     key,
                     PolicyFingerprint::from_config(&state.config),
                     group_key,
+                    &state.input_revisions,
+                    state.series_id,
+                    state.catalog_generation.as_ref(),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -775,6 +848,9 @@ impl Worker {
                     key,
                     PolicyFingerprint::from_config(&state.config),
                     group_key,
+                    &state.input_revisions,
+                    state.series_id,
+                    state.catalog_generation.as_ref(),
                 );
                 emit_batch.push((output, accumulator));
             }
@@ -964,6 +1040,9 @@ impl Worker {
                         key,
                         PolicyFingerprint::from_config(&state.config),
                         &group_key,
+                        &state.input_revisions,
+                        state.series_id,
+                        state.catalog_generation.as_ref(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -978,6 +1057,9 @@ impl Worker {
                         key,
                         PolicyFingerprint::from_config(&state.config),
                         &group_key,
+                        &state.input_revisions,
+                        state.series_id,
+                        state.catalog_generation.as_ref(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1064,6 +1146,9 @@ impl Worker {
                         key,
                         PolicyFingerprint::from_config(&state.config),
                         &group_key,
+                        &state.input_revisions,
+                        state.series_id,
+                        state.catalog_generation.as_ref(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1078,6 +1163,9 @@ impl Worker {
                         key,
                         PolicyFingerprint::from_config(&state.config),
                         &group_key,
+                        &state.input_revisions,
+                        state.series_id,
+                        state.catalog_generation.as_ref(),
                     );
                     emit_batch.push((output, accumulator));
                 }
@@ -1139,15 +1227,76 @@ fn population_labels_from_group_key(group_key: &GroupKey) -> Option<BTreeMap<Str
     (!labels.is_empty()).then_some(labels)
 }
 
+/// One admission receipt covers all fragments for a physical coordinate.
+/// Combine late corrections before publishing that receipt once.
+fn coalesce_admitted_outputs(
+    outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
+) -> Result<
+    Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
+    let mut merged: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)> = Vec::new();
+    let mut coordinates = BTreeMap::new();
+    for (output, state) in outputs {
+        let index = output.input_revision.as_ref().and_then(|revision| {
+            let key = (
+                output.policy_fp.0,
+                output.start_timestamp,
+                output.end_timestamp,
+                output
+                    .key
+                    .as_ref()
+                    .map(|key| key.serialize_to_bytes())
+                    .unwrap_or_default(),
+                output.population_labels.clone(),
+                revision.generation.plan_id,
+                revision.generation.plan_version,
+                revision.revision,
+            );
+            match coordinates.entry(key) {
+                std::collections::btree_map::Entry::Occupied(entry) => Some(*entry.get()),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(merged.len());
+                    None
+                }
+            }
+        });
+        if let Some(index) = index {
+            merged[index].1 = merged[index].1.merge_with(state.as_ref())?;
+            if output
+                .input_revision
+                .as_ref()
+                .is_some_and(|input| input.first_revision == 0)
+            {
+                if let Some(input) = merged[index].0.input_revision.as_mut() {
+                    Arc::make_mut(input).first_revision = 0;
+                }
+            }
+        } else {
+            merged.push((output, state));
+        }
+    }
+    Ok(merged)
+}
+
 fn precomputed_output_for_group(
     start_timestamp: u64,
     end_timestamp: u64,
     key: KeyByLabelValues,
     policy_fp: PolicyFingerprint,
     group_key: &GroupKey,
+    input_revisions: &BTreeMap<i64, Arc<crate::storage_engines::types::SummaryInputRevision>>,
+    series_id: u64,
+    catalog_generation: Option<&Arc<asap_types::sds::CatalogGeneration>>,
 ) -> PrecomputedOutput {
-    PrecomputedOutput::new(start_timestamp, end_timestamp, Some(key), policy_fp)
-        .with_population_labels(population_labels_from_group_key(group_key))
+    let mut output = PrecomputedOutput::new(start_timestamp, end_timestamp, Some(key), policy_fp)
+        .with_population_labels(population_labels_from_group_key(group_key));
+    output.series_id = Some(series_id);
+    output.catalog_generation = catalog_generation.cloned();
+    output.input_revision = i64::try_from(start_timestamp)
+        .ok()
+        .and_then(|start| input_revisions.get(&start).cloned());
+    output
 }
 
 /// Extract the metric name from a series key like `"metric_name{key1=\"val1\"}"`.
@@ -1166,7 +1315,7 @@ pub fn extract_key_from_series(series_key: &str, config: &AggregationConfig) -> 
     let labels = parse_labels_from_series_key(series_key);
     let mut values = Vec::new();
 
-    for label_name in &config.grouping_labels.labels {
+    for label_name in &config.grouping_labels.names() {
         if let Some(val) = labels.get(label_name.as_str()) {
             values.push(val.to_string());
         } else {
@@ -1462,6 +1611,37 @@ fn merge_sketch_panes_for_window(
 mod tests {
     use super::*;
 
+    #[test]
+    fn admitted_corrections_publish_all_fragments_under_one_receipt() {
+        let revision = Arc::new(crate::storage_engines::types::SummaryInputRevision {
+            generation: Arc::new(asap_types::sds::CatalogGeneration {
+                schema_version: 1,
+                plan_id: 1,
+                plan_version: 1,
+                snapshot_sha256: "test".into(),
+            }),
+            first_revision: 1,
+            revision: 1,
+        });
+        let mut output = PrecomputedOutput::new(0, 1000, None, PolicyFingerprint(1));
+        output.input_revision = Some(revision);
+        let merged = coalesce_admitted_outputs(vec![
+            (output.clone(), Box::new(SumAccumulator::with_sum(2.0))),
+            (output, Box::new(SumAccumulator::with_sum(3.0))),
+        ])
+        .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0]
+                .1
+                .as_any()
+                .downcast_ref::<SumAccumulator>()
+                .unwrap()
+                .sum,
+            5.0
+        );
+    }
+
     fn test_group_key(value: &str) -> Arc<GroupKey> {
         if value.is_empty() {
             return crate::precompute_engine::group_key::intern_pairs(std::iter::empty::<(
@@ -1705,6 +1885,56 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test: raw mode — each sample forwarded as SumAccumulator with sum==value
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn initial_counter_observation_publishes_an_empty_delta_window() {
+        let mut config = make_agg_config(1, "counter", AggregationType::Sum, "sum", 1, 1, vec![]);
+        config
+            .parameters
+            .insert("weight_mode".into(), serde_json::json!("counter_delta"));
+        let fingerprint = config.policy_fingerprint();
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker(
+            HashMap::from([(fingerprint.0, config)]),
+            sink.clone(),
+            false,
+            0,
+            LateDataPolicy::Drop,
+        );
+        worker.current_input_revision = Some(Arc::new(
+            crate::storage_engines::types::SummaryInputRevision {
+                generation: Arc::new(asap_types::sds::CatalogGeneration {
+                    schema_version: 1,
+                    plan_id: 1,
+                    plan_version: 1,
+                    snapshot_sha256: "test".into(),
+                }),
+                first_revision: 1,
+                revision: 1,
+            },
+        ));
+        worker
+            .process_group_samples(
+                1,
+                fingerprint,
+                &test_group_key(""),
+                vec![("counter".into(), 1000, 7.0)],
+            )
+            .unwrap();
+        worker.force_close_all().unwrap();
+        let captured = sink.drain();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0.input_revision.as_ref().unwrap().revision, 1);
+        assert_eq!(
+            captured[0]
+                .1
+                .as_any()
+                .downcast_ref::<SumAccumulator>()
+                .unwrap()
+                .sum,
+            0.0
+        );
+    }
 
     #[test]
     fn test_raw_mode_forwarding() {
@@ -2554,13 +2784,22 @@ aggregations:
             crate::precompute_engine::group_key::intern_pairs([("instance", "a"), ("job", "api")]);
         let key = build_group_key_label_values(&group);
         assert_eq!(key.labels, vec!["a".to_string(), "api".to_string()]);
-        let output = precomputed_output_for_group(0, 5_000, key, PolicyFingerprint(7), &group);
+        let output = precomputed_output_for_group(
+            0,
+            5_000,
+            key,
+            PolicyFingerprint(7),
+            &group,
+            &BTreeMap::new(),
+            1,
+            None,
+        );
         assert_eq!(
             output.population_labels,
             Some(BTreeMap::from([
                 ("instance".to_string(), "a".to_string()),
                 ("job".to_string(), "api".to_string()),
-            ]))
+            ])),
         );
     }
 

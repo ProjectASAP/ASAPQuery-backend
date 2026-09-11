@@ -165,6 +165,75 @@ fn fit_zipf_exponent(descending_counts: &[u64]) -> f64 {
     }
 }
 
+/// The measurement units are part of the readout contract, not a property of
+/// the shared sketch state. These keys must be supplied by the benchmark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadoutEvidence {
+    QuantileRank,
+    DistinctRelative,
+    FrequencyL2Relative,
+    EntropyAbsoluteBits,
+}
+
+impl ReadoutEvidence {
+    pub(crate) fn for_intent(
+        algorithm: &SketchAlgorithm,
+        intent: &planner_types::pre_asap::AggIntent,
+    ) -> Option<Self> {
+        use planner_types::pre_asap::AggIntent;
+        match (algorithm, intent) {
+            (SketchAlgorithm::Kll, AggIntent::Quantile { .. }) => Some(Self::QuantileRank),
+            (SketchAlgorithm::Hll | SketchAlgorithm::UnivMon, AggIntent::Cardinality { .. }) => {
+                Some(Self::DistinctRelative)
+            }
+            (SketchAlgorithm::UnivMon, AggIntent::FrequencyL2 { .. }) => {
+                Some(Self::FrequencyL2Relative)
+            }
+            (SketchAlgorithm::UnivMon, AggIntent::FrequencyEntropy { .. }) => {
+                Some(Self::EntropyAbsoluteBits)
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn for_query(
+        algorithm: &SketchAlgorithm,
+        query: &planner_types::post_asap::SketchQuery,
+    ) -> Option<Self> {
+        use planner_types::post_asap::SketchQuery;
+        match (algorithm, query) {
+            (SketchAlgorithm::Kll, SketchQuery::Quantile { .. }) => Some(Self::QuantileRank),
+            (SketchAlgorithm::Hll | SketchAlgorithm::UnivMon, SketchQuery::Cardinality) => {
+                Some(Self::DistinctRelative)
+            }
+            (SketchAlgorithm::UnivMon, SketchQuery::FrequencyL2) => Some(Self::FrequencyL2Relative),
+            (SketchAlgorithm::UnivMon, SketchQuery::FrequencyEntropy) => {
+                Some(Self::EntropyAbsoluteBits)
+            }
+            _ => None,
+        }
+    }
+
+    fn metric_key(self) -> &'static str {
+        match self {
+            Self::QuantileRank => "max_rank_err",
+            Self::DistinctRelative => "max_cardinality_relative_error",
+            Self::FrequencyL2Relative => "max_frequency_l2_relative_error",
+            Self::EntropyAbsoluteBits => "max_frequency_entropy_absolute_bits_error",
+        }
+    }
+
+    fn metric(self) -> planner_types::post_asap::ErrorMetric {
+        use planner_types::post_asap::ErrorMetric;
+        match self {
+            Self::QuantileRank => ErrorMetric::Rank,
+            Self::DistinctRelative => ErrorMetric::Cardinality,
+            Self::FrequencyL2Relative => ErrorMetric::RelativeValue,
+            Self::EntropyAbsoluteBits => ErrorMetric::AbsoluteValue,
+        }
+    }
+}
+
 /// ERP v1 measures error magnitudes, not tail probabilities. Only an explicit
 /// epsilon-only request may use these observations as its accuracy contract.
 pub(crate) struct ErpAccuracyModel<'a> {
@@ -185,51 +254,64 @@ impl asap_aware_mapping::AccuracyModel for ErpAccuracyModel<'_> {
         query: &planner_types::post_asap::SketchQuery,
     ) -> Option<planner_types::post_asap::ResultGuarantee> {
         use planner_types::post_asap::*;
-        let mut guarantee =
-            asap_aware_mapping::DefaultAccuracyModel.local_guarantee(family, query)?;
-        if let (Some(policy), SummaryFamilyType::Sketch(kind, _)) = (self.policy, family) {
-            let decision = policy.select(
+        let theoretical = asap_aware_mapping::DefaultAccuracyModel.local_guarantee(family, query);
+        let (Some(policy), SummaryFamilyType::Sketch(kind, _)) = (self.policy, family) else {
+            return theoretical;
+        };
+        let Some(readout) = ReadoutEvidence::for_query(kind.algorithm(), query) else {
+            // In particular, UnivMon's total unit count is exact without
+            // empirical error evidence. No unsupported readout gets a bound.
+            if theoretical.as_ref().is_some_and(ResultGuarantee::is_exact) {
+                return theoretical;
+            }
+            return match policy.select(
                 kind.algorithm().clone(),
                 self.max_error,
                 kind.params().clone(),
-            );
-            if matches!(decision, ErpParameterDecision::ExactFallback { .. }) {
-                return None;
-            }
-            if let ErpParameterDecision::Empirical {
+            ) {
+                ErpParameterDecision::ExactFallback { .. } => None,
+                _ => theoretical,
+            };
+        };
+        match policy.evidence_for_readout(
+            kind.algorithm().clone(),
+            readout,
+            self.max_error,
+            kind.params(),
+        ) {
+            ErpParameterDecision::ExactFallback { .. } => None,
+            ErpParameterDecision::TheoreticalFallback { .. } => theoretical,
+            ErpParameterDecision::Empirical {
                 params,
                 record_id,
                 observed_error,
                 ..
-            } = decision
-            {
-                if &params == kind.params() {
-                    // This is the only benchmark-to-query metric mapping currently
-                    // validated end to end. Means and value errors are not rank bounds.
-                    if guarantee.metric != ErrorMetric::Rank
-                        || policy.error_metric != "max_rank_err"
-                    {
-                        return None;
-                    }
-                    guarantee.bound = BoundExpr::Constant {
+            } => {
+                if &params != kind.params() {
+                    return None;
+                }
+                Some(ResultGuarantee {
+                    metric: readout.metric(),
+                    bound: BoundExpr::Constant {
                         value: observed_error,
-                    };
-                    guarantee.failure_probability = ProbabilityExpr::Unknown {
+                    },
+                    failure_probability: ProbabilityExpr::Unknown {
                         statistic: "erp_v1_has_no_failure_probability_evidence".into(),
-                    };
-                    guarantee.provenance = vec![GuaranteeSource::SketchReadout {
+                    },
+                    provenance: vec![GuaranteeSource::SketchReadout {
                         algorithm: format!("{:?}", kind.algorithm()),
                         contract: format!(
-                            "erp_v1_empirical:{}:{}",
-                            policy.artifact.producer_version, record_id
+                            "erp_v1_empirical:{}:{}:{}",
+                            policy.artifact.producer_version,
+                            record_id,
+                            readout.metric_key()
                         ),
                         params: serde_json::to_value(&params).ok()?,
                         query: format!("{query:?}"),
-                    }];
-                }
+                    }],
+                })
             }
         }
-        Some(guarantee)
     }
 
     fn propagate(
@@ -389,14 +471,63 @@ impl ErpPlanningInput {
         max_error: f64,
         theoretical: SketchParams,
     ) -> ErpParameterDecision {
+        self.select_metric(algorithm, &self.error_metric, max_error, theoretical, None)
+    }
+
+    pub(crate) fn select_readout(
+        &self,
+        algorithm: SketchAlgorithm,
+        readout: ReadoutEvidence,
+        max_error: f64,
+        theoretical: SketchParams,
+    ) -> ErpParameterDecision {
+        self.select_metric(
+            algorithm,
+            readout.metric_key(),
+            max_error,
+            theoretical,
+            None,
+        )
+    }
+
+    /// Validate an existing state's readout independently of which new state
+    /// would be cheapest to allocate for this one consumer.
+    fn evidence_for_readout(
+        &self,
+        algorithm: SketchAlgorithm,
+        readout: ReadoutEvidence,
+        max_error: f64,
+        actual: &SketchParams,
+    ) -> ErpParameterDecision {
+        self.select_metric(
+            algorithm,
+            readout.metric_key(),
+            max_error,
+            actual.clone(),
+            Some(actual),
+        )
+    }
+
+    fn select_metric(
+        &self,
+        algorithm: SketchAlgorithm,
+        error_metric: &str,
+        max_error: f64,
+        theoretical: SketchParams,
+        required_params: Option<&SketchParams>,
+    ) -> ErpParameterDecision {
         // Runtime admissibility belongs before ranking: an unusable cheap
         // profile must not hide a more expensive executable alternative.
         let mut artifact = self.artifact.clone();
         artifact.records.retain(|row| {
             sketch_name_matches(&row.sketch, &algorithm)
                 && parse_params(&algorithm, &row.parameters).is_some_and(|params| {
-                    self.runtime
-                        .supports(&algorithm, &params, Some(row.resources.memory_bytes))
+                    required_params.is_none_or(|required| required == &params)
+                        && self.runtime.supports(
+                            &algorithm,
+                            &params,
+                            Some(row.resources.memory_bytes),
+                        )
                 })
         });
         let allowed_sketches = artifact
@@ -408,7 +539,7 @@ impl ErpPlanningInput {
             distribution: self.distribution.clone(),
             implementation: self.implementation.clone(),
             allowed_sketches,
-            error_metric: self.error_metric.clone(),
+            error_metric: error_metric.to_owned(),
             max_error,
             min_trials: self.min_trials,
             expected_updates: self.expected_updates,
@@ -528,6 +659,7 @@ fn sketch_name_matches(name: &str, algorithm: &SketchAlgorithm) -> bool {
         SketchAlgorithm::Hll => name.starts_with("hll") || name.starts_with("hyperloglog"),
         SketchAlgorithm::Kll => name.starts_with("kll"),
         SketchAlgorithm::DDSketch => name.starts_with("ddsketch"),
+        SketchAlgorithm::UnivMon => name == "univmon",
         _ => false,
     }
 }
@@ -582,6 +714,12 @@ fn parse_params(algorithm: &SketchAlgorithm, parameters: &Value) -> Option<Sketc
         SketchAlgorithm::Kll => SketchParams::Kll {
             k: u32_param(parameters, &["k"])?,
         },
+        SketchAlgorithm::UnivMon => SketchParams::UnivMon {
+            heap_size: u32_param(parameters, &["heap_size"])?,
+            sketch_rows: u32_param(parameters, &["sketch_rows"])?,
+            sketch_cols: u32_param(parameters, &["sketch_cols"])?,
+            layers: u8::try_from(u32_param(parameters, &["layers"])?).ok()?,
+        },
         SketchAlgorithm::DDSketch => SketchParams::DDSketch {
             alpha: number(parameters, &["alpha", "relative_accuracy"])?,
         },
@@ -611,6 +749,24 @@ fn valid_runtime_params(algorithm: &SketchAlgorithm, params: &SketchParams) -> b
                 heap_size,
             },
         ) => *width >= 2 && width.is_power_of_two() && *depth >= 1 && *heap_size >= 1,
+        (
+            SketchAlgorithm::UnivMon,
+            SketchParams::UnivMon {
+                heap_size,
+                sketch_rows,
+                sketch_cols,
+                layers,
+            },
+        ) => {
+            *heap_size > 0
+                && *sketch_cols > 0
+                && (1..=20).contains(sketch_rows)
+                && (1..=64).contains(layers)
+                && sketch_rows
+                    .checked_mul(*sketch_cols)
+                    .and_then(|n| n.checked_mul(u32::from(*layers)))
+                    .is_some()
+        }
         (SketchAlgorithm::Hll, SketchParams::Hll { precision }) => (4..=18).contains(precision),
         (SketchAlgorithm::Kll, SketchParams::Kll { k }) => (8..=65_535).contains(k),
         (SketchAlgorithm::DDSketch, SketchParams::DDSketch { alpha }) => {
@@ -682,6 +838,176 @@ mod tests {
             shape_match: None,
             runtime: ErpRuntimeCapabilities::default(),
         }
+    }
+
+    /// Structural evidence fixture, not measured calibration data.
+    #[test]
+    fn existing_univmon_readout_uses_its_own_evidence_despite_cheaper_sibling() {
+        use asap_aware_mapping::AccuracyModel;
+        use planner_types::post_asap::*;
+        let mut policy = input(ErpAccuracyMode::Empirical);
+        let small = &mut policy.artifact.records[0];
+        small.sketch = "univmon".into();
+        small.parameters =
+            serde_json::json!({"heap_size":32,"sketch_rows":5,"sketch_cols":128,"layers":4});
+        small.error_metrics =
+            BTreeMap::from([("max_frequency_entropy_absolute_bits_error".into(), 0.1)]);
+        let mut large = small.clone();
+        large.id = "larger-shared-state".into();
+        large.parameters["heap_size"] = 128.into();
+        large.resources.memory_bytes *= 2.0;
+        large
+            .error_metrics
+            .insert("max_frequency_entropy_absolute_bits_error".into(), 0.02);
+        policy.artifact.records.push(large);
+        let small_params = SketchParams::UnivMon {
+            heap_size: 32,
+            sketch_rows: 5,
+            sketch_cols: 128,
+            layers: 4,
+        };
+        let actual = SketchParams::UnivMon {
+            heap_size: 128,
+            sketch_rows: 5,
+            sketch_cols: 128,
+            layers: 4,
+        };
+        assert_eq!(
+            policy
+                .select_readout(
+                    SketchAlgorithm::UnivMon,
+                    ReadoutEvidence::EntropyAbsoluteBits,
+                    0.2,
+                    actual.clone()
+                )
+                .params(),
+            Some(&small_params)
+        );
+        let family = SummaryFamilyType::Sketch(
+            SketchKind::new(SketchAlgorithm::UnivMon, actual),
+            GroupingStrategy::PerSubpopulationInstance,
+        );
+        let model = ErpAccuracyModel {
+            policy: Some(&policy),
+            max_error: 0.2,
+        };
+        let guarantee = model
+            .local_guarantee(&family, &SketchQuery::FrequencyEntropy)
+            .unwrap();
+        assert_eq!(guarantee.bound, BoundExpr::Constant { value: 0.02 });
+        assert!(matches!(
+            guarantee.failure_probability,
+            ProbabilityExpr::Unknown { .. }
+        ));
+        policy.artifact.records[1].error_metrics.clear();
+        assert!(ErpAccuracyModel {
+            policy: Some(&policy),
+            max_error: 0.2
+        }
+        .local_guarantee(&family, &SketchQuery::FrequencyEntropy)
+        .is_none());
+    }
+
+    #[test]
+    fn hll_cardinality_uses_measured_relative_error_not_rse() {
+        use asap_aware_mapping::AccuracyModel;
+        use planner_types::post_asap::*;
+        let mut policy = input(ErpAccuracyMode::Hybrid);
+        let row = &mut policy.artifact.records[0];
+        row.sketch = "hll".into();
+        row.parameters = serde_json::json!({"precision":12});
+        row.error_metrics = BTreeMap::from([("max_cardinality_relative_error".into(), 0.04)]);
+        let family = SummaryFamilyType::Sketch(
+            SketchKind::new(SketchAlgorithm::Hll, SketchParams::Hll { precision: 12 }),
+            GroupingStrategy::PerSubpopulationInstance,
+        );
+        let model = ErpAccuracyModel {
+            policy: Some(&policy),
+            max_error: 0.05,
+        };
+        let guarantee = model
+            .local_guarantee(&family, &SketchQuery::Cardinality)
+            .unwrap();
+        assert_eq!(guarantee.metric, ErrorMetric::Cardinality);
+        assert_eq!(guarantee.bound, BoundExpr::Constant { value: 0.04 });
+        assert!(matches!(
+            guarantee.failure_probability,
+            ProbabilityExpr::Unknown { .. }
+        ));
+        assert_eq!(
+            ReadoutEvidence::for_query(&SketchAlgorithm::Hll, &SketchQuery::FrequencyEntropy),
+            None
+        );
+    }
+
+    /// Contract fixture only; the process test measures real sketch errors.
+    #[test]
+    fn readout_evidence_keeps_units_and_missing_metrics_fail_closed() {
+        use asap_aware_mapping::AccuracyModel;
+        use planner_types::post_asap::*;
+        let mut policy = input(ErpAccuracyMode::Hybrid);
+        let row = &mut policy.artifact.records[0];
+        row.sketch = "univmon".into();
+        row.parameters =
+            serde_json::json!({"heap_size": 32, "sketch_rows": 5, "sketch_cols": 128, "layers": 4});
+        row.error_metrics = BTreeMap::from([
+            ("max_cardinality_relative_error".into(), 0.03),
+            ("max_frequency_l2_relative_error".into(), 0.02),
+            ("max_frequency_entropy_absolute_bits_error".into(), 0.1),
+        ]);
+        let family = SummaryFamilyType::Sketch(
+            SketchKind::new(
+                SketchAlgorithm::UnivMon,
+                SketchParams::UnivMon {
+                    heap_size: 32,
+                    sketch_rows: 5,
+                    sketch_cols: 128,
+                    layers: 4,
+                },
+            ),
+            GroupingStrategy::PerSubpopulationInstance,
+        );
+        let model = ErpAccuracyModel {
+            policy: Some(&policy),
+            max_error: 0.2,
+        };
+        for (query, metric, bound) in [
+            (SketchQuery::Cardinality, ErrorMetric::Cardinality, 0.03),
+            (SketchQuery::FrequencyL2, ErrorMetric::RelativeValue, 0.02),
+            (
+                SketchQuery::FrequencyEntropy,
+                ErrorMetric::AbsoluteValue,
+                0.1,
+            ),
+        ] {
+            let guarantee = model.local_guarantee(&family, &query).unwrap();
+            assert_eq!(guarantee.metric, metric);
+            assert_eq!(guarantee.bound, BoundExpr::Constant { value: bound });
+            assert!(matches!(
+                guarantee.failure_probability,
+                ProbabilityExpr::Unknown { .. }
+            ));
+            assert!(!model.satisfies(
+                &guarantee,
+                &crate::types_v2::AccuracyTarget::EpsilonDelta {
+                    epsilon: 0.2,
+                    delta: 0.01
+                }
+            ));
+        }
+        policy.artifact.records[0]
+            .error_metrics
+            .remove("max_frequency_entropy_absolute_bits_error");
+        let model = ErpAccuracyModel {
+            policy: Some(&policy),
+            max_error: 0.2,
+        };
+        assert!(model
+            .local_guarantee(&family, &SketchQuery::FrequencyEntropy)
+            .is_none());
+        assert!(model
+            .local_guarantee(&family, &SketchQuery::FrequencyL2)
+            .is_some());
     }
 
     /// A matching benchmark context may reduce CMS state below theory.

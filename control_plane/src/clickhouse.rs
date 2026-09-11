@@ -31,6 +31,7 @@ pub struct ClickHousePlannedQuery {
     pub canonical: QueryExpr,
     pub canonical_sql: String,
     pub physical: PhysicalExpr,
+    pub selection_trace: serde_json::Value,
 }
 
 pub async fn plan_clickhouse_sql(
@@ -45,24 +46,29 @@ pub async fn plan_clickhouse_sql(
     // summary-capable Aggregate. Use ASAPPlanner's recursive selector here;
     // the PromQL deployment lowering retains its existing conservative rules.
     let cost_model = ControlPlaneCostModel::new(accuracy.clone());
-    let selected = crate::planner_selection::select_workload(
-        vec![(0, Rc::new(canonical.clone()))],
-        accuracy,
-        &cost_model,
-    )?
-    .into_iter()
-    .next()
-    .map(|(_, node)| node)
-    .ok_or_else(|| {
-        crate::planner_selection::SelectionError::Workload(
-            "SQL workload search returned no root".into(),
-        )
-    })?;
+    let (selected, selection_trace) =
+        crate::planner_selection::select_workload_with_accuracy_model_and_trace(
+            vec![(0, Rc::new(canonical.clone()))],
+            accuracy,
+            &cost_model,
+            &asap_aware_mapping::NoAccuracyEvidence,
+            &asap_aware_mapping::DefaultAccuracyModel,
+        )?;
+    let selected = selected
+        .into_iter()
+        .next()
+        .map(|(_, node)| node)
+        .ok_or_else(|| {
+            crate::planner_selection::SelectionError::Workload(
+                "SQL workload search returned no root".into(),
+            )
+        })?;
     let physical = PhysicalExpr::committed(selected);
     Ok(ClickHousePlannedQuery {
         canonical_sql: canonical_sql_identity(&canonical),
         canonical,
         physical,
+        selection_trace,
     })
 }
 
@@ -103,6 +109,175 @@ pub struct ClickHouseSqlWorkloadEntry {
     pub cumulative: bool,
 }
 
+/// Workload input without predeclared summary families or materialization IDs.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClickHouseSqlAutomaticWorkload {
+    pub envelope: asap_types::precompute_plan::PlanEnvelope,
+    pub tables: HashMap<String, planner_types::pre_asap::Schema>,
+    pub accuracy: AccuracyTarget,
+    pub queries: Vec<ClickHouseSqlWorkloadEntry>,
+}
+
+pub async fn compile_automatic_clickhouse_workload(
+    request: &ClickHouseSqlAutomaticWorkload,
+) -> Result<
+    (
+        crate::physical::publication::PhysicalPlanPublication,
+        std::collections::BTreeMap<String, serde_json::Value>,
+    ),
+    ClickHousePlanningError,
+> {
+    let catalog = SqlCatalog {
+        tables: request.tables.clone(),
+    };
+    let mut entries = std::collections::BTreeMap::new();
+    let mut installed_dags = std::collections::BTreeMap::new();
+    let mut materializations = std::collections::BTreeMap::new();
+    let mut selection_traces = std::collections::BTreeMap::new();
+    for query in &request.queries {
+        validate_sql_evaluation(query)?;
+        // Selection runs once. Compilation installs only SummaryAgg nodes
+        // actually visited in this selected DAG, never a scripted family.
+        let mut planned =
+            plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
+        selection_traces.insert(
+            planned.canonical_sql.clone(),
+            std::mem::take(&mut planned.selection_trace),
+        );
+        let (entry, installed) = compile_selected_sql(query, planned, |node, family| {
+            let config = materialize_selected_sql(node, family, query)
+                .map_err(crate::query_plan::QueryPlanError::Invalid)?;
+            let binding = MaterializationBinding {
+                materialization: config.policy_fingerprint().into(),
+                output_grouping: PhysicalGrouping::Reduce(config.grouping_labels.names()),
+                window_ms: config.slide_interval * 1000,
+                pane_origin_ms: config.pane_origin_ms,
+                readout_lookback_ms: Some(query.end_ms - query.start_ms),
+                item_labels: config.aggregated_labels.labels.clone(),
+            };
+            materializations
+                .entry(config.policy_fingerprint())
+                .or_insert(config);
+            Ok(binding)
+        })?;
+        let key = QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &entry.canonical_query);
+        if entries.insert(key, entry).is_some() {
+            return Err(ClickHousePlanningError::Lower(
+                "duplicate canonical SQL query identity".into(),
+            ));
+        }
+        installed_dags.insert(query.sql.clone(), installed);
+    }
+    let configs: Vec<_> = materializations.into_values().collect();
+    let sds = SummaryCatalog::from_materializations(
+        request.envelope.plan_id,
+        request.envelope.plan_version,
+        &configs,
+    )
+    .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+    let mut precompute = PrecomputePlan::build_backend_local(request.envelope.clone(), configs)
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+    precompute.summary_catalog = Some(
+        sds.reference()
+            .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?,
+    );
+    precompute.executable_dags = installed_dags;
+    let mut transmission = crate::physical::compiler::compile_transmission_plan(
+        request.envelope.clone(),
+        &precompute,
+        &std::collections::BTreeMap::new(),
+    )
+    .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+    transmission.summary_catalog = precompute.summary_catalog.clone();
+    let publication = crate::physical::publication::PhysicalPlanPublication {
+        summary_catalog: sds,
+        precompute_plan: precompute,
+        collector_plans: Vec::new(),
+        transmission_plan: transmission,
+        query_plan: QueryPlan {
+            plan_id: request.envelope.plan_id,
+            plan_version: request.envelope.plan_version,
+            clickhouse_context: Some(ClickHousePlanningContext {
+                tables: request.tables.clone(),
+                accuracy: request.accuracy.clone(),
+            }),
+            entries,
+        },
+    };
+    publication
+        .validate()
+        .map_err(ClickHousePlanningError::Lower)?;
+    Ok((publication, selection_traces))
+}
+
+fn materialize_selected_sql(
+    node: &planner_types::post_asap::SummaryNode,
+    family: &planner_types::post_asap::SummaryFamilyType,
+    query: &ClickHouseSqlWorkloadEntry,
+) -> Result<asap_types::PrecomputeMaterialization, String> {
+    use crate::physical::colored_dag::emitter::{AggregationInput, BackendAggregation};
+    use planner_types::{post_asap::SummaryExpr, pre_asap::Reduction};
+    let SummaryExpr::SummaryAgg {
+        reduction: Reduction::Reduce(keys),
+        child,
+        ..
+    } = &node.expr
+    else {
+        return Err("SQL materialization requires a supported reduction".into());
+    };
+    if keys.is_without() {
+        return Err("SQL grouping exclusion requires a resolved projection".into());
+    }
+    let SummaryExpr::KeepPreAsap(source) = &child.expr else {
+        return Err("SQL grouping requires a typed source subtree".into());
+    };
+    let source_schema = source.output_schema().map_err(|error| error.to_string())?;
+    let mut columns = Vec::new();
+    for key in keys.keys() {
+        let mut column = source_schema
+            .columns
+            .get(*key)
+            .cloned()
+            .ok_or("SQL grouping column is absent from source schema")?;
+        column.table = None;
+        columns.push(column);
+    }
+    let grouping = asap_types::GroupingProjection::new(columns);
+    grouping.validate_table_group_codec()?;
+    let (table, value, window, population, timestamp) =
+        clickhouse_materialization_leaf_contract(node, query.start_ms, query.end_ms)?;
+    let window_secs = window.ok_or("SQL materialization requires a bounded window")?;
+    let aggregation = BackendAggregation {
+        aggregation_id: String::new(),
+        metric_name: format!("{table}.{}", value.column().unwrap_or("constant")),
+        family: crate::physical::compiler::physical_materialization_family(family),
+        window_secs,
+        spatial_filter: String::new(),
+        grouping: grouping.names(),
+        item_label: None,
+        heap_update_mode: None,
+        aggregation_input: AggregationInput::Raw,
+    };
+    let mut config = crate::physical::compiler::aggregation_config_for_materialization(
+        &aggregation,
+        asap_types::QueryLanguage::ClickHouseSql,
+    )
+    .map_err(|error| error.to_string())?;
+    config.table_name = Some(table);
+    config.grouping_labels = grouping;
+    config.value_projection = Some(value);
+    config.table_timestamp_column = Some(timestamp);
+    config.table_population = Some(population);
+    config.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
+    config.pane_origin_ms = Some(
+        i64::try_from(query.start_ms)
+            .map_err(|_| "SQL evaluation timestamp exceeds runtime range")?,
+    );
+    config.num_aggregates_to_retain = Some(2);
+    Ok(config)
+}
+
 pub async fn compile_clickhouse_workload(
     request: &ClickHouseSqlWorkload,
 ) -> Result<crate::physical::publication::PhysicalPlanPublication, ClickHousePlanningError> {
@@ -118,78 +293,26 @@ pub async fn compile_clickhouse_workload(
         tables: request.tables.clone(),
     };
     let mut entries = std::collections::BTreeMap::new();
+    let mut installed_dags = std::collections::BTreeMap::new();
     for query in &request.queries {
         let planned = plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
-        let PhysicalExpr::Committed(crate::physical::post_asap::PostAsapPlan::Summary(root)) =
-            planned.physical
-        else {
-            return Err(ClickHousePlanningError::Lower(
-                "SQL did not produce a summary DAG".into(),
-            ));
-        };
-        let executable = QueryPlanEntry::compile_bound_relational(
-            query.sql.clone(),
-            planned.canonical_sql.clone(),
-            &root,
-            FixedEvaluationRange {
-                start_ms: query.start_ms,
-                end_ms: query.end_ms,
-                cumulative: query.cumulative,
-            },
-            InstantExecution {
-                lookback_ms: query.end_ms.saturating_sub(query.start_ms),
-                full_history: query.start_ms == 0,
-                cumulative_readout: query.cumulative,
-            },
-            FallbackPolicy::ExactBackend,
-            |node, family| bind_selected_node(node, family, query, request),
-        )
-        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
-        if executable
-            .nodes
-            .values()
-            .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExactFallback { .. }))
-        {
-            return Err(ClickHousePlanningError::Lower(
-                "compiled SQL contains an unsupported operator; publication refused".into(),
-            ));
-        }
-        let bindings = executable.materialization_bindings();
-        let identities = bindings
-            .iter()
-            .map(|binding| {
-                request
-                    .sds
-                    .materializations
-                    .get(&binding.materialization)
-                    .ok_or_else(|| {
-                        ClickHousePlanningError::Lower(
-                            "compiled SQL binding is absent from SDS".into(),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        // Descriptor references are already represented by each DAG's
-        // MaterializationBinding and validated through SummaryCatalog.
-        let _descriptor_ids = identities
-            .iter()
-            .map(|identity| {
-                (
-                    &identity.summary_descriptor_id,
-                    &identity.data_descriptor_id,
-                )
-            })
-            .collect::<Vec<_>>();
-        let identity = QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &planned.canonical_sql);
+        let (executable, installed) = compile_selected_sql(query, planned, |node, family| {
+            bind_selected_node(node, family, query, request)
+        })?;
+        installed_dags.insert(query.sql.clone(), installed);
+        let identity =
+            QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &executable.canonical_query);
         if entries.insert(identity.clone(), executable).is_some() {
             return Err(ClickHousePlanningError::Lower(format!(
                 "duplicate canonical SQL query identity `{identity}`"
             )));
         }
     }
+    let mut precompute_plan = request.precompute_plan.clone();
+    precompute_plan.executable_dags = installed_dags;
     let publication = crate::physical::publication::PhysicalPlanPublication {
         summary_catalog: request.sds.clone(),
-        precompute_plan: request.precompute_plan.clone(),
+        precompute_plan,
         collector_plans: Vec::new(),
         transmission_plan: request.transmission_plan.clone(),
         query_plan: QueryPlan {
@@ -208,6 +331,100 @@ pub async fn compile_clickhouse_workload(
     Ok(publication)
 }
 
+fn compile_selected_sql<F>(
+    query: &ClickHouseSqlWorkloadEntry,
+    planned: ClickHousePlannedQuery,
+    mut bind: F,
+) -> Result<
+    (
+        QueryPlanEntry,
+        crate::physical::executable_binding::InstalledPostAsapDag,
+    ),
+    ClickHousePlanningError,
+>
+where
+    F: FnMut(
+        &Rc<planner_types::post_asap::SummaryNode>,
+        &planner_types::post_asap::SummaryFamilyType,
+    ) -> Result<MaterializationBinding, crate::query_plan::QueryPlanError>,
+{
+    validate_sql_evaluation(query)?;
+    let PhysicalExpr::Committed(crate::physical::post_asap::PostAsapPlan::Summary(root)) =
+        planned.physical
+    else {
+        return Err(ClickHousePlanningError::Lower(
+            "SQL did not produce a summary DAG".into(),
+        ));
+    };
+    let semantic = planner_types::post_asap::compile_executable_dag_with_node_ids(&root)
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+    let mut materialization_nodes = std::collections::BTreeMap::new();
+    let mut query_nodes = std::collections::BTreeMap::new();
+    let executable = crate::query_plan::compile_bound_relational_mapped(
+        query.sql.clone(),
+        planned.canonical_sql.clone(),
+        &root,
+        FixedEvaluationRange {
+            start_ms: query.start_ms,
+            end_ms: query.end_ms,
+            cumulative: query.cumulative,
+        },
+        InstantExecution {
+            lookback_ms: query.end_ms.saturating_sub(query.start_ms),
+            full_history: query.start_ms == 0,
+            cumulative_readout: query.cumulative,
+        },
+        FallbackPolicy::ExactBackend,
+        |node, family| {
+            let binding = bind(node, family)?;
+            let id = semantic.node_ids.node_id(node).ok_or_else(|| {
+                crate::query_plan::QueryPlanError::Invalid(
+                    "selected SQL node is absent from semantic DAG".into(),
+                )
+            })?;
+            materialization_nodes.insert(id, binding.materialization);
+            Ok(binding)
+        },
+        |node, query_node| {
+            if let Some(id) = semantic.node_ids.node_id(node) {
+                query_nodes.insert(id, query_node);
+            }
+        },
+    )
+    .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+    let installed = crate::physical::executable_binding::install_selected_dag(
+        query.sql.clone(),
+        &semantic.dag,
+        executable.root,
+        |id| materialization_nodes.get(&id).copied(),
+        |id| query_nodes.get(&id).copied(),
+    )
+    .map_err(ClickHousePlanningError::Lower)?;
+    crate::physical::executable_binding::validate_query_plan(&installed, &executable)
+        .map_err(ClickHousePlanningError::Lower)?;
+    if executable
+        .nodes
+        .values()
+        .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExactFallback { .. }))
+    {
+        return Err(ClickHousePlanningError::Lower(
+            "compiled SQL contains an unsupported operator; publication refused".into(),
+        ));
+    }
+    Ok((executable, installed))
+}
+
+fn validate_sql_evaluation(
+    query: &ClickHouseSqlWorkloadEntry,
+) -> Result<(), ClickHousePlanningError> {
+    if query.start_ms >= query.end_ms || query.end_ms > i64::MAX as u64 {
+        return Err(ClickHousePlanningError::Lower(
+            "SQL evaluation requires start_ms < end_ms within signed Unix milliseconds".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn bind_selected_node(
     node: &planner_types::post_asap::SummaryNode,
     family: &planner_types::post_asap::SummaryFamilyType,
@@ -222,7 +439,7 @@ fn bind_selected_node(
         &request.precompute_plan.materializations,
         &table_ref,
         &value_column,
-        &spatial_filter,
+        &spatial_filter.canonical(),
         &expected,
         source_window.unwrap_or((query.end_ms.saturating_sub(query.start_ms)) / 1000),
     )?;
@@ -233,7 +450,7 @@ fn bind_selected_node(
     }
     Ok(MaterializationBinding {
         materialization: selected.policy_fingerprint().into(),
-        output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.labels.clone()),
+        output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.names()),
         window_ms: selected.slide_interval.saturating_mul(1000),
         pane_origin_ms: selected.pane_origin_ms,
         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1000)),
@@ -241,18 +458,56 @@ fn bind_selected_node(
     })
 }
 
+/// Evaluate only exact integer constant arithmetic at the installation boundary.
+/// No SQL text rewrite, floating coercion, or runtime-column evaluation is allowed.
+fn constant_int64(expr: &QueryExpr) -> Option<i64> {
+    use planner_types::pre_asap::{ArithmeticOpKind, ScalarValue};
+    match expr {
+        QueryExpr::Literal(ScalarValue::Int64(value)) => Some(*value),
+        QueryExpr::Arithmetic { op, left, right } => {
+            let left = constant_int64(left)?;
+            let right = constant_int64(right)?;
+            match op {
+                ArithmeticOpKind::Add => left.checked_add(right),
+                ArithmeticOpKind::Sub => left.checked_sub(right),
+                ArithmeticOpKind::Mul => left.checked_mul(right),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn clickhouse_materialization_leaf_contract(
     node: &planner_types::post_asap::SummaryNode,
     evaluation_start_ms: u64,
     evaluation_end_ms: u64,
-) -> Result<(String, String, Option<u64>, String, String), String> {
+) -> Result<
+    (
+        String,
+        asap_types::sds::ValueProjectionIdentity,
+        Option<u64>,
+        asap_types::table_population::TablePopulation,
+        String,
+    ),
+    String,
+> {
     use planner_types::{
         post_asap::SummaryExpr,
         pre_asap::{CompareOpKind, QueryExpr, ScalarValue, Source},
     };
-    let SummaryExpr::SummaryAgg { child, input, .. } = &node.expr else {
+    let SummaryExpr::SummaryAgg {
+        child,
+        input,
+        family,
+        ..
+    } = &node.expr
+    else {
         return Err("SQL materialization leaf is not a summary aggregate".into());
     };
+    if input.item.is_some() {
+        return Err("SQL item/weight summary inputs require an explicit item projection".into());
+    }
     let SummaryExpr::KeepPreAsap(expr) = &child.expr else {
         return Err("SQL materialization leaf has no tabular source".into());
     };
@@ -264,7 +519,6 @@ fn clickhouse_materialization_leaf_contract(
         &planner_types::pre_asap::Schema,
     )> {
         match expr {
-            QueryExpr::Project { child, .. } => table_scan(child),
             QueryExpr::Scan {
                 source: Source::Table { table_ref },
                 predicates,
@@ -284,13 +538,47 @@ fn clickhouse_materialization_leaf_contract(
     let Some((table_ref, predicates, schema)) = table_scan(source) else {
         return Err("SQL materialization leaf has no table scan".into());
     };
-    let planner_types::post_asap::SummaryInputExpr::Column(value_input) = &input.weight else {
-        return Err("SQL summary requires a column-valued update".into());
-    };
-    let value_column = match value_input {
-        planner_types::pre_asap::ColumnRef::Named(name)
-        | planner_types::pre_asap::ColumnRef::Qualified { name, .. } => name.clone(),
-        _ => return Err("SQL summary requires a named value column".into()),
+    use asap_types::sds::ValueProjectionIdentity;
+    use planner_types::post_asap::SummaryInputExpr;
+    let value_projection = match &input.weight {
+        SummaryInputExpr::Column(
+            planner_types::pre_asap::ColumnRef::Wildcard
+            | planner_types::pre_asap::ColumnRef::SampleValue,
+        ) if matches!(
+            family,
+            planner_types::post_asap::SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Count,
+                _
+            )
+        ) =>
+        {
+            ValueProjectionIdentity::Constant {
+                value: ScalarValue::Int64(1),
+            }
+        }
+        SummaryInputExpr::Column(
+            planner_types::pre_asap::ColumnRef::Named(name)
+            | planner_types::pre_asap::ColumnRef::Qualified { name, .. },
+        ) => {
+            let column = schema
+                .columns
+                .iter()
+                .find(|column| column.name == *name)
+                .ok_or("SQL summary value projection is not a source column")?;
+            if column.nullable || column.dtype != planner_types::pre_asap::DataType::Float64 {
+                return Err("SQL value readout requires a non-null Float64 source until typed/null-aware ingest is available".into());
+            }
+            ValueProjectionIdentity::Column { name: name.clone() }
+        }
+        SummaryInputExpr::Constant(value) if value.is_finite() => {
+            let value = if value.fract() == 0.0 && value.abs() <= (1_u64 << 53) as f64 {
+                ScalarValue::Int64(*value as i64)
+            } else {
+                ScalarValue::Float64(*value)
+            };
+            ValueProjectionIdentity::Constant { value }
+        }
+        _ => return Err("SQL summary requires a named column or finite numeric update".into()),
     };
 
     fn comparisons<'a>(expr: &'a QueryExpr, out: &mut Vec<&'a QueryExpr>) {
@@ -323,7 +611,10 @@ fn clickhouse_materialization_leaf_contract(
             .ok_or_else(|| {
                 "SQL materialization predicate references an unknown column".to_string()
             })?;
-        match (name, op, right.as_ref()) {
+        let folded =
+            constant_int64(right).map(|value| QueryExpr::Literal(ScalarValue::Int64(value)));
+        let right = folded.as_ref().unwrap_or(right.as_ref());
+        match (name, op, right) {
             (
                 name,
                 CompareOpKind::Gt | CompareOpKind::Ge,
@@ -402,9 +693,9 @@ fn clickhouse_materialization_leaf_contract(
     })?;
     Ok((
         table_ref.to_owned(),
-        value_column,
+        value_projection,
         Some(window_secs),
-        population.canonical(),
+        population,
         schema
             .time_index
             .and_then(|index| schema.columns.get(index))
@@ -417,14 +708,14 @@ fn clickhouse_materialization_leaf_contract(
 fn select_materialization<'a>(
     materializations: &'a [asap_types::PrecomputeMaterialization],
     table_ref: &str,
-    value_column: &str,
+    value_projection: &asap_types::sds::ValueProjectionIdentity,
     spatial_filter: &str,
     expected: &planner_types::post_asap::SummaryFamilyType,
     semantic_window_seconds: u64,
 ) -> Result<&'a asap_types::PrecomputeMaterialization, crate::query_plan::QueryPlanError> {
     let mut matches = materializations.iter().filter(|candidate| {
         candidate.table_name.as_deref() == Some(table_ref)
-            && candidate.value_column.as_deref() == Some(value_column)
+            && candidate.effective_value_projection() == value_projection
             && candidate.population_filter_canonical().ok().as_deref() == Some(spatial_filter)
             && candidate
                 .accumulator_spec()
@@ -436,12 +727,12 @@ fn select_materialization<'a>(
     });
     let selected = matches.next().ok_or_else(|| {
         crate::query_plan::QueryPlanError::Invalid(format!(
-            "no precompute materialization matches {table_ref}.{value_column}/{expected:?}"
+            "no precompute materialization matches {table_ref}/{value_projection:?}/{expected:?}"
         ))
     })?;
     if matches.next().is_some() {
         return Err(crate::query_plan::QueryPlanError::Invalid(format!(
-            "ambiguous precompute materializations match {table_ref}.{value_column}/{expected:?}"
+            "ambiguous precompute materializations match {table_ref}/{value_projection:?}/{expected:?}"
         )));
     }
     Ok(selected)
@@ -480,6 +771,52 @@ mod tests {
         value.pane_origin_ms = Some(0);
         value.table_timestamp_column = Some("timestamp_ms".into());
         value
+    }
+
+    #[test]
+    fn keyed_summary_input_is_not_replaced_by_its_unit_weight() {
+        use planner_types::post_asap::{
+            SummaryExpr, SummaryInputExpr, SummaryNode, SummarySchema, SummaryUpdate,
+        };
+        use planner_types::pre_asap::{ColumnRef, QueryExpr, Reduction, ScalarValue};
+        let schema = SummarySchema {
+            fields: vec![],
+            time_index: None,
+        };
+        let family = materialization(
+            AggregationType::Sum,
+            "value",
+            60,
+            60,
+            ("variant", serde_json::json!(1)),
+        )
+        .accumulator_spec()
+        .unwrap()
+        .family;
+        let node = SummaryNode {
+            expr: SummaryExpr::SummaryAgg {
+                child: std::rc::Rc::new(SummaryNode {
+                    expr: SummaryExpr::KeepPreAsap(std::rc::Rc::new(QueryExpr::Literal(
+                        ScalarValue::Int64(1),
+                    ))),
+                    schema: schema.clone(),
+                    guarantee: Default::default(),
+                }),
+                family,
+                input: SummaryUpdate {
+                    item: Some(SummaryInputExpr::Column(ColumnRef::Named("value".into()))),
+                    weight: SummaryInputExpr::Constant(1.0),
+                    weight_domain: Default::default(),
+                },
+                reduction: Reduction::Reduce(vec![].into()),
+                grouping: Default::default(),
+            },
+            schema,
+            guarantee: Default::default(),
+        };
+        assert!(clickhouse_materialization_leaf_contract(&node, 0, 60_000)
+            .unwrap_err()
+            .contains("explicit item projection"));
     }
 
     #[test]
@@ -537,35 +874,117 @@ mod tests {
         let sum_family = sum_60.accumulator_spec().unwrap().family;
         let count_family = count_60.accumulator_spec().unwrap().family;
         assert_eq!(
-            select_materialization(&configs, "telemetry", "requests", "", &sum_family, 60)
-                .unwrap()
-                .policy_fingerprint(),
+            select_materialization(
+                &configs,
+                "telemetry",
+                &asap_types::sds::ValueProjectionIdentity::Column {
+                    name: "requests".into()
+                },
+                "",
+                &sum_family,
+                60
+            )
+            .unwrap()
+            .policy_fingerprint(),
             sum_60.policy_fingerprint()
         );
         let dd_family = dd_2.accumulator_spec().unwrap().family;
         assert_eq!(
-            select_materialization(&configs, "telemetry", "requests", "", &dd_family, 60)
-                .unwrap()
-                .policy_fingerprint(),
+            select_materialization(
+                &configs,
+                "telemetry",
+                &asap_types::sds::ValueProjectionIdentity::Column {
+                    name: "requests".into()
+                },
+                "",
+                &dd_family,
+                60
+            )
+            .unwrap()
+            .policy_fingerprint(),
             dd_2.policy_fingerprint()
         );
         assert_eq!(
-            select_materialization(&configs, "telemetry", "requests", "", &count_family, 60)
-                .unwrap()
-                .policy_fingerprint(),
+            select_materialization(
+                &configs,
+                "telemetry",
+                &asap_types::sds::ValueProjectionIdentity::Column {
+                    name: "requests".into()
+                },
+                "",
+                &count_family,
+                60
+            )
+            .unwrap()
+            .policy_fingerprint(),
             count_60.policy_fingerprint()
         );
-        assert!(
-            select_materialization(&configs, "telemetry", "missing", "", &sum_family, 60).is_err()
-        );
+        assert!(select_materialization(
+            &configs,
+            "telemetry",
+            &asap_types::sds::ValueProjectionIdentity::Column {
+                name: "missing".into()
+            },
+            "",
+            &sum_family,
+            60
+        )
+        .is_err());
         let mut ambiguous = configs.clone();
         ambiguous.push(sum_60);
-        assert!(
-            select_materialization(&ambiguous, "telemetry", "requests", "", &sum_family, 60)
-                .unwrap_err()
-                .to_string()
-                .contains("ambiguous")
+        assert!(select_materialization(
+            &ambiguous,
+            "telemetry",
+            &asap_types::sds::ValueProjectionIdentity::Column {
+                name: "requests".into()
+            },
+            "",
+            &sum_family,
+            60
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ambiguous"));
+    }
+
+    #[test]
+    fn constant_integer_boundaries_reject_overflow_and_dynamic_values() {
+        use planner_types::pre_asap::{ArithmeticOpKind, ScalarValue};
+        let literal = |value| QueryExpr::Literal(ScalarValue::Int64(value));
+        let subtract = |left, right| QueryExpr::Arithmetic {
+            op: ArithmeticOpKind::Sub,
+            left: std::rc::Rc::new(left),
+            right: std::rc::Rc::new(right),
+        };
+        assert_eq!(
+            constant_int64(&subtract(literal(1_788_891_296_000), literal(43_200_000))),
+            Some(1_788_848_096_000)
         );
+        assert_eq!(
+            constant_int64(&subtract(literal(i64::MIN), literal(1))),
+            None
+        );
+        assert_eq!(
+            constant_int64(&subtract(QueryExpr::Column(0), literal(1))),
+            None
+        );
+        assert_eq!(
+            constant_int64(&QueryExpr::Literal(ScalarValue::Float64(1.0))),
+            None
+        );
+    }
+
+    #[test]
+    fn sql_evaluation_rejects_empty_reversed_and_unrepresentable_ranges() {
+        for (start_ms, end_ms) in [(2, 1), (1, 1), (0, u64::MAX)] {
+            assert!(validate_sql_evaluation(&ClickHouseSqlWorkloadEntry {
+                sql: "SELECT sum(value) FROM telemetry".into(),
+                start_ms,
+                end_ms,
+                cumulative: true,
+            })
+            .is_err());
+        }
     }
 
     #[tokio::test]
@@ -591,9 +1010,12 @@ mod tests {
         let mut precompute =
             PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
         precompute.summary_catalog = Some(sds.reference().unwrap());
-        let mut transmission =
-            TransmissionPlan::build(envelope, &precompute, &std::collections::BTreeMap::new())
-                .unwrap();
+        let mut transmission = crate::physical::compiler::compile_transmission_plan(
+            envelope,
+            &precompute,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         transmission.summary_catalog = Some(sds.reference().unwrap());
         let timestamped = |time_name: &str, value_name: &str| {
             Schema::with_time_index(
@@ -632,6 +1054,89 @@ mod tests {
             }],
         };
         let publication = compile_clickhouse_workload(&request).await.unwrap();
+        let (automatic, traces) =
+            compile_automatic_clickhouse_workload(&ClickHouseSqlAutomaticWorkload {
+                envelope: request.precompute_plan.envelope.clone(),
+                tables: request.tables.clone(),
+                accuracy: request.accuracy.clone(),
+                queries: request
+                    .queries
+                    .iter()
+                    .map(|query| ClickHouseSqlWorkloadEntry {
+                        sql: query.sql.clone(),
+                        start_ms: query.start_ms,
+                        end_ms: query.end_ms,
+                        cumulative: query.cumulative,
+                    })
+                    .collect(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(automatic.precompute_plan.materializations.len(), 1);
+        assert_eq!(traces.len(), 1);
+        assert!(traces
+            .values()
+            .any(
+                |trace| trace["groups"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|group| group["candidates"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|candidate| candidate["selected"] == true))
+            ));
+        assert_eq!(automatic.precompute_plan.executable_dags.len(), 1);
+        automatic.validate().unwrap();
+        let mut integer_source = ClickHouseSqlAutomaticWorkload {
+            envelope: request.precompute_plan.envelope.clone(),
+            tables: request.tables.clone(),
+            accuracy: request.accuracy.clone(),
+            queries: request
+                .queries
+                .iter()
+                .map(|query| ClickHouseSqlWorkloadEntry {
+                    sql: query.sql.clone(),
+                    start_ms: query.start_ms,
+                    end_ms: query.end_ms,
+                    cumulative: query.cumulative,
+                })
+                .collect(),
+        };
+        integer_source.tables.get_mut("telemetry").unwrap().columns[1].dtype = DataType::Int64;
+        assert!(
+            compile_automatic_clickhouse_workload(&integer_source)
+                .await
+                .is_err(),
+            "an Int64 source may contain values beyond exact Float64 ingest range"
+        );
+        integer_source.tables.get_mut("telemetry").unwrap().columns[1].dtype = DataType::Float64;
+        integer_source.queries[0].sql = integer_source.queries[0].sql.replace(
+            "FROM telemetry WHERE",
+            "FROM (SELECT timestamp_ms, value * 2 AS value FROM telemetry) doubled WHERE",
+        );
+        assert!(
+            compile_automatic_clickhouse_workload(&integer_source)
+                .await
+                .is_err(),
+            "a producer projection must not be erased while binding its original table"
+        );
+        let installed = publication
+            .precompute_plan
+            .executable_dags
+            .get(&request.queries[0].sql)
+            .unwrap();
+        installed.validate().unwrap();
+        assert_eq!(installed.binding.precompute_sinks.len(), 1);
+        assert_eq!(
+            installed.binding.nodes.len(),
+            installed.document.nodes.len()
+        );
+        assert!(installed.binding.nodes.values().any(|binding| matches!(
+            binding,
+            crate::physical::executable_binding::BackendNodeBinding::Query { .. }
+        )));
         let entry = publication.query_plan.entries.values().next().unwrap();
         assert!(entry
             .nodes
@@ -702,7 +1207,7 @@ mod tests {
         request.precompute_plan =
             PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
         request.precompute_plan.summary_catalog = Some(request.sds.reference().unwrap());
-        request.transmission_plan = TransmissionPlan::build(
+        request.transmission_plan = crate::physical::compiler::compile_transmission_plan(
             envelope,
             &request.precompute_plan,
             &std::collections::BTreeMap::new(),

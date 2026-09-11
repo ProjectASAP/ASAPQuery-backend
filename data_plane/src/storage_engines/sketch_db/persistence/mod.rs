@@ -27,6 +27,7 @@ pub mod source;
 
 pub mod cache;
 pub mod flusher;
+pub mod immutable_output;
 pub mod recovery;
 
 pub use config::SketchStorePersistenceConfig;

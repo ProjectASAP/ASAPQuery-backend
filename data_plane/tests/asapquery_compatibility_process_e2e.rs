@@ -23,6 +23,8 @@ mod erp_planning_process;
 
 #[path = "support/distinct_planning_process.rs"]
 mod distinct_planning_process;
+#[path = "support/durable_summary_process.rs"]
+mod durable_summary_process;
 
 struct ChildGuard(Child);
 
@@ -87,7 +89,7 @@ async fn remote_write(client: &reqwest::Client, base: &str, request: &WriteReque
     let body = snap::raw::Encoder::new()
         .compress_vec(&request.encode_to_vec())
         .expect("snappy encode");
-    client
+    let response = client
         .post(format!("{base}/api/v1/write"))
         .header("content-encoding", "snappy")
         .header("content-type", "application/x-protobuf")
@@ -95,9 +97,15 @@ async fn remote_write(client: &reqwest::Client, base: &str, request: &WriteReque
         .body(body)
         .send()
         .await
-        .expect("send Remote Write")
-        .status()
-        .as_u16()
+        .expect("send Remote Write");
+    let status = response.status().as_u16();
+    if status >= 400 {
+        eprintln!(
+            "Remote Write {status}: {}",
+            response.text().await.unwrap_or_default()
+        );
+    }
+    status
 }
 
 async fn drain_precompute(client: &reqwest::Client, backend: &str) {
@@ -1580,9 +1588,19 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     let planned_snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
         serde_json::from_str(&std::fs::read_to_string(snapshot).unwrap()).unwrap();
     let planned = planned_snapshot.compile().unwrap();
-    // All four installed states, including the reset-aware counter state, have
-    // closed phase-aligned panes and are available to their query bindings.
-    assert_eq!(materializations.len(), 4, "{materializations:?}");
+    // Every selected state must be serving; the Planner may share or separate
+    // physical populations, so compare identities rather than a frozen count.
+    let expected = planned
+        .precompute_plan
+        .materializations
+        .iter()
+        .map(|config| config.policy_fp_u64())
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual = materializations
+        .iter()
+        .map(|entry| entry["materialization"].as_u64().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(actual, expected, "{materializations:?}");
     for entry in materializations {
         assert_eq!(entry["phase"], "serving", "{entry}");
         assert!(
@@ -1640,3 +1658,6 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     assert!(metrics.contains("asap_remote_write_duplicates_total 33"));
     assert!(metrics.contains("asap_remote_write_rejected_requests_total 1"));
 }
+
+#[path = "support/univmon_erp_process.rs"]
+mod univmon_erp_process;

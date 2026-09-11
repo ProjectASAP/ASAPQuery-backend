@@ -84,6 +84,9 @@ pub struct SdsBinding {
     pub metadata: Arc<SketchInstanceMetadata>,
     pub summary_descriptor: Arc<SummaryDescriptor>,
     pub data_descriptor: Arc<DataDescriptor>,
+    /// Immutable provenance of this physical series lifetime, shared with
+    /// the catalog snapshot used when the descriptors were bound.
+    pub catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
 }
 
 impl std::ops::Deref for SdsBinding {
@@ -101,7 +104,12 @@ pub struct SummaryDescriptorRegistry {
     // registry must not turn retired materializations into a permanent leak.
     summaries: RwLock<HashMap<SummaryDescriptorId, Weak<SummaryDescriptor>>>,
     data: RwLock<HashMap<DataDescriptorId, Weak<DataDescriptor>>>,
-    authoritative_catalog: RwLock<Option<Arc<asap_types::summary_catalog::SummaryCatalog>>>,
+    authoritative_catalog: RwLock<
+        Option<(
+            Arc<asap_types::summary_catalog::SummaryCatalog>,
+            Arc<asap_types::sds::CatalogGeneration>,
+        )>,
+    >,
 }
 
 impl SummaryDescriptorRegistry {
@@ -110,19 +118,39 @@ impl SummaryDescriptorRegistry {
         catalog: Arc<asap_types::summary_catalog::SummaryCatalog>,
     ) -> Result<(), asap_types::summary_catalog::SummaryCatalogError> {
         catalog.validate()?;
-        *self.authoritative_catalog.write().unwrap() = Some(catalog);
+        let reference = catalog.reference()?;
+        let generation = Arc::new(asap_types::sds::CatalogGeneration {
+            schema_version: reference.schema_version,
+            plan_id: reference.plan_id,
+            plan_version: reference.plan_version,
+            snapshot_sha256: reference.snapshot_sha256,
+        });
+        *self.authoritative_catalog.write().unwrap() = Some((catalog, generation));
         Ok(())
     }
 
     pub fn authoritative_catalog(
         &self,
     ) -> Option<Arc<asap_types::summary_catalog::SummaryCatalog>> {
+        self.authoritative_catalog
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|(catalog, _)| Arc::clone(catalog))
+    }
+
+    pub fn authoritative_snapshot(
+        &self,
+    ) -> Option<(
+        Arc<asap_types::summary_catalog::SummaryCatalog>,
+        Arc<asap_types::sds::CatalogGeneration>,
+    )> {
         self.authoritative_catalog.read().unwrap().clone()
     }
 
     pub fn bind(&self, metadata: SketchInstanceMetadata) -> Result<SdsBinding, String> {
-        let authoritative = self.authoritative_catalog.read().unwrap().clone();
-        let configured = if let Some(catalog) = authoritative.as_ref() {
+        let authoritative = self.authoritative_snapshot();
+        let configured = if let Some((catalog, _)) = authoritative.as_ref() {
             if metadata.policy_fp.is_unset() {
                 return Err(
                     "materialization identity is required by the installed SummaryCatalog".into(),
@@ -184,6 +212,7 @@ impl SummaryDescriptorRegistry {
             metadata: Arc::new(metadata),
             summary_descriptor,
             data_descriptor,
+            catalog_generation: authoritative.map(|(_, generation)| generation),
         })
     }
 

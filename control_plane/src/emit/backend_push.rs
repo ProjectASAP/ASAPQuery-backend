@@ -260,7 +260,7 @@ async fn push_documents_coupled(
         warn!(%error, "failed to bind compatibility PrecomputePlan to SummaryCatalog");
         return (false, false, 0);
     }
-    let transmission_plan = match crate::physical::compiler::TransmissionPlan::build(
+    let transmission_plan = match crate::physical::compiler::compile_transmission_plan(
         precompute_plan.envelope.clone(),
         &precompute_plan,
         &Default::default(),
@@ -464,7 +464,12 @@ async fn push_cumulative_entries(
     let materializations = match cumulative_be
         .aggregations
         .iter()
-        .map(crate::physical::compiler::aggregation_config_for_materialization)
+        .map(|aggregation| {
+            crate::physical::compiler::aggregation_config_for_materialization(
+                aggregation,
+                asap_types::QueryLanguage::PromQl,
+            )
+        })
         .collect::<anyhow::Result<Vec<_>>>()
     {
         Ok(materializations) => materializations,

@@ -1,0 +1,245 @@
+[
+  {
+    "id": "q01",
+    "publication": "failure",
+    "execution": "failed",
+    "route": "exact_fallback",
+    "equal": false,
+    "backend_status": 500,
+    "native_status": 500
+  },
+  {
+    "id": "q02",
+    "publication": "failure",
+    "execution": "failed",
+    "route": "exact_fallback",
+    "equal": false,
+    "backend_status": 500,
+    "native_status": 500
+  },
+  {
+    "id": "q03",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q04",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q05",
+    "publication": "pass",
+    "execution": "warm",
+    "route": "warm",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q06",
+    "publication": "pass",
+    "execution": "warm",
+    "route": "warm",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q07",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q08",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q09",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q10",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q11",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q12",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q13",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q14",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q15",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q16",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q17",
+    "publication": "failure",
+    "execution": "failed",
+    "route": "exact_fallback",
+    "equal": false,
+    "backend_status": 500,
+    "native_status": 500
+  },
+  {
+    "id": "q18",
+    "publication": "failure",
+    "execution": "failed",
+    "route": "exact_fallback",
+    "equal": false,
+    "backend_status": 500,
+    "native_status": 500
+  },
+  {
+    "id": "q19",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q20",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q21",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q22",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q23",
+    "publication": "pass",
+    "execution": "warm",
+    "route": "warm",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q24",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  },
+  {
+    "id": "q25",
+    "publication": "failure",
+    "execution": "failed",
+    "route": "exact_fallback",
+    "equal": false,
+    "backend_status": 500,
+    "native_status": 500
+  },
+  {
+    "id": "q26",
+    "publication": "failure",
+    "execution": "failed",
+    "route": "exact_fallback",
+    "equal": false,
+    "backend_status": 500,
+    "native_status": 500
+  },
+  {
+    "id": "q27",
+    "publication": "failure",
+    "execution": "exact_fallback",
+    "route": "exact_fallback",
+    "equal": true,
+    "backend_status": 200,
+    "native_status": 200
+  }
+]

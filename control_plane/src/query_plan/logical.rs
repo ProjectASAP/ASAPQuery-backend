@@ -6,125 +6,19 @@ use promql_parser::{
     label::MatchOp,
     parser::{self, Expr, LabelModifier, Offset, VectorSelector},
 };
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum LogicalOperator {
-    /// A maximal exact scalar/vector subtree evaluated by Prometheus.
-    ExactSubquery {
-        query: String,
-    },
-    /// Prometheus exact subtree whose selectors are restricted at runtime by
-    /// the candidate vector produced by its single input.
-    CandidateExactSubquery {
-        query: String,
-        item_label: String,
-    },
-    Scan {
-        metric: Option<String>,
-        matchers: Vec<LabelMatcher>,
-        range_ms: Option<u64>,
-        offset_ms: i64,
-    },
-    UnaryNegate,
-    VectorToScalar,
-    Aggregate {
-        operation: Aggregation,
-        grouping: Grouping,
-    },
-    /// PromQL `topk(k, vector)` selection over values produced by the child.
-    /// This is distinct from a frequency-sketch TopK readout: any exact or
-    /// summary-backed instant-vector child may feed this query-time operator.
-    TopKSelection {
-        k: u64,
-        grouping: Grouping,
-    },
-    Binary {
-        operation: BinaryOperation,
-        return_bool: bool,
-    },
-    Temporal {
-        operation: TemporalOperation,
-    },
-    Sort {
-        descending: bool,
-    },
-    HistogramQuantile,
-    Subquery {
-        range_ms: u64,
-        step_ms: u64,
-        offset_ms: i64,
-    },
-}
+pub use asap_types::query_plan::logical::*;
 
 /// Stable identity of a Planner-authorized materializable DAG leaf. This is a
 /// workload-selection key, not another physical materialization definition.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, serde::Serialize, PartialEq)]
 struct MaterializationCandidateIdentity {
     metric: String,
     matchers: Vec<LabelMatcher>,
     range_ms: u64,
     offset_ms: i64,
     operation: TemporalOperation,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Grouping {
-    pub labels: Vec<String>,
-    pub without: bool,
-}
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct LabelMatcher {
-    pub name: String,
-    pub value: String,
-    pub operation: LabelMatch,
-}
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LabelMatch {
-    Equal,
-    NotEqual,
-    Regex,
-    NotRegex,
-}
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Aggregation {
-    Sum,
-    Max,
-    Min,
-    Avg,
-    Count,
-}
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BinaryOperation {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Mod,
-    Pow,
-    Equal,
-    NotEqual,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
-}
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TemporalOperation {
-    Rate,
-    Increase,
-    Avg,
-    Max,
-    Min,
-    Sum,
-    Count,
 }
 
 fn invalid(message: impl Into<String>) -> QueryPlanError {
@@ -140,46 +34,6 @@ fn offset(value: &Option<Offset>) -> Result<i64, QueryPlanError> {
         Some(Offset::Neg(d)) => i64::try_from(millis(*d)?)
             .map(|v| -v)
             .map_err(|_| invalid("offset overflow")),
-    }
-}
-
-impl LogicalOperator {
-    pub fn validate(&self, inputs: usize) -> Result<(), QueryPlanError> {
-        let expected = match self {
-            Self::Scan { .. } | Self::ExactSubquery { .. } => 0,
-            Self::CandidateExactSubquery { .. } => 1,
-            Self::Binary { .. } | Self::HistogramQuantile => 2,
-            _ => 1,
-        };
-        if inputs != expected {
-            return Err(invalid("logical operator input arity mismatch"));
-        }
-        if matches!(
-            self,
-            Self::Scan {
-                range_ms: Some(0),
-                ..
-            }
-        ) {
-            return Err(invalid("zero range"));
-        }
-        if let Self::ExactSubquery { query } | Self::CandidateExactSubquery { query, .. } = self {
-            let parsed = parser::parse(query).map_err(|e| invalid(e.to_string()))?;
-            if matches!(parsed, Expr::MatrixSelector(_) | Expr::Subquery(_)) {
-                return Err(invalid(
-                    "exact subtree boundary must return scalar or instant vector",
-                ));
-            }
-        }
-        if let Self::Subquery {
-            range_ms, step_ms, ..
-        } = self
-        {
-            if *range_ms == 0 || *step_ms == 0 || range_ms / step_ms > 100_000 {
-                return Err(invalid("invalid or excessive subquery grid"));
-            }
-        }
-        Ok(())
     }
 }
 
@@ -409,53 +263,32 @@ impl Lower {
     }
 }
 
-impl QueryPlanEntry {
-    /// Lower a Planner-authorized native residual into typed backend operations.
-    /// Callers retain a separate external-native alternative for cost comparison.
-    pub fn compile_logical(
-        query_id: String,
-        canonical_query: String,
-        instant: InstantExecution,
-        fallback: FallbackPolicy,
-    ) -> Result<Self, QueryPlanError> {
-        let expr = parser::parse(&canonical_query).map_err(|e| invalid(e.to_string()))?;
-        let mut lower = Lower {
-            nodes: BTreeMap::new(),
-            seen: BTreeMap::new(),
-        };
-        let root = lower.lower(&expr)?;
-        let entry = Self {
-            language: super::QueryLanguage::PromQl,
-            query_id,
-            canonical_query,
-            fixed_evaluation: None,
-            root,
-            nodes: lower.nodes,
-            instant,
-            fallback,
-        };
-        entry.validate(&Default::default())?;
-        Ok(entry)
-    }
-    /// Promote only a wholly native entry; never discard selected summary bindings.
-    pub fn lower_native_residual(&self) -> Result<Self, QueryPlanError> {
-        if self.nodes.len() != 1
-            || !matches!(
-                self.nodes.get(&self.root),
-                Some(QueryPlanNode::ExactFallback { .. })
-            )
-        {
-            return Err(invalid(
-                "logical residual promotion requires a whole native root",
-            ));
-        }
-        Self::compile_logical(
-            self.query_id.clone(),
-            self.canonical_query.clone(),
-            self.instant,
-            self.fallback,
-        )
-    }
+/// Lower a Planner-authorized native residual into typed backend operations.
+/// Callers retain a separate external-native alternative for cost comparison.
+pub fn compile_logical(
+    query_id: String,
+    canonical_query: String,
+    instant: InstantExecution,
+    fallback: FallbackPolicy,
+) -> Result<QueryPlanEntry, QueryPlanError> {
+    let expr = parser::parse(&canonical_query).map_err(|e| invalid(e.to_string()))?;
+    let mut lower = Lower {
+        nodes: BTreeMap::new(),
+        seen: BTreeMap::new(),
+    };
+    let root = lower.lower(&expr)?;
+    let entry = QueryPlanEntry {
+        language: super::QueryLanguage::PromQl,
+        query_id,
+        canonical_query,
+        fixed_evaluation: None,
+        root,
+        nodes: lower.nodes,
+        instant,
+        fallback,
+    };
+    entry.validate(&Default::default())?;
+    Ok(entry)
 }
 
 /// Match residuals by semantic IR equality, not display text or source names.
@@ -555,7 +388,7 @@ mod tests {
             serde_json::from_str(include_str!("../../tests/fixtures/o11y_queries.json")).unwrap();
         for row in corpus["queries"].as_array().unwrap() {
             let query = row["query"].as_str().unwrap();
-            let entry = QueryPlanEntry::compile_logical(
+            let entry = crate::query_plan::logical::compile_logical(
                 row["id"].as_str().unwrap().into(),
                 query.into(),
                 instant(),
@@ -587,7 +420,7 @@ mod tests {
     #[test]
     fn repeated_subexpressions_share_node_identity() {
         // Serialized edges must retain CSE rather than duplicating raw work.
-        let entry = QueryPlanEntry::compile_logical(
+        let entry = crate::query_plan::logical::compile_logical(
             "q".into(),
             "sum(up) / sum(up)".into(),
             instant(),
@@ -633,7 +466,7 @@ mod tests {
                 3,
             ),
         ] {
-            let entry = QueryPlanEntry::compile_logical(
+            let entry = crate::query_plan::logical::compile_logical(
                 "topk".into(),
                 query.into(),
                 instant(),
@@ -652,7 +485,7 @@ mod tests {
 
     #[test]
     fn topk_keeps_unsupported_child_as_exact_leaf() {
-        let entry = QueryPlanEntry::compile_logical(
+        let entry = crate::query_plan::logical::compile_logical(
             "topk-subquery".into(),
             "topk(3, label_replace(memory_bytes, \"dst\", \"$1\", \"src\", \"(.*)\"))".into(),
             instant(),
@@ -681,7 +514,7 @@ mod tests {
             ("topk by (cluster) (2, m)", vec!["cluster"], false),
             ("topk without (pod) (2, m)", vec!["pod"], true),
         ] {
-            let entry = QueryPlanEntry::compile_logical(
+            let entry = crate::query_plan::logical::compile_logical(
                 "topk-group".into(),
                 query.into(),
                 instant(),
@@ -799,7 +632,7 @@ mod hybrid_tests {
         .unwrap();
         let selected = crate::planner_selection::select_summary_default(&canonical).unwrap();
         let entry =
-            QueryPlanEntry::compile_bound_composable(
+            crate::query_plan::compile_bound_composable(
                 "hybrid".into(),
                 query.into(),
                 &selected,

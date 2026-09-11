@@ -49,7 +49,9 @@ pub struct ClickHouseReader {
     config: ClickHouseReaderConfig,
     http: reqwest::Client,
     population: Option<asap_types::table_population::TablePopulation>,
+    value_projection: Option<asap_types::sds::ValueProjectionIdentity>,
     output_metric: Option<String>,
+    grouping_projection: Option<asap_types::GroupingProjection>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +59,7 @@ pub struct ClickHouseReader {
 enum ClickHouseLabels {
     Series(String),
     Map(std::collections::BTreeMap<String, String>),
+    Columns(Vec<(String, String)>),
 }
 
 #[derive(Deserialize)]
@@ -73,12 +76,29 @@ impl ClickHouseReader {
             config,
             http: reqwest::Client::new(),
             population: None,
+            value_projection: None,
             output_metric: None,
+            grouping_projection: None,
         })
     }
 
     fn sql(&self) -> String {
         let c = &self.config;
+        let labels = self.grouping_projection.as_ref().map_or_else(
+            || c.labels_column.clone(),
+            |grouping| {
+                let entries = grouping
+                    .columns()
+                    .iter()
+                    .map(|column| {
+                        let value = format!("base64Encode(toJSONString({}))", column.name);
+                        format!("'{}', {value}", column.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("map({entries})")
+            },
+        );
         let population = self.population.as_ref().map_or_else(
             || format!("{} = {{metric:String}}", c.metric_column),
             |population| {
@@ -116,14 +136,23 @@ impl ClickHouseReader {
                     .join(" AND ")
             },
         );
+        let value = match &self.value_projection {
+            Some(asap_types::sds::ValueProjectionIdentity::Constant {
+                value: planner_types::pre_asap::ScalarValue::Int64(_),
+            }) => "{projected_value:Int64}",
+            Some(asap_types::sds::ValueProjectionIdentity::Constant {
+                value: planner_types::pre_asap::ScalarValue::Float64(_),
+            }) => "{projected_value:Float64}",
+            _ => c.value_column.as_str(),
+        };
         format!(
             "SELECT {labels} AS labels, {timestamp} AS timestamp_ms, {value} AS value \
              FROM {database}.{table} WHERE {population} \
              AND {timestamp} >= {{start_ms:Int64}} AND {timestamp} < {{end_ms:Int64}} \
              ORDER BY labels, timestamp_ms FORMAT JSONEachRow",
-            labels = c.labels_column,
+            labels = labels,
             timestamp = c.timestamp_ms_column,
-            value = c.value_column,
+            value = value,
             database = c.database,
             table = c.table,
         )
@@ -142,6 +171,9 @@ pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactor
                 }
                 .into());
             }
+            materialization
+                .grouping_labels
+                .validate_table_group_codec()?;
             let mut source_config = config.clone();
             source_config.database = database.clone();
             source_config.table = table.clone();
@@ -149,14 +181,26 @@ pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactor
                 .table_timestamp_column
                 .clone()
                 .ok_or("table materialization has no timestamp projection")?;
-            source_config.value_column = materialization
-                .value_column
-                .clone()
-                .ok_or("table materialization has no value projection")?;
+            match materialization.effective_value_projection() {
+                asap_types::sds::ValueProjectionIdentity::Column { name } => {
+                    source_config.value_column = name.clone()
+                }
+                asap_types::sds::ValueProjectionIdentity::Constant {
+                    value: planner_types::pre_asap::ScalarValue::Int64(value),
+                } if value.unsigned_abs() > (1_u64 << 53) => {
+                    return Err("integer projection exceeds exact Float64 ingest range".into())
+                }
+                asap_types::sds::ValueProjectionIdentity::Constant { .. } => {}
+                asap_types::sds::ValueProjectionIdentity::SampleValue => {
+                    return Err("table materialization has no explicit value projection".into())
+                }
+            }
             materialization.population_filter_canonical()?;
             let mut reader = ClickHouseReader::new(source_config)?;
             reader.population = Some(materialization.table_population.clone().unwrap_or_default());
+            reader.value_projection = Some(materialization.effective_value_projection().clone());
             reader.output_metric = Some(materialization.metric.clone());
+            reader.grouping_projection = Some(materialization.grouping_labels.clone());
             Ok(Arc::new(reader) as Arc<dyn RawSampleReader>)
         }
         source => fallback(source, materialization),
@@ -183,6 +227,27 @@ impl RawSampleReader for ClickHouseReader {
             ("param_start_ms", start_ms.as_str()),
             ("param_end_ms", end_ms.as_str()),
         ]);
+        if self.grouping_projection.is_some() {
+            request = request.query(&[
+                ("output_format_json_map_as_array_of_tuples", "1"),
+                ("output_format_json_named_tuples_as_objects", "0"),
+                ("output_format_json_quote_64bit_integers", "0"),
+            ]);
+        }
+        if let Some(asap_types::sds::ValueProjectionIdentity::Constant { value }) =
+            &self.value_projection
+        {
+            let value = match value {
+                planner_types::pre_asap::ScalarValue::Int64(value) => value.to_string(),
+                planner_types::pre_asap::ScalarValue::Float64(value) => value.to_string(),
+                _ => {
+                    return Err(RawSampleReaderError::Other {
+                        reason: "unsupported constant projection".into(),
+                    })
+                }
+            };
+            request = request.query(&[("param_projected_value", value)]);
+        }
         if let Some(population) = &self.population {
             for (index, predicate) in population.predicates.iter().enumerate() {
                 use planner_types::pre_asap::ScalarValue;
@@ -222,8 +287,34 @@ impl RawSampleReader for ClickHouseReader {
                 serde_json::from_str(line).map_err(|error| RawSampleReaderError::Decode {
                     reason: error.to_string(),
                 })?;
+            let labels = match row.labels {
+                ClickHouseLabels::Columns(columns) => {
+                    let count = columns.len();
+                    let labels = columns
+                        .into_iter()
+                        .map(|(name, value)| {
+                            asap_types::grouping_projection::decode_table_group_value(&value)
+                                .and_then(|value| {
+                                    asap_types::grouping_projection::encode_table_group_value(
+                                        &value,
+                                    )
+                                })
+                                .map(|value| (name, value))
+                                .map_err(|reason| RawSampleReaderError::Decode { reason })
+                        })
+                        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
+                    if labels.len() != count {
+                        return Err(RawSampleReaderError::Decode {
+                            reason: "duplicate source grouping columns".into(),
+                        });
+                    }
+                    ClickHouseLabels::Map(labels)
+                }
+                labels => labels,
+            };
             let sample = RawSample {
-                labels: match row.labels {
+                labels: match labels {
+                    ClickHouseLabels::Columns(_) => unreachable!("columns normalized above"),
                     ClickHouseLabels::Series(series) => {
                         if self.population.is_some() {
                             let metric = self.output_metric.as_deref().unwrap_or(&filter.metric);
@@ -320,6 +411,16 @@ mod tests {
     }
 
     #[test]
+    fn constant_projection_uses_a_typed_parameter_without_a_fake_column() {
+        let mut reader = ClickHouseReader::new(config("samples")).unwrap();
+        reader.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Constant {
+            value: planner_types::pre_asap::ScalarValue::Int64(1),
+        });
+        assert!(reader.sql().contains("{projected_value:Int64} AS value"));
+        assert!(!reader.sql().contains(" value AS value"));
+    }
+
+    #[test]
     fn typed_source_enters_clickhouse_backfill_lifecycle() {
         let mut materialization = asap_types::PrecomputeMaterialization::new(
             asap_types::AggregationType::Sum,
@@ -349,6 +450,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reader.source_name(), "ClickHouseReader");
+        let mut typed = materialization.clone();
+        typed.grouping_labels =
+            asap_types::GroupingProjection::new(vec![planner_types::pre_asap::Column::new(
+                "tenant",
+                planner_types::pre_asap::DataType::Int64,
+                false,
+            )]);
+        assert!(factory(
+            &BackfillSource::ClickHouse {
+                database: "metrics".into(),
+                table: "another_table".into()
+            },
+            &typed,
+        )
+        .is_ok());
+        typed.grouping_labels =
+            asap_types::GroupingProjection::new(vec![planner_types::pre_asap::Column::new(
+                "tenant",
+                planner_types::pre_asap::DataType::Int64,
+                true,
+            )]);
+        let rejected = factory(
+            &BackfillSource::ClickHouse {
+                database: "metrics".into(),
+                table: "another_table".into(),
+            },
+            &typed,
+        );
+        assert!(matches!(rejected, Err(error) if error.to_string().contains("null-key encoding")));
+
         assert!(factory(
             &BackfillSource::ClickHouse {
                 database: "another_database".into(),

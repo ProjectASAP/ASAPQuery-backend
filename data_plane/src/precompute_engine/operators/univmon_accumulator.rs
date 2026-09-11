@@ -45,6 +45,11 @@ impl UnivMonAccumulator {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let inner = UnivMon::deserialize_from_bytes(bytes)
             .map_err(|e| format!("invalid UnivMon state: {e}"))?;
+        if !inner.accepts_standard_updates() {
+            return Err(
+                "terminal-mode UnivMon state cannot enter the standard-update accumulator".into(),
+            );
+        }
         Ok(Self { inner })
     }
 
@@ -194,6 +199,17 @@ mod tests {
         assert!((read(&restored, Statistic::Cardinality) - 2.0).abs() < 0.01);
         assert!((read(&restored, Statistic::FrequencyL2) - 8.0f64.sqrt()).abs() < 0.01);
         assert!((read(&restored, Statistic::FrequencyEntropy) - 1.0).abs() < 0.01);
+    }
+
+    /// Terminal-mode serialization is valid sketchlib state but not this accumulator's update domain.
+    #[test]
+    fn terminal_state_is_rejected_before_ingestion_or_merge() {
+        let mut state = UnivMon::init_univmon(4, 3, 16, 2);
+        state.fast_insert(&DataInput::U64(1), 1);
+        let bytes = state.serialize_to_bytes().unwrap();
+        assert!(UnivMonAccumulator::from_bytes(&bytes).is_err());
+        state.free();
+        assert!(UnivMonAccumulator::from_bytes(&state.serialize_to_bytes().unwrap()).is_ok());
     }
 
     /// Pane merge preserves overlapping keys and reset removes the previous window.

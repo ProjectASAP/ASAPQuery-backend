@@ -10,7 +10,7 @@ struct QueryReadinessRequirement {
 }
 
 fn readiness_requirement(
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &asap_types::query_plan::QueryPlanEntry,
 ) -> QueryReadinessRequirement {
     let bindings = entry.materialization_bindings();
     let mut materializations = bindings
@@ -128,10 +128,7 @@ impl ASAPQueryEngine {
         })?;
         let planned = physical
             .query_plan
-            .lookup_canonical(
-                control_plane::query_plan::QueryLanguage::MetricsQl,
-                identity,
-            )
+            .lookup_canonical(asap_types::query_plan::QueryLanguage::MetricsQl, identity)
             .map_err(|error| {
                 crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
             })?;
@@ -160,10 +157,7 @@ impl ASAPQueryEngine {
         })?;
         let planned = physical
             .query_plan
-            .lookup_canonical(
-                control_plane::query_plan::QueryLanguage::MetricsQl,
-                identity,
-            )
+            .lookup_canonical(asap_types::query_plan::QueryLanguage::MetricsQl, identity)
             .map_err(|error| {
                 crate::query_engines::EngineError::capability_miss("query_plan", error.to_string())
             })?;
@@ -201,7 +195,7 @@ impl ASAPQueryEngine {
     async fn prepare_logical(
         &self,
         physical: &crate::storage_engines::types::ActivePhysicalPlan,
-        entry: &control_plane::query_plan::QueryPlanEntry,
+        entry: &asap_types::query_plan::QueryPlanEntry,
         times: &[u64],
     ) -> Result<super::logical_dag::PreparedLeaves, crate::query_engines::EngineError> {
         super::catalog_resolver::validate_entry(
@@ -266,7 +260,7 @@ impl ASAPQueryEngine {
     fn execute_logical_entry(
         &self,
         physical: &crate::storage_engines::types::ActivePhysicalPlan,
-        entry: &control_plane::query_plan::QueryPlanEntry,
+        entry: &asap_types::query_plan::QueryPlanEntry,
         leaves: &super::logical_dag::PreparedLeaves,
         at: u64,
     ) -> Result<
@@ -277,109 +271,140 @@ impl ASAPQueryEngine {
         crate::query_engines::EngineError,
     > {
         use crate::query_engines::EngineError;
-        super::logical_dag::execute_installed(entry, leaves, at, |root, evaluation_ms| {
-            let mut subtree = entry.clone();
-            subtree.root = root;
-            let reachable = subtree.topological_order().map_err(|e| {
-                EngineError::capability_miss("installed_logical_dag", e.to_string())
-            })?;
-            subtree.nodes.retain(|id, _| reachable.contains(id));
-            let bindings: Vec<_> = subtree
-                .materialization_bindings()
-                .into_iter()
-                .cloned()
-                .collect();
-            let windows: std::collections::BTreeSet<Option<u64>> =
-                bindings.iter().map(|b| b.readout_lookback_ms).collect();
-            if windows.len() != 1 || windows.contains(&None) || windows.contains(&Some(0)) {
-                return Err(EngineError::capability_miss(
-                    "installed_logical_dag",
-                    "bound subtree requires one explicit positive window",
-                ));
-            }
-            subtree.instant.lookback_ms = windows
-                .first()
-                .copied()
-                .flatten()
-                .expect("explicit semantic lookback checked");
-            subtree.instant.full_history = false;
-            subtree.instant.cumulative_readout = true;
-            let requirement = readiness_requirement(&subtree);
-            let index = self.sketch_index.as_ref().ok_or_else(|| {
-                EngineError::capability_miss("installed_logical_dag", "summary store unavailable")
-            })?;
-            let (result, t0) =
-                super::live_serve::serve_instant_from_query_plan(index, &subtree, evaluation_ms)
-                    .map_err(|e| {
-                        EngineError::capability_miss(
-                            "installed_logical_dag",
-                            format!("bound readout failed: {e:?}"),
-                        )
-                    })?;
-            let active = self.active_physical_plan.as_ref().ok_or_else(|| {
-                EngineError::capability_miss(
-                    "installed_logical_dag",
-                    "readiness registry unavailable",
-                )
-            })?;
-            let plan_id = physical.plan_id();
-            let version = physical.plan_version();
-            // Exact range accumulators preserve their actual first/last sample
-            // timestamps. Sparse counter series may legitimately begin after
-            // the range boundary; Prometheus evaluates the samples that exist.
-            // The physical plan's retention bound guarantees stored panes were
-            // not evicted, so requiring a sample at t0 would reject valid data.
-            let exact_accumulator_bindings =
-                physical.summary_catalog.as_deref().is_some_and(|catalog| {
-                    bindings.iter().all(|binding| {
-                        super::catalog_resolver::resolve(catalog, binding.materialization)
-                            .is_ok_and(|resolved| resolved.is_exact())
-                    })
-                });
-            let sparse_exact_coverage = exact_accumulator_bindings
-                && result
-                    .coverage
-                    .is_some_and(|(_, coverage_end)| coverage_end >= evaluation_ms);
-            if !sparse_exact_coverage
-                && !complete_window_coverage(
-                    result.coverage,
-                    t0,
+        let revision = self
+            .sketch_index
+            .as_ref()
+            .map(|index| index.summary_update_revision());
+        let result =
+            super::logical_dag::execute_installed(entry, leaves, at, |root, evaluation_ms| {
+                let mut subtree = entry.clone();
+                subtree.root = root;
+                let reachable = subtree.topological_order().map_err(|e| {
+                    EngineError::capability_miss("installed_logical_dag", e.to_string())
+                })?;
+                subtree.nodes.retain(|id, _| reachable.contains(id));
+                let bindings: Vec<_> = subtree
+                    .materialization_bindings()
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                let windows: std::collections::BTreeSet<Option<u64>> =
+                    bindings.iter().map(|b| b.readout_lookback_ms).collect();
+                if windows.len() != 1 || windows.contains(&None) || windows.contains(&Some(0)) {
+                    return Err(EngineError::capability_miss(
+                        "installed_logical_dag",
+                        "bound subtree requires one explicit positive window",
+                    ));
+                }
+                subtree.instant.lookback_ms = windows
+                    .first()
+                    .copied()
+                    .flatten()
+                    .expect("explicit semantic lookback checked");
+                subtree.instant.full_history = false;
+                subtree.instant.cumulative_readout = true;
+                let requirement = readiness_requirement(&subtree);
+                let index = self.sketch_index.as_ref().ok_or_else(|| {
+                    EngineError::capability_miss(
+                        "installed_logical_dag",
+                        "summary store unavailable",
+                    )
+                })?;
+                let (result, t0) = super::live_serve::serve_instant_from_query_plan(
+                    index,
+                    &subtree,
                     evaluation_ms,
-                    requirement.max_window_ms,
                 )
-            {
-                active.mark_materializing(
-                    plan_id,
-                    version,
-                    &requirement.materializations,
-                    result.coverage,
-                );
-                return Err(EngineError::capability_miss(
-                    "installed_logical_dag",
-                    format!("bound readout incomplete at {evaluation_ms}"),
-                ));
-            }
-            let coverage = result.coverage.expect("coverage checked");
-            if !active.mark_ready(plan_id, version, &requirement.materializations, coverage)
-                || !active.mark_serving(plan_id, version, &requirement.materializations, coverage)
-            {
-                return Err(EngineError::capability_miss(
-                    "installed_logical_dag",
-                    "physical generation changed during bound readout",
-                ));
-            }
-            Ok(asap_tier_result_to_query_result(
-                result,
-                evaluation_ms,
-                false,
-            ))
-        })
+                .map_err(|e| {
+                    EngineError::capability_miss(
+                        "installed_logical_dag",
+                        format!("bound readout failed: {e:?}"),
+                    )
+                })?;
+                let active = self.active_physical_plan.as_ref().ok_or_else(|| {
+                    EngineError::capability_miss(
+                        "installed_logical_dag",
+                        "readiness registry unavailable",
+                    )
+                })?;
+                let plan_id = physical.plan_id();
+                let version = physical.plan_version();
+                // Exact range accumulators preserve their actual first/last sample
+                // timestamps. Sparse counter series may legitimately begin after
+                // the range boundary; Prometheus evaluates the samples that exist.
+                // The physical plan's retention bound guarantees stored panes were
+                // not evicted, so requiring a sample at t0 would reject valid data.
+                let exact_accumulator_bindings =
+                    physical.summary_catalog.as_deref().is_some_and(|catalog| {
+                        bindings.iter().all(|binding| {
+                            super::catalog_resolver::resolve(catalog, binding.materialization)
+                                .is_ok_and(|resolved| resolved.is_exact())
+                        })
+                    });
+                let sparse_exact_coverage = exact_accumulator_bindings
+                    && result
+                        .coverage
+                        .is_some_and(|(_, coverage_end)| coverage_end >= evaluation_ms);
+                if !sparse_exact_coverage
+                    && !complete_window_coverage(
+                        result.coverage,
+                        t0,
+                        evaluation_ms,
+                        requirement.max_window_ms,
+                    )
+                {
+                    active.mark_materializing(
+                        plan_id,
+                        version,
+                        &requirement.materializations,
+                        result.coverage,
+                    );
+                    return Err(EngineError::capability_miss(
+                        "installed_logical_dag",
+                        format!("bound readout incomplete at {evaluation_ms}"),
+                    ));
+                }
+                let coverage = result.coverage.expect("coverage checked");
+                if !active.mark_ready(plan_id, version, &requirement.materializations, coverage)
+                    || !active.mark_serving(
+                        plan_id,
+                        version,
+                        &requirement.materializations,
+                        coverage,
+                    )
+                {
+                    return Err(EngineError::capability_miss(
+                        "installed_logical_dag",
+                        "physical generation changed during bound readout",
+                    ));
+                }
+                Ok(asap_tier_result_to_query_result(
+                    result,
+                    evaluation_ms,
+                    false,
+                ))
+            });
+        let current = self
+            .sketch_index
+            .as_ref()
+            .map(|index| index.summary_update_revision());
+        if match (revision, current) {
+            (Some(before), Some(after)) => !before.matches(after),
+            (None, None) => false,
+            _ => true,
+        } {
+            return Err(EngineError::capability_miss(
+                "installed_logical_dag",
+                "summary input changed during query DAG evaluation",
+            ));
+        }
+        result
     }
 
     async fn execute_logical_range(
         &self,
         physical: &crate::storage_engines::types::ActivePhysicalPlan,
-        entry: &control_plane::query_plan::QueryPlanEntry,
+        entry: &asap_types::query_plan::QueryPlanEntry,
         start: u64,
         end: u64,
         step: u64,
@@ -636,10 +661,7 @@ impl ASAPQueryEngine {
         if let Some(physical) = self.physical_plan_snapshot() {
             if let Ok(entry) = physical.query_plan.lookup(query) {
                 if entry.nodes.values().any(|node| {
-                    matches!(
-                        node,
-                        control_plane::query_plan::QueryPlanNode::Logical { .. }
-                    )
+                    matches!(node, asap_types::query_plan::QueryPlanNode::Logical { .. })
                 }) {
                     return self
                         .execute_logical_range(&physical, entry, start_ms, end_ms, step_ms)
@@ -3591,7 +3613,7 @@ mod range_stitch_tests {
 
     #[tokio::test]
     async fn active_metricsql_entry_reaches_the_shared_dag_executor() {
-        use control_plane::query_plan::{
+        use asap_types::query_plan::{
             FallbackPolicy, InstantExecution, QueryLanguage, QueryNodeId, QueryPlanEntry,
             QueryPlanNode,
         };
@@ -3601,9 +3623,9 @@ mod range_stitch_tests {
             ))
             .unwrap();
         let mut plan = snapshot.compile().unwrap();
-        let identity = control_plane::query_plan::canonical_promql("1 + 2").unwrap();
+        let identity = asap_types::query_plan::canonical_promql("1 + 2").unwrap();
         plan.query_plan.entries.insert(
-            control_plane::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity),
+            asap_types::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity),
             QueryPlanEntry {
                 language: QueryLanguage::MetricsQl,
                 query_id: "vm-scalar".into(),

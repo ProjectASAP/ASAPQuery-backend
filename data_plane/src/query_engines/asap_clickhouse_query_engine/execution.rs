@@ -9,8 +9,8 @@ use crate::{
     },
     storage_engines::sketch_db::index::SketchStore,
 };
+use asap_types::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use asap_types::summary_catalog::SummaryCatalog;
-use control_plane::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use planner_types::post_asap::ValueOperation;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -65,8 +65,7 @@ fn execute_relation_subtree(
             if request.language != asap_types::QueryLanguage::ClickHouseSql {
                 return Err("ClickHouse DAG contains an external leaf for another language".into());
             }
-            let control_plane::query_plan::ExternalExactOutput::Relation { schema } =
-                &request.output
+            let asap_types::query_plan::ExternalExactOutput::Relation { schema } = &request.output
             else {
                 return Err("ClickHouse external leaf must declare relation output".into());
             };
@@ -231,6 +230,33 @@ pub fn execute_sql_dag_with_external(
     t1_ms: u64,
     is_cumulative: bool,
 ) -> ClickHouseDagOutcome {
+    let revision = index.summary_update_revision();
+    let result = execute_sql_dag_with_external_unfenced(
+        index,
+        entry,
+        sds,
+        prepared,
+        t0_ms,
+        t1_ms,
+        is_cumulative,
+    );
+    if !revision.matches(index.summary_update_revision()) {
+        return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
+            "summary input changed during SQL DAG evaluation".into(),
+        ));
+    }
+    result
+}
+
+fn execute_sql_dag_with_external_unfenced(
+    index: &SketchStore,
+    entry: &QueryPlanEntry,
+    sds: &SummaryCatalog,
+    prepared: &PreparedExternalLeaves,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+) -> ClickHouseDagOutcome {
     if let Err(error) = validate_payload(Some(sds), entry, sds.plan_id, sds.plan_version) {
         return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
             error.to_string(),
@@ -249,7 +275,7 @@ pub fn execute_sql_dag_with_external(
             Some(QueryPlanNode::Relational { output_schema, .. })
             | Some(QueryPlanNode::RelationalJoin { output_schema, .. }) => output_schema.clone(),
             Some(QueryPlanNode::ExternalExact { request, .. }) => {
-                let control_plane::query_plan::ExternalExactOutput::Relation { schema } =
+                let asap_types::query_plan::ExternalExactOutput::Relation { schema } =
                     &request.output
                 else {
                     return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
@@ -294,13 +320,17 @@ pub fn execute_sql_dag_with_external(
                 ))
             }
         };
-        let pane_ms = entry
-            .materialization_bindings()
+        let bindings = entry.materialization_bindings();
+        let pane_ms = bindings
             .iter()
             .map(|binding| binding.window_ms)
             .max()
             .unwrap_or(0);
-        if !complete_pane_coverage(relation.coverage, (t0_ms, t1_ms), pane_ms) {
+        // External-only DAGs have no summary panes to cover. Their source
+        // population is defined by the independently bound exact requests.
+        if !bindings.is_empty()
+            && !complete_pane_coverage(relation.coverage, (t0_ms, t1_ms), pane_ms)
+        {
             return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::IncompleteCoverage {
                 requested: (t0_ms, t1_ms),
                 observed: relation.coverage,
