@@ -14,16 +14,8 @@ use arrow::{
 };
 use chrono::{DateTime, NaiveDateTime, TimeZone};
 use planner_types::{
-    post_asap::{SummaryFamilyType, SummaryNode, SummarySchema, ValueOperation},
+    post_asap::{SummaryFamilyType, SummarySchema, ValueOperation},
     pre_asap::{ArithmeticOpKind, CompareOpKind, DataType, QueryExpr, ScalarValue, SortKey},
-};
-
-use crate::query_engines::{
-    asap_query_engine::{
-        summary_exec::ExecOutcome,
-        summary_executor::{GroupState, SummaryValue},
-    },
-    canonical::relational::RelationalAdapter,
 };
 
 use super::clickhouse_result_adapter::ClickHouseQueryResult;
@@ -456,81 +448,6 @@ impl ClickHouseRelationalAdapter {
     }
 }
 
-impl<E> RelationalAdapter<E> for ClickHouseRelationalAdapter
-where
-    E: crate::query_engines::canonical::executor::SummaryExecutor<
-        GroupKey = BTreeMap<String, String>,
-        State = GroupState,
-        Value = SummaryValue,
-    >,
-{
-    type Relation = ClickHouseRelation;
-    type Error = ClickHouseRelationalError;
-
-    fn relation_from_outcome(
-        &self,
-        node: &SummaryNode,
-        outcome: ExecOutcome<E>,
-    ) -> Result<Self::Relation, Self::Error> {
-        let fields = fields(node);
-        let mut rows = Vec::new();
-        let mut coverage = None;
-        let mut coverage_complete = true;
-        match outcome {
-            ExecOutcome::Value(groups) => {
-                for (group, value) in groups {
-                    match value.coverage() {
-                        Some(next) if coverage_complete => {
-                            coverage = intersect_coverage(coverage, Some(next));
-                        }
-                        None => {
-                            coverage = None;
-                            coverage_complete = false;
-                        }
-                        Some(_) => {}
-                    }
-                    match value {
-                        SummaryValue::Points(points, _) => {
-                            for (timestamp, value) in points {
-                                rows.push(row_from_value(&fields, &group, timestamp, value)?);
-                            }
-                        }
-                        SummaryValue::TopK(_, _) => {
-                            return Err(ClickHouseRelationalError::Unsupported(
-                                "TopK summary rows".into(),
-                            ));
-                        }
-                    }
-                }
-            }
-            ExecOutcome::State(groups) => {
-                for (group, state, family) in groups {
-                    let value = exact_value(&state, &family)?;
-                    rows.push(row_from_value(&fields, &group, 0, value)?);
-                }
-            }
-        }
-        Ok(ClickHouseRelation {
-            rows,
-            fields,
-            coverage,
-        })
-    }
-
-    fn apply(
-        &self,
-        node: &SummaryNode,
-        operation: &ValueOperation,
-        input: Self::Relation,
-    ) -> Result<Self::Relation, Self::Error> {
-        self.apply_operation(operation, &node.schema, input)
-    }
-}
-
-fn fields(node: &SummaryNode) -> Vec<(String, DataType, bool)> {
-    fields_from_schema(&node.schema)
-}
-
 fn fields_from_schema(schema: &SummarySchema) -> Vec<(String, DataType, bool)> {
     schema
         .fields
@@ -543,20 +460,6 @@ fn fields_from_schema(schema: &SummarySchema) -> Vec<(String, DataType, bool)> {
             (field.name.clone(), dtype, field.nullable)
         })
         .collect()
-}
-
-fn exact_value(
-    state: &GroupState,
-    family: &SummaryFamilyType,
-) -> Result<f64, ClickHouseRelationalError> {
-    if !matches!(family, SummaryFamilyType::ExactAggregate(..)) {
-        return Err(ClickHouseRelationalError::Unsupported(
-            "unfinalized non-exact summary state".into(),
-        ));
-    }
-    state.exact_value(&None).ok_or_else(|| {
-        ClickHouseRelationalError::Invalid("exact accumulator cannot be finalized".into())
-    })
 }
 
 fn row_from_value(
@@ -923,14 +826,6 @@ fn cell_cmp(left: &Cell, right: &Cell) -> Option<Ordering> {
     }
 }
 
-fn intersect_coverage(current: Option<(u64, u64)>, next: Option<(u64, u64)>) -> Option<(u64, u64)> {
-    match (current, next) {
-        (None, next) => next,
-        (current, None) => current,
-        (Some(left), Some(right)) => Some((left.0.max(right.0), left.1.min(right.1))),
-    }
-}
-
 fn arrow_type(dtype: &DataType) -> ArrowDataType {
     match dtype {
         DataType::Null => ArrowDataType::Null,
@@ -1073,53 +968,11 @@ fn build_array(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::query_engines::canonical::{
-        executor::SummaryExecutor, relational::execute_relational,
-    };
     use planner_types::{
-        post_asap::{ExecutionTiming, SketchQuery, SummaryExpr, SummaryField, SummarySchema},
-        pre_asap::{ColumnRef, GroupKeys, Predicate, ProjectItem, Reduction},
+        post_asap::{SummaryField, SummarySchema},
+        pre_asap::{GroupKeys, Predicate, ProjectItem},
     };
     use std::rc::Rc;
-
-    struct MockExecutor;
-
-    impl SummaryExecutor for MockExecutor {
-        type Handle = ();
-        type State = GroupState;
-        type Value = SummaryValue;
-        type Error = ();
-        type GroupKey = BTreeMap<String, String>;
-
-        fn find_candidates(
-            &self,
-            _: &SummaryFamilyType,
-            _: &ColumnRef,
-            _: &Reduction,
-            _: &SummaryNode,
-        ) -> Result<Vec<(Self::GroupKey, Self::Handle)>, Self::Error> {
-            unreachable!()
-        }
-
-        fn fetch_state(&self, _: &Self::Handle) -> Result<Self::State, Self::Error> {
-            unreachable!()
-        }
-
-        fn merge_states(&self, _: Vec<Self::State>) -> Result<Self::State, Self::Error> {
-            unreachable!()
-        }
-
-        fn readout(&self, _: &Self::State, _: &SketchQuery) -> Result<Self::Value, Self::Error> {
-            unreachable!()
-        }
-
-        fn logical(&self, _: &QueryExpr) -> Result<Self::Value, Self::Error> {
-            Ok(SummaryValue::Points(
-                vec![(10, 2.0), (20, 3.0), (30, 1.0)],
-                Some((0, 40)),
-            ))
-        }
-    }
 
     fn schema(fields: &[(&str, DataType)]) -> SummarySchema {
         SummarySchema {
@@ -1135,22 +988,6 @@ mod tests {
                 .iter()
                 .position(|(_, dtype)| *dtype == DataType::Timestamp),
         }
-    }
-
-    fn value_node(
-        child: Rc<SummaryNode>,
-        operation: ValueOperation,
-        schema: SummarySchema,
-    ) -> Rc<SummaryNode> {
-        Rc::new(SummaryNode {
-            expr: SummaryExpr::ValueOperation {
-                child,
-                operation,
-                timing: ExecutionTiming::ReadTime,
-            },
-            schema,
-            guarantee: None,
-        })
     }
 
     /// Map entries remain ordered pairs, including duplicate keys and null values.
@@ -1199,17 +1036,32 @@ mod tests {
     #[test]
     fn executes_filter_project_arithmetic_sort_and_limit_chain() {
         let input_schema = schema(&[("ts", DataType::Timestamp), ("sum", DataType::Float64)]);
-        let leaf = Rc::new(SummaryNode {
-            expr: SummaryExpr::KeepPreAsap(Rc::new(QueryExpr::Literal(ScalarValue::Int64(0)))),
-            schema: input_schema.clone(),
-            guarantee: None,
-        });
+        let adapter = ClickHouseRelationalAdapter;
+        let input = ClickHouseRelation {
+            rows: vec![
+                vec![Cell::Timestamp(10), Cell::Float64(2.0)],
+                vec![Cell::Timestamp(20), Cell::Float64(3.0)],
+                vec![Cell::Timestamp(30), Cell::Float64(1.0)],
+            ],
+            fields: fields_from_schema(&input_schema),
+            coverage: Some((0, 40)),
+        };
+        let mut relation = adapter
+            .apply_filter(
+                &Predicate(QueryExpr::Compare {
+                    left: Rc::new(QueryExpr::Column(1)),
+                    op: CompareOpKind::Gt,
+                    right: Rc::new(QueryExpr::Literal(ScalarValue::Float64(1.0))),
+                }),
+                input,
+            )
+            .unwrap();
+        assert_eq!(relation.rows.len(), 2);
         let projected_schema = schema(&[
             ("bucket", DataType::Timestamp),
             ("score", DataType::Float64),
         ]);
-        let projected = value_node(
-            leaf,
+        for operation in [
             ValueOperation::Project {
                 cols: vec![
                     ProjectItem {
@@ -1227,10 +1079,6 @@ mod tests {
                 ],
                 qualifier: None,
             },
-            projected_schema.clone(),
-        );
-        let sorted = value_node(
-            projected,
             ValueOperation::Sort {
                 keys: vec![SortKey {
                     expr: QueryExpr::Column(1),
@@ -1239,16 +1087,12 @@ mod tests {
                 }],
                 partition_by: GroupKeys::none(),
             },
-            projected_schema.clone(),
-        );
-        let limited = value_node(
-            sorted,
             ValueOperation::Limit { n: 1, offset: 0 },
-            projected_schema,
-        );
-
-        let relation = execute_relational(&limited, &MockExecutor, &ClickHouseRelationalAdapter)
-            .expect("supported SQL chain should execute");
+        ] {
+            relation = adapter
+                .apply_operation(&operation, &projected_schema, relation)
+                .expect("installed SQL operators should execute");
+        }
         assert_eq!(relation.coverage, Some((0, 40)));
         let result = relation.into_result().unwrap();
         let batch = &result.batches[0];
