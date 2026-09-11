@@ -694,7 +694,11 @@ fn route_messages(
             if config.metric.as_str() != sample.metric.as_ref() || !filter.matches(&sample.labels) {
                 continue;
             }
-            let group_key = IngestState::extract_group_key_for(&sample.series_key, config);
+            let group_key = if config.population_key_encoding.is_legacy() {
+                IngestState::extract_group_key_for(&sample.series_key, config)
+            } else {
+                IngestState::extract_group_key_from_labels(&sample.labels, config)
+            };
             // Reset-aware counters and temporal min/max must keep one
             // accumulator per source series. Their emitted label values still
             // follow the physical grouping, so query-time Reduce nodes can
@@ -736,10 +740,21 @@ fn route_messages(
                 group_key
             };
             let computed_attrs_fp;
-            let attrs_fp = if series_scoped {
+            let attrs_fp = if series_scoped && config.population_key_encoding.is_legacy() {
                 sample.all_attrs_fingerprint.as_ref()
             } else {
-                computed_attrs_fp = super::canonical_attrs_fingerprint(&grouping_pairs);
+                let pairs = if series_scoped {
+                    sample
+                        .labels
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.as_str()))
+                        .collect::<Vec<_>>()
+                } else {
+                    grouping_pairs
+                };
+                computed_attrs_fp =
+                    super::population_attrs_fingerprint(config.population_key_encoding, &pairs)
+                        .map_err(RemoteWriteError::SeriesIdentity)?;
                 &computed_attrs_fp
             };
             let policy_fp = asap_types::PolicyFingerprint(config.policy_fp_u64());
@@ -1067,6 +1082,69 @@ mod tests {
             PrometheusRemoteWriteReceiver::new(PrometheusRemoteWriteConfig::default(), ingest),
             receiver,
         )
+    }
+
+    #[test]
+    fn canonical_routing_preserves_group_labels_without_series_text_roundtrip() {
+        let (base, _worker) = configured_receiver();
+        let snapshot = base.inner.ingest.physical_plan_snapshot().unwrap();
+        let mut config = snapshot.precompute_plan.materializations[0].clone();
+        config.population_key_encoding = asap_types::PopulationKeyEncoding::CanonicalLabelsV1;
+        config.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
+        let hot = physical_config(StreamingConfig::new(HashMap::from([(
+            config.policy_fp_u64(),
+            config.clone(),
+        )])));
+        let physical = hot.physical_plan_snapshot().unwrap();
+        // A direct routing fixture; public installation remains intentionally gated.
+        let (sender, _worker) = mpsc::channel(8);
+        let ingest = Arc::new(IngestState {
+            router: SeriesRouter::new(vec![sender]),
+            samples_ingested: AtomicU64::new(0),
+            samples_blocked_by_schema_barrier: AtomicU64::new(0),
+            hot_reload_config: hot,
+            pass_raw_samples: false,
+            sketch_snapshots: dashmap::DashMap::new(),
+            series_resolver: Arc::new(super::super::SeriesIdResolver::new()),
+            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            observability: IngestObservability::default(),
+        });
+        ingest
+            .sketch_index
+            .install_summary_catalog(physical.summary_catalog.as_ref().unwrap().clone())
+            .unwrap();
+        let value = "a;z=\"x,y\\q";
+        let request = WriteRequest {
+            timeseries: vec![TimeSeries {
+                labels: vec![
+                    Label {
+                        name: "__name__".into(),
+                        value: config.metric.clone(),
+                    },
+                    Label {
+                        name: "job".into(),
+                        value: value.into(),
+                    },
+                ],
+                samples: vec![Sample {
+                    value: 1.0,
+                    timestamp: 1000,
+                }],
+                exemplars: vec![],
+                histograms: vec![],
+            }],
+        };
+        let samples =
+            canonicalize_request(&request, &PrometheusRemoteWriteConfig::default()).unwrap();
+        let messages = route_messages(&samples, &ingest, &physical).unwrap();
+        assert_eq!(messages.len(), 1);
+        let WorkerMessage::GroupSamples { group_key, .. } = &messages[0] else {
+            panic!("expected group samples")
+        };
+        assert_eq!(
+            group_key.as_population_labels(),
+            std::collections::BTreeMap::from([("job".into(), value.into())])
+        );
     }
 
     #[test]
