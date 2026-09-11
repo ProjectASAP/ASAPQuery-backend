@@ -108,7 +108,6 @@ fn bind_workload_typed_with_evidence(
     topk_evidence: Option<&crate::physical::compiler::TopKMembershipEvidence>,
 ) -> Option<crate::physical::post_asap::PhysicalExpr> {
     use crate::physical::post_asap::cost_model::ForcedFamilyCostModel;
-    use crate::types_v2::AccuracyTarget;
     use planner_types::post_asap::SketchAlgorithm;
     use planner_types::pre_asap::{AggIntent as L3AggIntent, QueryExpr, Schema, Source};
     use planner_types::pre_asap::{Column, DataType};
@@ -174,14 +173,7 @@ fn bind_workload_typed_with_evidence(
     // the intent. An invalid override produces no candidate below.
     let kind = override_kind.unwrap_or(default_kind);
 
-    // QueryWorkload::accuracy_sla in the legacy planner is interpreted
-    // directly as the ε bound (e.g. `0.01` ⇒ ε=0.01). The L3/L4 typed
-    // form is `AccuracyTarget::Epsilon(eps)` with the same semantic.
-    let accuracy = if w.accuracy_sla > 0.0 {
-        AccuracyTarget::Epsilon(w.accuracy_sla)
-    } else {
-        AccuracyTarget::Exact
-    };
+    let accuracy = w.accuracy.clone();
     let intent_accuracy = accuracy.clone();
 
     // Build the matching L3 `AggIntent` for the picked statistic class.
@@ -385,9 +377,12 @@ impl DeploymentPlanCompiler {
     }
 
     pub fn plan(&self, w: &QueryWorkload) -> CollectionPlan {
-        // When exact computation is required (RSI, MACD, stateful indicators),
-        // skip sketch selection and return a raw-passthrough plan.
-        if w.exact_required {
+        // This legacy scalar cost path cannot certify a failure probability.
+        // Exact/zero-error and EpsilonDelta use raw; the typed binder independently
+        // checks the full requirement against Planner's family guarantees.
+        if w.exact_required
+            || !matches!(w.accuracy, crate::types_v2::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
+        {
             return self.raw_passthrough_plan(w);
         }
 
@@ -395,7 +390,7 @@ impl DeploymentPlanCompiler {
         let sketch_params = crate::physical::sketch_catalog::build_sketch_params(
             &self.sketch_defaults,
             &sketch_type,
-            w.accuracy_sla,
+            w.error_bound(),
             &w.quantiles,
         );
         let (mode, window_duration) = select_window_strategy(w);
@@ -515,6 +510,7 @@ mod tests {
             time_window: Duration::from_secs(300),
             repeat_every: None,
             accuracy_sla: 0.01,
+            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
@@ -631,7 +627,7 @@ mod tests {
     #[test]
     fn ddsketch_accuracy_params() {
         let mut w = workload(vec![AggType::Quantile]);
-        w.accuracy_sla = 0.005;
+        w.accuracy = crate::types_v2::AccuracyTarget::Epsilon(0.005);
         let plan = DeploymentPlanCompiler::new().plan(&w);
         match &plan.agent_config.sketch_params {
             SketchParams::DDSketch {
@@ -644,7 +640,7 @@ mod tests {
     #[test]
     fn hll_precision_coarse_sla() {
         let mut w = workload(vec![AggType::Cardinality]);
-        w.accuracy_sla = 0.03;
+        w.accuracy = crate::types_v2::AccuracyTarget::Epsilon(0.03);
         let plan = DeploymentPlanCompiler::new().plan(&w);
         match &plan.agent_config.sketch_params {
             SketchParams::HLL { precision } => {
@@ -730,6 +726,7 @@ mod tests {
             time_window: Duration::from_secs(300),
             repeat_every: None,
             accuracy_sla: 0.01,
+            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,

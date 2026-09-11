@@ -12,10 +12,9 @@
 //! working byte-for-byte. Code that wants to *consume* the new fields can
 //! pattern-match on them; code that doesn't care can ignore them.
 //!
-//! Nothing in this module is yet load-bearing for cost / binding decisions
-//! in `planner/`. That's a separate downstream change once the planner has
-//! an L4 rule engine to pivot on `AccuracyTarget` and a stage allocator
-//! that respects `QueryShape::Streaming`.
+//! Accuracy is shared with ASAPPlanner and resolved once at the compatibility
+//! boundary. The remaining shape/deployment fields retain their existing
+//! partial support; they are not silently promoted to executable capabilities.
 
 // Several types in this module (`BindingName`, the `new` / `as_str` helpers on `QueryId`
 // and `BindingName`) are intentionally part of the public surface but
@@ -61,6 +60,37 @@ pub fn accuracy_target_from_legacy_accuracy_sla(accuracy_sla: f64) -> AccuracyTa
         AccuracyTarget::Exact
     } else {
         AccuracyTarget::Epsilon((1.0 - accuracy_sla).max(0.0))
+    }
+}
+
+/// Resolve the public compatibility input once, preserving typed delta/exact semantics.
+pub fn resolve_accuracy_target(
+    typed: Option<&AccuracyTarget>,
+    legacy_confidence: f64,
+) -> Result<AccuracyTarget, String> {
+    let target = if let Some(target) = typed {
+        target.clone()
+    } else {
+        if !legacy_confidence.is_finite() || !(0.0..=1.0).contains(&legacy_confidence) {
+            return Err("accuracy_sla must be finite and in [0,1]".into());
+        }
+        accuracy_target_from_legacy_accuracy_sla(legacy_confidence)
+    };
+    let valid = match target {
+        AccuracyTarget::Exact => true,
+        AccuracyTarget::Epsilon(epsilon) => epsilon.is_finite() && (0.0..=1.0).contains(&epsilon),
+        AccuracyTarget::EpsilonDelta { epsilon, delta } => {
+            epsilon.is_finite()
+                && (0.0..=1.0).contains(&epsilon)
+                && delta.is_finite()
+                && delta > 0.0
+                && delta < 1.0
+        }
+    };
+    if valid {
+        Ok(target)
+    } else {
+        Err("invalid typed accuracy requirement".into())
     }
 }
 

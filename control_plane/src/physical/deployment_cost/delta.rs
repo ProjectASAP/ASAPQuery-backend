@@ -483,6 +483,7 @@ mod tests {
             time_window: Duration::from_secs(300),
             repeat_every: Some(Duration::from_secs(10)),
             accuracy_sla: 0.01,
+            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
