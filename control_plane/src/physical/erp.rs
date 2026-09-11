@@ -387,25 +387,134 @@ pub struct ErpObservedShapeSource {
     pub source: String,
     pub sketch: String,
     pub implementation: String,
+    /// Required for catalog-scoped online evidence; absent only for legacy
+    /// offline runtime records that contain a single shape.
+    #[serde(default)]
+    pub population_scope: Option<ErpPopulationObservationScope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ErpPopulationObservationScope {
+    pub catalog_generation: asap_types::sds::CatalogGeneration,
+    pub summary_definition_id: asap_types::sds::SummaryDefinitionId,
+    pub input_semantics: asap_types::erp_observation::ErpObservationInputSemantics,
+    pub freshness: asap_types::erp_observation::ErpObservationFreshness,
 }
 
 impl ErpPlanningInput {
+    /// Resolve evidence against the control plane's accepted catalog, never
+    /// descriptors supplied by the observation producer.
+    pub fn resolve_population_data_descriptor(
+        &mut self,
+        catalog: Option<&asap_types::summary_catalog::SummaryCatalog>,
+    ) {
+        self.resolved_data_descriptor = None;
+        let Some(populations) = self.observed_populations.as_mut() else {
+            return;
+        };
+        if populations.invalid_reason.is_some() {
+            return;
+        }
+        let resolved = (|| -> Result<_, String> {
+            let catalog = catalog.ok_or("no active authoritative catalog for ERP evidence")?;
+            let generation = catalog.reference().map_err(|error| error.to_string())?;
+            if generation != populations.catalog_generation {
+                return Err("ERP evidence catalog differs from the active catalog".into());
+            }
+            let materialization = catalog
+                .materializations
+                .get(&populations.summary_definition_id)
+                .ok_or("ERP evidence summary is absent from the active catalog")?;
+            let data = catalog
+                .data_descriptors
+                .get(&materialization.data_descriptor_id)
+                .ok_or("ERP evidence data descriptor is absent from the active catalog")?;
+            Ok(std::sync::Arc::new(data.clone()))
+        })();
+        match resolved {
+            Ok(data) => self.resolved_data_descriptor = Some(data),
+            Err(reason) => {
+                populations.invalid_reason = Some(reason);
+                populations.populations.clear();
+            }
+        }
+    }
+
     pub fn hydrate_observed_shape(
         &mut self,
         samples: &crate::runtime_samples::RuntimeSamplesStore,
     ) -> Result<(), String> {
-        if self.observed_shape.is_some() {
-            return Ok(());
-        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| format!("cannot timestamp ERP observation: {error}"))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| "ERP observation timestamp overflows milliseconds")?;
+        self.hydrate_observed_shape_at(samples, now_ms)
+    }
+
+    pub fn hydrate_observed_shape_at(
+        &mut self,
+        samples: &crate::runtime_samples::RuntimeSamplesStore,
+        now_ms: u64,
+    ) -> Result<(), String> {
         let Some(source) = &self.observed_shape_source else {
             return Ok(());
         };
+        // A reused planning request must resolve new evidence on every compile.
+        // Never keep an old inline or previously hydrated fit after drift.
+        self.observed_shape = None;
+        self.observed_populations = None;
         let key = crate::runtime_samples::SampleKey {
             source: source.source.clone(),
             sketch: source.sketch.clone(),
             impl_name: source.implementation.clone(),
         };
-        let record = samples.latest(&key).ok_or_else(|| {
+        let record = samples.latest(&key);
+        if let Some(scope) = &source.population_scope {
+            let resolved = (|| -> Result<_, String> {
+                let record = record
+                    .as_ref()
+                    .ok_or("no live ERP population observation")?;
+                let value = record
+                    .payload
+                    .get("erp_population_observations")
+                    .ok_or("latest runtime sample has no erp_population_observations")?;
+                let observed: asap_types::erp_observation::ErpPopulationObservations<
+                    ErpObservedShape,
+                > = serde_json::from_value(value.clone())
+                    .map_err(|error| format!("invalid ERP population observations: {error}"))?;
+                observed.validate_identity_and_freshness(
+                    &scope.catalog_generation,
+                    scope.summary_definition_id,
+                    now_ms,
+                    scope.freshness,
+                )?;
+                if observed.input_semantics != scope.input_semantics {
+                    return Err("ERP observation input semantics do not match the summary".into());
+                }
+                Ok(observed)
+            })();
+            // An explicit invalid envelope prevents selection from borrowing an
+            // older fit or falling back to the artifact's distribution identity.
+            // The normal ERP -> theoretical -> exact policy handles this miss.
+            self.observed_populations = Some(resolved.unwrap_or_else(|reason| {
+                asap_types::erp_observation::ErpPopulationObservations {
+                    schema_version: 1,
+                    catalog_generation: scope.catalog_generation.clone(),
+                    summary_definition_id: scope.summary_definition_id,
+                    observed_at_unix_ms: now_ms,
+                    window_start_ms: 0,
+                    window_end_ms: 0,
+                    input_semantics: scope.input_semantics,
+                    invalid_reason: Some(reason),
+                    populations: Vec::new(),
+                }
+            }));
+            return Ok(());
+        }
+        let record = record.ok_or_else(|| {
             format!(
                 "no runtime shape sample for {}/{}/{}",
                 source.source, source.sketch, source.implementation
@@ -1215,9 +1324,191 @@ mod tests {
             source: "edge-a".into(),
             sketch: "cms".into(),
             implementation: "oxide".into(),
+            population_scope: None,
         });
         policy.hydrate_observed_shape(&samples).unwrap();
         assert_eq!(policy.observed_shape.unwrap().cardinality, 1000);
+    }
+
+    fn online_population_fixture() -> (
+        ErpPlanningInput,
+        asap_types::erp_observation::ErpPopulationObservations<ErpObservedShape>,
+    ) {
+        use asap_types::erp_observation::*;
+        let generation = asap_types::sds::CatalogGeneration {
+            schema_version: 1,
+            plan_id: 7,
+            plan_version: 3,
+            snapshot_sha256: "test-catalog".into(),
+        };
+        let definition = asap_types::PolicyFingerprint(7).into();
+        let mut observer = ErpShapeObserver::new(4).unwrap();
+        for key in ["a", "a", "b", "b"] {
+            observer.observe(key, 0).unwrap();
+        }
+        let observed = ErpPopulationObservations {
+            schema_version: 1,
+            catalog_generation: generation.clone(),
+            summary_definition_id: definition,
+            observed_at_unix_ms: 1_000,
+            window_start_ms: 0,
+            window_end_ms: 1_000,
+            input_semantics: ErpObservationInputSemantics::UnitSampleFrequency,
+            invalid_reason: None,
+            populations: vec![ErpPopulationObservation {
+                population_id: asap_types::sds::SummaryInstanceId::new("partition-a").unwrap(),
+                shape: observer.snapshot().unwrap(),
+            }],
+        };
+        let mut policy = input(ErpAccuracyMode::Hybrid);
+        policy.observed_shape_source = Some(ErpObservedShapeSource {
+            source: "backend-a".into(),
+            sketch: "univmon".into(),
+            implementation: "asap_sketchlib".into(),
+            population_scope: Some(ErpPopulationObservationScope {
+                catalog_generation: generation,
+                summary_definition_id: definition,
+                input_semantics: ErpObservationInputSemantics::UnitSampleFrequency,
+                freshness: ErpObservationFreshness {
+                    max_age_ms: 100,
+                    max_future_skew_ms: 5,
+                },
+            }),
+        });
+        (policy, observed)
+    }
+
+    fn publish_population_fixture(
+        samples: &crate::runtime_samples::RuntimeSamplesStore,
+        payload: serde_json::Value,
+    ) {
+        samples.append_for_test(crate::runtime_samples::RuntimeRecord {
+            source: "backend-a".into(),
+            sketch: "univmon".into(),
+            impl_name: "asap_sketchlib".into(),
+            schema_version: 1,
+            payload,
+        });
+    }
+
+    /// New live evidence replaces hydrated fits; expiry invalidates them even
+    /// when a caller reuses the same planning request.
+    #[test]
+    fn online_hydration_refreshes_and_expires_population_evidence() {
+        let (mut policy, mut observed) = online_population_fixture();
+        let samples = crate::runtime_samples::RuntimeSamplesStore::new(4);
+        publish_population_fixture(
+            &samples,
+            serde_json::json!({"erp_population_observations": observed}),
+        );
+        policy.hydrate_observed_shape_at(&samples, 1_000).unwrap();
+        assert_eq!(
+            policy.observed_populations.as_ref().unwrap().populations[0]
+                .shape
+                .observation
+                .cardinality,
+            2
+        );
+        observed.populations[0].shape.observation.cardinality = 3;
+        observed.observed_at_unix_ms = 1_010;
+        publish_population_fixture(
+            &samples,
+            serde_json::json!({"erp_population_observations": observed}),
+        );
+        policy.hydrate_observed_shape_at(&samples, 1_010).unwrap();
+        assert_eq!(
+            policy.observed_populations.as_ref().unwrap().populations[0]
+                .shape
+                .observation
+                .cardinality,
+            3
+        );
+        policy.hydrate_observed_shape_at(&samples, 1_111).unwrap();
+        let invalid = policy.observed_populations.as_ref().unwrap();
+        assert!(invalid.populations.is_empty());
+        assert!(invalid.invalid_reason.as_deref().unwrap().contains("stale"));
+        assert!(policy.observed_shape.is_none());
+    }
+
+    /// Only the activated catalog may supply a candidate's data contract.
+    #[test]
+    fn online_population_descriptor_requires_authoritative_catalog() {
+        let snapshot: crate::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let (mut policy, mut observed) = online_population_fixture();
+        observed.catalog_generation = plan.summary_catalog.reference().unwrap();
+        observed.summary_definition_id =
+            *plan.summary_catalog.materializations.keys().next().unwrap();
+        policy.observed_populations = Some(observed.clone());
+        policy.resolve_population_data_descriptor(Some(&plan.summary_catalog));
+        let expected = &plan.summary_catalog.materializations[&observed.summary_definition_id]
+            .data_descriptor_id;
+        assert_eq!(
+            &policy.resolved_data_descriptor.as_ref().unwrap().id,
+            expected
+        );
+        policy.resolve_population_data_descriptor(None);
+        assert!(policy.resolved_data_descriptor.is_none());
+        assert!(policy
+            .observed_populations
+            .as_ref()
+            .unwrap()
+            .invalid_reason
+            .is_some());
+        assert!(policy
+            .observed_populations
+            .as_ref()
+            .unwrap()
+            .populations
+            .is_empty());
+    }
+
+    /// Missing, corrupt, foreign and overflow evidence must never recover a
+    /// previously accepted fit or the artifact's legacy distribution match.
+    #[test]
+    fn online_hydration_invalidates_unusable_latest_evidence() {
+        let (template, observed) = online_population_fixture();
+        let mut foreign = observed.clone();
+        foreign.catalog_generation.plan_version += 1;
+        let mut wrong_input = observed.clone();
+        wrong_input.input_semantics =
+            asap_types::erp_observation::ErpObservationInputSemantics::ScalarSampleValue;
+        let mut overflow = observed.clone();
+        overflow.invalid_reason = Some("population limit".into());
+        let mut future = observed.clone();
+        future.observed_at_unix_ms = 1_006;
+        for payload in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"erp_population_observations": foreign})),
+            Some(serde_json::json!({"erp_population_observations": wrong_input})),
+            Some(serde_json::json!({"erp_population_observations": overflow})),
+            Some(serde_json::json!({"erp_population_observations": future})),
+        ] {
+            let mut policy = template.clone();
+            policy.observed_shape = Some(observed.populations[0].shape.observation.clone());
+            let samples = crate::runtime_samples::RuntimeSamplesStore::new(4);
+            if let Some(payload) = payload {
+                publish_population_fixture(&samples, payload);
+            }
+            policy.hydrate_observed_shape_at(&samples, 1_000).unwrap();
+            let invalid = policy.observed_populations.as_ref().unwrap();
+            assert!(invalid.invalid_reason.is_some());
+            assert!(invalid.populations.is_empty());
+            assert!(policy.observed_shape.is_none());
+            assert!(matches!(
+                policy.select(
+                    SketchAlgorithm::Hll,
+                    0.05,
+                    SketchParams::Hll { precision: 12 }
+                ),
+                ErpParameterDecision::TheoreticalFallback { .. }
+            ));
+        }
     }
 
     #[test]

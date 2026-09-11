@@ -33,7 +33,7 @@ pub struct ErpPopulationObservations<Shape> {
     pub populations: Vec<ErpPopulationObservation<Shape>>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ErpObservationFreshness {
     pub max_age_ms: u64,
