@@ -1,5 +1,11 @@
 # Measured ERP Top-K dashboard comparison (v2)
 
+The committed v2 artifacts are historical wall-time measurements. Their ERP
+`*_cpu_seconds` fields were populated from elapsed wall time and must not be
+used as CPU evidence. The corrected runner measures process CPU time and rejects
+those old catalogs; recalibration into a fresh output directory is required.
+No corrected performance numbers have been substituted into the historical report.
+
 Supersedes the withdrawn v1 measurements. Values below are generated from release-mode raw data; they are not smoke-test results.
 
 Four TopK(10) frequency queries cover the latest 1, 5, 15, and 60 minutes. A new 30-second pane arrives before every dashboard refresh. Each trial evaluates 100 refreshes (400 panel queries), with exactly the same endpoints for all methods. Calibration uses the first 120 panes; held-out endpoints are 121–220. Update time includes warm-up and ingestion of all 220 panes. Events update sketches in their original order, one event per update.
