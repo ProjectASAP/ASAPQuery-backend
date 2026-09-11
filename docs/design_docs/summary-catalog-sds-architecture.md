@@ -457,11 +457,11 @@ input definition or transformation creates a new identity. Existing raw-source
 identities retain their previous byte representation. Catalog validation rejects
 missing input definitions and dependency cycles.
 
-This contract is a prerequisite, not enabled summary-over-summary execution.
-Installation currently rejects derived inputs so they cannot accidentally receive
-raw samples through the legacy metric router. Enabling them requires the immutable
-maintenance consumer and durable output deduplication protocol; neither raw-table
-substitution nor treating late correction fragments as new observations is valid.
+Installation still rejects derived inputs so they cannot accidentally receive
+raw samples through the legacy metric router. The explicit immutable maintenance
+entry point below must be wired into compiler construction and automatic
+scheduling before this guard is removed. Neither raw-table substitution nor
+treating late correction fragments as new observations is valid.
 
 ### Immutable completed windows
 
@@ -486,29 +486,6 @@ must atomically publish their output identity before claiming replay-safe consum
 The existing finite-source completeness proof still rejects untracked writes or
 pending admitted work. Continuous producer watermarks and derived-state commit
 transactions are separate from this finite-input boundary.
-
-### Derived summary input identity
-
-A summary computed from another summary has a different data source from the
-original raw table or metric. `PrecomputeMaterialization.derived_input` and
-`DataSourceIdentity::Derived` use the same `DerivedInputIdentity`: the referenced
-`SummaryDefinitionId`s and a SHA-256 of the maintenance program. The executable
-program remains in `OwnedPostAsapDag`; the catalog does not retain another copy.
-
-The signature replaces materialized input frontiers with stable summary IDs and
-hashes the remaining node payloads, schemas, guarantees, and edge semantics. It
-excludes query names, plan-local node numbering, and catalog generations. Literal
-leaves are hashed directly; raw input leaves still require catalog frontiers. A changed
-input definition or transformation creates a new identity. Existing raw-source
-identities retain their previous byte representation. Catalog validation rejects
-missing input definitions and dependency cycles.
-
-This contract is a prerequisite, not enabled summary-over-summary execution.
-Installation currently rejects derived inputs so they cannot accidentally receive
-raw samples through the legacy metric router. Enabling them requires the immutable
-maintenance consumer and durable output deduplication protocol; neither raw-table
-substitution nor treating late correction fragments as new observations is valid.
-
 ### Executing an immutable maintenance sink
 
 `precompute_engine::maintenance_runtime::execute_completed_maintenance` executes
