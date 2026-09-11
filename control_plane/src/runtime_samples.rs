@@ -71,6 +71,7 @@ pub struct RuntimeSamplesStats {
     pub records_stored: AtomicU64,
     pub records_evicted: AtomicU64,
     pub decode_errors: AtomicU64,
+    pub records_rejected: AtomicU64,
 }
 
 impl RuntimeSamplesStats {
@@ -80,6 +81,7 @@ impl RuntimeSamplesStats {
             records_stored: self.records_stored.load(Ordering::Relaxed),
             records_evicted: self.records_evicted.load(Ordering::Relaxed),
             decode_errors: self.decode_errors.load(Ordering::Relaxed),
+            records_rejected: self.records_rejected.load(Ordering::Relaxed),
         }
     }
 }
@@ -90,22 +92,80 @@ pub struct RuntimeSamplesStatsSnapshot {
     pub records_stored: u64,
     pub records_evicted: u64,
     pub decode_errors: u64,
+    pub records_rejected: u64,
 }
 
 /// Bounded FIFO ring buffer of runtime records, keyed by
-/// `(source, sketch, impl)`. Each key gets its own buffer so a
-/// chatty source can't starve a quiet one.
+/// `(source, sketch, impl)`. Each key has its own record cap. Global key and
+/// serialized-byte limits evict whole oldest keys; consumers see missing
+/// evidence rather than a partially retained observation.
 pub struct RuntimeSamplesStore {
-    buffers: RwLock<HashMap<SampleKey, VecDeque<RuntimeRecord>>>,
+    buffers: RwLock<RuntimeBuffers>,
     per_key_capacity: usize,
+    max_keys: usize,
+    max_json_bytes: usize,
     stats: Arc<RuntimeSamplesStats>,
+}
+
+#[derive(Default)]
+struct RuntimeBuffers {
+    by_key: HashMap<SampleKey, VecDeque<(RuntimeRecord, usize)>>,
+    insertion_order: VecDeque<SampleKey>,
+    json_bytes: usize,
+}
+
+impl RuntimeBuffers {
+    fn remove(&mut self, key: &SampleKey) -> usize {
+        self.insertion_order.retain(|stored| stored != key);
+        let Some(records) = self.by_key.remove(key) else {
+            return 0;
+        };
+        self.json_bytes -= records.iter().map(|(_, bytes)| bytes).sum::<usize>();
+        records.len()
+    }
+}
+
+// Count serialized bytes without allocating another copy of the observation.
+fn encoded_size(record: &RuntimeRecord, limit: usize) -> Option<usize> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self
+                .bytes
+                .checked_add(bytes.len())
+                .filter(|size| *size <= self.limit)
+                .ok_or_else(|| std::io::Error::other("runtime record exceeds byte budget"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Counter { bytes: 0, limit };
+    serde_json::to_writer(&mut count, record).ok()?;
+    Some(count.bytes)
 }
 
 impl RuntimeSamplesStore {
     pub fn new(per_key_capacity: usize) -> Arc<Self> {
+        Self::with_limits(per_key_capacity, 1024, 16 * 1024 * 1024)
+    }
+
+    /// Limits serialized retained metadata bytes, not allocator RSS. A zero
+    /// limit disables retention; rejected latest records invalidate older fits.
+    pub fn with_limits(
+        per_key_capacity: usize,
+        max_keys: usize,
+        max_json_bytes: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            buffers: RwLock::new(HashMap::new()),
+            buffers: RwLock::new(RuntimeBuffers::default()),
             per_key_capacity,
+            max_keys,
+            max_json_bytes,
             stats: Arc::new(RuntimeSamplesStats::default()),
         })
     }
@@ -120,45 +180,86 @@ impl RuntimeSamplesStore {
 
     #[cfg(test)]
     pub(crate) fn append_for_test(&self, rec: RuntimeRecord) {
-        self.append(rec)
+        self.append(rec);
     }
 
-    fn append(&self, rec: RuntimeRecord) {
+    fn invalidate(&self, key: &SampleKey) {
+        let removed = self.buffers.write().remove(key);
+        self.stats
+            .records_evicted
+            .fetch_add(removed as u64, Ordering::Relaxed);
+    }
+
+    fn append(&self, rec: RuntimeRecord) -> bool {
         let key = SampleKey {
             source: rec.source.clone(),
             sketch: rec.sketch.clone(),
             impl_name: rec.impl_name.clone(),
         };
-        let mut map = self.buffers.write();
-        let buf = map
-            .entry(key)
-            .or_insert_with(|| VecDeque::with_capacity(self.per_key_capacity));
-        if buf.len() >= self.per_key_capacity {
-            buf.pop_front();
-            self.stats.records_evicted.fetch_add(1, Ordering::Relaxed);
+        let size = encoded_size(&rec, self.max_json_bytes);
+        if self.per_key_capacity == 0 || self.max_keys == 0 || size.is_none() {
+            self.invalidate(&key);
+            self.stats.records_rejected.fetch_add(1, Ordering::Relaxed);
+            return false;
         }
-        buf.push_back(rec);
+        let size = size.unwrap();
+        let mut buffers = self.buffers.write();
+        if let Some(records) = buffers.by_key.get_mut(&key) {
+            if records.len() >= self.per_key_capacity {
+                let (_, bytes) = records.pop_front().unwrap();
+                buffers.json_bytes -= bytes;
+                self.stats.records_evicted.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        while (buffers.by_key.len() >= self.max_keys && !buffers.by_key.contains_key(&key))
+            || buffers.json_bytes.saturating_add(size) > self.max_json_bytes
+        {
+            let oldest = buffers
+                .insertion_order
+                .front()
+                .cloned()
+                .expect("retained keys have an order");
+            let removed = buffers.remove(&oldest);
+            self.stats
+                .records_evicted
+                .fetch_add(removed as u64, Ordering::Relaxed);
+        }
+        if !buffers.by_key.contains_key(&key) {
+            buffers.insertion_order.push_back(key.clone());
+        }
+        buffers
+            .by_key
+            .entry(key)
+            .or_default()
+            .push_back((rec, size));
+        buffers.json_bytes += size;
         self.stats.records_stored.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Peek the latest record for a given key, or `None` if the
     /// key has never been seen. Used by the replanner /
     /// decision loop to read freshness signals.
     pub fn latest(&self, key: &SampleKey) -> Option<RuntimeRecord> {
-        self.buffers.read().get(key).and_then(|b| b.back().cloned())
+        self.buffers
+            .read()
+            .by_key
+            .get(key)
+            .and_then(|b| b.back().map(|(record, _)| record.clone()))
     }
 
     /// Snapshot the full ring for a key. O(n) clone; non-hot-path only.
     pub fn snapshot(&self, key: &SampleKey) -> Vec<RuntimeRecord> {
         self.buffers
             .read()
+            .by_key
             .get(key)
-            .map(|b| b.iter().cloned().collect())
+            .map(|b| b.iter().map(|(record, _)| record.clone()).collect())
             .unwrap_or_default()
     }
 
     pub fn keys(&self) -> Vec<SampleKey> {
-        self.buffers.read().keys().cloned().collect()
+        self.buffers.read().by_key.keys().cloned().collect()
     }
 }
 
@@ -208,7 +309,12 @@ impl RuntimeSamples for RuntimeSamplesService {
                         .stats
                         .decode_errors
                         .fetch_add(1, Ordering::Relaxed);
-                    tracing::warn!(error = %e, "runtime-samples: malformed payload_json, skipping");
+                    self.store.invalidate(&SampleKey {
+                        source: pb.source.clone(),
+                        sketch: pb.sketch.clone(),
+                        impl_name: pb.impl_name.clone(),
+                    });
+                    tracing::warn!(error = %e, "runtime-samples: malformed payload_json, invalidating source evidence");
                     continue;
                 }
             };
@@ -228,8 +334,9 @@ impl RuntimeSamples for RuntimeSamplesService {
                 schema_version: pb.schema_version,
                 payload,
             };
-            self.store.append(rec);
-            accepted += 1;
+            if self.store.append(rec) {
+                accepted += 1;
+            }
         }
         Ok(tonic::Response::new(PushAck { accepted }))
     }
@@ -303,6 +410,94 @@ mod tests {
         let snap = store.stats.snapshot();
         assert_eq!(snap.records_stored, 2);
         assert_eq!(snap.decode_errors, 1);
+    }
+
+    /// Replanning can create new definition keys forever; retain only a bounded
+    /// set and expose eviction as missing evidence.
+    #[tokio::test]
+    async fn global_key_limit_evicts_whole_oldest_source() {
+        let store = RuntimeSamplesStore::with_limits(4, 2, 16_384);
+        let svc = RuntimeSamplesService::new(Arc::clone(&store));
+        for source in ["old", "current", "new"] {
+            let ack = svc
+                .push(tonic::Request::new(PushBatch {
+                    records: vec![make_pb_record(source, "hll", "runtime", 10.0)],
+                }))
+                .await
+                .unwrap();
+            assert_eq!(ack.into_inner().accepted, 1);
+        }
+        assert_eq!(store.keys().len(), 2);
+        assert!(store
+            .latest(&SampleKey {
+                source: "old".into(),
+                sketch: "hll".into(),
+                impl_name: "runtime".into()
+            })
+            .is_none());
+        assert_eq!(store.stats.snapshot().records_evicted, 1);
+    }
+
+    /// Byte pressure never truncates population fits inside an observation.
+    #[tokio::test]
+    async fn byte_budget_and_oversized_latest_invalidate_old_evidence() {
+        let store = RuntimeSamplesStore::with_limits(10, 10, 600);
+        let svc = RuntimeSamplesService::new(Arc::clone(&store));
+        for source in ["a", "b", "c", "d"] {
+            svc.push(tonic::Request::new(PushBatch {
+                records: vec![make_pb_record(source, "hll", "runtime", 10.0)],
+            }))
+            .await
+            .unwrap();
+            assert!(store.buffers.read().json_bytes <= 600);
+        }
+        assert!(store.stats.snapshot().records_evicted > 0);
+        let key = SampleKey {
+            source: "d".into(),
+            sketch: "hll".into(),
+            impl_name: "runtime".into(),
+        };
+        assert!(store.latest(&key).is_some());
+        let mut oversized = make_pb_record("d", "hll", "runtime", 10.0);
+        oversized.payload_json = serde_json::json!({"large": "x".repeat(1000)}).to_string();
+        let ack = svc
+            .push(tonic::Request::new(PushBatch {
+                records: vec![oversized],
+            }))
+            .await
+            .unwrap();
+        assert_eq!(ack.into_inner().accepted, 0);
+        assert!(store.latest(&key).is_none());
+        assert_eq!(store.stats.snapshot().records_rejected, 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_latest_and_disabled_retention_cannot_leave_old_fit() {
+        let store = RuntimeSamplesStore::new(2);
+        let svc = RuntimeSamplesService::new(Arc::clone(&store));
+        let mut record = make_pb_record("a", "hll", "runtime", 10.0);
+        svc.push(tonic::Request::new(PushBatch {
+            records: vec![record.clone()],
+        }))
+        .await
+        .unwrap();
+        record.payload_json = "{".into();
+        svc.push(tonic::Request::new(PushBatch {
+            records: vec![record],
+        }))
+        .await
+        .unwrap();
+        assert!(store.keys().is_empty());
+        let disabled = RuntimeSamplesStore::with_limits(0, 2, 600);
+        let service = RuntimeSamplesService::new(Arc::clone(&disabled));
+        let ack = service
+            .push(tonic::Request::new(PushBatch {
+                records: vec![make_pb_record("a", "hll", "runtime", 10.0)],
+            }))
+            .await
+            .unwrap();
+        assert_eq!(ack.into_inner().accepted, 0);
+        assert!(disabled.keys().is_empty());
     }
 
     #[tokio::test]
