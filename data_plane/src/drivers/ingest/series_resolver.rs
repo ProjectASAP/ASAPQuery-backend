@@ -827,6 +827,31 @@ fn read_one_record(f: &mut File) -> ReadOne {
 /// lexicographically. Mirrors
 /// `opentelemetry-go-patch/exporters/otlp/otlpmetric/otlpmetricgrpc/
 /// internal/series/dictionary.go::attributesFingerprint`.
+/// Select the population key protocol explicitly carried by the policy identity.
+/// Legacy bytes remain unchanged; canonical keys reject ambiguous duplicate names.
+pub fn population_attrs_fingerprint(
+    encoding: asap_types::PopulationKeyEncoding,
+    attrs: &[(&str, &str)],
+) -> Result<String, String> {
+    match encoding {
+        asap_types::PopulationKeyEncoding::LegacyDelimited => {
+            Ok(canonical_attrs_fingerprint(attrs))
+        }
+        asap_types::PopulationKeyEncoding::CanonicalLabelsV1 => {
+            let mut labels = std::collections::BTreeMap::new();
+            for (name, value) in attrs {
+                if labels
+                    .insert((*name).to_string(), (*value).to_string())
+                    .is_some()
+                {
+                    return Err("duplicate population label name".into());
+                }
+            }
+            asap_types::grouping_projection::encode_label_population_key(&labels)
+        }
+    }
+}
+
 pub fn canonical_attrs_fingerprint(attrs: &[(&str, &str)]) -> String {
     let mut sorted: Vec<(&str, &str)> = attrs.to_vec();
     sorted.sort_by(|a, b| a.0.cmp(b.0));
@@ -849,6 +874,36 @@ mod tests {
     /// equality. Production callers compute this via
     /// `AggKind::canonical_string()`.
     const TEST_AGG: &str = "sketch:DDSketch:D:0.01";
+
+    #[test]
+    fn versioned_population_routing_separates_delimiter_collisions() {
+        use asap_types::PopulationKeyEncoding::{CanonicalLabelsV1, LegacyDelimited};
+        let a = [("a", "b;c=d")];
+        let b = [("a", "b"), ("c", "d")];
+        assert_eq!(
+            population_attrs_fingerprint(LegacyDelimited, &a).unwrap(),
+            "a=b;c=d;"
+        );
+        assert_eq!(
+            population_attrs_fingerprint(LegacyDelimited, &a),
+            population_attrs_fingerprint(LegacyDelimited, &b)
+        );
+        let ka = population_attrs_fingerprint(CanonicalLabelsV1, &a).unwrap();
+        let kb = population_attrs_fingerprint(CanonicalLabelsV1, &b).unwrap();
+        assert_ne!(ka, kb);
+        assert_eq!(
+            kb,
+            population_attrs_fingerprint(CanonicalLabelsV1, &[("c", "d"), ("a", "b")]).unwrap()
+        );
+        let resolver = SeriesIdResolver::new();
+        assert_ne!(
+            resolver.resolve("m", &ka, TEST_AGG),
+            resolver.resolve("m", &kb, TEST_AGG)
+        );
+        assert!(
+            population_attrs_fingerprint(CanonicalLabelsV1, &[("a", "1"), ("a", "2")]).is_err()
+        );
+    }
 
     #[test]
     fn idempotent_same_input_same_sid() {

@@ -9,6 +9,35 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
+/// Check the initial executable maintenance population reductions against the
+/// installed configuration. Indexed reductions need authoritative column mapping
+/// and are not admitted by this bounded capability check.
+pub fn validate_maintenance_reduction(
+    config: &crate::PrecomputeMaterialization,
+    node: &planner_types::post_asap::ExecutableDagNode,
+) -> Result<(), String> {
+    use crate::sds::PopulationPartitioning;
+    use planner_types::{post_asap::ExecutableOperatorPayload, pre_asap::Reduction};
+    match &node.payload {
+        ExecutableOperatorPayload::SummaryAgg {
+            reduction: Reduction::PerEntity,
+            ..
+        } if config.partitioning == Some(PopulationPartitioning::PerEntity) => Ok(()),
+        ExecutableOperatorPayload::SummaryAgg {
+            reduction: Reduction::Reduce(keys),
+            ..
+        } if keys.is_empty()
+            && config.partitioning == Some(PopulationPartitioning::Grouped)
+            && config.grouping_labels.is_empty() =>
+        {
+            Ok(())
+        }
+        _ => Err(
+            "maintenance reduction does not match supported configured population grouping".into(),
+        ),
+    }
+}
+
 /// Validate the physical windows consumed by one derived input program.
 /// This returns the existing source definitions, not a second serialized
 /// contract. It does not prove completion or authorize runtime execution.
@@ -440,12 +469,10 @@ impl PrecomputePlan {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             validated_source_window_cohort(config, &sources)?;
-            if sources.iter().any(|source| {
-                !matches!(
-                    source.aggregation_type,
-                    crate::AggregationType::Sum
-                )
-            }) {
+            if sources
+                .iter()
+                .any(|source| !matches!(source.aggregation_type, crate::AggregationType::Sum))
+            {
                 return Err(invalid());
             }
             if config.window_size != config.slide_interval {
@@ -464,6 +491,13 @@ impl PrecomputePlan {
                     {
                         continue;
                     }
+                    let target_node = dag
+                        .nodes
+                        .iter()
+                        .find(|node| node.id == *sink)
+                        .ok_or_else(invalid)?;
+                    validate_maintenance_reduction(config, target_node)
+                        .map_err(PrecomputePlanError::CatalogContract)?;
                     let inputs: Vec<_> = dag
                         .edges
                         .iter()
@@ -829,6 +863,50 @@ mod source_window_cohort_tests {
         }))
         .unwrap()
     }
+    #[test]
+    fn maintenance_reduction_requires_matching_explicit_population_contract() {
+        use planner_types::post_asap::*;
+        use planner_types::pre_asap::Reduction;
+        let mut config = full_window();
+        config.partitioning = Some(crate::sds::PopulationPartitioning::Grouped);
+        let mut node = ExecutableDagNode {
+            id: PostAsapNodeId(1),
+            operator: ExecutableOperator::SummaryAgg,
+            payload: ExecutableOperatorPayload::SummaryAgg {
+                family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
+                input: SummaryUpdate {
+                    item: None,
+                    weight: SummaryInputExpr::Constant(1.0),
+                    weight_domain: Default::default(),
+                },
+                reduction: Reduction::by(vec![]),
+                grouping: Default::default(),
+            },
+            output_state: ExecutionDataState::MAINTENANCE_SUMMARY,
+            output_schema: SummarySchema {
+                fields: vec![],
+                time_index: None,
+            },
+            guarantee: None,
+        };
+        assert!(validate_maintenance_reduction(&config, &node).is_ok());
+        config.partitioning = Some(crate::sds::PopulationPartitioning::PerEntity);
+        assert!(validate_maintenance_reduction(&config, &node).is_err());
+        if let ExecutableOperatorPayload::SummaryAgg { reduction, .. } = &mut node.payload {
+            *reduction = Reduction::PerEntity;
+        }
+        assert!(validate_maintenance_reduction(&config, &node).is_ok());
+        config.partitioning = Some(crate::sds::PopulationPartitioning::Grouped);
+        if let ExecutableOperatorPayload::SummaryAgg { reduction, .. } = &mut node.payload {
+            *reduction = Reduction::by(vec![0]);
+        }
+        assert!(validate_maintenance_reduction(&config, &node).is_err());
+        config.partitioning = None;
+        assert!(validate_maintenance_reduction(&config, &node).is_err());
+        node.payload = ExecutableOperatorPayload::SummaryMerge;
+        assert!(validate_maintenance_reduction(&config, &node).is_err());
+    }
+
     #[test]
     fn canonical_population_encoding_is_not_yet_installable() {
         let mut config = full_window();
