@@ -254,8 +254,13 @@ fn finalize_exact(
     let [field] = node.output_schema.fields.as_slice() else {
         return Err("exact maintenance finalization requires one scalar output column".into());
     };
-    if !matches!(field.dtype, SummaryFamilyType::Plain(_)) {
-        return Err("exact maintenance finalization output must be a plain value".into());
+    if !matches!(
+        field.dtype,
+        SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Float64)
+    ) {
+        return Err(
+            "exact maintenance finalization currently requires a Float64 output column".into(),
+        );
     }
     let values = states
         .into_iter()
@@ -1606,6 +1611,18 @@ mod tests {
             panic!("expected finalized row")
         };
         assert_eq!(values, vec![(2_000, 9.0)]);
+        read.output_schema.fields[0].dtype =
+            SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Int64);
+        let integer_state = Arc::new(MaintenanceValue::Summary {
+            state: sum(9.0),
+            family: Some(SummaryFamilyType::ExactAggregate(
+                ExactKind::Sum,
+                ExactParams::Sum,
+            )),
+        });
+        assert!(
+            matches!(finalize_exact(&read, &[integer_state]), Err(error) if error.contains("Float64"))
+        );
     }
 
     #[test]
