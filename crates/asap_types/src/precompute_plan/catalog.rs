@@ -86,15 +86,19 @@ impl PrecomputePlan {
                 .map_or(ValueProjectionIdentity::SampleValue, |name| {
                     ValueProjectionIdentity::Column { name: name.clone() }
                 });
-            if data.source != expected_source
+            if data.partitioning != config.partitioning
+                || data.timestamp_column != config.table_timestamp_column
+                || data.source != expected_source
                 || data.value_projection != expected_projection
                 || data.population_filter_canonical
-                    != crate::utils::normalize_spatial_filter(&config.spatial_filter)
+                    != config.population_filter_canonical().map_err(invalid)?
                 || data.group_by_keys != config.grouping_labels.labels.iter().cloned().collect()
             {
                 return Err(invalid("source/population/grouping differs from catalog"));
             }
-            if config.spatial_filter_normalized != data.population_filter_canonical {
+            if config.spatial_filter_normalized
+                != crate::utils::normalize_spatial_filter(&config.spatial_filter)
+            {
                 return Err(invalid("normalized population predicate drift"));
             }
             let schema = self

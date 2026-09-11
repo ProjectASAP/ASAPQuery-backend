@@ -100,6 +100,8 @@ pub struct PrecomputeMaterialization {
     pub aggregation_sub_type: String,
     pub parameters: HashMap<String, Value>,
     pub grouping_labels: KeyByLabelNames,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitioning: Option<crate::sds::PopulationPartitioning>,
     pub aggregated_labels: KeyByLabelNames,
     pub rollup_labels: KeyByLabelNames,
     pub original_yaml: String,
@@ -126,6 +128,19 @@ pub struct PrecomputeMaterialization {
     // SQL-specific fields (optional, used when query_language=sql)
     pub table_name: Option<String>,   // SQL mode: table name
     pub value_column: Option<String>, // SQL mode: which value column to aggregate
+    /// Table timestamp projection, in Unix milliseconds.
+    #[serde(
+        default,
+        alias = "tableTimestampColumn",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub table_timestamp_column: Option<String>,
+    #[serde(
+        default,
+        alias = "tablePopulation",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub table_population: Option<crate::table_population::TablePopulation>,
 }
 
 /// Policy-match handles for both the key and value dimensions of a
@@ -162,6 +177,29 @@ impl AggregationIdInfo {
 pub type AggregationConfig = PrecomputeMaterialization;
 
 impl PrecomputeMaterialization {
+    pub fn population_filter_canonical(&self) -> Result<String, String> {
+        if let Some(column) = &self.table_timestamp_column {
+            if self.table_name.is_none() || column.is_empty() {
+                return Err("table timestamp projection requires a table and a column".into());
+            }
+            crate::table_population::validate_column_name(column)?;
+        }
+        if self.table_name.is_some() && !self.spatial_filter.is_empty() {
+            return Err("table populations cannot use a PromQL label filter".into());
+        }
+        if let Some(population) = &self.table_population {
+            if self.table_name.is_none() || !self.spatial_filter.is_empty() {
+                return Err(
+                    "typed table population requires a table and no PromQL label filter".into(),
+                );
+            }
+            population.validate()?;
+            Ok(population.canonical())
+        } else {
+            Ok(normalize_spatial_filter(&self.spatial_filter))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         aggregation_type: AggregationType,
@@ -189,6 +227,7 @@ impl PrecomputeMaterialization {
             aggregation_sub_type,
             parameters,
             grouping_labels,
+            partitioning: None,
             aggregated_labels,
             rollup_labels,
             original_yaml,
@@ -209,6 +248,8 @@ impl PrecomputeMaterialization {
             num_aggregates_to_retain,
             table_name,
             value_column,
+            table_population: None,
+            table_timestamp_column: None,
         }
     }
 
@@ -317,7 +358,25 @@ impl PrecomputeMaterialization {
             table_name,
             value_column,
         );
+        config.partitioning = data
+            .get("partitioning")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?;
         config.pane_origin_ms = pane_origin_ms;
+        config.table_timestamp_column = data
+            .get("tableTimestampColumn")
+            .or_else(|| data.get("table_timestamp_column"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        config.table_population = data
+            .get("tablePopulation")
+            .or_else(|| data.get("table_population"))
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?;
+        config.population_filter_canonical()?;
         Ok(config)
     }
 
@@ -456,7 +515,27 @@ impl PrecomputeMaterialization {
             table_name,
             value_column,
         );
+        config.partitioning = aggregation_data
+            .get("partitioning")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_yaml::from_value(value.clone()))
+            .transpose()?;
         config.pane_origin_ms = pane_origin_ms;
+        config.table_timestamp_column = aggregation_data
+            .get("tableTimestampColumn")
+            .or_else(|| aggregation_data.get("table_timestamp_column"))
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::to_owned);
+        config.table_population = aggregation_data
+            .get("tablePopulation")
+            .or_else(|| aggregation_data.get("table_population"))
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(serde_yaml::from_value)
+            .transpose()?;
+        config
+            .population_filter_canonical()
+            .map_err(anyhow::Error::msg)?;
         Ok(config)
     }
 }
@@ -469,6 +548,7 @@ impl SerializableToSink for PrecomputeMaterialization {
             "aggregationType": self.aggregation_type,
             "aggregationSubType": self.aggregation_sub_type,
             "parameters": self.parameters,
+            "partitioning": self.partitioning,
             "originalYaml": self.original_yaml,
             "windowSize": self.window_size,
             "slideInterval": self.slide_interval,
@@ -491,6 +571,12 @@ impl SerializableToSink for PrecomputeMaterialization {
         }
         if let Some(ref value_column) = self.value_column {
             json["valueColumn"] = serde_json::json!(value_column);
+        }
+        if let Some(ref population) = self.table_population {
+            json["tablePopulation"] = serde_json::json!(population);
+        }
+        if let Some(ref column) = self.table_timestamp_column {
+            json["tableTimestampColumn"] = serde_json::json!(column);
         }
 
         json

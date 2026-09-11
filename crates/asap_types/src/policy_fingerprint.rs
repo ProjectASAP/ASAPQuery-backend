@@ -28,8 +28,9 @@
 //!   semantics — two policies with the same shape but different
 //!   retention are *the same policy* for ingest/query routing
 //!   purposes; retention is a separate concern).
-//! - `table_name` / `value_column` (SQL-mode wire shape; folded into
-//!   `metric` upstream for time-series mode).
+//! SQL source table, value projection, timestamp projection, and typed
+//! population are included explicitly; the output metric is not a substitute
+//! for these source semantics.
 //!
 //! ## Hash function
 //!
@@ -114,6 +115,10 @@ impl PolicyFingerprint {
         }
         buf.push(0);
 
+        if let Some(partitioning) = cfg.partitioning {
+            buf.extend_from_slice(format!("partition:{partitioning:?}\0").as_bytes());
+        }
+
         // 5. grouping_labels (already sorted at construction per
         //    KeyByLabelNames invariant; encode as `,`-joined list)
         for l in &cfg.grouping_labels.labels {
@@ -171,6 +176,25 @@ impl PolicyFingerprint {
 
         // 10. spatial_filter_normalized — canonicalized predicate
         buf.extend_from_slice(cfg.spatial_filter_normalized.as_bytes());
+        if let Some(table) = &cfg.table_name {
+            buf.extend_from_slice(b"\0sql-source-v1\0");
+            buf.extend_from_slice(table.as_bytes());
+            buf.push(0);
+            if let Some(column) = &cfg.value_column {
+                buf.extend_from_slice(column.as_bytes());
+            }
+        }
+        if let Some(population) = &cfg.table_population {
+            let canonical = population.canonical();
+            if !canonical.is_empty() {
+                buf.push(0);
+                buf.extend_from_slice(canonical.as_bytes());
+            }
+        }
+        if let Some(column) = &cfg.table_timestamp_column {
+            buf.extend_from_slice(b"\0timestamp-ms\0");
+            buf.extend_from_slice(column.as_bytes());
+        }
 
         Self(xxh64(&buf, 0))
     }

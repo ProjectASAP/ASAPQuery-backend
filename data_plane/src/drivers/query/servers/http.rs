@@ -3673,6 +3673,9 @@ aggregations:
                 num_aggregates_to_retain: None,
                 table_name: None,
                 value_column: None,
+                table_population: None,
+                table_timestamp_column: None,
+                partitioning: None,
             };
             // PR 5: streaming-config is keyed on the policy
             // fingerprint. Build a marker→fingerprint map so the test
