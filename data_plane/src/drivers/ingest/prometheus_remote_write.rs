@@ -201,6 +201,13 @@ impl PrometheusRemoteWriteReceiver {
             .ingest
             .sketch_index
             .seal_finite_summary_input(&generation)?;
+        if let Some(observer) = self.inner.ingest.router.erp_observer() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_millis() as u64;
+            observer.publish_finite(&generation, now_ms).await?;
+        }
         trim_process_allocator();
         Ok(())
     }

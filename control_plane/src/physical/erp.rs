@@ -31,6 +31,10 @@ pub struct ErpShapeObserver {
 }
 
 impl ErpShapeObserver {
+    pub fn observed_key_count(&self) -> usize {
+        self.frequencies.len()
+    }
+
     pub fn new(max_observed_keys: usize) -> Result<Self, &'static str> {
         Self::with_limits(max_observed_keys, 256)
     }
