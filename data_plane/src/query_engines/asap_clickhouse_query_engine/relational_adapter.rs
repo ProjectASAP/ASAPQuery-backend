@@ -1,6 +1,7 @@
 //! ClickHouse row semantics for planner-owned relational wrappers.
 
 mod aggregate;
+mod collection;
 
 use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
 
@@ -42,6 +43,7 @@ enum Cell {
     Timestamp(i64),
     Map(Vec<(Cell, Cell)>),
     List(Arc<[Cell]>),
+    Struct(Arc<[Cell]>),
 }
 
 fn json_cell(
@@ -75,9 +77,25 @@ fn json_cell(
                     .into(),
             ))
         }
-        DataType::Struct { .. } => Err(ClickHouseRelationalError::Unsupported(
-            "struct value transport".into(),
-        )),
+        DataType::Struct { fields } => {
+            let types =
+                collection::tuple_field_types(clickhouse_type, fields).ok_or_else(invalid)?;
+            let items = value
+                .as_array()
+                .filter(|items| items.len() == fields.len())
+                .ok_or_else(invalid)?;
+            Ok(Cell::Struct(
+                items
+                    .iter()
+                    .zip(fields)
+                    .zip(types)
+                    .map(|((item, field), native)| {
+                        json_cell(item, &field.dtype, field.nullable, native)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into(),
+            ))
+        }
         DataType::Int64 => value.as_i64().map(Cell::Int64).ok_or_else(invalid),
         DataType::Float64 => value.as_f64().map(Cell::Float64).ok_or_else(invalid),
         DataType::Utf8 => value
@@ -289,20 +307,11 @@ impl ClickHouseRelation {
 
 fn map_type_parts(actual: &str) -> Option<(&str, &str)> {
     let inner = actual.trim().strip_prefix("Map(")?.strip_suffix(')')?;
-    let mut depth = 0_i32;
-    let mut quoted = false;
-    for (index, ch) in inner.char_indices() {
-        match ch {
-            '\'' => quoted = !quoted,
-            '(' if !quoted => depth += 1,
-            ')' if !quoted => depth -= 1,
-            ',' if !quoted && depth == 0 => {
-                return Some((inner[..index].trim(), inner[index + 1..].trim()))
-            }
-            _ => {}
-        }
-    }
-    None
+    let args = collection::arguments(inner)?;
+    let [key, value] = args.as_slice() else {
+        return None;
+    };
+    Some((*key, *value))
 }
 
 fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: bool) -> bool {
@@ -331,7 +340,9 @@ fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: 
                         clickhouse_type_matches(Some(inner), &element.dtype, element.nullable)
                     })
         }
-        DataType::Struct { .. } => false,
+        DataType::Struct { fields } => {
+            !nullable && collection::tuple_field_types(actual, fields).is_some()
+        }
         DataType::Int64 => actual == "Int64",
         DataType::Float64 => actual == "Float64",
         DataType::Utf8 => actual == "String",
@@ -578,6 +589,37 @@ fn eval(
         }
         QueryExpr::FunctionCall { name, args } => {
             use planner_types::pre_asap::scalar_signature::MapScalarFunction;
+            if name.eq_ignore_ascii_case("asap_struct_field") {
+                expr.scalar_type(schema)
+                    .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?;
+                let DataType::Struct { fields } = args[0]
+                    .scalar_type(schema)
+                    .map_err(|error| ClickHouseRelationalError::Invalid(error.to_string()))?
+                    .0
+                else {
+                    unreachable!()
+                };
+                let offset = match &args[1] {
+                    QueryExpr::Literal(ScalarValue::Int64(index)) => {
+                        usize::try_from(index - 1).ok()
+                    }
+                    QueryExpr::Literal(ScalarValue::Utf8(name)) => {
+                        fields.iter().position(|field| &field.name == name)
+                    }
+                    _ => None,
+                }
+                .ok_or_else(|| {
+                    ClickHouseRelationalError::Invalid("struct field selector".into())
+                })?;
+                let Cell::Struct(values) = eval(&args[0], row, schema)? else {
+                    return Err(ClickHouseRelationalError::Invalid(
+                        "struct field input".into(),
+                    ));
+                };
+                return values.get(offset).cloned().ok_or_else(|| {
+                    ClickHouseRelationalError::Invalid("struct field value".into())
+                });
+            }
             if name.eq_ignore_ascii_case("asap_element_access") {
                 let (output_type, _) = expr
                     .scalar_type(schema)
@@ -717,6 +759,13 @@ fn default_collection_element(
         DataType::Bool => Cell::Bool(false),
         DataType::Map { .. } => Cell::Map(Vec::new()),
         DataType::List { .. } => Cell::List(Arc::from([])),
+        DataType::Struct { fields } => Cell::Struct(
+            fields
+                .iter()
+                .map(|field| default_collection_element(&field.dtype, field.nullable))
+                .collect::<Result<Vec<_>, _>>()?
+                .into(),
+        ),
         _ => {
             return Err(ClickHouseRelationalError::Unsupported(
                 "collection missing-element default type".into(),
@@ -845,7 +894,7 @@ fn compare_sort_keys(
 fn contains_nan(value: &Cell) -> bool {
     match value {
         Cell::Float64(value) => value.is_nan(),
-        Cell::List(values) => values.iter().any(contains_nan),
+        Cell::List(values) | Cell::Struct(values) => values.iter().any(contains_nan),
         Cell::Map(entries) => entries
             .iter()
             .any(|(key, value)| contains_nan(key) || contains_nan(value)),
@@ -1185,6 +1234,63 @@ mod tests {
             ],
         );
         assert!(eval(&zero, &[Cell::List(Arc::from([])), Cell::Int64(0)], &schema).is_err());
+    }
+
+    #[test]
+    fn nested_array_tuple_access_preserves_fields_and_defaults() {
+        use planner_types::pre_asap::{Column, Schema};
+        let tuple = DataType::Struct {
+            fields: vec![
+                Column::new("ts", DataType::Int64, false),
+                Column::new("value", DataType::Float64, true),
+            ],
+        };
+        let dtype = DataType::List {
+            element: Box::new(Column::new("item", tuple, false)),
+        };
+        let native = "Array(Tuple(ts Int64, value Nullable(Float64)))";
+        assert!(clickhouse_type_matches(Some(native), &dtype, false));
+        let samples = json_cell(
+            &serde_json::json!([[9007199254740993_i64, 2.5], [7, null]]),
+            &dtype,
+            false,
+            native,
+        )
+        .unwrap();
+        let schema = Schema::new(vec![Column::new("samples", dtype, false)]);
+        let field = |index, name: &str| QueryExpr::FunctionCall {
+            name: "asap_struct_field".into(),
+            args: vec![
+                QueryExpr::FunctionCall {
+                    name: "asap_element_access".into(),
+                    args: vec![
+                        QueryExpr::Column(0),
+                        QueryExpr::Literal(ScalarValue::Int64(index)),
+                    ],
+                },
+                QueryExpr::Literal(ScalarValue::Utf8(name.into())),
+            ],
+        };
+        assert_eq!(
+            eval(&field(1, "ts"), std::slice::from_ref(&samples), &schema).unwrap(),
+            Cell::Int64(9007199254740993)
+        );
+        assert_eq!(
+            eval(&field(1, "value"), std::slice::from_ref(&samples), &schema).unwrap(),
+            Cell::Float64(2.5)
+        );
+        assert_eq!(
+            eval(&field(-1, "value"), std::slice::from_ref(&samples), &schema).unwrap(),
+            Cell::Null
+        );
+        assert_eq!(
+            eval(&field(99, "ts"), std::slice::from_ref(&samples), &schema).unwrap(),
+            Cell::Int64(0)
+        );
+        assert_eq!(
+            eval(&field(99, "value"), std::slice::from_ref(&samples), &schema).unwrap(),
+            Cell::Null
+        );
     }
 
     fn schema(fields: &[(&str, DataType)]) -> SummarySchema {
