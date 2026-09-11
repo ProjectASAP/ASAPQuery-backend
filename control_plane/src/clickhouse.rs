@@ -233,7 +233,7 @@ fn materialize_selected_sql(
     let window_secs = window.ok_or("SQL materialization requires a bounded window")?;
     let aggregation = BackendAggregation {
         aggregation_id: String::new(),
-        metric_name: format!("{table}.{value}"),
+        metric_name: format!("{table}.{}", value.column().unwrap_or("constant")),
         family: crate::physical::compiler::physical_materialization_family(family),
         window_secs,
         spatial_filter: String::new(),
@@ -248,8 +248,7 @@ fn materialize_selected_sql(
     )
     .map_err(|error| error.to_string())?;
     config.table_name = Some(table);
-    config.value_projection =
-        Some(asap_types::sds::ValueProjectionIdentity::Column { name: value });
+    config.value_projection = Some(value);
     config.table_timestamp_column = Some(timestamp);
     config.table_population = Some(population);
     config.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
@@ -448,7 +447,7 @@ fn clickhouse_materialization_leaf_contract(
 ) -> Result<
     (
         String,
-        String,
+        asap_types::sds::ValueProjectionIdentity,
         Option<u64>,
         asap_types::table_population::TablePopulation,
         String,
@@ -459,9 +458,18 @@ fn clickhouse_materialization_leaf_contract(
         post_asap::SummaryExpr,
         pre_asap::{CompareOpKind, QueryExpr, ScalarValue, Source},
     };
-    let SummaryExpr::SummaryAgg { child, input, .. } = &node.expr else {
+    let SummaryExpr::SummaryAgg {
+        child,
+        input,
+        family,
+        ..
+    } = &node.expr
+    else {
         return Err("SQL materialization leaf is not a summary aggregate".into());
     };
+    if input.item.is_some() {
+        return Err("SQL item/weight summary inputs require an explicit item projection".into());
+    }
     let SummaryExpr::KeepPreAsap(expr) = &child.expr else {
         return Err("SQL materialization leaf has no tabular source".into());
     };
@@ -473,7 +481,6 @@ fn clickhouse_materialization_leaf_contract(
         &planner_types::pre_asap::Schema,
     )> {
         match expr {
-            QueryExpr::Project { child, .. } => table_scan(child),
             QueryExpr::Scan {
                 source: Source::Table { table_ref },
                 predicates,
@@ -493,13 +500,47 @@ fn clickhouse_materialization_leaf_contract(
     let Some((table_ref, predicates, schema)) = table_scan(source) else {
         return Err("SQL materialization leaf has no table scan".into());
     };
-    let planner_types::post_asap::SummaryInputExpr::Column(value_input) = &input.weight else {
-        return Err("SQL summary requires a column-valued update".into());
-    };
-    let value_column = match value_input {
-        planner_types::pre_asap::ColumnRef::Named(name)
-        | planner_types::pre_asap::ColumnRef::Qualified { name, .. } => name.clone(),
-        _ => return Err("SQL summary requires a named value column".into()),
+    use asap_types::sds::ValueProjectionIdentity;
+    use planner_types::post_asap::SummaryInputExpr;
+    let value_projection = match &input.weight {
+        SummaryInputExpr::Column(
+            planner_types::pre_asap::ColumnRef::Wildcard
+            | planner_types::pre_asap::ColumnRef::SampleValue,
+        ) if matches!(
+            family,
+            planner_types::post_asap::SummaryFamilyType::ExactAggregate(
+                planner_types::post_asap::ExactKind::Count,
+                _
+            )
+        ) =>
+        {
+            ValueProjectionIdentity::Constant {
+                value: ScalarValue::Int64(1),
+            }
+        }
+        SummaryInputExpr::Column(
+            planner_types::pre_asap::ColumnRef::Named(name)
+            | planner_types::pre_asap::ColumnRef::Qualified { name, .. },
+        ) => {
+            let column = schema
+                .columns
+                .iter()
+                .find(|column| column.name == *name)
+                .ok_or("SQL summary value projection is not a source column")?;
+            if column.nullable || column.dtype != planner_types::pre_asap::DataType::Float64 {
+                return Err("SQL value readout requires a non-null Float64 source until typed/null-aware ingest is available".into());
+            }
+            ValueProjectionIdentity::Column { name: name.clone() }
+        }
+        SummaryInputExpr::Constant(value) if value.is_finite() => {
+            let value = if value.fract() == 0.0 && value.abs() <= (1_u64 << 53) as f64 {
+                ScalarValue::Int64(*value as i64)
+            } else {
+                ScalarValue::Float64(*value)
+            };
+            ValueProjectionIdentity::Constant { value }
+        }
+        _ => return Err("SQL summary requires a named column or finite numeric update".into()),
     };
 
     fn comparisons<'a>(expr: &'a QueryExpr, out: &mut Vec<&'a QueryExpr>) {
@@ -611,7 +652,7 @@ fn clickhouse_materialization_leaf_contract(
     })?;
     Ok((
         table_ref.to_owned(),
-        value_column,
+        value_projection,
         Some(window_secs),
         population,
         schema
@@ -626,14 +667,14 @@ fn clickhouse_materialization_leaf_contract(
 fn select_materialization<'a>(
     materializations: &'a [asap_types::PrecomputeMaterialization],
     table_ref: &str,
-    value_column: &str,
+    value_projection: &asap_types::sds::ValueProjectionIdentity,
     spatial_filter: &str,
     expected: &planner_types::post_asap::SummaryFamilyType,
     semantic_window_seconds: u64,
 ) -> Result<&'a asap_types::PrecomputeMaterialization, crate::query_plan::QueryPlanError> {
     let mut matches = materializations.iter().filter(|candidate| {
         candidate.table_name.as_deref() == Some(table_ref)
-            && candidate.effective_value_projection().column() == Some(value_column)
+            && candidate.effective_value_projection() == value_projection
             && candidate.population_filter_canonical().ok().as_deref() == Some(spatial_filter)
             && candidate
                 .accumulator_spec()
@@ -645,12 +686,12 @@ fn select_materialization<'a>(
     });
     let selected = matches.next().ok_or_else(|| {
         crate::query_plan::QueryPlanError::Invalid(format!(
-            "no precompute materialization matches {table_ref}.{value_column}/{expected:?}"
+            "no precompute materialization matches {table_ref}/{value_projection:?}/{expected:?}"
         ))
     })?;
     if matches.next().is_some() {
         return Err(crate::query_plan::QueryPlanError::Invalid(format!(
-            "ambiguous precompute materializations match {table_ref}.{value_column}/{expected:?}"
+            "ambiguous precompute materializations match {table_ref}/{value_projection:?}/{expected:?}"
         )));
     }
     Ok(selected)
@@ -689,6 +730,52 @@ mod tests {
         value.pane_origin_ms = Some(0);
         value.table_timestamp_column = Some("timestamp_ms".into());
         value
+    }
+
+    #[test]
+    fn keyed_summary_input_is_not_replaced_by_its_unit_weight() {
+        use planner_types::post_asap::{
+            SummaryExpr, SummaryInputExpr, SummaryNode, SummarySchema, SummaryUpdate,
+        };
+        use planner_types::pre_asap::{ColumnRef, QueryExpr, Reduction, ScalarValue};
+        let schema = SummarySchema {
+            fields: vec![],
+            time_index: None,
+        };
+        let family = materialization(
+            AggregationType::Sum,
+            "value",
+            60,
+            60,
+            ("variant", serde_json::json!(1)),
+        )
+        .accumulator_spec()
+        .unwrap()
+        .family;
+        let node = SummaryNode {
+            expr: SummaryExpr::SummaryAgg {
+                child: std::rc::Rc::new(SummaryNode {
+                    expr: SummaryExpr::KeepPreAsap(std::rc::Rc::new(QueryExpr::Literal(
+                        ScalarValue::Int64(1),
+                    ))),
+                    schema: schema.clone(),
+                    guarantee: Default::default(),
+                }),
+                family,
+                input: SummaryUpdate {
+                    item: Some(SummaryInputExpr::Column(ColumnRef::Named("value".into()))),
+                    weight: SummaryInputExpr::Constant(1.0),
+                    weight_domain: Default::default(),
+                },
+                reduction: Reduction::Reduce(vec![].into()),
+                grouping: Default::default(),
+            },
+            schema,
+            guarantee: Default::default(),
+        };
+        assert!(clickhouse_materialization_leaf_contract(&node, 0, 60_000)
+            .unwrap_err()
+            .contains("explicit item projection"));
     }
 
     #[test]
@@ -746,35 +833,77 @@ mod tests {
         let sum_family = sum_60.accumulator_spec().unwrap().family;
         let count_family = count_60.accumulator_spec().unwrap().family;
         assert_eq!(
-            select_materialization(&configs, "telemetry", "requests", "", &sum_family, 60)
-                .unwrap()
-                .policy_fingerprint(),
+            select_materialization(
+                &configs,
+                "telemetry",
+                &asap_types::sds::ValueProjectionIdentity::Column {
+                    name: "requests".into()
+                },
+                "",
+                &sum_family,
+                60
+            )
+            .unwrap()
+            .policy_fingerprint(),
             sum_60.policy_fingerprint()
         );
         let dd_family = dd_2.accumulator_spec().unwrap().family;
         assert_eq!(
-            select_materialization(&configs, "telemetry", "requests", "", &dd_family, 60)
-                .unwrap()
-                .policy_fingerprint(),
+            select_materialization(
+                &configs,
+                "telemetry",
+                &asap_types::sds::ValueProjectionIdentity::Column {
+                    name: "requests".into()
+                },
+                "",
+                &dd_family,
+                60
+            )
+            .unwrap()
+            .policy_fingerprint(),
             dd_2.policy_fingerprint()
         );
         assert_eq!(
-            select_materialization(&configs, "telemetry", "requests", "", &count_family, 60)
-                .unwrap()
-                .policy_fingerprint(),
+            select_materialization(
+                &configs,
+                "telemetry",
+                &asap_types::sds::ValueProjectionIdentity::Column {
+                    name: "requests".into()
+                },
+                "",
+                &count_family,
+                60
+            )
+            .unwrap()
+            .policy_fingerprint(),
             count_60.policy_fingerprint()
         );
-        assert!(
-            select_materialization(&configs, "telemetry", "missing", "", &sum_family, 60).is_err()
-        );
+        assert!(select_materialization(
+            &configs,
+            "telemetry",
+            &asap_types::sds::ValueProjectionIdentity::Column {
+                name: "missing".into()
+            },
+            "",
+            &sum_family,
+            60
+        )
+        .is_err());
         let mut ambiguous = configs.clone();
         ambiguous.push(sum_60);
-        assert!(
-            select_materialization(&ambiguous, "telemetry", "requests", "", &sum_family, 60)
-                .unwrap_err()
-                .to_string()
-                .contains("ambiguous")
-        );
+        assert!(select_materialization(
+            &ambiguous,
+            "telemetry",
+            &asap_types::sds::ValueProjectionIdentity::Column {
+                name: "requests".into()
+            },
+            "",
+            &sum_family,
+            60
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("ambiguous"));
     }
 
     #[test]
@@ -889,6 +1018,39 @@ mod tests {
             ));
         assert_eq!(automatic.precompute_plan.executable_dags.len(), 1);
         automatic.validate().unwrap();
+        let mut integer_source = ClickHouseSqlAutomaticWorkload {
+            envelope: request.precompute_plan.envelope.clone(),
+            tables: request.tables.clone(),
+            accuracy: request.accuracy.clone(),
+            queries: request
+                .queries
+                .iter()
+                .map(|query| ClickHouseSqlWorkloadEntry {
+                    sql: query.sql.clone(),
+                    start_ms: query.start_ms,
+                    end_ms: query.end_ms,
+                    cumulative: query.cumulative,
+                })
+                .collect(),
+        };
+        integer_source.tables.get_mut("telemetry").unwrap().columns[1].dtype = DataType::Int64;
+        assert!(
+            compile_automatic_clickhouse_workload(&integer_source)
+                .await
+                .is_err(),
+            "an Int64 source may contain values beyond exact Float64 ingest range"
+        );
+        integer_source.tables.get_mut("telemetry").unwrap().columns[1].dtype = DataType::Float64;
+        integer_source.queries[0].sql = integer_source.queries[0].sql.replace(
+            "FROM telemetry WHERE",
+            "FROM (SELECT timestamp_ms, value * 2 AS value FROM telemetry) doubled WHERE",
+        );
+        assert!(
+            compile_automatic_clickhouse_workload(&integer_source)
+                .await
+                .is_err(),
+            "a producer projection must not be erased while binding its original table"
+        );
         let installed = publication
             .precompute_plan
             .executable_dags
