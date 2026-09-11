@@ -28,7 +28,7 @@ use dashmap::DashMap;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -179,6 +179,26 @@ impl SeriesIdResolver {
         *entry
     }
 
+    /// Persist a new binding before exposing it to catalog-bound producers.
+    pub fn try_resolve(&self, metric: &str, attrs: &str, kind: &str) -> std::io::Result<u64> {
+        use dashmap::mapref::entry::Entry;
+        let key = (metric.to_owned(), attrs.to_owned(), kind.to_owned());
+        match self.cache.entry(key) {
+            Entry::Occupied(entry) => Ok(*entry.get()),
+            Entry::Vacant(entry) => {
+                let sid = self
+                    .next_sid
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                        value.checked_add(1)
+                    })
+                    .map_err(|_| std::io::Error::other("series ID exhausted"))?;
+                self.persistence.append(sid, metric, attrs, kind)?;
+                entry.insert(sid);
+                Ok(sid)
+            }
+        }
+    }
+
     /// Resolve a logical series and ask the storage lifecycle owner whether
     /// an explicit catalog activation requires a fresh physical lifetime.
     pub fn resolve_with_reactivation(
@@ -188,7 +208,9 @@ impl SeriesIdResolver {
         kind: &str,
         authorize: impl FnOnce(u64) -> Result<Option<Arc<asap_types::sds::CatalogGeneration>>, String>,
     ) -> Result<u64, String> {
-        let sid = self.resolve(metric, attrs, kind);
+        let sid = self
+            .try_resolve(metric, attrs, kind)
+            .map_err(|error| error.to_string())?;
         match authorize(sid)? {
             None => Ok(sid),
             Some(generation) => self
@@ -464,6 +486,12 @@ impl FilePersistence {
                             )?;
                         }
                         ReadOne::Eof | ReadOne::Torn => break,
+                        ReadOne::Corrupt => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "corrupt legacy resolver record",
+                            ))
+                        }
                     }
                 }
                 migrated.sync_all()?;
@@ -595,6 +623,8 @@ impl SeriesResolverPersistence for FilePersistence {
         }
         let mut generations = BTreeMap::new();
         let mut records = Vec::new();
+        let mut physical_keys = BTreeMap::new();
+        let mut logical_sids = BTreeMap::new();
         let mut safe_offset = 8;
         loop {
             let mut length = [0; 4];
@@ -644,6 +674,33 @@ impl SeriesResolverPersistence for FilePersistence {
                     agg_kind_canonical,
                     generation_sha256,
                 } => {
+                    if sid == 0
+                        || metric.len() > MAX_METRIC_LEN
+                        || attrs_fingerprint.len() > MAX_FP_LEN
+                        || agg_kind_canonical.len() > MAX_AGG_KIND_LEN
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid resolver binding",
+                        ));
+                    }
+                    let key = (
+                        metric.clone(),
+                        attrs_fingerprint.clone(),
+                        agg_kind_canonical.clone(),
+                    );
+                    if physical_keys.get(&sid).is_some_and(|existing| {
+                        existing != &(key.clone(), generation_sha256.clone())
+                    }) || logical_sids.get(&key).is_some_and(|previous| {
+                        *previous != sid && (generation_sha256.is_none() || sid < *previous)
+                    }) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "conflicting resolver binding",
+                        ));
+                    }
+                    physical_keys.insert(sid, (key.clone(), generation_sha256.clone()));
+                    logical_sids.insert(key, sid);
                     let catalog_generation = generation_sha256
                         .map(|key| {
                             generations.get(&key).cloned().ok_or_else(|| {
@@ -672,12 +729,14 @@ impl SeriesResolverPersistence for FilePersistence {
 }
 
 /// Outcome of attempting to read a single WAL record. `Torn` means a
-/// short read or out-of-range field length was detected mid-record;
+/// short read was detected mid-record; malformed complete fields are corruption.
+/// Only an incomplete tail may be discarded;
 /// the caller truncates the file to the last `Ok` offset.
 enum ReadOne {
     Ok(ResolverRecord, u64),
     Eof,
     Torn,
+    Corrupt,
 }
 
 fn read_one_record(f: &mut File) -> ReadOne {
@@ -688,6 +747,9 @@ fn read_one_record(f: &mut File) -> ReadOne {
         Err(_) => return ReadOne::Torn,
     }
     let sid = u64::from_le_bytes(sid_buf);
+    if sid == 0 {
+        return ReadOne::Corrupt;
+    }
 
     let mut len_buf = [0u8; 4];
     if f.read_exact(&mut len_buf).is_err() {
@@ -695,7 +757,7 @@ fn read_one_record(f: &mut File) -> ReadOne {
     }
     let metric_len = u32::from_le_bytes(len_buf) as usize;
     if metric_len > MAX_METRIC_LEN {
-        return ReadOne::Torn;
+        return ReadOne::Corrupt;
     }
     let mut metric_bytes = vec![0u8; metric_len];
     if f.read_exact(&mut metric_bytes).is_err() {
@@ -707,7 +769,7 @@ fn read_one_record(f: &mut File) -> ReadOne {
     }
     let fp_len = u32::from_le_bytes(len_buf) as usize;
     if fp_len > MAX_FP_LEN {
-        return ReadOne::Torn;
+        return ReadOne::Corrupt;
     }
     let mut fp_bytes = vec![0u8; fp_len];
     if f.read_exact(&mut fp_bytes).is_err() {
@@ -719,7 +781,7 @@ fn read_one_record(f: &mut File) -> ReadOne {
     }
     let agg_kind_len = u32::from_le_bytes(len_buf) as usize;
     if agg_kind_len > MAX_AGG_KIND_LEN {
-        return ReadOne::Torn;
+        return ReadOne::Corrupt;
     }
     let mut agg_kind_bytes = vec![0u8; agg_kind_len];
     if f.read_exact(&mut agg_kind_bytes).is_err() {
@@ -728,15 +790,15 @@ fn read_one_record(f: &mut File) -> ReadOne {
 
     let metric = match String::from_utf8(metric_bytes) {
         Ok(s) => s,
-        Err(_) => return ReadOne::Torn,
+        Err(_) => return ReadOne::Corrupt,
     };
     let attrs_fingerprint = match String::from_utf8(fp_bytes) {
         Ok(s) => s,
-        Err(_) => return ReadOne::Torn,
+        Err(_) => return ReadOne::Corrupt,
     };
     let agg_kind_canonical = match String::from_utf8(agg_kind_bytes) {
         Ok(s) => s,
-        Err(_) => return ReadOne::Torn,
+        Err(_) => return ReadOne::Corrupt,
     };
     let new_offset = match f.stream_position() {
         Ok(p) => p,
@@ -939,6 +1001,41 @@ mod persistence_tests {
     }
 
     #[test]
+    fn corrupt_legacy_record_preserves_original_file() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+        let mut bytes = LEGACY_WAL_MAGIC.to_vec();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&((MAX_METRIC_LEN + 1) as u32).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(FilePersistence::open(path.clone()).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn replay_rejects_invalid_or_conflicting_physical_bindings() {
+        for second in [0, 1] {
+            let dir = TempDir::new().unwrap();
+            let path = wal_path(&dir);
+            let persistence = FilePersistence::open(path.clone()).unwrap();
+            persistence.append(1, "first", "", TEST_AGG).unwrap();
+            let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+            write_wal_record(
+                &mut file,
+                &WalRecord::Binding {
+                    sid: second,
+                    metric: "other".into(),
+                    attrs_fingerprint: "".into(),
+                    agg_kind_canonical: TEST_AGG.into(),
+                    generation_sha256: None,
+                },
+            )
+            .unwrap();
+            assert!(persistence.replay().is_err());
+        }
+    }
+
+    #[test]
     fn empty_log_replays_empty() {
         let dir = TempDir::new().unwrap();
         let p = FilePersistence::open(wal_path(&dir)).unwrap();
@@ -1119,8 +1216,14 @@ mod persistence_tests {
             }
         }
         let r = SeriesIdResolver::with_persistence(Arc::new(FailingPersistence));
+        assert!(r
+            .resolve_with_reactivation("strict", "k=v;", TEST_AGG, |_| Ok(None))
+            .is_err());
+        assert!(!r
+            .cache
+            .contains_key(&("strict".into(), "k=v;".into(), TEST_AGG.into())));
         let sid = r.resolve("m", "k=v;", TEST_AGG);
-        assert_eq!(sid, 1, "resolver returns the sid despite persistence error");
+        assert_eq!(sid, 2, "resolver returns the sid despite persistence error");
         // Second call hits the cache; no second append attempt.
         let sid2 = r.resolve("m", "k=v;", TEST_AGG);
         assert_eq!(sid, sid2);
