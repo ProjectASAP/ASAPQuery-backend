@@ -220,14 +220,31 @@ fn materialize_selected_sql(
     use planner_types::{post_asap::SummaryExpr, pre_asap::Reduction};
     let SummaryExpr::SummaryAgg {
         reduction: Reduction::Reduce(keys),
+        child,
         ..
     } = &node.expr
     else {
         return Err("SQL materialization requires a supported reduction".into());
     };
-    if keys.is_without() || !keys.keys().is_empty() {
-        return Err("SQL grouped source projection requires a typed grouping reader".into());
+    if keys.is_without() {
+        return Err("SQL grouping exclusion requires a resolved projection".into());
     }
+    let SummaryExpr::KeepPreAsap(source) = &child.expr else {
+        return Err("SQL grouping requires a typed source subtree".into());
+    };
+    let source_schema = source.output_schema().map_err(|error| error.to_string())?;
+    let mut columns = Vec::new();
+    for key in keys.keys() {
+        let mut column = source_schema
+            .columns
+            .get(*key)
+            .cloned()
+            .ok_or("SQL grouping column is absent from source schema")?;
+        column.table = None;
+        columns.push(column);
+    }
+    let grouping = asap_types::GroupingProjection::new(columns);
+    grouping.validate_table_group_codec()?;
     let (table, value, window, population, timestamp) =
         clickhouse_materialization_leaf_contract(node, query.start_ms, query.end_ms)?;
     let window_secs = window.ok_or("SQL materialization requires a bounded window")?;
@@ -237,7 +254,7 @@ fn materialize_selected_sql(
         family: crate::physical::compiler::physical_materialization_family(family),
         window_secs,
         spatial_filter: String::new(),
-        grouping: Vec::new(),
+        grouping: grouping.names(),
         item_label: None,
         heap_update_mode: None,
         aggregation_input: AggregationInput::Raw,
@@ -248,6 +265,7 @@ fn materialize_selected_sql(
     )
     .map_err(|error| error.to_string())?;
     config.table_name = Some(table);
+    config.grouping_labels = grouping;
     config.value_projection = Some(value);
     config.table_timestamp_column = Some(timestamp);
     config.table_population = Some(population);
@@ -440,6 +458,26 @@ fn bind_selected_node(
     })
 }
 
+/// Evaluate only exact integer constant arithmetic at the installation boundary.
+/// No SQL text rewrite, floating coercion, or runtime-column evaluation is allowed.
+fn constant_int64(expr: &QueryExpr) -> Option<i64> {
+    use planner_types::pre_asap::{ArithmeticOpKind, ScalarValue};
+    match expr {
+        QueryExpr::Literal(ScalarValue::Int64(value)) => Some(*value),
+        QueryExpr::Arithmetic { op, left, right } => {
+            let left = constant_int64(left)?;
+            let right = constant_int64(right)?;
+            match op {
+                ArithmeticOpKind::Add => left.checked_add(right),
+                ArithmeticOpKind::Sub => left.checked_sub(right),
+                ArithmeticOpKind::Mul => left.checked_mul(right),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn clickhouse_materialization_leaf_contract(
     node: &planner_types::post_asap::SummaryNode,
     evaluation_start_ms: u64,
@@ -573,7 +611,10 @@ fn clickhouse_materialization_leaf_contract(
             .ok_or_else(|| {
                 "SQL materialization predicate references an unknown column".to_string()
             })?;
-        match (name, op, right.as_ref()) {
+        let folded =
+            constant_int64(right).map(|value| QueryExpr::Literal(ScalarValue::Int64(value)));
+        let right = folded.as_ref().unwrap_or(right.as_ref());
+        match (name, op, right) {
             (
                 name,
                 CompareOpKind::Gt | CompareOpKind::Ge,
@@ -904,6 +945,33 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("ambiguous"));
+    }
+
+    #[test]
+    fn constant_integer_boundaries_reject_overflow_and_dynamic_values() {
+        use planner_types::pre_asap::{ArithmeticOpKind, ScalarValue};
+        let literal = |value| QueryExpr::Literal(ScalarValue::Int64(value));
+        let subtract = |left, right| QueryExpr::Arithmetic {
+            op: ArithmeticOpKind::Sub,
+            left: std::rc::Rc::new(left),
+            right: std::rc::Rc::new(right),
+        };
+        assert_eq!(
+            constant_int64(&subtract(literal(1_788_891_296_000), literal(43_200_000))),
+            Some(1_788_848_096_000)
+        );
+        assert_eq!(
+            constant_int64(&subtract(literal(i64::MIN), literal(1))),
+            None
+        );
+        assert_eq!(
+            constant_int64(&subtract(QueryExpr::Column(0), literal(1))),
+            None
+        );
+        assert_eq!(
+            constant_int64(&QueryExpr::Literal(ScalarValue::Float64(1.0))),
+            None
+        );
     }
 
     #[test]

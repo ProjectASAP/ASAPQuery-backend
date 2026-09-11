@@ -119,7 +119,11 @@ impl SummaryCatalog {
                         .population_filter_canonical()
                         .map_err(SummaryCatalogError::Descriptor)?,
                     config.grouping_labels.names(),
-                    "asap.timestamped-observations.v2",
+                    if config.table_name.is_some() && !config.grouping_labels.is_empty() {
+                        crate::grouping_projection::TABLE_GROUP_OBSERVATION_SEMANTICS
+                    } else {
+                        "asap.timestamped-observations.v2"
+                    },
                 )
                 .with_grouping_projection(config.grouping_labels.clone())
                 .with_partitioning(config.partitioning)
