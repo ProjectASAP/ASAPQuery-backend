@@ -2694,12 +2694,20 @@ mod tests {
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
+        let catalog = Arc::new(
+            asap_types::summary_catalog::SummaryCatalog::from_materializations(7, 1, &[]).unwrap(),
+        );
+        let generation = catalog.reference().unwrap();
+        let sketch_index = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+        sketch_index
+            .install_summary_catalog(Arc::clone(&catalog))
+            .unwrap();
         let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(
             crate::storage_engines::types::ActivePhysicalPlan {
                 envelope: envelope.clone(),
-                summary_catalog: None,
+                summary_catalog: Some(Arc::clone(&catalog)),
                 precompute_plan: PrecomputePlan {
-                    summary_catalog: None,
+                    summary_catalog: Some(generation.clone()),
                     envelope: envelope.clone(),
                     ingest: IngestContract {
                         protocol: IngestProtocol::PrometheusRemoteWriteV1,
@@ -2715,7 +2723,7 @@ mod tests {
                     materializations: Vec::new(),
                 },
                 transmission_plan: TransmissionPlan {
-                    summary_catalog: None,
+                    summary_catalog: Some(generation),
                     envelope,
                     frame_identity: FrameIdentityContract {
                         identity_version: 1,
@@ -2747,7 +2755,7 @@ mod tests {
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(crate::drivers::ingest::SeriesIdResolver::new()),
-            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            sketch_index: Arc::clone(&sketch_index),
             observability: IngestObservability::default(),
         });
         let receiver =
@@ -2760,7 +2768,7 @@ mod tests {
                 adapter_config,
             },
             Arc::new(ASAPQueryEngine::new(15_000)),
-            Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            sketch_index,
         )
         .with_active_physical_plan(active)
         .with_remote_write(receiver.clone());
@@ -3055,9 +3063,8 @@ aggregations:
     }
 
     #[tokio::test]
-    async fn test_streaming_config_hot_reload_missing_handle_503() {
-        // setup_test_server() passes `None` for hot_reload → both
-        // endpoints should return 503 with a clear error message.
+    async fn test_streaming_config_route_is_absent_without_legacy_handle() {
+        // A server without a legacy hot-reload handle does not expose this route.
         let server_port = setup_test_server().await;
         let client = Client::new();
 
@@ -3068,7 +3075,7 @@ aggregations:
             .send()
             .await
             .unwrap();
-        assert_eq!(get_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(get_resp.status(), reqwest::StatusCode::NOT_FOUND);
 
         let post_resp = client
             .post(format!(
@@ -3078,7 +3085,7 @@ aggregations:
             .send()
             .await
             .unwrap();
-        assert_eq!(post_resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(post_resp.status(), reqwest::StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -3658,7 +3665,7 @@ aggregations:
                 aggregation_type: AggregationType::Sum,
                 aggregation_sub_type: String::new(),
                 parameters: HashMap::new(),
-                grouping_labels: KeyByLabelNames::empty(),
+                grouping_labels: KeyByLabelNames::empty().into(),
                 aggregated_labels: KeyByLabelNames::empty(),
                 rollup_labels: KeyByLabelNames::empty(),
                 original_yaml: String::new(),
@@ -7278,7 +7285,8 @@ mod catalog_install_tests {
     #[test]
     fn catalog_install_applies_pane_origin_validation_to_metricsql_entries() {
         let mut request = request();
-        let entry = request.query_plan.entries.values_mut().next().unwrap();
+        let key = request.query_plan.entries.keys().next().unwrap().clone();
+        let mut entry = request.query_plan.entries.remove(&key).unwrap();
         entry.language = control_plane::query_plan::QueryLanguage::MetricsQl;
         let binding = entry
             .nodes
@@ -7291,6 +7299,12 @@ mod catalog_install_tests {
             })
             .expect("demo has maintained summaries");
         binding.pane_origin_ms = Some(1);
-        assert!(install(request).unwrap_err().contains("pane origin"));
+        let key = control_plane::query_plan::QueryPlan::catalog_key(
+            entry.language,
+            &entry.canonical_query,
+        );
+        request.query_plan.entries.insert(key, entry);
+        let error = install(request).unwrap_err();
+        assert!(error.contains("pane origin"), "{error}");
     }
 }

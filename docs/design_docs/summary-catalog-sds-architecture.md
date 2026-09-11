@@ -188,13 +188,23 @@ compatibility DTO while older sidecars are read.
 
 The implemented `SummaryDescriptor` currently contains one `SummaryOperator`,
 one derived `FidelityGuarantee`, and a numeric state-schema version. The
-implemented `DataDescriptor` contains metric name, canonical population filter,
-grouping keys and versioned observation semantics. The shared contract now also
+implemented `DataDescriptor` contains typed source and value projections, a
+canonical population filter, typed grouping columns and versioned observation
+semantics. The shared contract now also
 defines `SummaryInstance`, `ObservedSummaryInventory`, placement, completeness,
 state references, catalog generation and ephemeral leases. The control-plane
 reconciler emits create, update, recover, retire, garbage-collect, promote and
 expire actions. Summary payloads and the application of those actions remain in
 the SummaryStore runtime.
+
+The same `GroupingProjection` supplies source columns to precompute configuration,
+`DataDescriptor` and the state-schema contract. Each column retains the Planner's
+name, type and nullability; routing derives names without storing a second list.
+Legacy label lists decode as non-null UTF-8 columns and keep their existing
+identities. A changed type or nullability changes catalog and policy identity.
+A SQL map column is one grouping value, not a set of PromQL labels. Typed
+ClickHouse group transport remains a separate execution capability: the current
+reader rejects non-label projections until that transport is implemented.
 
 `DataDescriptor`, precompute configuration and state-schema validation share
 `ValueProjectionIdentity`: sample value, named column, or a finite numeric
@@ -261,6 +271,22 @@ algorithm parameter, **not itself a numerical error guarantee**. Its fidelity
 contract separately identifies the supported rank-error bound or versioned
 bound derivation, probability of failure, readout scope and required conditions.
 If that guarantee is unavailable, fidelity is explicitly `Unknown`.
+
+For a shared UnivMon state, `heap_size`, `sketch_rows`, `sketch_cols`, and
+`layers` describe one configuration. They do not establish one error bound for
+all readouts. The backend's `UnivMonFrequency` contract records these parameters
+and the unit-frequency update domain: each sample value contributes one
+occurrence. Total count is exact in that domain; distinct count, frequency L2,
+and frequency entropy require their own accuracy evidence. Frequency L2 means
+`sqrt(sum(frequency(key)^2))`; entropy is measured in bits.
+
+ERP evidence must state the readout's units: relative error for distinct and L2,
+and absolute bits error for entropy. A measured error is not a certified failure
+probability. Readouts may share state only when their configuration and data
+population match and each readout's accuracy requirements are satisfied. A
+small configuration suitable for L2 may therefore be unsuitable for entropy.
+Completeness of the input window remains a separate requirement for every
+readout, including exact count.
 
 A `FidelityGuarantee` contains:
 

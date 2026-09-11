@@ -153,6 +153,9 @@ pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactor
                 }
                 .into());
             }
+            if !materialization.grouping_labels.is_legacy_labels() {
+                return Err("typed table grouping requires a typed grouping reader".into());
+            }
             let mut source_config = config.clone();
             source_config.database = database.clone();
             source_config.table = table.clone();
@@ -395,6 +398,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reader.source_name(), "ClickHouseReader");
+        let mut typed = materialization.clone();
+        typed.grouping_labels =
+            asap_types::GroupingProjection::new(vec![planner_types::pre_asap::Column::new(
+                "tenant",
+                planner_types::pre_asap::DataType::Int64,
+                false,
+            )]);
+        let rejected = factory(
+            &BackfillSource::ClickHouse {
+                database: "metrics".into(),
+                table: "another_table".into(),
+            },
+            &typed,
+        );
+        assert!(
+            matches!(rejected, Err(error) if error.to_string().contains("typed grouping reader"))
+        );
+
         assert!(factory(
             &BackfillSource::ClickHouse {
                 database: "another_database".into(),

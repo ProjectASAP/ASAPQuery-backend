@@ -144,7 +144,7 @@ pub struct StateSchemaContract {
         deserialize_with = "crate::sds::deserialize_state_value_projection"
     )]
     pub value_projection: crate::sds::ValueProjectionIdentity,
-    pub group_by: Vec<String>,
+    pub group_by: crate::GroupingProjection,
     pub window: StateWindowContract,
     pub encodings: Vec<StateEncoding>,
 }
@@ -234,7 +234,7 @@ impl PrecomputePlan {
                     family,
                     source,
                     value_projection,
-                    group_by: materialization.grouping_labels.labels.clone(),
+                    group_by: materialization.grouping_labels.clone(),
                     window: StateWindowContract {
                         kind: materialization.window_type,
                         size_ms: materialization.window_size.saturating_mul(1_000),
@@ -363,6 +363,34 @@ impl PrecomputePlan {
                         "DAG materialization has no runtime configuration".into(),
                     ));
                 };
+                if self.ingest.protocol == IngestProtocol::PrometheusRemoteWriteV1
+                    && matches!(
+                        config.aggregation_type,
+                        crate::AggregationType::HLL | crate::AggregationType::UnivMon
+                    )
+                {
+                    if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+                        input,
+                        ..
+                    } = &node.payload
+                    {
+                        let supported = match config.aggregation_type {
+                            crate::AggregationType::HLL => {
+                                crate::accumulator_spec::is_scalar_sample_value(input)
+                                    || crate::accumulator_spec::is_unit_sample_frequency(input)
+                            }
+                            crate::AggregationType::UnivMon => {
+                                crate::accumulator_spec::is_unit_sample_frequency(input)
+                            }
+                            _ => unreachable!(),
+                        };
+                        if !supported {
+                            return Err(PrecomputePlanError::CatalogContract(
+                                "raw materialization input does not match its accumulator update semantics".into(),
+                            ));
+                        }
+                    }
+                }
                 if let Some(partitioning) = config.partitioning {
                     if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
                         reduction,
@@ -389,6 +417,18 @@ impl PrecomputePlan {
         }
         let mut materializations = BTreeSet::new();
         for materialization in &self.materializations {
+            if materialization.table_name.is_none()
+                && !materialization.grouping_labels.is_legacy_labels()
+            {
+                return Err(PrecomputePlanError::CatalogContract(
+                    "time-series grouping requires non-null string labels".into(),
+                ));
+            }
+
+            materialization
+                .grouping_labels
+                .validate()
+                .map_err(PrecomputePlanError::CatalogContract)?;
             materialization
                 .window_layout
                 .validate(materialization.window_size, materialization.slide_interval)
@@ -406,15 +446,6 @@ impl PrecomputePlan {
                     materialization: materialization.policy_fp_u64(),
                     reason: "window kind disagrees with size and slide".into(),
                 });
-            }
-            // HLL is supported as an ingested sketch envelope, not as a raw
-            // accumulator. Validate here so external installs cannot bypass it.
-            if self.ingest.protocol == IngestProtocol::PrometheusRemoteWriteV1
-                && materialization.aggregation_type == crate::AggregationType::HLL
-            {
-                return Err(PrecomputePlanError::UnsupportedFamily(
-                    materialization.policy_fp_u64(),
-                ));
             }
             if !materializations.insert(materialization.policy_fingerprint().into()) {
                 return Err(PrecomputePlanError::DuplicateMaterialization(
@@ -474,7 +505,7 @@ impl PrecomputePlan {
                 || schema.family != family
                 || schema.source != source
                 || schema.value_projection != value_projection
-                || schema.group_by != materialization.grouping_labels.labels
+                || schema.group_by != materialization.grouping_labels
                 || schema.window.kind != materialization.window_type
                 || schema.window.size_ms != materialization.window_size.saturating_mul(1_000)
                 || schema.window.slide_ms
@@ -542,7 +573,9 @@ pub(crate) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> 
         SummaryFamilyType::Sketch(kind, _)
             if matches!(
                 kind.algorithm(),
-                SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap
+                SketchAlgorithm::CmsWithHeap
+                    | SketchAlgorithm::CountSketchWithHeap
+                    | SketchAlgorithm::UnivMon
             ) =>
         {
             vec![StateEncoding::SketchCoreMsgpackV1]

@@ -68,11 +68,29 @@ pub const SERIES_ID_METADATA_FILE: &str = "sid_metadata.json";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SketchConfigRec {
-    DdSketch { relative_accuracy: f64 },
-    Kll { k: u32 },
-    Hll { precision: u32 },
-    CountSketch { rows: i32, cols: i32 },
-    CountMin { rows: i32, cols: i32 },
+    UnivMon {
+        heap_size: u32,
+        sketch_rows: u32,
+        sketch_cols: u32,
+        layers: u8,
+    },
+    DdSketch {
+        relative_accuracy: f64,
+    },
+    Kll {
+        k: u32,
+    },
+    Hll {
+        precision: u32,
+    },
+    CountSketch {
+        rows: i32,
+        cols: i32,
+    },
+    CountMin {
+        rows: i32,
+        cols: i32,
+    },
 }
 
 impl From<&SketchConfig> for SketchConfigRec {
@@ -82,6 +100,17 @@ impl From<&SketchConfig> for SketchConfigRec {
                 relative_accuracy: *relative_accuracy,
             },
             SketchConfig::Kll { k } => SketchConfigRec::Kll { k: *k },
+            SketchConfig::UnivMon {
+                heap_size,
+                sketch_rows,
+                sketch_cols,
+                layers,
+            } => SketchConfigRec::UnivMon {
+                heap_size: *heap_size,
+                sketch_rows: *sketch_rows,
+                sketch_cols: *sketch_cols,
+                layers: *layers,
+            },
             SketchConfig::Hll { precision } => SketchConfigRec::Hll {
                 precision: *precision,
             },
@@ -104,6 +133,17 @@ impl From<&SketchConfigRec> for SketchConfig {
                 relative_accuracy: *relative_accuracy,
             },
             SketchConfigRec::Kll { k } => SketchConfig::Kll { k: *k },
+            SketchConfigRec::UnivMon {
+                heap_size,
+                sketch_rows,
+                sketch_cols,
+                layers,
+            } => SketchConfig::UnivMon {
+                heap_size: *heap_size,
+                sketch_rows: *sketch_rows,
+                sketch_cols: *sketch_cols,
+                layers: *layers,
+            },
             SketchConfigRec::Hll { precision } => SketchConfig::Hll {
                 precision: *precision,
             },
@@ -127,6 +167,7 @@ fn sketch_algorithm_to_str(k: SketchAlgorithm) -> &'static str {
         SketchAlgorithm::DDSketch => "DDSketch",
         SketchAlgorithm::Kll => "Kll",
         SketchAlgorithm::Hll => "Hll",
+        SketchAlgorithm::UnivMon => "UnivMon",
         SketchAlgorithm::CountSketch => "CountSketch",
         SketchAlgorithm::Cms => "CountMin",
         SketchAlgorithm::CmsWithHeap => "CmsWithHeap",
@@ -141,6 +182,7 @@ fn sketch_algorithm_from_str(s: &str) -> Option<SketchAlgorithm> {
         "DDSketch" => SketchAlgorithm::DDSketch,
         "Kll" => SketchAlgorithm::Kll,
         "Hll" => SketchAlgorithm::Hll,
+        "UnivMon" => SketchAlgorithm::UnivMon,
         "CountSketch" => SketchAlgorithm::CountSketch,
         "CountMin" => SketchAlgorithm::Cms,
         "CmsWithHeap" => SketchAlgorithm::CmsWithHeap,
@@ -326,7 +368,7 @@ impl SidMetaRecord {
                 SketchAlgorithm::DDSketch | SketchAlgorithm::Kll => {
                     Capability::QuantileApprox(Some(kind))
                 }
-                SketchAlgorithm::Hll => Capability::CardinalityApprox,
+                SketchAlgorithm::Hll | SketchAlgorithm::UnivMon => Capability::CardinalityApprox,
                 SketchAlgorithm::CountSketch | SketchAlgorithm::Cms => {
                     Capability::FrequencyEstimate(Some(kind))
                 }

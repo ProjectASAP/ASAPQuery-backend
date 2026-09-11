@@ -85,6 +85,11 @@ impl BackendAccuracyProfile for AccuracyProfile {
     /// The sketch's own theoretical bound, without the GOS staleness term.
     fn derive_sketch_only(config: &AggregationConfig) -> Self {
         match config.aggregation_type {
+            AggregationType::UnivMon => Self {
+                epsilon: f64::MAX,
+                delta: 1.0,
+                kind: AccuracyKind::Uncalibrated,
+            },
             // Exact aggregates. (The `SetAggregator` /
             // `DeltaSetAggregator` exact-set-membership family lived
             // here too before its retirement.)

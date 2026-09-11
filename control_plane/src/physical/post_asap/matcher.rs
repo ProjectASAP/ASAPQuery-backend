@@ -110,6 +110,7 @@ pub fn sketch_family_satisfied(required: &SketchAlgorithm, available: &SketchAlg
 /// this function never sees).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SummaryFamily {
+    Universal,
     Quantile,
     Cardinality,
     /// Bare per-item frequency point-query — no heavy-hitter heap.
@@ -131,6 +132,7 @@ impl SummaryFamily {
 
 fn summary_family(kind: &SketchAlgorithm) -> SummaryFamily {
     match kind {
+        SketchAlgorithm::UnivMon => SummaryFamily::Universal,
         SketchAlgorithm::Kll | SketchAlgorithm::DDSketch => SummaryFamily::Quantile,
         SketchAlgorithm::Hll | SketchAlgorithm::Theta | SketchAlgorithm::Kmv => {
             SummaryFamily::Cardinality
@@ -154,6 +156,12 @@ mod tests {
     /// never arise from real code.
     fn params_for(kind: &SketchAlgorithm) -> SketchParams {
         match kind {
+            SketchAlgorithm::UnivMon => SketchParams::UnivMon {
+                heap_size: 32,
+                sketch_rows: 5,
+                sketch_cols: 1024,
+                layers: 4,
+            },
             SketchAlgorithm::Kll => SketchParams::Kll { k: 200 },
             SketchAlgorithm::Cms => SketchParams::Cms {
                 width: 100,

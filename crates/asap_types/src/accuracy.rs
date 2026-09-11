@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccuracyKind {
+    Uncalibrated,
     Exact,
     AdditiveFrequency,
     RelativeCardinality,
@@ -16,6 +17,7 @@ pub enum AccuracyKind {
 impl AccuracyKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Uncalibrated => "uncalibrated",
             Self::Exact => "exact",
             Self::AdditiveFrequency => "additive_frequency",
             Self::RelativeCardinality => "relative_cardinality",

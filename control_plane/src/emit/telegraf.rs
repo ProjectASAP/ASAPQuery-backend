@@ -197,7 +197,7 @@ fn emit_processors_allsketches(
         // Exact-accumulator kinds (Sum/Count/MinMax/Increase/Rate) aren't
         // representable in `SketchParams` at all anymore -- they're
         // `ExactParams`, a distinct type post ASAPPlanner#218's split.
-        SketchParams::Kmv { .. } | SketchParams::Theta { .. } => {
+        SketchParams::UnivMon { .. } | SketchParams::Kmv { .. } | SketchParams::Theta { .. } => {
             unreachable!(
                 "edge sketch processor config requested for an unsupported SketchAlgorithm; \
                  no Bind* rule in this repo produces one"
@@ -214,7 +214,7 @@ fn sketch_algorithm_tag(kind: &SketchAlgorithm) -> &'static str {
         SketchAlgorithm::Hll => "hll",
         SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap => "cms",
         SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap => "count_sketch",
-        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => {
+        SketchAlgorithm::UnivMon | SketchAlgorithm::Kmv | SketchAlgorithm::Theta => {
             unreachable!(
                 "edge sketch processor config requested for an unsupported \
                  SketchAlgorithm; no Bind* rule in this repo produces one"

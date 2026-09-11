@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "0deceda3e776216c5542d638d958b159f22e27ce";
+pub const PLANNER_REVISION: &str = env!("ASAPPLANNER_REVISION");
 pub const BACKEND_REVISION: &str = env!("ASAPQUERY_BACKEND_REVISION");
 pub use asap_types::precompute_plan::BACKEND_COMPAT;
 /// Matches the data plane's default persistence memory limit. A backend-local
@@ -1515,11 +1515,16 @@ fn has_unsafe_raw_entity_leaf(
                     )
                 );
                 let scalar_series_input = matches!(&node.expr,
-                    SummaryExpr::SummaryAgg { input, .. }
-                    if input.item.is_none() && matches!(&input.weight, planner_types::post_asap::SummaryInputExpr::Column(planner_types::pre_asap::ColumnRef::SampleValue)));
+                    SummaryExpr::SummaryAgg { input, family, .. }
+                    if !matches!(family, SummaryFamilyType::Sketch(kind, _) if matches!(kind.algorithm(), SketchAlgorithm::UnivMon))
+                        && asap_types::accumulator_spec::is_scalar_sample_value(input));
+                let frequency_series_input = matches!(&node.expr,
+                    SummaryExpr::SummaryAgg { input, family: SummaryFamilyType::Sketch(kind, _), .. }
+                    if matches!(kind.algorithm(), SketchAlgorithm::Hll | SketchAlgorithm::UnivMon)
+                        && asap_types::accumulator_spec::is_unit_sample_frequency(input));
                 return matches!(reduction, Reduction::PerEntity)
                     && !pooling
-                    && !(preserves_series_state || scalar_series_input);
+                    && !(preserves_series_state || scalar_series_input || frequency_series_input);
             }
             let additive_reduction = matches!(reduction, Reduction::Reduce(_))
                 && matches!(family, SummaryFamilyType::ExactAggregate(ExactKind::Sum, _))
@@ -2189,7 +2194,7 @@ impl PhysicalCompiler {
                         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1_000)),
                         materialization: fingerprint.into(),
                         output_grouping: PhysicalGrouping::Reduce(
-                            materialization.grouping_labels.labels.clone(),
+                            materialization.grouping_labels.names(),
                         ),
                         item_labels: materialization.aggregated_labels.labels.clone(),
                         window_ms: stored_interval_ms,
@@ -2807,6 +2812,11 @@ fn retained_state_bytes(materialization: &asap_types::PrecomputeMaterialization)
                 + parameter(&["heap_size"], 1) * 256
         }
         A::DatasketchesKLL => parameter(&["k"], 200) * 32,
+        A::UnivMon => {
+            parameter(&["layers"], 4)
+                * (parameter(&["sketch_rows"], 5) * parameter(&["sketch_cols"], 1024) * 16
+                    + parameter(&["heap_size"], 32) * 256)
+        }
         A::HydraKLL => parameter(&["k"], 200) * parameter(&["col", "cols"], 1) * 32,
         A::HLL => 1u128 << parameter(&["precision", "p"], 14).min(24),
         A::DDSketch => 64 * 1024,
@@ -2835,7 +2845,7 @@ fn retained_partition_count(
             materialization.aggregation_type,
             A::Increase | A::MultipleIncrease | A::MinMax | A::MultipleMinMax
         )
-        || !materialization.grouping_labels.labels.is_empty()
+        || !materialization.grouping_labels.names().is_empty()
     {
         u128::from(input_cardinality.unwrap_or(1).max(1))
     } else {
@@ -3432,6 +3442,14 @@ fn collect_selected_materializations(
                 input,
                 ..
             } => {
+                // Planner can model these families, but no backend state
+                // implementation exists. Leave an exact boundary unbound.
+                if matches!(
+                    kind.algorithm(),
+                    SketchAlgorithm::Kmv | SketchAlgorithm::Theta
+                ) {
+                    return Ok(());
+                }
                 if let Some(readout) = readout {
                     let mut parameters = sketch_params_json(kind.params());
                     let mut item_label = None;
@@ -3564,6 +3582,13 @@ pub(crate) fn physical_materialization_family(family: &SummaryFamilyType) -> Sum
 fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
     use planner_types::post_asap::SketchParams as P;
     match params {
+        P::UnivMon {
+            heap_size,
+            sketch_rows,
+            sketch_cols,
+            layers,
+        } => json!({"heap_size": heap_size, "sketch_rows": sketch_rows,
+                "sketch_cols": sketch_cols, "layers": layers}),
         P::Kll { k } => json!({"k": k}),
         P::Cms { width, depth } => json!({"width": width, "depth": depth}),
         P::Hll { precision } => json!({"precision": precision}),
@@ -3869,7 +3894,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(heaps.len(), 1, "unpartitioned TopK owns one global CMS");
-        assert!(heaps[0].grouping_labels.labels.is_empty());
+        assert!(heaps[0].grouping_labels.names().is_empty());
         assert_eq!(heaps[0].aggregated_labels.labels, vec!["job"]);
         assert_eq!(heaps[0].parameters["weight_scale"], 1_000_000);
         assert_eq!(retained_partition_count(heaps[0], Some(5)), 1);
@@ -4142,6 +4167,62 @@ mod tests {
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    /// Distinct range queries retain a per-series HLL selected by Planner.
+    #[test]
+    fn distinct_range_compiles_to_partitioned_hll() {
+        let mut deployment = environment(10_000);
+        deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        deployment.collector_ids.clear();
+        let mut workload = request("distinct", "distinct_over_time(m{job=\"api\"}[1m])");
+        let query = &mut workload.queries[0];
+        // HLL's modeled RSE does not certify a failure probability.
+        query.accuracy = AccuracyTarget::Epsilon(0.05);
+        let parsed = crate::query_parser::parse_query_expr_canonical(
+            &query.query_string,
+            query.accuracy.clone(),
+        )
+        .unwrap();
+        query.post_asap =
+            select_post_asap(&parsed, query.accuracy.clone(), &query.lifecycle, None).unwrap();
+        let plan = PhysicalCompiler
+            .compile_metricsql(workload, deployment)
+            .unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        let materialization = &plan.precompute_plan.materializations[0];
+        assert_eq!(
+            materialization.aggregation_type,
+            asap_types::AggregationType::HLL
+        );
+        assert_eq!(
+            materialization.partitioning,
+            Some(asap_types::sds::PopulationPartitioning::PerEntity)
+        );
+        plan.precompute_plan.validate().unwrap();
+        assert!(plan
+            .query_plan
+            .entries
+            .values()
+            .any(|entry| entry.nodes.values().any(|node| matches!(
+                node,
+                crate::query_plan::QueryPlanNode::SummaryEstimate {
+                    query: crate::query_plan::QueryReadout::Cardinality,
+                    ..
+                }
+            ))));
+    }
+
+    /// An unimplemented cardinality family fails admission rather than panicking in an emitter.
+    #[test]
+    fn unsupported_cardinality_family_fails_admission() {
+        let mut deployment = environment(10_000);
+        deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        deployment.collector_ids.clear();
+        let mut workload = request("confidence", "distinct_over_time(m[1m])");
+        workload.hybrid_execution = true;
+        let result = PhysicalCompiler.compile_metricsql(workload, deployment);
+        assert!(matches!(result, Err(CompileError::QueryPlan(_))));
     }
 
     #[test]
@@ -5410,7 +5491,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_local_hll_rejected_but_envelope_ingest_supported() {
+    fn backend_local_hll_and_envelope_ingest_are_supported() {
         let bundle = PhysicalCompiler
             .compile(
                 request("q", "quantile_over_time(0.99, m[1m])"),
@@ -5435,14 +5516,8 @@ mod tests {
             require_registered_producer: false,
         };
         envelope_plan.producers.clear();
-        assert!(matches!(
-            envelope_plan.validate(),
-            Err(PrecomputePlanError::UnsupportedFamily(_))
-        ));
-        assert!(matches!(
-            PrecomputePlan::build_backend_local(bundle.envelope, materializations),
-            Err(PrecomputePlanError::UnsupportedFamily(_))
-        ));
+        envelope_plan.validate().unwrap();
+        PrecomputePlan::build_backend_local(bundle.envelope, materializations).unwrap();
     }
 
     #[test]

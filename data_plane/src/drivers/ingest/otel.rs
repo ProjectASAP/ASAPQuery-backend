@@ -608,7 +608,6 @@ fn resolve_bucket_sid_for_agg_config(
 ) -> Result<(u64, asap_types::PolicyFingerprint), String> {
     let grouping_pairs: Vec<(&str, &str)> = config
         .grouping_labels
-        .labels
         .iter()
         .map(|name| {
             let v = point_labels.get(name).map(|s| s.as_str()).unwrap_or("");
@@ -1381,7 +1380,9 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 SketchAlgorithm::DDSketch | SketchAlgorithm::Kll => {
                                     Capability::QuantileApprox(Some(algorithm.clone()))
                                 }
-                                SketchAlgorithm::Hll => Capability::CardinalityApprox,
+                                SketchAlgorithm::Hll | SketchAlgorithm::UnivMon => {
+                                    Capability::CardinalityApprox
+                                }
                                 // Heap-LESS frequency sketches answer bare
                                 // frequency point queries (no top-k); index
                                 // them as FrequencyEstimate so a `topk(...)`
@@ -1939,6 +1940,7 @@ fn aggregation_type_for_sketch_algorithm(
         SketchAlgorithm::DDSketch => Some(AggregationType::DDSketch),
         SketchAlgorithm::Kll => Some(AggregationType::DatasketchesKLL),
         SketchAlgorithm::Hll => Some(AggregationType::HLL),
+        SketchAlgorithm::UnivMon => Some(AggregationType::UnivMon),
         SketchAlgorithm::CountSketch => Some(AggregationType::CountSketch),
         SketchAlgorithm::CountSketchWithHeap => Some(AggregationType::CountSketchWithHeap),
         SketchAlgorithm::Cms => Some(AggregationType::CountMinSketch),
@@ -1962,6 +1964,17 @@ fn sketch_config_to_params(
     use crate::storage_engines::sketch_db::data::SketchConfig;
     let mut params = std::collections::HashMap::new();
     match cfg {
+        SketchConfig::UnivMon {
+            heap_size,
+            sketch_rows,
+            sketch_cols,
+            layers,
+        } => {
+            params.insert("heap_size".into(), serde_json::json!(heap_size));
+            params.insert("sketch_rows".into(), serde_json::json!(sketch_rows));
+            params.insert("sketch_cols".into(), serde_json::json!(sketch_cols));
+            params.insert("layers".into(), serde_json::json!(layers));
+        }
         SketchConfig::DDSketch { relative_accuracy } => {
             params.insert(
                 "relative_accuracy".to_string(),

@@ -155,7 +155,7 @@ fn build_attrs_fp_and_label_map(
         .as_ref()
         .map(|k| k.labels.clone())
         .unwrap_or_default();
-    let key_names = &agg_cfg.grouping_labels.labels;
+    let key_names = &agg_cfg.grouping_labels.names();
     let mut attrs_fp = String::new();
     let mut label_values_map: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in key_names.iter().zip(label_values_vec.iter()) {
@@ -2767,7 +2767,7 @@ impl SketchStore {
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
         let (_attrs_fp, label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
-        let key_names = &agg_cfg.grouping_labels.labels;
+        let key_names = &agg_cfg.grouping_labels.names();
         let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg);
         let (capability, accuracy) = agg_kind.capability_and_accuracy();
 
@@ -2889,8 +2889,7 @@ impl SketchStore {
         let target_metric = agg_cfg.metric.as_str();
         let target_agg_type = agg_cfg.aggregation_type;
         let target_params = canonical_parameters(&agg_cfg.parameters);
-        let target_group_keys: BTreeSet<String> =
-            agg_cfg.grouping_labels.labels.iter().cloned().collect();
+        let target_group_keys: BTreeSet<String> = agg_cfg.grouping_labels.iter().cloned().collect();
 
         // Collect the matching sids under a short read lock; then call
         // `remove_instance` per sid (which takes its own write lock).

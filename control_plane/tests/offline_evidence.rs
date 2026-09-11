@@ -215,7 +215,7 @@ fn fixture(
         "distinct_count":100, "parameters":{"seed":42}});
     let environment = json!({"id":"test-machine", "cpu":"test", "os":"test", "runtime":"test",
         "implementation":"synthetic-test-fixture", "implementation_version":"v1"});
-    let records: Vec<_> = [(SketchAlgorithm::Cms,20.0), (SketchAlgorithm::CountSketch,10.0)].into_iter().map(|(algorithm,value)| {
+    let records: Vec<_> = [(SketchAlgorithm::Cms,20.0), (SketchAlgorithm::CountSketch,10.0), (SketchAlgorithm::UnivMon,30.0)].into_iter().map(|(algorithm,value)| {
         let params = model.size_params(algorithm.clone(), intent, 0.01, 0.01);
         json!({"id":format!("test-{algorithm:?}"), "algorithm":algorithm, "params":params,
             "distribution":distribution, "environment":environment,

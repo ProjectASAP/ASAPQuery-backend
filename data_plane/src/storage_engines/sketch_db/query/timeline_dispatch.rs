@@ -129,6 +129,8 @@ pub fn combine_statistic(
             .fold(None, |acc, v| Some(acc.map_or(v, |a: f64| a.max(v)))),
         // Non-combinable at the scalar level — see module doc.
         Statistic::Cardinality
+        | Statistic::FrequencyL2
+        | Statistic::FrequencyEntropy
         | Statistic::Increase
         | Statistic::Rate
         | Statistic::Quantile

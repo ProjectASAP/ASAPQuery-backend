@@ -104,6 +104,34 @@ pub enum SampleUpdateRule {
     CounterDelta { scale: f64 },
 }
 
+/// The implemented raw frequency domain counts occurrences of sample values.
+pub fn is_unit_sample_frequency(update: &planner_types::post_asap::SummaryUpdate) -> bool {
+    use planner_types::post_asap::{NonNegativeWeightProof, SummaryInputExpr, WeightDomain};
+    matches!(
+        update.item,
+        Some(SummaryInputExpr::Column(
+            planner_types::pre_asap::ColumnRef::SampleValue
+        ))
+    ) && matches!(update.weight, SummaryInputExpr::Constant(1.0))
+        && matches!(
+            update.weight_domain,
+            WeightDomain::NonNegative {
+                proof: NonNegativeWeightProof::UnitCount
+            }
+        )
+}
+
+/// Raw HLL hashes the scalar sample; it does not interpret it as a frequency weight.
+pub fn is_scalar_sample_value(update: &planner_types::post_asap::SummaryUpdate) -> bool {
+    update.item.is_none()
+        && matches!(
+            update.weight,
+            planner_types::post_asap::SummaryInputExpr::Column(
+                planner_types::pre_asap::ColumnRef::SampleValue
+            )
+        )
+}
+
 impl AggregationConfig {
     pub fn sample_update_rule(&self) -> SampleUpdateRule {
         let scale = self
@@ -311,6 +339,32 @@ impl AggregationConfig {
                 ),
                 false,
             ),
+            UnivMon => {
+                let param =
+                    |name: &str, default: u64, max: u64| -> Result<u32, AccumulatorSpecError> {
+                        let value = self
+                            .parameters
+                            .get(name)
+                            .map_or(Some(default), |v| v.as_u64())
+                            .ok_or(AccumulatorSpecError::UnmappedAggregationType(UnivMon))?;
+                        if value == 0 || value > max {
+                            return Err(AccumulatorSpecError::UnmappedAggregationType(UnivMon));
+                        }
+                        Ok(value as u32)
+                    };
+                (
+                    independent_sketch(
+                        SketchAlgorithm::UnivMon,
+                        SketchParams::UnivMon {
+                            heap_size: param("heap_size", 32, u32::MAX as u64)?,
+                            sketch_rows: param("sketch_rows", 5, 20)?,
+                            sketch_cols: param("sketch_cols", 1024, u32::MAX as u64)?,
+                            layers: param("layers", 4, 64)? as u8,
+                        },
+                    ),
+                    false,
+                )
+            }
             HLL => {
                 let precision = match self.parameters.get("precision") {
                     None => 14,
@@ -403,7 +457,7 @@ impl AggregationConfig {
         };
 
         let grouping = if keyed {
-            Some(self.grouping_labels.clone())
+            Some(self.grouping_labels.label_names())
         } else {
             None
         };
