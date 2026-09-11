@@ -85,7 +85,7 @@ impl PrecomputePlan {
                 || &data.value_projection != expected_projection
                 || data.population_filter_canonical
                     != config.population_filter_canonical().map_err(invalid)?
-                || data.group_by_keys != config.grouping_labels.labels.iter().cloned().collect()
+                || data.group_by_keys != config.grouping_labels
             {
                 return Err(invalid("source/population/grouping differs from catalog"));
             }
@@ -136,7 +136,7 @@ impl PrecomputePlan {
                 || schema.family != expected_family
                 || schema.source != source
                 || &schema.value_projection != projection
-                || schema.group_by != config.grouping_labels.labels
+                || schema.group_by != config.grouping_labels
                 || schema.window.kind != config.window_type
                 || schema.window.size_ms != size
                 || schema.window.slide_ms != expected_slide

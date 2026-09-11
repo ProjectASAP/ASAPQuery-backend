@@ -99,7 +99,8 @@ pub struct PrecomputeMaterialization {
     pub aggregation_type: AggregationType,
     pub aggregation_sub_type: String,
     pub parameters: HashMap<String, Value>,
-    pub grouping_labels: KeyByLabelNames,
+    #[serde(serialize_with = "crate::grouping_projection::serialize_config_grouping")]
+    pub grouping_labels: crate::GroupingProjection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partitioning: Option<crate::sds::PopulationPartitioning>,
     pub aggregated_labels: KeyByLabelNames,
@@ -231,7 +232,7 @@ impl PrecomputeMaterialization {
         aggregation_type: AggregationType,
         aggregation_sub_type: String,
         parameters: HashMap<String, Value>,
-        grouping_labels: KeyByLabelNames,
+        grouping_labels: impl Into<crate::GroupingProjection>,
         aggregated_labels: KeyByLabelNames,
         rollup_labels: KeyByLabelNames,
         original_yaml: String,
@@ -252,7 +253,7 @@ impl PrecomputeMaterialization {
             aggregation_type,
             aggregation_sub_type,
             parameters,
-            grouping_labels,
+            grouping_labels: grouping_labels.into(),
             partitioning: None,
             aggregated_labels,
             rollup_labels,
@@ -342,7 +343,8 @@ impl PrecomputeMaterialization {
         let original_yaml = data["originalYaml"].as_str().unwrap_or("").to_string();
 
         // Deserialize KeyByLabelNames - assuming they have deserialize_from_json methods
-        let grouping_labels = KeyByLabelNames::deserialize_from_json(&data["groupingLabels"])?;
+        let grouping_labels =
+            crate::GroupingProjection::deserialize_from_json(&data["groupingLabels"])?;
         let aggregated_labels = KeyByLabelNames::deserialize_from_json(&data["aggregatedLabels"])?;
         let rollup_labels = KeyByLabelNames::deserialize_from_json(&data["rollupLabels"])?;
 
@@ -445,15 +447,8 @@ impl PrecomputeMaterialization {
         // fixtures that still spell out the field parse cleanly.
 
         let labels = &aggregation_data["labels"];
-        let grouping_labels = KeyByLabelNames::new(
-            labels["grouping"]
-                .as_sequence()
-                .ok_or_else(|| anyhow::anyhow!("Missing grouping labels"))?
-                .iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect(),
-        );
+        let grouping_labels: crate::GroupingProjection =
+            serde_yaml::from_value(labels["grouping"].clone())?;
         let aggregated_labels = KeyByLabelNames::new(
             labels["aggregated"]
                 .as_sequence()
