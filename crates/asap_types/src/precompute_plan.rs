@@ -343,6 +343,77 @@ impl PrecomputePlan {
             installed
                 .validate()
                 .map_err(PrecomputePlanError::CatalogContract)?;
+            let dag = installed
+                .document
+                .decode()
+                .map_err(PrecomputePlanError::CatalogContract)?;
+            for node in &dag.nodes {
+                let Some(crate::executable_plan::BackendNodeBinding::Materialization {
+                    summary_definition,
+                }) = installed.binding.node(node.id)
+                else {
+                    continue;
+                };
+                let Some(config) = self
+                    .materializations
+                    .iter()
+                    .find(|config| config.policy_fingerprint() == summary_definition.fingerprint())
+                else {
+                    return Err(PrecomputePlanError::CatalogContract(
+                        "DAG materialization has no runtime configuration".into(),
+                    ));
+                };
+                if self.ingest.protocol == IngestProtocol::PrometheusRemoteWriteV1
+                    && matches!(
+                        config.aggregation_type,
+                        crate::AggregationType::HLL | crate::AggregationType::UnivMon
+                    )
+                {
+                    if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+                        input,
+                        ..
+                    } = &node.payload
+                    {
+                        let supported = match config.aggregation_type {
+                            crate::AggregationType::HLL => {
+                                crate::accumulator_spec::is_scalar_sample_value(input)
+                                    || crate::accumulator_spec::is_unit_sample_frequency(input)
+                            }
+                            crate::AggregationType::UnivMon => {
+                                crate::accumulator_spec::is_unit_sample_frequency(input)
+                            }
+                            _ => unreachable!(),
+                        };
+                        if !supported {
+                            return Err(PrecomputePlanError::CatalogContract(
+                                "raw materialization input does not match its accumulator update semantics".into(),
+                            ));
+                        }
+                    }
+                }
+                if let Some(partitioning) = config.partitioning {
+                    if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+                        reduction,
+                        ..
+                    } = &node.payload
+                    {
+                        let expected = match reduction {
+                            planner_types::pre_asap::Reduction::PerEntity => {
+                                crate::sds::PopulationPartitioning::PerEntity
+                            }
+                            planner_types::pre_asap::Reduction::Reduce(_) => {
+                                crate::sds::PopulationPartitioning::Grouped
+                            }
+                        };
+                        if partitioning != expected {
+                            return Err(PrecomputePlanError::CatalogContract(
+                                "runtime population partition disagrees with Planner reduction"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            }
         }
         let mut materializations = BTreeSet::new();
         for materialization in &self.materializations {
@@ -363,15 +434,6 @@ impl PrecomputePlan {
                     materialization: materialization.policy_fp_u64(),
                     reason: "window kind disagrees with size and slide".into(),
                 });
-            }
-            // HLL is supported as an ingested sketch envelope, not as a raw
-            // accumulator. Validate here so external installs cannot bypass it.
-            if self.ingest.protocol == IngestProtocol::PrometheusRemoteWriteV1
-                && materialization.aggregation_type == crate::AggregationType::HLL
-            {
-                return Err(PrecomputePlanError::UnsupportedFamily(
-                    materialization.policy_fp_u64(),
-                ));
             }
             if !materializations.insert(materialization.policy_fingerprint().into()) {
                 return Err(PrecomputePlanError::DuplicateMaterialization(
@@ -499,7 +561,9 @@ pub(crate) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> 
         SummaryFamilyType::Sketch(kind, _)
             if matches!(
                 kind.algorithm(),
-                SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap
+                SketchAlgorithm::CmsWithHeap
+                    | SketchAlgorithm::CountSketchWithHeap
+                    | SketchAlgorithm::UnivMon
             ) =>
         {
             vec![StateEncoding::SketchCoreMsgpackV1]

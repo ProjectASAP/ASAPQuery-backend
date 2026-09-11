@@ -264,11 +264,24 @@ fn sketch_algorithm_byte(k: SketchAlgorithm) -> u8 {
         SketchAlgorithm::CountSketchWithHeap => 7,
         SketchAlgorithm::Kmv => 8,
         SketchAlgorithm::Theta => 9,
+        SketchAlgorithm::UnivMon => 10,
     }
 }
 
 fn encode_sketch_config(cfg: &SketchConfig, buf: &mut Vec<u8>) {
     match cfg {
+        SketchConfig::UnivMon {
+            heap_size,
+            sketch_rows,
+            sketch_cols,
+            layers,
+        } => {
+            buf.push(b'U');
+            buf.extend_from_slice(&heap_size.to_le_bytes());
+            buf.extend_from_slice(&sketch_rows.to_le_bytes());
+            buf.extend_from_slice(&sketch_cols.to_le_bytes());
+            buf.push(*layers);
+        }
         SketchConfig::DDSketch { relative_accuracy } => {
             buf.push(b'D');
             buf.extend_from_slice(&relative_accuracy.to_le_bytes());

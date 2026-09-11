@@ -58,6 +58,12 @@ use crate::storage_engines::sketch_db::query::decoders::{
 /// so those two need the params known up front to allocate it.
 #[derive(Debug, Clone, Copy)]
 pub enum DeltaSketchKind {
+    UnivMon {
+        heap_size: u32,
+        sketch_rows: u32,
+        sketch_cols: u32,
+        layers: u8,
+    },
     DDSketch {
         alpha: f64,
     },
@@ -103,6 +109,20 @@ impl DeltaSketchKind {
     /// (delta-from-empty ⊕ empty = window state).
     fn bootstrap_empty(&self) -> SummaryState {
         match self {
+            Self::UnivMon {
+                heap_size,
+                sketch_rows,
+                sketch_cols,
+                layers,
+            } => SummaryState::UnivMon(
+                crate::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator::new(
+                    *heap_size as usize,
+                    *sketch_rows as usize,
+                    *sketch_cols as usize,
+                    *layers as usize,
+                )
+                .expect("validated UnivMon catalog dimensions"),
+            ),
             DeltaSketchKind::DDSketch { alpha } => SummaryState::Dd(DdSketch::new(*alpha)),
             DeltaSketchKind::Kll { k } => SummaryState::Kll(KllSketch::new(*k as u16)),
             DeltaSketchKind::Hll { precision } => {
@@ -138,6 +158,29 @@ fn decode_full(
     encoding: SketchEncoding,
 ) -> Result<SummaryState, String> {
     match (kind, encoding) {
+        (
+            DeltaSketchKind::UnivMon {
+                heap_size,
+                sketch_rows,
+                sketch_cols,
+                layers,
+            },
+            SketchEncoding::MsgpackFull,
+        ) => {
+            let state = crate::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator::from_bytes(bytes)
+                .map_err(|e| e.to_string())?;
+            if state.dimensions()
+                != (
+                    *heap_size as usize,
+                    *sketch_rows as usize,
+                    *sketch_cols as usize,
+                    *layers as usize,
+                )
+            {
+                return Err("UnivMon payload dimensions differ from installed catalog".into());
+            }
+            Ok(SummaryState::UnivMon(state))
+        }
         (DeltaSketchKind::DDSketch { .. }, SketchEncoding::ProtoFull) => {
             let sk = dd_from_proto(bytes)?;
             Ok(SummaryState::Dd(sk))
@@ -201,6 +244,7 @@ fn decode_full(
 /// folded across a window (or several) via delta application, or merged
 /// in from another sid's own reconstruction.
 pub enum SummaryState {
+    UnivMon(crate::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator),
     Dd(DdSketch),
     Hll(HllSketch),
     Kll(KllSketch),
@@ -235,6 +279,7 @@ impl SummaryState {
             ));
         }
         match self {
+            SummaryState::UnivMon(_) => Err("UnivMon requires full pane snapshots".into()),
             SummaryState::Dd(sk) => {
                 match encoding {
                     // PROTO_DELTA: dispatch on the payload SHAPE, mirroring the
@@ -492,6 +537,9 @@ impl SummaryState {
     /// on `DeltaSketchKind`.
     pub fn merge_same_family(&mut self, other: &SummaryState) -> Result<(), String> {
         match (self, other) {
+            (SummaryState::UnivMon(a), SummaryState::UnivMon(b)) => {
+                a.merge_in_place(b).map_err(|e| e.to_string())
+            }
             (SummaryState::Dd(a), SummaryState::Dd(b)) => {
                 a.merge(b).map_err(|e| format!("merge DDSketch: {e}"))
             }
@@ -523,6 +571,7 @@ impl SummaryState {
     /// Diagnostic family name for error messages — not used for dispatch.
     fn family_name(&self) -> &'static str {
         match self {
+            SummaryState::UnivMon(_) => "UnivMon",
             SummaryState::Dd(_) => "DDSketch",
             SummaryState::Hll(_) => "Hll",
             SummaryState::Kll(_) => "Kll",

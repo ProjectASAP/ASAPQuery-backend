@@ -265,6 +265,9 @@ impl SerializableToSink for HllSketchAccumulator {
 }
 
 impl AggregateCore for HllSketchAccumulator {
+    fn approx_memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(self.inner.registers.capacity())
+    }
     fn clone_boxed_core(&self) -> Box<dyn AggregateCore> {
         Box::new(self.clone())
     }

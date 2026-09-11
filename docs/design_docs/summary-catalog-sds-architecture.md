@@ -258,6 +258,22 @@ contract separately identifies the supported rank-error bound or versioned
 bound derivation, probability of failure, readout scope and required conditions.
 If that guarantee is unavailable, fidelity is explicitly `Unknown`.
 
+For a shared UnivMon state, `heap_size`, `sketch_rows`, `sketch_cols`, and
+`layers` describe one configuration. They do not establish one error bound for
+all readouts. The backend's `UnivMonFrequency` contract records these parameters
+and the unit-frequency update domain: each sample value contributes one
+occurrence. Total count is exact in that domain; distinct count, frequency L2,
+and frequency entropy require their own accuracy evidence. Frequency L2 means
+`sqrt(sum(frequency(key)^2))`; entropy is measured in bits.
+
+ERP evidence must state the readout's units: relative error for distinct and L2,
+and absolute bits error for entropy. A measured error is not a certified failure
+probability. Readouts may share state only when their configuration and data
+population match and each readout's accuracy requirements are satisfied. A
+small configuration suitable for L2 may therefore be unsuitable for entropy.
+Completeness of the input window remains a separate requirement for every
+readout, including exact count.
+
 A `FidelityGuarantee` contains:
 
 - The applicable operation and error quantity, such as quantile rank error.

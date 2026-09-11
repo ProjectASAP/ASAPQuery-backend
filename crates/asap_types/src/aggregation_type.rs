@@ -44,6 +44,7 @@ pub enum AggregationType {
     CountSketchWithHeap,
     // ---------- cardinality / set tracking ----------
     HLL,
+    UnivMon,
     DDSketch,
     // ---------- legacy config wrapper names ----------
     SingleSubpopulation,
@@ -66,6 +67,7 @@ impl AggregationType {
             AggregationType::CountSketch => "CountSketch",
             AggregationType::CountSketchWithHeap => "CountSketchWithHeap",
             AggregationType::HLL => "HLL",
+            AggregationType::UnivMon => "UnivMon",
             AggregationType::DDSketch => "DDSketch",
             AggregationType::SingleSubpopulation => "SingleSubpopulation",
             AggregationType::MultipleSubpopulation => "MultipleSubpopulation",
@@ -137,6 +139,7 @@ impl FromStr for AggregationType {
             "CountSketch" => Ok(AggregationType::CountSketch),
             "CountSketchWithHeap" => Ok(AggregationType::CountSketchWithHeap),
             "HLL" | "HyperLogLog" => Ok(AggregationType::HLL),
+            "UnivMon" => Ok(AggregationType::UnivMon),
             "DDSketch" | "DdSketch" => Ok(AggregationType::DDSketch),
             "SingleSubpopulation" => Ok(AggregationType::SingleSubpopulation),
             "MultipleSubpopulation" => Ok(AggregationType::MultipleSubpopulation),

@@ -125,6 +125,11 @@ impl WireCostTable {
     // control_plane/docs/design-asapplanner-pin-migration.md).
     pub const fn for_algorithm(&self, algorithm: &SketchAlgorithm) -> SketchWireCost {
         match algorithm {
+            // No collector wire implementation is available for this family.
+            SketchAlgorithm::UnivMon => SketchWireCost {
+                state_bytes: u64::MAX,
+                envelope_bytes: 0,
+            },
             SketchAlgorithm::DDSketch => self.ddsketch_delta,
             SketchAlgorithm::Kll => self.kll_full,
             SketchAlgorithm::Hll => self.hll_delta,

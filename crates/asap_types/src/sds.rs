@@ -376,6 +376,14 @@ pub enum SummaryOperator {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FidelityGuarantee {
+    /// Total unit-frequency count is exact. Distinct, L2 and entropy require
+    /// readout-specific evidence; dimensions alone certify no error bound.
+    UnivMonFrequency {
+        heap_size: u32,
+        sketch_rows: u32,
+        sketch_cols: u32,
+        layers: u8,
+    },
     Exact,
     /// Exact PromQL counter readout from fixed-size pane summaries. Each pane
     /// stores only `(first value/time, last value/time, reset-corrected delta,
@@ -440,6 +448,17 @@ impl FidelityGuarantee {
             },
             Ok(SummaryFamilyType::ExactAggregate(..)) => Self::Exact,
             Ok(SummaryFamilyType::Sketch(kind, _)) => match kind.params() {
+                SketchParams::UnivMon {
+                    heap_size,
+                    sketch_rows,
+                    sketch_cols,
+                    layers,
+                } => Self::UnivMonFrequency {
+                    heap_size: *heap_size,
+                    sketch_rows: *sketch_rows,
+                    sketch_cols: *sketch_cols,
+                    layers: *layers,
+                },
                 SketchParams::Kll { k } => Self::KllRankError {
                     k: *k,
                     model: if config.aggregation_type == AggregationType::HydraKLL {
@@ -479,6 +498,17 @@ impl FidelityGuarantee {
     }
     fn validate(&self) -> Result<(), SdsError> {
         let valid = match self {
+            Self::UnivMonFrequency {
+                heap_size,
+                sketch_rows,
+                sketch_cols,
+                layers,
+            } => {
+                *heap_size > 0
+                    && *sketch_cols > 0
+                    && (1..=20).contains(sketch_rows)
+                    && (1..=64).contains(layers)
+            }
             Self::Exact => true,
             Self::ExactCounter {
                 model,
@@ -618,6 +648,7 @@ impl FidelityGuarantee {
         use SketchAlgorithm as S;
 
         let configured = |aggregation_type| match (aggregation_type, self) {
+            (A::UnivMon, UnivMonFrequency { .. }) => true,
             (A::Sum | A::MultipleSum | A::MinMax | A::MultipleMinMax, Exact) => true,
             (A::Increase | A::MultipleIncrease, ExactCounter { .. }) => true,
             (A::DatasketchesKLL | A::HydraKLL, KllRankError { .. }) => true,
@@ -643,7 +674,8 @@ impl FidelityGuarantee {
             } => {
                 matches!(
                     (algorithm, self),
-                    (S::Kll, KllRankError { .. })
+                    (S::UnivMon, UnivMonFrequency { .. })
+                        | (S::Kll, KllRankError { .. })
                         | (S::DDSketch, DdSketchRelativeError { .. })
                         | (S::Hll, HllCardinalityError { .. })
                         | (S::Cms | S::CmsWithHeap, CmsFrequencyError { .. })
@@ -665,6 +697,17 @@ impl FidelityGuarantee {
                 .all(|value| value.as_u64() == Some(u64::from(expected)))
         };
         match self {
+            Self::UnivMonFrequency {
+                heap_size,
+                sketch_rows,
+                sketch_cols,
+                layers,
+            } => {
+                u32_parameter(&["heap_size"], *heap_size)
+                    && u32_parameter(&["sketch_rows"], *sketch_rows)
+                    && u32_parameter(&["sketch_cols"], *sketch_cols)
+                    && u32_parameter(&["layers"], u32::from(*layers))
+            }
             Self::KllRankError { k, .. } => u32_parameter(&["k", "K"], *k),
             Self::HllCardinalityError { precision, .. } => {
                 u32_parameter(&["precision", "p"], *precision)

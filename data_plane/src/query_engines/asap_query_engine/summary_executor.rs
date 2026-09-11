@@ -992,7 +992,30 @@ fn readout_per_window(
 /// `SketchQuery` -- shared by both the cumulative and per-window readout
 /// paths.
 fn sketch_query_value(rs: &SummaryState, query: &SketchQuery) -> Result<f64, SummaryExecutorError> {
+    if let SummaryState::UnivMon(state) = rs {
+        use crate::storage_engines::types::AggregateCore;
+        let statistic = match query {
+            SketchQuery::Cardinality => asap_types::Statistic::Cardinality,
+            SketchQuery::FrequencyL2 => asap_types::Statistic::FrequencyL2,
+            SketchQuery::FrequencyEntropy => asap_types::Statistic::FrequencyEntropy,
+            SketchQuery::PointCount {
+                key: ColumnRef::SampleValue,
+                value: None,
+            } => asap_types::Statistic::Count,
+            _ => {
+                return Err(SummaryExecutorError::Unsupported(
+                    "unsupported UnivMon readout",
+                ))
+            }
+        };
+        return state
+            .query_statistic(statistic, &None, &Default::default())
+            .map_err(|_| SummaryExecutorError::Unsupported("UnivMon readout failed"));
+    }
     match query {
+        SketchQuery::FrequencyL2 | SketchQuery::FrequencyEntropy => Err(
+            SummaryExecutorError::Unsupported("frequency moment readout requires UnivMon"),
+        ),
         SketchQuery::Quantile { q } => Ok(rs.quantile(*q)),
         SketchQuery::Cardinality => Ok(rs.cardinality()),
         // `key: ColumnRef::SampleValue, value: None` means "no specific
@@ -1073,6 +1096,22 @@ fn summary_family_matches_sketch(
         return false;
     };
     match (sketch.algorithm(), sketch.params(), kind, config) {
+        (
+            SketchAlgorithm::UnivMon,
+            SketchParams::UnivMon {
+                heap_size,
+                sketch_rows,
+                sketch_cols,
+                layers,
+            },
+            SketchAlgorithm::UnivMon,
+            SketchConfig::UnivMon {
+                heap_size: h,
+                sketch_rows: r,
+                sketch_cols: c,
+                layers: l,
+            },
+        ) => heap_size == h && sketch_rows == r && sketch_cols == c && layers == l,
         (
             SketchAlgorithm::DDSketch,
             SketchParams::DDSketch { alpha },
@@ -1224,6 +1263,20 @@ fn to_delta_kind(kind: SketchAlgorithm, config: &SketchConfig) -> Option<DeltaSk
     // heap_size-absent default (`accuracy.rs`).
     const DEFAULT_HEAP_SIZE: usize = 100;
     match (kind, config) {
+        (
+            SketchAlgorithm::UnivMon,
+            SketchConfig::UnivMon {
+                heap_size,
+                sketch_rows,
+                sketch_cols,
+                layers,
+            },
+        ) => Some(DeltaSketchKind::UnivMon {
+            heap_size: *heap_size,
+            sketch_rows: *sketch_rows,
+            sketch_cols: *sketch_cols,
+            layers: *layers,
+        }),
         (SketchAlgorithm::DDSketch, SketchConfig::DDSketch { relative_accuracy }) => {
             Some(DeltaSketchKind::DDSketch {
                 alpha: *relative_accuracy,
@@ -1730,6 +1783,92 @@ mod tests {
 
     const T0: u64 = 1_000_000;
     const T1: u64 = 2_000_000;
+
+    /// One installed frequency summary merges panes before all four readouts.
+    #[test]
+    fn bound_univmon_merges_panes_for_four_readouts() {
+        use crate::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator;
+        use crate::storage_engines::sketch_db::index::SketchEncoding;
+        use crate::storage_engines::types::SerializableToSink;
+        use control_plane::query_plan::{MaterializationBinding, PhysicalGrouping};
+        let index = SketchStore::new();
+        let fp = asap_types::PolicyFingerprint(701);
+        let mut meta = kll_meta(1, "m", &["job"]);
+        meta.policy_fp = fp;
+        meta.agg_kind = AggKind::Sketch {
+            algorithm: SketchAlgorithm::UnivMon,
+            config: SketchConfig::UnivMon {
+                heap_size: 32,
+                sketch_rows: 5,
+                sketch_cols: 1024,
+                layers: 4,
+            },
+            spatial_filter_canonical: String::new(),
+        };
+        meta.accuracy = None;
+        meta.capability = Some(Capability::CardinalityApprox);
+        index.register(meta);
+        for (start, values) in [(0, [1.0, 2.0]), (1000, [2.0, 3.0])] {
+            let mut state = UnivMonAccumulator::new(32, 5, 1024, 4).unwrap();
+            for value in values {
+                state.insert_sample(value).unwrap();
+            }
+            index.append_sample(
+                1,
+                BTreeMap::from([("job".into(), "a".into())]),
+                (start, start + 1000),
+                SketchSampleState {
+                    bytes: state.serialize_to_bytes(),
+                    encoding: SketchEncoding::MsgpackFull,
+                },
+            );
+        }
+        let context = QueryExecutionContext {
+            index: &index,
+            t0_ms: 0,
+            t1_ms: 2000,
+            is_cumulative: true,
+            allowed_materializations: Some(BTreeSet::from([fp])),
+        };
+        let binding = MaterializationBinding {
+            materialization: fp.into(),
+            output_grouping: PhysicalGrouping::PerEntity,
+            item_labels: vec![],
+            window_ms: 1000,
+            pane_origin_ms: Some(0),
+            readout_lookback_ms: Some(2000),
+        };
+        let states = context.read_bound_materialization(&binding).unwrap();
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].0.get("job").unwrap(), "a");
+        for (query, expected) in [
+            (
+                SketchQuery::PointCount {
+                    key: ColumnRef::SampleValue,
+                    value: None,
+                },
+                4.0,
+            ),
+            (SketchQuery::Cardinality, 3.0),
+            (SketchQuery::FrequencyL2, 6.0f64.sqrt()),
+            (SketchQuery::FrequencyEntropy, 1.5),
+        ] {
+            let SummaryValue::Points(points, _) =
+                context.readout_bound(&states[0].1, &query).unwrap()
+            else {
+                panic!("expected scalar points")
+            };
+            assert_eq!(points.len(), 1);
+            assert!(
+                (points[0].1 - expected).abs() < 0.05,
+                "{query:?}: {:?}",
+                points
+            );
+        }
+        let mut unknown = binding;
+        unknown.materialization = asap_types::PolicyFingerprint(702).into();
+        assert!(context.read_bound_materialization(&unknown).is_err());
+    }
 
     fn ctx(index: &SketchStore) -> QueryExecutionContext<'_> {
         QueryExecutionContext {

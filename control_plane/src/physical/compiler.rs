@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "0deceda3e776216c5542d638d958b159f22e27ce";
+pub const PLANNER_REVISION: &str = env!("ASAPPLANNER_REVISION");
 pub const BACKEND_REVISION: &str = env!("ASAPQUERY_BACKEND_REVISION");
 pub use asap_types::precompute_plan::BACKEND_COMPAT;
 /// Matches the data plane's default persistence memory limit. A backend-local
@@ -1489,8 +1489,9 @@ impl BackendLocalPlanningSnapshot {
     }
 }
 
-/// Raw accumulators do not retain arbitrary source labels. Preserve native semantics
-/// unless the selected DAG explicitly authorizes pooling the source entities.
+/// Admit per-entity raw state only when the installed partition contract and
+/// scalar input evaluator preserve source rows. Composite updates still require
+/// an executable maintenance evaluator; a partition flag cannot authorize them.
 fn has_unsafe_raw_entity_leaf(
     node: &Rc<SummaryNode>,
     selected: &[Rc<SummaryNode>],
@@ -1513,9 +1514,17 @@ fn has_unsafe_raw_entity_leaf(
                         _
                     )
                 );
+                let scalar_series_input = matches!(&node.expr,
+                    SummaryExpr::SummaryAgg { input, family, .. }
+                    if !matches!(family, SummaryFamilyType::Sketch(kind, _) if matches!(kind.algorithm(), SketchAlgorithm::UnivMon))
+                        && asap_types::accumulator_spec::is_scalar_sample_value(input));
+                let frequency_series_input = matches!(&node.expr,
+                    SummaryExpr::SummaryAgg { input, family: SummaryFamilyType::Sketch(kind, _), .. }
+                    if matches!(kind.algorithm(), SketchAlgorithm::Hll | SketchAlgorithm::UnivMon)
+                        && asap_types::accumulator_spec::is_unit_sample_frequency(input));
                 return matches!(reduction, Reduction::PerEntity)
                     && !pooling
-                    && !preserves_series_state;
+                    && !(preserves_series_state || scalar_series_input || frequency_series_input);
             }
             let additive_reduction = matches!(reduction, Reduction::Reduce(_))
                 && matches!(family, SummaryFamilyType::ExactAggregate(ExactKind::Sum, _))
@@ -1871,10 +1880,8 @@ impl PhysicalCompiler {
                     aggregation_id.clone(),
                     environment.target,
                 );
-                let precompute_materialization = aggregation_config_for_materialization(
-                    &aggregation,
-                    asap_types::QueryLanguage::PromQl,
-                )?;
+                let precompute_materialization =
+                    scoped_materialization(&aggregation, &selected.node)?;
                 let materialization = precompute_materialization.policy_fingerprint();
                 let state_consumers = consumers[&materialization]
                     .iter()
@@ -1905,10 +1912,8 @@ impl PhysicalCompiler {
                 // Preserve semantic window and evaluation cadence independently
                 // from the selected storage representation.
                 aggregation.window_secs = window_implementation.window_secs;
-                let mut runtime_materialization = aggregation_config_for_materialization(
-                    &aggregation,
-                    asap_types::QueryLanguage::PromQl,
-                )?;
+                let mut runtime_materialization =
+                    scoped_materialization(&aggregation, &selected.node)?;
                 runtime_materialization.window_size = window_implementation.window_secs;
                 runtime_materialization.slide_interval = window_implementation.slide_secs;
                 runtime_materialization.window_type =
@@ -2162,13 +2167,7 @@ impl PhysicalCompiler {
                         .materializations
                         .iter()
                         .find(|candidate| candidate.policy_fingerprint() == fingerprint)
-                        .map(|candidate| match &candidate.window_layout {
-                            asap_types::WindowMaterializationLayout::FullWindow => {
-                                candidate.window_size
-                            }
-                            layout => layout.base_pane_secs(),
-                        }
-                        .saturating_mul(1_000))
+                        .map(asap_types::PrecomputeMaterialization::stored_window_ms)
                         .ok_or_else(|| {
                             crate::query_plan::QueryPlanError::Invalid(format!(
                                 "compiled binding {} has no precompute materialization",
@@ -2813,6 +2812,11 @@ fn retained_state_bytes(materialization: &asap_types::PrecomputeMaterialization)
                 + parameter(&["heap_size"], 1) * 256
         }
         A::DatasketchesKLL => parameter(&["k"], 200) * 32,
+        A::UnivMon => {
+            parameter(&["layers"], 4)
+                * (parameter(&["sketch_rows"], 5) * parameter(&["sketch_cols"], 1024) * 16
+                    + parameter(&["heap_size"], 32) * 256)
+        }
         A::HydraKLL => parameter(&["k"], 200) * parameter(&["col", "cols"], 1) * 32,
         A::HLL => 1u128 << parameter(&["precision", "p"], 14).min(24),
         A::DDSketch => 64 * 1024,
@@ -2836,10 +2840,12 @@ fn retained_partition_count(
     // Reset-aware and min/max state remains source-series scoped even with an
     // empty output grouping. Grouped states have at most one partition per
     // input series. Other empty groupings are the Reduce([]) global singleton.
-    if matches!(
-        materialization.aggregation_type,
-        A::Increase | A::MultipleIncrease | A::MinMax | A::MultipleMinMax
-    ) || !materialization.grouping_labels.labels.is_empty()
+    if materialization.partitioning == Some(asap_types::sds::PopulationPartitioning::PerEntity)
+        || matches!(
+            materialization.aggregation_type,
+            A::Increase | A::MultipleIncrease | A::MinMax | A::MultipleMinMax
+        )
+        || !materialization.grouping_labels.labels.is_empty()
     {
         u128::from(input_cardinality.unwrap_or(1).max(1))
     } else {
@@ -3190,6 +3196,29 @@ fn physical_aggregation(
 /// content-addressed materialization contract. This is the one conversion
 /// shared by the physical compiler and the compatibility replanner; it does
 /// not create a second registry or wire plan.
+fn scoped_materialization(
+    aggregation: &BackendAggregation,
+    node: &SummaryNode,
+) -> anyhow::Result<asap_types::PrecomputeMaterialization> {
+    let mut config =
+        aggregation_config_for_materialization(aggregation, asap_types::QueryLanguage::PromQl)?;
+    if !matches!(aggregation.aggregation_input, AggregationInput::Raw) {
+        return Ok(config);
+    }
+    let SummaryExpr::SummaryAgg { reduction, .. } = &node.expr else {
+        anyhow::bail!("materialization lacks SummaryAgg partition contract");
+    };
+    config.partitioning = Some(match reduction {
+        planner_types::pre_asap::Reduction::PerEntity => {
+            asap_types::sds::PopulationPartitioning::PerEntity
+        }
+        planner_types::pre_asap::Reduction::Reduce(_) => {
+            asap_types::sds::PopulationPartitioning::Grouped
+        }
+    });
+    Ok(config)
+}
+
 pub(crate) fn aggregation_config_for_materialization(
     aggregation: &BackendAggregation,
     language: asap_types::QueryLanguage,
@@ -3241,9 +3270,9 @@ fn materialization_consumers(
             {
                 continue;
             }
-            let config = aggregation_config_for_materialization(
+            let config = scoped_materialization(
                 &physical_aggregation(query, &state, query.query_id.clone(), target),
-                asap_types::QueryLanguage::PromQl,
+                &state.node,
             )?;
             consumers
                 .entry(config.policy_fingerprint())
@@ -3306,8 +3335,9 @@ fn shared_pane_origin_ms(
 /// serialized QueryPlan retains the merge edges. Unsupported operators are
 /// intentionally not traversed: QueryPlan lowers them to an explicit exact
 /// fallback node and no unused warm state is provisioned.
-/// Raw accumulators do not retain arbitrary source labels. Preserve native semantics
-/// unless the selected DAG explicitly authorizes pooling the source entities.
+/// Admit per-entity raw state only when the installed partition contract and
+/// scalar input evaluator preserve source rows. Composite updates still require
+/// an executable maintenance evaluator; a partition flag cannot authorize them.
 fn collect_selected_materializations(
     node: &Rc<SummaryNode>,
     composable: bool,
@@ -3412,6 +3442,14 @@ fn collect_selected_materializations(
                 input,
                 ..
             } => {
+                // Planner can model these families, but no backend state
+                // implementation exists. Leave an exact boundary unbound.
+                if matches!(
+                    kind.algorithm(),
+                    SketchAlgorithm::Kmv | SketchAlgorithm::Theta
+                ) {
+                    return Ok(());
+                }
                 if let Some(readout) = readout {
                     let mut parameters = sketch_params_json(kind.params());
                     let mut item_label = None;
@@ -3544,6 +3582,13 @@ pub(crate) fn physical_materialization_family(family: &SummaryFamilyType) -> Sum
 fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
     use planner_types::post_asap::SketchParams as P;
     match params {
+        P::UnivMon {
+            heap_size,
+            sketch_rows,
+            sketch_cols,
+            layers,
+        } => json!({"heap_size": heap_size, "sketch_rows": sketch_rows,
+                "sketch_cols": sketch_cols, "layers": layers}),
         P::Kll { k } => json!({"k": k}),
         P::Cms { width, depth } => json!({"width": width, "depth": depth}),
         P::Hll { precision } => json!({"precision": precision}),
@@ -3590,7 +3635,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn raw_per_entity_state_requires_explicit_additive_reduction() {
+    fn installed_partition_must_match_the_bound_dag_reduction() {
+        let mut env = environment(10_000);
+        env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        env.collector_ids.clear();
+        let mut plan = PhysicalCompiler
+            .compile(request("scope", "sum_over_time(m[1m])"), env)
+            .unwrap();
+        let installed = plan
+            .precompute_plan
+            .executable_dags
+            .values_mut()
+            .next()
+            .unwrap();
+        let mut dag = installed.document.decode().unwrap();
+        let node = dag
+            .nodes
+            .iter_mut()
+            .find(|node| {
+                matches!(
+                    node.payload,
+                    planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg { .. }
+                )
+            })
+            .unwrap();
+        if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+            reduction, ..
+        } = &mut node.payload
+        {
+            *reduction = planner_types::pre_asap::Reduction::by(vec![]);
+        }
+        installed.document = asap_types::executable_plan::OwnedPostAsapDag::from_executable(
+            installed.document.query_id.clone(),
+            &dag,
+        )
+        .unwrap();
+        assert!(plan
+            .precompute_plan
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("partition"));
+    }
+
+    #[test]
+    fn raw_per_entity_state_carries_explicit_isolation() {
         for query in [
             "sum_over_time(m[1m])",
             "quantile_over_time(0.99, m[1m])",
@@ -3603,7 +3692,11 @@ mod tests {
                 .compile(request("per-entity", query), environment)
                 .unwrap();
             assert!(
-                plan.precompute_plan.materializations.is_empty(),
+                plan.precompute_plan
+                    .materializations
+                    .iter()
+                    .all(|state| state.partitioning
+                        == Some(asap_types::sds::PopulationPartitioning::PerEntity)),
                 "{query} pooled source entities"
             );
         }
@@ -4074,6 +4167,62 @@ mod tests {
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    /// Distinct range queries retain a per-series HLL selected by Planner.
+    #[test]
+    fn distinct_range_compiles_to_partitioned_hll() {
+        let mut deployment = environment(10_000);
+        deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        deployment.collector_ids.clear();
+        let mut workload = request("distinct", "distinct_over_time(m{job=\"api\"}[1m])");
+        let query = &mut workload.queries[0];
+        // HLL's modeled RSE does not certify a failure probability.
+        query.accuracy = AccuracyTarget::Epsilon(0.05);
+        let parsed = crate::query_parser::parse_query_expr_canonical(
+            &query.query_string,
+            query.accuracy.clone(),
+        )
+        .unwrap();
+        query.post_asap =
+            select_post_asap(&parsed, query.accuracy.clone(), &query.lifecycle, None).unwrap();
+        let plan = PhysicalCompiler
+            .compile_metricsql(workload, deployment)
+            .unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        let materialization = &plan.precompute_plan.materializations[0];
+        assert_eq!(
+            materialization.aggregation_type,
+            asap_types::AggregationType::HLL
+        );
+        assert_eq!(
+            materialization.partitioning,
+            Some(asap_types::sds::PopulationPartitioning::PerEntity)
+        );
+        plan.precompute_plan.validate().unwrap();
+        assert!(plan
+            .query_plan
+            .entries
+            .values()
+            .any(|entry| entry.nodes.values().any(|node| matches!(
+                node,
+                crate::query_plan::QueryPlanNode::SummaryEstimate {
+                    query: crate::query_plan::QueryReadout::Cardinality,
+                    ..
+                }
+            ))));
+    }
+
+    /// An unimplemented cardinality family fails admission rather than panicking in an emitter.
+    #[test]
+    fn unsupported_cardinality_family_fails_admission() {
+        let mut deployment = environment(10_000);
+        deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        deployment.collector_ids.clear();
+        let mut workload = request("confidence", "distinct_over_time(m[1m])");
+        workload.hybrid_execution = true;
+        let result = PhysicalCompiler.compile_metricsql(workload, deployment);
+        assert!(matches!(result, Err(CompileError::QueryPlan(_))));
     }
 
     #[test]
@@ -4879,8 +5028,8 @@ mod tests {
     }
 
     #[test]
-    fn composable_per_entity_window_delegates_exact_subtree_to_prometheus() {
-        use crate::query_plan::{logical::LogicalOperator, QueryPlanNode};
+    fn composable_per_entity_window_installs_isolated_state() {
+        use crate::query_plan::QueryPlanNode;
         let mut snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
             "../../../docs/examples/asapquery-planning-snapshot.json"
         ))
@@ -4890,24 +5039,16 @@ mod tests {
         entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
         let (request, env) = snapshot.planning_request().unwrap();
         let plan = PhysicalCompiler.compile(request, env).unwrap();
-        assert!(plan.precompute_plan.materializations.is_empty());
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        assert_eq!(
+            plan.precompute_plan.materializations[0].partitioning,
+            Some(asap_types::sds::PopulationPartitioning::PerEntity)
+        );
         let entry = plan.query_plan.lookup("sum_over_time(m[1m])").unwrap();
-        assert!(entry.nodes.values().any(|node| matches!(
-            node,
-            QueryPlanNode::Logical {
-                operator: LogicalOperator::ExactSubquery { query },
-                ..
-            } if query == "sum_over_time(m[1m])"
-        )));
-        assert!(entry.nodes.values().all(|node| !matches!(
-            node,
-            QueryPlanNode::ReadMaterialization { .. }
-                | QueryPlanNode::ExactFallback { .. }
-                | QueryPlanNode::Logical {
-                    operator: LogicalOperator::Scan { .. },
-                    ..
-                }
-        )));
+        assert!(entry
+            .nodes
+            .values()
+            .any(|node| matches!(node, QueryPlanNode::ReadMaterialization { .. })));
     }
 
     // Each operand retains its source and semantic range; a smaller shared pane
@@ -5350,7 +5491,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_local_hll_rejected_but_envelope_ingest_supported() {
+    fn backend_local_hll_and_envelope_ingest_are_supported() {
         let bundle = PhysicalCompiler
             .compile(
                 request("q", "quantile_over_time(0.99, m[1m])"),
@@ -5375,14 +5516,8 @@ mod tests {
             require_registered_producer: false,
         };
         envelope_plan.producers.clear();
-        assert!(matches!(
-            envelope_plan.validate(),
-            Err(PrecomputePlanError::UnsupportedFamily(_))
-        ));
-        assert!(matches!(
-            PrecomputePlan::build_backend_local(bundle.envelope, materializations),
-            Err(PrecomputePlanError::UnsupportedFamily(_))
-        ));
+        envelope_plan.validate().unwrap();
+        PrecomputePlan::build_backend_local(bundle.envelope, materializations).unwrap();
     }
 
     #[test]
@@ -5601,11 +5736,13 @@ mod tests {
             .compile()
             .expect("unquoted v1 compatibility startup remains available");
         let (local, env) = snapshot.clone().planning_request().unwrap();
-        assert!(PhysicalCompiler
-            .compile(local, env)
-            .unwrap_err()
-            .to_string()
-            .contains("native residual substitution requires an exact selected value"));
+        let isolated = PhysicalCompiler.compile(local, env).unwrap();
+        assert!(!isolated.precompute_plan.materializations.is_empty());
+        assert!(isolated
+            .precompute_plan
+            .materializations
+            .iter()
+            .all(|state| state.partitioning.is_some()));
         let (request, environment) = snapshot.planning_request().unwrap();
         let native = crate::physical::workload_cost::with_exact_alternative(request)
             .unwrap()
@@ -5635,11 +5772,13 @@ mod tests {
             .compile()
             .expect("unquoted v1 compatibility startup remains available");
         let (local, env) = snapshot.clone().planning_request().unwrap();
-        assert!(PhysicalCompiler
-            .compile(local, env)
-            .unwrap_err()
-            .to_string()
-            .contains("native residual substitution requires an exact selected value"));
+        let isolated = PhysicalCompiler.compile(local, env).unwrap();
+        assert!(!isolated.precompute_plan.materializations.is_empty());
+        assert!(isolated
+            .precompute_plan
+            .materializations
+            .iter()
+            .all(|state| state.partitioning.is_some()));
         let (request, environment) = snapshot.planning_request().unwrap();
         let native = crate::physical::workload_cost::with_exact_alternative(request)
             .unwrap()
