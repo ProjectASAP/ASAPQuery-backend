@@ -10,11 +10,12 @@ use std::{
 pub struct MaterializationCommitKey {
     pub plan_id: u64,
     pub plan_version: u64,
-    pub node_id: u32,
+    pub summary_definition: asap_types::sds::SummaryDefinitionId,
     pub window_start_ms: i64,
     pub window_end_ms: i64,
-    /// Collision-free producer lineage bytes. Callers should include source
-    /// identity and immutable input payload identity, not a lossy hash.
+    /// Producer lineage identity, including source and immutable input payload.
+    /// Production uses a domain-separated SHA-256 digest to avoid retaining
+    /// another full copy of every source summary.
     pub input_lineage: Vec<u8>,
 }
 
@@ -59,10 +60,11 @@ where
     R: PrecomputeOperatorRegistry<V>,
     S: IdempotentCommitSink<V>,
 {
-    if key.node_id != sink_node.0 {
+    if !matches!(binding.node(sink_node), Some(BackendNodeBinding::Materialization { summary_definition }) if *summary_definition == key.summary_definition)
+    {
         return Err(ScheduleError::Invalid(format!(
-            "commit key node {} does not match sink {}",
-            key.node_id, sink_node.0
+            "commit key materialization {:?} does not match sink {}",
+            key.summary_definition, sink_node.0
         )));
     }
     binding.validate(dag).map_err(ScheduleError::Invalid)?;
@@ -250,7 +252,7 @@ mod tests {
         MaterializationCommitKey {
             plan_id: 7,
             plan_version: 1,
-            node_id,
+            summary_definition: asap_types::PolicyFingerprint(u64::from(node_id) + 1).into(),
             window_start_ms: 10,
             window_end_ms: 20,
             input_lineage: b"checkpoint:3".to_vec(),
