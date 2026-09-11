@@ -29,6 +29,7 @@ enum MaintenanceValue {
     Rows {
         values: Vec<(i64, f64)>,
         name: String,
+        timestamped: bool,
     },
 }
 
@@ -141,7 +142,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                 let [value] = inputs else {
                     return Err("maintenance SummaryAgg requires exactly one row input".into());
                 };
-                let MaintenanceValue::Rows { values, name } = value.as_ref() else {
+                let MaintenanceValue::Rows { values, name, .. } = value.as_ref() else {
                     return Err("maintenance SummaryAgg requires a typed update evaluator; finalize summary state before applying an update".into());
                 };
                 if !matches!(&self.inputs, MaintenanceInputs::Frozen(_)) {
@@ -263,6 +264,119 @@ fn evaluate_weight(
     Ok(weight)
 }
 
+// Rows carry only a value and its window timestamp. Reject any schema that
+// would require silently dropping another column or manufacturing a timestamp.
+fn maintenance_float64_column(
+    node: &ExecutableDagNode,
+) -> Result<&planner_types::post_asap::SummaryField, String> {
+    use planner_types::post_asap::SummaryFamilyType;
+    let fields = &node.output_schema.fields;
+    let field = match node.output_schema.time_index {
+        None if fields.len() == 1 => &fields[0],
+        Some(time_index) if fields.len() == 2 && time_index < 2 => {
+            let timestamp = &fields[time_index];
+            let value = &fields[1 - time_index];
+            if timestamp.nullable
+                || timestamp.name == value.name
+                || !matches!(
+                    timestamp.dtype,
+                    SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Timestamp)
+                )
+            {
+                return Err("finalization timestamp column differs from its typed schema".into());
+            }
+            value
+        }
+        _ => {
+            return Err(
+                "exact maintenance finalization requires one value and optional declared timestamp"
+                    .into(),
+            )
+        }
+    };
+    if field.nullable
+        || !matches!(
+            field.dtype,
+            SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Float64)
+        )
+    {
+        return Err(
+            "exact maintenance finalization currently requires a Float64 output column".into(),
+        );
+    }
+    Ok(field)
+}
+
+fn evaluate_aligned_binary(
+    node: &ExecutableDagNode,
+    operator: &planner_types::post_asap::BinaryOperator,
+    inputs: &[Arc<MaintenanceValue>],
+) -> Result<MaintenanceValue, String> {
+    use planner_types::pre_asap::BinaryOpKind;
+    let BinaryOpKind::Arithmetic(arithmetic) = &operator.kind else {
+        return Err("maintenance binary currently requires arithmetic".into());
+    };
+    if operator.vector_match.is_some() {
+        return Err(
+            "maintenance binary requires explicit population routing for vector matching".into(),
+        );
+    }
+    let name = maintenance_float64_column(node)?.name.clone();
+    if node.output_schema.time_index.is_none() {
+        return Err("maintenance binary requires declared window timestamps".into());
+    }
+    let [left, right] = inputs else {
+        return Err("maintenance binary requires two row inputs".into());
+    };
+    let (
+        MaintenanceValue::Rows {
+            values: left,
+            timestamped: true,
+            ..
+        },
+        MaintenanceValue::Rows {
+            values: right,
+            timestamped: true,
+            ..
+        },
+    ) = (left.as_ref(), right.as_ref())
+    else {
+        return Err("maintenance binary requires finalized row inputs".into());
+    };
+    if left.is_empty() || left.len() != right.len() {
+        return Err("maintenance binary requires matching nonempty timestamp sets".into());
+    }
+    // Canonical timestamp maps accept arrival-order differences, but never
+    // collapse duplicate updates or pair unrelated source windows by position.
+    let mut left_rows = BTreeMap::new();
+    let mut right_rows = BTreeMap::new();
+    for (rows, index) in [(left, &mut left_rows), (right, &mut right_rows)] {
+        for &(timestamp, value) in rows {
+            if !value.is_finite() || index.insert(timestamp, value).is_some() {
+                return Err(
+                    "maintenance binary input has duplicate timestamps or non-finite values".into(),
+                );
+            }
+        }
+    }
+    let mut values = Vec::with_capacity(left.len());
+    for (timestamp, left) in left_rows {
+        let right = right_rows
+            .get(&timestamp)
+            .ok_or("maintenance binary requires matching timestamp sets")?;
+        let value = crate::utils::arithmetic::evaluate_float64_arithmetic(arithmetic, left, *right);
+        if !value.is_finite() {
+            return Err("maintenance binary produced a non-finite update".into());
+        }
+        values.push((timestamp, value));
+    }
+    Ok(MaintenanceValue::Rows {
+        values,
+        name,
+        timestamped: true,
+    })
+}
+
 fn finalize_exact(
     node: &ExecutableDagNode,
     inputs: &[Arc<MaintenanceValue>],
@@ -303,40 +417,7 @@ fn finalize_exact(
             )
         }
     };
-    let fields = &node.output_schema.fields;
-    let field = match node.output_schema.time_index {
-        None if fields.len() == 1 => &fields[0],
-        Some(time_index) if fields.len() == 2 && time_index < 2 => {
-            let timestamp = &fields[time_index];
-            let value = &fields[1 - time_index];
-            if timestamp.nullable
-                || timestamp.name == value.name
-                || !matches!(
-                    timestamp.dtype,
-                    SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Timestamp)
-                )
-            {
-                return Err("finalization timestamp column differs from its typed schema".into());
-            }
-            value
-        }
-        _ => {
-            return Err(
-                "exact maintenance finalization requires one value and optional declared timestamp"
-                    .into(),
-            )
-        }
-    };
-    if field.nullable
-        || !matches!(
-            field.dtype,
-            SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Float64)
-        )
-    {
-        return Err(
-            "exact maintenance finalization currently requires a Float64 output column".into(),
-        );
-    }
+    let field = maintenance_float64_column(node)?;
     let values = states
         .into_iter()
         .map(|(timestamp, state)| {
@@ -352,6 +433,8 @@ fn finalize_exact(
     Ok(MaintenanceValue::Rows {
         values,
         name: field.name.clone(),
+        timestamped: node.output_schema.time_index.is_some()
+            && matches!(input.as_ref(), MaintenanceValue::SummaryWindows { .. }),
     })
 }
 
@@ -2417,6 +2500,72 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_binary_aligns_windows_and_rejects_incomplete_or_ambiguous_rows() {
+        use planner_types::post_asap::{BinaryOperator, SummaryFamilyType, SummaryField};
+        use planner_types::pre_asap::{ArithmeticOpKind, BinaryOpKind, DataType};
+        let mut operation = node(10);
+        operation.output_schema.fields = vec![
+            SummaryField {
+                name: "ts".into(),
+                dtype: SummaryFamilyType::Plain(DataType::Timestamp),
+                nullable: false,
+            },
+            SummaryField {
+                name: "value".into(),
+                dtype: SummaryFamilyType::Plain(DataType::Float64),
+                nullable: false,
+            },
+        ];
+        operation.output_schema.time_index = Some(0);
+        let mut operator = BinaryOperator {
+            kind: BinaryOpKind::Arithmetic(ArithmeticOpKind::Sub),
+            vector_match: None,
+        };
+        let rows = |values: Vec<(i64, f64)>| {
+            Arc::new(MaintenanceValue::Rows {
+                values,
+                name: "value".into(),
+                timestamped: true,
+            })
+        };
+        let left = rows(vec![(2_000, 7.0), (1_000, 5.0)]);
+        let right = rows(vec![(1_000, 2.0), (2_000, 3.0)]);
+        // Arrival order cannot exchange windows, and subtraction retains edge order.
+        let MaintenanceValue::Rows { values, .. } =
+            evaluate_aligned_binary(&operation, &operator, &[left.clone(), right.clone()]).unwrap()
+        else {
+            panic!("expected rows")
+        };
+        assert_eq!(values, vec![(1_000, 3.0), (2_000, 4.0)]);
+        for invalid in [
+            rows(vec![]),
+            rows(vec![(1_000, 2.0)]),
+            rows(vec![(1_000, 2.0), (3_000, 3.0)]),
+            rows(vec![(1_000, 2.0), (1_000, 3.0)]),
+            rows(vec![(1_000, f64::NAN), (2_000, 3.0)]),
+            Arc::new(MaintenanceValue::Rows {
+                values: vec![(1_000, 2.0), (2_000, 3.0)],
+                name: "value".into(),
+                timestamped: false,
+            }),
+            Arc::new(MaintenanceValue::summary(sum(2.0))),
+        ] {
+            assert!(
+                evaluate_aligned_binary(&operation, &operator, &[left.clone(), invalid]).is_err()
+            );
+        }
+        operator.kind = BinaryOpKind::Arithmetic(ArithmeticOpKind::Div);
+        assert!(evaluate_aligned_binary(
+            &operation,
+            &operator,
+            &[left.clone(), rows(vec![(1_000, 0.0), (2_000, 3.0)])]
+        )
+        .is_err());
+        operation.output_schema.fields[1].dtype = SummaryFamilyType::Plain(DataType::Int64);
+        assert!(evaluate_aligned_binary(&operation, &operator, &[left, right]).is_err());
+    }
+
+    #[test]
     fn finalization_preserves_windows_until_an_explicit_merge() {
         use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType, SummaryField};
         let family = SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum);
@@ -2480,7 +2629,7 @@ mod tests {
             },
         ];
         read.output_schema.time_index = Some(0);
-        let MaintenanceValue::Rows { values, name } =
+        let MaintenanceValue::Rows { values, name, .. } =
             finalize_exact(&read, &[Arc::clone(&input)]).unwrap()
         else {
             panic!("expected typed rows")
