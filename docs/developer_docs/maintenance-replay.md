@@ -1,5 +1,13 @@
 # Maintenance replay and retention
 
+The production maintenance adapter accepts an already computed source summary
+and executes homogeneous `SummaryMerge` dependencies. An additional `SummaryAgg`
+requires evaluation of its declared update expression and target family; it is
+rejected until that evaluator exists. Copying or merging its input would silently
+ignore those semantics (for example, count over a sum state is not that sum).
+The scheduler's ability to traverse a DAG does not imply every operator is
+implemented by the production adapter.
+
 The maintenance sink retains in-process publication receipts for the active
 physical plan. Receipt identity includes the plan generation, target summary
 definition, output window, and a SHA-256 digest of the source definition,

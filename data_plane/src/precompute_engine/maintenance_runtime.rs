@@ -42,8 +42,10 @@ impl PrecomputeOperatorRegistry<SummaryState> for OperatorAdapter<'_> {
             return Ok(Arc::clone(&self.source));
         }
         match &node.payload {
-            ExecutableOperatorPayload::SummaryAgg { .. }
-            | ExecutableOperatorPayload::SummaryMerge => merge_inputs(inputs),
+            ExecutableOperatorPayload::SummaryMerge => merge_inputs(inputs),
+            ExecutableOperatorPayload::SummaryAgg { .. } => Err(
+                "maintenance SummaryAgg requires a typed update evaluator; merging input state does not execute its update expression".into(),
+            ),
             payload => Err(format!(
                 "maintenance operator {:?} has no summary-state implementation",
                 payload.operator()
@@ -594,6 +596,36 @@ mod tests {
         let mut accumulator = SumAccumulator::new();
         accumulator.update(value);
         Arc::new(accumulator)
+    }
+
+    #[test]
+    fn summary_aggregation_does_not_silently_reuse_input_family() {
+        use planner_types::post_asap::{
+            ExactKind, ExactParams, GroupingStrategy, SummaryFamilyType, SummaryUpdate,
+        };
+        use planner_types::pre_asap::{ColumnRef, Reduction};
+
+        let binding = BackendExecutableBinding {
+            nodes: BTreeMap::new(),
+            query_sink: PostAsapNodeId(2),
+            query_plan_sink: control_plane::query_plan::QueryNodeId(2),
+            precompute_sinks: vec![PostAsapNodeId(1)],
+        };
+        let adapter = OperatorAdapter {
+            binding: &binding,
+            source_definition: definition(1),
+            source: sum(7.0),
+        };
+        let mut aggregate = node(1);
+        aggregate.operator = ExecutableOperator::SummaryAgg;
+        aggregate.payload = ExecutableOperatorPayload::SummaryAgg {
+            family: SummaryFamilyType::ExactAggregate(ExactKind::Count, ExactParams::Count),
+            input: SummaryUpdate::column(ColumnRef::SampleValue),
+            reduction: Reduction::by(vec![]),
+            grouping: GroupingStrategy::default(),
+        };
+        let error = adapter.execute(&aggregate, &[Arc::new(sum(7.0))]);
+        assert!(matches!(error, Err(reason) if reason.contains("typed update evaluator")));
     }
 
     // Receipts follow the declared event-time horizon and never retain accepted
