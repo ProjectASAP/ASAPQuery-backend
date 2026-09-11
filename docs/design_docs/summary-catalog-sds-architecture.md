@@ -37,9 +37,13 @@ operator-specific stores beside `SketchStore`.
 
 The target model has descriptor registries plus pane instances. Descriptor IDs
 are derived from canonical semantic content; display names and runtime SIDs are
-not descriptor identities. The current implementation uses the canonical string
-itself as the ID. A future hashed representation must preserve the same content
-identity and handle collisions explicitly.
+not descriptor identities. `SummaryDescriptorId` and `DataDescriptorId` currently
+contain versioned canonical semantic strings. `SummaryDefinitionId` is a distinct
+typed policy fingerprint, and `CatalogGeneration` identifies a publication using
+its digest and plan version. A physical `SeriesId` identifies one storage lifetime
+of a definition/group; it is neither a descriptor ID nor a pane instance ID.
+Changing descriptor encoding to a hash must preserve content identity and handle
+collisions explicitly.
 
 ```rust
 struct SummaryDescriptor {
@@ -371,3 +375,31 @@ creates a new Data Descriptor. Advancing the time range creates a new Summary
 Instance. Merge compatibility additionally requires the operator's merge rules,
 compatible data scopes and valid instance coverage; sharing descriptors alone
 does not authorize merging overlapping observations.
+
+
+### Retired physical series and catalog reactivation
+
+A persisted removal tombstone prevents late fragments and stale metadata flushes
+from reopening the same physical `SeriesId`. A later installed catalog generation
+may authorize a fresh physical series for the same logical definition/group.
+The resolver writes that rotation and its catalog provenance before changing its
+cache; ordinary writes from the original generation cannot authorize rotation.
+The original physical ID remains tombstoned so old disk parts cannot enter the
+replacement's readout.
+
+Queued precompute inputs carry their captured catalog generation and physical
+series ID separately from an optional admission receipt. Workers preserve both
+on publication. A delayed output writes its original physical series, never a
+newly resolved replacement. Derived materializations resolve their own target
+series while retaining the source generation proof. Backfill processors capture
+the catalog generation when attached to the store; old jobs cannot authorize a
+new catalog's rotation. An older queued input that has not yet published its
+first storage instance is conservatively rejected after a catalog change. Already
+registered retained series can drain their birth generation or accept the current
+generation. Seamless re-planning of unpublished old inputs requires additional
+first-mint provenance; it is not guaranteed by this transition.
+
+This is an explicit lifetime transition, not cross-generation recovery of arbitrary
+summary state. Legacy records without trustworthy catalog provenance remain
+unbound. Tombstone reclamation still requires coordinated removal of old physical
+parts and is not implemented by this transition.
