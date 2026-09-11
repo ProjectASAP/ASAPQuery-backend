@@ -1657,6 +1657,53 @@ pub fn select_workload_roots(
     select_workload_roots_with_erp(queries, roots, evidence, exact_costs, None)
 }
 
+fn observed_population_matches_root(
+    policy: &super::erp::ErpPlanningInput,
+    root: &QueryExpr,
+) -> bool {
+    use asap_types::sds::{PopulationPartitioning, ValueProjectionIdentity};
+    use planner_types::pre_asap::{AggIntent, Reduction};
+    let (Some(data), Some(observed)) = (
+        &policy.resolved_data_descriptor,
+        &policy.observed_populations,
+    ) else {
+        return false;
+    };
+    let QueryExpr::Aggregate {
+        reduction: Reduction::PerEntity,
+        measures,
+        having: None,
+        child,
+        ..
+    } = root
+    else {
+        return false;
+    };
+    if measures.is_empty()
+        || !measures.iter().all(|intent| {
+            matches!(
+                intent,
+                AggIntent::Cardinality { col: None, .. }
+                    | AggIntent::FrequencyL2 { col: None, .. }
+                    | AggIntent::FrequencyEntropy { col: None, .. }
+            )
+        })
+    {
+        return false;
+    }
+    let Ok((metric, Some(window), filter)) = raw_time_series_input_contract(child, false) else {
+        return false;
+    };
+    data.time_series_metric() == Some(metric.as_str())
+        && data.population_filter_canonical == filter
+        && data.value_projection == ValueProjectionIdentity::SampleValue
+        && data.partitioning == Some(PopulationPartitioning::PerEntity)
+        && data.group_by_keys.is_empty()
+        && data.observation_semantics == asap_types::sds::TIMESTAMPED_OBSERVATION_SEMANTICS
+        && observed.window_end_ms.checked_sub(observed.window_start_ms)
+            == i64::try_from(window.saturating_mul(1000)).ok()
+}
+
 pub fn select_workload_roots_with_erp(
     queries: &mut [PlanningQuery],
     roots: Vec<Rc<QueryExpr>>,
@@ -1693,6 +1740,17 @@ pub fn select_workload_roots_with_erp(
             let mut policy = policy.clone();
             if !matches!(accuracy, AccuracyTarget::Epsilon(_)) {
                 policy.artifact.records.clear();
+            }
+            if policy.observed_populations.is_some()
+                && !roots
+                    .iter()
+                    .all(|(_, root)| observed_population_matches_root(&policy, root))
+            {
+                if let Some(observed) = &mut policy.observed_populations {
+                    observed.invalid_reason =
+                        Some("candidate input differs from observed catalog data semantics".into());
+                    observed.populations.clear();
+                }
             }
             // A benchmark of a different KLL implementation is not evidence
             // for the collector's sketchlib KLL, even with the same k.
@@ -2295,29 +2353,37 @@ fn select_lifecycle(
 pub(crate) fn materialization_leaf_contract(
     node: &SummaryNode,
 ) -> Result<(String, Option<u64>, String), String> {
-    use planner_types::pre_asap::{CompareOpKind, QueryExpr, ScalarValue};
     let SummaryExpr::SummaryAgg { child, .. } = &node.expr else {
         return Err("materialization requires a SummaryAgg leaf".into());
     };
     let SummaryExpr::KeepPreAsap(expr) = &child.expr else {
         return Err("materialization input is not a raw source".into());
     };
-    let (source, window_secs) = match expr.as_ref() {
+    raw_time_series_input_contract(
+        expr,
+        matches!(
+            &node.expr,
+            SummaryExpr::SummaryAgg {
+                family: SummaryFamilyType::ExactAggregate(..),
+                ..
+            }
+        ),
+    )
+}
+
+fn raw_time_series_input_contract(
+    expr: &QueryExpr,
+    exact: bool,
+) -> Result<(String, Option<u64>, String), String> {
+    use planner_types::pre_asap::{CompareOpKind, ScalarValue};
+    let (source, window_secs) = match expr {
         QueryExpr::TimeRange { child, range } => {
             if range.as_millis() == 0 || range.as_millis() % 1000 != 0 {
                 return Err("warm producer requires a positive whole-second range".into());
             }
             (child.as_ref(), Some(range.as_secs()))
         }
-        QueryExpr::Scan { .. }
-            if matches!(
-                &node.expr,
-                SummaryExpr::SummaryAgg {
-                    family: SummaryFamilyType::ExactAggregate(..),
-                    ..
-                }
-            ) =>
-        {
+        QueryExpr::Scan { .. } if exact => {
             return Err(
                 "instantaneous sample selection is not a temporal accumulator readout".into(),
             );
@@ -3543,6 +3609,8 @@ mod tests {
             byte_second_weight: 1e-9,
             mode: super::super::erp::ErpAccuracyMode::Hybrid,
             observed_shape: None,
+            observed_populations: None,
+            resolved_data_descriptor: None,
             observed_shape_source: None,
             shape_match: None,
             runtime: super::super::erp::ErpRuntimeCapabilities {
@@ -3592,6 +3660,8 @@ mod tests {
             byte_second_weight: 1e-9,
             mode: ErpAccuracyMode::Hybrid,
             observed_shape: None,
+            observed_populations: None,
+            resolved_data_descriptor: None,
             observed_shape_source: None,
             shape_match: None,
             runtime: ErpRuntimeCapabilities {

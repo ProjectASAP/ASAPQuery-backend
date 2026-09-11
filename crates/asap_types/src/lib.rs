@@ -4,6 +4,7 @@ pub mod aggregation_config;
 pub mod aggregation_type;
 pub mod derived_input;
 pub mod enums;
+pub mod erp_observation;
 pub mod executable_plan;
 pub mod grouping_projection;
 pub mod key_by_label_names;

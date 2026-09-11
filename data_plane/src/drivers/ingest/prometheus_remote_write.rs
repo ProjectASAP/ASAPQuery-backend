@@ -179,6 +179,15 @@ impl PrometheusRemoteWriteReceiver {
         self.inner.stats.clone()
     }
 
+    pub(crate) fn install_erp_observation_generation(
+        &self,
+        generation: asap_types::sds::CatalogGeneration,
+    ) {
+        if let Some(observer) = self.inner.ingest.router.erp_observer() {
+            observer.install_generation(generation);
+        }
+    }
+
     /// Permanently seal this finite source before queuing worker barriers.
     pub async fn drain(&self) -> Result<(), String> {
         {
@@ -215,6 +224,13 @@ impl PrometheusRemoteWriteReceiver {
                 );
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if let Some(observer) = self.inner.ingest.router.erp_observer() {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_millis() as u64;
+            observer.publish_finite(&generation, now_ms).await?;
         }
         trim_process_allocator();
         Ok(())

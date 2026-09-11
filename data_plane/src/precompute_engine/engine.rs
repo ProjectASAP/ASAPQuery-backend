@@ -129,7 +129,7 @@ impl PrecomputeEngine {
         // ConfigReload messages needed.
         let mut worker_handles = Vec::with_capacity(num_workers);
         for (id, rx) in receivers.into_iter().enumerate() {
-            let worker = Worker::new(
+            let mut worker = Worker::new(
                 id,
                 rx,
                 output_sink.clone(),
@@ -148,6 +148,7 @@ impl PrecomputeEngine {
                 self.diagnostics.worker_group_counts[id].clone(),
                 self.diagnostics.worker_watermarks[id].clone(),
             );
+            worker.set_erp_observer(self.ingest_state.router.erp_observer());
             let handle = tokio::spawn(async move {
                 worker.run().await;
             });
