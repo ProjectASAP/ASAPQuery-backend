@@ -171,14 +171,9 @@ pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactor
                 }
                 .into());
             }
-            materialization.grouping_labels.validate_table_columns()?;
-            for column in materialization.grouping_labels.columns() {
-                if column.nullable {
-                    return Err(
-                        "nullable table grouping requires an explicit null-key encoding".into(),
-                    );
-                }
-            }
+            materialization
+                .grouping_labels
+                .validate_table_group_codec()?;
             let mut source_config = config.clone();
             source_config.database = database.clone();
             source_config.table = table.clone();
@@ -297,7 +292,17 @@ impl RawSampleReader for ClickHouseReader {
                     let count = columns.len();
                     let labels = columns
                         .into_iter()
-                        .collect::<std::collections::BTreeMap<_, _>>();
+                        .map(|(name, value)| {
+                            asap_types::grouping_projection::decode_table_group_value(&value)
+                                .and_then(|value| {
+                                    asap_types::grouping_projection::encode_table_group_value(
+                                        &value,
+                                    )
+                                })
+                                .map(|value| (name, value))
+                                .map_err(|reason| RawSampleReaderError::Decode { reason })
+                        })
+                        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
                     if labels.len() != count {
                         return Err(RawSampleReaderError::Decode {
                             reason: "duplicate source grouping columns".into(),

@@ -84,6 +84,31 @@ pub fn from_series_rows(
 
 impl ClickHouseQueryResult {
     pub fn encode(&self, format: ClickHouseFormat) -> Result<Vec<u8>, ClickHouseResultError> {
+        if self.batches.iter().any(|batch| {
+            batch
+                .columns()
+                .iter()
+                .any(|column| contains_map_timestamp(column.data_type(), false))
+        }) {
+            return Err(ClickHouseResultError::Arrow(
+                "nested Map timestamp output requires an explicit formatting contract".into(),
+            ));
+        }
+        // ClickHouse's 64-bit JSON quoting default is deployment-configurable.
+        // Until the client output policy is explicit, never guess it for warm output.
+        if matches!(
+            format,
+            ClickHouseFormat::Json | ClickHouseFormat::JsonEachRow
+        ) && self.batches.iter().any(|batch| {
+            batch
+                .columns()
+                .iter()
+                .any(|column| contains_json_integer64(column.data_type()))
+        }) {
+            return Err(ClickHouseResultError::Arrow(
+                "64-bit JSON integer output requires an explicit quoting contract".into(),
+            ));
+        }
         let mut output = Vec::new();
         for batch in &self.batches {
             for row in 0..batch.num_rows() {
@@ -235,6 +260,28 @@ pub(super) fn clickhouse_type(data_type: &arrow::datatypes::DataType, nullable: 
     }
 }
 
+fn contains_map_timestamp(dtype: &DataType, in_map: bool) -> bool {
+    match dtype {
+        DataType::Timestamp(..) => in_map,
+        DataType::Map(entries, _) => contains_map_timestamp(entries.data_type(), true),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_map_timestamp(field.data_type(), in_map)),
+        _ => false,
+    }
+}
+
+fn contains_json_integer64(dtype: &DataType) -> bool {
+    match dtype {
+        DataType::Int64 | DataType::UInt64 => true,
+        DataType::Map(entries, _) => contains_json_integer64(entries.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .any(|field| contains_json_integer64(field.data_type())),
+        _ => false,
+    }
+}
+
 fn escape_tsv(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -262,6 +309,32 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn map_timestamp_transport_is_not_assumed_to_match_native_formatting() {
+        let entries = DataType::Struct(
+            vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new(
+                    "value",
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                    false,
+                ),
+            ]
+            .into(),
+        );
+        let dtype = DataType::Map(Arc::new(Field::new("entries", entries, false)), false);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("m", dtype.clone(), false)])),
+            vec![arrow::array::new_empty_array(&dtype)],
+        )
+        .unwrap();
+        let result = ClickHouseQueryResult {
+            batches: vec![batch],
+        };
+        assert!(result.encode(ClickHouseFormat::Json).is_err());
+        assert!(result.encode(ClickHouseFormat::TabSeparated).is_err());
+    }
+
+    #[test]
     fn encodes_table_without_using_promql_query_result() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("zone", DataType::Utf8, false),
@@ -282,15 +355,8 @@ mod tests {
             result.encode(ClickHouseFormat::TabSeparated).unwrap(),
             b"a\\tb\t7\n"
         );
-        assert_eq!(
-            result.encode(ClickHouseFormat::JsonEachRow).unwrap(),
-            b"{\"zone\":\"a\\tb\",\"count\":7}\n"
-        );
-        let document: serde_json::Value =
-            serde_json::from_slice(&result.encode(ClickHouseFormat::Json).unwrap()).unwrap();
-        assert_eq!(document["data"][0]["count"], 7);
-        assert_eq!(document["meta"][1]["type"], "Int64");
-        assert_eq!(document["rows"], 1);
+        assert!(result.encode(ClickHouseFormat::JsonEachRow).is_err());
+        assert!(result.encode(ClickHouseFormat::Json).is_err());
     }
 }
 

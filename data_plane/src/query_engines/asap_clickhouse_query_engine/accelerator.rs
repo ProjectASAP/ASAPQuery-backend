@@ -144,6 +144,13 @@ impl CatalogClickHouseAccelerator {
 }
 
 fn requested_format(request: &ClickHouseQueryRequest) -> Result<ClickHouseFormat, String> {
+    if let Some(setting) = request
+        .parameters
+        .keys()
+        .find(|key| key.starts_with("output_format_"))
+    {
+        return Err(format!("unsupported output setting {setting}"));
+    }
     match request
         .format()
         .unwrap_or("TabSeparated")
@@ -277,6 +284,26 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_output_settings_cannot_silently_change_warm_format() {
+        let mut request = ClickHouseQueryRequest {
+            method: axum::http::Method::GET,
+            sql: "SELECT labels FROM samples".into(),
+            body: Bytes::new(),
+            parameters: BTreeMap::from([("default_format".into(), "JSON".into())]),
+            headers: HeaderMap::new(),
+        };
+        assert!(requested_format(&request).is_ok());
+        for setting in [
+            "output_format_json_map_as_array_of_tuples",
+            "output_format_json_quote_64bit_integers",
+        ] {
+            request.parameters.insert(setting.into(), "1".into());
+            assert!(requested_format(&request).is_err());
+            request.parameters.remove(setting);
+        }
+    }
+
     use crate::{
         precompute_engine::operators::SumAccumulator,
         storage_engines::sketch_db::index::{AggKind, Capability, SketchInstanceMetadata},

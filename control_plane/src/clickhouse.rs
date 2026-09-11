@@ -240,14 +240,11 @@ fn materialize_selected_sql(
             .get(*key)
             .cloned()
             .ok_or("SQL grouping column is absent from source schema")?;
-        if column.nullable {
-            return Err("nullable table grouping requires an explicit null-key encoding".into());
-        }
         column.table = None;
         columns.push(column);
     }
     let grouping = asap_types::GroupingProjection::new(columns);
-    grouping.validate()?;
+    grouping.validate_table_group_codec()?;
     let (table, value, window, population, timestamp) =
         clickhouse_materialization_leaf_contract(node, query.start_ms, query.end_ms)?;
     let window_secs = window.ok_or("SQL materialization requires a bounded window")?;

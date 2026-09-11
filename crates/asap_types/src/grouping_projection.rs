@@ -24,10 +24,21 @@ impl GroupingProjection {
         }
         Ok(())
     }
-    pub fn validate_table_columns(&self) -> Result<(), String> {
+    pub fn validate_table_group_codec(&self) -> Result<(), String> {
         self.validate()?;
         for column in self.columns() {
             crate::table_population::validate_column_name(&column.name)?;
+            if column.nullable {
+                return Err(
+                    "nullable table grouping requires an explicit null-key encoding".into(),
+                );
+            }
+            if !table_group_codec_type(&column.dtype) {
+                return Err(
+                    "table group codec requires integer, string, boolean, or supported Map values"
+                        .into(),
+                );
+            }
         }
         Ok(())
     }
@@ -67,6 +78,21 @@ impl GroupingProjection {
         serde_json::from_value(value.clone())
     }
 }
+// Float grouping requires SQL equality canonicalization (+0/-0 and NaNs),
+// and timestamps need explicit unit/timezone semantics. Neither is claimed by v1.
+fn table_group_codec_type(dtype: &DataType) -> bool {
+    match dtype {
+        DataType::Int64 | DataType::Utf8 | DataType::Bool => true,
+        DataType::Map { key, value, .. } => {
+            matches!(
+                key.as_ref(),
+                DataType::Int64 | DataType::Utf8 | DataType::Bool
+            ) && table_group_codec_type(value)
+        }
+        _ => false,
+    }
+}
+
 impl From<KeyByLabelNames> for GroupingProjection {
     fn from(mut names: KeyByLabelNames) -> Self {
         names.labels.sort();
@@ -252,6 +278,48 @@ pub fn decode_table_group_value(encoded: &str) -> Result<serde_json::Value, Stri
 #[cfg(test)]
 mod codec_tests {
     use super::*;
+    #[test]
+    fn table_group_codec_rejects_noncanonical_float_and_timestamp_keys() {
+        for dtype in [
+            DataType::Float64,
+            DataType::Timestamp,
+            DataType::Map {
+                key: Box::new(DataType::Utf8),
+                value: Box::new(DataType::Float64),
+                value_nullable: false,
+            },
+        ] {
+            assert!(
+                GroupingProjection::new(vec![Column::new("g", dtype, false)])
+                    .validate_table_group_codec()
+                    .is_err()
+            );
+        }
+        assert!(GroupingProjection::new(vec![Column::new(
+            "g",
+            DataType::Map {
+                key: Box::new(DataType::Utf8),
+                value: Box::new(DataType::Int64),
+                value_nullable: true,
+            },
+            false
+        )])
+        .validate_table_group_codec()
+        .is_ok());
+    }
+
+    #[test]
+    fn equivalent_json_spelling_has_one_shared_group_encoding() {
+        use base64::Engine;
+        let first = base64::engine::general_purpose::STANDARD.encode(br#""a\/b""#);
+        let second = base64::engine::general_purpose::STANDARD.encode(br#""a/b""#);
+        assert_ne!(first, second);
+        let normalize = |input: &str| {
+            encode_table_group_value(&decode_table_group_value(input).unwrap()).unwrap()
+        };
+        assert_eq!(normalize(&first), normalize(&second));
+    }
+
     /// The grouping codec preserves null, escaping, duplicate map keys and exact integers.
     #[test]
     fn typed_group_codec_is_lossless_at_numeric_and_string_boundaries() {
