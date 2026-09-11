@@ -214,7 +214,7 @@ fn bind_selected_node(
     query: &ClickHouseSqlWorkloadEntry,
     request: &ClickHouseSqlWorkload,
 ) -> Result<MaterializationBinding, crate::query_plan::QueryPlanError> {
-    let (table_ref, value_column, source_window, spatial_filter) =
+    let (table_ref, value_column, source_window, spatial_filter, timestamp_column) =
         clickhouse_materialization_leaf_contract(node, query.start_ms, query.end_ms)
             .map_err(crate::query_plan::QueryPlanError::Invalid)?;
     let expected = crate::physical::compiler::physical_materialization_family(family);
@@ -226,6 +226,11 @@ fn bind_selected_node(
         &expected,
         source_window.unwrap_or((query.end_ms.saturating_sub(query.start_ms)) / 1000),
     )?;
+    if selected.table_timestamp_column.as_deref() != Some(timestamp_column.as_str()) {
+        return Err(crate::query_plan::QueryPlanError::Invalid(
+            "SQL timestamp projection differs from the installed materialization".into(),
+        ));
+    }
     Ok(MaterializationBinding {
         materialization: selected.policy_fingerprint().into(),
         output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.labels.clone()),
@@ -240,7 +245,7 @@ fn clickhouse_materialization_leaf_contract(
     node: &planner_types::post_asap::SummaryNode,
     evaluation_start_ms: u64,
     evaluation_end_ms: u64,
-) -> Result<(String, String, Option<u64>, String), String> {
+) -> Result<(String, String, Option<u64>, String, String), String> {
     use planner_types::{
         post_asap::SummaryExpr,
         pre_asap::{CompareOpKind, QueryExpr, ScalarValue, Source},
@@ -400,6 +405,12 @@ fn clickhouse_materialization_leaf_contract(
         value_column,
         Some(window_secs),
         population.canonical(),
+        schema
+            .time_index
+            .and_then(|index| schema.columns.get(index))
+            .ok_or("SQL summary source has no timestamp projection")?
+            .name
+            .clone(),
     ))
 }
 
@@ -467,6 +478,7 @@ mod tests {
             Some(value_column.into()),
         );
         value.pane_origin_ms = Some(0);
+        value.table_timestamp_column = Some("timestamp_ms".into());
         value
     }
 
@@ -645,6 +657,15 @@ mod tests {
             )
         }));
         let original = request.queries[0].sql.clone();
+        let schema = request.tables.get_mut("telemetry").unwrap();
+        schema.columns[schema.time_index.unwrap()].name = "other_timestamp".into();
+        request.queries[0].sql = original.replace("timestamp_ms", "other_timestamp");
+        assert!(
+            compile_clickhouse_workload(&request).await.is_err(),
+            "a summary cannot bind a different timestamp projection"
+        );
+        let schema = request.tables.get_mut("telemetry").unwrap();
+        schema.columns[schema.time_index.unwrap()].name = "timestamp_ms".into();
         request.queries[0].sql = original.replace("timestamp_ms < 2000", "timestamp_ms <= 1999");
         assert!(compile_clickhouse_workload(&request).await.is_ok());
         request.queries[0].sql = original.replace("timestamp_ms < 2000", "timestamp_ms <= 2000");

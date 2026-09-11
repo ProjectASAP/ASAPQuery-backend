@@ -126,7 +126,8 @@ impl SummaryCatalog {
                     config.grouping_labels.labels.clone(),
                     "asap.timestamped-observations.v2",
                 )
-                .with_partitioning(config.partitioning);
+                .with_partitioning(config.partitioning)
+                .with_timestamp_column(config.table_timestamp_column.clone());
                 Ok((
                     config.policy_fingerprint(),
                     summary,
@@ -312,9 +313,20 @@ mod tests {
             requests.policy_fingerprint(),
             other_value.policy_fingerprint()
         );
-        let catalog = SummaryCatalog::from_materializations(1, 1, &[requests, errors]).unwrap();
-        assert_eq!(catalog.data_descriptors.len(), 2);
-        assert_eq!(catalog.materializations.len(), 2);
+        let mut other_time = requests.clone();
+        other_time.table_timestamp_column = Some("event_time_ms".into());
+        assert_ne!(
+            requests.policy_fingerprint(),
+            other_time.policy_fingerprint()
+        );
+        let mut invalid_labels = requests.clone();
+        invalid_labels.table_population = None;
+        invalid_labels.spatial_filter = "job=\"requests\"".into();
+        assert!(SummaryCatalog::from_materializations(1, 1, &[invalid_labels]).is_err());
+        let catalog =
+            SummaryCatalog::from_materializations(1, 1, &[requests, errors, other_time]).unwrap();
+        assert_eq!(catalog.data_descriptors.len(), 3);
+        assert_eq!(catalog.materializations.len(), 3);
     }
 
     #[test]

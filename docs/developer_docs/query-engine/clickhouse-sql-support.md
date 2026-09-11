@@ -86,6 +86,17 @@ reader takes its value projection and population from the installed materializat
 binds literal values as ClickHouse parameters, and accepts either encoded series
 labels or a `Map(String,String)` label column. The requested database/table must
 match the deployment and installed source respectively.
+An absent or empty table population means every row in the table's time interval;
+the output metric name never becomes an implicit SQL predicate. Table sources
+reject legacy PromQL spatial filters.
+
+The installed `table_timestamp_column` names a Unix-millisecond column and is
+shared as `DataDescriptor.timestamp_column`. It enters both identities and is
+checked against the Planner source schema's `time_index`. Backfill uses this
+installed projection even when the deployment default names a different column.
+Legacy table definitions without a timestamp projection cannot be bound or
+backfilled; republish them with the explicit column. Time-series definitions
+retain their existing timestamp semantics and identity.
 SQL fingerprints now include the explicit table/value source, so existing SQL
 materializations must be republished and rebuilt; their old state is not reused
 under the new identity. Legacy PromQL fingerprints remain unchanged.

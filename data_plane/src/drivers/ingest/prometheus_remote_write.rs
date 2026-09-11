@@ -859,6 +859,7 @@ mod tests {
             table_name: None,
             value_column: None,
             table_population: None,
+            table_timestamp_column: None,
             partitioning: None,
         };
         let policy_fp = aggregation.policy_fp_u64();
@@ -914,6 +915,7 @@ mod tests {
                 table_name: None,
                 value_column: None,
                 table_population: None,
+                table_timestamp_column: None,
                 partitioning: None,
             };
         let cms = config(

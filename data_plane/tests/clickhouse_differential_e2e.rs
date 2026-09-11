@@ -81,6 +81,7 @@ fn mixed_workload(
         Some("value".into()),
     );
     config.pane_origin_ms = Some(0);
+    config.table_timestamp_column = Some("timestamp_ms".into());
     config.table_population = Some(asap_types::table_population::TablePopulation {
         predicates: vec![asap_types::table_population::TableColumnPredicate {
             column: "metric".into(),

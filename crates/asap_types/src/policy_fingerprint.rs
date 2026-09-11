@@ -190,6 +190,10 @@ impl PolicyFingerprint {
                 buf.extend_from_slice(canonical.as_bytes());
             }
         }
+        if let Some(column) = &cfg.table_timestamp_column {
+            buf.extend_from_slice(b"\0timestamp-ms\0");
+            buf.extend_from_slice(column.as_bytes());
+        }
 
         Self(xxh64(&buf, 0))
     }
