@@ -294,6 +294,19 @@ impl PrecomputeMaterialization {
     pub fn deserialize_from_json(
         data: &Value,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        if [
+            "valueColumn",
+            "value_column",
+            "valueProjection",
+            "value_projection",
+        ]
+        .iter()
+        .filter(|key| data.get(**key).is_some_and(|value| !value.is_null()))
+        .count()
+            > 1
+        {
+            return Err("multiple value projection fields are not allowed".into());
+        }
         // `aggregationId` is silently ignored — identity is
         // content-addressed via PolicyFingerprint (PR 5).
 
@@ -500,6 +513,25 @@ impl PrecomputeMaterialization {
             .unwrap_or("")
             .to_string();
 
+        if [
+            "valueColumn",
+            "value_column",
+            "valueProjection",
+            "value_projection",
+        ]
+        .iter()
+        .filter(|key| {
+            aggregation_data
+                .get(**key)
+                .is_some_and(|value| !value.is_null())
+        })
+        .count()
+            > 1
+        {
+            return Err(anyhow::anyhow!(
+                "multiple value projection fields are not allowed"
+            ));
+        }
         let typed_projection: Option<crate::sds::ValueProjectionIdentity> = aggregation_data
             .get("valueProjection")
             .or_else(|| aggregation_data.get("value_projection"))
@@ -803,7 +835,7 @@ mod tests {
         assert!(wire.get("valueColumn").is_none());
         let json = AggregationConfig::deserialize_from_json(&wire).unwrap();
         let yaml = AggregationConfig::from_yaml_data(
-            &serde_yaml::to_value(wire).unwrap(),
+            &serde_yaml::to_value(&wire).unwrap(),
             None,
             QueryLanguage::ClickHouseSql,
         )
@@ -816,6 +848,15 @@ mod tests {
             yaml.effective_value_projection(),
             config.effective_value_projection()
         );
+        let mut conflicting = wire;
+        conflicting["valueColumn"] = serde_json::json!("other_column");
+        assert!(AggregationConfig::deserialize_from_json(&conflicting).is_err());
+        assert!(AggregationConfig::from_yaml_data(
+            &serde_yaml::to_value(conflicting).unwrap(),
+            None,
+            QueryLanguage::ClickHouseSql
+        )
+        .is_err());
         assert_ne!(config.policy_fingerprint(), column_identity);
         config.value_projection = Some(ValueProjectionIdentity::Constant {
             value: ScalarValue::Float64(f64::NAN),
