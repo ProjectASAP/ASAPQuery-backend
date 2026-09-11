@@ -381,7 +381,11 @@ on publication. A delayed output writes its original physical series, never a
 newly resolved replacement. Derived materializations resolve their own target
 series while retaining the source generation proof. Backfill processors capture
 the catalog generation when attached to the store; old jobs cannot authorize a
-new catalog's rotation.
+new catalog's rotation. An older queued input that has not yet published its
+first storage instance is conservatively rejected after a catalog change. Already
+registered retained series can drain their birth generation or accept the current
+generation. Seamless re-planning of unpublished old inputs requires additional
+first-mint provenance; it is not guaranteed by this transition.
 
 This is an explicit lifetime transition, not cross-generation recovery of arbitrary
 summary state. Legacy records without trustworthy catalog provenance remain
