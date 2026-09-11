@@ -90,7 +90,7 @@ async fn run_maintenance_process(multi_source: bool, distinct_groups: bool) {
     };
     // Complete canonical populations are supported; missing source/group sets
     // must fail closed before publishing any global output.
-    for (count, missing_source) in [(1, false), (2, false), (1, true), (2, true)] {
+    for (count, missing_source) in [(1, true), (2, true), (1, false), (2, false)] {
         let expected = if distinct_groups && count == 2 {
             38.0
         } else {
@@ -99,6 +99,7 @@ async fn run_maintenance_process(multi_source: bool, distinct_groups: bool) {
         if missing_source && !multi_source {
             continue;
         }
+        eprintln!("IMMUTABLE_CASE count={count} missing_source_or_group={missing_source}");
         let mut directory = tempfile::tempdir().unwrap();
         eprintln!("IMMUTABLE_PROCESS_ARTIFACT {}", directory.path().display());
         directory.disable_cleanup(true);
@@ -231,6 +232,30 @@ async fn run_maintenance_process(multi_source: bool, distinct_groups: bool) {
             estimate.is_finite() && (estimate - expected).abs() / expected <= max_relative_error,
             "selected population quantile exceeded its value contract: {response}"
         );
+        let part_ids = || {
+            let mut ids = std::fs::read_dir(disk.join("sketch_index/parts"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+        let before_retry_parts = part_ids();
+        let repeated = client
+            .post(format!("{backend}/api/v1/precompute/drain"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            repeated.status().is_success(),
+            "{}",
+            repeated.text().await.unwrap()
+        );
+        assert_eq!(
+            part_ids(),
+            before_retry_parts,
+            "repeated completion published extra parts"
+        );
         drop(first);
         let port = unused_port();
         let backend = format!("http://127.0.0.1:{port}");
@@ -252,6 +277,11 @@ async fn run_maintenance_process(multi_source: bool, distinct_groups: bool) {
             .unwrap();
         assert!(is_warm(&after), "{after}");
         assert_eq!(after["data"]["result"], response["data"]["result"]);
+        assert_eq!(
+            part_ids(),
+            before_retry_parts,
+            "restart published extra immutable parts"
+        );
         assert_ne!(
             remote_write(
                 &client,
