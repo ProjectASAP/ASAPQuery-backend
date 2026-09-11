@@ -690,12 +690,70 @@ pub enum DataSourceIdentity {
     Table { table_ref: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub enum ValueProjectionIdentity {
     SampleValue,
-    Column { name: String },
+    Column {
+        name: String,
+    },
+    Constant {
+        value: planner_types::pre_asap::ScalarValue,
+    },
+}
+
+impl ValueProjectionIdentity {
+    pub fn column(&self) -> Option<&str> {
+        match self {
+            Self::Column { name } => Some(name),
+            _ => None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        use planner_types::pre_asap::ScalarValue;
+        match self {
+            Self::Column { name } => crate::table_population::validate_column_name(name),
+            Self::Constant {
+                value: ScalarValue::Int64(_),
+            }
+            | Self::SampleValue => Ok(()),
+            Self::Constant {
+                value: ScalarValue::Float64(value),
+            } if value.is_finite() => Ok(()),
+            Self::Constant { .. } => {
+                Err("summary value projection requires a finite numeric literal".into())
+            }
+        }
+    }
+}
+
+/// Compatibility adapter for old config column strings; storage is always typed.
+pub(crate) fn deserialize_optional_value_projection<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ValueProjectionIdentity>, D::Error> {
+    let value = Option::<Value>::deserialize(deserializer)?;
+    value
+        .map(|value| match value {
+            Value::String(name) => Ok(ValueProjectionIdentity::Column { name }),
+            value => serde_json::from_value(value).map_err(serde::de::Error::custom),
+        })
+        .transpose()
+}
+
+/// Read legacy StateSchema ColumnRef values without retaining a parallel field.
+pub(crate) fn deserialize_state_value_projection<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ValueProjectionIdentity, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    if value == "SampleValue" {
+        return Ok(ValueProjectionIdentity::SampleValue);
+    }
+    if let Some(name) = value.get("Named").and_then(Value::as_str) {
+        return Ok(ValueProjectionIdentity::Column { name: name.into() });
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
 }
 
 /// Whether a materialization preserves source entities or pools a population.
@@ -707,7 +765,7 @@ pub enum PopulationPartitioning {
     Grouped,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataDescriptor {
     pub id: DataDescriptorId,
@@ -815,6 +873,7 @@ impl DataDescriptor {
         &self.id
     }
     pub fn validate(&self) -> Result<(), SdsError> {
+        self.value_projection.validate().map_err(SdsError)?;
         if let Some(column) = &self.timestamp_column {
             if !matches!(self.source, DataSourceIdentity::Table { .. }) || column.is_empty() {
                 return Err(SdsError(
