@@ -147,11 +147,9 @@ impl CatalogClickHouseAccelerator {
 }
 
 fn requested_format(request: &ClickHouseQueryRequest) -> Result<ClickHouseFormat, String> {
-    if let Some(setting) = request
-        .parameters
-        .keys()
-        .find(|key| key.starts_with("output_format_"))
-    {
+    if let Some(setting) = request.parameters.keys().find(|key| {
+        key.starts_with("output_format_") || key.as_str() == "format_tsv_null_representation"
+    }) {
         return Err(format!("unsupported output setting {setting}"));
     }
     match request
@@ -302,6 +300,7 @@ mod tests {
         for setting in [
             "output_format_json_map_as_array_of_tuples",
             "output_format_json_quote_64bit_integers",
+            "format_tsv_null_representation",
         ] {
             request.parameters.insert(setting.into(), "1".into());
             assert!(requested_format(&request).is_err());
