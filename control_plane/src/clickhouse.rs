@@ -478,7 +478,6 @@ fn clickhouse_materialization_leaf_contract(
         &planner_types::pre_asap::Schema,
     )> {
         match expr {
-            QueryExpr::Project { child, .. } => table_scan(child),
             QueryExpr::Scan {
                 source: Source::Table { table_ref },
                 predicates,
@@ -519,7 +518,17 @@ fn clickhouse_materialization_leaf_contract(
         SummaryInputExpr::Column(
             planner_types::pre_asap::ColumnRef::Named(name)
             | planner_types::pre_asap::ColumnRef::Qualified { name, .. },
-        ) => ValueProjectionIdentity::Column { name: name.clone() },
+        ) => {
+            let column = schema
+                .columns
+                .iter()
+                .find(|column| column.name == *name)
+                .ok_or("SQL summary value projection is not a source column")?;
+            if column.nullable || column.dtype != planner_types::pre_asap::DataType::Float64 {
+                return Err("SQL value readout requires a non-null Float64 source until typed/null-aware ingest is available".into());
+            }
+            ValueProjectionIdentity::Column { name: name.clone() }
+        }
         SummaryInputExpr::Constant(value) if value.is_finite() => {
             let value = if value.fract() == 0.0 && value.abs() <= (1_u64 << 53) as f64 {
                 ScalarValue::Int64(*value as i64)
@@ -960,6 +969,39 @@ mod tests {
             ));
         assert_eq!(automatic.precompute_plan.executable_dags.len(), 1);
         automatic.validate().unwrap();
+        let mut integer_source = ClickHouseSqlAutomaticWorkload {
+            envelope: request.precompute_plan.envelope.clone(),
+            tables: request.tables.clone(),
+            accuracy: request.accuracy.clone(),
+            queries: request
+                .queries
+                .iter()
+                .map(|query| ClickHouseSqlWorkloadEntry {
+                    sql: query.sql.clone(),
+                    start_ms: query.start_ms,
+                    end_ms: query.end_ms,
+                    cumulative: query.cumulative,
+                })
+                .collect(),
+        };
+        integer_source.tables.get_mut("telemetry").unwrap().columns[1].dtype = DataType::Int64;
+        assert!(
+            compile_automatic_clickhouse_workload(&integer_source)
+                .await
+                .is_err(),
+            "an Int64 source may contain values beyond exact Float64 ingest range"
+        );
+        integer_source.tables.get_mut("telemetry").unwrap().columns[1].dtype = DataType::Float64;
+        integer_source.queries[0].sql = integer_source.queries[0].sql.replace(
+            "FROM telemetry WHERE",
+            "FROM (SELECT timestamp_ms, value * 2 AS value FROM telemetry) doubled WHERE",
+        );
+        assert!(
+            compile_automatic_clickhouse_workload(&integer_source)
+                .await
+                .is_err(),
+            "a producer projection must not be erased while binding its original table"
+        );
         let installed = publication
             .precompute_plan
             .executable_dags

@@ -210,8 +210,12 @@ async fn run_mixed_aggregate(aggregate: &str) {
     if aggregate == "count(*)" {
         let mut nullable_count = mixed_workload(&sql.replace("count(*)", "count(value)"));
         nullable_count.tables.get_mut("telemetry").unwrap().columns[1].nullable = true;
-        let result = control_plane::clickhouse::compile_automatic_clickhouse_workload(&nullable_count).await;
-        assert!(result.is_err(), "nullable count(value) requires explicit null exclusion");
+        let result =
+            control_plane::clickhouse::compile_automatic_clickhouse_workload(&nullable_count).await;
+        assert!(
+            result.is_err(),
+            "nullable count(value) requires explicit null exclusion"
+        );
     }
     let (publication, selection_trace) =
         control_plane::clickhouse::compile_automatic_clickhouse_workload(&workload)

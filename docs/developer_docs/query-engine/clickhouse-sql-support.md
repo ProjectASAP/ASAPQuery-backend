@@ -65,14 +65,25 @@ publishes the shared catalog and both execution plans through the normal atomic
 install/activate path.
 
 The initial automatic binder supports bounded, whole-second scalar reductions
-over one value column and typed table predicates. It uses the query's fixed
+over a non-null Float64 value column or a finite numeric literal, plus typed
+table predicates. Row counts use the shared typed constant `1` projection. It uses the query's fixed
 window as the materialization duration; this is not a cost-optimized pane/layout
 search. The initial fixed-window policy retains two windows (a completed window
 and the next active window); it does not certify arbitrary historical or moving
 window coverage. Empty, reversed, and out-of-range evaluation intervals are
-rejected before automatic planning. Grouped table projections, count-of-rows literal updates, complex table
+rejected before automatic planning. Grouped table projections, complex table
 types, and arbitrary boundary fragments remain unsupported here. Such inputs
 must not be presented as accelerated workload coverage.
+
+SQL `count(*)` now installs an exact Count state through the same catalog and
+readout DAG as other summaries. It includes rows with a NULL value column.
+Planner rejects nullable `count(value)` until per-aggregate null exclusion is
+represented; it must not silently become row count. Non-Float64 named sources
+are rejected because the current Float64 ingest path cannot preserve arbitrary
+Int64 values exactly. Producer `Project` subtrees are also rejected until their
+computation is executed, rather than skipped while binding the original table.
+The real process test covers SUM and row count mixed with a ClickHouse exact
+branch, and deletes a source row after materialization to prove summary readout.
 
 The response includes `selection_trace` from the same Planner search: candidate
 strategy, rationale, ranking, selected flag, and estimated cost when available.
