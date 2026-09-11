@@ -1871,8 +1871,10 @@ impl PhysicalCompiler {
                     aggregation_id.clone(),
                     environment.target,
                 );
-                let precompute_materialization =
-                    aggregation_config_for_materialization(&aggregation)?;
+                let precompute_materialization = aggregation_config_for_materialization(
+                    &aggregation,
+                    asap_types::QueryLanguage::PromQl,
+                )?;
                 let materialization = precompute_materialization.policy_fingerprint();
                 let state_consumers = consumers[&materialization]
                     .iter()
@@ -1903,8 +1905,10 @@ impl PhysicalCompiler {
                 // Preserve semantic window and evaluation cadence independently
                 // from the selected storage representation.
                 aggregation.window_secs = window_implementation.window_secs;
-                let mut runtime_materialization =
-                    aggregation_config_for_materialization(&aggregation)?;
+                let mut runtime_materialization = aggregation_config_for_materialization(
+                    &aggregation,
+                    asap_types::QueryLanguage::PromQl,
+                )?;
                 runtime_materialization.window_size = window_implementation.window_secs;
                 runtime_materialization.slide_interval = window_implementation.slide_secs;
                 runtime_materialization.window_type =
@@ -3188,12 +3192,22 @@ fn physical_aggregation(
 /// not create a second registry or wire plan.
 pub(crate) fn aggregation_config_for_materialization(
     aggregation: &BackendAggregation,
+    language: asap_types::QueryLanguage,
 ) -> anyhow::Result<asap_types::PrecomputeMaterialization> {
     use anyhow::Context as _;
-    let json = crate::emit::stage_config::build_backend_aggregation_json(aggregation);
-    let text = serde_json::to_string(&json).context("serialize synthesized aggregation JSON")?;
-    let yaml: serde_yaml::Value =
-        serde_yaml::from_str(&text).context("parse synthesized aggregation JSON as YAML")?;
+    let mut json = crate::emit::stage_config::build_backend_aggregation_json(aggregation);
+    // The selected physical duration is authoritative. The legacy edge emitter's
+    // 5..60 second clamp must not silently change a backend materialization.
+    json["windowSize"] = serde_json::json!(aggregation.window_secs);
+    if language == asap_types::QueryLanguage::ClickHouseSql {
+        // Raw input does not imply PromQL's (start,end] convention. SQL bounds
+        // are normalized and bound explicitly by the SQL compiler.
+        json["parameters"]
+            .as_object_mut()
+            .expect("emitter parameters are an object")
+            .remove("promql_right_closed");
+    }
+    let yaml = serde_yaml::to_value(json).context("convert physical aggregation fields")?;
     asap_types::PrecomputeMaterialization::from_yaml_data(
         &yaml,
         None,
@@ -3227,12 +3241,10 @@ fn materialization_consumers(
             {
                 continue;
             }
-            let config = aggregation_config_for_materialization(&physical_aggregation(
-                query,
-                &state,
-                query.query_id.clone(),
-                target,
-            ))?;
+            let config = aggregation_config_for_materialization(
+                &physical_aggregation(query, &state, query.query_id.clone(), target),
+                asap_types::QueryLanguage::PromQl,
+            )?;
             consumers
                 .entry(config.policy_fingerprint())
                 .or_default()

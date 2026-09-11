@@ -567,6 +567,10 @@ async fn main() {
             "/api/v1/clickhouse-plan/compile-and-publish",
             post(handle_compile_and_publish_clickhouse_plan),
         )
+        .route(
+            "/api/v1/clickhouse-plan/automatic/compile-and-publish",
+            post(handle_compile_and_publish_automatic_clickhouse_plan),
+        )
         .route("/api/v1/plan/auto", post(handle_plan_auto))
         .route("/api/v1/plan/pareto", post(handle_pareto))
         .route("/api/v1/plan/:metric", get(handle_get_plan))
@@ -818,6 +822,26 @@ async fn handle_compile_and_publish_clickhouse_plan(
         Ok(publication) => publication,
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
+    publish_clickhouse_plan(&state, publication, None).await
+}
+
+async fn handle_compile_and_publish_automatic_clickhouse_plan(
+    State(state): State<AppState>,
+    Json(request): Json<clickhouse::ClickHouseSqlAutomaticWorkload>,
+) -> impl IntoResponse {
+    let (publication, trace) =
+        match clickhouse::compile_automatic_clickhouse_workload(&request).await {
+            Ok(publication) => publication,
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+    publish_clickhouse_plan(&state, publication, Some(serde_json::json!(trace))).await
+}
+
+async fn publish_clickhouse_plan(
+    state: &AppState,
+    publication: physical::publication::PhysicalPlanPublication,
+    selection_trace: Option<serde_json::Value>,
+) -> axum::response::Response {
     let plan_id = publication.summary_catalog.plan_id;
     let plan_version = publication.summary_catalog.plan_version;
     let Some(client) = state.backend_client.as_ref() else {
@@ -842,7 +866,8 @@ async fn handle_compile_and_publish_clickhouse_plan(
     Json(serde_json::json!({
         "plan_id": plan_id,
         "plan_version": plan_version,
-        "status": "active"
+        "status": "active",
+        "selection_trace": selection_trace,
     }))
     .into_response()
 }

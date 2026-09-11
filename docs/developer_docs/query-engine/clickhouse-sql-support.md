@@ -56,6 +56,37 @@ summary, or maintain a cloned executable catalog.
 
 ## HTTP surfaces
 
+`POST /api/v1/clickhouse-plan/automatic/compile-and-publish` accepts a plan
+`envelope`, typed `tables`, `accuracy`, and `queries` (SQL plus fixed start/end
+milliseconds and cumulative-readout policy). It accepts no preselected family,
+materialization, or catalog. The control plane plans each query once and derives
+materializations only for supported SummaryAgg nodes in that selected DAG, then
+publishes the shared catalog and both execution plans through the normal atomic
+install/activate path.
+
+The initial automatic binder supports bounded, whole-second scalar reductions
+over one value column and typed table predicates. It uses the query's fixed
+window as the materialization duration; this is not a cost-optimized pane/layout
+search. The initial fixed-window policy retains two windows (a completed window
+and the next active window); it does not certify arbitrary historical or moving
+window coverage. Empty, reversed, and out-of-range evaluation intervals are
+rejected before automatic planning. Grouped table projections, count-of-rows literal updates, complex table
+types, and arbitrary boundary fragments remain unsupported here. Such inputs
+must not be presented as accelerated workload coverage.
+
+The response includes `selection_trace` from the same Planner search: candidate
+strategy, rationale, ranking, selected flag, and estimated cost when available.
+The current SQL cost model uses relative ranking and may not report a numeric
+cost; those entries carry `null` and `not_reported_by_cost_model`, not zero.
+The selected DAG, exact branches, and installed materialization IDs remain in
+the publication. The real mixed process regression optionally writes both
+publication and trace to `CLICKHOUSE_PLANNING_ARTIFACT`.
+
+Physical backend conversion preserves the selected window duration instead of
+inheriting the legacy edge emitter's 5–60 second clamp. It also takes the query
+language explicitly so SQL half-open intervals cannot acquire PromQL's
+right-closed range flag merely because both ingest raw samples.
+
 The data-plane listener supports `/`, `/ping`, and standard ClickHouse query
 parameters. Configure it with:
 
