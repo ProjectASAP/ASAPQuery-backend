@@ -113,3 +113,29 @@ class CandidateTopKArtifactTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PerQueryAccuracyTests(unittest.TestCase):
+    def test_entropy_absolute_error_does_not_accept_relative_tolerance(self):
+        from types import SimpleNamespace
+        from calibrate_runtime import comparison_tolerances
+        from compare import compare_results
+        args = SimpleNamespace(relative_tolerance=.9, absolute_tolerance=.9)
+        relative, absolute = comparison_tolerances({"accuracy_validation": {"metric": "absolute_bits", "bound": .1}}, args)
+        actual = {"status": "success", "data": {"resultType": "vector", "result": [{"metric": {}, "value": [0, "10.2"]}]}}
+        exact = {"status": "success", "data": {"resultType": "vector", "result": [{"metric": {}, "value": [0, "10"]}]}}
+        self.assertEqual((relative, absolute), (0, .1))
+        self.assertFalse(compare_results(actual, exact, relative, absolute)["equal"])
+
+    def test_unknown_metric_and_invalid_bound_are_rejected(self):
+        from types import SimpleNamespace
+        from calibrate_runtime import comparison_tolerances
+        for metric, bound in [("rank", .1), ("relative", float("nan")), ("absolute_bits", -1), ("exact", .1)]:
+            with self.assertRaises(ValueError):
+                comparison_tolerances({"accuracy_validation": {"metric": metric, "bound": bound}}, SimpleNamespace())
+
+    def test_result_cache_policy_is_explicit_on_both_query_endpoints(self):
+        from urllib.parse import parse_qs
+        from calibrate_runtime import query_parameters
+        row = {"query": "count_over_time(m[1h])", "eval_timestamp_ms": 1234}
+        self.assertNotIn("nocache", parse_qs(query_parameters(row, False)))
+        self.assertEqual(parse_qs(query_parameters(row, True))["nocache"], ["1"])

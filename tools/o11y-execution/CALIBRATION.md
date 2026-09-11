@@ -63,3 +63,38 @@ The backend currently exposes its Planner-selected forest and a whole-workload
 exact alternative. This workflow does not claim exhaustive algorithm or lifecycle
 search, and its unit discovery seed can influence which forest becomes available.
 A calibrated comparison is only between the candidates actually exported.
+
+## VictoriaMetrics and readout-specific checks
+
+Use `calibration_candidates SNAPSHOT --metricsql` and
+`compile_workload_artifact SNAPSHOT --metricsql` to compile the shared parser
+subset through the existing MetricsQL serving path. This preserves language-tagged
+query entries and exact edges; do not change an emitted install artifact by hand.
+`BackendLocalPlanningSnapshot::compile_metricsql()` exposes the same operation.
+
+`calibrate_runtime.py --victoriametrics BINARY` starts a fresh VictoriaMetrics
+fallback instead of Prometheus. Ingestion and drain use the normal backend port;
+queries use `--metricsql-port`. `--exact-cache-bytes` controls VictoriaMetrics cache
+allocation, not process RSS. Record the binary version, cache budget and CPU set.
+`--disable-result-cache` sets VictoriaMetrics `-search.disableCache` (including
+its use through backend exact edges) and sends `nocache=1` to both query endpoints, so repeated
+identical timestamps measure query execution instead of the exact server's result
+cache. Declare that policy in the comparison report.
+
+A corpus occurrence may contain `accuracy_validation` with a `metric` and
+`bound`. Supported validation units are `relative`, `absolute_bits`, and `exact`
+(the last requires zero bound). In particular, entropy absolute bits cannot
+borrow a relative tolerance. A rank-error contract needs a rank oracle and is
+intentionally rejected by this scalar comparison helper; do not use value error
+to certify KLL rank accuracy. Native unsupported exact functions remain failed
+comparisons and cannot obtain an executable cost quote.
+
+For offline UnivMon error evidence, `cargo run --release -p data_plane --example
+univmon_erp_artifact -- samples.jsonl` measures two-pane merged readouts on the
+first ten source populations. It requires equal observed shapes; differing
+populations must be calibrated separately. The tool retains samples offline,
+records observed maxima and serialized state bytes, and does not measure CPU or
+calibrate a failure probability. Use a zero CPU objective weight for that artifact;
+whole-candidate CPU comes from the independent runtime calibration above. Keep
+held-out source populations and performance runs separate from these training
+populations. This tool does not select a plan.

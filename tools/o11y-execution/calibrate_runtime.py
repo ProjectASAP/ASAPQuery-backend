@@ -7,6 +7,7 @@ input replay is explicitly distinct from a wall-clock deployment horizon.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import resource
@@ -46,6 +47,47 @@ def file_bytes(root):
     return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
 
 
+def exact_service_command(args, folder, port):
+    if getattr(args, "victoriametrics", None):
+        command = [str(args.victoriametrics.resolve()),
+                f"-storageDataPath={(folder / 'exact-data').resolve()}",
+                f"-httpListenAddr=127.0.0.1:{port}", "-retentionPeriod=1y",
+                f"-memory.allowedBytes={args.exact_cache_bytes}"]
+        if args.disable_result_cache:
+            command.append("-search.disableCache")
+        return command
+    config = folder / "prometheus.yml"
+    config.write_text('global:\n  scrape_interval: 1h\nscrape_configs: []\n')
+    return [str(args.prometheus.resolve()), f"--config.file={config.resolve()}",
+            f"--storage.tsdb.path={(folder / 'exact-data').resolve()}",
+            f"--web.listen-address=127.0.0.1:{port}", "--web.enable-remote-write-receiver",
+            "--storage.tsdb.retention.time=1000000h"]
+
+
+def query_parameters(occurrence, disable_cache):
+    params = {"query": occurrence["query"], "time": f'{occurrence["eval_timestamp_ms"] / 1000:.3f}'}
+    if disable_cache:
+        params["nocache"] = "1"
+    return urllib.parse.urlencode(params)
+
+
+def comparison_tolerances(occurrence, args):
+    contract = occurrence.get("accuracy_validation")
+    if contract is None:
+        return args.relative_tolerance, args.absolute_tolerance
+    bound = contract.get("bound")
+    if not isinstance(bound, (float, int)) or not math.isfinite(bound) or bound < 0:
+        raise ValueError("invalid per-query accuracy bound")
+    metric = contract.get("metric")
+    if metric == "relative":
+        return bound, 0.0
+    if metric == "absolute_bits":
+        return 0.0, bound
+    if metric == "exact" and bound == 0:
+        return 0.0, 0.0
+    raise ValueError("unsupported per-query accuracy metric")
+
+
 def measure(args, artifact, corpus, snapshot, folder):
     folder.mkdir()
     manifest = artifact["manifest"]
@@ -65,21 +107,19 @@ def measure(args, artifact, corpus, snapshot, folder):
     backend = f"http://127.0.0.1:{args.backend_port}"
     install = folder / "install.json"
     runner.write_json(install, artifact["install_request"])
-    config = folder / "prometheus.yml"
-    config.write_text('global:\n  scrape_interval: 1h\nscrape_configs: []\n')
+    query_backend = f"http://127.0.0.1:{args.metricsql_port}" if args.victoriametrics else backend
     children_cpu_before = resource.getrusage(resource.RUSAGE_CHILDREN)
     try:
         start = time.perf_counter_ns()
-        prom = launch("fallback", [str(args.prometheus.resolve()), f"--config.file={config.resolve()}",
-                     f"--storage.tsdb.path={(folder / 'prometheus-data').resolve()}",
-                     f"--web.listen-address=127.0.0.1:{args.fallback_port}", "--web.enable-remote-write-receiver",
-                     "--storage.tsdb.retention.time=1000000h"])
-        # Backend startup validates its exact service immediately.
-        wait_ready(fallback + "/-/ready", prom)
-        dp = launch("backend", [str(args.data_plane.resolve()), "--profile", "asapquery", "--physical-plan", str(install.resolve()),
-                    "--prometheus-server", fallback, "--forward-unsupported-queries", "--http-port", str(args.backend_port),
-                    "--output-dir", str((folder / "backend-data").resolve()), "--precompute-allowed-lateness-ms", "0",
-                    "--precompute-flush-interval-ms", "25"])
+        prom = launch("fallback", exact_service_command(args, folder, args.fallback_port))
+        wait_ready(fallback + ("/health" if args.victoriametrics else "/-/ready"), prom)
+        command = [str(args.data_plane.resolve()), "--profile", "asapquery", "--physical-plan", str(install.resolve()),
+                   "--prometheus-server", fallback, "--forward-unsupported-queries", "--http-port", str(args.backend_port),
+                   "--output-dir", str((folder / "backend-data").resolve()), "--precompute-allowed-lateness-ms", "0",
+                   "--precompute-flush-interval-ms", "25"]
+        if args.victoriametrics:
+            command += ["--victoriametrics-url", fallback, "--victoriametrics-http-port", str(args.metricsql_port)]
+        dp = launch("backend", command)
         wait_ready(backend + "/api/v1/health", dp)
         after = snapshots(children)
         # Fresh processes: cumulative CPU from exec includes all install/startup work.
@@ -107,18 +147,18 @@ def measure(args, artifact, corpus, snapshot, folder):
                 raise RuntimeError(f"no original corpus occurrences for {qid}")
             exact = {}
             for occurrence in occurrences:
-                params = urllib.parse.urlencode({"query": occurrence["query"], "time": f'{occurrence["eval_timestamp_ms"] / 1000:.3f}'})
+                params = query_parameters(occurrence, args.disable_result_cache)
                 exact[occurrence["id"]] = runner._http_request(args.reference_url.rstrip("/") + "/api/v1/query?" + params)
             records, before, start = [], snapshots(children), time.perf_counter_ns()
             repeat = 0
             measured_cpu = 0
             while repeat < args.repetitions or (measured_cpu < args.minimum_query_cpu_ns and repeat < args.max_repetitions):
                 for occurrence in occurrences:
-                    params = urllib.parse.urlencode({"query": occurrence["query"], "time": f'{occurrence["eval_timestamp_ms"] / 1000:.3f}'})
-                    answer = runner._http_request(backend + "/api/v1/query?" + params)
+                    params = query_parameters(occurrence, args.disable_result_cache)
+                    answer = runner._http_request(query_backend + "/api/v1/query?" + params)
                     reference = exact[occurrence["id"]]
                     route = runner.classify(answer["response"], answer["headers"]) if answer["http_status"] == 200 else "failed"
-                    comparison = compare_results(answer["response"], reference["response"], args.relative_tolerance, args.absolute_tolerance)
+                    comparison = compare_results(answer["response"], reference["response"], *comparison_tolerances(occurrence, args))
                     records.append({**occurrence, "repetition": repeat, "execution": route,
                                     "execution_provenance": runner.execution_provenance(answer["response"], answer["headers"]), **answer,
                                     "exact": reference, "comparison": comparison})
@@ -141,7 +181,7 @@ def measure(args, artifact, corpus, snapshot, folder):
         runner.write_json(folder / "store.json", state)
         final = snapshots(children)
         row["resources"] = {"peak_memory_bytes": sum(v["process_lifetime_peak_rss_bytes"] for v in final.values()),
-                            "storage_bytes": file_bytes(folder / "prometheus-data") + file_bytes(folder / "backend-data"),
+                            "storage_bytes": file_bytes(folder / "exact-data") + file_bytes(folder / "backend-data"),
                             "backend_state": state, "processes": final, "source_scan_bytes": None, "network_bytes": None,
                             "residency_wall_seconds": args.residency_seconds,
                             "scope": "accelerated finite-input replay; no extrapolation of short idle residency to logical data horizon; process HWM sum is conservative"}
@@ -283,8 +323,14 @@ def validate_candidate_topk_execution(artifact, records):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ["candidates", "metrics", "queries", "snapshot", "data-plane", "prometheus", "output"]:
+    for name in ["candidates", "metrics", "queries", "snapshot", "data-plane", "output"]:
         parser.add_argument("--" + name, type=Path, required=True)
+    engines = parser.add_mutually_exclusive_group(required=True)
+    engines.add_argument("--prometheus", type=Path)
+    engines.add_argument("--victoriametrics", type=Path)
+    parser.add_argument("--metricsql-port", type=int, default=19212)
+    parser.add_argument("--exact-cache-bytes", type=int, default=268435456, help="VictoriaMetrics cache budget, not an RSS limit")
+    parser.add_argument("--disable-result-cache", action="store_true", help="send nocache=1 to both query endpoints")
     parser.add_argument("--reference-url", required=True, help="separate already-loaded exact Prometheus using identical input")
     parser.add_argument("--cpu-affinity", required=True)
     parser.add_argument("--backend-port", type=int, default=19210)
@@ -298,12 +344,15 @@ def main():
     args = parser.parse_args()
     if args.repetitions < 1 or args.max_repetitions < args.repetitions or args.minimum_query_cpu_ns <= 0 or args.residency_seconds < 0:
         parser.error("positive repetitions and nonnegative residency required")
+    if len({args.backend_port, args.fallback_port, args.metricsql_port}) != 3 or args.exact_cache_bytes <= 0:
+        parser.error("distinct listener ports and positive exact cache budget required")
     args.output.mkdir(parents=True, exist_ok=False)
     sample_count = runner.validate_sample_file(args.metrics)
     corpus, snapshot = json.loads(args.queries.read_text()), json.loads(args.snapshot.read_text())
     runner.validate_workload(snapshot, corpus)
     candidate_document = json.loads(args.candidates.read_text())
     result = {"units": "cpu_ns", "compiler_identity": candidate_document.get("compiler_identity"), "data_snapshot_id": "sha256:" + hashlib.sha256(args.metrics.read_bytes()).hexdigest(),
+              "exact_engine": "victoriametrics" if args.victoriametrics else "prometheus", "result_cache_disabled": args.disable_result_cache,
               "scope": "accelerated finite-input calibration; measured wall residency is not full logical-horizon residency", "validated_sample_count": sample_count, "candidates": []}
     candidates = candidate_document["candidates"]
     for candidate in candidates:

@@ -120,7 +120,8 @@ fn planner_forest(queries: &[control_plane::physical::compiler::PlanningQuery]) 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::args()
         .nth(1)
-        .ok_or("usage: calibration_candidates SNAPSHOT.json")?;
+        .ok_or("usage: calibration_candidates SNAPSHOT.json [--metricsql]")?;
+    let metricsql = std::env::args().skip(2).any(|arg| arg == "--metricsql");
     let snapshot: BackendLocalPlanningSnapshot = serde_json::from_slice(&std::fs::read(path)?)?;
     let (request, environment) = snapshot.planning_request()?;
     let mut results = Vec::new();
@@ -131,7 +132,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let queries = candidate.queries.clone();
         let materialization_policy = candidate.materialization_policy.clone();
         let planner_selected_queries = planner_forest(&queries);
-        let plan = match PhysicalCompiler.compile(candidate, environment.clone()) {
+        let compiled = if metricsql {
+            PhysicalCompiler.compile_metricsql(candidate, environment.clone())
+        } else {
+            PhysicalCompiler.compile(candidate, environment.clone())
+        };
+        let plan = match compiled {
             Ok(plan) => plan,
             Err(error) => {
                 results.push(

@@ -1276,6 +1276,15 @@ impl BackendLocalPlanningSnapshot {
     /// one backend-local PhysicalPlan. No CollectorPlan is produced and no
     /// precompiled serving artifact is accepted at this boundary.
     pub fn compile(self) -> Result<PhysicalPlan, CompileError> {
+        self.compile_frontend(false)
+    }
+
+    /// Use the shared parser subset with MetricsQL serving and exact routing.
+    pub fn compile_metricsql(self) -> Result<PhysicalPlan, CompileError> {
+        self.compile_frontend(true)
+    }
+
+    fn compile_frontend(self, metricsql: bool) -> Result<PhysicalPlan, CompileError> {
         let evidence = self.workload_cost_evidence.clone();
         if self.snapshot_version == 2 && evidence.is_none() {
             return Err(CompileError::Snapshot(
@@ -1284,18 +1293,25 @@ impl BackendLocalPlanningSnapshot {
         }
         let (request, environment) = self.planning_request()?;
         match evidence {
-            Some(evidence) => super::workload_cost::select(
-                super::workload_cost::with_exact_alternative(request)?,
-                environment,
-                &evidence,
-            ),
+            Some(evidence) => {
+                let candidates = super::workload_cost::with_exact_alternative(request)?;
+                if metricsql {
+                    super::workload_cost::select_metricsql(candidates, environment, &evidence)
+                } else {
+                    super::workload_cost::select(candidates, environment, &evidence)
+                }
+            }
             None => {
                 // Unquoted v1 startup snapshots keep the established summary/native
                 // compatibility policy. Local residual candidates are enumerated by
                 // planning_request and admitted through measured workload selection.
                 let mut request = request;
                 request.hybrid_execution = false;
-                PhysicalCompiler.compile(request, environment)
+                if metricsql {
+                    PhysicalCompiler.compile_metricsql(request, environment)
+                } else {
+                    PhysicalCompiler.compile(request, environment)
+                }
             }
         }
     }
@@ -4265,6 +4281,21 @@ mod tests {
         workload.hybrid_execution = true;
         let result = PhysicalCompiler.compile_metricsql(workload, deployment);
         assert!(matches!(result, Err(CompileError::QueryPlan(_))));
+    }
+
+    #[test]
+    fn snapshot_metricsql_entry_uses_the_shared_serving_language_contract() {
+        let snapshot: BackendLocalPlanningSnapshot = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let plan = snapshot.compile_metricsql().unwrap();
+        assert!(!plan.query_plan.entries.is_empty());
+        assert!(plan
+            .query_plan
+            .entries
+            .values()
+            .all(|entry| entry.language == crate::query_plan::QueryLanguage::MetricsQl));
     }
 
     #[test]
