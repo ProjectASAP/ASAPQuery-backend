@@ -53,6 +53,7 @@ docker run --name "$backend" --user "$(id -u):$(id -g)" \
     -w "$repo_root" -e CLICKHOUSE_URL=http://127.0.0.1:28123 \
     -e CLICKHOUSE_USER -e CLICKHOUSE_PASSWORD -e CLICKHOUSE_PID="$server_pid" \
     -e CLICKHOUSE_BENCH_INPUT -e CLICKHOUSE_BENCH_METRIC -e CLICKHOUSE_BENCH_END_MS \
+    -e CLICKHOUSE_BENCH_AGGREGATE="${CLICKHOUSE_BENCH_AGGREGATE:-max}" \
     -e CLICKHOUSE_BENCH_REPETITIONS="${CLICKHOUSE_BENCH_REPETITIONS:-1000}" \
     -e CLICKHOUSE_BENCH_OUTPUT="$output.json" \
     --entrypoint "$TEST_BINARY" "$image" --nocapture

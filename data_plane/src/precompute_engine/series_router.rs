@@ -25,6 +25,11 @@ use xxhash_rust::xxh64::xxh64;
 /// by sid without losing the data the legacy `(agg_id, group_key)` shape
 /// carried.
 pub enum WorkerMessage {
+    /// Receipt allocated after queue reservation and before any input is visible.
+    Admitted {
+        input: Box<WorkerMessage>,
+        revision: Arc<crate::storage_engines::types::SummaryInputRevision>,
+    },
     /// A batch of samples for the same series, routed by series key.
     /// Used in `pass_raw_samples` mode where no aggregation is needed.
     RawSamples {
@@ -96,6 +101,11 @@ pub enum WorkerMessage {
 impl fmt::Debug for WorkerMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Admitted { input, revision } => f
+                .debug_struct("Admitted")
+                .field("input", input)
+                .field("revision", &revision.revision)
+                .finish(),
             Self::RawSamples {
                 series_key,
                 samples,
@@ -166,6 +176,9 @@ impl SeriesRouter {
         let mut per_worker: HashMap<usize, Vec<WorkerMessage>> = HashMap::new();
         for msg in messages {
             let worker_idx = match &msg {
+                WorkerMessage::Admitted { .. } => {
+                    return Err("input must be admitted by the router".into())
+                }
                 WorkerMessage::GroupSamples { sid, .. } => self.worker_for_sid(*sid),
                 WorkerMessage::AccumulatorInput { sid, .. } => self.worker_for_sid(*sid),
                 WorkerMessage::RawSamples { series_key, .. } => self.worker_for(series_key),
@@ -204,12 +217,26 @@ impl SeriesRouter {
         &self,
         messages: Vec<WorkerMessage>,
     ) -> Result<(), TryRouteError> {
+        self.try_route_group_batch_with_admission(messages, || Ok(None))
+    }
+
+    pub fn try_route_group_batch_with_admission(
+        &self,
+        messages: Vec<WorkerMessage>,
+        admit: impl FnOnce() -> Result<
+            Option<Arc<crate::storage_engines::types::SummaryInputRevision>>,
+            String,
+        >,
+    ) -> Result<(), TryRouteError> {
         let mut pending = Vec::with_capacity(messages.len());
         for message in messages {
             let worker_idx = match &message {
                 WorkerMessage::GroupSamples { sid, .. }
                 | WorkerMessage::AccumulatorInput { sid, .. } => self.worker_for_sid(*sid),
                 WorkerMessage::RawSamples { series_key, .. } => self.worker_for(series_key),
+                WorkerMessage::Admitted { .. } => {
+                    return Err(TryRouteError::Admission("input already admitted".into()))
+                }
                 WorkerMessage::Flush | WorkerMessage::Drain(_) | WorkerMessage::Shutdown => 0,
             };
             let permit = self.senders[worker_idx]
@@ -221,8 +248,15 @@ impl SeriesRouter {
                 })?;
             pending.push((permit, message));
         }
+        let revision = admit().map_err(TryRouteError::Admission)?;
         for (permit, message) in pending {
-            permit.send(message);
+            permit.send(match &revision {
+                Some(revision) => WorkerMessage::Admitted {
+                    input: Box::new(message),
+                    revision: Arc::clone(revision),
+                },
+                None => message,
+            });
         }
         Ok(())
     }
@@ -283,8 +317,10 @@ impl SeriesRouter {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TryRouteError {
+    #[error("summary admission rejected: {0}")]
+    Admission(String),
     #[error("precompute queue is full")]
     Full,
     #[error("precompute worker is unavailable")]
@@ -343,9 +379,17 @@ mod tests {
                 ingest_received_at: Instant::now(),
             },
         ];
+        let mut admitted = false;
         assert_eq!(
-            router.try_route_group_batch_atomic(messages),
+            router.try_route_group_batch_with_admission(messages, || {
+                admitted = true;
+                Ok(None)
+            }),
             Err(TryRouteError::Full)
+        );
+        assert!(
+            !admitted,
+            "failed queue reservation must not mutate admission"
         );
         assert!(matches!(
             receiver.try_recv(),
