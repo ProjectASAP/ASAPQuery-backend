@@ -635,7 +635,7 @@ pub fn execute_completed_maintenance(
     if store.recover_frozen_maintenance_output(
         target_sid,
         target_config,
-        &frozen,
+        std::slice::from_ref(&frozen),
         digest,
         window,
     )? {
@@ -665,7 +665,7 @@ pub fn execute_completed_maintenance(
         target_config,
         &output,
         state.as_ref(),
-        &frozen,
+        std::slice::from_ref(&frozen),
         digest,
     )
 }
