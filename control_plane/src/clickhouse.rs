@@ -467,6 +467,9 @@ fn clickhouse_materialization_leaf_contract(
     else {
         return Err("SQL materialization leaf is not a summary aggregate".into());
     };
+    if input.item.is_some() {
+        return Err("SQL item/weight summary inputs require an explicit item projection".into());
+    }
     let SummaryExpr::KeepPreAsap(expr) = &child.expr else {
         return Err("SQL materialization leaf has no tabular source".into());
     };
@@ -727,6 +730,52 @@ mod tests {
         value.pane_origin_ms = Some(0);
         value.table_timestamp_column = Some("timestamp_ms".into());
         value
+    }
+
+    #[test]
+    fn keyed_summary_input_is_not_replaced_by_its_unit_weight() {
+        use planner_types::post_asap::{
+            SummaryExpr, SummaryInputExpr, SummaryNode, SummarySchema, SummaryUpdate,
+        };
+        use planner_types::pre_asap::{ColumnRef, QueryExpr, Reduction, ScalarValue};
+        let schema = SummarySchema {
+            fields: vec![],
+            time_index: None,
+        };
+        let family = materialization(
+            AggregationType::Sum,
+            "value",
+            60,
+            60,
+            ("variant", serde_json::json!(1)),
+        )
+        .accumulator_spec()
+        .unwrap()
+        .family;
+        let node = SummaryNode {
+            expr: SummaryExpr::SummaryAgg {
+                child: std::rc::Rc::new(SummaryNode {
+                    expr: SummaryExpr::KeepPreAsap(std::rc::Rc::new(QueryExpr::Literal(
+                        ScalarValue::Int64(1),
+                    ))),
+                    schema: schema.clone(),
+                    guarantee: Default::default(),
+                }),
+                family,
+                input: SummaryUpdate {
+                    item: Some(SummaryInputExpr::Column(ColumnRef::Named("value".into()))),
+                    weight: SummaryInputExpr::Constant(1.0),
+                    weight_domain: Default::default(),
+                },
+                reduction: Reduction::Reduce(vec![].into()),
+                grouping: Default::default(),
+            },
+            schema,
+            guarantee: Default::default(),
+        };
+        assert!(clickhouse_materialization_leaf_contract(&node, 0, 60_000)
+            .unwrap_err()
+            .contains("explicit item projection"));
     }
 
     #[test]
