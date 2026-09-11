@@ -145,13 +145,17 @@ pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactor
             let mut source_config = config.clone();
             source_config.database = database.clone();
             source_config.table = table.clone();
+            source_config.timestamp_ms_column = materialization
+                .table_timestamp_column
+                .clone()
+                .ok_or("table materialization has no timestamp projection")?;
             source_config.value_column = materialization
                 .value_column
                 .clone()
                 .ok_or("table materialization has no value projection")?;
             materialization.population_filter_canonical()?;
             let mut reader = ClickHouseReader::new(source_config)?;
-            reader.population = materialization.table_population.clone();
+            reader.population = Some(materialization.table_population.clone().unwrap_or_default());
             reader.output_metric = Some(materialization.metric.clone());
             Ok(Arc::new(reader) as Arc<dyn RawSampleReader>)
         }
@@ -307,8 +311,17 @@ mod tests {
     }
 
     #[test]
+    fn unfiltered_table_population_does_not_filter_by_output_metric() {
+        let mut reader = ClickHouseReader::new(config("samples")).unwrap();
+        reader.population = Some(Default::default());
+        let sql = reader.sql();
+        assert!(sql.contains("WHERE 1 AND"));
+        assert!(!sql.contains("{metric:String}"));
+    }
+
+    #[test]
     fn typed_source_enters_clickhouse_backfill_lifecycle() {
-        let materialization = asap_types::PrecomputeMaterialization::new(
+        let mut materialization = asap_types::PrecomputeMaterialization::new(
             asap_types::AggregationType::Sum,
             String::new(),
             Default::default(),
@@ -326,6 +339,7 @@ mod tests {
             Some("value".into()),
         );
         let factory = clickhouse_reader_factory(config("samples"));
+        materialization.table_timestamp_column = Some("timestamp_ms".into());
         let reader = factory(
             &BackfillSource::ClickHouse {
                 database: "metrics".into(),

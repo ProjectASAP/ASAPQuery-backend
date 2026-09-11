@@ -87,6 +87,7 @@ impl PrecomputePlan {
                     ValueProjectionIdentity::Column { name: name.clone() }
                 });
             if data.partitioning != config.partitioning
+                || data.timestamp_column != config.table_timestamp_column
                 || data.source != expected_source
                 || data.value_projection != expected_projection
                 || data.population_filter_canonical
