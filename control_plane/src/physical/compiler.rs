@@ -3545,6 +3545,25 @@ mod tests {
     }
 
     #[test]
+    fn unshared_immutable_nodes_do_not_share_legacy_raw_cost_cohort() {
+        let sum = request("sum", "quantile(0.9, sum_over_time(m[1m]))");
+        let count = request("other", "quantile(0.5, sum_over_time(m[1m]))");
+        let queries = vec![sum.queries[0].clone(), count.queries[0].clone()];
+        let error = materialization_consumers(
+            &queries,
+            PhysicalDeploymentTarget::BackendLocalRemoteWrite,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("separate lifecycle cost cohorts"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn immutable_nested_summary_keeps_actual_source_and_derived_bindings() {
         let mut workload = request("nested", "quantile(0.9, sum_over_time(m[1m]))");
         workload.hybrid_execution = true;
