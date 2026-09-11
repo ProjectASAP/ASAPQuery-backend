@@ -171,9 +171,11 @@ impl FlusherShared {
             let key = record.sid.to_string();
             let mut current = records.get(&key).cloned().unwrap_or_else(|| record.clone());
             validate_identity(&current, record)?;
+            // Completion fences window ends. An advancing overlapping full
+            // window is a new immutable publication, not a correction.
             if current
                 .completed_through_ms
-                .is_some_and(|end| snapshot.min_ts < end)
+                .is_some_and(|end| snapshot.max_ts <= end)
             {
                 let Some(previous) = &current.last_immutable else {
                     return Err(invalid(
@@ -519,6 +521,52 @@ mod tests {
         assert!(handle
             .publish_immutable_window(&record(), [7; 32], &snapshot())
             .is_err());
+    }
+    #[test]
+    fn overlapping_windows_advance_end_frontier_and_reject_old_corrections_after_restart() {
+        // Completion fences window ends, allowing an explicitly planned full
+        // window to overlap its predecessor without reopening that predecessor.
+        fn window(start: u64, end: u64) -> EpochSnapshot {
+            let mut state = snapshot();
+            state.min_ts = start;
+            state.max_ts = end;
+            state.entries[0].start_ts = start;
+            state.entries[0].end_ts = end;
+            state
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let mut first = handle(temp.path());
+        first
+            .publish_immutable_window(&record(), [1; 32], &window(0, 60))
+            .unwrap();
+        let next = first
+            .publish_immutable_window(&record(), [2; 32], &window(10, 70))
+            .unwrap();
+        assert!(!next.already_published);
+        assert_eq!(first.manifest().live_parts().len(), 2);
+        first.shutdown();
+        drop(first);
+        let mut restored = handle(temp.path());
+        let retried = restored
+            .publish_immutable_window(&record(), [2; 32], &window(10, 70))
+            .unwrap();
+        assert!(retried.already_published);
+        assert_eq!(retried.part_id, next.part_id);
+        for (start, end, digest) in [(0, 60, [1; 32]), (0, 70, [2; 32]), (10, 70, [3; 32])] {
+            assert!(restored
+                .publish_immutable_window(&record(), digest, &window(start, end))
+                .is_err());
+        }
+        let mut changed_payload = window(10, 70);
+        changed_payload.entries[0].sketch_bytes.push(9);
+        assert!(restored
+            .publish_immutable_window(&record(), [2; 32], &changed_payload)
+            .is_err());
+        assert_eq!(restored.manifest().live_parts().len(), 2);
+        let metadata = restored.inner.sid_metadata.load_strict().unwrap();
+        assert_eq!(metadata[0].completed_through_ms, Some(70));
+        assert!(metadata[0].pending_immutable.is_none());
+        restored.shutdown();
     }
     #[test]
     fn restart_preserves_reserved_part_and_resumes_without_source() {
