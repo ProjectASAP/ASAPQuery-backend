@@ -439,6 +439,23 @@ impl QueryExecutionContext<'_> {
     ) -> Result<Vec<(BTreeMap<String, String>, GroupState)>, SummaryExecutorError> {
         use control_plane::query_plan::PhysicalGrouping;
 
+        let inventory_revision = self.index.summary_update_revision();
+        let query_range = asap_types::sds::HalfOpenTimeRange {
+            start_ms: i64::try_from(self.t0_ms).map_err(|_| {
+                SummaryExecutorError::Unsupported("query start exceeds signed event time")
+            })?,
+            end_ms: i64::try_from(self.t1_ms).map_err(|_| {
+                SummaryExecutorError::Unsupported("query end exceeds signed event time")
+            })?,
+        };
+        if self
+            .index
+            .has_pending_summary_updates(binding.materialization, query_range)
+        {
+            return Err(SummaryExecutorError::Unsupported(
+                "materialization population has unpublished input",
+            ));
+        }
         validate_binding_phase(binding, self.t1_ms)?;
 
         enum Candidate {
@@ -488,6 +505,12 @@ impl QueryExecutionContext<'_> {
         let mut by_group: BTreeMap<BTreeMap<String, String>, Vec<GroupState>> = BTreeMap::new();
 
         for sid in sids.iter().copied() {
+            if self
+                .index
+                .summary_window_known_empty(binding.materialization, sid, query_range)
+            {
+                continue;
+            }
             let candidate = self
                 .index
                 .with_instance(sid, |meta| {
@@ -617,12 +640,18 @@ impl QueryExecutionContext<'_> {
             );
             return Err(SummaryExecutorError::NoCandidates);
         }
-        by_group
+        let result = by_group
             .into_iter()
             .map(|(key, states)| {
                 <Self as SummaryExecutor>::merge_states(self, states).map(|state| (key, state))
             })
-            .collect()
+            .collect();
+        if inventory_revision != self.index.summary_update_revision() {
+            return Err(SummaryExecutorError::Unsupported(
+                "summary input changed during read",
+            ));
+        }
+        result
     }
 
     pub fn readout_bound(

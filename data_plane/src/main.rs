@@ -673,6 +673,14 @@ async fn main() -> Result<()> {
         Arc::new(data_plane::drivers::ingest::series_resolver::SeriesIdResolver::new())
     };
     let sketch_index = Arc::new(data_plane::storage_engines::sketch_db::index::SketchStore::new());
+    if let Some(catalog) = startup_physical_plan
+        .as_ref()
+        .and_then(|plan| plan.summary_catalog.as_ref())
+    {
+        sketch_index
+            .install_summary_catalog(Arc::clone(catalog))
+            .map_err(std::io::Error::other)?;
+    }
 
     // M2.3.6c — also start a persistence layer behind the SketchStore
     // when --persistence-enabled. SketchStore is now where all

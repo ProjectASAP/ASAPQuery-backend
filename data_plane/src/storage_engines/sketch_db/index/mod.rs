@@ -559,6 +559,7 @@ impl From<&control_plane::physical::compiler::SummaryFrameIdentity> for Incomple
 /// `series` is a `DashMap` because per-sid writes happen on every DP.
 #[derive(Default)]
 pub struct SketchStore {
+    admission: RwLock<admission::AdmissionInventory>,
     /// sid → metadata. May contain ghost sids (registered identities
     /// whose state was merged away by an upstream gateway before
     /// reaching this backend).
@@ -747,9 +748,100 @@ impl SketchStore {
         &self,
         catalog: Arc<asap_types::summary_catalog::SummaryCatalog>,
     ) -> Result<(), String> {
+        let reference = catalog.reference().map_err(|error| error.to_string())?;
+        let mut inventory = self.admission.write().unwrap();
         self.descriptors
             .install_catalog(Arc::clone(&catalog))
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        inventory.install(CatalogGeneration {
+            schema_version: reference.schema_version,
+            plan_id: reference.plan_id,
+            plan_version: reference.plan_version,
+            snapshot_sha256: reference.snapshot_sha256,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn admit_summary_updates(
+        &self,
+        generation: &CatalogGeneration,
+        coordinates: BTreeSet<asap_types::sds::SummaryInstanceCoordinates>,
+    ) -> Result<u64, String> {
+        let catalog = self
+            .descriptors
+            .authoritative_catalog()
+            .ok_or("summary admission requires an installed catalog")?;
+        if coordinates.iter().any(|coordinate| {
+            !catalog
+                .materializations
+                .contains_key(&coordinate.summary_definition_id)
+        }) {
+            return Err("summary admission references an uninstalled definition".into());
+        }
+        self.admission
+            .write()
+            .unwrap()
+            .admit(generation, coordinates)
+    }
+
+    pub(crate) fn publish_admitted_summary_update(
+        &self,
+        generation: &CatalogGeneration,
+        coordinate: &asap_types::sds::SummaryInstanceCoordinates,
+        first_revision: u64,
+        revision: u64,
+        replay_horizon_ms: u64,
+        persist: impl FnOnce() -> Option<u64>,
+    ) -> Result<(), String> {
+        // Fence installation and read validation across the state write: an old
+        // producer cannot mutate a new generation before its receipt is rejected.
+        let mut inventory = self.admission.write().unwrap();
+        if inventory.validate_publication(generation, coordinate, first_revision, revision)? {
+            return Ok(());
+        }
+        let series_id = persist().ok_or("summary state publication failed")?;
+        inventory.record_series(generation, coordinate, series_id)?;
+        inventory.acknowledge(generation, coordinate, revision)?;
+        let floor = coordinate
+            .time_range
+            .end_ms
+            .saturating_sub(i64::try_from(replay_horizon_ms).unwrap_or(i64::MAX));
+        inventory.retire_completed_before(coordinate.summary_definition_id, floor);
+        Ok(())
+    }
+
+    pub(crate) fn seal_finite_summary_input(
+        &self,
+        generation: &CatalogGeneration,
+    ) -> Result<(), String> {
+        self.admission.write().unwrap().seal_finite(generation)
+    }
+
+    pub(crate) fn summary_window_known_empty(
+        &self,
+        definition: SummaryDefinitionId,
+        series_id: u64,
+        range: HalfOpenTimeRange,
+    ) -> bool {
+        self.admission
+            .read()
+            .unwrap()
+            .known_empty(definition, series_id, range)
+    }
+
+    pub(crate) fn summary_update_revision(&self) -> u64 {
+        self.admission.read().unwrap().revision()
+    }
+
+    pub(crate) fn has_pending_summary_updates(
+        &self,
+        definition: SummaryDefinitionId,
+        range: HalfOpenTimeRange,
+    ) -> bool {
+        self.admission
+            .read()
+            .unwrap()
+            .has_pending(definition, range)
     }
 
     /// Record that `sid` is a per-item (item_label-mode) frequency sketch
@@ -4876,6 +4968,7 @@ mod tests {
 
 // 2026-05 reorg: generic epoch-partitioned columnar storage lives
 // alongside the store that uses it.
+mod admission;
 pub mod epoch_columnar;
 
 // `persistence` moved up to `sketch_db::persistence`. Re-exported here

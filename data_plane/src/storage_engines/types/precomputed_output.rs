@@ -42,8 +42,18 @@ pub enum Origin {
 /// `AggregationConfig::aggregation_id`; this PR completes the cleanup
 /// by retiring the field on `PrecomputedOutput` too. Sinks resolve the
 /// source config via `PolicyRegistry::get(policy_fp)`.
+/// In-process proof of which accepted input revision a window includes.
+#[derive(Debug, Clone)]
+pub struct SummaryInputRevision {
+    pub generation: std::sync::Arc<asap_types::sds::CatalogGeneration>,
+    pub revision: u64,
+    pub first_revision: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputedOutput {
+    #[serde(skip)]
+    pub input_revision: Option<std::sync::Arc<SummaryInputRevision>>,
     pub start_timestamp: u64,
     pub end_timestamp: u64,
     pub key: Option<KeyByLabelValues>,
@@ -81,6 +91,7 @@ impl PrecomputedOutput {
         policy_fp: PolicyFingerprint,
     ) -> Self {
         Self {
+            input_revision: None,
             start_timestamp,
             end_timestamp,
             key,
@@ -107,6 +118,7 @@ impl PrecomputedOutput {
         policy_fp: PolicyFingerprint,
     ) -> Self {
         Self {
+            input_revision: None,
             start_timestamp,
             end_timestamp,
             key,
