@@ -606,7 +606,12 @@ where
                     completeness: completeness.clone(),
                 }
             }
-            SummaryExpr::BinaryOp { lhs, rhs, operator } if self.logical_source.is_some() => {
+            SummaryExpr::BinaryOp {
+                lhs,
+                rhs,
+                operator,
+                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+            } if self.logical_source.is_some() => {
                 let operator = logical::binary_operator(operator)?;
                 QueryPlanNode::Logical {
                     operator,
@@ -680,7 +685,12 @@ where
                     inputs: vec![self.lower(child)?],
                 }
             }
-            SummaryExpr::BinaryOp { lhs, rhs, operator } if exact_value_executable(node) => {
+            SummaryExpr::BinaryOp {
+                lhs,
+                rhs,
+                operator,
+                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+            } if exact_value_executable(node) => {
                 let planner_types::pre_asap::BinaryOpKind::Arithmetic(operator) = &operator.kind
                 else {
                     unreachable!()
@@ -931,7 +941,12 @@ pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
             exact_accumulator_value_source(node).is_some_and(exact_value_executable)
         }
         SummaryExpr::KeepPreAsap(expr) => scalar_literal(expr).is_some(),
-        SummaryExpr::BinaryOp { lhs, rhs, operator } => {
+        SummaryExpr::BinaryOp {
+            lhs,
+            rhs,
+            operator,
+            timing: planner_types::post_asap::ExecutionTiming::ReadTime,
+        } => {
             matches!(
                 operator.kind,
                 planner_types::pre_asap::BinaryOpKind::Arithmetic(_)

@@ -4602,6 +4602,7 @@ mod tests {
         let selected = request.queries[0].post_asap.clone();
         request.queries[0].post_asap = Rc::new(SummaryNode {
             expr: SummaryExpr::BinaryOp {
+                timing: planner_types::post_asap::ExecutionTiming::ReadTime,
                 lhs: selected.clone(),
                 rhs: selected.clone(),
                 operator: planner_types::post_asap::BinaryOperator {
