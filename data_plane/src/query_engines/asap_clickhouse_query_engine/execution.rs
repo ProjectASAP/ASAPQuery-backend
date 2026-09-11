@@ -231,6 +231,33 @@ pub fn execute_sql_dag_with_external(
     t1_ms: u64,
     is_cumulative: bool,
 ) -> ClickHouseDagOutcome {
+    let revision = index.summary_update_revision();
+    let result = execute_sql_dag_with_external_unfenced(
+        index,
+        entry,
+        sds,
+        prepared,
+        t0_ms,
+        t1_ms,
+        is_cumulative,
+    );
+    if !revision.matches(index.summary_update_revision()) {
+        return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
+            "summary input changed during SQL DAG evaluation".into(),
+        ));
+    }
+    result
+}
+
+fn execute_sql_dag_with_external_unfenced(
+    index: &SketchStore,
+    entry: &QueryPlanEntry,
+    sds: &SummaryCatalog,
+    prepared: &PreparedExternalLeaves,
+    t0_ms: u64,
+    t1_ms: u64,
+    is_cumulative: bool,
+) -> ClickHouseDagOutcome {
     if let Err(error) = validate_payload(Some(sds), entry, sds.plan_id, sds.plan_version) {
         return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
             error.to_string(),

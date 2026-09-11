@@ -80,6 +80,7 @@ struct CommitRegistryState {
     frontiers: BTreeMap<asap_types::sds::SummaryDefinitionId, (i64, u64)>,
     pending_batch: Option<[u8; 32]>,
     batch_has_published: bool,
+    admitted_keys: BTreeSet<MaterializationCommitKey>,
 }
 
 impl CommitRegistryState {
@@ -90,13 +91,14 @@ impl CommitRegistryState {
         {
             return Err("maintenance retry belongs to an obsolete plan generation".into());
         }
-        if self
-            .frontiers
-            .get(&key.summary_definition)
-            .is_some_and(|(latest, horizon)| {
-                key.window_end_ms
-                    <= latest.saturating_sub(i64::try_from(*horizon).unwrap_or(i64::MAX))
-            })
+        if !self.admitted_keys.contains(key)
+            && self
+                .frontiers
+                .get(&key.summary_definition)
+                .is_some_and(|(latest, horizon)| {
+                    key.window_end_ms
+                        <= latest.saturating_sub(i64::try_from(*horizon).unwrap_or(i64::MAX))
+                })
         {
             return Err(
                 "maintenance retry is outside the materialization retention horizon".into(),
@@ -123,6 +125,7 @@ impl CommitRegistry {
             .map(|plan| (plan.plan_id(), plan.plan_version()));
         if state.generation != generation {
             state.entries.clear();
+            state.admitted_keys.clear();
             state.frontiers.clear();
             state.pending_batch = None;
             state.batch_has_published = false;
@@ -157,6 +160,7 @@ impl CommitRegistry {
             if !state.batch_has_published {
                 state.entries.retain(|_, entry| entry.published);
                 state.pending_batch = None;
+                state.admitted_keys.clear();
             }
         }
     }
@@ -195,7 +199,19 @@ impl CommitRegistry {
                 })
         });
         state.pending_batch = None;
+        state.admitted_keys.clear();
         state.batch_has_published = false;
+        Ok(())
+    }
+
+    fn pin_admitted(&self, key: &MaterializationCommitKey) -> Result<(), String> {
+        let mut state = self.0.lock().map_err(|_| "commit registry poisoned")?;
+        if state.pending_batch.is_none()
+            || state.generation != Some((key.plan_id, key.plan_version))
+        {
+            return Err("admitted maintenance output has no current batch".into());
+        }
+        state.admitted_keys.insert(key.clone());
         Ok(())
     }
 
@@ -295,6 +311,15 @@ impl MaintenanceDagSink {
         lineage.update(b"asap-maintenance-lineage-v1");
         let definition_bytes = source_definition.0 .0.to_be_bytes();
         lineage.update(definition_bytes);
+        if let Some(input) = &output.input_revision {
+            if input.generation.plan_id != plan.plan_id()
+                || input.generation.plan_version != plan.plan_version()
+            {
+                return Err("maintenance input belongs to an obsolete generation".into());
+            }
+            lineage.update(input.first_revision.to_be_bytes());
+            lineage.update(input.revision.to_be_bytes());
+        }
         let group_bytes = output
             .key
             .as_ref()
@@ -386,6 +411,12 @@ impl MaintenanceDagSink {
                     .saturating_mul(config.slide_interval)
                     .max(config.window_size)
                     .saturating_mul(1_000);
+                // This output was admitted before another worker advanced the
+                // replay floor. The store validates its exact consumed receipt
+                // before publication; it is not an unsolicited expired replay.
+                if output.input_revision.is_some() {
+                    self.commits.pin_admitted(&key)?;
+                }
                 if self.commits.is_published(&key)? {
                     continue;
                 }
@@ -503,6 +534,10 @@ impl OutputSink for MaintenanceDagSink {
                     "maintenance batch exceeds serialized source budget; split the input batch"
                         .into(),
                 );
+            }
+            if let Some(input) = &output.input_revision {
+                digest.update(input.first_revision.to_be_bytes());
+                digest.update(input.revision.to_be_bytes());
             }
             digest.update(output.policy_fp.0.to_be_bytes());
             digest.update(output.start_timestamp.to_be_bytes());
@@ -636,6 +671,40 @@ mod tests {
         };
         let error = adapter.execute(&aggregate, &[Arc::new(sum(7.0))]);
         assert!(matches!(error, Err(reason) if reason.contains("typed update evaluator")));
+    }
+
+    #[test]
+    fn admitted_slow_worker_can_publish_behind_another_workers_replay_floor() {
+        let commits = CommitRegistry::default();
+        commits.0.lock().unwrap().generation = Some((7, 1));
+        let key = |end| MaterializationCommitKey {
+            plan_id: 7,
+            plan_version: 1,
+            summary_definition: definition(2),
+            window_start_ms: end - 10,
+            window_end_ms: end,
+            input_lineage: vec![0; 32],
+        };
+        let fast = key(1000);
+        commits.begin_batch([1; 32]).unwrap();
+        commits
+            .commit_if_absent(fast.clone(), Arc::new(sum(2.0)))
+            .unwrap();
+        commits.publish(&fast, || Ok(())).unwrap();
+        commits.complete_batch([1; 32], &[(fast, 30)]).unwrap();
+        let slow = key(10);
+        assert!(commits.is_published(&slow).is_err());
+        commits.begin_batch([2; 32]).unwrap();
+        commits.pin_admitted(&slow).unwrap();
+        commits
+            .commit_if_absent(slow.clone(), Arc::new(sum(3.0)))
+            .unwrap();
+        commits.publish(&slow, || Ok(())).unwrap();
+        commits
+            .complete_batch([2; 32], &[(slow.clone(), 30)])
+            .unwrap();
+        assert!(commits.is_published(&slow).is_err());
+        assert!(commits.0.lock().unwrap().admitted_keys.is_empty());
     }
 
     // Receipts follow the declared event-time horizon and never retain accepted
@@ -1008,4 +1077,37 @@ mod tests {
         ));
         assert!(commits.get(&key).unwrap().is_none());
     }
+}
+
+/// Materializations affected by an admitted source update, following installed
+/// semantic dependencies rather than assuming source and output identities match.
+pub(crate) fn affected_materializations(
+    plan: &asap_types::precompute_plan::PrecomputePlan,
+    source: asap_types::sds::SummaryDefinitionId,
+) -> BTreeSet<asap_types::sds::SummaryDefinitionId> {
+    use asap_types::executable_plan::BackendNodeBinding;
+    let mut affected = BTreeSet::from([source]);
+    for installed in plan.executable_dags.values() {
+        let mut reachable = installed.binding.nodes.iter().filter_map(|(node, binding)| {
+            matches!(binding, BackendNodeBinding::Materialization { summary_definition } if *summary_definition == source).then_some(*node)
+        }).collect::<BTreeSet<_>>();
+        let mut frontier = reachable.iter().copied().collect::<Vec<_>>();
+        while let Some(producer) = frontier.pop() {
+            for edge in &installed.document.edges {
+                if edge.producer == producer && reachable.insert(edge.consumer) {
+                    frontier.push(edge.consumer);
+                }
+            }
+        }
+        for sink in &installed.binding.precompute_sinks {
+            if reachable.contains(sink) {
+                if let Some(BackendNodeBinding::Materialization { summary_definition }) =
+                    installed.binding.nodes.get(sink)
+                {
+                    affected.insert(*summary_definition);
+                }
+            }
+        }
+    }
+    affected
 }

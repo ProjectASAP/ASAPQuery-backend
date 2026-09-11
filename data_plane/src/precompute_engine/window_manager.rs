@@ -12,6 +12,7 @@ pub struct WindowManager {
     pane_interval_ms: i64,
     /// Planned event-time phase of this materialization definition.
     origin_ms: Option<i64>,
+    stores_full_windows: bool,
 }
 
 impl WindowManager {
@@ -39,6 +40,7 @@ impl WindowManager {
             slide_interval_ms,
             pane_interval_ms: slide_interval_ms,
             origin_ms,
+            stores_full_windows: true,
         }
     }
 
@@ -49,10 +51,30 @@ impl WindowManager {
         layout: &asap_types::WindowMaterializationLayout,
     ) -> Self {
         let mut manager = Self::with_origin(window_size_secs, slide_interval_secs, origin_ms);
-        if !matches!(layout, asap_types::WindowMaterializationLayout::FullWindow) {
+        manager.stores_full_windows =
+            matches!(layout, asap_types::WindowMaterializationLayout::FullWindow);
+        if !manager.stores_full_windows {
             manager.pane_interval_ms = (layout.base_pane_secs() * 1_000) as i64;
         }
         manager
+    }
+
+    /// Resolve the physical buckets updated by an input timestamp.
+    /// Their extent may differ from the semantic window or emission cadence.
+    pub fn stored_bucket_starts(&self, timestamp_ms: i64) -> Vec<i64> {
+        if self.stores_full_windows {
+            self.window_starts_containing(timestamp_ms)
+        } else {
+            vec![self.pane_start_for(timestamp_ms)]
+        }
+    }
+
+    pub fn stored_bucket_bounds(&self, start_ms: i64) -> (i64, i64) {
+        if self.stores_full_windows {
+            self.window_bounds(start_ms)
+        } else {
+            self.pane_bounds(start_ms)
+        }
     }
 
     pub fn window_size_ms(&self) -> i64 {
@@ -170,6 +192,29 @@ impl WindowManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_bucket_assignment_distinguishes_full_windows_from_base_panes() {
+        // Admission and execution need the stored extent, not only slide cadence.
+        let full = WindowManager::with_layout(
+            10,
+            5,
+            Some(1_000),
+            &asap_types::WindowMaterializationLayout::FullWindow,
+        );
+        let mut starts = full.stored_bucket_starts(7_000);
+        starts.sort_unstable();
+        assert_eq!(starts, vec![1_000, 6_000]);
+        assert_eq!(full.stored_bucket_bounds(1_000), (1_000, 11_000));
+        let panes = WindowManager::with_layout(
+            10,
+            5,
+            Some(1_000),
+            &asap_types::WindowMaterializationLayout::Pane { pane_secs: 1 },
+        );
+        assert_eq!(panes.stored_bucket_starts(7_000), vec![7_000]);
+        assert_eq!(panes.stored_bucket_bounds(7_000), (7_000, 8_000));
+    }
 
     #[test]
     fn test_tumbling_window_start() {
