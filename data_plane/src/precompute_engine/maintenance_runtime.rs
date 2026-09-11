@@ -28,19 +28,20 @@ struct OperatorAdapter<'a> {
 impl PrecomputeOperatorRegistry<SummaryState> for OperatorAdapter<'_> {
     type Error = String;
 
+    fn materialized_input(&self, node: &ExecutableDagNode) -> Result<Option<SummaryState>, String> {
+        Ok(matches!(
+            self.binding.node(node.id),
+            Some(BackendNodeBinding::Materialization { summary_definition })
+                if *summary_definition == self.source_definition
+        )
+        .then(|| Arc::clone(&self.source)))
+    }
+
     fn execute(
         &self,
         node: &ExecutableDagNode,
         inputs: &[Arc<SummaryState>],
     ) -> Result<SummaryState, Self::Error> {
-        let is_source = matches!(
-            self.binding.node(node.id),
-            Some(BackendNodeBinding::Materialization { summary_definition })
-                if *summary_definition == self.source_definition
-        );
-        if is_source && inputs.is_empty() {
-            return Ok(Arc::clone(&self.source));
-        }
         match &node.payload {
             ExecutableOperatorPayload::SummaryMerge => merge_inputs(inputs),
             ExecutableOperatorPayload::SummaryAgg { .. } => Err(
@@ -326,7 +327,7 @@ impl MaintenanceDagSink {
                 if !depends_on_any(&dag, *sink_node, &source_nodes) {
                     continue;
                 }
-                let reachable = dependencies(&dag, *sink_node);
+                let reachable = dependencies_until(&dag, *sink_node, &source_nodes);
                 let foreign_source = reachable.iter().any(|node| {
                     let has_input = dag.edges.iter().any(|edge| edge.consumer == *node);
                     !has_input
@@ -344,6 +345,7 @@ impl MaintenanceDagSink {
                 }
                 if dag.edges.iter().any(|edge| {
                     reachable.contains(&edge.consumer)
+                        && !source_nodes.contains(&edge.consumer)
                         && !matches!(
                             edge.grouping,
                             planner_types::post_asap::GroupingEdgeCompatibility::Identical
@@ -431,10 +433,18 @@ fn dependencies(
     dag: &planner_types::post_asap::ExecutableDag,
     sink: PostAsapNodeId,
 ) -> BTreeSet<PostAsapNodeId> {
+    dependencies_until(dag, sink, &BTreeSet::new())
+}
+
+fn dependencies_until(
+    dag: &planner_types::post_asap::ExecutableDag,
+    sink: PostAsapNodeId,
+    frontier: &BTreeSet<PostAsapNodeId>,
+) -> BTreeSet<PostAsapNodeId> {
     let mut pending = vec![sink];
     let mut seen = BTreeSet::new();
     while let Some(node) = pending.pop() {
-        if seen.insert(node) {
+        if seen.insert(node) && !frontier.contains(&node) {
             pending.extend(
                 dag.edges
                     .iter()
@@ -696,9 +706,7 @@ mod tests {
         use crate::storage_engines::types::{
             ActivePhysicalPlan, HotReloadActivePhysicalPlan, StreamingConfig,
         };
-        use control_plane::physical::executable_binding::{
-            InstalledPostAsapDag, PostAsapDagDocument,
-        };
+        use control_plane::physical::executable_binding::{InstalledPostAsapDag, OwnedPostAsapDag};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[derive(Default)]
@@ -774,7 +782,7 @@ mod tests {
         bundle.precompute_plan.executable_dags = BTreeMap::from([(
             "retry".into(),
             InstalledPostAsapDag {
-                document: PostAsapDagDocument::from_executable("retry".into(), &dag).unwrap(),
+                document: OwnedPostAsapDag::from_executable("retry".into(), &dag).unwrap(),
                 binding,
             },
         )]);
