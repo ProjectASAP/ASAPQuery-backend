@@ -313,6 +313,12 @@ pub struct SidMetaRecord {
     pub group_by_keys: Vec<String>,
     agg_kind: AggKindRec,
     pub first_seen_unix_ms: i64,
+    #[serde(default)]
+    pub retired_at_ms: Option<u64>,
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+    #[serde(default)]
+    pub removed: bool,
 }
 
 impl SidMetaRecord {
@@ -334,6 +340,9 @@ impl SidMetaRecord {
             group_by_keys,
             agg_kind: agg_kind.into(),
             first_seen_unix_ms,
+            retired_at_ms: None,
+            expires_at_ms: None,
+            removed: false,
         }
     }
 
@@ -395,6 +404,12 @@ struct SidBindingRec {
     summary_descriptor_id: String,
     data_descriptor_id: String,
     first_seen_unix_ms: i64,
+    #[serde(default)]
+    retired_at_ms: Option<u64>,
+    #[serde(default)]
+    expires_at_ms: Option<u64>,
+    #[serde(default)]
+    removed: bool,
 }
 
 /// Version-3 normalized sidecar with authoritative catalog provenance. Descriptors appear once and SeriesId bindings hold
@@ -462,6 +477,9 @@ impl SdsSidecar {
                     summary_descriptor_id: summary_id,
                     data_descriptor_id: data_id,
                     first_seen_unix_ms: record.first_seen_unix_ms,
+                    retired_at_ms: record.retired_at_ms,
+                    expires_at_ms: record.expires_at_ms,
+                    removed: record.removed,
                 },
             );
         }
@@ -512,6 +530,9 @@ impl SdsSidecar {
                     group_by_keys: data.group_by_keys.clone(),
                     agg_kind: operator.with_population_filter(&data.population_filter_canonical),
                     first_seen_unix_ms: binding.first_seen_unix_ms,
+                    retired_at_ms: binding.retired_at_ms,
+                    expires_at_ms: binding.expires_at_ms,
+                    removed: binding.removed,
                 })
             })
             .collect()
@@ -525,6 +546,7 @@ impl SdsSidecar {
 #[derive(Debug)]
 pub struct SidMetadataStore {
     path: PathBuf,
+    writer: std::sync::Mutex<()>,
 }
 
 impl SidMetadataStore {
@@ -533,6 +555,7 @@ impl SidMetadataStore {
     pub fn new(disk_path: &Path) -> Self {
         Self {
             path: disk_path.join(SERIES_ID_METADATA_FILE),
+            writer: std::sync::Mutex::new(()),
         }
     }
 
@@ -608,6 +631,9 @@ impl SidMetadataStore {
     /// disk (last write wins per sid). Atomic via tmp + rename + dir
     /// fsync, matching the manifest's durability discipline.
     pub fn upsert_all(&self, records: &[SidMetaRecord]) -> PersistResult<()> {
+        let _writer = self.writer.lock().map_err(|_| {
+            PersistError::Io(std::io::Error::other("summary metadata writer poisoned"))
+        })?;
         if records.is_empty() {
             return Ok(());
         }
@@ -619,12 +645,20 @@ impl SidMetadataStore {
         let mut changed = false;
         for r in records {
             let key = r.sid.to_string();
-            match map.get(&key) {
-                Some(existing) if existing == r => {}
-                _ => {
-                    map.insert(key, r.clone());
-                    changed = true;
-                }
+            let mut next = r.clone();
+            if let Some(existing) = map.get(&key) {
+                // Lifecycle is monotone for a SeriesId. An older flush snapshot
+                // must not resurrect a retired or removed persisted instance.
+                next.removed |= existing.removed;
+                next.retired_at_ms = existing.retired_at_ms.or(next.retired_at_ms);
+                next.expires_at_ms = match (existing.expires_at_ms, next.expires_at_ms) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            if map.get(&key) != Some(&next) {
+                map.insert(key, next);
+                changed = true;
             }
         }
         if !changed {

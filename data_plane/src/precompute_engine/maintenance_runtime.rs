@@ -431,6 +431,7 @@ impl MaintenanceDagSink {
                 .map_err(schedule_error)?;
                 let mut target_output = output.clone();
                 target_output.policy_fp = target.into();
+                target_output.series_id = None;
                 derived.push((
                     Some((key, horizon_ms)),
                     target_output,

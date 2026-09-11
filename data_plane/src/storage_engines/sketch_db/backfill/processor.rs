@@ -124,7 +124,9 @@ fn resolve_backfill_bucket_sid(
     resolver: &SeriesIdResolver,
     config: &AggregationConfig,
     series_key: &str,
-) -> u64 {
+    store: Option<&crate::storage_engines::sketch_db::index::SketchStore>,
+    captured_generation: Option<&asap_types::sds::CatalogGeneration>,
+) -> Result<u64, String> {
     let labels = parse_labels_from_series_key(series_key);
     let grouping_pairs: Vec<(&str, &str)> = config
         .grouping_labels
@@ -134,7 +136,20 @@ fn resolve_backfill_bucket_sid(
     let attrs_fp = canonical_attrs_fingerprint(&grouping_pairs);
     let agg_kind_canonical =
         crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
-    resolver.resolve(&config.metric, &attrs_fp, &agg_kind_canonical)
+    resolver.resolve_with_reactivation(&config.metric, &attrs_fp, &agg_kind_canonical, |sid| {
+        store.map_or(Ok(None), |store| {
+            store.validate_routed_catalog_generation(captured_generation)?;
+            let activation =
+                store.authorize_series_reactivation(sid, config.policy_fingerprint().into())?;
+            if activation
+                .as_deref()
+                .is_some_and(|generation| Some(generation) != captured_generation)
+            {
+                return Err("stale backfill job cannot reactivate series".into());
+            }
+            Ok(activation)
+        })
+    })
 }
 
 /// Fallback bucket id for the resolver-less code path (registry-only
@@ -179,6 +194,7 @@ pub struct BackfillWindowProcessor {
     /// The job this processor is running on behalf of. Threaded
     /// into provenance calls; never used for dispatch logic.
     job_id: u64,
+    catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
 }
 
 impl BackfillWindowProcessor {
@@ -193,6 +209,7 @@ impl BackfillWindowProcessor {
             series_resolver: None,
             registry,
             job_id,
+            catalog_generation: None,
         }
     }
 
@@ -202,6 +219,7 @@ impl BackfillWindowProcessor {
         mut self,
         sketch_index: Arc<crate::storage_engines::sketch_db::index::SketchStore>,
     ) -> Self {
+        self.catalog_generation = sketch_index.active_catalog_generation();
         self.sketch_index = Some(sketch_index);
         self
     }
@@ -278,7 +296,13 @@ impl WindowProcessor for BackfillWindowProcessor {
         for sample in samples {
             let group_key = extract_group_key(&sample.labels, &config);
             let sid = match resolver_opt {
-                Some(r) => resolve_backfill_bucket_sid(r.as_ref(), &config, &sample.labels),
+                Some(r) => resolve_backfill_bucket_sid(
+                    r.as_ref(),
+                    &config,
+                    &sample.labels,
+                    self.sketch_index.as_deref(),
+                    self.catalog_generation.as_deref(),
+                )?,
                 None => fallback_bucket_id(&group_key),
             };
             by_bucket
@@ -327,13 +351,15 @@ impl WindowProcessor for BackfillWindowProcessor {
             } else {
                 Some(build_group_key_label_values(&group_key))
             };
-            let output = crate::storage_engines::types::PrecomputedOutput::new_backfilled(
+            let mut output = crate::storage_engines::types::PrecomputedOutput::new_backfilled(
                 window_range.0,
                 window_range.1,
                 key,
                 self.job_id,
                 PolicyFingerprint::from_config(&config),
             );
+            output.series_id = Some(sid);
+            output.catalog_generation = self.catalog_generation.clone();
             batch.push((sid, output, accumulator));
         }
 
@@ -360,7 +386,8 @@ impl WindowProcessor for BackfillWindowProcessor {
                             &config,
                             output,
                             accumulator.as_ref(),
-                        );
+                        )
+                        .ok_or("backfill summary state publication rejected")?;
                     }
                 }
                 None => {
@@ -841,6 +868,15 @@ mod tests {
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let sketch_index = Arc::new(SketchStore::new());
+        let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
+            1,
+            1,
+            &[cfg.clone()],
+        )
+        .unwrap();
+        sketch_index
+            .install_summary_catalog(Arc::new(catalog))
+            .unwrap();
         let resolver = Arc::new(SeriesIdResolver::new());
 
         let job_id = registry.create(
@@ -895,8 +931,10 @@ mod tests {
         // `SeriesIdResolver::lookup` would return for the same
         // `(metric, grouping-values, agg_kind)` tuple — i.e. live
         // ingest and backfill share one sid namespace.
-        let sid_a = resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"a\"}");
-        let sid_b = resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"b\"}");
+        let sid_a =
+            resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"a\"}", None, None).unwrap();
+        let sid_b =
+            resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"b\"}", None, None).unwrap();
         assert_ne!(sid_a, sid_b, "distinct svc values mint distinct sids");
         assert_eq!(sketch_index.classify(sid_a), SeriesLookup::Hit);
         assert_eq!(sketch_index.classify(sid_b), SeriesLookup::Hit);
@@ -916,8 +954,14 @@ mod tests {
         let resolver = SeriesIdResolver::new();
 
         // Backfill side: derive sid via the new helper.
-        let backfill_sid =
-            resolve_backfill_bucket_sid(&resolver, &cfg, "latency{svc=\"a\",zone=\"z0\"}");
+        let backfill_sid = resolve_backfill_bucket_sid(
+            &resolver,
+            &cfg,
+            "latency{svc=\"a\",zone=\"z0\"}",
+            None,
+            None,
+        )
+        .unwrap();
 
         // Exercise the actual live sink instead of duplicating its SID formula.
         let store = crate::storage_engines::sketch_db::index::SketchStore::new();

@@ -84,6 +84,9 @@ pub struct SdsBinding {
     pub metadata: Arc<SketchInstanceMetadata>,
     pub summary_descriptor: Arc<SummaryDescriptor>,
     pub data_descriptor: Arc<DataDescriptor>,
+    /// Immutable provenance of this physical series lifetime, shared with
+    /// the catalog snapshot used when the descriptors were bound.
+    pub catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
 }
 
 impl std::ops::Deref for SdsBinding {
@@ -146,8 +149,8 @@ impl SummaryDescriptorRegistry {
     }
 
     pub fn bind(&self, metadata: SketchInstanceMetadata) -> Result<SdsBinding, String> {
-        let authoritative = self.authoritative_catalog();
-        let configured = if let Some(catalog) = authoritative.as_ref() {
+        let authoritative = self.authoritative_snapshot();
+        let configured = if let Some((catalog, _)) = authoritative.as_ref() {
             if metadata.policy_fp.is_unset() {
                 return Err(
                     "materialization identity is required by the installed SummaryCatalog".into(),
@@ -209,6 +212,7 @@ impl SummaryDescriptorRegistry {
             metadata: Arc::new(metadata),
             summary_descriptor,
             data_descriptor,
+            catalog_generation: authoritative.map(|(_, generation)| generation),
         })
     }
 
