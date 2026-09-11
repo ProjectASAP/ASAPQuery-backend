@@ -41,6 +41,13 @@ pane duration, and `pane_origin_ms` through the authoritative SummaryCatalog.
 Any invalid SQL entry rejects the complete candidate snapshot before
 activation; the active generation remains unchanged.
 
+SQL compilation also retains the selected Planner semantic DAG in
+`PrecomputePlan.executable_dags`. The compiler records materialization and query
+node bindings during lowering and assigns phases with the same placement builder
+as PromQL. Planner node IDs remain distinct from SummaryDefinitionId and
+QueryNodeId. This preserves the actual selected DAG across publication instead
+of reconstructing it from materialization configs later.
+
 The query listener snapshots `HotReloadActivePhysicalPlan` once per request.
 It uses the SQL parsing context and the matching `QueryPlanEntry` from that
 same snapshot, reads SummaryStore state, executes relational operators, and
