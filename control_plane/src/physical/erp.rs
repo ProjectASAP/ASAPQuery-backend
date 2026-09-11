@@ -362,6 +362,9 @@ pub struct ErpPlanningInput {
     /// replaced by bounded nearest-profile matching.
     #[serde(default)]
     pub observed_shape: Option<ErpShapeObservation>,
+    #[serde(default)]
+    pub observed_populations:
+        Option<asap_types::erp_observation::ErpPopulationObservations<ErpObservedShape>>,
     /// Runtime-samples ring key from which the backend resolves the freshest
     /// `erp_observed_shape` payload before compiling a plan.
     #[serde(default)]
@@ -516,6 +519,75 @@ impl ErpPlanningInput {
         theoretical: SketchParams,
         required_params: Option<&SketchParams>,
     ) -> ErpParameterDecision {
+        if let Some(populations) = &self.observed_populations {
+            // Every installed partition must support the same configuration.
+            // Never aggregate their frequency maps into a fictitious population.
+            let mut best: Option<ErpParameterDecision> = None;
+            if populations.invalid_reason.is_none() && !populations.populations.is_empty() {
+                for row in &self.artifact.records {
+                    if !sketch_name_matches(&row.sketch, &algorithm) {
+                        continue;
+                    }
+                    let Some(params) = parse_params(&algorithm, &row.parameters) else {
+                        continue;
+                    };
+                    if required_params.is_some_and(|required| required != &params) {
+                        continue;
+                    }
+                    let mut policy = self.clone();
+                    policy.observed_populations = None;
+                    policy.mode = ErpAccuracyMode::Empirical;
+                    let mut errors: f64 = 0.0;
+                    let mut cost = 0.0;
+                    let mut evidence = Vec::new();
+                    let valid = populations.populations.iter().all(|population| {
+                        policy.observed_shape = Some(population.shape.observation.clone());
+                        match policy.select_metric(
+                            algorithm.clone(),
+                            error_metric,
+                            max_error,
+                            theoretical.clone(),
+                            Some(&params),
+                        ) {
+                            ErpParameterDecision::Empirical {
+                                record_id,
+                                observed_error,
+                                estimated_cost,
+                                ..
+                            } => {
+                                errors = errors.max(observed_error);
+                                cost += estimated_cost;
+                                evidence.push(record_id);
+                                true
+                            }
+                            _ => false,
+                        }
+                    });
+                    if valid && cost.is_finite() && best.as_ref().is_none_or(|previous| {
+                        matches!(previous, ErpParameterDecision::Empirical { estimated_cost, .. } if cost < *estimated_cost)
+                    }) {
+                        best = Some(ErpParameterDecision::Empirical {
+                            params, record_id: serde_json::to_string(&evidence).expect("string IDs serialize"),
+                            observed_error: errors, estimated_cost: cost,
+                        });
+                    }
+                }
+            }
+            return best.unwrap_or_else(|| {
+                let reason =
+                    "ERP has no configuration valid for every observed population".to_owned();
+                if self.mode == ErpAccuracyMode::Hybrid
+                    && self.runtime.supports(&algorithm, &theoretical, None)
+                {
+                    ErpParameterDecision::TheoreticalFallback {
+                        params: theoretical,
+                        reason,
+                    }
+                } else {
+                    ErpParameterDecision::ExactFallback { reason }
+                }
+            });
+        }
         // Runtime admissibility belongs before ranking: an unusable cheap
         // profile must not hide a more expensive executable alternative.
         let mut artifact = self.artifact.clone();
@@ -834,6 +906,7 @@ mod tests {
             byte_second_weight: 1e-9,
             mode,
             observed_shape: None,
+            observed_populations: None,
             observed_shape_source: None,
             shape_match: None,
             runtime: ErpRuntimeCapabilities::default(),

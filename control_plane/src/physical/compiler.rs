@@ -4350,6 +4350,7 @@ mod tests {
             byte_second_weight: 1e-9,
             mode: super::super::erp::ErpAccuracyMode::Hybrid,
             observed_shape: None,
+            observed_populations: None,
             observed_shape_source: None,
             shape_match: None,
             runtime: super::super::erp::ErpRuntimeCapabilities {
@@ -4399,6 +4400,7 @@ mod tests {
             byte_second_weight: 1e-9,
             mode: ErpAccuracyMode::Hybrid,
             observed_shape: None,
+            observed_populations: None,
             observed_shape_source: None,
             shape_match: None,
             runtime: ErpRuntimeCapabilities {
