@@ -322,6 +322,10 @@ pub struct SidMetaRecord {
     /// No further publication may change a window ending at or before this bound.
     #[serde(default)]
     pub completed_through_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_immutable: Option<super::immutable_output::ImmutableOutputReservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_immutable: Option<super::immutable_output::ImmutableOutputReservation>,
 }
 
 impl SidMetaRecord {
@@ -347,7 +351,13 @@ impl SidMetaRecord {
             expires_at_ms: None,
             removed: false,
             completed_through_ms: None,
+            pending_immutable: None,
+            last_immutable: None,
         }
+    }
+
+    pub(super) fn same_kind(&self, other: &Self) -> bool {
+        self.agg_kind == other.agg_kind
     }
 
     /// Reconstruct the structured [`AggKind`], or `None` for an
@@ -416,6 +426,10 @@ struct SidBindingRec {
     removed: bool,
     #[serde(default)]
     completed_through_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_immutable: Option<super::immutable_output::ImmutableOutputReservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_immutable: Option<super::immutable_output::ImmutableOutputReservation>,
 }
 
 /// Version-3 normalized sidecar with authoritative catalog provenance. Descriptors appear once and SeriesId bindings hold
@@ -487,6 +501,8 @@ impl SdsSidecar {
                     expires_at_ms: record.expires_at_ms,
                     removed: record.removed,
                     completed_through_ms: record.completed_through_ms,
+                    pending_immutable: record.pending_immutable,
+                    last_immutable: record.last_immutable,
                 },
             );
         }
@@ -541,6 +557,8 @@ impl SdsSidecar {
                     expires_at_ms: binding.expires_at_ms,
                     removed: binding.removed,
                     completed_through_ms: binding.completed_through_ms,
+                    pending_immutable: binding.pending_immutable,
+                    last_immutable: binding.last_immutable,
                 })
             })
             .collect()
@@ -646,7 +664,7 @@ impl SidMetadataStore {
             return Ok(());
         }
         let mut map: HashMap<String, SidMetaRecord> = self
-            .load()?
+            .load_strict()?
             .into_iter()
             .map(|r| (r.sid.to_string(), r))
             .collect();
@@ -657,6 +675,8 @@ impl SidMetadataStore {
             if let Some(existing) = map.get(&key) {
                 // Lifecycle is monotone for a SeriesId. An older flush snapshot
                 // must not resurrect a retired or removed persisted instance.
+                next.pending_immutable = existing.pending_immutable.clone();
+                next.last_immutable = existing.last_immutable.clone();
                 next.removed |= existing.removed;
                 next.completed_through_ms =
                     existing.completed_through_ms.max(next.completed_through_ms);
@@ -680,6 +700,55 @@ impl SidMetadataStore {
         self.write_atomic(json.as_bytes())
     }
 
+    pub fn load_strict(&self) -> PersistResult<Vec<SidMetaRecord>> {
+        let bytes = match fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| PersistError::Format(format!("invalid SID metadata: {error}")))?;
+        if let Some(version) = value.get("schema_version") {
+            if !matches!(version.as_u64(), Some(2 | 3)) {
+                return Err(PersistError::Format(
+                    "unsupported SID metadata version".into(),
+                ));
+            }
+            let sidecar: SdsSidecar = serde_json::from_value(value)
+                .map_err(|error| PersistError::Format(error.to_string()))?;
+            sidecar.into_records()
+        } else {
+            let records: HashMap<String, SidMetaRecord> = serde_json::from_value(value)
+                .map_err(|error| PersistError::Format(error.to_string()))?;
+            Ok(records.into_values().collect())
+        }
+    }
+
+    pub(super) fn transaction<T>(
+        &self,
+        operation: impl FnOnce(&mut HashMap<String, SidMetaRecord>, &Self) -> PersistResult<T>,
+    ) -> PersistResult<T> {
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| PersistError::Internal("SID metadata writer poisoned".into()))?;
+        let mut records = self
+            .load_strict()?
+            .into_iter()
+            .map(|r| (r.sid.to_string(), r))
+            .collect();
+        operation(&mut records, self)
+    }
+    pub(super) fn write_records(
+        &self,
+        records: &HashMap<String, SidMetaRecord>,
+    ) -> PersistResult<()> {
+        let sidecar = SdsSidecar::from_records(records.values().cloned());
+        let bytes =
+            serde_json::to_vec(&sidecar).map_err(|e| PersistError::Serialize(e.to_string()))?;
+        self.write_atomic(&bytes)
+    }
+
     fn write_atomic(&self, bytes: &[u8]) -> PersistResult<()> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -696,9 +765,7 @@ impl SidMetadataStore {
         }
         fs::rename(&tmp, &self.path)?;
         if let Some(parent) = self.path.parent() {
-            if let Ok(dir) = File::open(parent) {
-                let _ = dir.sync_all();
-            }
+            File::open(parent)?.sync_all()?;
         }
         Ok(())
     }
