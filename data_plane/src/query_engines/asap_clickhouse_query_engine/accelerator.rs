@@ -252,7 +252,9 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                             }
                         }),
                     );
-                    let (execution, detail) = if prepared.is_empty() {
+                    let (execution, detail) = if entry.materialization_bindings().is_empty() {
+                        ("exact_fallback", "external_dag")
+                    } else if prepared.is_empty() {
                         ("warm", "asap")
                     } else {
                         ("hybrid", "hybrid")
