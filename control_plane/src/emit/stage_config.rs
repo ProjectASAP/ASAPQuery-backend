@@ -3129,6 +3129,7 @@ fn base_family(kind: &SketchAlgorithm) -> SketchAlgorithm {
 /// for `topk(...)` queries to bind to the right sids.
 fn sketch_algorithm_to_backend_type(kind: &SketchAlgorithm) -> &'static str {
     match kind {
+        SketchAlgorithm::UnivMon => "UnivMon",
         SketchAlgorithm::DDSketch => "DDSketch",
         SketchAlgorithm::Kll => "DatasketchesKLL",
         SketchAlgorithm::Hll => "HLL",
@@ -3136,7 +3137,7 @@ fn sketch_algorithm_to_backend_type(kind: &SketchAlgorithm) -> &'static str {
         SketchAlgorithm::CountSketch => "CountSketch",
         SketchAlgorithm::CmsWithHeap => "CountMinSketchWithHeap",
         SketchAlgorithm::Cms => "CountMinSketch",
-        SketchAlgorithm::UnivMon | SketchAlgorithm::Kmv | SketchAlgorithm::Theta => unreachable!(
+        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => unreachable!(
             "sketch_algorithm_to_backend_type: unsupported SketchAlgorithm; \
              no Bind* rule in this repo produces one"
         ),
@@ -3167,6 +3168,14 @@ fn sketch_algorithm_tag(kind: &SketchAlgorithm) -> &'static str {
 /// internally-tagged enum form.
 fn sketch_params_to_json(p: &SketchParams) -> JsonValue {
     match p {
+        SketchParams::UnivMon {
+            heap_size,
+            sketch_rows,
+            sketch_cols,
+            layers,
+        } => json!({
+            "heap_size": heap_size, "sketch_rows": sketch_rows, "sketch_cols": sketch_cols, "layers": layers,
+        }),
         SketchParams::Kll { k } => json!({ "k": k }),
         SketchParams::DDSketch { alpha } => json!({ "alpha": alpha }),
         SketchParams::Hll { precision } => json!({ "precision": precision }),
@@ -3199,7 +3208,7 @@ fn sketch_params_to_json(p: &SketchParams) -> JsonValue {
         }),
         // Exact accumulators never reach here -- see
         // `sketch_kind_to_backend_type`'s doc.
-        SketchParams::UnivMon { .. } | SketchParams::Kmv { .. } | SketchParams::Theta { .. } => {
+        SketchParams::Kmv { .. } | SketchParams::Theta { .. } => {
             unreachable!(
                 "sketch_params_to_json: non-sketch or unsupported SummaryParams; \
              no Bind* rule in this repo produces one"

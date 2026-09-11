@@ -3459,6 +3459,14 @@ fn collect_selected_materializations(
                 input,
                 ..
             } => {
+                // Planner can model these families, but no backend state
+                // implementation exists. Leave an exact boundary unbound.
+                if matches!(
+                    kind.algorithm(),
+                    SketchAlgorithm::Kmv | SketchAlgorithm::Theta
+                ) {
+                    return Ok(());
+                }
                 if let Some(readout) = readout {
                     let mut parameters = sketch_params_json(kind.params());
                     let mut item_label = None;
@@ -4176,6 +4184,50 @@ mod tests {
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    /// Distinct range queries retain a per-series HLL selected by Planner.
+    #[test]
+    fn distinct_range_compiles_to_partitioned_hll() {
+        let mut deployment = environment(10_000);
+        deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        deployment.collector_ids.clear();
+        let mut workload = request("distinct", "distinct_over_time(m{job=\"api\"}[1m])");
+        let query = &mut workload.queries[0];
+        // HLL's modeled RSE does not certify a failure probability.
+        query.accuracy = AccuracyTarget::Epsilon(0.05);
+        let parsed = crate::query_parser::parse_query_expr_canonical(
+            &query.query_string,
+            query.accuracy.clone(),
+        )
+        .unwrap();
+        query.post_asap =
+            select_post_asap(&parsed, query.accuracy.clone(), &query.lifecycle, None).unwrap();
+        let plan = PhysicalCompiler
+            .compile_metricsql(workload, deployment)
+            .unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        let materialization = &plan.precompute_plan.materializations[0];
+        assert_eq!(
+            materialization.aggregation_type,
+            asap_types::AggregationType::HLL
+        );
+        assert_eq!(
+            materialization.partitioning,
+            Some(asap_types::sds::PopulationPartitioning::PerEntity)
+        );
+        plan.precompute_plan.validate().unwrap();
+        assert!(plan
+            .query_plan
+            .entries
+            .values()
+            .any(|entry| entry.nodes.values().any(|node| matches!(
+                node,
+                crate::query_plan::QueryPlanNode::SummaryEstimate {
+                    query: crate::query_plan::QueryReadout::Cardinality,
+                    ..
+                }
+            ))));
     }
 
     #[test]
