@@ -84,6 +84,8 @@ def main():
     fig.suptitle('PARTIAL: Alibaba service dashboard, trial 0 only — accuracy violations shown')
     fig.tight_layout()
     fig.savefig(root / 'partial-figure.svg'); fig.savefig(root / 'partial-figure.png', dpi=150)
+    svg = root / 'partial-figure.svg'
+    svg.write_text('\n'.join(line.rstrip() for line in svg.read_text().splitlines()) + '\n')
     print(f'Validated and reported {len(runs)} complete real runs; no replay started.')
 
 
