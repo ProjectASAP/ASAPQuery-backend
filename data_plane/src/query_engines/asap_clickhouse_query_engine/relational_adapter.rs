@@ -420,8 +420,7 @@ impl ClickHouseRelationalAdapter {
                 }
                 for row in &input.rows {
                     for key in keys {
-                        if matches!(eval(&key.expr, row, &schema)?, Cell::Float64(value) if value.is_nan())
-                        {
+                        if contains_nan(&eval(&key.expr, row, &schema)?) {
                             return Err(ClickHouseRelationalError::Unsupported(
                                 "NaN sort key".into(),
                             ));
@@ -845,6 +844,16 @@ fn compare_sort_keys(
         }
     }
     Ordering::Equal
+}
+
+fn contains_nan(value: &Cell) -> bool {
+    match value {
+        Cell::Float64(value) => value.is_nan(),
+        Cell::Map(entries) => entries
+            .iter()
+            .any(|(key, value)| contains_nan(key) || contains_nan(value)),
+        _ => false,
+    }
 }
 
 fn integer_float_cmp(integer: i64, float: f64) -> Option<Ordering> {
@@ -1418,6 +1427,42 @@ mod scalar_contract_tests {
             ],
         );
         assert!(eval(&mixed, &[], &schema).is_err());
+    }
+
+    #[test]
+    fn sorting_nested_nan_fails_before_comparator_can_treat_it_as_equal() {
+        let dtype = DataType::Map {
+            key: Box::new(DataType::Utf8),
+            value: Box::new(DataType::Float64),
+            value_nullable: false,
+        };
+        let input = ClickHouseRelation {
+            rows: vec![vec![Cell::Map(vec![(
+                Cell::Utf8("a".into()),
+                Cell::Float64(f64::NAN),
+            )])]],
+            fields: vec![("m".into(), dtype.clone(), false)],
+            coverage: None,
+        };
+        let schema = SummarySchema {
+            fields: vec![planner_types::post_asap::SummaryField {
+                name: "m".into(),
+                dtype: SummaryFamilyType::Plain(dtype),
+                nullable: false,
+            }],
+            time_index: None,
+        };
+        let operation = ValueOperation::Sort {
+            keys: vec![SortKey {
+                expr: QueryExpr::Column(0),
+                ascending: true,
+                nulls_first: false,
+            }],
+            partition_by: planner_types::pre_asap::GroupKeys::none(),
+        };
+        assert!(ClickHouseRelationalAdapter
+            .apply_operation(&operation, &schema, input)
+            .is_err());
     }
 
     #[test]
