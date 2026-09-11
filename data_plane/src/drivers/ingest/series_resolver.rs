@@ -25,6 +25,7 @@
 //! in `docs/design_docs/series-identity.md`.
 
 use dashmap::DashMap;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -178,6 +179,67 @@ impl SeriesIdResolver {
         *entry
     }
 
+    /// Resolve a logical series and ask the storage lifecycle owner whether
+    /// an explicit catalog activation requires a fresh physical lifetime.
+    pub fn resolve_with_reactivation(
+        &self,
+        metric: &str,
+        attrs: &str,
+        kind: &str,
+        authorize: impl FnOnce(u64) -> Result<Option<Arc<asap_types::sds::CatalogGeneration>>, String>,
+    ) -> Result<u64, String> {
+        let sid = self.resolve(metric, attrs, kind);
+        match authorize(sid)? {
+            None => Ok(sid),
+            Some(generation) => self
+                .rotate_for_catalog_activation(metric, attrs, kind, sid, &generation)
+                .map_err(|error| error.to_string()),
+        }
+    }
+
+    /// Advance a tombstoned physical series after the storage engine has
+    /// authorized reactivation in a different installed catalog generation.
+    /// The logical cache key remains unchanged. Persistence failure leaves
+    /// the old binding intact; concurrent retries observe one replacement.
+    pub fn rotate_for_catalog_activation(
+        &self,
+        metric_name: &str,
+        attrs_fingerprint: &str,
+        agg_kind_canonical: &str,
+        previous_sid: u64,
+        generation: &asap_types::sds::CatalogGeneration,
+    ) -> std::io::Result<u64> {
+        let key = (
+            metric_name.to_owned(),
+            attrs_fingerprint.to_owned(),
+            agg_kind_canonical.to_owned(),
+        );
+        let mut binding = self.cache.get_mut(&key).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "catalog activation requires an existing resolver binding",
+            )
+        })?;
+        if *binding != previous_sid {
+            return Ok(*binding);
+        }
+        let replacement = self
+            .next_sid
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |sid| {
+                sid.checked_add(1)
+            })
+            .map_err(|_| std::io::Error::other("physical series ID space exhausted"))?;
+        self.persistence.append_catalog_activation(
+            replacement,
+            metric_name,
+            attrs_fingerprint,
+            agg_kind_canonical,
+            generation,
+        )?;
+        *binding = replacement;
+        Ok(replacement)
+    }
+
     /// Look up an existing sid without minting. Returns `None` if the
     /// `(metric, attrs, agg_kind)` tuple is not in the cache.
     pub fn lookup(
@@ -221,34 +283,17 @@ impl Default for SeriesIdResolver {
 // writes a WAL record per fresh mint; the resolver replays it on startup
 // so the agent's cached sids stay valid across backend restarts.
 //
-// WAL format v3 (current; v1 was attrs-only, never shipped to prod;
-// v2 used `agg_kind_canonical` without spatial-filter, replaced when
-// spatial_filter_canonical was folded into agg_kind_canonical to
-// distinguish filter-distinct policies on the sid identity):
-//   header: 8 bytes  → b"ASAPSRP\x03"
-//   record: 8 bytes  → sid (u64 little-endian)
-//           4 bytes  → metric_len (u32 LE)
-//           metric_len bytes → metric utf8
-//           4 bytes  → fp_len (u32 LE)
-//           fp_len bytes → fp utf8
-//           4 bytes  → agg_kind_len (u32 LE)
-//           agg_kind_len bytes → agg_kind_canonical utf8
+// WAL v4: header b"ASAPSRP\x04", followed by u32-length-prefixed JSON
+// records. CatalogGeneration records are normalized by snapshot digest;
+// Binding records carry a reference only for explicitly authorized rotations.
+// Opening a v3 WAL atomically migrates its durable prefix without changing
+// physical IDs. v1/v2 remain unsupported because they used different identity
+// semantics. Older binaries reject the v4 header rather than truncating it.
 //
-// v2 WALs are not auto-migrated — pre-prod constraint. A v2 header
-// causes `FilePersistence::open` to fail with `InvalidData`; recovery
-// is to delete the file and let the resolver cold-start (the
-// `unknown_series_ids` eviction primitive handles the bandwidth blip).
-//
-// Append-only; sids are minted once and never rewritten, so the log size
-// is proportional to live cardinality. At 100M sids (~5GB) compaction
-// becomes worth scheduling; not implemented here.
-//
-// Crash safety: every `append` calls `fsync` before returning. A torn
-// write at EOF (kernel buffered the bytes but the metadata flush was
-// interrupted) is detected at replay via short-read on any record field
-// — the file is truncated to the last durable record's offset and replay
-// returns the durable prefix. No CRC: bit-rot is low-probability for an
-// append-only WAL; add a CRC field if telemetry ever shows it firing.
+// Every append is fsynced before publication. Failed appends roll back to the
+// previous offset; replay truncates incomplete trailing frames and rejects
+// malformed or oversized complete frames. The append-only WAL has no garbage
+// collection yet; lifetime rotations add bindings for the same logical key.
 
 /// One durable binding row read back from the WAL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +302,7 @@ pub struct ResolverRecord {
     pub metric: String,
     pub attrs_fingerprint: String,
     pub agg_kind_canonical: String,
+    pub catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
 }
 
 /// Durability hook for [`SeriesIdResolver`]. Implementations decide
@@ -276,6 +322,23 @@ pub trait SeriesResolverPersistence: Send + Sync {
         attrs_fingerprint: &str,
         agg_kind_canonical: &str,
     ) -> std::io::Result<()>;
+
+    /// Persist a replacement physical lifetime with its catalog provenance.
+    /// Backends must explicitly implement this stronger contract; silently
+    /// downgrading to a legacy binding append would lose authorization.
+    fn append_catalog_activation(
+        &self,
+        _sid: u64,
+        _metric: &str,
+        _attrs_fingerprint: &str,
+        _agg_kind_canonical: &str,
+        _generation: &asap_types::sds::CatalogGeneration,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "resolver persistence does not support catalog activation",
+        ))
+    }
 
     /// Read every durable binding in append order. Called once at
     /// resolver construction time.
@@ -298,6 +361,17 @@ impl SeriesResolverPersistence for NoopPersistence {
         Ok(())
     }
 
+    fn append_catalog_activation(
+        &self,
+        _sid: u64,
+        _metric: &str,
+        _attrs_fingerprint: &str,
+        _agg_kind_canonical: &str,
+        _generation: &asap_types::sds::CatalogGeneration,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn replay(&self) -> std::io::Result<Vec<ResolverRecord>> {
         Ok(Vec::new())
     }
@@ -310,9 +384,40 @@ impl SeriesResolverPersistence for NoopPersistence {
 pub struct FilePersistence {
     file: Mutex<File>,
     path: PathBuf,
+    generations: Mutex<BTreeMap<String, Arc<asap_types::sds::CatalogGeneration>>>,
 }
 
-const WAL_MAGIC: &[u8; 8] = b"ASAPSRP\x03";
+const WAL_MAGIC: &[u8; 8] = b"ASAPSRP\x04";
+const LEGACY_WAL_MAGIC: &[u8; 8] = b"ASAPSRP\x03";
+const MAX_WAL_RECORD_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum WalRecord {
+    CatalogGeneration {
+        generation: Arc<asap_types::sds::CatalogGeneration>,
+    },
+    Binding {
+        sid: u64,
+        metric: String,
+        attrs_fingerprint: String,
+        agg_kind_canonical: String,
+        #[serde(default)]
+        generation_sha256: Option<String>,
+    },
+}
+
+fn write_wal_record(file: &mut File, record: &WalRecord) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
+    if bytes.len() > MAX_WAL_RECORD_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "resolver WAL record exceeds size limit",
+        ));
+    }
+    file.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    file.write_all(&bytes)
+}
 /// Reject any single field whose length-prefix exceeds these caps. A
 /// corrupted file might claim huge field lengths; without these bounds
 /// the replay loop could allocate gigabytes of zeros before discovering
@@ -324,9 +429,6 @@ const MAX_FP_LEN: usize = 64 * 1024;
 const MAX_AGG_KIND_LEN: usize = 4 * 1024;
 
 impl FilePersistence {
-    /// Open or create the WAL at `path`. On a fresh file, writes the
-    /// magic header and fsyncs. On an existing file, verifies the
-    /// header matches and seeks to EOF for future appends.
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -336,36 +438,119 @@ impl FilePersistence {
             .write(true)
             .create(true)
             .open(&path)?;
-        let len = file.metadata()?.len();
-        if len == 0 {
+        if file.metadata()?.len() == 0 {
             file.write_all(WAL_MAGIC)?;
             file.sync_all()?;
         } else {
-            let mut hdr = [0u8; 8];
-            file.seek(SeekFrom::Start(0))?;
-            file.read_exact(&mut hdr)?;
-            if &hdr != WAL_MAGIC {
+            let mut header = [0; 8];
+            file.read_exact(&mut header)?;
+            if &header == LEGACY_WAL_MAGIC {
+                let temporary = path.with_extension("v4.tmp");
+                let mut migrated = File::create(&temporary)?;
+                migrated.write_all(WAL_MAGIC)?;
+                loop {
+                    match read_one_record(&mut file) {
+                        ReadOne::Ok(record, offset) => {
+                            debug_assert!(offset >= 8);
+                            write_wal_record(
+                                &mut migrated,
+                                &WalRecord::Binding {
+                                    sid: record.sid,
+                                    metric: record.metric,
+                                    attrs_fingerprint: record.attrs_fingerprint,
+                                    agg_kind_canonical: record.agg_kind_canonical,
+                                    generation_sha256: None,
+                                },
+                            )?;
+                        }
+                        ReadOne::Eof | ReadOne::Torn => break,
+                    }
+                }
+                migrated.sync_all()?;
+                std::fs::rename(&temporary, &path)?;
+                if let Some(parent) = path.parent() {
+                    File::open(parent)?.sync_all()?;
+                }
+                file = OpenOptions::new().read(true).write(true).open(&path)?;
+            } else if &header != WAL_MAGIC {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!(
-                        "resolver WAL header mismatch at {:?}: expected {:?}, got {:?}",
-                        path, WAL_MAGIC, hdr,
-                    ),
+                    "resolver WAL header mismatch",
                 ));
             }
         }
-        // Position at EOF — appends start here.
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
             file: Mutex::new(file),
             path,
+            generations: Mutex::new(BTreeMap::new()),
         })
     }
 
-    /// Diagnostic accessor — the WAL path. Tests use this to inspect
-    /// the on-disk file.
-    pub fn path(&self) -> &Path {
-        &self.path
+    fn append_binding(
+        &self,
+        sid: u64,
+        metric: &str,
+        attrs_fingerprint: &str,
+        agg_kind_canonical: &str,
+        generation: Option<&asap_types::sds::CatalogGeneration>,
+    ) -> std::io::Result<()> {
+        if sid == 0
+            || metric.len() > MAX_METRIC_LEN
+            || attrs_fingerprint.len() > MAX_FP_LEN
+            || agg_kind_canonical.len() > MAX_AGG_KIND_LEN
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid resolver binding",
+            ));
+        }
+        let mut file = self.file.lock().unwrap();
+        let mut generations = self.generations.lock().unwrap();
+        let offset = file.stream_position()?;
+        let result = (|| {
+            if let Some(generation) = generation {
+                if let Some(existing) = generations.get(&generation.snapshot_sha256) {
+                    if existing.as_ref() != generation {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "conflicting catalog generation digest",
+                        ));
+                    }
+                } else {
+                    write_wal_record(
+                        &mut file,
+                        &WalRecord::CatalogGeneration {
+                            generation: Arc::new(generation.clone()),
+                        },
+                    )?;
+                }
+            }
+            write_wal_record(
+                &mut file,
+                &WalRecord::Binding {
+                    sid,
+                    metric: metric.into(),
+                    attrs_fingerprint: attrs_fingerprint.into(),
+                    agg_kind_canonical: agg_kind_canonical.into(),
+                    generation_sha256: generation.map(|value| value.snapshot_sha256.clone()),
+                },
+            )?;
+            file.sync_all()
+        })();
+        if result.is_err() {
+            // Do not append behind an incomplete record after a failed write.
+            file.set_len(offset)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.sync_all()?;
+            return result;
+        }
+        if let Some(generation) = generation {
+            generations
+                .entry(generation.snapshot_sha256.clone())
+                .or_insert_with(|| Arc::new(generation.clone()));
+        }
+        Ok(())
     }
 }
 
@@ -374,93 +559,115 @@ impl SeriesResolverPersistence for FilePersistence {
         &self,
         sid: u64,
         metric: &str,
-        fp: &str,
+        attrs_fingerprint: &str,
         agg_kind_canonical: &str,
     ) -> std::io::Result<()> {
-        let metric_bytes = metric.as_bytes();
-        let fp_bytes = fp.as_bytes();
-        let agg_kind_bytes = agg_kind_canonical.as_bytes();
-        let metric_len: u32 = metric_bytes.len().try_into().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "metric name longer than u32::MAX bytes",
-            )
-        })?;
-        let fp_len: u32 = fp_bytes.len().try_into().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "fingerprint longer than u32::MAX bytes",
-            )
-        })?;
-        let agg_kind_len: u32 = agg_kind_bytes.len().try_into().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "agg_kind_canonical longer than u32::MAX bytes",
-            )
-        })?;
+        self.append_binding(sid, metric, attrs_fingerprint, agg_kind_canonical, None)
+    }
 
-        let mut f = self.file.lock().unwrap();
-        f.write_all(&sid.to_le_bytes())?;
-        f.write_all(&metric_len.to_le_bytes())?;
-        f.write_all(metric_bytes)?;
-        f.write_all(&fp_len.to_le_bytes())?;
-        f.write_all(fp_bytes)?;
-        f.write_all(&agg_kind_len.to_le_bytes())?;
-        f.write_all(agg_kind_bytes)?;
-        // Durability barrier: caller must not observe the sid until the
-        // record is on stable storage. fsync is the slow part of the
-        // mint path (a few ms on SSD) but it's amortized — minting is
-        // once per identity, not per emit.
-        f.sync_all()?;
-        Ok(())
+    fn append_catalog_activation(
+        &self,
+        sid: u64,
+        metric: &str,
+        attrs_fingerprint: &str,
+        agg_kind_canonical: &str,
+        generation: &asap_types::sds::CatalogGeneration,
+    ) -> std::io::Result<()> {
+        self.append_binding(
+            sid,
+            metric,
+            attrs_fingerprint,
+            agg_kind_canonical,
+            Some(generation),
+        )
     }
 
     fn replay(&self) -> std::io::Result<Vec<ResolverRecord>> {
-        let mut f = self.file.lock().unwrap();
-        f.seek(SeekFrom::Start(0))?;
-        let mut hdr = [0u8; 8];
-        match f.read_exact(&mut hdr) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                // File exists but is empty — caller likely opened it
-                // moments ago without writing the header yet. Treat as
-                // no records.
-                return Ok(Vec::new());
-            }
-            Err(e) => return Err(e),
-        }
-        if &hdr != WAL_MAGIC {
+        let mut file = self.file.lock().unwrap();
+        file.seek(SeekFrom::Start(0))?;
+        let mut header = [0; 8];
+        file.read_exact(&mut header)?;
+        if &header != WAL_MAGIC {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "resolver WAL header mismatch during replay",
+                "resolver WAL header mismatch",
             ));
         }
-        let mut out = Vec::new();
-        // After successful header read, the offset is 8.
-        let mut safe_offset: u64 = 8;
+        let mut generations = BTreeMap::new();
+        let mut records = Vec::new();
+        let mut safe_offset = 8;
         loop {
-            match read_one_record(&mut *f) {
-                ReadOne::Ok(record, new_offset) => {
-                    out.push(record);
-                    safe_offset = new_offset;
+            let mut length = [0; 4];
+            match file.read_exact(&mut length) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    file.set_len(safe_offset)?;
+                    break;
                 }
-                ReadOne::Eof => break,
-                ReadOne::Torn => {
-                    warn!(
-                        path = %self.path.display(),
-                        torn_at = safe_offset,
-                        recovered = out.len(),
-                        "resolver WAL: torn record at EOF — truncating to last durable offset",
-                    );
-                    f.set_len(safe_offset)?;
-                    f.seek(SeekFrom::End(0))?;
-                    return Ok(out);
+                Err(error) => return Err(error),
+            }
+            let length = u32::from_le_bytes(length) as usize;
+            if length > MAX_WAL_RECORD_BYTES {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "resolver WAL record exceeds size limit",
+                ));
+            }
+            let mut bytes = vec![0; length];
+            if let Err(error) = file.read_exact(&mut bytes) {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    file.set_len(safe_offset)?;
+                    break;
+                }
+                return Err(error);
+            }
+            let record: WalRecord = serde_json::from_slice(&bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            match record {
+                WalRecord::CatalogGeneration { generation } => {
+                    let key = generation.snapshot_sha256.clone();
+                    if generations
+                        .get(&key)
+                        .is_some_and(|existing| existing != &generation)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "conflicting catalog generation digest",
+                        ));
+                    }
+                    generations.insert(key, generation);
+                }
+                WalRecord::Binding {
+                    sid,
+                    metric,
+                    attrs_fingerprint,
+                    agg_kind_canonical,
+                    generation_sha256,
+                } => {
+                    let catalog_generation = generation_sha256
+                        .map(|key| {
+                            generations.get(&key).cloned().ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "missing catalog generation reference",
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    records.push(ResolverRecord {
+                        sid,
+                        metric,
+                        attrs_fingerprint,
+                        agg_kind_canonical,
+                        catalog_generation,
+                    });
                 }
             }
+            safe_offset = file.stream_position()?;
         }
-        // Clean EOF — seek back to end for future appends and return.
-        f.seek(SeekFrom::End(0))?;
-        Ok(out)
+        file.seek(SeekFrom::End(0))?;
+        *self.generations.lock().unwrap() = generations;
+        Ok(records)
     }
 }
 
@@ -541,6 +748,7 @@ fn read_one_record(f: &mut File) -> ReadOne {
             metric,
             attrs_fingerprint,
             agg_kind_canonical,
+            catalog_generation: None,
         },
         new_offset,
     )
@@ -645,6 +853,91 @@ mod persistence_tests {
         dir.path().join("series_resolver.wal")
     }
 
+    fn generation() -> asap_types::sds::CatalogGeneration {
+        asap_types::sds::CatalogGeneration {
+            schema_version: 1,
+            plan_id: 7,
+            plan_version: 2,
+            snapshot_sha256: "new-catalog".into(),
+        }
+    }
+
+    #[test]
+    fn catalog_rotation_is_once_and_survives_restart_with_provenance() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+        let resolver = Arc::new(SeriesIdResolver::open(path.clone()).unwrap());
+        let previous = resolver.resolve("m", "group=a", TEST_AGG);
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let resolver = Arc::clone(&resolver);
+                std::thread::spawn(move || {
+                    resolver
+                        .rotate_for_catalog_activation(
+                            "m",
+                            "group=a",
+                            TEST_AGG,
+                            previous,
+                            &generation(),
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        let ids: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(ids.iter().all(|sid| *sid == ids[0] && *sid != previous));
+        drop(resolver);
+        let reopened = SeriesIdResolver::open(path.clone()).unwrap();
+        assert_eq!(reopened.resolve("m", "group=a", TEST_AGG), ids[0]);
+        let records = FilePersistence::open(path).unwrap().replay().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[1].catalog_generation.as_deref(),
+            Some(&generation())
+        );
+    }
+
+    #[test]
+    fn failed_catalog_rotation_keeps_old_resolver_mapping() {
+        struct RejectRotation;
+        impl SeriesResolverPersistence for RejectRotation {
+            fn append(&self, _: u64, _: &str, _: &str, _: &str) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn replay(&self) -> std::io::Result<Vec<ResolverRecord>> {
+                Ok(vec![])
+            }
+        }
+        let resolver = SeriesIdResolver::with_persistence(Arc::new(RejectRotation));
+        let previous = resolver.resolve("m", "group=a", TEST_AGG);
+        assert!(resolver
+            .rotate_for_catalog_activation("m", "group=a", TEST_AGG, previous, &generation())
+            .is_err());
+        assert_eq!(resolver.resolve("m", "group=a", TEST_AGG), previous);
+    }
+
+    #[test]
+    fn legacy_v3_bindings_migrate_without_changing_physical_ids() {
+        let dir = TempDir::new().unwrap();
+        let path = wal_path(&dir);
+        let mut file = File::create(&path).unwrap();
+        file.write_all(LEGACY_WAL_MAGIC).unwrap();
+        file.write_all(&9u64.to_le_bytes()).unwrap();
+        for field in ["m", "group=a", TEST_AGG] {
+            file.write_all(&(field.len() as u32).to_le_bytes()).unwrap();
+            file.write_all(field.as_bytes()).unwrap();
+        }
+        file.sync_all().unwrap();
+        drop(file);
+        let resolver = SeriesIdResolver::open(path.clone()).unwrap();
+        assert_eq!(resolver.resolve("m", "group=a", TEST_AGG), 9);
+        assert_eq!(resolver.resolve("m", "group=b", TEST_AGG), 10);
+        assert_eq!(&std::fs::read(path).unwrap()[..8], WAL_MAGIC);
+    }
+
     #[test]
     fn empty_log_replays_empty() {
         let dir = TempDir::new().unwrap();
@@ -692,22 +985,17 @@ mod persistence_tests {
     fn torn_record_truncated_on_replay() {
         let dir = TempDir::new().unwrap();
         let path = wal_path(&dir);
-        // Write two clean records, then a torn third one (sid + len
-        // header but truncated payload).
+        // Write two clean frames, then a length prefix with no payload.
         {
             let p = FilePersistence::open(path.clone()).unwrap();
             p.append(1, "m", "k=v;", TEST_AGG).unwrap();
             p.append(2, "m", "k=w;", TEST_AGG).unwrap();
         }
-        // Manually append a torn record: sid (8B) + metric_len=999
-        // (claims 999 bytes of metric but we write 0 bytes after).
+        // The third frame claims 999 bytes but has no payload.
         {
             use std::io::Write;
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-            f.write_all(&3u64.to_le_bytes()).unwrap();
             f.write_all(&999u32.to_le_bytes()).unwrap();
-            // No payload bytes — replay reads metric_len=999 then
-            // hits EOF.
             f.sync_all().unwrap();
         }
         let pre_size = std::fs::metadata(&path).unwrap().len();
@@ -730,10 +1018,9 @@ mod persistence_tests {
     }
 
     #[test]
-    fn out_of_range_metric_len_treated_as_torn() {
-        // A corrupted file might claim a 4GB metric name. The replay
-        // must NOT allocate that much; the bounds check rejects it as
-        // torn instead.
+    fn oversized_frame_fails_without_allocating_or_discarding_history() {
+        // An oversized frame is corruption, not a torn tail. Reject it
+        // before allocation and leave the durable file unchanged.
         let dir = TempDir::new().unwrap();
         let path = wal_path(&dir);
         {
@@ -743,15 +1030,17 @@ mod persistence_tests {
         {
             use std::io::Write;
             let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-            f.write_all(&2u64.to_le_bytes()).unwrap();
-            // metric_len = MAX_METRIC_LEN + 1 — over the cap.
-            f.write_all(&((MAX_METRIC_LEN as u32) + 1).to_le_bytes())
+            f.write_all(&((MAX_WAL_RECORD_BYTES as u32) + 1).to_le_bytes())
                 .unwrap();
             f.sync_all().unwrap();
         }
-        let p = FilePersistence::open(path).unwrap();
-        let records = p.replay().unwrap();
-        assert_eq!(records.len(), 1);
+        let before = std::fs::metadata(&path).unwrap().len();
+        let p = FilePersistence::open(path.clone()).unwrap();
+        assert_eq!(
+            p.replay().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert_eq!(std::fs::metadata(path).unwrap().len(), before);
     }
 
     #[test]
