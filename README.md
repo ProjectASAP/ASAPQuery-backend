@@ -92,7 +92,7 @@ flowchart TB
     PE --> F["Exact fallback result"]
     VE --> F
     CE --> F
-    CE -.->|"supported exact SQL subtree"| SD
+    CE -->|"supported exact SQL subtree"| SD
   end
 
   subgraph completion["Independent completion authority"]
