@@ -42,7 +42,7 @@ pub(crate) struct FlusherShared {
     /// Per-sid metadata sidecar — upserted on every flush so recovery can
     /// re-register disk-resident sids as queryable instances. See
     /// [`super::metadata`].
-    pub sid_metadata: super::metadata::SidMetadataStore,
+    pub sid_metadata: Arc<super::metadata::SidMetadataStore>,
     pub next_part_id: AtomicU64,
     pub shutdown: AtomicBool,
     /// Woken by the insert path when it hits `hard_cap_bytes` and by
@@ -79,7 +79,7 @@ impl FlusherHandle {
             .map(|m| m + 1)
             .unwrap_or(1);
 
-        let sid_metadata = super::metadata::SidMetadataStore::new(&cfg.disk_path);
+        let sid_metadata = Arc::new(super::metadata::SidMetadataStore::new(&cfg.disk_path));
 
         let shared = Arc::new(FlusherShared {
             cfg: cfg.clone(),
@@ -102,6 +102,10 @@ impl FlusherHandle {
             inner: shared,
             thread: Some(thread),
         })
+    }
+
+    pub(crate) fn metadata_store(&self) -> Arc<super::metadata::SidMetadataStore> {
+        Arc::clone(&self.inner.sid_metadata)
     }
 
     /// Signal shutdown and wait for the thread to finish its current
