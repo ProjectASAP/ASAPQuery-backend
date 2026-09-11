@@ -591,7 +591,7 @@ async fn main() -> Result<()> {
             && (active.plan_id() == 0
                 || !matches!(
                     active.precompute_plan.ingest.protocol,
-                    control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
+                    asap_types::precompute_plan::IngestProtocol::PrometheusRemoteWriteV1
                 )
                 || active.precompute_plan.ingest.endpoint_path != "/api/v1/write")
         {
@@ -731,9 +731,9 @@ async fn main() -> Result<()> {
     };
 
     // Bootstrap projections share one immutable physical-plan envelope.
-    let initial_precompute_plan = control_plane::physical::compiler::PrecomputePlan {
+    let initial_precompute_plan = asap_types::precompute_plan::PrecomputePlan {
         summary_catalog: None,
-        envelope: control_plane::physical::compiler::PlanEnvelope {
+        envelope: asap_types::precompute_plan::PlanEnvelope {
             plan_id: 0,
             plan_version: 0,
             generated_at_unix_ms: 0,
@@ -743,10 +743,10 @@ async fn main() -> Result<()> {
             planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
             capability_snapshot_id: "bootstrap".into(),
         },
-        ingest: control_plane::physical::compiler::IngestContract {
-            protocol: control_plane::physical::compiler::IngestProtocol::ModifiedOtlpMetricsV1,
+        ingest: asap_types::precompute_plan::IngestContract {
+            protocol: asap_types::precompute_plan::IngestProtocol::ModifiedOtlpMetricsV1,
             endpoint_path: "/v1/metrics".into(),
-            timestamp_unit: control_plane::physical::compiler::TimestampUnit::UnixNanoseconds,
+            timestamp_unit: asap_types::precompute_plan::TimestampUnit::UnixNanoseconds,
             require_plan_identity: false,
             require_summary_definition_identity: false,
             require_registered_producer: false,

@@ -2690,7 +2690,7 @@ mod tests {
             generated_at_unix_ms: 0,
             activation_unix_ms: 1,
             expiry_unix_ms: None,
-            backend_compat: control_plane::physical::compiler::BACKEND_COMPAT.into(),
+            backend_compat: asap_types::precompute_plan::BACKEND_COMPAT.into(),
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
@@ -5865,7 +5865,7 @@ async fn handle_health(State(state): State<AppState>) -> axum::response::Respons
             && active.expiry_unix_ms().is_none_or(|expiry| now < expiry);
         let ingest_ready = matches!(
             active.precompute_plan.ingest.protocol,
-            control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
+            asap_types::precompute_plan::IngestProtocol::PrometheusRemoteWriteV1
         ) && active.precompute_plan.ingest.endpoint_path == "/api/v1/write";
         if !lifecycle_ready || !ingest_ready {
             return (
@@ -6187,7 +6187,7 @@ async fn handle_post_physical_plan(
         && (active.plan_id() == 0
             || !matches!(
                 active.precompute_plan.ingest.protocol,
-                control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
+                asap_types::precompute_plan::IngestProtocol::PrometheusRemoteWriteV1
             )
             || active.precompute_plan.ingest.endpoint_path != "/api/v1/write")
     {

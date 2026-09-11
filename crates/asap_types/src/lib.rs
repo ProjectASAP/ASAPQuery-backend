@@ -28,3 +28,5 @@ pub use policy_registry::PolicyRegistry;
 pub use query_requirements::*;
 pub use routing_index::RoutingIndex;
 pub use storage_backend::*;
+
+pub mod precompute_plan;
