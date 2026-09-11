@@ -40,6 +40,10 @@ async fn distinct_range_uses_planner_selected_hll_and_source_labels() {
     let path = output.path().join("planning.json");
     std::fs::write(&path, serde_json::to_vec(&fixture).unwrap()).unwrap();
     let port = unused_port();
+    let mut vm_port = unused_port();
+    while vm_port == port {
+        vm_port = unused_port();
+    }
     let mut child = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_data_plane"))
             .args([
@@ -54,6 +58,12 @@ async fn distinct_range_uses_planner_selected_hll_and_source_labels() {
             .args(["--http-port", &port.to_string(), "--output-dir"])
             .arg(output.path())
             .args([
+                "--victoriametrics-http-port",
+                &vm_port.to_string(),
+                "--victoriametrics-url",
+                &fallback_url,
+            ])
+            .args([
                 "--precompute-allowed-lateness-ms",
                 "0",
                 "--precompute-flush-interval-ms",
@@ -67,6 +77,51 @@ async fn distinct_range_uses_planner_selected_hll_and_source_labels() {
     let client = reqwest::Client::new();
     let backend = format!("http://127.0.0.1:{port}");
     wait_until_ready(&client, &format!("{backend}/api/v1/health"), &mut child.0).await;
+    // Source syntax uses the shared parser fork; serving semantics and exact
+    // routing belong to the MetricsQL adapter and its installed query entries.
+    let snapshot = serde_json::from_value::<BackendLocalPlanningSnapshot>(fixture).unwrap();
+    let (mut request, mut environment) = snapshot.planning_request().unwrap();
+    request.hybrid_execution = false;
+    environment.plan_version = 2;
+    let compiled = control_plane::physical::compiler::PhysicalCompiler
+        .compile_metricsql(request, environment)
+        .unwrap();
+    let identity = serde_json::json!({"plan_id": compiled.envelope.plan_id, "plan_version": compiled.envelope.plan_version});
+    let install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
+        summary_catalog: compiled.summary_catalog,
+        collector_plans: compiled.collector_plans,
+        precompute_plan: compiled.precompute_plan,
+        transmission_plan: compiled.transmission_plan,
+        query_plan: compiled.query_plan,
+        storage_routing: None,
+        adaptation_evidence: vec![],
+    };
+    eprintln!(
+        "DISTINCT_INSTALLED {}",
+        serde_json::to_string(&install).unwrap()
+    );
+    let response = client
+        .post(format!("{backend}/api/v1/physical-plan"))
+        .json(&install)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
+    let response = client
+        .post(format!("{backend}/api/v1/physical-plan/activate"))
+        .json(&identity)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap()
+    );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -92,7 +147,7 @@ async fn distinct_range_uses_planner_selected_hll_and_source_labels() {
     drain_precompute(&client, &backend).await;
     let result = wait_for_warm_instant(
         &client,
-        &backend,
+        &format!("http://127.0.0.1:{vm_port}"),
         QUERY,
         (base + 5000) as f64 / 1000.0,
         &output.path().join("query_engine.log"),

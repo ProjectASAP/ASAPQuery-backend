@@ -363,6 +363,34 @@ impl PrecomputePlan {
                         "DAG materialization has no runtime configuration".into(),
                     ));
                 };
+                if self.ingest.protocol == IngestProtocol::PrometheusRemoteWriteV1
+                    && matches!(
+                        config.aggregation_type,
+                        crate::AggregationType::HLL | crate::AggregationType::UnivMon
+                    )
+                {
+                    if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
+                        input,
+                        ..
+                    } = &node.payload
+                    {
+                        let supported = match config.aggregation_type {
+                            crate::AggregationType::HLL => {
+                                crate::accumulator_spec::is_scalar_sample_value(input)
+                                    || crate::accumulator_spec::is_unit_sample_frequency(input)
+                            }
+                            crate::AggregationType::UnivMon => {
+                                crate::accumulator_spec::is_unit_sample_frequency(input)
+                            }
+                            _ => unreachable!(),
+                        };
+                        if !supported {
+                            return Err(PrecomputePlanError::CatalogContract(
+                                "raw materialization input does not match its accumulator update semantics".into(),
+                            ));
+                        }
+                    }
+                }
                 if let Some(partitioning) = config.partitioning {
                     if let planner_types::post_asap::ExecutableOperatorPayload::SummaryAgg {
                         reduction,
@@ -537,7 +565,9 @@ pub(crate) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> 
         SummaryFamilyType::Sketch(kind, _)
             if matches!(
                 kind.algorithm(),
-                SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap | SketchAlgorithm::UnivMon
+                SketchAlgorithm::CmsWithHeap
+                    | SketchAlgorithm::CountSketchWithHeap
+                    | SketchAlgorithm::UnivMon
             ) =>
         {
             vec![StateEncoding::SketchCoreMsgpackV1]

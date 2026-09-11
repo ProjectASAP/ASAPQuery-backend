@@ -1515,14 +1515,13 @@ fn has_unsafe_raw_entity_leaf(
                     )
                 );
                 let scalar_series_input = matches!(&node.expr,
-                    SummaryExpr::SummaryAgg { input, .. }
-                    if input.item.is_none() && matches!(&input.weight, planner_types::post_asap::SummaryInputExpr::Column(planner_types::pre_asap::ColumnRef::SampleValue)));
+                    SummaryExpr::SummaryAgg { input, family, .. }
+                    if !matches!(family, SummaryFamilyType::Sketch(kind, _) if matches!(kind.algorithm(), SketchAlgorithm::UnivMon))
+                        && asap_types::accumulator_spec::is_scalar_sample_value(input));
                 let frequency_series_input = matches!(&node.expr,
                     SummaryExpr::SummaryAgg { input, family: SummaryFamilyType::Sketch(kind, _), .. }
                     if matches!(kind.algorithm(), SketchAlgorithm::Hll | SketchAlgorithm::UnivMon)
-                        && matches!(input.item, Some(planner_types::post_asap::SummaryInputExpr::Column(planner_types::pre_asap::ColumnRef::SampleValue)))
-                        && matches!(input.weight, planner_types::post_asap::SummaryInputExpr::Constant(1.0))
-                        && matches!(input.weight_domain, planner_types::post_asap::WeightDomain::NonNegative { proof: planner_types::post_asap::NonNegativeWeightProof::UnitCount }));
+                        && asap_types::accumulator_spec::is_unit_sample_frequency(input));
                 return matches!(reduction, Reduction::PerEntity)
                     && !pooling
                     && !(preserves_series_state || scalar_series_input || frequency_series_input);
@@ -4254,6 +4253,18 @@ mod tests {
                     ..
                 }
             ))));
+    }
+
+    /// An unimplemented cardinality family fails admission rather than panicking in an emitter.
+    #[test]
+    fn unsupported_cardinality_family_fails_admission() {
+        let mut deployment = environment(10_000);
+        deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        deployment.collector_ids.clear();
+        let mut workload = request("confidence", "distinct_over_time(m[1m])");
+        workload.hybrid_execution = true;
+        let result = PhysicalCompiler.compile_metricsql(workload, deployment);
+        assert!(matches!(result, Err(CompileError::QueryPlan(_))));
     }
 
     #[test]
