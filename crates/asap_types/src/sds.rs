@@ -842,6 +842,11 @@ pub struct DataDescriptor {
     pub timestamp_column: Option<String>,
     pub population_filter_canonical: String,
     pub group_by_keys: crate::GroupingProjection,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::grouping_projection::PopulationKeyEncoding::is_legacy"
+    )]
+    pub population_key_encoding: crate::grouping_projection::PopulationKeyEncoding,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partitioning: Option<PopulationPartitioning>,
     /// Versioned contract for timestamp interpretation and
@@ -905,6 +910,7 @@ impl DataDescriptor {
             &observation_semantics,
             None,
             None,
+            Default::default(),
         );
         Self {
             id,
@@ -914,6 +920,7 @@ impl DataDescriptor {
             population_filter_canonical,
             group_by_keys,
             partitioning: None,
+            population_key_encoding: Default::default(),
             observation_semantics,
         }
     }
@@ -927,6 +934,7 @@ impl DataDescriptor {
             &self.observation_semantics,
             self.partitioning,
             self.timestamp_column.as_deref(),
+            self.population_key_encoding,
         );
         self
     }
@@ -940,8 +948,17 @@ impl DataDescriptor {
             &self.observation_semantics,
             partitioning,
             self.timestamp_column.as_deref(),
+            self.population_key_encoding,
         );
         self
+    }
+    pub fn with_population_key_encoding(
+        mut self,
+        encoding: crate::grouping_projection::PopulationKeyEncoding,
+    ) -> Self {
+        self.population_key_encoding = encoding;
+        let partitioning = self.partitioning;
+        self.with_partitioning(partitioning)
     }
     pub fn with_timestamp_column(mut self, column: Option<String>) -> Self {
         self.timestamp_column = column;
@@ -987,6 +1004,7 @@ impl DataDescriptor {
                 &self.observation_semantics,
                 self.partitioning,
                 self.timestamp_column.as_deref(),
+                self.population_key_encoding,
             )
         {
             return Err(SdsError("data descriptor ID/content mismatch".into()));
@@ -994,6 +1012,7 @@ impl DataDescriptor {
         Ok(())
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn data_descriptor_id(
     source: &DataSourceIdentity,
     value_projection: &ValueProjectionIdentity,
@@ -1002,6 +1021,7 @@ fn data_descriptor_id(
     observation_semantics: &str,
     partitioning: Option<PopulationPartitioning>,
     timestamp_column: Option<&str>,
+    population_key_encoding: crate::grouping_projection::PopulationKeyEncoding,
 ) -> DataDescriptorId {
     // Length framing keeps distinct typed sources, projections, predicates,
     // and grouping keys collision-free in the content identity.
@@ -1032,6 +1052,9 @@ fn data_descriptor_id(
         "|{}:{observation_semantics}",
         observation_semantics.len()
     ));
+    if !population_key_encoding.is_legacy() {
+        key = format!("data:population-key:canonical-labels-v1|{key}");
+    }
     DataDescriptorId(key)
 }
 
@@ -1039,6 +1062,24 @@ fn data_descriptor_id(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn population_encoding_is_part_of_data_identity_with_legacy_default() {
+        use crate::grouping_projection::PopulationKeyEncoding;
+        let legacy = DataDescriptor::new("m", "", ["host".to_string()]);
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert!(wire.get("population_key_encoding").is_none());
+        let decoded: DataDescriptor = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy.id(), decoded.id());
+        let canonical = legacy
+            .clone()
+            .with_population_key_encoding(PopulationKeyEncoding::CanonicalLabelsV1);
+        assert_ne!(legacy.id(), canonical.id());
+        canonical.validate().unwrap();
+        let reverted =
+            canonical.with_population_key_encoding(PopulationKeyEncoding::LegacyDelimited);
+        assert_eq!(legacy.id(), reverted.id());
+    }
 
     fn completion(epoch: u64) -> SummaryWindowCompletion {
         SummaryWindowCompletion {

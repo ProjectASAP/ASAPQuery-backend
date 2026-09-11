@@ -90,6 +90,7 @@ pub fn create_engine_single_pop_with_aggregated(
 
     let mut aggregation_configs = HashMap::new();
     let agg_config = AggregationConfig {
+        population_key_encoding: Default::default(),
         aggregation_type,
         aggregation_sub_type: String::new(),
         parameters: HashMap::new(),
@@ -188,6 +189,7 @@ pub fn create_engine_dual_input(
 
     // Value aggregation
     let value_agg_config = AggregationConfig {
+        population_key_encoding: Default::default(),
         aggregation_type: value_agg_type,
         aggregation_sub_type: String::new(),
         parameters: HashMap::new(),
@@ -216,6 +218,7 @@ pub fn create_engine_dual_input(
 
     // Keys aggregation
     let keys_agg_config = AggregationConfig {
+        population_key_encoding: Default::default(),
         aggregation_type: key_agg_type,
         aggregation_sub_type: String::new(),
         parameters: HashMap::new(),
@@ -309,6 +312,7 @@ pub fn create_engine_two_metrics(
     let mut aggregation_configs = HashMap::new();
 
     let agg_config_a = AggregationConfig {
+        population_key_encoding: Default::default(),
         aggregation_type: aggregation_type_a,
         aggregation_sub_type: String::new(),
         parameters: HashMap::new(),
@@ -336,6 +340,7 @@ pub fn create_engine_two_metrics(
     aggregation_configs.insert(id_a, agg_config_a);
 
     let agg_config_b = AggregationConfig {
+        population_key_encoding: Default::default(),
         aggregation_type: aggregation_type_b,
         aggregation_sub_type: String::new(),
         parameters: HashMap::new(),
@@ -439,6 +444,7 @@ pub fn create_engine_three_metrics(
         (aggregation_type_c, &labels_c, metric_c),
     ] {
         let cfg = AggregationConfig {
+            population_key_encoding: Default::default(),
             aggregation_type: agg_type,
             aggregation_sub_type: String::new(),
             parameters: HashMap::new(),
@@ -519,6 +525,7 @@ pub fn create_engine_multi_timestamp(
 
     let mut aggregation_configs = HashMap::new();
     let agg_config = AggregationConfig {
+        population_key_encoding: Default::default(),
         aggregation_type,
         aggregation_sub_type: String::new(),
         parameters: HashMap::new(),
@@ -591,6 +598,7 @@ pub fn create_engine_multi_timestamp_with_window(
 
     let mut aggregation_configs = HashMap::new();
     let agg_config = AggregationConfig {
+        population_key_encoding: Default::default(),
         aggregation_type,
         aggregation_sub_type: String::new(),
         parameters: HashMap::new(),

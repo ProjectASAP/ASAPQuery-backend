@@ -257,6 +257,7 @@ mod tests {
 
     fn sum_agg_config(id: u64) -> AggregationConfig {
         AggregationConfig {
+            population_key_encoding: Default::default(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
             parameters: HashMap::new(),
