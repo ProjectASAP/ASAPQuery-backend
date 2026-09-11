@@ -1106,6 +1106,33 @@ mod tests {
     }
 
     #[test]
+    fn nonfinite_external_array_values_cannot_become_nulls() {
+        use planner_types::pre_asap::Column;
+        let dtype = DataType::List {
+            element: Box::new(Column::new("item", DataType::Float64, true)),
+        };
+        for value in ["inf", "-inf", "nan"] {
+            assert!(json_cell(
+                &serde_json::json!([value]),
+                &dtype,
+                false,
+                "Array(Nullable(Float64))"
+            )
+            .is_err());
+        }
+        assert_eq!(
+            json_cell(
+                &serde_json::json!([null]),
+                &dtype,
+                false,
+                "Array(Nullable(Float64))"
+            )
+            .unwrap(),
+            Cell::List(vec![Cell::Null].into())
+        );
+    }
+
+    #[test]
     fn array_access_uses_signed_indices_and_element_defaults() {
         use planner_types::pre_asap::{Column, Schema};
         let function = |name: &str, args| QueryExpr::FunctionCall {

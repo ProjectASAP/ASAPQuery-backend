@@ -111,6 +111,9 @@ impl CatalogClickHouseAccelerator {
                 "0".into(),
             );
             parameters.insert("output_format_json_quote_64bit_integers".into(), "0".into());
+            // Preserve the distinction between NULL and unsupported NaN/Inf.
+            // The typed decoder rejects quoted non-finite values and falls back.
+            parameters.insert("output_format_json_quote_denormals".into(), "1".into());
             if let Some(database) = request_context.database() {
                 parameters.insert("database".into(), database.into());
             }
