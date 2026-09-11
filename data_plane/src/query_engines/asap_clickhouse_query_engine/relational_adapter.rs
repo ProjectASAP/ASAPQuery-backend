@@ -702,7 +702,10 @@ fn eval(
     }
 }
 
-fn default_collection_element(dtype: &DataType, nullable: bool) -> Result<Cell, ClickHouseRelationalError> {
+fn default_collection_element(
+    dtype: &DataType,
+    nullable: bool,
+) -> Result<Cell, ClickHouseRelationalError> {
     if nullable {
         return Ok(Cell::Null);
     }
