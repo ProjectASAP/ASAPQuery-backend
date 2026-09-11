@@ -693,6 +693,7 @@ pub struct SketchStore {
     /// flush-then-evict loop is the memory bound).
     persistence_read: RwLock<Option<Arc<PersistenceReadHandle>>>,
     persistence_metadata: RwLock<Option<Arc<persistence::metadata::SidMetadataStore>>>,
+    immutable_publisher: RwLock<std::sync::Weak<persistence::flusher::FlusherShared>>,
     removed_sids: RwLock<
         BTreeMap<
             u64,
@@ -1272,6 +1273,27 @@ impl SketchStore {
         window: TimestampRange,
         sample: SketchSampleState,
     ) -> bool {
+        let instances = self.instances.read().unwrap();
+        if instances.get(&sid).is_some_and(|binding| {
+            matches!(
+                binding.data_descriptor.source,
+                asap_types::sds::DataSourceIdentity::Derived { .. }
+            )
+        }) {
+            return false;
+        }
+        self.append_sample_with_binding(sid, series_label_values, window, sample)
+    }
+
+    // Caller retains the existing metadata guard and has rejected derived
+    // definitions. Avoid recursively acquiring it when a writer is waiting.
+    fn append_sample_with_binding(
+        &self,
+        sid: u64,
+        series_label_values: BTreeMap<String, String>,
+        window: TimestampRange,
+        sample: SketchSampleState,
+    ) -> bool {
         let completed = self.completed_windows.read().unwrap();
         if completed.get(&sid).is_some_and(|end| window.1 <= *end) {
             return false;
@@ -1314,6 +1336,27 @@ impl SketchStore {
     /// guard against (it'll crash the reducer at runtime, not silently
     /// corrupt).
     pub fn append_precompute(
+        &self,
+        sid: u64,
+        series_label_values: BTreeMap<String, String>,
+        window: TimestampRange,
+        payload: Box<dyn crate::storage_engines::types::AggregateCore>,
+    ) -> bool {
+        let instances = self.instances.read().unwrap();
+        if instances.get(&sid).is_some_and(|binding| {
+            matches!(
+                binding.data_descriptor.source,
+                asap_types::sds::DataSourceIdentity::Derived { .. }
+            )
+        }) {
+            return false;
+        }
+        self.append_precompute_with_binding(sid, series_label_values, window, payload)
+    }
+
+    // Caller retains the existing metadata guard and has rejected derived
+    // definitions. Avoid recursively acquiring it when a writer is waiting.
+    fn append_precompute_with_binding(
         &self,
         sid: u64,
         series_label_values: BTreeMap<String, String>,
@@ -2479,6 +2522,15 @@ impl SketchStore {
     }
 
     fn metadata_record(&self, m: &SdsBinding) -> Option<persistence::metadata::SidMetaRecord> {
+        let mut record = self.metadata_record_without_completion(m)?;
+        record.completed_through_ms = self.completed_windows.read().unwrap().get(&m.sid).copied();
+        Some(record)
+    }
+
+    fn metadata_record_without_completion(
+        &self,
+        m: &SdsBinding,
+    ) -> Option<persistence::metadata::SidMetaRecord> {
         let mut record =
             crate::storage_engines::sketch_db::index::persistence::metadata::SidMetaRecord::new(
                 m.sid,
@@ -2491,7 +2543,6 @@ impl SketchStore {
             record.summary_definition_id = Some(SummaryDefinitionId::from(m.policy_fp));
             record.catalog_generation = Some(Arc::clone(m.catalog_generation.as_ref()?));
         }
-        record.completed_through_ms = self.completed_windows.read().unwrap().get(&m.sid).copied();
         record.retired_at_ms = m.retired_at_ms;
         record.expires_at_ms = m.expires_at_ms;
         Some(record)
@@ -2759,27 +2810,12 @@ impl SketchStore {
         self.ingest_precompute_with_series_id(sid, agg_cfg, output, accumulator)
     }
 
-    /// B7.7 sid-direct sibling of [`Self::ingest_precompute_for_agg_config`].
-    ///
-    /// Callers that already hold the bucket sid (the live worker after
-    /// B7.6 reshaped its `WorkerMessage`, and the backfill processor
-    /// after B7.7 rekeyed its per-window grouping from group_key to
-    /// sid) skip the mint round-trip by handing the sid in directly.
-    /// The mint-driven [`Self::ingest_precompute_for_agg_config`] is
-    /// content-addressed and idempotent with this method — passing the
-    /// resolver-minted sid here yields the same state under the same
-    /// sid — so both methods can coexist while migration finishes.
-    ///
-    /// The §6.3 ingest barrier (`Retired` / `Expired` sids reject
-    /// writes) and first-sight metadata registration are identical to
-    /// the mint-driven path.
-    pub fn ingest_precompute_with_series_id(
+    fn register_precompute_output(
         &self,
         sid: u64,
-        agg_cfg: &asap_types::aggregation_config::AggregationConfig,
+        agg_cfg: &asap_types::PrecomputeMaterialization,
         output: &crate::storage_engines::types::PrecomputedOutput,
-        accumulator: &dyn crate::storage_engines::types::AggregateCore,
-    ) -> Option<u64> {
+    ) -> Option<BTreeMap<String, String>> {
         let (_attrs_fp, label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
         let key_names = &agg_cfg.grouping_labels.names();
         let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg);
@@ -2826,12 +2862,44 @@ impl SketchStore {
             Some(_) => {}
         }
 
+        Some(label_values_map)
+    }
+
+    /// B7.7 sid-direct sibling of [`Self::ingest_precompute_for_agg_config`].
+    ///
+    /// Callers that already hold the bucket sid (the live worker after
+    /// B7.6 reshaped its `WorkerMessage`, and the backfill processor
+    /// after B7.7 rekeyed its per-window grouping from group_key to
+    /// sid) skip the mint round-trip by handing the sid in directly.
+    /// The mint-driven [`Self::ingest_precompute_for_agg_config`] is
+    /// content-addressed and idempotent with this method — passing the
+    /// resolver-minted sid here yields the same state under the same
+    /// sid — so both methods can coexist while migration finishes.
+    ///
+    /// The §6.3 ingest barrier (`Retired` / `Expired` sids reject
+    /// writes) and first-sight metadata registration are identical to
+    /// the mint-driven path.
+    pub fn ingest_precompute_with_series_id(
+        &self,
+        sid: u64,
+        agg_cfg: &asap_types::aggregation_config::AggregationConfig,
+        output: &crate::storage_engines::types::PrecomputedOutput,
+        accumulator: &dyn crate::storage_engines::types::AggregateCore,
+    ) -> Option<u64> {
+        let label_values_map = self.register_precompute_output(sid, agg_cfg, output)?;
+
         // Keep the physical lifetime alive through publication. Removal takes
         // this same lock exclusively, so it cannot race metadata validation and
         // recreate orphan payload after the tombstone commits.
         let instances = self.instances.read().ok()?;
         let binding = instances.get(&sid)?;
-        if !binding.metadata.is_writable() || binding.metadata.policy_fp != output.policy_fp {
+        if !binding.metadata.is_writable()
+            || binding.metadata.policy_fp != output.policy_fp
+            || matches!(
+                binding.data_descriptor.source,
+                asap_types::sds::DataSourceIdentity::Derived { .. }
+            )
+        {
             return None;
         }
         if binding.catalog_generation.is_some() && output.catalog_generation.is_none() {
@@ -2870,7 +2938,7 @@ impl SketchStore {
 
         let window = (output.start_timestamp, output.end_timestamp);
         let accepted = match crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg) {
-            AggKind::Sketch { .. } => self.append_sample(
+            AggKind::Sketch { .. } => self.append_sample_with_binding(
                 sid,
                 label_values_map,
                 window,
@@ -2879,7 +2947,7 @@ impl SketchStore {
                     encoding: SketchEncoding::MsgpackFull,
                 },
             ),
-            AggKind::ExactAgg { .. } => self.append_precompute(
+            AggKind::ExactAgg { .. } => self.append_precompute_with_binding(
                 sid,
                 label_values_map,
                 window,
@@ -3048,6 +3116,7 @@ impl SketchStore {
             metadata_writer,
         )?;
 
+        *self.immutable_publisher.write().unwrap() = Arc::downgrade(&flusher.publication_handle());
         Ok(SketchIndexPersistence {
             manifest,
             part_cache,
@@ -5782,6 +5851,8 @@ mod tests {
 // 2026-05 reorg: generic epoch-partitioned columnar storage lives
 // alongside the store that uses it.
 mod admission;
+mod maintenance;
+pub(crate) use maintenance::FrozenExactWindows;
 pub mod epoch_columnar;
 
 // `persistence` moved up to `sketch_db::persistence`. Re-exported here

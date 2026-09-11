@@ -457,11 +457,11 @@ input definition or transformation creates a new identity. Existing raw-source
 identities retain their previous byte representation. Catalog validation rejects
 missing input definitions and dependency cycles.
 
-This contract is a prerequisite, not enabled summary-over-summary execution.
-Installation currently rejects derived inputs so they cannot accidentally receive
-raw samples through the legacy metric router. Enabling them requires the immutable
-maintenance consumer and durable output deduplication protocol; neither raw-table
-substitution nor treating late correction fragments as new observations is valid.
+Installation still rejects derived inputs so they cannot accidentally receive
+raw samples through the legacy metric router. The explicit immutable maintenance
+entry point below must be wired into compiler construction and automatic
+scheduling before this guard is removed. Neither raw-table substitution nor
+treating late correction fragments as new observations is valid.
 
 ### Immutable completed windows
 
@@ -486,3 +486,39 @@ must atomically publish their output identity before claiming replay-safe consum
 The existing finite-source completeness proof still rejects untracked writes or
 pending admitted work. Continuous producer watermarks and derived-state commit
 transactions are separate from this finite-input boundary.
+### Executing an immutable maintenance sink
+
+`precompute_engine::maintenance_runtime::execute_completed_maintenance` executes
+one installed semantic subDAG from a physical source whose required base windows
+are durably complete. SummaryStore validates the catalog generation, physical
+SeriesId, population, exact window coverage, and each part read. Missing, corrupt,
+or duplicate source windows are errors; this path cannot silently omit a pane as
+a query fallback helper might.
+
+The existing maintenance operator registry preserves a collection of source
+states until the DAG explicitly merges or finalizes it. Exact Sum/Count
+finalization with a declared Float64 output produces one row per source window; an unkeyed SummaryAgg consumes
+those rows together. Consequently `Finalize -> SummaryAgg` does not accidentally
+become one complete DAG evaluation per correction fragment. Live worker fragments
+remain ineligible for finalization.
+
+The engine resumes a matching durable pending part and looks up the stored input
+digest before computing a potentially randomized sketch. The existing flusher publishes a new result through its part
+reservation protocol; SummaryStore fences query reads and physical lifetime
+changes during publication. A concurrent identical completion reuses the durable
+result instead of comparing newly randomized bytes. Both pending recovery and a
+committed lookup restore the live completion boundary. Catalog-derived definitions
+reject additive sketch/precompute writes even beyond that boundary; only reserved
+publication may create their output state. The latest committed window can be
+retried after restart without adding another part.
+
+This is an explicit maintenance entry point, not automatic workload coverage.
+The initial consumer supports one source definition and population, complete
+non-overlapping base panes, Sum/Count finalization, and unkeyed aggregate updates.
+Compiler construction and automatic scheduling must use this entry point before
+derived installation is enabled. Cross-population reductions, synchronized
+multiple sources, general row operators, overlapping output-window replacement,
+and continuous producer watermarks remain unsupported. In particular, the SQL
+subquery's timestamp grouping and sampling predicate must not be replaced with an
+arbitrary tumbling aggregate. Historical completion-metadata GC and pinning source
+parts for recovery before a reserved output part exists remain lifecycle work.
