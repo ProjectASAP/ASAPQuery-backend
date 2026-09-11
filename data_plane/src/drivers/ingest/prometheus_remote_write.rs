@@ -177,6 +177,15 @@ impl PrometheusRemoteWriteReceiver {
         self.inner.stats.clone()
     }
 
+    pub(crate) fn install_erp_observation_generation(
+        &self,
+        generation: asap_types::sds::CatalogGeneration,
+    ) {
+        if let Some(observer) = self.inner.ingest.router.erp_observer() {
+            observer.install_generation(generation);
+        }
+    }
+
     /// Permanently seal this finite source before queuing worker barriers.
     pub async fn drain(&self) -> Result<(), String> {
         {

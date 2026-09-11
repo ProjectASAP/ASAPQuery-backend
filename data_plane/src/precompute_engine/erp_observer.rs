@@ -41,6 +41,17 @@ impl RuntimeErpObserver {
             }),
         })
     }
+    /// Only the accepted catalog activation path may reset an observation epoch.
+    pub(crate) fn install_generation(&self, generation: CatalogGeneration) {
+        let mut state = self.observations.lock().unwrap();
+        if state.generation.as_ref() != Some(&generation) {
+            *state = Observations {
+                generation: Some(generation),
+                ..Default::default()
+            };
+        }
+    }
+
     pub fn observe(
         &self,
         generation: &CatalogGeneration,
@@ -321,6 +332,11 @@ mod tests {
     fn delayed_generation_cannot_reset_current_population_counts() {
         let (generation, config) = fixture();
         let observer = RuntimeErpObserver::new("http://127.0.0.1:1".into(), generation.clone());
+        let mut previous = generation.clone();
+        previous.plan_version = 0;
+        observer.install_generation(previous.clone());
+        observer.observe(&previous, coordinate(0), &config, 0, 77.0);
+        observer.install_generation(generation.clone());
         observer.observe(&generation, coordinate(0), &config, 1, 1.0);
         let mut stale = generation.clone();
         stale.plan_version = 0;

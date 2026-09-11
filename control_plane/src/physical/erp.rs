@@ -1540,7 +1540,7 @@ mod tests {
         observer.observe("a", 0).unwrap();
         assert_eq!(
             observer.observe("b", 0),
-            Err("ERP shape observer cardinality cap exceeded")
+            Err("ERP observation key or interval budget exceeded")
         );
         assert!(observer.snapshot().is_none());
         assert!(observer.observe("a", 0).is_err());
