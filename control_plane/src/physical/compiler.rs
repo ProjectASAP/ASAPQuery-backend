@@ -139,6 +139,8 @@ pub struct LifecyclePlanningInput {
 
 #[derive(Debug, Clone, Default)]
 pub struct PlanningRequest {
+    /// Diagnostic projections of the original Planner search; never consumed by selection.
+    pub logical_selection: Vec<serde_json::Value>,
     /// Enable a composable DAG with SummaryStore materializations and Prometheus exact subtrees.
     pub hybrid_execution: bool,
     /// Allowed materialization leaf contracts; None enables every eligible leaf.
@@ -403,6 +405,7 @@ pub struct PhysicalPlan {
     /// Lifecycle component only, not a complete physical-plan comparison.
     pub lifecycle_estimates: Vec<MaterializationLifecycleEstimate>,
     pub cost_comparison: Option<super::workload_cost::WorkloadCostComparison>,
+    pub logical_selection: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -420,6 +423,8 @@ pub struct MaterializationLifecycleEstimate {
 pub enum CompileError {
     #[error("invalid backend-local workload snapshot: {0}")]
     Snapshot(String),
+    #[error("no feasible completely costed alternative: {0}")]
+    Alternatives(serde_json::Value),
     #[error("planner revision mismatch: request={request}, compiler={compiler}")]
     PlannerRevision {
         request: String,
@@ -666,7 +671,7 @@ impl BackendLocalPlanningSnapshot {
                 exact_costs_by_id.insert(format!("compat-query-{index}"), rows.clone());
             }
         }
-        select_workload_roots_with_erp(
+        let logical_selection = select_workload_roots_with_trace(
             &mut queries,
             canonical_roots,
             &topk_evidence_by_id,
@@ -676,6 +681,7 @@ impl BackendLocalPlanningSnapshot {
         // Composable lowering residualizes unsafe leaves individually; retain Planner siblings.
         Ok((
             PlanningRequest {
+                logical_selection,
                 hybrid_execution: true,
                 materialization_policy: None,
                 query_workload: Some(workload),
@@ -1768,6 +1774,7 @@ impl PhysicalCompiler {
             query_plan,
             lifecycle_estimates: lifecycle_estimates.into_values().collect(),
             cost_comparison: None,
+            logical_selection: request.logical_selection,
         })
     }
 }
@@ -1886,6 +1893,17 @@ pub fn select_workload_roots_with_erp(
     exact_costs: &HashMap<String, Vec<ExactCompositionCostEvidence>>,
     erp: Option<&super::erp::ErpPlanningInput>,
 ) -> Result<(), CompileError> {
+    select_workload_roots_with_trace(queries, roots, evidence, exact_costs, erp).map(|_| ())
+}
+
+pub fn select_workload_roots_with_trace(
+    queries: &mut [PlanningQuery],
+    roots: Vec<Rc<QueryExpr>>,
+    evidence: &HashMap<String, TopKMembershipEvidence>,
+    exact_costs: &HashMap<String, Vec<ExactCompositionCostEvidence>>,
+    erp: Option<&super::erp::ErpPlanningInput>,
+) -> Result<Vec<serde_json::Value>, CompileError> {
+    let mut traces = Vec::new();
     if roots.len() != queries.len() {
         return Err(CompileError::Snapshot(
             "canonical root/query mapping is incomplete".into(),
@@ -1957,18 +1975,27 @@ pub fn select_workload_roots_with_erp(
                 AccuracyTarget::Exact => 0.0,
             },
         };
-        let selected = crate::planner_selection::select_workload_with_accuracy_model(
-            roots,
-            accuracy,
-            &model,
-            &QueryEvidence(certificate),
-            &accuracy_model,
-        )
-        .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+        let (selected, mut trace) =
+            crate::planner_selection::select_workload_with_accuracy_model_and_trace(
+                roots,
+                accuracy,
+                &model,
+                &QueryEvidence(certificate),
+                &accuracy_model,
+            )
+            .map_err(|error| CompileError::Snapshot(error.to_string()))?;
+        trace["deployment_overrides"] = serde_json::json!([]);
+        let selected_indices = selected.iter().map(|(index, _)| *index).collect::<Vec<_>>();
         for (index, node) in selected {
             if erp.is_some_and(|policy| {
                 requires_exact_erp_fallback(&node, &queries[index].accuracy, policy)
             }) {
+                if let Some(values) = trace["deployment_overrides"].as_array_mut() {
+                    values.push(
+                        serde_json::json!({"query_index": index, "status": "rejected",
+                        "reason": "ERP requires exact fallback"}),
+                    );
+                }
                 queries[index].post_asap =
                     crate::planner_selection::keep_pre_asap(&original_roots[index])
                         .map_err(|error| CompileError::Snapshot(error.to_string()))?;
@@ -1976,8 +2003,13 @@ pub fn select_workload_roots_with_erp(
                 queries[index].post_asap = node;
             }
         }
+        trace["committed_roots"] = serde_json::json!(selected_indices.into_iter().map(|index|
+            serde_json::json!({"query_index": index,
+                "logical_root_id": crate::planner_selection::explained_root_id(&queries[index].post_asap, &queries[index].accuracy)
+            })).collect::<Vec<_>>());
+        traces.push(trace);
     }
-    Ok(())
+    Ok(traces)
 }
 
 fn requires_exact_erp_fallback(
@@ -3691,6 +3723,7 @@ mod tests {
             evidence_by_query.insert(query_id.to_string(), evidence);
         }
         Ok(PlanningRequest {
+            logical_selection: Vec::new(),
             hybrid_execution: false,
             materialization_policy: None,
             query_workload: None,

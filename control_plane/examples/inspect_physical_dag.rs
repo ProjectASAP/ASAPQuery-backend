@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "backend_revision": control_plane::physical::compiler::BACKEND_REVISION,
             "planner_revision": control_plane::physical::compiler::PLANNER_REVISION,
             "cost_comparison": plan.cost_comparison,
+            "logical_selection": plan.logical_selection,
             "lifecycle_estimates": plan.lifecycle_estimates,
             "install_request": {
                 "summary_catalog": plan.summary_catalog,

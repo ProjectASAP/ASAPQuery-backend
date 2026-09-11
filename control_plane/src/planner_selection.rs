@@ -30,6 +30,109 @@ pub enum SelectionError {
     UnexpectedRewrite,
 }
 
+/// Versioned diagnostic identity over existing canonical IR, never Rc or rank IDs.
+/// Evidence/activation generations are reported separately from semantic identity.
+pub(crate) fn explain_identity(kind: &str, value: &impl serde::Serialize) -> String {
+    use sha2::{Digest, Sha256};
+    fn canonical(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(fields) => {
+                let sorted: std::collections::BTreeMap<_, _> = fields
+                    .into_iter()
+                    .map(|(key, value)| (key, canonical(value)))
+                    .collect();
+                serde_json::Value::Object(sorted.into_iter().collect())
+            }
+            serde_json::Value::Array(values) => {
+                serde_json::Value::Array(values.into_iter().map(canonical).collect())
+            }
+            value => value,
+        }
+    }
+    let value = canonical(serde_json::to_value(value).expect("canonical IR serializes"));
+    let bytes = serde_json::to_vec(&serde_json::json!({"kind": kind,
+        "planner_revision": crate::physical::compiler::PLANNER_REVISION, "value": value}))
+    .expect("JSON serializes");
+    format!("asap-explain-v1:{kind}:{:x}", Sha256::digest(bytes))
+}
+
+// serde_json maps non-finite floats to null. A lossy encoding must never
+// become a semantic identity, even when the runtime keeps an exact fallback.
+fn lossless_json<T: serde::Serialize + serde::de::DeserializeOwned + PartialEq>(
+    value: &T,
+) -> Option<serde_json::Value> {
+    let encoded = serde_json::to_value(value).ok()?;
+    let restored: T = serde_json::from_value(encoded.clone()).ok()?;
+    (restored == *value).then_some(encoded)
+}
+
+fn target_identity(target: &QueryExpr, accuracy: &AccuracyTarget) -> Option<String> {
+    Some(explain_identity(
+        "target",
+        &(lossless_json(target)?, lossless_json(accuracy)?),
+    ))
+}
+
+fn summary_identity(node: &SummaryNode) -> Option<String> {
+    // Canonical exporter owns operator payloads and edge semantics. Hash its
+    // structure, not assigned node IDs or the incidental sharing of Rc values.
+    let dag = planner_types::post_asap::compile_executable_dag(&Rc::new(node.clone())).ok()?;
+    lossless_json(&dag)?;
+    fn visit(
+        dag: &planner_types::post_asap::ExecutableDag,
+        id: planner_types::post_asap::PostAsapNodeId,
+        memo: &mut std::collections::HashMap<planner_types::post_asap::PostAsapNodeId, String>,
+    ) -> String {
+        if let Some(hash) = memo.get(&id) {
+            return hash.clone();
+        }
+        let node = dag
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .expect("exported node exists");
+        let mut inputs = dag.edges.iter().filter(|edge| edge.consumer == id).map(|edge| {
+            let child = visit(dag, edge.producer, memo);
+            serde_json::json!({"child": child, "role": edge.role, "schema": edge.intermediate_schema,
+                "state": edge.data_state, "grouping": edge.grouping, "window": edge.window})
+        }).collect::<Vec<_>>();
+        inputs.sort_by_cached_key(|input| input.to_string());
+        let hash = explain_identity(
+            "summary_node",
+            &serde_json::json!({
+            "operator": node.operator, "payload": node.payload, "state": node.output_state,
+            "schema": node.output_schema, "guarantee": node.guarantee, "inputs": inputs}),
+        );
+        memo.insert(id, hash.clone());
+        hash
+    }
+    Some(visit(&dag, dag.root, &mut std::collections::HashMap::new()))
+}
+
+pub(crate) fn explained_root_id(node: &SummaryNode, accuracy: &AccuracyTarget) -> Option<String> {
+    Some(explain_identity(
+        "root",
+        &(summary_identity(node)?, lossless_json(accuracy)?),
+    ))
+}
+
+fn replacement_identity(
+    target: &QueryExpr,
+    replacement: &Replacement,
+    accuracy: &AccuracyTarget,
+) -> Option<String> {
+    let target = lossless_json(target)?;
+    let accuracy = lossless_json(accuracy)?;
+    let value = match replacement {
+        Replacement::Summary(node) => serde_json::json!({"summary": summary_identity(node)?}),
+        Replacement::Rewrite(node) => serde_json::json!({"rewrite": lossless_json(node.as_ref())?}),
+        Replacement::ExactComposition(composition) => serde_json::json!({
+            "exact_composition": {"placement": format!("{:?}", composition.placement),
+                "operation": lossless_json(&composition.op)?, "child": lossless_json(composition.child_target.as_ref())?, "schema": lossless_json(&composition.schema)?}}),
+    };
+    Some(explain_identity("candidate", &(target, accuracy, value)))
+}
+
 /// Deployment extension tag for keyed point-frequency queries. ASAPPlanner
 /// intentionally treats extension payloads as opaque; this adapter is the one
 /// backend-owned interpretation point.
@@ -224,7 +327,7 @@ fn select_workload_impl(
     cost_model: &dyn CostModel,
     evidence: &dyn AccuracyEvidenceProvider,
     accuracy_model: &dyn AccuracyModel,
-    trace: Option<&mut serde_json::Value>,
+    mut trace: Option<&mut serde_json::Value>,
 ) -> Result<Vec<(usize, Rc<SummaryNode>)>, SelectionError> {
     // Canonical CSE still runs inside search_workload_with_targets. Do not
     // offer CSE's per-invocation recompute alternative: this runtime currently
@@ -250,13 +353,15 @@ fn select_workload_impl(
         accuracy_model,
     );
     let selection = space.global_selection(cost_model);
-    if let Some(trace) = trace {
+    if let Some(trace) = trace.as_deref_mut() {
         let groups = space.cost_sorted(cost_model).iter().enumerate().map(|(index, group)| {
             let chosen = selection.groups().find(|selected| Rc::ptr_eq(selected.target, group.target))
                 .and_then(|selected| selected.chosen);
             let candidates = group.candidates.iter().zip(&group.costs).enumerate()
                 .map(|(rank, (candidate, cost))| serde_json::json!({
                     "rank": rank,
+                    "candidate_id": replacement_identity(group.target, &candidate.replacement, &accuracy),
+                    "status": if chosen.is_some_and(|chosen| std::ptr::eq(chosen, *candidate)) { "selected" } else { "unselected" },
                     "strategy": candidate.strategy,
                     "provenance": format!("{:?}", candidate.provenance),
                     "rationale": candidate.rationale,
@@ -269,8 +374,14 @@ fn select_workload_impl(
                     "estimated_cost_status": if cost.is_finite() { "available" } else { "not_reported_by_cost_model" },
                     "selected": chosen.is_some_and(|chosen| std::ptr::eq(chosen, *candidate)),
                 })).collect::<Vec<_>>();
-            serde_json::json!({ "group_id": index, "consumer_count": group.consumer_count,
-                "candidates": candidates })
+            let rejected = space.groups().find(|memo| Rc::ptr_eq(&memo.target, group.target))
+                .into_iter().flat_map(|memo| &memo.rejected).map(|candidate| serde_json::json!({
+                    "status": "rejected", "strategy": candidate.strategy,
+                    "description": candidate.description, "reason": candidate.error.to_string()
+                })).collect::<Vec<_>>();
+            serde_json::json!({ "group_id": index,
+                "target_id": target_identity(group.target, &accuracy),
+                "consumer_count": group.consumer_count, "candidates": candidates, "rejected": rejected })
         }).collect::<Vec<_>>();
         *trace = serde_json::json!({ "schema_version": 1, "group_id_scope": "this_selection", "groups": groups });
     }
@@ -285,9 +396,16 @@ fn select_workload_impl(
                 .ok_or_else(|| SelectionError::Workload(format!("missing query root {id}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(planner_types::post_asap::share_common_summary_subtrees(
-        roots,
-    ))
+    let roots = planner_types::post_asap::share_common_summary_subtrees(roots);
+    if let Some(trace) = trace {
+        trace["roots"] = serde_json::json!(roots
+            .iter()
+            .map(|(id, node)| serde_json::json!({
+                "query_index": id, "logical_root_id": explained_root_id(node, &accuracy)
+            }))
+            .collect::<Vec<_>>());
+    }
+    Ok(roots)
 }
 
 /// Select from Planner's legal candidates with deployment-supplied accuracy
@@ -359,6 +477,85 @@ mod workload_tests {
             &ControlPlaneCostModel::new(accuracy),
         )
         .unwrap()
+    }
+
+    // Allocation identities and ranking ordinals are not semantic candidate identities.
+    #[test]
+    fn explain_candidate_ids_survive_reparse_and_preserve_accuracy() {
+        fn trace(accuracy: AccuracyTarget) -> serde_json::Value {
+            let root = crate::query_parser::parse_query_expr_canonical(
+                "quantile_over_time(0.9, m[1m])",
+                accuracy.clone(),
+            )
+            .unwrap();
+            select_workload_with_accuracy_model_and_trace(
+                vec![(0, Rc::new(root))],
+                accuracy.clone(),
+                &ControlPlaneCostModel::new(accuracy),
+                &asap_aware_mapping::NoAccuracyEvidence,
+                &asap_aware_mapping::DefaultAccuracyModel,
+            )
+            .unwrap()
+            .1
+        }
+        let a = trace(AccuracyTarget::Epsilon(0.05));
+        let b = trace(AccuracyTarget::Epsilon(0.05));
+        assert_eq!(a, b);
+        assert!(a["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|group| group["candidates"].as_array().unwrap())
+            .any(|candidate| candidate["candidate_id"].is_string()));
+        assert_ne!(
+            a["roots"][0]["logical_root_id"],
+            trace(AccuracyTarget::Epsilon(0.1))["roots"][0]["logical_root_id"]
+        );
+    }
+
+    // JSON must not alias NaN and infinity through its null representation.
+    #[test]
+    fn explain_nonfinite_identity_is_unavailable() {
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let root = QueryExpr::Literal(planner_types::pre_asap::ScalarValue::Float64(value));
+            assert!(replacement_identity(
+                &root,
+                &Replacement::Rewrite(Rc::new(root.clone())),
+                &AccuracyTarget::Exact
+            )
+            .is_none());
+        }
+    }
+
+    // Hashing excludes incidental allocation sharing but retains operand roles.
+    #[test]
+    fn explain_summary_identity_preserves_roles_and_ignores_rc_sharing() {
+        let root = plan(
+            &["sum_over_time(m[1m]) - sum_over_time(n[1m])"],
+            AccuracyTarget::Exact,
+        )[0]
+        .1
+        .clone();
+        let id = summary_identity(&root).expect("canonical binary exports");
+        let mut reversed = (*root).clone();
+        let SummaryExpr::BinaryOp { lhs, rhs, .. } = &mut reversed.expr else {
+            panic!("binary expected")
+        };
+        std::mem::swap(lhs, rhs);
+        assert_ne!(Some(id), summary_identity(&reversed));
+        let root = plan(
+            &["sum_over_time(m[1m]) + sum_over_time(m[1m])"],
+            AccuracyTarget::Exact,
+        )[0]
+        .1
+        .clone();
+        let id = summary_identity(&root).expect("canonical shared binary exports");
+        let mut unshared = (*root).clone();
+        let SummaryExpr::BinaryOp { rhs, .. } = &mut unshared.expr else {
+            panic!("binary expected")
+        };
+        *rhs = Rc::new((**rhs).clone());
+        assert_eq!(Some(id), summary_identity(&unshared));
     }
 
     // Distinct quantile roots retain their readouts while sharing one selected sketch.
