@@ -3623,7 +3623,7 @@ mod range_stitch_tests {
             ))
             .unwrap();
         let mut plan = snapshot.compile().unwrap();
-        let identity = control_plane::query_plan::canonical_promql("1 + 2").unwrap();
+        let identity = asap_types::query_plan::canonical_promql("1 + 2").unwrap();
         plan.query_plan.entries.insert(
             asap_types::query_plan::QueryPlan::catalog_key(QueryLanguage::MetricsQl, &identity),
             QueryPlanEntry {

@@ -1464,9 +1464,9 @@ mod tests {
             .keys()
             .next()
             .unwrap();
-        let binding = control_plane::query_plan::MaterializationBinding {
+        let binding = asap_types::query_plan::MaterializationBinding {
             materialization: asap_types::PolicyFingerprint(policy).into(),
-            output_grouping: control_plane::query_plan::PhysicalGrouping::Reduce(
+            output_grouping: asap_types::query_plan::PhysicalGrouping::Reduce(
                 vec!["job".into()],
             ),
             item_labels: vec![],
