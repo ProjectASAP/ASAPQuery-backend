@@ -48,7 +48,7 @@ its presence alone does not prove selection or measured benefit.
 | `PrecomputePlan` | Materializations, input schemas, producer bindings and installed precompute subDAGs. Window size, slide, layout and origin are explicit contracts. |
 | `ProducerContract`, `CollectorPlan`, `TransmissionPlan` | Producer/materialization authorization, external collector work and state-frame encoding/sequence rules. They are shared producer/consumer contracts; backend-local Remote Write does not require ASAPCollector. |
 | `QueryPlan` | Language-tagged query entries, exact dependencies, typed operations and materialization/readout bindings. Query subDAGs execute against the active installed snapshot. |
-| SummaryStore (`SketchStore`) | Physical state, indexes, lifecycle and persistence. A `SummaryDefinitionId` identifies the planned materialization; physical SID/`SummaryInstanceId` identifies its concrete stored population/lifetime. Planner node IDs are not storage IDs. |
+| SummaryStore (`SketchStore`) | Physical state, indexes, lifecycle and persistence. A `SummaryDefinitionId` identifies the planned materialization. SID identifies a physical stored series/lifetime; `SummaryInstanceId` identifies a concrete definition/window/group instance. Planner node IDs are not storage IDs. |
 | Physical-plan publication | Publishes catalog, precompute, query, collector and transmission views together; invalid bindings reject installation rather than silently selecting replacement state. |
 
 See the [physical compiler](docs/developer_docs/control-plane/physical-compiler.md),
