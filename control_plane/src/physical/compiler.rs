@@ -2607,6 +2607,10 @@ fn materialization_consumers(
     composable: bool,
 ) -> Result<BTreeMap<asap_types::PolicyFingerprint, BTreeSet<usize>>, CompileError> {
     let mut consumers = BTreeMap::<_, BTreeSet<_>>::new();
+    // Until logical lifecycle costing carries a derived-program identity,
+    // never combine unrelated programs under the legacy raw-state key.
+    let mut cohort_programs =
+        BTreeMap::<asap_types::PolicyFingerprint, Option<*const SummaryNode>>::new();
     for (index, query) in queries.iter().enumerate() {
         let states =
             collect_selected_materializations(&query.post_asap, composable).map_err(|reason| {
@@ -2630,6 +2634,18 @@ fn materialization_consumers(
                 &physical_aggregation(query, &state, query.query_id.clone(), target),
                 &state.node,
             )?;
+            let program =
+                immutable_materialization_source(&state.node).map(|_| Rc::as_ptr(&state.node));
+            if let Some(previous) = cohort_programs.insert(config.policy_fingerprint(), program) {
+                if previous != program && (previous.is_some() || program.is_some()) {
+                    return Err(CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason:
+                            "distinct immutable programs require separate lifecycle cost cohorts"
+                                .into(),
+                    });
+                }
+            }
             consumers
                 .entry(config.policy_fingerprint())
                 .or_default()
@@ -3526,6 +3542,25 @@ mod tests {
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    #[test]
+    fn unshared_immutable_nodes_do_not_share_legacy_raw_cost_cohort() {
+        let sum = request("sum", "quantile(0.9, sum_over_time(m[1m]))");
+        let count = request("other", "quantile(0.5, sum_over_time(m[1m]))");
+        let queries = vec![sum.queries[0].clone(), count.queries[0].clone()];
+        let error = materialization_consumers(
+            &queries,
+            PhysicalDeploymentTarget::BackendLocalRemoteWrite,
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("separate lifecycle cost cohorts"),
+            "{error}"
+        );
     }
 
     #[test]
