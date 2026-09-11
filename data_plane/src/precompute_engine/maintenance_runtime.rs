@@ -691,9 +691,9 @@ pub(crate) fn execute_finite_maintenance(
             let sources = ingest
                 .sketch_index
                 .completed_maintenance_coordinates(source, generation)?;
-            if sources.len() > 1 {
+            if sources.len() > 1 || sources.values().any(|populations| populations.len() != 1) {
                 return Err(
-                    "finite maintenance requires synchronized multi-series scheduling".into(),
+                    "finite maintenance requires exactly one physical source population".into(),
                 );
             }
             let existing = ingest
@@ -2361,7 +2361,12 @@ pub(crate) fn affected_materializations(
         let mut frontier = reachable.iter().copied().collect::<Vec<_>>();
         while let Some(producer) = frontier.pop() {
             for edge in &installed.document.edges {
-                if edge.producer == producer && reachable.insert(edge.consumer) {
+                let immutable = matches!(installed.binding.node(edge.consumer),
+                    Some(BackendNodeBinding::Materialization { summary_definition })
+                        if plan.materializations.iter().any(|config|
+                            config.policy_fingerprint() == summary_definition.fingerprint()
+                                && config.derived_input.is_some()));
+                if edge.producer == producer && !immutable && reachable.insert(edge.consumer) {
                     frontier.push(edge.consumer);
                 }
             }

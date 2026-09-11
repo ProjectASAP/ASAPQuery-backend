@@ -119,6 +119,10 @@ impl SketchStore {
                 return Err("immutable input identity or lifetime differs".into());
             }
             let singleton = admission.is_finite_complete()
+                && !matches!(
+                    binding.data_descriptor.source,
+                    asap_types::sds::DataSourceIdentity::Derived { .. }
+                )
                 && bindings
                     .values()
                     .filter(|candidate| candidate.metadata.policy_fp == definition.fingerprint())
@@ -147,6 +151,7 @@ impl SketchStore {
             .clone()
             .ok_or("immutable maintenance requires durable input state")?;
         let mut windows = BTreeMap::new();
+        let mut observed_populations = BTreeSet::new();
         for part in handle.manifest.live_parts_overlapping(start_ms, end_ms) {
             let reader = handle
                 .part_cache
@@ -160,7 +165,9 @@ impl SketchStore {
                 if entry.label.as_ref().map_or(0, |label| label.labels.len()) != keys.len() {
                     return Err("immutable input label arity differs from its descriptor".into());
                 }
-                if Self::rebuild_label_map(&keys, &entry.label) != *group {
+                let population = Self::rebuild_label_map(&keys, &entry.label);
+                observed_populations.insert(population.clone());
+                if population != *group {
                     continue;
                 }
                 let state = reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes)
@@ -185,7 +192,8 @@ impl SketchStore {
             generation: Arc::clone(generation),
             group: group.clone(),
             windows,
-            singleton_population_complete,
+            singleton_population_complete: singleton_population_complete
+                && observed_populations.len() == 1,
         })
     }
 }
