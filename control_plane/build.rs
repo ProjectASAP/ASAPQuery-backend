@@ -29,6 +29,26 @@ fn git_path(repo: &Path, name: &str) -> Option<PathBuf> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let repo = manifest_dir.parent().unwrap_or(&manifest_dir);
+    let lock_path = repo.join("Cargo.lock");
+    println!("cargo:rerun-if-changed={}", lock_path.display());
+    let lock: toml::Value = std::fs::read_to_string(&lock_path)?.parse()?;
+    let planner_source = lock
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|package| package.get("name").and_then(toml::Value::as_str) == Some("asap-types"))
+        .and_then(|package| package.get("source"))
+        .and_then(toml::Value::as_str)
+        .ok_or("Cargo.lock has no resolved ASAPPlanner types source")?;
+    let planner_revision = planner_source
+        .rsplit_once('#')
+        .filter(|(_, revision)| {
+            revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit())
+        })
+        .map(|(_, revision)| revision)
+        .ok_or("ASAPPlanner source must resolve to a Git commit")?;
+    println!("cargo:rustc-env=ASAPPLANNER_REVISION={planner_revision}");
     let revision = std::env::var("ASAPQUERY_BACKEND_REVISION")
         .ok()
         .or_else(|| git_output(repo, &["rev-parse", "HEAD"]))

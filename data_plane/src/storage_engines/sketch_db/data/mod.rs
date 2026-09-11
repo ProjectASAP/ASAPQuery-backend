@@ -70,11 +70,29 @@ pub use asap_types::AggregationType;
 /// `SketchInstanceMetadata.agg_kind`.
 #[derive(Debug, Clone)]
 pub enum SketchConfig {
-    DDSketch { relative_accuracy: f64 },
-    Kll { k: u32 },
-    Hll { precision: u32 },
-    CountSketch { rows: i32, cols: i32 },
-    CountMin { rows: i32, cols: i32 },
+    UnivMon {
+        heap_size: u32,
+        sketch_rows: u32,
+        sketch_cols: u32,
+        layers: u8,
+    },
+    DDSketch {
+        relative_accuracy: f64,
+    },
+    Kll {
+        k: u32,
+    },
+    Hll {
+        precision: u32,
+    },
+    CountSketch {
+        rows: i32,
+        cols: i32,
+    },
+    CountMin {
+        rows: i32,
+        cols: i32,
+    },
 }
 
 /// What kind of aggregation a `sid` identifies. M2.3 generalization
@@ -172,6 +190,20 @@ pub fn agg_kind_for_config(config: &asap_types::aggregation_config::AggregationC
                 };
                 let algorithm = kind.algorithm().clone();
                 let physical = match (kind.algorithm(), kind.params()) {
+                    (
+                        Algorithm::UnivMon,
+                        SketchParams::UnivMon {
+                            heap_size,
+                            sketch_rows,
+                            sketch_cols,
+                            layers,
+                        },
+                    ) => SketchConfig::UnivMon {
+                        heap_size: *heap_size,
+                        sketch_rows: *sketch_rows,
+                        sketch_cols: *sketch_cols,
+                        layers: *layers,
+                    },
                     (Algorithm::DDSketch, SketchParams::DDSketch { alpha }) => {
                         SketchConfig::DDSketch {
                             relative_accuracy: *alpha,
@@ -257,7 +289,9 @@ impl AggKind {
                     SketchAlgorithm::DDSketch | SketchAlgorithm::Kll => {
                         Capability::QuantileApprox(Some(algorithm.clone()))
                     }
-                    SketchAlgorithm::Hll => Capability::CardinalityApprox,
+                    SketchAlgorithm::Hll | SketchAlgorithm::UnivMon => {
+                        Capability::CardinalityApprox
+                    }
                     SketchAlgorithm::Cms | SketchAlgorithm::CountSketch => {
                         Capability::FrequencyEstimate(Some(algorithm.clone()))
                     }
@@ -348,6 +382,7 @@ fn sketch_algorithm_canonical(k: SketchAlgorithm) -> &'static str {
         SketchAlgorithm::DDSketch => "DDSketch",
         SketchAlgorithm::Kll => "Kll",
         SketchAlgorithm::Hll => "Hll",
+        SketchAlgorithm::UnivMon => "UnivMon",
         SketchAlgorithm::CountSketch => "CountSketch",
         SketchAlgorithm::Cms => "CountMin",
         SketchAlgorithm::CmsWithHeap => "CmsWithHeap",
@@ -363,6 +398,12 @@ fn sketch_algorithm_canonical(k: SketchAlgorithm) -> &'static str {
 
 fn sketch_config_canonical(cfg: &SketchConfig) -> String {
     match cfg {
+        SketchConfig::UnivMon {
+            heap_size,
+            sketch_rows,
+            sketch_cols,
+            layers,
+        } => format!("U:{heap_size}:{sketch_rows}:{sketch_cols}:{layers}"),
         SketchConfig::DDSketch { relative_accuracy } => {
             format!("D:{relative_accuracy}")
         }
@@ -403,6 +444,11 @@ impl AccuracyBound {
     /// error envelope.
     pub fn from_config(cfg: &SketchConfig) -> Self {
         match cfg {
+            // Family dimensions alone do not establish a readout error bound.
+            SketchConfig::UnivMon { .. } => Self {
+                epsilon: f64::MAX,
+                confidence: 0.0,
+            },
             SketchConfig::DDSketch { relative_accuracy } => Self {
                 epsilon: *relative_accuracy,
                 confidence: 1.0,

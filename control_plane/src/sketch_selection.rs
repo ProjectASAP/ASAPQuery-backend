@@ -42,7 +42,7 @@ pub fn sketch_type_for_algorithm(h: SketchAlgorithm) -> Option<SketchType> {
             Some(SketchType::CountSketch)
         }
         SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap => Some(SketchType::CountMinSketch),
-        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => None,
+        SketchAlgorithm::UnivMon | SketchAlgorithm::Kmv | SketchAlgorithm::Theta => None,
     }
 }
 

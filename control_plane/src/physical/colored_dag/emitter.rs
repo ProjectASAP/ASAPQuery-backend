@@ -1085,7 +1085,7 @@ pub(crate) fn edge_processor_name(kind: &SketchAlgorithm) -> Result<String, Emit
         // representable here anymore -- they're `ExactKind`, a distinct
         // type post ASAPPlanner#218's split, not a `SketchAlgorithm` variant
         // this function could even be called with.
-        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => {
+        SketchAlgorithm::UnivMon | SketchAlgorithm::Kmv | SketchAlgorithm::Theta => {
             Err(EmitError::NoEdgeProcessor(kind.clone()))
         }
     }

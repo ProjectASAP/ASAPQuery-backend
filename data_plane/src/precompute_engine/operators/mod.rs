@@ -14,6 +14,7 @@ pub mod multiple_min_max_accumulator;
 pub mod multiple_sum_accumulator;
 pub mod sketch_envelope_accumulator;
 pub mod sum_accumulator;
+pub mod univmon_accumulator;
 
 pub use count_min_sketch_accumulator::*;
 pub use count_min_sketch_with_heap_accumulator::*;
