@@ -39,6 +39,10 @@ All 9,000 backend requests were warm, and all 9,000 matched native/backend pairs
 | q06: 12h user-service maximum | 2.27–2.38 ms | 19.92–20.36 ms | 8.37–8.97× | 5,238 B |
 | q23: TopK over 6h retry-backlog maximum | 2.37–2.43 ms | 33.64–35.41 ms | 13.84–14.70× | 6,122 B |
 
+The serial request-time rate (requests divided by summed HTTP request durations, excluding controller gaps) was 399.7–422.3 versus 18.6–19.0 requests/s for q05, 419.7–434.6 versus 45.6–46.4 for q06, and 400.4–414.0 versus 27.2–28.0 for q23. This is not a concurrent saturation-throughput benchmark.
+
+First requests after state construction took 4.99–5.67 versus 72.46–146.82 ms for q05, 4.36–5.14 versus 35.23–40.99 ms for q06, and 4.92–6.24 versus 36.71–47.29 ms for q23. They are separate from the repeated-query medians and do not represent empty filesystem-cache cold starts: construction has already read the source data.
+
 Publication and backfill took approximately 4.29 seconds for q05, 1.77 seconds for q06, and 2.78 seconds for q23. Backend construction CPU was 2.73–2.80, 0.52–0.55, and 1.35–1.38 seconds respectively; the source ClickHouse process additionally used 1.00–1.29, 0.24–0.42, and 0.60–0.84 seconds. State-directory bytes include metadata and are not a comparison against the complete source database.
 
 A separate q05 experiment restarted ClickHouse before each of three ASAP-only and native-only phases. The ASAP phase used a previously validated response only as a correctness oracle, never to construct state, and issued no native query during its 1,000 warm requests. This avoids attributing native query allocations to the ASAP deployment.
