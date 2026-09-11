@@ -81,6 +81,14 @@ fn mixed_workload(
         Some("value".into()),
     );
     config.pane_origin_ms = Some(0);
+    config.table_timestamp_column = Some("timestamp_ms".into());
+    config.table_population = Some(asap_types::table_population::TablePopulation {
+        predicates: vec![asap_types::table_population::TableColumnPredicate {
+            column: "metric".into(),
+            operator: planner_types::pre_asap::CompareOpKind::Eq,
+            value: planner_types::pre_asap::ScalarValue::Utf8("requests".into()),
+        }],
+    });
     let sds = asap_types::summary_catalog::SummaryCatalog::from_materializations(
         72,
         1,
@@ -108,6 +116,7 @@ fn mixed_workload(
             vec![
                 Column::new(time, DataType::Timestamp, false),
                 Column::new(value, DataType::Float64, false),
+                Column::new("metric", DataType::Utf8, false),
             ],
             0,
             vec![],
@@ -202,13 +211,13 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
     let user = std::env::var("CLICKHOUSE_USER").ok();
     let password = std::env::var("CLICKHOUSE_PASSWORD").ok();
     let client = reqwest::Client::new();
-    let sql = "SELECT sums.timestamp, sums.total / divisors.divisor AS ratio FROM (SELECT 2000 AS timestamp, sum(value) AS total FROM telemetry WHERE timestamp_ms >= 0 AND timestamp_ms < 2000) AS sums INNER JOIN divisors ON sums.timestamp = divisors.timestamp";
+    let sql = "SELECT sums.timestamp, sums.total / divisors.divisor AS ratio FROM (SELECT 2000 AS timestamp, sum(value) AS total FROM telemetry WHERE metric = 'requests' AND timestamp_ms >= 0 AND timestamp_ms < 2000) AS sums INNER JOIN divisors ON sums.timestamp = divisors.timestamp";
     for statement in [
         "DROP TABLE IF EXISTS default.telemetry",
         "DROP TABLE IF EXISTS default.divisors",
-        "CREATE TABLE default.telemetry(metric String, labels String, timestamp_ms Int64, value Float64) ENGINE=Memory",
+        "CREATE TABLE default.telemetry(metric String, labels Map(String,String), timestamp_ms Int64, value Float64, wrong_value Float64) ENGINE=Memory",
         "CREATE TABLE default.divisors(timestamp Int64, divisor Float64) ENGINE=Memory",
-        "INSERT INTO default.telemetry VALUES ('telemetry.value','telemetry.value',100,2),('telemetry.value','telemetry.value',1100,3)",
+        "INSERT INTO default.telemetry VALUES ('requests',map('member','a'),0,2,10000),('requests',map('member','b'),1100,3,10000),('errors',map('member','c'),1100,99999,10000),('requests',map('member','a'),2000,88888,10000)",
         "INSERT INTO default.divisors VALUES (2000,10)",
     ] {
         let mut request = client.post(&clickhouse_url).body(statement);
@@ -257,9 +266,11 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
         .arg("--clickhouse-url")
         .arg(&clickhouse_url)
         .arg("--clickhouse-backfill-table")
-        .arg("telemetry")
+        .arg("deployment_default_not_the_job_table")
         .arg("--clickhouse-backfill-database")
         .arg("default")
+        .arg("--clickhouse-backfill-value-column")
+        .arg("wrong_value")
         .arg("--enable-backfill-worker")
         .arg("--precompute-allowed-lateness-ms")
         .arg("0")
@@ -317,7 +328,7 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
             "agg_id": config.policy_fp_u64(),
             "start_ms": 0,
             "end_ms": 2000,
-            "source": {"Prometheus": {"url": "clickhouse://configured"}},
+            "source": {"ClickHouse": {"database": "default", "table": "telemetry"}},
             "windows_total": 1
         }))
         .send()

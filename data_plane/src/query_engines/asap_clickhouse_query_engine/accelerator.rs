@@ -441,10 +441,11 @@ mod tests {
             String::new(),
             "requests".into(),
             None,
-            None,
-            None,
+            Some("asap_e2e.samples".into()),
+            Some("value".into()),
         );
         config.pane_origin_ms = Some(0);
+        config.table_timestamp_column = Some("timestamp_ms".into());
         let sds = SummaryCatalog::from_materializations(41, 1, &[config.clone()]).unwrap();
         let materialization = *sds.materializations.keys().next().unwrap();
         let read = QueryNodeId(0);
@@ -732,7 +733,7 @@ mod tests {
             "CREATE DATABASE IF NOT EXISTS asap_e2e",
             "DROP TABLE IF EXISTS asap_e2e.samples",
             "CREATE TABLE asap_e2e.samples(metric String, labels String, timestamp_ms Int64, value Float64) ENGINE=Memory",
-            "INSERT INTO asap_e2e.samples VALUES ('requests','requests',100,2),('requests','requests',1100,3)",
+            "INSERT INTO asap_e2e.samples VALUES ('requests','requests',100,2),('errors','errors',1100,3)",
         ] {
             let mut request = client.post(&base_url).body(sql);
             if let Some(user) = &user { request = request.basic_auth(user, password.as_ref()); }
@@ -756,6 +757,9 @@ mod tests {
             None,
         );
         cfg.pane_origin_ms = Some(0);
+        cfg.table_name = Some("asap_e2e.samples".into());
+        cfg.table_timestamp_column = Some("timestamp_ms".into());
+        cfg.value_column = Some("value".into());
         let hot = crate::storage_engines::types::HotReloadStreamingConfig::from_arc(Arc::new(
             crate::storage_engines::types::StreamingConfig::new(HashMap::from([(
                 cfg.policy_fp_u64(),
@@ -770,7 +774,7 @@ mod tests {
             table: "samples".into(),
             metric_column: "metric".into(),
             labels_column: "labels".into(),
-            timestamp_ms_column: "timestamp_ms".into(),
+            timestamp_ms_column: "wrong_deployment_timestamp".into(),
             value_column: "value".into(),
             user,
             password,
@@ -792,8 +796,9 @@ mod tests {
         let job = registry.create(
             cfg.policy_fp_u64(),
             (0, 2_000),
-            crate::storage_engines::sketch_db::backfill::BackfillSource::Prometheus {
-                url: "clickhouse://configured".into(),
+            crate::storage_engines::sketch_db::backfill::BackfillSource::ClickHouse {
+                database: "asap_e2e".into(),
+                table: "samples".into(),
             },
             2,
         );
@@ -822,9 +827,9 @@ mod tests {
             ),
         };
         assert_eq!(response.body, "1970-01-01T00:00:02\t50.0\n");
-        let mut exact = client.post(std::env::var("CLICKHOUSE_URL").unwrap()).body(
-            "SELECT sum(value) * 10 FROM asap_e2e.samples WHERE metric='requests' FORMAT TabSeparated",
-        );
+        let mut exact = client
+            .post(std::env::var("CLICKHOUSE_URL").unwrap())
+            .body("SELECT sum(value) * 10 FROM asap_e2e.samples FORMAT TabSeparated");
         if let Some(user) = std::env::var("CLICKHOUSE_USER").ok() {
             exact = exact.basic_auth(user, std::env::var("CLICKHOUSE_PASSWORD").ok());
         }

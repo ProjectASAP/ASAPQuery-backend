@@ -31,6 +31,7 @@ impl ClickHouseReaderConfig {
             ("value column", self.value_column.as_str()),
         ] {
             if value.is_empty()
+                || !value.as_bytes()[0].is_ascii_alphabetic() && !value.starts_with('_')
                 || !value
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
@@ -47,11 +48,20 @@ impl ClickHouseReaderConfig {
 pub struct ClickHouseReader {
     config: ClickHouseReaderConfig,
     http: reqwest::Client,
+    population: Option<asap_types::table_population::TablePopulation>,
+    output_metric: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ClickHouseLabels {
+    Series(String),
+    Map(std::collections::BTreeMap<String, String>),
 }
 
 #[derive(Deserialize)]
 struct ClickHouseSampleRow {
-    labels: String,
+    labels: ClickHouseLabels,
     timestamp_ms: i64,
     value: f64,
 }
@@ -62,14 +72,53 @@ impl ClickHouseReader {
         Ok(Self {
             config,
             http: reqwest::Client::new(),
+            population: None,
+            output_metric: None,
         })
     }
 
     fn sql(&self) -> String {
         let c = &self.config;
+        let population = self.population.as_ref().map_or_else(
+            || format!("{} = {{metric:String}}", c.metric_column),
+            |population| {
+                if population.predicates.is_empty() {
+                    return "1".into();
+                }
+                population
+                    .predicates
+                    .iter()
+                    .enumerate()
+                    .map(|(index, predicate)| {
+                        use planner_types::pre_asap::{CompareOpKind, ScalarValue};
+                        let operator = match predicate.operator {
+                            CompareOpKind::Eq => "=",
+                            CompareOpKind::Ne => "!=",
+                            CompareOpKind::Lt => "<",
+                            CompareOpKind::Le => "<=",
+                            CompareOpKind::Gt => ">",
+                            CompareOpKind::Ge => ">=",
+                            _ => unreachable!("validated table predicate"),
+                        };
+                        let kind = match predicate.value {
+                            ScalarValue::Utf8(_) => "String",
+                            ScalarValue::Int64(_) => "Int64",
+                            ScalarValue::Float64(_) => "Float64",
+                            ScalarValue::Boolean(_) => "Bool",
+                            ScalarValue::Null => unreachable!("validated table literal"),
+                        };
+                        format!(
+                            "{} {operator} {{population_{index}:{kind}}}",
+                            predicate.column
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            },
+        );
         format!(
             "SELECT {labels} AS labels, {timestamp} AS timestamp_ms, {value} AS value \
-             FROM {database}.{table} WHERE {metric} = {{metric:String}} \
+             FROM {database}.{table} WHERE {population} \
              AND {timestamp} >= {{start_ms:Int64}} AND {timestamp} < {{end_ms:Int64}} \
              ORDER BY labels, timestamp_ms FORMAT JSONEachRow",
             labels = c.labels_column,
@@ -77,22 +126,40 @@ impl ClickHouseReader {
             value = c.value_column,
             database = c.database,
             table = c.table,
-            metric = c.metric_column,
         )
     }
 }
 
-/// Adds ClickHouse to the existing backfill lifecycle without extending the
-/// shared `BackfillSource` enum. Jobs opt in with the reserved
-/// `Prometheus { url: "clickhouse://configured" }` source marker; all other
-/// sources retain the default factory behavior.
+/// Resolve a typed table source using deployment-local connection settings.
 pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactory {
     let fallback = super::service::default_reader_factory();
-    Arc::new(move |source| match source {
-        BackfillSource::Prometheus { url } if url == "clickhouse://configured" => {
-            Ok(Arc::new(ClickHouseReader::new(config.clone())?) as Arc<dyn RawSampleReader>)
+    Arc::new(move |source, materialization| match source {
+        BackfillSource::ClickHouse { database, table } => {
+            if database != &config.database {
+                return Err(RawSampleReaderError::Other {
+                    reason: "ClickHouse source database differs from the deployment database"
+                        .into(),
+                }
+                .into());
+            }
+            let mut source_config = config.clone();
+            source_config.database = database.clone();
+            source_config.table = table.clone();
+            source_config.timestamp_ms_column = materialization
+                .table_timestamp_column
+                .clone()
+                .ok_or("table materialization has no timestamp projection")?;
+            source_config.value_column = materialization
+                .value_column
+                .clone()
+                .ok_or("table materialization has no value projection")?;
+            materialization.population_filter_canonical()?;
+            let mut reader = ClickHouseReader::new(source_config)?;
+            reader.population = Some(materialization.table_population.clone().unwrap_or_default());
+            reader.output_metric = Some(materialization.metric.clone());
+            Ok(Arc::new(reader) as Arc<dyn RawSampleReader>)
         }
-        source => fallback(source),
+        source => fallback(source, materialization),
     })
 }
 
@@ -116,6 +183,19 @@ impl RawSampleReader for ClickHouseReader {
             ("param_start_ms", start_ms.as_str()),
             ("param_end_ms", end_ms.as_str()),
         ]);
+        if let Some(population) = &self.population {
+            for (index, predicate) in population.predicates.iter().enumerate() {
+                use planner_types::pre_asap::ScalarValue;
+                let value = match &predicate.value {
+                    ScalarValue::Utf8(value) => value.clone(),
+                    ScalarValue::Int64(value) => value.to_string(),
+                    ScalarValue::Float64(value) => value.to_string(),
+                    ScalarValue::Boolean(value) => value.to_string(),
+                    ScalarValue::Null => unreachable!("validated table literal"),
+                };
+                request = request.query(&[(format!("param_population_{index}"), value)]);
+            }
+        }
         if let Some(user) = &self.config.user {
             request = request.basic_auth(user, self.config.password.as_ref());
         }
@@ -143,7 +223,35 @@ impl RawSampleReader for ClickHouseReader {
                     reason: error.to_string(),
                 })?;
             let sample = RawSample {
-                labels: row.labels,
+                labels: match row.labels {
+                    ClickHouseLabels::Series(series) => {
+                        if self.population.is_some() {
+                            let metric = self.output_metric.as_deref().unwrap_or(&filter.metric);
+                            let suffix = series.find('{').map_or("", |start| &series[start..]);
+                            format!("{metric}{suffix}")
+                        } else {
+                            series
+                        }
+                    }
+                    ClickHouseLabels::Map(labels) => {
+                        let metric = self.output_metric.as_deref().unwrap_or(&filter.metric);
+                        let labels = labels
+                            .iter()
+                            .map(|(key, value)| {
+                                format!(
+                                    "{key}={}",
+                                    serde_json::to_string(value).expect("label serialization")
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        if labels.is_empty() {
+                            metric.into()
+                        } else {
+                            format!("{metric}{{{labels}}}")
+                        }
+                    }
+                },
                 timestamp_ms: row.timestamp_ms,
                 value: row.value,
             };
@@ -187,12 +295,75 @@ mod tests {
     }
 
     #[test]
-    fn configured_source_marker_enters_clickhouse_backfill_lifecycle() {
+    fn table_population_values_are_parameters_not_sql_fragments() {
+        let mut reader = ClickHouseReader::new(config("samples")).unwrap();
+        reader.population = Some(asap_types::table_population::TablePopulation {
+            predicates: vec![asap_types::table_population::TableColumnPredicate {
+                column: "metric".into(),
+                operator: planner_types::pre_asap::CompareOpKind::Eq,
+                value: planner_types::pre_asap::ScalarValue::Utf8("requests' OR 1=1 --".into()),
+            }],
+        });
+        let sql = reader.sql();
+        assert!(sql.contains("metric = {population_0:String}"));
+        assert!(!sql.contains("requests"));
+        assert!(!sql.contains("metric = {metric:String}"));
+    }
+
+    #[test]
+    fn unfiltered_table_population_does_not_filter_by_output_metric() {
+        let mut reader = ClickHouseReader::new(config("samples")).unwrap();
+        reader.population = Some(Default::default());
+        let sql = reader.sql();
+        assert!(sql.contains("WHERE 1 AND"));
+        assert!(!sql.contains("{metric:String}"));
+    }
+
+    #[test]
+    fn typed_source_enters_clickhouse_backfill_lifecycle() {
+        let mut materialization = asap_types::PrecomputeMaterialization::new(
+            asap_types::AggregationType::Sum,
+            String::new(),
+            Default::default(),
+            asap_types::KeyByLabelNames::empty(),
+            asap_types::KeyByLabelNames::empty(),
+            asap_types::KeyByLabelNames::empty(),
+            String::new(),
+            1,
+            1,
+            asap_types::WindowKind::Tumbling,
+            String::new(),
+            "samples.value".into(),
+            None,
+            Some("another_table".into()),
+            Some("value".into()),
+        );
         let factory = clickhouse_reader_factory(config("samples"));
-        let reader = factory(&BackfillSource::Prometheus {
-            url: "clickhouse://configured".into(),
-        })
+        materialization.table_timestamp_column = Some("timestamp_ms".into());
+        let reader = factory(
+            &BackfillSource::ClickHouse {
+                database: "metrics".into(),
+                table: "another_table".into(),
+            },
+            &materialization,
+        )
         .unwrap();
         assert_eq!(reader.source_name(), "ClickHouseReader");
+        assert!(factory(
+            &BackfillSource::ClickHouse {
+                database: "another_database".into(),
+                table: "samples".into(),
+            },
+            &materialization
+        )
+        .is_err());
+        assert!(factory(
+            &BackfillSource::ClickHouse {
+                database: "metrics".into(),
+                table: "samples; DROP TABLE x".into(),
+            },
+            &materialization
+        )
+        .is_err());
     }
 }
