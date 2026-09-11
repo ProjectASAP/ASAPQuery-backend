@@ -28,8 +28,9 @@
 //!   semantics — two policies with the same shape but different
 //!   retention are *the same policy* for ingest/query routing
 //!   purposes; retention is a separate concern).
-//! - `table_name` / `value_column` (SQL-mode wire shape; folded into
-//!   `metric` upstream for time-series mode).
+//! SQL source table, value projection, timestamp projection, and typed
+//! population are included explicitly; the output metric is not a substitute
+//! for these source semantics.
 //!
 //! ## Hash function
 //!
