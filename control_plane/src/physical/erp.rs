@@ -1,7 +1,8 @@
 //! Deployment adapter for ASAPPlanner Error–Resource Profiles.
 
 use asap_aware_mapping::erp::{
-    AccuracyMode, ErpArtifact, ErpDataShape, ErpNearestSelectionRequest, ErpSelectionRequest,
+    AccuracyMode, ErpArtifact, ErpMultiFitSelectionRequest, ErpSelectionRequest, ErpShapeFit,
+    ErpShapeObservation,
 };
 use planner_types::post_asap::{SketchAlgorithm, SketchParams};
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ErpObservedShape {
-    pub shape: ErpDataShape,
+    pub observation: ErpShapeObservation,
     /// Largest interval rate divided by the median non-zero interval rate.
     pub burst_ratio: f64,
 }
@@ -22,58 +23,103 @@ pub struct ErpObservedShape {
 #[derive(Debug)]
 pub struct ErpShapeObserver {
     frequencies: HashMap<String, u64>,
-    interval_updates: Vec<u64>,
+    interval_updates: HashMap<usize, u64>,
     max_observed_keys: usize,
+    max_observed_intervals: usize,
     updates: u64,
+    invalid: bool,
 }
 
 impl ErpShapeObserver {
     pub fn new(max_observed_keys: usize) -> Result<Self, &'static str> {
-        if max_observed_keys == 0 {
-            return Err("max_observed_keys must be positive");
+        Self::with_limits(max_observed_keys, 256)
+    }
+
+    pub fn with_limits(
+        max_observed_keys: usize,
+        max_observed_intervals: usize,
+    ) -> Result<Self, &'static str> {
+        if max_observed_keys == 0 || max_observed_intervals == 0 {
+            return Err("observation limits must be positive");
         }
         Ok(Self {
             frequencies: HashMap::new(),
-            interval_updates: Vec::new(),
+            interval_updates: HashMap::new(),
             max_observed_keys,
+            max_observed_intervals,
             updates: 0,
+            invalid: false,
         })
     }
 
     pub fn observe(&mut self, key: &str, interval: usize) -> Result<(), &'static str> {
+        if self.invalid {
+            return Err("ERP observation was invalidated; start a fresh observation window");
+        }
+        if key.len() > 4096 {
+            self.invalid = true;
+            return Err("ERP shape observer key size exceeded");
+        }
         if !self.frequencies.contains_key(key) && self.frequencies.len() == self.max_observed_keys {
+            self.invalid = true;
             return Err("ERP shape observer cardinality cap exceeded");
         }
-        *self.frequencies.entry(key.to_owned()).or_default() += 1;
-        if self.interval_updates.len() <= interval {
-            self.interval_updates.resize(interval + 1, 0);
+        if !self.interval_updates.contains_key(&interval)
+            && self.interval_updates.len() == self.max_observed_intervals
+        {
+            self.invalid = true;
+            return Err("ERP shape observer interval cap exceeded");
         }
-        self.interval_updates[interval] += 1;
-        self.updates += 1;
+        let Some(updates) = self.updates.checked_add(1) else {
+            self.invalid = true;
+            return Err("ERP shape observer count overflow");
+        };
+        *self.frequencies.entry(key.to_owned()).or_default() += 1;
+        *self.interval_updates.entry(interval).or_default() += 1;
+        self.updates = updates;
         Ok(())
     }
 
-    pub fn snapshot(&self, uniform_exponent_threshold: f64) -> Option<ErpObservedShape> {
-        if self.frequencies.is_empty()
-            || !uniform_exponent_threshold.is_finite()
-            || uniform_exponent_threshold < 0.0
-        {
+    pub fn snapshot(&self) -> Option<ErpObservedShape> {
+        if self.frequencies.is_empty() || self.invalid {
             return None;
         }
         let mut counts: Vec<_> = self.frequencies.values().copied().collect();
         counts.sort_unstable_by(|left, right| right.cmp(left));
         let exponent = fit_zipf_exponent(&counts);
-        let (family, parameters) = if exponent > uniform_exponent_threshold {
-            (
-                "zipf".to_owned(),
-                BTreeMap::from([("exponent".to_owned(), exponent)]),
-            )
-        } else {
-            ("uniform".to_owned(), BTreeMap::new())
-        };
+        let fits = [("uniform", 0.0), ("zipf", exponent)]
+            .into_iter()
+            // Zipf(0) is exactly uniform; duplicate models are not ambiguity.
+            .filter(|(family, _)| *family != "zipf" || counts.first() != counts.last())
+            .map(|(family, slope)| {
+                let expected: Vec<_> = (1..=counts.len())
+                    .map(|rank| (rank as f64).powf(-slope))
+                    .collect();
+                let total: f64 = expected.iter().sum();
+                let distance = counts
+                    .iter()
+                    .zip(expected)
+                    .map(|(count, expected)| {
+                        (*count as f64 / self.updates as f64 - expected / total).abs()
+                    })
+                    .sum::<f64>()
+                    / 2.0;
+                ErpShapeFit {
+                    family: family.into(),
+                    parameters: if family == "zipf" {
+                        BTreeMap::from([("exponent".into(), slope)])
+                    } else {
+                        BTreeMap::new()
+                    },
+                    goodness_of_fit: distance,
+                    // A fit-quality score, not an estimator tail-probability claim.
+                    confidence: (1.0 - distance) * (1.0 - 1.0 / (self.updates as f64).sqrt()),
+                }
+            })
+            .collect();
         let mut nonzero: Vec<_> = self
             .interval_updates
-            .iter()
+            .values()
             .copied()
             .filter(|count| *count > 0)
             .collect();
@@ -81,11 +127,11 @@ impl ErpShapeObserver {
         let median = nonzero.get(nonzero.len() / 2).copied().unwrap_or(1);
         let peak = nonzero.last().copied().unwrap_or(median);
         Some(ErpObservedShape {
-            shape: ErpDataShape {
+            observation: ErpShapeObservation {
                 cardinality: self.frequencies.len() as u64,
-                family,
-                parameters,
-                benchmark_events: self.updates,
+                observed_events: self.updates,
+                fits,
+                empirical_fingerprint: None,
             },
             burst_ratio: peak as f64 / median as f64,
         })
@@ -233,7 +279,7 @@ pub struct ErpPlanningInput {
     /// Runtime-observed shape. If present, exact descriptor equality is
     /// replaced by bounded nearest-profile matching.
     #[serde(default)]
-    pub observed_shape: Option<ErpDataShape>,
+    pub observed_shape: Option<ErpShapeObservation>,
     /// Runtime-samples ring key from which the backend resolves the freshest
     /// `erp_observed_shape` payload before compiling a plan.
     #[serde(default)]
@@ -282,7 +328,7 @@ impl ErpPlanningInput {
         })?;
         let observed: ErpObservedShape = serde_json::from_value(value.clone())
             .map_err(|error| format!("invalid erp_observed_shape: {error}"))?;
-        self.observed_shape = Some(observed.shape);
+        self.observed_shape = Some(observed.observation);
         Ok(())
     }
 }
@@ -293,6 +339,9 @@ pub struct ErpShapeMatchPolicy {
     pub minimum_benchmark_events: u64,
     pub max_log2_cardinality_distance: f64,
     pub max_parameter_distance: f64,
+    pub max_goodness_of_fit: f64,
+    pub minimum_confidence: f64,
+    pub minimum_confidence_margin: f64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -340,11 +389,19 @@ impl ErpPlanningInput {
         max_error: f64,
         theoretical: SketchParams,
     ) -> ErpParameterDecision {
-        let allowed_sketches = self
-            .artifact
+        // Runtime admissibility belongs before ranking: an unusable cheap
+        // profile must not hide a more expensive executable alternative.
+        let mut artifact = self.artifact.clone();
+        artifact.records.retain(|row| {
+            sketch_name_matches(&row.sketch, &algorithm)
+                && parse_params(&algorithm, &row.parameters).is_some_and(|params| {
+                    self.runtime
+                        .supports(&algorithm, &params, Some(row.resources.memory_bytes))
+                })
+        });
+        let allowed_sketches = artifact
             .records
             .iter()
-            .filter(|row| sketch_name_matches(&row.sketch, &algorithm))
             .map(|row| row.sketch.clone())
             .collect();
         let request = ErpSelectionRequest {
@@ -368,22 +425,20 @@ impl ErpPlanningInput {
         let empirical = if request.allowed_sketches.is_empty() {
             Err(asap_aware_mapping::erp::ErpError::NoApplicableConfiguration)
         } else {
-            let custom_dataset = self.distribution.pointer("/workload/external").is_some();
-            let selected = match (custom_dataset, &self.observed_shape, self.shape_match) {
-                // Custom/external datasets intentionally have no portable
-                // shape descriptor. Their complete distribution identity is
-                // the applicability key even if runtime observations exist.
-                (true, _, _) => self.artifact.select(&request),
-                (false, Some(observed), Some(policy)) => {
-                    self.artifact.select_nearest(&ErpNearestSelectionRequest {
+            let selected = match (&self.observed_shape, self.shape_match) {
+                (Some(observed), Some(policy)) => {
+                    artifact.select_multi_fit(&ErpMultiFitSelectionRequest {
                         selection: request.clone(),
                         observed: observed.clone(),
                         minimum_benchmark_events: policy.minimum_benchmark_events,
                         max_log2_cardinality_distance: policy.max_log2_cardinality_distance,
                         max_parameter_distance: policy.max_parameter_distance,
+                        max_goodness_of_fit: policy.max_goodness_of_fit,
+                        minimum_confidence: policy.minimum_confidence,
+                        minimum_confidence_margin: policy.minimum_confidence_margin,
                     })
                 }
-                (false, None, None) => self.artifact.select(&request),
+                (None, None) => artifact.select(&request),
                 _ => Err(asap_aware_mapping::erp::ErpError::Invalid(
                     "observed_shape and shape_match must be supplied together",
                 )),
@@ -652,6 +707,19 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn unusable_cheapest_profile_does_not_hide_executable_alternative() {
+        let mut policy = input(ErpAccuracyMode::Hybrid);
+        let mut unusable = policy.artifact.records[0].clone();
+        unusable.id = "invalid-cheapest".into();
+        unusable.parameters = serde_json::json!({"rows": 0, "cols": 0});
+        unusable.resources.memory_bytes = 1.0;
+        policy.artifact.records.insert(0, unusable);
+        assert!(matches!(policy.select(SketchAlgorithm::Cms, 0.01,
+            SketchParams::Cms { width: 4096, depth: 5 }),
+            ErpParameterDecision::Empirical { record_id, .. } if record_id == "cms-512"));
+    }
+
     /// Distribution drift in Hybrid mode preserves the analytical fallback.
     #[test]
     fn hybrid_drift_falls_back_to_theoretical_parameters() {
@@ -701,10 +769,19 @@ mod tests {
                 observer.observe("a", interval).unwrap();
             }
         }
-        let observed = observer.snapshot(0.05).unwrap();
-        assert_eq!(observed.shape.cardinality, 4);
-        assert_eq!(observed.shape.family, "zipf");
-        assert!(observed.shape.parameters["exponent"] > 1.0);
+        let observed = observer.snapshot().unwrap();
+        assert_eq!(observed.observation.cardinality, 4);
+        assert_eq!(observed.observation.fits.len(), 2);
+        assert!(
+            observed
+                .observation
+                .fits
+                .iter()
+                .find(|fit| fit.family == "zipf")
+                .unwrap()
+                .parameters["exponent"]
+                > 1.0
+        );
         assert!(observed.burst_ratio > 30.0);
     }
 
@@ -718,11 +795,10 @@ mod tests {
             schema_version: 1,
             payload: serde_json::json!({
                 "erp_observed_shape": {
-                    "shape": {
+                    "observation": {
                         "cardinality": 1000,
-                        "family": "zipf",
-                        "parameters": {"exponent": 1.1},
-                        "benchmark_events": 500000
+                        "observed_events": 500000,
+                        "fits": [{"family": "zipf", "parameters": {"exponent": 1.1}, "goodness_of_fit": 0.01, "confidence": 0.99}]
                     },
                     "burst_ratio": 2.5
                 }
@@ -746,21 +822,84 @@ mod tests {
             observer.observe("b", 0),
             Err("ERP shape observer cardinality cap exceeded")
         );
+        assert!(observer.snapshot().is_none());
+        assert!(observer.observe("a", 0).is_err());
+    }
+
+    #[test]
+    fn sparse_intervals_and_overflow_cannot_publish_partial_observations() {
+        let mut observer = ErpShapeObserver::with_limits(2, 2).unwrap();
+        observer.observe("a", usize::MAX).unwrap();
+        observer.observe("a", 0).unwrap();
+        assert_eq!(observer.interval_updates.len(), 2);
+        assert!(observer.observe("a", 1).is_err());
+        assert!(observer.snapshot().is_none());
+        let mut observer = ErpShapeObserver::new(2).unwrap();
+        observer.observe("a", 0).unwrap();
+        observer.updates = u64::MAX;
+        assert!(observer.observe("a", 0).is_err());
+        assert!(observer.snapshot().is_none());
+    }
+
+    #[test]
+    fn uniform_observation_matches_without_degenerate_zipf_ambiguity() {
+        let mut observer = ErpShapeObserver::new(4).unwrap();
+        for _ in 0..1000 {
+            for key in ["a", "b", "c", "d"] {
+                observer.observe(key, 0).unwrap();
+            }
+        }
+        let observed = observer.snapshot().unwrap().observation;
+        assert_eq!(observed.fits.len(), 1);
+        assert_eq!(observed.fits[0].family, "uniform");
+        let mut policy = input(ErpAccuracyMode::Hybrid);
+        policy.artifact.records[0].distribution = serde_json::json!({"erp_shape": {
+            "cardinality": 4, "family": "uniform", "parameters": {},
+            "benchmark_events": 4000
+        }});
+        policy.observed_shape = Some(observed);
+        policy.shape_match = Some(ErpShapeMatchPolicy {
+            minimum_benchmark_events: 1000,
+            max_log2_cardinality_distance: 1.0,
+            max_parameter_distance: 0.1,
+            max_goodness_of_fit: 0.1,
+            minimum_confidence: 0.9,
+            minimum_confidence_margin: 0.05,
+        });
+        assert!(matches!(
+            policy.select(
+                SketchAlgorithm::Cms,
+                0.01,
+                SketchParams::Cms {
+                    width: 4096,
+                    depth: 5
+                }
+            ),
+            ErpParameterDecision::Empirical { .. }
+        ));
     }
 
     #[test]
     fn nearest_profile_miss_keeps_hybrid_fallback() {
         let mut policy = input(ErpAccuracyMode::Hybrid);
-        policy.observed_shape = Some(ErpDataShape {
+        policy.observed_shape = Some(ErpShapeObservation {
             cardinality: 1_000_000,
-            family: "zipf".into(),
-            parameters: BTreeMap::from([("exponent".into(), 2.0)]),
-            benchmark_events: 10_000,
+            observed_events: 10_000,
+            fits: vec![ErpShapeFit {
+                family: "zipf".into(),
+                parameters: BTreeMap::from([("exponent".into(), 2.0)]),
+                goodness_of_fit: 0.01,
+                confidence: 0.99,
+            }],
+            empirical_fingerprint: None,
         });
         policy.shape_match = Some(ErpShapeMatchPolicy {
             minimum_benchmark_events: 1_000,
             max_log2_cardinality_distance: 1.0,
             max_parameter_distance: 0.2,
+            max_goodness_of_fit: 0.2,
+            minimum_confidence: 0.5,
+            minimum_confidence_margin: 0.05,
         });
         let theory = SketchParams::Cms {
             width: 4096,
@@ -773,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_dataset_identity_is_exact_even_with_runtime_shape() {
+    fn custom_dataset_can_match_an_evidenced_shape_without_same_identity() {
         let mut policy = input(ErpAccuracyMode::Hybrid);
         policy.distribution = serde_json::json!({
             "workload": {"external": {"dataset": "customer-a"}}
@@ -787,16 +926,24 @@ mod tests {
                 "benchmark_events": 100000
             }
         });
-        policy.observed_shape = Some(ErpDataShape {
+        policy.observed_shape = Some(ErpShapeObservation {
             cardinality: 1000,
-            family: "zipf".into(),
-            parameters: BTreeMap::from([("exponent".into(), 1.1)]),
-            benchmark_events: 100000,
+            observed_events: 100000,
+            fits: vec![ErpShapeFit {
+                family: "zipf".into(),
+                parameters: BTreeMap::from([("exponent".into(), 1.1)]),
+                goodness_of_fit: 0.01,
+                confidence: 0.99,
+            }],
+            empirical_fingerprint: None,
         });
         policy.shape_match = Some(ErpShapeMatchPolicy {
             minimum_benchmark_events: 1000,
             max_log2_cardinality_distance: 1.0,
             max_parameter_distance: 0.2,
+            max_goodness_of_fit: 0.2,
+            minimum_confidence: 0.5,
+            minimum_confidence_margin: 0.05,
         });
         assert!(matches!(
             policy.select(
@@ -807,7 +954,7 @@ mod tests {
                     depth: 5,
                 }
             ),
-            ErpParameterDecision::TheoreticalFallback { .. }
+            ErpParameterDecision::Empirical { .. }
         ));
     }
 }
