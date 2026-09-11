@@ -389,6 +389,14 @@ impl PrecomputePlan {
         }
         let mut materializations = BTreeSet::new();
         for materialization in &self.materializations {
+            if materialization.table_name.is_none()
+                && !materialization.grouping_labels.is_legacy_labels()
+            {
+                return Err(PrecomputePlanError::CatalogContract(
+                    "time-series grouping requires non-null string labels".into(),
+                ));
+            }
+
             materialization
                 .grouping_labels
                 .validate()
