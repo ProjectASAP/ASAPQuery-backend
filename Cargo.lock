@@ -462,6 +462,7 @@ dependencies = [
  "asap-types",
  "base64 0.21.7",
  "clap 4.6.1",
+ "promql-parser",
  "serde",
  "serde_json",
  "serde_yaml",

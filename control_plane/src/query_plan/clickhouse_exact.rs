@@ -384,8 +384,8 @@ mod original_tests {
             if sql.contains("sum(value)") && sql.contains("argMax") {
                 use crate::physical::post_asap::{PhysicalExpr, PostAsapPlan};
                 use crate::query_plan::{
-                    FallbackPolicy, FixedEvaluationRange, InstantExecution, QueryPlanEntry,
-                    QueryPlanError, QueryPlanNode,
+                    FallbackPolicy, FixedEvaluationRange, InstantExecution, QueryPlanError,
+                    QueryPlanNode,
                 };
                 let planned =
                     crate::clickhouse::plan_clickhouse_sql(sql, &catalog, AccuracyTarget::Exact)
@@ -394,7 +394,7 @@ mod original_tests {
                 let PhysicalExpr::Committed(PostAsapPlan::Summary(root)) = planned.physical else {
                     panic!("missing selected SQL DAG")
                 };
-                let entry = QueryPlanEntry::compile_bound_relational(
+                let entry = crate::query_plan::compile_bound_relational(
                     "test".into(),
                     planned.canonical_sql,
                     &root,

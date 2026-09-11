@@ -183,7 +183,7 @@ pub async fn compile_automatic_clickhouse_workload(
             .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?,
     );
     precompute.executable_dags = installed_dags;
-    let mut transmission = TransmissionPlan::build(
+    let mut transmission = crate::physical::compiler::compile_transmission_plan(
         request.envelope.clone(),
         &precompute,
         &std::collections::BTreeMap::new(),
@@ -360,7 +360,7 @@ where
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     let mut materialization_nodes = std::collections::BTreeMap::new();
     let mut query_nodes = std::collections::BTreeMap::new();
-    let executable = QueryPlanEntry::compile_bound_relational_mapped(
+    let executable = crate::query_plan::compile_bound_relational_mapped(
         query.sql.clone(),
         planned.canonical_sql.clone(),
         &root,
@@ -1010,9 +1010,12 @@ mod tests {
         let mut precompute =
             PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
         precompute.summary_catalog = Some(sds.reference().unwrap());
-        let mut transmission =
-            TransmissionPlan::build(envelope, &precompute, &std::collections::BTreeMap::new())
-                .unwrap();
+        let mut transmission = crate::physical::compiler::compile_transmission_plan(
+            envelope,
+            &precompute,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
         transmission.summary_catalog = Some(sds.reference().unwrap());
         let timestamped = |time_name: &str, value_name: &str| {
             Schema::with_time_index(
@@ -1204,7 +1207,7 @@ mod tests {
         request.precompute_plan =
             PrecomputePlan::build_backend_local(envelope.clone(), vec![config]).unwrap();
         request.precompute_plan.summary_catalog = Some(request.sds.reference().unwrap());
-        request.transmission_plan = TransmissionPlan::build(
+        request.transmission_plan = crate::physical::compiler::compile_transmission_plan(
             envelope,
             &request.precompute_plan,
             &std::collections::BTreeMap::new(),

@@ -3,10 +3,10 @@
 //! query execution checks only reachable IDs and their requested capabilities.
 use std::collections::{BTreeMap, BTreeSet};
 
+use asap_types::query_plan::{ExactReadout, QueryPlanEntry, QueryPlanNode, QueryReadout};
 use asap_types::sds::{SummaryDefinitionId, SummaryDescriptor, SummaryOperator};
 use asap_types::summary_catalog::SummaryCatalog;
 use asap_types::AggregationType;
-use control_plane::query_plan::{ExactReadout, QueryPlanEntry, QueryPlanNode, QueryReadout};
 
 use crate::query_engines::EngineError;
 

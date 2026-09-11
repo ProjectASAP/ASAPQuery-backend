@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome};
-use control_plane::query_plan::{QueryNodeId, QueryPlanNode};
+use asap_types::query_plan::{QueryNodeId, QueryPlanNode};
 use control_plane::types_v2::AccuracyTarget;
 
 use crate::query_engines::asap_query_engine::physical_dag::{self, QueryNodeRuntime};
@@ -82,7 +82,7 @@ pub fn execute_post_asap_readout(
 /// Installed QueryPlan materialization resolution occurs before this legacy test helper.
 pub fn execute_query_plan_readout(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &asap_types::query_plan::QueryPlanEntry,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
@@ -92,8 +92,8 @@ pub fn execute_query_plan_readout(
 
 pub fn execute_query_plan_from_readout(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
-    root: control_plane::query_plan::QueryNodeId,
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    root: asap_types::query_plan::QueryNodeId,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
@@ -103,7 +103,7 @@ pub fn execute_query_plan_from_readout(
 
 pub fn execute_query_plan_instant(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &asap_types::query_plan::QueryPlanEntry,
     now_ms: u64,
 ) -> Result<(PostAsapReadoutOutcome, u64), LoweringSkip> {
     let t0_ms = if entry.instant.full_history {
@@ -476,11 +476,11 @@ fn intersect_coverage(left: Option<(u64, u64)>, right: Option<(u64, u64)>) -> Op
 }
 
 fn reduce_sum_values(
-    grouping: &control_plane::query_plan::PhysicalGrouping,
+    grouping: &asap_types::query_plan::PhysicalGrouping,
     values: &[(BTreeMap<String, String>, SummaryValue)],
     coverage: Option<(u64, u64)>,
 ) -> Result<PhysicalQueryOutput, PhysicalNodeError> {
-    let control_plane::query_plan::PhysicalGrouping::Reduce(keys) = grouping else {
+    let asap_types::query_plan::PhysicalGrouping::Reduce(keys) = grouping else {
         return Ok(PhysicalQueryOutput::Value(values.to_vec(), coverage));
     };
     let mut groups = BTreeMap::new();
@@ -519,7 +519,7 @@ fn reduce_sum_values(
 
 fn execute_physical_query_plan(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &asap_types::query_plan::QueryPlanEntry,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
@@ -529,8 +529,8 @@ fn execute_physical_query_plan(
 
 fn execute_physical_query_payload(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
-    root: control_plane::query_plan::QueryNodeId,
+    entry: &asap_types::query_plan::QueryPlanEntry,
+    root: asap_types::query_plan::QueryNodeId,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
@@ -793,7 +793,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let PhysicalQueryOutput::Value(result, _) = reduce_sum_values(
-            &control_plane::query_plan::PhysicalGrouping::Reduce(vec!["service".into()]),
+            &asap_types::query_plan::PhysicalGrouping::Reduce(vec!["service".into()]),
             &values,
             Some((1000, 2000)),
         )
@@ -907,22 +907,22 @@ mod tests {
         register_hll(&idx, 2, "worker", &["b", "c"]);
         let node = plan_promql_to_post_asap(&idx, "count(unique_users)", accuracy())
             .expect("compile-stage fixture");
-        let canonical = control_plane::query_plan::canonical_promql("count(unique_users)").unwrap();
-        let entry = control_plane::query_plan::QueryPlanEntry::compile_bound(
+        let canonical = asap_types::query_plan::canonical_promql("count(unique_users)").unwrap();
+        let entry = control_plane::query_plan::compile_bound(
             "q-cardinality".into(),
             canonical,
             &node,
-            control_plane::query_plan::InstantExecution {
+            asap_types::query_plan::InstantExecution {
                 lookback_ms: 60_000,
                 full_history: false,
                 cumulative_readout: true,
             },
-            control_plane::query_plan::FallbackPolicy::ExactBackend,
+            asap_types::query_plan::FallbackPolicy::ExactBackend,
             |_node, _family| {
-                Ok(control_plane::query_plan::MaterializationBinding {
+                Ok(asap_types::query_plan::MaterializationBinding {
                     item_labels: Vec::new(),
                     materialization: asap_types::PolicyFingerprint(123).into(),
-                    output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
+                    output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                     window_ms: 60_000,
                     pane_origin_ms: Some(2_000),
                     readout_lookback_ms: Some(60_000),
@@ -1058,27 +1058,27 @@ mod tests {
             );
         }
 
-        let entry = control_plane::query_plan::QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
+        let entry = asap_types::query_plan::QueryPlanEntry {
+            language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "q-rate".into(),
             canonical_query: "rate(requests_total[1m])".into(),
             fixed_evaluation: None,
-            root: control_plane::query_plan::QueryNodeId(0),
+            root: asap_types::query_plan::QueryNodeId(0),
             nodes: BTreeMap::from([
                 (
-                    control_plane::query_plan::QueryNodeId(0),
+                    asap_types::query_plan::QueryNodeId(0),
                     QueryPlanNode::ExactReadout {
-                        input: control_plane::query_plan::QueryNodeId(1),
-                        readout: control_plane::query_plan::ExactReadout::Sum,
+                        input: asap_types::query_plan::QueryNodeId(1),
+                        readout: asap_types::query_plan::ExactReadout::Sum,
                     },
                 ),
                 (
-                    control_plane::query_plan::QueryNodeId(1),
+                    asap_types::query_plan::QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
-                        binding: control_plane::query_plan::MaterializationBinding {
+                        binding: asap_types::query_plan::MaterializationBinding {
                             item_labels: Vec::new(),
                             materialization: policy.into(),
-                            output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
+                            output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 10_000,
                             pane_origin_ms: Some(0),
                             readout_lookback_ms: Some(60_000),
@@ -1086,12 +1086,12 @@ mod tests {
                     },
                 ),
             ]),
-            instant: control_plane::query_plan::InstantExecution {
+            instant: asap_types::query_plan::InstantExecution {
                 lookback_ms: 60_000,
                 full_history: false,
                 cumulative_readout: true,
             },
-            fallback: control_plane::query_plan::FallbackPolicy::ExactBackend,
+            fallback: asap_types::query_plan::FallbackPolicy::ExactBackend,
         };
         for (now, expected) in [(60_000, 21.0), (70_000, 27.0), (80_000, 33.0)] {
             let (outcome, _) = execute_query_plan_instant(&idx, &entry, now).unwrap();
@@ -1154,27 +1154,27 @@ mod tests {
         accumulator.update(Measurement::new(13.0), 50_000);
         idx.append_precompute(7, BTreeMap::new(), (0, 60_000), Box::new(accumulator));
 
-        let entry = control_plane::query_plan::QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
+        let entry = asap_types::query_plan::QueryPlanEntry {
+            language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "q-rate".into(),
             canonical_query: "rate(requests_total[1m])".into(),
             fixed_evaluation: None,
-            root: control_plane::query_plan::QueryNodeId(0),
+            root: asap_types::query_plan::QueryNodeId(0),
             nodes: BTreeMap::from([
                 (
-                    control_plane::query_plan::QueryNodeId(0),
+                    asap_types::query_plan::QueryNodeId(0),
                     QueryPlanNode::ExactReadout {
-                        input: control_plane::query_plan::QueryNodeId(1),
-                        readout: control_plane::query_plan::ExactReadout::Rate,
+                        input: asap_types::query_plan::QueryNodeId(1),
+                        readout: asap_types::query_plan::ExactReadout::Rate,
                     },
                 ),
                 (
-                    control_plane::query_plan::QueryNodeId(1),
+                    asap_types::query_plan::QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
-                        binding: control_plane::query_plan::MaterializationBinding {
+                        binding: asap_types::query_plan::MaterializationBinding {
                             item_labels: Vec::new(),
                             materialization: policy.into(),
-                            output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
+                            output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 60_000,
                             pane_origin_ms: Some(0),
                             readout_lookback_ms: Some(60_000),
@@ -1182,12 +1182,12 @@ mod tests {
                     },
                 ),
             ]),
-            instant: control_plane::query_plan::InstantExecution {
+            instant: asap_types::query_plan::InstantExecution {
                 lookback_ms: 60_000,
                 full_history: false,
                 cumulative_readout: true,
             },
-            fallback: control_plane::query_plan::FallbackPolicy::ExactBackend,
+            fallback: asap_types::query_plan::FallbackPolicy::ExactBackend,
         };
         let outcome = execute_query_plan_readout(&idx, &entry, 0, 60_000, true)
             .expect("execute exact rate DAG");

@@ -537,8 +537,8 @@ struct IncompleteSummaryLineage {
     window_end_unix_ms: u64,
 }
 
-impl From<&control_plane::physical::compiler::SummaryFrameIdentity> for IncompleteSummaryLineage {
-    fn from(frame: &control_plane::physical::compiler::SummaryFrameIdentity) -> Self {
+impl From<&asap_types::producer_plan::SummaryFrameIdentity> for IncompleteSummaryLineage {
+    fn from(frame: &asap_types::producer_plan::SummaryFrameIdentity) -> Self {
         Self {
             plan_id: frame.plan_id,
             plan_version: frame.plan_version,
@@ -2679,7 +2679,7 @@ impl SketchStore {
     pub fn mark_summary_lineage_incomplete(
         &self,
         sid: u64,
-        frame: &control_plane::physical::compiler::SummaryFrameIdentity,
+        frame: &asap_types::producer_plan::SummaryFrameIdentity,
     ) {
         self.incomplete_summary_lineages
             .entry(sid)
@@ -2691,7 +2691,7 @@ impl SketchStore {
     pub fn clear_summary_lineage_incomplete(
         &self,
         sid: u64,
-        frame: &control_plane::physical::compiler::SummaryFrameIdentity,
+        frame: &asap_types::producer_plan::SummaryFrameIdentity,
     ) {
         let key = IncompleteSummaryLineage::from(frame);
         if let Some(mut lineages) = self.incomplete_summary_lineages.get_mut(&sid) {
@@ -3613,9 +3613,8 @@ mod tests {
 
     #[test]
     fn incomplete_delta_window_fails_closed_until_matching_full_checkpoint() {
-        use control_plane::physical::compiler::{
-            StateEncoding, SummaryFrameIdentity, SummaryFrameKind,
-        };
+        use asap_types::producer_plan::{SummaryFrameIdentity, SummaryFrameKind};
+        use control_plane::physical::compiler::StateEncoding;
 
         let idx = SketchStore::new();
         idx.register(meta(12));
