@@ -121,7 +121,7 @@ def main():
                     for _ in range(2400):
                         jobs = require(request(base + '/api/v1/db/backfill/jobs'))
                         statuses = [job['status'] for job in jobs['jobs']]
-                        if statuses and all(status == 'complete' for status in statuses):
+                        if not install['summary_catalog']['materializations'] or (statuses and all(status == 'complete' for status in statuses)):
                             break
                         if 'failed' in statuses:
                             raise RuntimeError(str(jobs))
