@@ -3,21 +3,26 @@ use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_source_maintenance_is_automatic_and_durable() {
-    run_maintenance_process(false).await;
+    run_maintenance_process(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_source_maintenance_is_automatic_and_durable() {
-    run_maintenance_process(true).await;
+    run_maintenance_process(true, false).await;
 }
 
-async fn run_maintenance_process(multi_source: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn complete_group_maintenance_is_automatic_and_durable() {
+    run_maintenance_process(true, true).await;
+}
+
+async fn run_maintenance_process(multi_source: bool, distinct_groups: bool) {
     let query = if multi_source {
         "quantile(0.9, sum_over_time(immutable_value[1m]) + sum_over_time(immutable_other[1m]))"
     } else {
         "quantile(0.9, sum_over_time(immutable_value[1m]))"
     };
-    let expected = if multi_source { 20.0 } else { 10.0 };
+    let base_expected = if multi_source { 20.0 } else { 10.0 };
     let mut fixture: Value = serde_json::from_str(include_str!(
         "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
     ))
@@ -83,9 +88,14 @@ async fn run_maintenance_process(multi_source: bool) {
         storage_routing: None,
         adaptation_evidence: vec![],
     };
-    // Two independent deployments: singleton is supported; a second physical
-    // input series must never be mistaken for a complete singleton population.
-    for (count, missing_source) in [(1, false), (2, false), (1, true)] {
+    // Complete canonical populations are supported; missing source/group sets
+    // must fail closed before publishing any global output.
+    for (count, missing_source) in [(1, false), (2, false), (1, true), (2, true)] {
+        let expected = if distinct_groups && count == 2 {
+            38.0
+        } else {
+            base_expected
+        };
         if missing_source && !multi_source {
             continue;
         }
@@ -146,19 +156,27 @@ async fn run_maintenance_process(multi_source: bool) {
                         ("instance", if i == 0 { "a" } else { "b" }),
                         ("job", "worker"),
                     ],
-                    &[(1_000, 2.0), (2_000, 3.0), (60_000, 5.0)],
+                    &[
+                        (1_000, if distinct_groups && i == 1 { 4.0 } else { 2.0 }),
+                        (2_000, if distinct_groups && i == 1 { 6.0 } else { 3.0 }),
+                        (60_000, if distinct_groups && i == 1 { 10.0 } else { 5.0 }),
+                    ],
                 )
             })
             .collect();
-        if multi_source && !missing_source {
-            for i in 0..count {
+        if multi_source && (!missing_source || count == 2) {
+            for i in 0..if missing_source { 1 } else { count } {
                 series.push(series_with_labels(
                     "immutable_other",
                     &[
                         ("instance", if i == 0 { "a" } else { "b" }),
                         ("job", "worker"),
                     ],
-                    &[(1_000, 2.0), (2_000, 3.0), (60_000, 5.0)],
+                    &[
+                        (1_000, if distinct_groups && i == 1 { 4.0 } else { 2.0 }),
+                        (2_000, if distinct_groups && i == 1 { 6.0 } else { 3.0 }),
+                        (60_000, if distinct_groups && i == 1 { 10.0 } else { 5.0 }),
+                    ],
                 ));
             }
         }
@@ -171,7 +189,7 @@ async fn run_maintenance_process(multi_source: bool) {
             .send()
             .await
             .unwrap();
-        if count == 1 && !missing_source {
+        if !missing_source {
             assert!(
                 drain.status().is_success(),
                 "{}",
@@ -187,10 +205,10 @@ async fn run_maintenance_process(multi_source: bool) {
             .json()
             .await
             .unwrap();
-        if count == 2 || missing_source {
+        if missing_source {
             assert!(
                 !is_warm(&response),
-                "multi-series population was incorrectly admitted: {response}"
+                "incomplete source group set was incorrectly admitted: {response}"
             );
             continue;
         }
@@ -211,7 +229,7 @@ async fn run_maintenance_process(multi_source: bool) {
             .unwrap();
         assert!(
             estimate.is_finite() && (estimate - expected).abs() / expected <= max_relative_error,
-            "selected singleton quantile exceeded its value contract: {response}"
+            "selected population quantile exceeded its value contract: {response}"
         );
         drop(first);
         let port = unused_port();

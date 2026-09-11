@@ -438,8 +438,21 @@ impl PrecomputePlan {
         if !valid_ingest {
             return Err(PrecomputePlanError::UnsupportedIngestEndpoint);
         }
+        let canonical_cohort_members: BTreeSet<_> = self
+            .materializations
+            .iter()
+            .filter(|config| !config.population_key_encoding.is_legacy())
+            .filter_map(|config| config.derived_input.as_ref().map(|input| (config, input)))
+            .flat_map(|(config, input)| {
+                std::iter::once(config.policy_fingerprint().into())
+                    .chain(input.inputs.iter().copied())
+            })
+            .collect();
         for config in &self.materializations {
-            if !config.population_key_encoding.is_legacy() {
+            if !config.population_key_encoding.is_legacy()
+                && (self.ingest.protocol != IngestProtocol::PrometheusRemoteWriteV1
+                    || !canonical_cohort_members.contains(&config.policy_fingerprint().into()))
+            {
                 return Err(PrecomputePlanError::CatalogContract(
                     "population key encoding is not supported by the installed runtime".into(),
                 ));
@@ -468,6 +481,21 @@ impl PrecomputePlan {
                         .ok_or_else(invalid)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            if !config.population_key_encoding.is_legacy() {
+                if config.partitioning != Some(crate::sds::PopulationPartitioning::Grouped)
+                    || !config.grouping_labels.is_empty()
+                    || sources.iter().any(|source| {
+                        source.population_key_encoding != config.population_key_encoding
+                    })
+                {
+                    return Err(invalid());
+                }
+            } else if sources
+                .iter()
+                .any(|source| !source.population_key_encoding.is_legacy())
+            {
+                return Err(invalid());
+            }
             validated_source_window_cohort(config, &sources)?;
             if sources
                 .iter()
