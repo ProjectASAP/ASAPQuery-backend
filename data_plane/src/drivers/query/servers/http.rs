@@ -3672,7 +3672,7 @@ aggregations:
                 metric: metric.clone(),
                 num_aggregates_to_retain: None,
                 table_name: None,
-                value_column: None,
+                value_projection: None,
                 table_population: None,
                 table_timestamp_column: None,
                 partitioning: None,
