@@ -1768,7 +1768,15 @@ impl PhysicalCompiler {
             let selected = selected
                 .into_iter()
                 .filter(|state| {
-                    (!request.hybrid_execution
+                    // Counter readout implements Prometheus extrapolation. Native
+                    // MetricsQL includes boundary samples differently, so retain
+                    // these leaves as external exact dependencies until its
+                    // counter semantics have a dedicated implementation.
+                    !(metricsql && matches!(state.family,
+                        SummaryFamilyType::ExactAggregate(
+                            planner_types::post_asap::ExactKind::Rate
+                                | planner_types::post_asap::ExactKind::Increase, _)))
+                    && (!request.hybrid_execution
                         || state.window_secs.is_none_or(|window| {
                             query
                                 .window_implementations
@@ -4299,6 +4307,27 @@ mod tests {
             CompileError::Snapshot(reason)
                 if reason == "planning query IDs must be unique within a plan generation"
         ));
+    }
+
+    #[test]
+    fn metricsql_counter_readouts_remain_external_exact() {
+        for text in [
+            "rate(counter_probe{case=\"reset\"}[5s])",
+            "increase(counter_probe{case=\"reset\"}[5s])",
+        ] {
+            let mut workload = request("counter", text);
+            workload.hybrid_execution = true;
+            let mut deployment = environment(10_000);
+            deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+            deployment.collector_ids.clear();
+            let plan = PhysicalCompiler
+                .compile_metricsql(workload, deployment)
+                .unwrap();
+            assert!(plan.precompute_plan.materializations.is_empty());
+            let entry = plan.query_plan.entries.values().next().unwrap();
+            assert!(entry.materialization_bindings().is_empty());
+            assert_eq!(entry.language, crate::query_plan::QueryLanguage::MetricsQl);
+        }
     }
 
     #[test]
