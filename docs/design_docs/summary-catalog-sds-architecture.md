@@ -429,3 +429,27 @@ This is an explicit lifetime transition, not cross-generation recovery of arbitr
 summary state. Legacy records without trustworthy catalog provenance remain
 unbound. Tombstone reclamation still requires coordinated removal of old physical
 parts and is not implemented by this transition.
+
+### Immutable completed windows
+
+Finite Remote Write completion now fences the SummaryStore append boundary,
+not just the receiver queue. After all admitted outputs are published, the store
+records the greatest published window end for each physical SeriesId. Sketch and
+exact-state writes ending at or before that boundary are rejected, including
+writes arriving through other producers. A later window remains writable. Observed SDS inventory reports only these frozen
+instances as `Complete`; ordinary emitted panes remain `Unknown`.
+
+The boundary is monotone in the existing SeriesId metadata sidecar and is restored
+before recovered identities become writable. A stale background metadata flush
+cannot reopen a completed window. The guard belongs to the physical lifetime;
+a catalog-authorized replacement SeriesId has its own boundary.
+
+With persistence enabled, completion explicitly requests the existing flusher to
+make the completed prefix durable, even if it is still inside the hot tier.
+Completion waits until the corresponding epochs have been evicted after part and
+manifest publication; only then does it persist the immutable boundary. An
+in-memory deployment provides no restart guarantee. Maintenance consumers still
+must atomically publish their output identity before claiming replay-safe consumption.
+The existing finite-source completeness proof still rejects untracked writes or
+pending admitted work. Continuous producer watermarks and derived-state commit
+transactions are separate from this finite-input boundary.
