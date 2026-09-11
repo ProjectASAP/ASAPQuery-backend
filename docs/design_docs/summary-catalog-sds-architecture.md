@@ -436,7 +436,8 @@ Finite Remote Write completion now fences the SummaryStore append boundary,
 not just the receiver queue. After all admitted outputs are published, the store
 records the greatest published window end for each physical SeriesId. Sketch and
 exact-state writes ending at or before that boundary are rejected, including
-writes arriving through other producers. A later window remains writable.
+writes arriving through other producers. A later window remains writable. Observed SDS inventory reports only these frozen
+instances as `Complete`; ordinary emitted panes remain `Unknown`.
 
 The boundary is monotone in the existing SeriesId metadata sidecar and is restored
 before recovered identities become writable. A stale background metadata flush

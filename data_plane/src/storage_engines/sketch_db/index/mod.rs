@@ -1109,6 +1109,12 @@ impl SketchStore {
                 .series
                 .get(series_id)
                 .map(|entry| Arc::clone(entry.value()));
+            let completed_through = self
+                .completed_windows
+                .read()
+                .unwrap()
+                .get(series_id)
+                .copied();
             let status = match binding.metadata.status() {
                 AggStatus::Active => SummaryInstanceStatus::Ready,
                 AggStatus::Retired | AggStatus::Expired => SummaryInstanceStatus::Retiring,
@@ -1155,10 +1161,11 @@ impl SketchStore {
                         checksum: None,
                     },
                     status: status.clone(),
-                    // The current payload row does not distinguish a normal
-                    // pane close from a late standalone correction. Report the
-                    // concrete instance without inventing a completeness proof.
-                    completeness: InstanceCompleteness::Unknown,
+                    completeness: if completed_through.is_some_and(|end| window.1 <= end) {
+                        InstanceCompleteness::Complete
+                    } else {
+                        InstanceCompleteness::Unknown
+                    },
                     lifecycle: InstanceLifecycle::Persistent,
                     observed_at_ms,
                 };
@@ -4880,6 +4887,15 @@ mod tests {
         assert!(!store.completed_windows.read().unwrap().contains_key(&850));
         std::fs::remove_dir(writer.path()).unwrap();
         store.seal_finite_summary_input(&generation).unwrap();
+        let producers = BTreeMap::from([(fingerprint.into(), "producer".to_string())]);
+        let inventory = store
+            .observed_summary_inventory("backend", "store", &producers, 1, 30_000)
+            .unwrap();
+        assert_eq!(inventory.instances.len(), 1);
+        assert_eq!(
+            inventory.instances.values().next().unwrap().completeness,
+            InstanceCompleteness::Complete
+        );
         assert!(!store.append_sample(850, BTreeMap::new(), (0, 30_000), sample(2)));
         assert!(!store.append_precompute(
             850,
