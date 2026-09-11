@@ -111,7 +111,13 @@ impl RuntimeErpObserver {
         let before = population.observer.observed_key_count();
         // Canonical fixed-width numeric identity; no raw sample or arbitrary label copy.
         let key = format!("{:016x}", if value == 0.0 { 0 } else { value.to_bits() });
-        let result = population.observer.observe(&key, 0);
+        let range = population.coordinates.time_range;
+        let duration = range.end_ms.saturating_sub(range.start_ms).max(1);
+        let offset = timestamp_ms
+            .saturating_sub(range.start_ms)
+            .clamp(0, duration);
+        let interval = ((offset as u128 * 64) / duration as u128).min(63) as usize;
+        let result = population.observer.observe(&key, interval);
         let added = population
             .observer
             .observed_key_count()
@@ -219,5 +225,86 @@ impl RuntimeErpObserver {
             return Err("control plane rejected ERP observation records".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture() -> (CatalogGeneration, asap_types::AggregationConfig) {
+        let config = asap_types::AggregationConfig::new(
+            asap_types::AggregationType::HLL,
+            String::new(),
+            Default::default(),
+            asap_types::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
+            asap_types::KeyByLabelNames::new(vec![]),
+            String::new(),
+            60,
+            60,
+            planner_types::pre_asap::WindowKind::Tumbling,
+            String::new(),
+            "m".into(),
+            None,
+            None,
+            None,
+        );
+        (
+            CatalogGeneration {
+                schema_version: 1,
+                plan_id: 1,
+                plan_version: 1,
+                snapshot_sha256: "a".repeat(64),
+            },
+            config,
+        )
+    }
+    fn coordinate(group: usize) -> SummaryInstanceCoordinates {
+        SummaryInstanceCoordinates {
+            summary_definition_id: asap_types::PolicyFingerprint(1).into(),
+            time_range: HalfOpenTimeRange {
+                start_ms: 0,
+                end_ms: 60_000,
+            },
+            group_values: BTreeMap::from([("job".into(), group.to_string())]),
+        }
+    }
+    #[test]
+    fn observations_keep_partitions_separate_and_invalidate_on_overflow() {
+        let observer = RuntimeErpObserver::new("http://127.0.0.1:1".into());
+        let (generation, config) = fixture();
+        observer.observe(&generation, coordinate(0), &config, 1, 1.0);
+        observer.observe(&generation, coordinate(0), &config, 2, 1.0);
+        observer.observe(&generation, coordinate(1), &config, 3, 2.0);
+        {
+            let state = observer.observations.lock().unwrap();
+            assert_eq!(state.populations.len(), 2);
+            assert_eq!(state.total_keys, 2);
+            assert!(state
+                .populations
+                .values()
+                .all(|p| p.observer.observed_key_count() == 1));
+        }
+        for group in 2..=MAX_POPULATIONS {
+            observer.observe(&generation, coordinate(group), &config, 4, 3.0);
+        }
+        let state = observer.observations.lock().unwrap();
+        assert!(state.invalid.is_some());
+        assert!(state
+            .populations
+            .values()
+            .all(|p| p.observer.snapshot().is_none()));
+    }
+    #[test]
+    fn changed_catalog_resets_invalid_observation_without_cross_generation_counts() {
+        let observer = RuntimeErpObserver::new("http://127.0.0.1:1".into());
+        let (mut generation, config) = fixture();
+        observer.observe(&generation, coordinate(0), &config, 1, f64::NAN);
+        generation.plan_version = 2;
+        observer.observe(&generation, coordinate(0), &config, 2, 9.0);
+        let state = observer.observations.lock().unwrap();
+        assert!(state.invalid.is_none());
+        assert_eq!(state.total_keys, 1);
+        assert_eq!(state.generation.as_ref(), Some(&generation));
     }
 }
