@@ -7,7 +7,7 @@ use asap_aware_mapping::erp::{
 use planner_types::post_asap::{SketchAlgorithm, SketchParams};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -22,74 +22,40 @@ pub struct ErpObservedShape {
 /// instead of silently under-reporting cardinality.
 #[derive(Debug)]
 pub struct ErpShapeObserver {
-    frequencies: HashMap<String, u64>,
-    interval_updates: HashMap<usize, u64>,
-    max_observed_keys: usize,
-    max_observed_intervals: usize,
-    updates: u64,
-    invalid: bool,
+    inner: asap_types::erp_observation::BoundedFrequencyObserver<String>,
 }
-
 impl ErpShapeObserver {
     pub fn observed_key_count(&self) -> usize {
-        self.frequencies.len()
+        self.inner.observed_key_count()
     }
-
-    pub fn new(max_observed_keys: usize) -> Result<Self, &'static str> {
-        Self::with_limits(max_observed_keys, 256)
+    pub fn new(max_keys: usize) -> Result<Self, &'static str> {
+        Self::with_limits(max_keys, 256)
     }
-
-    pub fn with_limits(
-        max_observed_keys: usize,
-        max_observed_intervals: usize,
-    ) -> Result<Self, &'static str> {
-        if max_observed_keys == 0 || max_observed_intervals == 0 {
-            return Err("observation limits must be positive");
-        }
+    pub fn with_limits(max_keys: usize, max_intervals: usize) -> Result<Self, &'static str> {
         Ok(Self {
-            frequencies: HashMap::new(),
-            interval_updates: HashMap::new(),
-            max_observed_keys,
-            max_observed_intervals,
-            updates: 0,
-            invalid: false,
+            inner: asap_types::erp_observation::BoundedFrequencyObserver::new(
+                max_keys,
+                max_intervals,
+            )?,
         })
     }
-
     pub fn observe(&mut self, key: &str, interval: usize) -> Result<(), &'static str> {
-        if self.invalid {
-            return Err("ERP observation was invalidated; start a fresh observation window");
-        }
         if key.len() > 4096 {
-            self.invalid = true;
+            self.inner.invalidate();
             return Err("ERP shape observer key size exceeded");
         }
-        if !self.frequencies.contains_key(key) && self.frequencies.len() == self.max_observed_keys {
-            self.invalid = true;
-            return Err("ERP shape observer cardinality cap exceeded");
-        }
-        if !self.interval_updates.contains_key(&interval)
-            && self.interval_updates.len() == self.max_observed_intervals
-        {
-            self.invalid = true;
-            return Err("ERP shape observer interval cap exceeded");
-        }
-        let Some(updates) = self.updates.checked_add(1) else {
-            self.invalid = true;
-            return Err("ERP shape observer count overflow");
-        };
-        *self.frequencies.entry(key.to_owned()).or_default() += 1;
-        *self.interval_updates.entry(interval).or_default() += 1;
-        self.updates = updates;
-        Ok(())
+        self.inner.observe(key.to_owned(), interval)
     }
-
     pub fn snapshot(&self) -> Option<ErpObservedShape> {
-        if self.frequencies.is_empty() || self.invalid {
-            return None;
-        }
-        let mut counts: Vec<_> = self.frequencies.values().copied().collect();
-        counts.sort_unstable_by(|left, right| right.cmp(left));
+        ErpObservedShape::from_empirical(&self.inner.snapshot()?)
+    }
+}
+impl ErpObservedShape {
+    pub fn from_empirical(
+        empirical: &asap_types::erp_observation::EmpiricalFrequencyObservation,
+    ) -> Option<Self> {
+        let events = empirical.event_count()?;
+        let counts = &empirical.sorted_counts;
         let exponent = fit_zipf_exponent(&counts);
         let fits = [("uniform", 0.0), ("zipf", exponent)]
             .into_iter()
@@ -104,7 +70,7 @@ impl ErpShapeObserver {
                     .iter()
                     .zip(expected)
                     .map(|(count, expected)| {
-                        (*count as f64 / self.updates as f64 - expected / total).abs()
+                        (*count as f64 / events as f64 - expected / total).abs()
                     })
                     .sum::<f64>()
                     / 2.0;
@@ -117,13 +83,13 @@ impl ErpShapeObserver {
                     },
                     goodness_of_fit: distance,
                     // A fit-quality score, not an estimator tail-probability claim.
-                    confidence: (1.0 - distance) * (1.0 - 1.0 / (self.updates as f64).sqrt()),
+                    confidence: (1.0 - distance) * (1.0 - 1.0 / (events as f64).sqrt()),
                 }
             })
             .collect();
-        let mut nonzero: Vec<_> = self
-            .interval_updates
-            .values()
+        let mut nonzero: Vec<_> = empirical
+            .interval_counts
+            .iter()
             .copied()
             .filter(|count| *count > 0)
             .collect();
@@ -132,8 +98,8 @@ impl ErpShapeObserver {
         let peak = nonzero.last().copied().unwrap_or(median);
         Some(ErpObservedShape {
             observation: ErpShapeObservation {
-                cardinality: self.frequencies.len() as u64,
-                observed_events: self.updates,
+                cardinality: counts.len() as u64,
+                observed_events: events,
                 fits,
                 empirical_fingerprint: None,
             },
@@ -506,7 +472,7 @@ impl ErpPlanningInput {
                     .get("erp_population_observations")
                     .ok_or("latest runtime sample has no erp_population_observations")?;
                 let observed: asap_types::erp_observation::ErpPopulationObservations<
-                    ErpObservedShape,
+                    asap_types::erp_observation::EmpiricalFrequencyObservation,
                 > = serde_json::from_value(value.clone())
                     .map_err(|error| format!("invalid ERP population observations: {error}"))?;
                 observed.validate_identity_and_freshness(
@@ -518,7 +484,9 @@ impl ErpPlanningInput {
                 if observed.input_semantics != scope.input_semantics {
                     return Err("ERP observation input semantics do not match the summary".into());
                 }
-                Ok(observed)
+                observed
+                    .try_map_shapes(|empirical| ErpObservedShape::from_empirical(&empirical))
+                    .ok_or_else(|| "invalid bounded empirical frequency observations".to_owned())
             })();
             // An explicit invalid envelope prevents selection from borrowing an
             // older fit or falling back to the artifact's distribution identity.
@@ -1415,8 +1383,21 @@ mod tests {
 
     fn publish_population_fixture(
         samples: &crate::runtime_samples::RuntimeSamplesStore,
-        payload: serde_json::Value,
+        mut payload: serde_json::Value,
     ) {
+        if let Some(populations) = payload
+            .pointer_mut("/erp_population_observations/populations")
+            .and_then(Value::as_array_mut)
+        {
+            for population in populations {
+                if let Some(cardinality) = population
+                    .pointer("/shape/observation/cardinality")
+                    .and_then(Value::as_u64)
+                {
+                    population["shape"] = serde_json::json!({"sorted_counts":vec![2;cardinality as usize],"interval_counts":[cardinality*2]});
+                }
+            }
+        }
         samples.append_for_test(crate::runtime_samples::RuntimeRecord {
             source: "backend-a".into(),
             sketch: "univmon".into(),
@@ -1468,16 +1449,23 @@ mod tests {
     /// Only the activated catalog may supply a candidate's data contract.
     #[test]
     fn online_population_descriptor_requires_authoritative_catalog() {
+        let mut fixture: Value = serde_json::from_str(include_str!(
+            "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let mut query = fixture["query_workload"]["repeating_queries"][3].clone();
+        query["query"] = "distinct_over_time(asap_demo_latency_ms[5s])".into();
+        query["requirements"]["accuracy"] = serde_json::json!({"explicit":{"Epsilon":0.05}});
+        fixture["query_workload"]["repeating_queries"] = serde_json::json!([query]);
         let snapshot: crate::physical::compiler::BackendLocalPlanningSnapshot =
-            serde_json::from_str(include_str!(
-                "../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
-            ))
-            .unwrap();
+            serde_json::from_value(fixture).unwrap();
         let plan = snapshot.compile().unwrap();
         let (mut policy, mut observed) = online_population_fixture();
         observed.catalog_generation = plan.summary_catalog.reference().unwrap();
         observed.summary_definition_id =
             *plan.summary_catalog.materializations.keys().next().unwrap();
+        observed.input_semantics =
+            asap_types::erp_observation::ErpObservationInputSemantics::ScalarSampleValue;
         policy.observed_populations = Some(observed.clone());
         policy.resolve_population_data_descriptor(Some(&plan.summary_catalog));
         let expected = &plan.summary_catalog.materializations[&observed.summary_definition_id]
@@ -1563,14 +1551,16 @@ mod tests {
         let mut observer = ErpShapeObserver::with_limits(2, 2).unwrap();
         observer.observe("a", usize::MAX).unwrap();
         observer.observe("a", 0).unwrap();
-        assert_eq!(observer.interval_updates.len(), 2);
+        assert_eq!(observer.inner.snapshot().unwrap().interval_counts.len(), 2);
         assert!(observer.observe("a", 1).is_err());
         assert!(observer.snapshot().is_none());
-        let mut observer = ErpShapeObserver::new(2).unwrap();
-        observer.observe("a", 0).unwrap();
-        observer.updates = u64::MAX;
-        assert!(observer.observe("a", 0).is_err());
-        assert!(observer.snapshot().is_none());
+        assert!(ErpObservedShape::from_empirical(
+            &asap_types::erp_observation::EmpiricalFrequencyObservation {
+                sorted_counts: vec![u64::MAX, 1],
+                interval_counts: vec![u64::MAX, 1],
+            }
+        )
+        .is_none());
     }
 
     #[test]

@@ -163,9 +163,15 @@ impl SeriesRouter {
         }
     }
 
-    pub fn enable_erp_observation(&self, endpoint: String) -> Result<(), String> {
+    pub fn enable_erp_observation(
+        &self,
+        endpoint: String,
+        generation: asap_types::sds::CatalogGeneration,
+    ) -> Result<(), String> {
         self.erp_observer
-            .set(super::erp_observer::RuntimeErpObserver::new(endpoint))
+            .set(super::erp_observer::RuntimeErpObserver::new(
+                endpoint, generation,
+            ))
             .map_err(|_| "ERP observer already configured".into())
     }
     pub fn erp_observer(&self) -> Option<std::sync::Arc<super::erp_observer::RuntimeErpObserver>> {
