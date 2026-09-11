@@ -2607,6 +2607,10 @@ fn materialization_consumers(
     composable: bool,
 ) -> Result<BTreeMap<asap_types::PolicyFingerprint, BTreeSet<usize>>, CompileError> {
     let mut consumers = BTreeMap::<_, BTreeSet<_>>::new();
+    // Until logical lifecycle costing carries a derived-program identity,
+    // never combine unrelated programs under the legacy raw-state key.
+    let mut cohort_programs =
+        BTreeMap::<asap_types::PolicyFingerprint, Option<*const SummaryNode>>::new();
     for (index, query) in queries.iter().enumerate() {
         let states =
             collect_selected_materializations(&query.post_asap, composable).map_err(|reason| {
@@ -2630,6 +2634,18 @@ fn materialization_consumers(
                 &physical_aggregation(query, &state, query.query_id.clone(), target),
                 &state.node,
             )?;
+            let program =
+                immutable_materialization_source(&state.node).map(|_| Rc::as_ptr(&state.node));
+            if let Some(previous) = cohort_programs.insert(config.policy_fingerprint(), program) {
+                if previous != program && (previous.is_some() || program.is_some()) {
+                    return Err(CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason:
+                            "distinct immutable programs require separate lifecycle cost cohorts"
+                                .into(),
+                    });
+                }
+            }
             consumers
                 .entry(config.policy_fingerprint())
                 .or_default()
