@@ -15,6 +15,68 @@ pub(crate) struct FrozenExactWindows {
 }
 
 impl SketchStore {
+    /// Enumerate durable source coordinates; the consumer revalidates exact
+    /// coverage and incarnation before reading or publishing any state.
+    pub(crate) fn completed_maintenance_coordinates(
+        &self,
+        definition: SummaryDefinitionId,
+        generation: &CatalogGeneration,
+    ) -> Result<BTreeMap<u64, BTreeMap<BTreeMap<String, String>, BTreeSet<(u64, u64)>>>, String>
+    {
+        self.validate_routed_catalog_generation(Some(generation))?;
+        let handle = self
+            .persistence_read
+            .read()
+            .map_err(|_| "persistence registry poisoned")?
+            .clone()
+            .ok_or("immutable maintenance requires durable input state")?;
+        let instances = self
+            .instances
+            .read()
+            .map_err(|_| "instance registry poisoned")?;
+        let completed = self
+            .completed_windows
+            .read()
+            .map_err(|_| "completion registry poisoned")?;
+        let mut coordinates = BTreeMap::new();
+        for (sid, binding) in instances.iter() {
+            if binding.metadata.policy_fp != definition.fingerprint()
+                || binding.catalog_generation.as_deref() != Some(generation)
+                || !binding.metadata.is_writable()
+            {
+                continue;
+            }
+            let Some(end) = completed.get(sid).copied() else {
+                continue;
+            };
+            let keys: Vec<_> = binding.metadata.group_by_keys.iter().cloned().collect();
+            for part in handle.manifest.live_parts_overlapping(0, end) {
+                let reader = handle
+                    .part_cache
+                    .get_or_load(part.part_id)
+                    .map_err(|e| e.to_string())?;
+                for record in reader.index_records() {
+                    if record.agg_id != *sid || record.end_ts > end {
+                        continue;
+                    }
+                    let entry = reader.load_entry(&record).map_err(|e| e.to_string())?;
+                    if entry.label.as_ref().map_or(0, |label| label.labels.len()) != keys.len() {
+                        return Err(
+                            "immutable input label arity differs from its descriptor".into()
+                        );
+                    }
+                    coordinates
+                        .entry(*sid)
+                        .or_insert_with(BTreeMap::new)
+                        .entry(Self::rebuild_label_map(&keys, &entry.label))
+                        .or_insert_with(BTreeSet::new)
+                        .insert((record.start_ts, record.end_ts));
+                }
+            }
+        }
+        Ok(coordinates)
+    }
+
     pub(crate) fn read_frozen_exact_windows(
         &self,
         sid: u64,

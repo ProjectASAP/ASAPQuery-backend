@@ -604,6 +604,137 @@ pub fn execute_completed_maintenance(
     )
 }
 
+/// Schedule retained, aligned completed windows from the installed DAG after
+/// the finite source barrier. Missing panes remain unavailable to query reads.
+pub(crate) fn execute_finite_maintenance(
+    ingest: &super::ingest_handler::IngestState,
+    plan: &crate::storage_engines::types::ActivePhysicalPlan,
+) -> Result<(), String> {
+    let generation = plan
+        .precompute_plan
+        .summary_catalog
+        .as_ref()
+        .ok_or("finite maintenance requires a catalog generation")?;
+    for installed in plan.precompute_plan.executable_dags.values() {
+        for sink in &installed.binding.precompute_sinks {
+            let Some(BackendNodeBinding::Materialization {
+                summary_definition: target,
+            }) = installed.binding.node(*sink)
+            else {
+                continue;
+            };
+            let config = plan
+                .precompute_plan
+                .materializations
+                .iter()
+                .find(|config| config.policy_fingerprint() == target.fingerprint())
+                .ok_or("maintenance target configuration is absent")?;
+            let Some(derived) = &config.derived_input else {
+                continue;
+            };
+            if derived.inputs.len() != 1 {
+                return Err("finite maintenance requires one source definition".into());
+            }
+            let source = *derived.inputs.first().unwrap();
+            let source_config = plan
+                .precompute_plan
+                .materializations
+                .iter()
+                .find(|config| config.policy_fingerprint() == source.fingerprint())
+                .ok_or("maintenance source configuration is absent")?;
+            if source_config.derived_input.is_some() {
+                return Err(
+                    "multi-stage finite maintenance requires topological scheduling".into(),
+                );
+            }
+            let width = config.stored_window_ms();
+            let pane = source_config.stored_window_ms();
+            if width == 0 || pane == 0 || width % pane != 0 || width / pane > 65_536 {
+                return Err("finite maintenance window extent is unsupported".into());
+            }
+            let sources = ingest
+                .sketch_index
+                .completed_maintenance_coordinates(source, generation)?;
+            if sources.len() > 1 {
+                return Err(
+                    "finite maintenance requires synchronized multi-series scheduling".into(),
+                );
+            }
+            let existing = ingest
+                .sketch_index
+                .completed_maintenance_coordinates(*target, generation)?;
+            for (source_sid, populations) in sources {
+                for (group, windows) in populations {
+                    let pairs: Vec<_> = group
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str()))
+                        .collect();
+                    let attrs = crate::drivers::ingest::canonical_attrs_fingerprint(&pairs);
+                    let kind =
+                        crate::storage_engines::sketch_db::data::materialization_kind_for_config(
+                            config,
+                        );
+                    let target_sid = ingest.series_resolver.resolve_with_reactivation(
+                        &config.metric,
+                        &attrs,
+                        &kind,
+                        |sid| {
+                            ingest
+                                .sketch_index
+                                .validate_routed_catalog_generation(Some(generation))?;
+                            let activation = ingest
+                                .sketch_index
+                                .authorize_series_reactivation(sid, *target)?;
+                            if activation
+                                .as_deref()
+                                .is_some_and(|actual| actual != generation)
+                            {
+                                return Err("finite maintenance generation changed".into());
+                            }
+                            Ok(activation)
+                        },
+                    )?;
+                    for (start, _) in &windows {
+                        if (*start as i128 - config.pane_origin_ms.unwrap_or(0) as i128)
+                            .rem_euclid(width as i128)
+                            != 0
+                        {
+                            continue;
+                        }
+                        let Some(end) = start.checked_add(width) else {
+                            continue;
+                        };
+                        if !(0..width / pane).all(|offset| {
+                            let begin = start + offset * pane;
+                            windows.contains(&(begin, begin + pane))
+                        }) {
+                            continue;
+                        }
+                        if existing
+                            .get(&target_sid)
+                            .and_then(|groups| groups.get(&group))
+                            .is_some_and(|present| present.contains(&(*start, end)))
+                        {
+                            continue;
+                        }
+                        execute_completed_maintenance(
+                            &ingest.sketch_index,
+                            installed,
+                            &plan.precompute_plan.materializations,
+                            *sink,
+                            source_sid,
+                            target_sid,
+                            (*start, end),
+                            &group,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 struct CommittedState {
     value: Option<Arc<MaintenanceValue>>,
     published: bool,
@@ -887,6 +1018,16 @@ impl MaintenanceDagSink {
                 immutable_windows: None,
             };
             for sink_node in &installed.binding.precompute_sinks {
+                // Derived summaries consume complete immutable windows at the
+                // completion barrier, never additive worker fragments.
+                if matches!(installed.binding.node(*sink_node),
+                    Some(BackendNodeBinding::Materialization { summary_definition })
+                        if plan.precompute_plan.materializations.iter().any(|config|
+                            config.policy_fingerprint() == summary_definition.fingerprint()
+                                && config.derived_input.is_some()))
+                {
+                    continue;
+                }
                 if !depends_on_any(&dag, *sink_node, &source_nodes) {
                     continue;
                 }
@@ -1461,6 +1602,12 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert_eq!(
+            store
+                .completed_maintenance_coordinates(source_definition, &generation)
+                .unwrap(),
+            BTreeMap::from([(600, BTreeMap::from([(BTreeMap::new(), expected.clone())]))])
+        );
         let frozen = store
             .read_frozen_exact_windows(
                 600,
