@@ -1048,11 +1048,11 @@ mod tests {
         };
         let mut relation = adapter
             .apply_filter(
-                &Predicate(QueryExpr::Compare {
+                &Predicate(Rc::new(QueryExpr::Compare {
                     left: Rc::new(QueryExpr::Column(1)),
                     op: CompareOpKind::Gt,
                     right: Rc::new(QueryExpr::Literal(ScalarValue::Float64(1.0))),
-                }),
+                })),
                 input,
             )
             .unwrap();
