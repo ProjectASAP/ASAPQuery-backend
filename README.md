@@ -123,6 +123,79 @@ external-only DAG execution is not acceleration.
 | ClickHouse | An optional SQL HTTP adapter uses the same catalog/publication with typed relational and mixed exact/summary DAG execution. Supported collection/scalar operations are explicit; arbitrary SQL, lambdas and counter queries are not implied. External-only DAG execution is not summary acceleration. See [SQL support](docs/developer_docs/query-engine/clickhouse-sql-support.md). |
 | External producers | The distributed path accepts configured collector/state input, including modified OTLP. It is distinct from standard Prometheus Remote Write and uses the shared producer/transmission contracts. |
 
+### Query workload input
+
+Planning input and serving traffic are separate. Sending a PromQL request from
+Grafana does not declare that it is a recurring dashboard query. Declare known
+query classes through the control plane; send each evaluation to the data-plane
+query endpoint.
+
+At startup, set `CONTROLLER_WORKLOADS` to a YAML registry containing the query
+text and deployment hints:
+
+```yaml
+- metric_name: http_requests_total
+  query_string: "sum by (region) (rate(http_requests_total[5m]))"
+  accuracy_sla: 0.99
+  assign_to_role: agent
+  grouping_labels: [region]
+```
+
+`query_string` is the preferred source for metric, aggregation, filters,
+grouping and range-window semantics. Optional registry fields include
+`sketch_family_override`, `sample_p`, `distinct_keys_per_window`, `item_label`
+and `monitor`. `accuracy_sla` is the legacy success fraction: `1.0` requests
+exact results and `0.99` permits epsilon `0.01`.
+
+The startup registry does not currently carry dashboard recurrence. The legacy
+planning API accepts an evaluation cadence at `POST /api/v1/plan`
+(`CONTROLLER_ADDR`, default port `8080`):
+
+```bash
+curl -X POST http://localhost:8080/api/v1/plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "query_string": "sum by (region) (rate(http_requests_total[5m]))",
+    "repeat_every": "30s",
+    "accuracy_sla": 0.99,
+    "latency_sla": "1s",
+    "workload": {
+      "series_count": 100000,
+      "samples_per_sec_per_series": 0.0667,
+      "bytes_per_raw_sample": 100,
+      "distinct_keys_per_window": null,
+      "data_distribution": "zipf",
+      "memory_budget_bytes": 268435456
+    }
+  }'
+```
+
+`repeat_every` describes an expected cadence—for example, a dashboard panel
+refreshed every 30 seconds—but does not schedule evaluations. Its current use is
+narrow: the legacy deployment cost path uses it as the flush-period proxy for
+batch-mode plans. Window-mode plans use their configured window duration, and
+the canonical physical-plan request does not yet model general query recurrence.
+Do not assume that changing `repeat_every` will change summary selection.
+
+The `workload` object describes the incoming data stream and may be omitted to
+use conservative defaults. The API also accepts explicit `metric_name`,
+`aggregations`, `time_window`, `group_by_labels` and `label_filters` instead of
+a query string.
+
+Once the matching physical plan is installed and its state is ready, clients
+execute the query through the data plane's Prometheus-compatible API:
+
+```bash
+curl -G http://localhost:8088/api/v1/query \
+  --data-urlencode 'query=sum by (region) (rate(http_requests_total[5m]))'
+```
+
+Range evaluations use `/api/v1/query_range` with `query`, `start`, `end` and
+`step`. Serving requests do not update `repeat_every` automatically. End-to-end
+dashboard-frequency-aware planning still requires a typed recurrence field on
+the canonical workload/publication path and an observer or explicit workload
+registration to populate it.
+
 Remote Write `204` acknowledges atomic bounded queue admission, **not** durable
 accumulator publication or a raw write-ahead log. Deduplication is in memory;
 there is no durable raw-WAL replay guarantee. Stale markers are recognized and
