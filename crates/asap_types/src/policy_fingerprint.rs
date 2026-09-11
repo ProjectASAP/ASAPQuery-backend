@@ -89,6 +89,10 @@ impl PolicyFingerprint {
     pub fn from_config(cfg: &AggregationConfig) -> Self {
         let mut buf: Vec<u8> = Vec::with_capacity(512);
 
+        if !cfg.population_key_encoding.is_legacy() {
+            // UTF-8 raw metrics cannot alias this nonlegacy domain prefix.
+            buf.extend_from_slice(b"\xffpopulation-key-canonical-labels-v1\0");
+        }
         // 1. metric name
         if cfg.derived_input.is_some() {
             // Raw policies start with UTF-8 metric bytes; 0xff is impossible
@@ -283,6 +287,45 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[test]
+    fn population_encoding_preserves_legacy_wire_and_separates_identity() {
+        use crate::grouping_projection::PopulationKeyEncoding;
+        let legacy = cfg(
+            "m",
+            AggregationType::Sum,
+            HashMap::new(),
+            vec!["host"],
+            60,
+            "",
+        );
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert!(wire.get("population_key_encoding").is_none());
+        let decoded: AggregationConfig = serde_json::from_value(wire).unwrap();
+        assert!(decoded.population_key_encoding.is_legacy());
+        assert_eq!(legacy.policy_fingerprint(), decoded.policy_fingerprint());
+        let mut canonical = legacy.clone();
+        canonical.population_key_encoding = PopulationKeyEncoding::CanonicalLabelsV1;
+        assert_ne!(legacy.policy_fingerprint(), canonical.policy_fingerprint());
+        let wire = serde_json::to_value(&canonical).unwrap();
+        assert_eq!(wire["population_key_encoding"], "canonical_labels_v1");
+        let decoded: AggregationConfig = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.policy_fingerprint(), canonical.policy_fingerprint());
+        use crate::traits::SerializableToSink;
+        let mut sink = canonical.serialize_to_json();
+        // Transport wrappers supply the three label projections separately.
+        sink["groupingLabels"] = serde_json::to_value(&canonical.grouping_labels).unwrap();
+        sink["aggregatedLabels"] =
+            serde_json::to_value(&canonical.aggregated_labels.labels).unwrap();
+        sink["rollupLabels"] = serde_json::to_value(&canonical.rollup_labels.labels).unwrap();
+        let decoded = AggregationConfig::deserialize_from_json(&sink).unwrap();
+        assert_eq!(
+            decoded.population_key_encoding,
+            canonical.population_key_encoding
+        );
+
+        assert!(serde_json::from_str::<PopulationKeyEncoding>("\"canonical_labels_v2\"").is_err());
     }
 
     #[test]

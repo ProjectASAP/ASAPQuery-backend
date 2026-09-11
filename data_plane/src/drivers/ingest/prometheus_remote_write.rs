@@ -1013,6 +1013,7 @@ mod tests {
         use asap_types::enums::WindowKind;
         use asap_types::{AggregationConfig, AggregationType, KeyByLabelNames};
         let aggregation = AggregationConfig {
+            population_key_encoding: Default::default(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
             parameters: HashMap::new(),
@@ -1075,6 +1076,7 @@ mod tests {
 
         let config =
             |aggregation_type, grouping: Vec<String>, aggregated: Vec<String>| AggregationConfig {
+                population_key_encoding: Default::default(),
                 aggregation_type,
                 aggregation_sub_type: String::new(),
                 parameters: match aggregation_type {
