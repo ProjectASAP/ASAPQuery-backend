@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -86,6 +87,8 @@ impl AtomicPublicationKey {
 struct CheckpointDocument {
     schema_version: u32,
     revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coordinator_scope: Option<super::multisource_coordinator::MultiSourceNodeSpec>,
     staged: Vec<StagedSummaryInput>,
     watermarks: Vec<SummaryWatermarkBarrier>,
     published: Vec<AtomicPublicationKey>,
@@ -96,6 +99,7 @@ impl Default for CheckpointDocument {
         Self {
             schema_version: SCHEMA_VERSION,
             revision: 0,
+            coordinator_scope: None,
             staged: Vec::new(),
             watermarks: Vec::new(),
             published: Vec::new(),
@@ -111,6 +115,7 @@ pub struct SummaryCoordinationCheckpointStore {
     /// the same snapshot concurrently.
     _lock_file: File,
     document: Mutex<CheckpointDocument>,
+    persistence_uncertain: AtomicBool,
 }
 
 impl SummaryCoordinationCheckpointStore {
@@ -142,6 +147,33 @@ impl SummaryCoordinationCheckpointStore {
             path,
             _lock_file: lock_file,
             document: Mutex::new(document),
+            persistence_uncertain: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn bind_coordinator_scope(
+        &self,
+        spec: &super::multisource_coordinator::MultiSourceNodeSpec,
+    ) -> io::Result<bool> {
+        super::multisource_coordinator::validate_spec(spec)?;
+        self.mutate(|document| {
+            if let Some(existing) = &document.coordinator_scope {
+                return if existing == spec {
+                    Ok(false)
+                } else {
+                    Err(invalid("persisted coordinator scope changed"))
+                };
+            }
+            if !document.staged.is_empty()
+                || !document.watermarks.is_empty()
+                || !document.published.is_empty()
+            {
+                return Err(invalid(
+                    "nonempty legacy checkpoint has no authoritative coordinator scope",
+                ));
+            }
+            document.coordinator_scope = Some(spec.clone());
+            Ok(true)
         })
     }
 
@@ -236,25 +268,43 @@ impl SummaryCoordinationCheckpointStore {
         let mut guard = self.lock()?;
         let mut next = guard.clone();
         let result = update(&mut next)?;
+        if next == *guard {
+            return Ok(result);
+        }
         next.revision = next
             .revision
             .checked_add(1)
             .ok_or_else(|| invalid("coordination checkpoint store revision overflow"))?;
-        persist_atomically(&self.path, &next)?;
+        if let Err(error) = persist_atomically(&self.path, &next) {
+            // Rename may have succeeded before directory fsync failed. Do not
+            // overwrite that possible newer checkpoint from stale live state.
+            self.persistence_uncertain.store(true, Ordering::Release);
+            return Err(error);
+        }
         *guard = next;
         Ok(result)
     }
 
     fn lock(&self) -> io::Result<std::sync::MutexGuard<'_, CheckpointDocument>> {
-        self.document
+        let guard = self
+            .document
             .lock()
-            .map_err(|_| io::Error::other("coordination checkpoint store lock poisoned"))
+            .map_err(|_| io::Error::other("coordination checkpoint store lock poisoned"))?;
+        if self.persistence_uncertain.load(Ordering::Acquire) {
+            return Err(io::Error::other(
+                "checkpoint persistence is uncertain; reopen before continuing",
+            ));
+        }
+        Ok(guard)
     }
 }
 
 fn validate_document(document: &CheckpointDocument) -> io::Result<()> {
     if document.schema_version != SCHEMA_VERSION {
         return Err(invalid("unsupported coordination checkpoint store schema"));
+    }
+    if let Some(scope) = &document.coordinator_scope {
+        super::multisource_coordinator::validate_spec(scope)?;
     }
     let mut staged_ids = std::collections::BTreeSet::new();
     for input in &document.staged {
@@ -486,6 +536,7 @@ mod tests {
         let document = CheckpointDocument {
             schema_version: SCHEMA_VERSION,
             revision: 1,
+            coordinator_scope: None,
             staged: vec![duplicate.clone(), duplicate],
             watermarks: Vec::new(),
             published: Vec::new(),
