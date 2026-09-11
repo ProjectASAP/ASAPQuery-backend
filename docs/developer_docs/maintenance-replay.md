@@ -99,3 +99,19 @@ pin a partially accepted batch until retry completes. They do not replace the
 SID sidecar/manifest protocol above and must not be used as durable immutable
 publication evidence. Their existence alone does not authorize arbitrary
 maintenance DAGs, groups or producer completion claims.
+
+### Installed producer partition roster
+
+`ProducerContract.partition_ids` optionally declares the authoritative partitions
+for that producer and materialization. The default empty set preserves legacy
+serialization and permits no completion claims. It does not infer a roster from
+received Remote Write series, worker count or observed timestamps.
+
+`PrecomputePlan::validate_watermark_scope(materialization, barrier)` checks an
+existing `SummaryWatermarkBarrier` against the installed catalog generation,
+plan envelope and producer/partition/materialization binding. It also applies
+the existing barrier validation. This is a scope check only: a receiver still
+needs authenticated producer identity, ordered publication, durable progress
+and the existing coordinator's epoch/sequence rules before accepting closure.
+There is no public HTTP barrier endpoint in this change. In particular, a
+successful `/api/v1/write` response does not advance this authority.
