@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 type SummaryState = Arc<dyn AggregateCore>;
+type Population = BTreeMap<String, String>;
+type PopulationRows = BTreeMap<Population, Vec<(i64, f64)>>;
 
 #[derive(Clone)]
 enum MaintenanceValue {
@@ -24,10 +26,11 @@ enum MaintenanceValue {
     // the whole DAG once per source pane would change nested reductions.
     SummaryWindows {
         states: Arc<[(i64, SummaryState)]>,
+        group: Population,
         family: planner_types::post_asap::SummaryFamilyType,
     },
     Rows {
-        values: Vec<(i64, f64)>,
+        values: PopulationRows,
         name: String,
         timestamped: bool,
     },
@@ -107,6 +110,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                     return Err("maintenance frontier requires explicit population routing".into());
                 }
                 Ok(Some(MaintenanceValue::SummaryWindows {
+                    group: input.group.clone(),
                     states: input
                         .windows
                         .iter()
@@ -210,16 +214,47 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                 if updater.is_keyed() {
                     return Err("keyed maintenance accumulator requires an item expression".into());
                 }
-                for (timestamp_ms, value) in values {
+                let output_groups = values
+                    .keys()
+                    .map(|group| {
+                        if config.partitioning
+                            == Some(asap_types::sds::PopulationPartitioning::PerEntity)
+                        {
+                            return Ok(group.clone());
+                        }
+                        config
+                            .grouping_labels
+                            .names()
+                            .into_iter()
+                            .map(|key| {
+                                group
+                                    .get(&key)
+                                    .cloned()
+                                    .map(|value| (key.to_string(), value))
+                                    .ok_or_else(|| {
+                                        "maintenance output grouping key is absent".to_string()
+                                    })
+                            })
+                            .collect::<Result<Population, String>>()
+                    })
+                    .collect::<Result<BTreeSet<_>, String>>()?;
+                if output_groups.len() != 1 {
+                    return Err(
+                        "maintenance sink requires one explicitly reduced output population".into(),
+                    );
+                }
+                for (timestamp_ms, value) in values.values().flatten() {
                     let weight = evaluate_weight(&input.weight, *value, name)?;
                     updater.update_single(weight, *timestamp_ms);
                 }
                 let timestamp = values
-                    .iter()
+                    .values()
+                    .flatten()
                     .map(|(timestamp, _)| *timestamp)
                     .max()
                     .ok_or("maintenance aggregation has no input rows")?;
                 Ok(MaintenanceValue::SummaryWindows {
+                    group: output_groups.into_iter().next().unwrap(),
                     states: vec![(timestamp, Arc::from(updater.into_accumulator()))].into(),
                     family: family.clone(),
                 })
@@ -356,32 +391,42 @@ fn evaluate_aligned_binary(
     else {
         return Err("maintenance binary requires finalized row inputs".into());
     };
-    if left.is_empty() || left.len() != right.len() {
-        return Err("maintenance binary requires matching nonempty timestamp sets".into());
+    if left.is_empty() || left.keys().ne(right.keys()) {
+        return Err("maintenance binary requires matching nonempty population sets".into());
     }
-    // Canonical timestamp maps accept arrival-order differences, but never
-    // collapse duplicate updates or pair unrelated source windows by position.
-    let mut left_rows = BTreeMap::new();
-    let mut right_rows = BTreeMap::new();
-    for (rows, index) in [(left, &mut left_rows), (right, &mut right_rows)] {
-        for &(timestamp, value) in rows {
-            if !value.is_finite() || index.insert(timestamp, value).is_some() {
-                return Err(
-                    "maintenance binary input has duplicate timestamps or non-finite values".into(),
-                );
+    let mut values = PopulationRows::new();
+    for (group, left) in left {
+        let right = &right[group];
+        if left.is_empty() || left.len() != right.len() {
+            return Err("maintenance binary requires matching nonempty timestamp sets".into());
+        }
+        // Canonical timestamp maps accept arrival-order differences, but never
+        // collapse duplicate updates or pair unrelated source windows by position.
+        let mut left_rows = BTreeMap::new();
+        let mut right_rows = BTreeMap::new();
+        for (rows, index) in [(left, &mut left_rows), (right, &mut right_rows)] {
+            for &(timestamp, value) in rows {
+                if !value.is_finite() || index.insert(timestamp, value).is_some() {
+                    return Err(
+                        "maintenance binary input has duplicate timestamps or non-finite values"
+                            .into(),
+                    );
+                }
             }
         }
-    }
-    let mut values = Vec::with_capacity(left.len());
-    for (timestamp, left) in left_rows {
-        let right = right_rows
-            .get(&timestamp)
-            .ok_or("maintenance binary requires matching timestamp sets")?;
-        let value = crate::utils::arithmetic::evaluate_float64_arithmetic(arithmetic, left, *right);
-        if !value.is_finite() {
-            return Err("maintenance binary produced a non-finite update".into());
+        let mut joined = Vec::with_capacity(left.len());
+        for (timestamp, left) in left_rows {
+            let right = right_rows
+                .get(&timestamp)
+                .ok_or("maintenance binary requires matching timestamp sets")?;
+            let value =
+                crate::utils::arithmetic::evaluate_float64_arithmetic(arithmetic, left, *right);
+            if !value.is_finite() {
+                return Err("maintenance binary produced a non-finite update".into());
+            }
+            joined.push((timestamp, value));
         }
-        values.push((timestamp, value));
+        values.insert(group.clone(), joined);
     }
     Ok(MaintenanceValue::Rows {
         values,
@@ -398,7 +443,7 @@ fn finalize_exact(
     let [input] = inputs else {
         return Err("exact maintenance finalization requires one summary input".into());
     };
-    let (states, family): (Vec<(i64, &SummaryState)>, _) = match input.as_ref() {
+    let (states, family, group): (Vec<(i64, &SummaryState)>, _, _) = match input.as_ref() {
         MaintenanceValue::Summary {
             state,
             family: Some(family),
@@ -408,11 +453,16 @@ fn finalize_exact(
             }
             // Single-state merge execution has no row timestamp. Immutable
             // execution supplies SummaryWindows with the actual window ends.
-            (vec![(0, state)], family)
+            (vec![(0, state)], family, Population::new())
         }
-        MaintenanceValue::SummaryWindows { states, family } => (
+        MaintenanceValue::SummaryWindows {
+            states,
+            family,
+            group,
+        } => (
             states.iter().map(|(time, state)| (*time, state)).collect(),
             family,
+            group.clone(),
         ),
         _ => {
             return Err("exact maintenance finalization requires a typed exact accumulator".into())
@@ -444,7 +494,7 @@ fn finalize_exact(
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok(MaintenanceValue::Rows {
-        values,
+        values: BTreeMap::from([(group, values)]),
         name: field.name.clone(),
         timestamped: node.output_schema.time_index.is_some()
             && matches!(input.as_ref(), MaintenanceValue::SummaryWindows { .. }),
@@ -455,16 +505,29 @@ fn merge_inputs(inputs: &[Arc<MaintenanceValue>]) -> Result<MaintenanceValue, St
     let mut states = Vec::new();
     let mut family = None;
     let mut end_timestamp = None;
+    let mut group = None;
     for input in inputs {
         let input_family = match input.as_ref() {
             MaintenanceValue::Summary { state, family } => {
+                if group
+                    .as_ref()
+                    .is_some_and(|group: &Population| !group.is_empty())
+                {
+                    return Err("summary merge cannot mix unscoped and grouped state".into());
+                }
+                group = Some(Population::new());
                 states.push(state);
                 family.as_ref()
             }
             MaintenanceValue::SummaryWindows {
                 states: windows,
                 family,
+                group: input_group,
             } => {
+                if group.as_ref().is_some_and(|group| group != input_group) {
+                    return Err("summary merge cannot collapse different populations".into());
+                }
+                group = Some(input_group.clone());
                 states.extend(windows.iter().map(|(_, state)| state));
                 end_timestamp = end_timestamp
                     .into_iter()
@@ -492,6 +555,7 @@ fn merge_inputs(inputs: &[Arc<MaintenanceValue>]) -> Result<MaintenanceValue, St
     }
     if let Some(timestamp) = end_timestamp {
         return Ok(MaintenanceValue::SummaryWindows {
+            group: group.unwrap_or_default(),
             states: vec![(timestamp, Arc::from(merged))].into(),
             family: family.ok_or("merged immutable state lacks a family")?,
         });
@@ -2804,7 +2868,7 @@ mod tests {
         };
         let rows = |values: Vec<(i64, f64)>| {
             Arc::new(MaintenanceValue::Rows {
-                values,
+                values: BTreeMap::from([(BTreeMap::new(), values)]),
                 name: "value".into(),
                 timestamped: true,
             })
@@ -2817,7 +2881,47 @@ mod tests {
         else {
             panic!("expected rows")
         };
-        assert_eq!(values, vec![(1_000, 3.0), (2_000, 4.0)]);
+        assert_eq!(values[&BTreeMap::new()], vec![(1_000, 3.0), (2_000, 4.0)]);
+        // Equal timestamps in different populations are separate rows, never
+        // added together before the DAG explicitly reduces those populations.
+        let a = BTreeMap::from([("instance".to_string(), "a".to_string())]);
+        let b = BTreeMap::from([("instance".to_string(), "b".to_string())]);
+        let grouped = |values| {
+            Arc::new(MaintenanceValue::Rows {
+                values,
+                name: "value".into(),
+                timestamped: true,
+            })
+        };
+        let grouped_left = grouped(BTreeMap::from([
+            (a.clone(), vec![(1_000, 5.0)]),
+            (b.clone(), vec![(1_000, 9.0)]),
+        ]));
+        let grouped_right = grouped(BTreeMap::from([
+            (a.clone(), vec![(1_000, 2.0)]),
+            (b.clone(), vec![(1_000, 4.0)]),
+        ]));
+        let MaintenanceValue::Rows { values, .. } = evaluate_aligned_binary(
+            &operation,
+            &operator,
+            &[grouped_left.clone(), grouped_right],
+        )
+        .unwrap() else {
+            panic!("expected grouped rows")
+        };
+        assert_eq!(
+            values,
+            BTreeMap::from([(a.clone(), vec![(1_000, 3.0)]), (b, vec![(1_000, 5.0)]),])
+        );
+        assert!(evaluate_aligned_binary(
+            &operation,
+            &operator,
+            &[
+                grouped_left,
+                grouped(BTreeMap::from([(a, vec![(1_000, 2.0)])]))
+            ]
+        )
+        .is_err());
         let binding = BackendExecutableBinding {
             nodes: BTreeMap::new(),
             query_sink: PostAsapNodeId(10),
@@ -2863,7 +2967,7 @@ mod tests {
             rows(vec![(1_000, 2.0), (1_000, 3.0)]),
             rows(vec![(1_000, f64::NAN), (2_000, 3.0)]),
             Arc::new(MaintenanceValue::Rows {
-                values: vec![(1_000, 2.0), (2_000, 3.0)],
+                values: BTreeMap::from([(BTreeMap::new(), vec![(1_000, 2.0), (2_000, 3.0)])]),
                 name: "value".into(),
                 timestamped: false,
             }),
@@ -2889,9 +2993,16 @@ mod tests {
         use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType, SummaryField};
         let family = SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum);
         let inputs = Arc::new(MaintenanceValue::SummaryWindows {
+            group: BTreeMap::new(),
             states: vec![(1_000, sum(2.0)), (2_000, sum(7.0))].into(),
+            family: family.clone(),
+        });
+        let different_group = Arc::new(MaintenanceValue::SummaryWindows {
+            group: BTreeMap::from([("instance".into(), "other".into())]),
+            states: vec![(1_000, sum(3.0))].into(),
             family,
         });
+        assert!(merge_inputs(&[inputs.clone(), different_group]).is_err());
         let mut read = node(2);
         read.output_schema.fields = vec![SummaryField {
             name: "value".into(),
@@ -2903,7 +3014,7 @@ mod tests {
         else {
             panic!("expected finalized rows")
         };
-        assert_eq!(values, vec![(1_000, 2.0), (2_000, 7.0)]);
+        assert_eq!(values[&BTreeMap::new()], vec![(1_000, 2.0), (2_000, 7.0)]);
         // Merge is a semantic DAG operation, not an implicit batch optimization.
         // Finalizing after it emits exactly one value instead of two updates.
         let merged = Arc::new(merge_inputs(&[inputs]).unwrap());
@@ -2911,7 +3022,7 @@ mod tests {
         else {
             panic!("expected finalized row")
         };
-        assert_eq!(values, vec![(2_000, 9.0)]);
+        assert_eq!(values[&BTreeMap::new()], vec![(2_000, 9.0)]);
         read.output_schema.fields[0].dtype =
             SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Int64);
         let integer_state = Arc::new(MaintenanceValue::Summary {
@@ -2931,6 +3042,7 @@ mod tests {
         use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType, SummaryField};
         use planner_types::pre_asap::DataType;
         let input = Arc::new(MaintenanceValue::SummaryWindows {
+            group: BTreeMap::new(),
             states: vec![(60_000, sum(10.0))].into(),
             family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
         });
@@ -2953,7 +3065,7 @@ mod tests {
         else {
             panic!("expected typed rows")
         };
-        assert_eq!(values, vec![(60_000, 10.0)]);
+        assert_eq!(values[&BTreeMap::new()], vec![(60_000, 10.0)]);
         assert_eq!(name, "value");
         let mut malformed = Vec::new();
         let mut copy = read.clone();
@@ -3020,6 +3132,62 @@ mod tests {
         };
         let error = adapter.execute(&aggregate, &[Arc::new(MaintenanceValue::summary(sum(7.0)))]);
         assert!(matches!(error, Err(reason) if reason.contains("typed update evaluator")));
+    }
+
+    #[test]
+    fn summary_update_rejects_multiple_output_populations_before_updating() {
+        use planner_types::post_asap::{GroupingStrategy, SummaryUpdate};
+        use planner_types::pre_asap::{ColumnRef, Reduction};
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../docs/examples/asapquery-planning-snapshot.json"
+            ))
+            .unwrap();
+        let mut config = snapshot.compile().unwrap().precompute_plan.materializations[0].clone();
+        config.aggregation_type = asap_types::AggregationType::Sum;
+        config.aggregation_sub_type = "sum".into();
+        config.grouping_labels = ["instance".to_string()].into_iter().collect();
+        config.partitioning = Some(asap_types::sds::PopulationPartitioning::PerEntity);
+        let family = config.accumulator_spec().unwrap().family;
+        let binding = BackendExecutableBinding {
+            nodes: BTreeMap::from([(
+                PostAsapNodeId(1),
+                BackendNodeBinding::Materialization {
+                    summary_definition: config.policy_fingerprint().into(),
+                },
+            )]),
+            query_sink: PostAsapNodeId(1),
+            query_plan_sink: asap_types::query_plan::QueryNodeId(1),
+            precompute_sinks: vec![PostAsapNodeId(1)],
+        };
+        let configs = [config];
+        let adapter = OperatorAdapter {
+            binding: &binding,
+            inputs: MaintenanceInputs::Frozen(&[]),
+            configs: &configs,
+        };
+        let mut aggregate = node(1);
+        aggregate.payload = ExecutableOperatorPayload::SummaryAgg {
+            family,
+            input: SummaryUpdate::column(ColumnRef::SampleValue),
+            reduction: Reduction::PerEntity,
+            grouping: GroupingStrategy::default(),
+        };
+        let rows = MaintenanceValue::Rows {
+            values: ["a", "b"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        BTreeMap::from([("instance".into(), name.into())]),
+                        vec![(1_000, 5.0)],
+                    )
+                })
+                .collect(),
+            name: "value".into(),
+            timestamped: true,
+        };
+        assert!(matches!(adapter.execute(&aggregate, &[Arc::new(rows)]),
+            Err(error) if error.contains("one explicitly reduced output population")));
     }
 
     #[test]
