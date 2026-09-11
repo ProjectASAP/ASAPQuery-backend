@@ -254,12 +254,32 @@ impl FlusherShared {
         })
     }
 
+    /// Resume only the caller's pending lineage, atomically with metadata
+    /// validation. A different pending input cannot be acknowledged by this call.
+    pub fn resume_matching_immutable_window(
+        &self,
+        record: &SidMetaRecord,
+        input_digest: [u8; 32],
+        start_ms: u64,
+        end_ms: u64,
+    ) -> PersistResult<Option<ImmutableWindowPublication>> {
+        self.resume_immutable_window(record.sid, Some((record, input_digest, start_ms, end_ms)))
+    }
+
     /// Complete a pending durable part without reconstructing its source input.
     /// A reservation whose part was never completed returns an error, preserving
     /// the reservation for an explicit recovery policy rather than losing data.
     pub fn resume_pending_immutable_window(
         &self,
         sid: u64,
+    ) -> PersistResult<Option<ImmutableWindowPublication>> {
+        self.resume_immutable_window(sid, None)
+    }
+
+    fn resume_immutable_window(
+        &self,
+        sid: u64,
+        expected: Option<(&SidMetaRecord, [u8; 32], u64, u64)>,
     ) -> PersistResult<Option<ImmutableWindowPublication>> {
         self.sid_metadata.transaction(|records, metadata| {
             let key = sid.to_string();
@@ -272,6 +292,15 @@ impl FlusherShared {
             if current.removed || current.retired_at_ms.is_some() || current.expires_at_ms.is_some()
             {
                 return Err(invalid("pending immutable SID was removed"));
+            }
+            if let Some((record, digest, start, end)) = expected {
+                validate_identity(&current, record)?;
+                if pending.input_digest != digest
+                    || pending.start_ms != start
+                    || pending.end_ms != end
+                {
+                    return Err(invalid("pending immutable recovery lineage differs"));
+                }
             }
             self.validate_reserved_part(sid, &pending)?;
             self.finish_reserved_part(&mut current, &pending)?;
@@ -595,5 +624,36 @@ mod tests {
             .inner
             .lookup_immutable_window(&record(), [7; 32], 10, 20)
             .is_err());
+    }
+    #[test]
+    fn matching_resume_rejects_other_lineage_without_mutating_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let handle = handle(temp.path());
+        let state = snapshot();
+        let pending = reserve(&handle, &state);
+        let path = part_dir_path(&temp.path().join("parts"), pending.part_id);
+        PartWriter::write_part(&path, pending.part_id, &[state]).unwrap();
+        assert!(handle
+            .inner
+            .resume_matching_immutable_window(&record(), [8; 32], 10, 20)
+            .is_err());
+        assert!(handle
+            .inner
+            .resume_matching_immutable_window(&record(), [7; 32], 20, 30)
+            .is_err());
+        assert!(handle.manifest().live_parts().is_empty());
+        assert_eq!(
+            handle.inner.sid_metadata.load_strict().unwrap()[0].pending_immutable,
+            Some(pending.clone())
+        );
+        assert_eq!(
+            handle
+                .inner
+                .resume_matching_immutable_window(&record(), [7; 32], 10, 20)
+                .unwrap()
+                .unwrap()
+                .part_id,
+            pending.part_id
+        );
     }
 }
