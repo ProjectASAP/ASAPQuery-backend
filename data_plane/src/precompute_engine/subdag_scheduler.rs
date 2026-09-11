@@ -1,6 +1,8 @@
 use asap_types::executable_plan::{BackendExecutableBinding, BackendNodeBinding};
 use planner_types::post_asap::PostAsapNodeId;
-use planner_types::post_asap::{ExecutableDag, ExecutableDagNode, ExecutionDataState};
+use planner_types::post_asap::{
+    EdgeRole, ExecutableDag, ExecutableDagNode, ExecutableOperatorPayload, ExecutionDataState,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
@@ -91,12 +93,36 @@ where
         .iter()
         .map(|n| (n.id.0, n))
         .collect::<BTreeMap<_, _>>();
-    let mut inputs = BTreeMap::<u32, Vec<u32>>::new();
+    let mut incoming = BTreeMap::<u32, Vec<_>>::new();
     for edge in &dag.edges {
-        inputs
-            .entry(edge.consumer.0)
-            .or_default()
-            .push(edge.producer.0);
+        incoming.entry(edge.consumer.0).or_default().push(edge);
+    }
+    let mut inputs = BTreeMap::<u32, Vec<u32>>::new();
+    for (consumer, edges) in incoming {
+        let ordered = if nodes
+            .get(&consumer)
+            .is_some_and(|node| matches!(node.payload, ExecutableOperatorPayload::Binary { .. }))
+        {
+            // Wire order is not operand order. Preserve noncommutative binary
+            // semantics even when a valid transport reorders its edge list.
+            let left = edges
+                .iter()
+                .filter(|edge| edge.role == EdgeRole::Left)
+                .collect::<Vec<_>>();
+            let right = edges
+                .iter()
+                .filter(|edge| edge.role == EdgeRole::Right)
+                .collect::<Vec<_>>();
+            if edges.len() != 2 || left.len() != 1 || right.len() != 1 {
+                return Err(ScheduleError::Invalid(
+                    "binary maintenance input roles must be exactly Left and Right".into(),
+                ));
+            }
+            vec![left[0].producer.0, right[0].producer.0]
+        } else {
+            edges.iter().map(|edge| edge.producer.0).collect()
+        };
+        inputs.insert(consumer, ordered);
     }
     let mut active = BTreeSet::new();
     let mut values = BTreeMap::<u32, Arc<V>>::new();
@@ -270,6 +296,66 @@ mod tests {
             window_end_ms: 20,
             input_lineage: b"checkpoint:3".to_vec(),
         }
+    }
+
+    #[test]
+    fn binary_operand_roles_survive_edge_reordering_and_reject_duplicates() {
+        use planner_types::post_asap::BinaryOperator;
+        use planner_types::pre_asap::{ArithmeticOpKind, BinaryOpKind};
+        struct Subtract;
+        impl PrecomputeOperatorRegistry<u32> for Subtract {
+            type Error = String;
+            fn execute(
+                &self,
+                node: &ExecutableDagNode,
+                inputs: &[Arc<u32>],
+            ) -> Result<u32, String> {
+                match node.id.0 {
+                    0 => Ok(10),
+                    1 => Ok(3),
+                    3 => Ok(*inputs[0] - *inputs[1]),
+                    _ => Err("unexpected node".into()),
+                }
+            }
+        }
+        let mut binary = node(3);
+        binary.operator = ExecutableOperator::Binary;
+        binary.payload = ExecutableOperatorPayload::Binary {
+            operator: BinaryOperator {
+                kind: BinaryOpKind::Arithmetic(ArithmeticOpKind::Sub),
+                vector_match: None,
+            },
+        };
+        let mut left = edge(0, 3);
+        left.role = EdgeRole::Left;
+        let mut right = edge(1, 3);
+        right.role = EdgeRole::Right;
+        let mut dag = ExecutableDag {
+            nodes: vec![node(0), node(1), node(2), binary, {
+                let mut query = node(4);
+                query.output_state = ExecutionDataState::READ_ROWS;
+                query
+            }],
+            edges: vec![right, left],
+            root: PostAsapNodeId(3),
+        };
+        let execute = |dag: &ExecutableDag| {
+            execute_precompute_sink(
+                dag,
+                &binding(),
+                PostAsapNodeId(3),
+                key(3),
+                &Subtract,
+                &Sink::default(),
+            )
+        };
+        assert_eq!(*execute(&dag).unwrap(), 7);
+        dag.edges.reverse();
+        assert_eq!(*execute(&dag).unwrap(), 7);
+        dag.edges[1].role = EdgeRole::Left;
+        assert!(matches!(execute(&dag), Err(ScheduleError::Invalid(_))));
+        dag.edges.pop();
+        assert!(matches!(execute(&dag), Err(ScheduleError::Invalid(_))));
     }
 
     #[test]
