@@ -91,7 +91,9 @@ impl PolicyFingerprint {
 
         // 1. metric name
         if cfg.derived_input.is_some() {
-            buf.extend_from_slice(b"derived-input-v1:");
+            // Raw policies start with UTF-8 metric bytes; 0xff is impossible
+            // there, so a metric cannot impersonate this source domain.
+            buf.extend_from_slice(b"\xffderived-input-v1:");
             buf.extend_from_slice(
                 &serde_json::to_vec(&cfg.source_identity()).expect("typed source identity"),
             );

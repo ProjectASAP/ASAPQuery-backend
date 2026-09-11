@@ -40,7 +40,20 @@ impl DerivedInputIdentity {
         if document.schema_version != crate::executable_plan::OWNED_POST_ASAP_DAG_SCHEMA_VERSION {
             return Err("unsupported derived program document version".into());
         }
-        document.decode()?;
+        let decoded = document.decode()?;
+        let literals: BTreeSet<_> = decoded
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                matches!(
+                    &node.payload,
+                    planner_types::post_asap::ExecutableOperatorPayload::Fallback {
+                        expression: planner_types::pre_asap::QueryExpr::Literal(_),
+                    }
+                )
+                .then_some(node.id)
+            })
+            .collect();
         let mut incoming: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for edge in &document.edges {
             incoming.entry(edge.consumer).or_default().push(edge);
@@ -70,10 +83,10 @@ impl DerivedInputIdentity {
                     return Err("derived program has a cycle".into());
                 }
                 stack.push((id, true));
-                let edges = incoming
-                    .get(&id)
-                    .ok_or("derived program has an unbound input leaf")?;
-                for edge in edges {
+                if !incoming.contains_key(&id) && !literals.contains(&id) {
+                    return Err("derived program has an unbound input leaf".into());
+                }
+                for edge in incoming.get(&id).into_iter().flatten() {
                     stack.push((edge.producer, false));
                 }
                 continue;
@@ -163,6 +176,22 @@ mod tests {
         let json = serde_json::to_value(&derived).unwrap();
         let decoded: PrecomputeMaterialization = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.policy_fingerprint(), derived.policy_fingerprint());
+    }
+
+    #[test]
+    fn raw_utf8_metric_cannot_impersonate_derived_policy_domain() {
+        let mut derived = config();
+        derived.derived_input = Some(DerivedInputIdentity {
+            inputs: BTreeSet::from([SummaryDefinitionId::from(derived.policy_fingerprint())]),
+            program_sha256: "d".repeat(64),
+        });
+        let mut raw = derived.clone();
+        raw.metric = format!(
+            "derived-input-v1:{}",
+            serde_json::to_string(&derived.source_identity()).unwrap()
+        );
+        raw.derived_input = None;
+        assert_ne!(raw.policy_fingerprint(), derived.policy_fingerprint());
     }
 
     #[test]
@@ -318,5 +347,37 @@ mod tests {
         let error =
             PrecomputePlan::build(envelope, vec![config], &["producer".into()]).unwrap_err();
         assert!(error.to_string().contains("immutable maintenance consumer"));
+    }
+    #[test]
+    fn literal_leaves_are_hashed_without_inventing_materialization_references() {
+        use planner_types::{
+            post_asap::{ExecutableOperator, ExecutableOperatorPayload},
+            pre_asap::{QueryExpr, ScalarValue},
+        };
+        let mut dag = program(1, 2);
+        let mut literal = dag.nodes[0].clone();
+        literal.id = PostAsapNodeId(3);
+        literal.operator = ExecutableOperator::Fallback;
+        literal.payload = serde_json::to_value(ExecutableOperatorPayload::Fallback {
+            expression: QueryExpr::Literal(ScalarValue::Int64(2)),
+        })
+        .unwrap();
+        dag.nodes.push(literal);
+        let mut edge = dag.edges[0].clone();
+        edge.producer = PostAsapNodeId(3);
+        dag.edges.push(edge);
+        let source = SummaryDefinitionId::from(config().policy_fingerprint());
+        let frontiers = BTreeMap::from([(PostAsapNodeId(1), source)]);
+        let first = DerivedInputIdentity::from_dag(&dag, dag.root, &frontiers).unwrap();
+        assert_eq!(first.inputs, BTreeSet::from([source]));
+        dag.nodes[2].payload = serde_json::to_value(ExecutableOperatorPayload::Fallback {
+            expression: QueryExpr::Literal(ScalarValue::Int64(3)),
+        })
+        .unwrap();
+        assert_ne!(
+            first,
+            DerivedInputIdentity::from_dag(&dag, dag.root, &frontiers).unwrap()
+        );
+        assert!(DerivedInputIdentity::from_dag(&dag, PostAsapNodeId(3), &frontiers).is_err());
     }
 }

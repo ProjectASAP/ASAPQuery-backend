@@ -440,7 +440,8 @@ program remains in `OwnedPostAsapDag`; the catalog does not retain another copy.
 
 The signature replaces materialized input frontiers with stable summary IDs and
 hashes the remaining node payloads, schemas, guarantees, and edge semantics. It
-excludes query names, plan-local node numbering, and catalog generations. A changed
+excludes query names, plan-local node numbering, and catalog generations. Literal
+leaves are hashed directly; raw input leaves still require catalog frontiers. A changed
 input definition or transformation creates a new identity. Existing raw-source
 identities retain their previous byte representation. Catalog validation rejects
 missing input definitions and dependency cycles.
