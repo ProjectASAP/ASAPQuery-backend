@@ -118,9 +118,14 @@ impl SummaryCatalog {
                     config
                         .population_filter_canonical()
                         .map_err(SummaryCatalogError::Descriptor)?,
-                    config.grouping_labels.labels.clone(),
-                    "asap.timestamped-observations.v2",
+                    config.grouping_labels.names(),
+                    if config.table_name.is_some() && !config.grouping_labels.is_empty() {
+                        crate::grouping_projection::TABLE_GROUP_OBSERVATION_SEMANTICS
+                    } else {
+                        "asap.timestamped-observations.v2"
+                    },
                 )
+                .with_grouping_projection(config.grouping_labels.clone())
                 .with_partitioning(config.partitioning)
                 .with_timestamp_column(config.table_timestamp_column.clone());
                 Ok((

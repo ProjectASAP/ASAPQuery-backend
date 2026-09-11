@@ -3665,7 +3665,7 @@ aggregations:
                 aggregation_type: AggregationType::Sum,
                 aggregation_sub_type: String::new(),
                 parameters: HashMap::new(),
-                grouping_labels: KeyByLabelNames::empty(),
+                grouping_labels: KeyByLabelNames::empty().into(),
                 aggregated_labels: KeyByLabelNames::empty(),
                 rollup_labels: KeyByLabelNames::empty(),
                 original_yaml: String::new(),

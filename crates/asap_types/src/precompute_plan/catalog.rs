@@ -78,6 +78,21 @@ impl PrecomputePlan {
                     table_ref: table_ref.clone(),
                 },
             );
+            if config.table_name.is_some()
+                && !config.grouping_labels.is_empty()
+                && data.observation_semantics
+                    != crate::grouping_projection::TABLE_GROUP_OBSERVATION_SEMANTICS
+            {
+                return Err(invalid(
+                    "table grouping codec differs from installed contract",
+                ));
+            }
+            if config.table_name.is_some() {
+                config
+                    .grouping_labels
+                    .validate_table_group_codec()
+                    .map_err(invalid)?;
+            }
             let expected_projection = config.effective_value_projection();
             if data.partitioning != config.partitioning
                 || data.timestamp_column != config.table_timestamp_column
@@ -85,7 +100,7 @@ impl PrecomputePlan {
                 || &data.value_projection != expected_projection
                 || data.population_filter_canonical
                     != config.population_filter_canonical().map_err(invalid)?
-                || data.group_by_keys != config.grouping_labels.labels.iter().cloned().collect()
+                || data.group_by_keys != config.grouping_labels
             {
                 return Err(invalid("source/population/grouping differs from catalog"));
             }
@@ -136,7 +151,7 @@ impl PrecomputePlan {
                 || schema.family != expected_family
                 || schema.source != source
                 || &schema.value_projection != projection
-                || schema.group_by != config.grouping_labels.labels
+                || schema.group_by != config.grouping_labels
                 || schema.window.kind != config.window_type
                 || schema.window.size_ms != size
                 || schema.window.slide_ms != expected_slide

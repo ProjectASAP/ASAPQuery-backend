@@ -52,6 +52,12 @@ pub struct SummaryInputRevision {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrecomputedOutput {
+    /// Physical lifetime chosen before execution; never re-resolve a queued
+    /// fragment against a newer logical-series mapping.
+    #[serde(skip)]
+    pub series_id: Option<u64>,
+    #[serde(skip)]
+    pub catalog_generation: Option<std::sync::Arc<asap_types::sds::CatalogGeneration>>,
     #[serde(skip)]
     pub input_revision: Option<std::sync::Arc<SummaryInputRevision>>,
     pub start_timestamp: u64,
@@ -91,6 +97,8 @@ impl PrecomputedOutput {
         policy_fp: PolicyFingerprint,
     ) -> Self {
         Self {
+            series_id: None,
+            catalog_generation: None,
             input_revision: None,
             start_timestamp,
             end_timestamp,
@@ -118,6 +126,8 @@ impl PrecomputedOutput {
         policy_fp: PolicyFingerprint,
     ) -> Self {
         Self {
+            series_id: None,
+            catalog_generation: None,
             input_revision: None,
             start_timestamp,
             end_timestamp,
