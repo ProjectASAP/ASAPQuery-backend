@@ -509,18 +509,12 @@ impl Worker {
             let too_late = previous_event_time != i64::MIN
                 && pane_timestamp(*ts)
                     < watermark_for_event_time(previous_event_time, allowed_lateness_ms);
-            let value = if let SampleUpdateRule::CounterDelta { .. } =
-                state.config.sample_update_rule()
-            {
-                let Some(delta) =
+            let value =
+                if let SampleUpdateRule::CounterDelta { .. } = state.config.sample_update_rule() {
                     reset_aware_counter_delta(&mut state.counter_previous, series_key, *val, *ts)
-                else {
-                    continue;
+                } else {
+                    Some(*val)
                 };
-                delta
-            } else {
-                *val
-            };
             for bucket_start in state.bucket_starts_for(pane_timestamp(*ts)) {
                 if let Some(revision) = &input_revision {
                     state
@@ -608,7 +602,9 @@ impl Worker {
                     .active_panes
                     .entry(bucket_start)
                     .or_insert_with(|| create_accumulator_updater(&state.config));
-                apply_sample(&mut **updater, series_key, value, *ts, &state.config);
+                if let Some(value) = value {
+                    apply_sample(&mut **updater, series_key, value, *ts, &state.config);
+                }
             }
         }
 
@@ -1847,6 +1843,56 @@ mod tests {
     // -----------------------------------------------------------------------
     // Test: raw mode — each sample forwarded as SumAccumulator with sum==value
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn initial_counter_observation_publishes_an_empty_delta_window() {
+        let mut config = make_agg_config(1, "counter", AggregationType::Sum, "sum", 1, 1, vec![]);
+        config
+            .parameters
+            .insert("weight_mode".into(), serde_json::json!("counter_delta"));
+        let fingerprint = config.policy_fingerprint();
+        let sink = Arc::new(CapturingOutputSink::new());
+        let mut worker = make_worker(
+            HashMap::from([(fingerprint.0, config)]),
+            sink.clone(),
+            false,
+            0,
+            LateDataPolicy::Drop,
+        );
+        worker.current_input_revision = Some(Arc::new(
+            crate::storage_engines::types::SummaryInputRevision {
+                generation: Arc::new(asap_types::sds::CatalogGeneration {
+                    schema_version: 1,
+                    plan_id: 1,
+                    plan_version: 1,
+                    snapshot_sha256: "test".into(),
+                }),
+                first_revision: 1,
+                revision: 1,
+            },
+        ));
+        worker
+            .process_group_samples(
+                1,
+                fingerprint,
+                &test_group_key(""),
+                vec![("counter".into(), 1000, 7.0)],
+            )
+            .unwrap();
+        worker.force_close_all().unwrap();
+        let captured = sink.drain();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].0.input_revision.as_ref().unwrap().revision, 1);
+        assert_eq!(
+            captured[0]
+                .1
+                .as_any()
+                .downcast_ref::<SumAccumulator>()
+                .unwrap()
+                .sum,
+            0.0
+        );
+    }
 
     #[test]
     fn test_raw_mode_forwarding() {

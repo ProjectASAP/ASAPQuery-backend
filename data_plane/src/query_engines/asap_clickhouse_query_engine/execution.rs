@@ -241,7 +241,7 @@ pub fn execute_sql_dag_with_external(
         t1_ms,
         is_cumulative,
     );
-    if revision != index.summary_update_revision() {
+    if !revision.matches(index.summary_update_revision()) {
         return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(
             "summary input changed during SQL DAG evaluation".into(),
         ));

@@ -557,9 +557,59 @@ impl From<&control_plane::physical::compiler::SummaryFrameIdentity> for Incomple
 /// `instances` is keyed under a `RwLock<HashMap>` because the registration
 /// rate is low (one write per first-seen sid) and reads dominate;
 /// `series` is a `DashMap` because per-sid writes happen on every DP.
+#[derive(Clone, Copy)]
+pub(crate) struct SummaryReadRevision {
+    admission: u64,
+    mutation: u64,
+    in_flight: usize,
+}
+impl SummaryReadRevision {
+    fn capture(
+        admission: u64,
+        mutation: &std::sync::atomic::AtomicU64,
+        active: &std::sync::atomic::AtomicUsize,
+        between_reads: impl FnOnce(),
+    ) -> Self {
+        use std::sync::atomic::Ordering::SeqCst;
+        let before = mutation.load(SeqCst);
+        between_reads();
+        let in_flight = active.load(SeqCst);
+        let after = mutation.load(SeqCst);
+        Self {
+            admission,
+            mutation: after,
+            in_flight: if before == after {
+                in_flight
+            } else {
+                in_flight.max(1)
+            },
+        }
+    }
+
+    pub(crate) fn matches(self, other: Self) -> bool {
+        self.in_flight == 0
+            && other.in_flight == 0
+            && self.admission == other.admission
+            && self.mutation == other.mutation
+    }
+}
+
+struct StateMutation<'a>(&'a SketchStore);
+impl Drop for StateMutation<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0.mutation_revision.fetch_add(1, SeqCst);
+        self.0.active_mutations.fetch_sub(1, SeqCst);
+    }
+}
+
 #[derive(Default)]
 pub struct SketchStore {
     admission: RwLock<admission::AdmissionInventory>,
+    mutation_revision: std::sync::atomic::AtomicU64,
+    active_mutations: std::sync::atomic::AtomicUsize,
+    admitted_mutations: std::sync::atomic::AtomicU64,
+    finite_mutation_revision: std::sync::atomic::AtomicU64,
     /// sid → metadata. May contain ghost sids (registered identities
     /// whose state was merged away by an upstream gateway before
     /// reaching this backend).
@@ -802,6 +852,8 @@ impl SketchStore {
         let series_id = persist().ok_or("summary state publication failed")?;
         inventory.record_series(generation, coordinate, series_id)?;
         inventory.acknowledge(generation, coordinate, revision)?;
+        self.admitted_mutations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let floor = coordinate
             .time_range
             .end_ms
@@ -814,7 +866,16 @@ impl SketchStore {
         &self,
         generation: &CatalogGeneration,
     ) -> Result<(), String> {
-        self.admission.write().unwrap().seal_finite(generation)
+        use std::sync::atomic::Ordering::SeqCst;
+        let mutation = self.mutation_revision.load(SeqCst);
+        if self.active_mutations.load(SeqCst) != 0
+            || mutation != self.admitted_mutations.load(SeqCst)
+        {
+            return Err("finite summary completion cannot certify untracked state writes".into());
+        }
+        self.admission.write().unwrap().seal_finite(generation)?;
+        self.finite_mutation_revision.store(mutation, SeqCst);
+        Ok(())
     }
 
     pub(crate) fn summary_window_known_empty(
@@ -823,14 +884,29 @@ impl SketchStore {
         series_id: u64,
         range: HalfOpenTimeRange,
     ) -> bool {
-        self.admission
-            .read()
-            .unwrap()
-            .known_empty(definition, series_id, range)
+        use std::sync::atomic::Ordering::SeqCst;
+        self.active_mutations.load(SeqCst) == 0
+            && self.finite_mutation_revision.load(SeqCst) == self.mutation_revision.load(SeqCst)
+            && self
+                .admission
+                .read()
+                .unwrap()
+                .known_empty(definition, series_id, range)
     }
 
-    pub(crate) fn summary_update_revision(&self) -> u64 {
-        self.admission.read().unwrap().revision()
+    pub(crate) fn summary_update_revision(&self) -> SummaryReadRevision {
+        SummaryReadRevision::capture(
+            self.admission.read().unwrap().revision(),
+            &self.mutation_revision,
+            &self.active_mutations,
+            || {},
+        )
+    }
+
+    fn begin_state_mutation(&self) -> StateMutation<'_> {
+        self.active_mutations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        StateMutation(self)
     }
 
     pub(crate) fn has_pending_summary_updates(
@@ -1117,6 +1193,7 @@ impl SketchStore {
         window: TimestampRange,
         sample: SketchSampleState,
     ) {
+        let _mutation = self.begin_state_mutation();
         let store = self
             .series
             .entry(sid)
@@ -1159,6 +1236,7 @@ impl SketchStore {
         window: TimestampRange,
         payload: Box<dyn crate::storage_engines::types::AggregateCore>,
     ) {
+        let _mutation = self.begin_state_mutation();
         let max_value = payload
             .as_any()
             .downcast_ref::<crate::precompute_engine::operators::MinMaxAccumulator>()
@@ -2335,6 +2413,7 @@ impl SketchStore {
     /// operator / debug-endpoint use so eviction can be observed in
     /// e2e tests without waiting out retirement retention.
     pub fn force_expire(&self, sid: u64) -> Option<Arc<SketchInstanceMetadata>> {
+        let _mutation = self.begin_state_mutation();
         let mut map = self.instances.write().ok()?;
         let instance = map.get_mut(&sid)?;
         let meta = Arc::make_mut(&mut instance.metadata);
@@ -2360,6 +2439,7 @@ impl SketchStore {
     /// (it is independently keyed and not part of the metadata-index
     /// invariant).
     pub fn remove_instance(&self, sid: u64) -> Option<Arc<SketchInstanceMetadata>> {
+        let _mutation = self.begin_state_mutation();
         let removed = {
             // Fixed lock order: instances → policy_to_series_ids → metric_to_series_ids.
             let mut instances = self.instances.write().ok()?;
@@ -3079,6 +3159,38 @@ mod tests {
             expires_at_ms: None,
             policy_fp,
         }
+    }
+
+    #[test]
+    fn completing_writer_between_revision_loads_cannot_certify_a_snapshot() {
+        let store = SketchStore::new();
+        let before = store.summary_update_revision();
+        let writer = store.begin_state_mutation();
+        let after = SummaryReadRevision::capture(
+            0,
+            &store.mutation_revision,
+            &store.active_mutations,
+            || drop(writer),
+        );
+        assert!(!before.matches(after));
+        assert!(!after.matches(after), "capture crossed a writer completion");
+    }
+
+    #[test]
+    fn direct_store_writes_invalidate_query_snapshots_even_without_admission() {
+        let store = SketchStore::new();
+        let before = store.summary_update_revision();
+        let mutation = store.begin_state_mutation();
+        let during = store.summary_update_revision();
+        assert!(
+            !during.matches(during),
+            "an in-flight write cannot certify a snapshot"
+        );
+        drop(mutation);
+        assert!(!before.matches(store.summary_update_revision()));
+        let before = store.summary_update_revision();
+        store.append_sample(1, BTreeMap::new(), (0, 1000), sample(1));
+        assert!(!before.matches(store.summary_update_revision()));
     }
 
     #[test]

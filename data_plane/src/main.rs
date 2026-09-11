@@ -110,8 +110,7 @@ struct Args {
     #[arg(long, env = "ASAP_CLICKHOUSE_DATABASE", default_value = "default")]
     clickhouse_database: String,
 
-    /// Enable ClickHouse as a source for queued backfill jobs whose source URL
-    /// is `clickhouse://configured`.
+    /// Enable the configured ClickHouse connection for typed table backfill jobs.
     #[arg(long, env = "ASAP_CLICKHOUSE_BACKFILL_TABLE")]
     clickhouse_backfill_table: Option<String>,
     #[arg(

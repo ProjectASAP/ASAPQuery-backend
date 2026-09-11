@@ -41,6 +41,13 @@ pane duration, and `pane_origin_ms` through the authoritative SummaryCatalog.
 Any invalid SQL entry rejects the complete candidate snapshot before
 activation; the active generation remains unchanged.
 
+SQL compilation also retains the selected Planner semantic DAG in
+`PrecomputePlan.executable_dags`. The compiler records materialization and query
+node bindings during lowering and assigns phases with the same placement builder
+as PromQL. Planner node IDs remain distinct from SummaryDefinitionId and
+QueryNodeId. This preserves the actual selected DAG across publication instead
+of reconstructing it from materialization configs later.
+
 The query listener snapshots `HotReloadActivePhysicalPlan` once per request.
 It uses the SQL parsing context and the matching `QueryPlanEntry` from that
 same snapshot, reads SummaryStore state, executes relational operators, and
@@ -48,6 +55,37 @@ encodes the requested ClickHouse format. It does not replan, choose a different
 summary, or maintain a cloned executable catalog.
 
 ## HTTP surfaces
+
+`POST /api/v1/clickhouse-plan/automatic/compile-and-publish` accepts a plan
+`envelope`, typed `tables`, `accuracy`, and `queries` (SQL plus fixed start/end
+milliseconds and cumulative-readout policy). It accepts no preselected family,
+materialization, or catalog. The control plane plans each query once and derives
+materializations only for supported SummaryAgg nodes in that selected DAG, then
+publishes the shared catalog and both execution plans through the normal atomic
+install/activate path.
+
+The initial automatic binder supports bounded, whole-second scalar reductions
+over one value column and typed table predicates. It uses the query's fixed
+window as the materialization duration; this is not a cost-optimized pane/layout
+search. The initial fixed-window policy retains two windows (a completed window
+and the next active window); it does not certify arbitrary historical or moving
+window coverage. Empty, reversed, and out-of-range evaluation intervals are
+rejected before automatic planning. Grouped table projections, count-of-rows literal updates, complex table
+types, and arbitrary boundary fragments remain unsupported here. Such inputs
+must not be presented as accelerated workload coverage.
+
+The response includes `selection_trace` from the same Planner search: candidate
+strategy, rationale, ranking, selected flag, and estimated cost when available.
+The current SQL cost model uses relative ranking and may not report a numeric
+cost; those entries carry `null` and `not_reported_by_cost_model`, not zero.
+The selected DAG, exact branches, and installed materialization IDs remain in
+the publication. The real mixed process regression optionally writes both
+publication and trace to `CLICKHOUSE_PLANNING_ARTIFACT`.
+
+Physical backend conversion preserves the selected window duration instead of
+inheriting the legacy edge emitter's 5–60 second clamp. It also takes the query
+language explicitly so SQL half-open intervals cannot acquire PromQL's
+right-closed range flag merely because both ingest raw samples.
 
 The data-plane listener supports `/`, `/ping`, and standard ClickHouse query
 parameters. Configure it with:
@@ -74,9 +112,40 @@ pane coverage, and execution errors fail closed to exact ClickHouse. The proxy
 preserves the upstream status, safe headers, and response body.
 
 ClickHouse can also provide samples to the queued backfill service through the
-explicit `clickhouse://configured` source marker. Backfill populates the same
+typed `ClickHouse { database, table }` source. Backfill populates the same
 SummaryStore instances used by other ingest sources; it does not introduce a
 second storage or catalog lifecycle.
+
+SQL materializations can carry a shared `TablePopulation` conjunction of typed
+column/literal comparisons. Its canonical identity is stored in the catalog and
+included in the materialization fingerprint together with table and value-column
+identity. These predicates do not use the PromQL label-filter normalizer. The
+reader takes its value projection and population from the installed materialization,
+binds literal values as ClickHouse parameters, and accepts either encoded series
+labels or a `Map(String,String)` label column. The requested database/table must
+match the deployment and installed source respectively.
+An absent or empty table population means every row in the table's time interval;
+the output metric name never becomes an implicit SQL predicate. Table sources
+reject legacy PromQL spatial filters.
+
+The installed `table_timestamp_column` names a Unix-millisecond column and is
+shared as `DataDescriptor.timestamp_column`. It enters both identities and is
+checked against the Planner source schema's `time_index`. Backfill uses this
+installed projection even when the deployment default names a different column.
+Legacy table definitions without a timestamp projection cannot be bound or
+backfilled; republish them with the explicit column. Time-series definitions
+retain their existing timestamp semantics and identity.
+SQL fingerprints now include the explicit table/value source, so existing SQL
+materializations must be republished and rebuilt; their old state is not reused
+under the new identity. Legacy PromQL fingerprints remain unchanged.
+
+SQL timestamp comparisons retain their exact integer-millisecond inclusivity.
+For example, `t <= 1999` and `t < 2000` identify the same half-open interval;
+`t <= 2000` does not. A source range differing from the installed fixed evaluation
+is rejected. Whole-second panes cannot yet cover an arbitrary inclusive boundary
+fragment; those queries require exact fallback until the compiler can compose
+boundary exact reads with summary interiors. Backfill still buffers a requested
+window and has not demonstrated bounded memory at large window/cardinality scale.
 
 ## Verification
 

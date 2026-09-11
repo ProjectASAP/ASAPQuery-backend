@@ -390,12 +390,15 @@ impl ASAPQueryEngine {
                     false,
                 ))
             });
-        if revision
-            != self
-                .sketch_index
-                .as_ref()
-                .map(|index| index.summary_update_revision())
-        {
+        let current = self
+            .sketch_index
+            .as_ref()
+            .map(|index| index.summary_update_revision());
+        if match (revision, current) {
+            (Some(before), Some(after)) => !before.matches(after),
+            (None, None) => false,
+            _ => true,
+        } {
             return Err(EngineError::capability_miss(
                 "installed_logical_dag",
                 "summary input changed during query DAG evaluation",

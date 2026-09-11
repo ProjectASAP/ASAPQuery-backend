@@ -14,8 +14,9 @@ use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 
 /// VictoriaMetrics HTTP adapter. VictoriaMetrics intentionally uses the
-/// Prometheus-compatible wire envelope; language classification remains in the
-/// MetricsQL binder and engine fallback path.
+/// Prometheus-compatible wire envelope. Canonical identities use the shared
+/// parser; execution resolves the installed MetricsQL QueryPlan or falls back
+/// to VictoriaMetrics.
 pub struct VictoriaMetricsHttpAdapter {
     wire: PrometheusHttpAdapter,
 }
@@ -135,7 +136,7 @@ mod tests {
     fn adapter() -> VictoriaMetricsHttpAdapter {
         VictoriaMetricsHttpAdapter::new(AdapterConfig::new(
             QueryProtocol::PrometheusHttp,
-            QueryLanguage::PromQl,
+            QueryLanguage::MetricsQl,
             None,
         ))
     }
@@ -154,6 +155,7 @@ mod tests {
 
     #[test]
     fn exposes_victoriametrics_query_endpoints() {
+        assert_eq!(adapter().query_language(), QueryLanguage::MetricsQl);
         assert_eq!(adapter().get_query_endpoint(), "/api/v1/query");
         assert_eq!(adapter().get_range_query_endpoint(), "/api/v1/query_range");
     }
@@ -170,6 +172,8 @@ mod tests {
         for query in [
             "default_rollup(cpu_usage[5m])",
             "topk_over_time(3, cpu_usage[5m])",
+            "rate(requests[5m]) keep_metric_names",
+            "sum(foo, bar)",
         ] {
             assert!(adapter().canonical_plan_identity(query).is_err());
         }
