@@ -420,7 +420,12 @@ impl ClickHouseRelationalAdapter {
                 }
                 for row in &input.rows {
                     for key in keys {
-                        eval(&key.expr, row, &schema)?;
+                        if matches!(eval(&key.expr, row, &schema)?, Cell::Float64(value) if value.is_nan())
+                        {
+                            return Err(ClickHouseRelationalError::Unsupported(
+                                "NaN sort key".into(),
+                            ));
+                        }
                     }
                 }
                 input
@@ -842,12 +847,32 @@ fn compare_sort_keys(
     Ordering::Equal
 }
 
+fn integer_float_cmp(integer: i64, float: f64) -> Option<Ordering> {
+    if float.is_nan() {
+        return None;
+    }
+    // These bounds are powers of two, exactly representable as Float64.
+    if float >= 9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Less);
+    }
+    if float < -9_223_372_036_854_775_808.0 {
+        return Some(Ordering::Greater);
+    }
+    let integral = float as i64;
+    match integer.cmp(&integral) {
+        Ordering::Equal => 0.0_f64.partial_cmp(&float.fract()),
+        other => Some(other),
+    }
+}
+
 fn cell_cmp(left: &Cell, right: &Cell) -> Option<Ordering> {
     match (left, right) {
         (Cell::Int64(left), Cell::Int64(right)) => Some(left.cmp(right)),
         (Cell::Float64(left), Cell::Float64(right)) => left.partial_cmp(right),
-        (Cell::Int64(left), Cell::Float64(right)) => (*left as f64).partial_cmp(right),
-        (Cell::Float64(left), Cell::Int64(right)) => left.partial_cmp(&(*right as f64)),
+        (Cell::Int64(left), Cell::Float64(right)) => integer_float_cmp(*left, *right),
+        (Cell::Float64(left), Cell::Int64(right)) => {
+            integer_float_cmp(*right, *left).map(Ordering::reverse)
+        }
         (Cell::Utf8(left), Cell::Utf8(right)) => Some(left.cmp(right)),
         (Cell::Bool(left), Cell::Bool(right)) => Some(left.cmp(right)),
         (Cell::Timestamp(left), Cell::Timestamp(right)) => Some(left.cmp(right)),
@@ -1393,6 +1418,30 @@ mod scalar_contract_tests {
             ],
         );
         assert!(eval(&mixed, &[], &schema).is_err());
+    }
+
+    #[test]
+    fn mixed_comparison_preserves_integer_precision_and_boundaries() {
+        assert_eq!(
+            integer_float_cmp(9_007_199_254_740_993, 9_007_199_254_740_992.0),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            integer_float_cmp(i64::MAX, 9_223_372_036_854_775_808.0),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            integer_float_cmp(i64::MIN, -9_223_372_036_854_775_808.0),
+            Some(Ordering::Equal)
+        );
+        assert_eq!(integer_float_cmp(-1, -1.5), Some(Ordering::Greater));
+        assert_eq!(integer_float_cmp(1, 1.5), Some(Ordering::Less));
+        assert_eq!(integer_float_cmp(0, f64::INFINITY), Some(Ordering::Less));
+        assert_eq!(
+            integer_float_cmp(0, f64::NEG_INFINITY),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(integer_float_cmp(0, f64::NAN), None);
     }
 
     #[test]
