@@ -76,8 +76,8 @@ asap_types.workspace = true
 # scaffolding, unaware that `data_plane`'s `summary_executor.rs` in *this*
 # repo is a real one. Vendored locally instead of chased upstream -- see
 # `data_plane/src/query_engines/asap_query_engine/summary_exec.rs`.
-planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "5e9396033a5a5d5f350bfa675d12770c972ee991" }
-asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "5e9396033a5a5d5f350bfa675d12770c972ee991" }
+planner-types = { package = "asap-types", git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "23270ba33009953b6c1e293ba95c6a430ab8d222" }
+asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "23270ba33009953b6c1e293ba95c6a430ab8d222" }
 
 # L1 adoption (design-target-architecture.md Part B): the PromQL front
 # end itself, replacing control_plane's own query_parser/promql.rs.
@@ -85,8 +85,8 @@ asap-aware-mapping = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev =
 # `planner-types`/`asap-aware-mapping` above -- these three MUST move
 # together (two revs of the same upstream repo's types in one workspace
 # resolve to distinct Rust types that won't unify).
-asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "5e9396033a5a5d5f350bfa675d12770c972ee991" }
-asap-frontend-sql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "5e9396033a5a5d5f350bfa675d12770c972ee991" }
+asap-frontend-promql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "23270ba33009953b6c1e293ba95c6a430ab8d222" }
+asap-frontend-sql = { git = "https://github.com/ProjectASAP/ASAPPlanner", rev = "23270ba33009953b6c1e293ba95c6a430ab8d222" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
