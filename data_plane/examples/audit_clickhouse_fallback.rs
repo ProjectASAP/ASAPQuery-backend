@@ -3,9 +3,7 @@ use axum::{
     http::{HeaderMap, Method},
 };
 use control_plane::{
-    physical::compiler::{
-        PlanEnvelope, PrecomputePlan, TransmissionPlan, BACKEND_COMPAT, PLANNER_REVISION,
-    },
+    physical::compiler::{PlanEnvelope, PrecomputePlan, BACKEND_COMPAT, PLANNER_REVISION},
     query_plan::{ClickHousePlanningContext, QueryPlan},
 };
 use data_plane::{
@@ -76,8 +74,12 @@ async fn main() {
     let mut precompute_plan =
         PrecomputePlan::build_backend_local(envelope.clone(), vec![]).unwrap();
     precompute_plan.summary_catalog = Some(reference.clone());
-    let mut transmission_plan =
-        TransmissionPlan::build(envelope, &precompute_plan, &BTreeMap::new()).unwrap();
+    let mut transmission_plan = control_plane::physical::compiler::compile_transmission_plan(
+        envelope,
+        &precompute_plan,
+        &BTreeMap::new(),
+    )
+    .unwrap();
     transmission_plan.summary_catalog = Some(reference);
     let query_plan = QueryPlan {
         plan_id: 27,

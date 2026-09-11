@@ -1630,7 +1630,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 crate::precompute_engine::frame_lineage::FrameLineageDecision::Apply,
                             ) => {
                                 if frame.kind
-                                    == control_plane::physical::compiler::SummaryFrameKind::Full
+                                    == asap_types::producer_plan::SummaryFrameKind::Full
                                 {
                                     ingest_state
                                         .sketch_index
@@ -2157,7 +2157,7 @@ fn preflight_summary_frames(
         mut dp: ModifiedOtlpSketchDp,
         ingest_state: &IngestState,
         active: &crate::storage_engines::types::ActivePhysicalPlan,
-    ) -> Result<control_plane::physical::compiler::SummaryFrameIdentity, String> {
+    ) -> Result<asap_types::producer_plan::SummaryFrameIdentity, String> {
         let canonical_name = canonical_sketch_metric_name(metric_name, dp.algorithm.clone());
         let frame =
             take_summary_frame_identity(&mut dp.attrs, dp.start_time_unix_nano, dp.time_unix_nano)?;
@@ -2200,7 +2200,7 @@ fn preflight_summary_frames(
 
         // A malformed full snapshot must not be discovered after an earlier
         // frame in the request has already reached SketchStore.
-        if frame.kind == control_plane::physical::compiler::SummaryFrameKind::Full {
+        if frame.kind == asap_types::producer_plan::SummaryFrameKind::Full {
             decode_modified_otlp_sketch_bytes(dp.algorithm.clone(), dp.encoding, &dp.sketch)
                 .map_err(|error| format!("invalid full frame for {metric_name}: {error}"))?;
         } else {
@@ -2358,10 +2358,9 @@ fn take_summary_frame_identity(
     attrs: &mut HashMap<String, String>,
     window_start_unix_nano: u64,
     window_end_unix_nano: u64,
-) -> Result<control_plane::physical::compiler::SummaryFrameIdentity, String> {
-    use control_plane::physical::compiler::{
-        StateEncoding, SummaryFrameIdentity, SummaryFrameKind,
-    };
+) -> Result<asap_types::producer_plan::SummaryFrameIdentity, String> {
+    use asap_types::producer_plan::{SummaryFrameIdentity, SummaryFrameKind};
+    use control_plane::physical::compiler::StateEncoding;
 
     fn required(attrs: &mut HashMap<String, String>, key: &str) -> Result<String, String> {
         attrs

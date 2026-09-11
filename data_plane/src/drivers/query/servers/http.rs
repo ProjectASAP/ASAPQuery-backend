@@ -2679,9 +2679,10 @@ mod tests {
     }
 
     async fn setup_remote_write_test_server() -> (u16, PrometheusRemoteWriteReceiver) {
+        use asap_types::producer_plan::{FrameIdentityContract, SequenceScope, TransmissionPlan};
         use control_plane::physical::compiler::{
-            FrameIdentityContract, IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan,
-            SequenceScope, TimestampUnit, TransmissionPlan, PLANNER_REVISION,
+            IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan, TimestampUnit,
+            PLANNER_REVISION,
         };
         let streaming_config = Arc::new(StreamingConfig::default());
         let envelope = PlanEnvelope {
@@ -6045,7 +6046,7 @@ async fn handle_post_streaming_config(
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-pub use control_plane::physical::publication::PhysicalPlanInstallRequest;
+pub use asap_types::plan_publication::PhysicalPlanInstallRequest;
 
 /// Decode and cross-validate every backend view before it can become visible.
 /// Used by both startup artifact loading and the staged HTTP install path.
