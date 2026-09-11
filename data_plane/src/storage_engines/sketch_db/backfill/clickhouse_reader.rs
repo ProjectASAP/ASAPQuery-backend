@@ -82,15 +82,22 @@ impl ClickHouseReader {
     }
 }
 
-/// Adds ClickHouse to the existing backfill lifecycle without extending the
-/// shared `BackfillSource` enum. Jobs opt in with the reserved
-/// `Prometheus { url: "clickhouse://configured" }` source marker; all other
-/// sources retain the default factory behavior.
+/// Resolve a typed table source using deployment-local connection settings.
 pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactory {
     let fallback = super::service::default_reader_factory();
     Arc::new(move |source| match source {
-        BackfillSource::Prometheus { url } if url == "clickhouse://configured" => {
-            Ok(Arc::new(ClickHouseReader::new(config.clone())?) as Arc<dyn RawSampleReader>)
+        BackfillSource::ClickHouse { database, table } => {
+            if database != &config.database {
+                return Err(RawSampleReaderError::Other {
+                    reason: "ClickHouse source database differs from the deployment database"
+                        .into(),
+                }
+                .into());
+            }
+            let mut source_config = config.clone();
+            source_config.database = database.clone();
+            source_config.table = table.clone();
+            Ok(Arc::new(ClickHouseReader::new(source_config)?) as Arc<dyn RawSampleReader>)
         }
         source => fallback(source),
     })
@@ -187,12 +194,23 @@ mod tests {
     }
 
     #[test]
-    fn configured_source_marker_enters_clickhouse_backfill_lifecycle() {
+    fn typed_source_enters_clickhouse_backfill_lifecycle() {
         let factory = clickhouse_reader_factory(config("samples"));
-        let reader = factory(&BackfillSource::Prometheus {
-            url: "clickhouse://configured".into(),
+        let reader = factory(&BackfillSource::ClickHouse {
+            database: "metrics".into(),
+            table: "another_table".into(),
         })
         .unwrap();
         assert_eq!(reader.source_name(), "ClickHouseReader");
+        assert!(factory(&BackfillSource::ClickHouse {
+            database: "another_database".into(),
+            table: "samples".into(),
+        })
+        .is_err());
+        assert!(factory(&BackfillSource::ClickHouse {
+            database: "metrics".into(),
+            table: "samples; DROP TABLE x".into(),
+        })
+        .is_err());
     }
 }
