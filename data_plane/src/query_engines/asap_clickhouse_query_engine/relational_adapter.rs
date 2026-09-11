@@ -1356,6 +1356,14 @@ mod scalar_contract_tests {
             eval(&access, &[Cell::Map(vec![])], &nullable).unwrap(),
             Cell::Null
         );
+        let null_key = function(
+            "asap_map_access",
+            vec![QueryExpr::Column(0), QueryExpr::Literal(ScalarValue::Null)],
+        );
+        assert_eq!(
+            eval(&null_key, &[Cell::Map(vec![])], &schema).unwrap(),
+            Cell::Null
+        );
     }
 
     #[test]
