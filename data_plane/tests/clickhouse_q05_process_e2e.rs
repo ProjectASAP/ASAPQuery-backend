@@ -271,7 +271,7 @@ async fn q05_sql_is_planned_backfilled_and_served_warm_by_backend_process() {
         .post(format!("{base}/api/v1/db/backfill"))
         .json(
             &serde_json::json!({"agg_id":agg_id,"start_ms":start_ms,"end_ms":end_ms,
-            "source":{"Prometheus":{"url":"clickhouse://configured"}},"windows_total":1}),
+            "source":{"ClickHouse":{"database":"asap_q05_e2e","table":"q05_samples"}},"windows_total":1}),
         )
         .send()
         .await

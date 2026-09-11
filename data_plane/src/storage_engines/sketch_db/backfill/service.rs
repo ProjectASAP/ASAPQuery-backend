@@ -199,6 +199,22 @@ impl BackfillService {
                 "BackfillService picking up queued job"
             );
 
+            if let BackfillSource::ClickHouse { database, table } = &job.source {
+                let snapshot = self.config_source.snapshot();
+                let configured_table = snapshot
+                    .get_aggregation_config(job.agg_id)
+                    .and_then(|config| config.table_name.as_deref());
+                let qualified_table = format!("{database}.{table}");
+                if configured_table != Some(table.as_str())
+                    && configured_table != Some(qualified_table.as_str())
+                {
+                    self.registry.mark_failed(
+                        job.job_id,
+                        "ClickHouse source differs from the installed materialization table",
+                    );
+                    continue;
+                }
+            }
             let reader = match (self.reader_factory)(&job.source) {
                 Ok(r) => r,
                 Err(e) => {
@@ -301,23 +317,22 @@ pub fn noop_reader_factory() -> ReaderFactory {
 /// * [`BackfillSource::Prometheus`] — routed to
 ///   [`super::prometheus_reader::PrometheusReader`].
 ///
-/// All other variants (`S3Gorilla`, `OtherSketch`) return a clear
+/// Other variants return a clear
 /// "not yet implemented" error, which the worker surfaces on
 /// `BackfillJob::error_message` so the control plane / operator sees
 /// exactly which reader is missing.
 pub fn default_reader_factory() -> ReaderFactory {
-    Arc::new(|source| {
-        match source {
+    Arc::new(|source| match source {
         BackfillSource::Prometheus { url } => {
             let reader = super::prometheus_reader::PrometheusReader::new(url.clone());
             Ok(Arc::new(reader) as Arc<dyn RawSampleReader>)
         }
-        BackfillSource::S3Gorilla { .. }
+        BackfillSource::ClickHouse { .. }
+        | BackfillSource::S3Gorilla { .. }
         | BackfillSource::OtherSketch { .. } => Err(format!(
-            "reader for {source:?} not yet implemented; only Prometheus is wired in-tree as of Phase 5h"
+            "no reader configured for {source:?}; ClickHouse requires its deployment reader factory"
         )
         .into()),
-    }
     })
 }
 
@@ -382,6 +397,42 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clickhouse_source_must_match_installed_table_before_reader_creation() {
+        let mut cfg = sum_config(1, "latency");
+        cfg.table_name = Some("expected_table".into());
+        let agg_fp = cfg.policy_fp_u64();
+        let hot = HotReloadStreamingConfig::from_arc(streaming_with(cfg));
+        let registry = Arc::new(BackfillRegistry::new());
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called = calls.clone();
+        let service = BackfillService::new(
+            registry.clone(),
+            hot,
+            Arc::new(move |_| {
+                called.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(Arc::new(MockRawSampleReader::new(vec![])))
+            }),
+            BackfillServiceConfig {
+                poll_interval: Duration::from_millis(5),
+            },
+        );
+        let handle = service.spawn();
+        let job_id = registry.create(
+            agg_fp,
+            (0, 20),
+            BackfillSource::ClickHouse {
+                database: "default".into(),
+                table: "wrong_table".into(),
+            },
+            1,
+        );
+        let status = wait_for_status(&registry, job_id, BackfillStatus::Failed, 2000).await;
+        handle.shutdown().await;
+        assert_eq!(status, BackfillStatus::Failed);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
