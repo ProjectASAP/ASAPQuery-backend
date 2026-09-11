@@ -126,8 +126,15 @@ pub struct PrecomputeMaterialization {
     pub num_aggregates_to_retain: Option<u64>,
 
     // SQL-specific fields (optional, used when query_language=sql)
-    pub table_name: Option<String>,   // SQL mode: table name
-    pub value_column: Option<String>, // SQL mode: which value column to aggregate
+    pub table_name: Option<String>, // SQL mode: table name
+    #[serde(
+        default,
+        alias = "value_column",
+        alias = "valueColumn",
+        alias = "valueProjection",
+        deserialize_with = "crate::sds::deserialize_optional_value_projection"
+    )]
+    pub value_projection: Option<crate::sds::ValueProjectionIdentity>,
     /// Table timestamp projection, in Unix milliseconds.
     #[serde(
         default,
@@ -177,6 +184,12 @@ impl AggregationIdInfo {
 pub type AggregationConfig = PrecomputeMaterialization;
 
 impl PrecomputeMaterialization {
+    pub fn effective_value_projection(&self) -> &crate::sds::ValueProjectionIdentity {
+        self.value_projection
+            .as_ref()
+            .unwrap_or(&crate::sds::ValueProjectionIdentity::SampleValue)
+    }
+
     /// Temporal extent of one stored base state, independent of emission cadence.
     pub fn stored_window_ms(&self) -> u64 {
         match &self.window_layout {
@@ -187,6 +200,10 @@ impl PrecomputeMaterialization {
     }
 
     pub fn population_filter_canonical(&self) -> Result<String, String> {
+        self.effective_value_projection().validate()?;
+        if self.value_projection.is_some() && self.table_name.is_none() {
+            return Err("explicit table value projection requires a table source".into());
+        }
         if let Some(column) = &self.table_timestamp_column {
             if self.table_name.is_none() || column.is_empty() {
                 return Err("table timestamp projection requires a table and a column".into());
@@ -256,7 +273,8 @@ impl PrecomputeMaterialization {
             metric,
             num_aggregates_to_retain,
             table_name,
-            value_column,
+            value_projection: value_column
+                .map(|name| crate::sds::ValueProjectionIdentity::Column { name }),
             table_population: None,
             table_timestamp_column: None,
         }
@@ -285,6 +303,19 @@ impl PrecomputeMaterialization {
     pub fn deserialize_from_json(
         data: &Value,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        if [
+            "valueColumn",
+            "value_column",
+            "valueProjection",
+            "value_projection",
+        ]
+        .iter()
+        .filter(|key| data.get(**key).is_some_and(|value| !value.is_null()))
+        .count()
+            > 1
+        {
+            return Err("multiple value projection fields are not allowed".into());
+        }
         // `aggregationId` is silently ignored — identity is
         // content-addressed via PolicyFingerprint (PR 5).
 
@@ -372,6 +403,13 @@ impl PrecomputeMaterialization {
             .filter(|value| !value.is_null())
             .map(|value| serde_json::from_value(value.clone()))
             .transpose()?;
+        if let Some(projection) = data
+            .get("valueProjection")
+            .or_else(|| data.get("value_projection"))
+            .filter(|value| !value.is_null())
+        {
+            config.value_projection = Some(serde_json::from_value(projection.clone())?);
+        }
         config.pane_origin_ms = pane_origin_ms;
         config.table_timestamp_column = data
             .get("tableTimestampColumn")
@@ -484,6 +522,31 @@ impl PrecomputeMaterialization {
             .unwrap_or("")
             .to_string();
 
+        if [
+            "valueColumn",
+            "value_column",
+            "valueProjection",
+            "value_projection",
+        ]
+        .iter()
+        .filter(|key| {
+            aggregation_data
+                .get(**key)
+                .is_some_and(|value| !value.is_null())
+        })
+        .count()
+            > 1
+        {
+            return Err(anyhow::anyhow!(
+                "multiple value projection fields are not allowed"
+            ));
+        }
+        let typed_projection: Option<crate::sds::ValueProjectionIdentity> = aggregation_data
+            .get("valueProjection")
+            .or_else(|| aggregation_data.get("value_projection"))
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::to_value(value).and_then(serde_json::from_value))
+            .transpose()?;
         let (metric, table_name, value_column) = match query_language {
             QueryLanguage::PromQl | QueryLanguage::MetricsQl => {
                 let metric = aggregation_data["metric"]
@@ -501,9 +564,22 @@ impl PrecomputeMaterialization {
                     .to_string();
                 let column = aggregation_data["valueColumn"]
                     .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("Missing valueColumn for ClickHouse SQL"))?
-                    .to_string();
-                (format!("{table}.{column}"), Some(table), Some(column))
+                    .or_else(|| {
+                        typed_projection
+                            .as_ref()
+                            .and_then(|projection| projection.column())
+                    })
+                    .map(str::to_owned);
+                if column.is_none() && typed_projection.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "Missing value projection for ClickHouse SQL"
+                    ));
+                }
+                (
+                    format!("{table}.{}", column.as_deref().unwrap_or("constant")),
+                    Some(table),
+                    column,
+                )
             }
         };
 
@@ -529,6 +605,9 @@ impl PrecomputeMaterialization {
             .filter(|value| !value.is_null())
             .map(|value| serde_yaml::from_value(value.clone()))
             .transpose()?;
+        if let Some(projection) = typed_projection {
+            config.value_projection = Some(projection);
+        }
         config.pane_origin_ms = pane_origin_ms;
         config.table_timestamp_column = aggregation_data
             .get("tableTimestampColumn")
@@ -578,8 +657,8 @@ impl SerializableToSink for PrecomputeMaterialization {
         if let Some(ref table_name) = self.table_name {
             json["tableName"] = serde_json::json!(table_name);
         }
-        if let Some(ref value_column) = self.value_column {
-            json["valueColumn"] = serde_json::json!(value_column);
+        if let Some(ref projection) = self.value_projection {
+            json["valueProjection"] = serde_json::json!(projection);
         }
         if let Some(ref population) = self.table_population {
             json["tablePopulation"] = serde_json::json!(population);
@@ -729,5 +808,68 @@ mod tests {
             json.get("aggregationId").is_none(),
             "PR 5: aggregationId must not appear on the wire — readers derive it from content"
         );
+    }
+
+    #[test]
+    fn typed_projection_roundtrips_and_legacy_column_keeps_identity() {
+        use crate::sds::ValueProjectionIdentity;
+        use planner_types::pre_asap::ScalarValue;
+        let mut config =
+            AggregationConfig::from_yaml_data(&sample_yaml(false), None, QueryLanguage::PromQl)
+                .unwrap();
+        config.table_name = Some("telemetry".into());
+        config.value_projection = Some(ValueProjectionIdentity::Column {
+            name: "value".into(),
+        });
+        let column_identity = config.policy_fingerprint();
+        let mut legacy = serde_json::to_value(&config).unwrap();
+        legacy.as_object_mut().unwrap().remove("value_projection");
+        legacy["value_column"] = serde_json::json!("value");
+        let decoded: AggregationConfig = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.policy_fingerprint(), column_identity);
+        config.value_projection = Some(ValueProjectionIdentity::Constant {
+            value: ScalarValue::Int64(1),
+        });
+        let mut wire = config.serialize_to_json();
+        // The legacy JSON and YAML readers receive their labels from the
+        // enclosing streaming config, in their respective wire shapes.
+        wire["groupingLabels"] = config.grouping_labels.serialize_to_json();
+        wire["aggregatedLabels"] = config.aggregated_labels.serialize_to_json();
+        wire["rollupLabels"] = config.rollup_labels.serialize_to_json();
+        wire["labels"] = serde_json::json!({
+            "grouping": config.grouping_labels.serialize_to_json(),
+            "aggregated": config.aggregated_labels.serialize_to_json(),
+            "rollup": config.rollup_labels.serialize_to_json(),
+        });
+        assert!(wire.get("valueColumn").is_none());
+        let json = AggregationConfig::deserialize_from_json(&wire).unwrap();
+        let yaml = AggregationConfig::from_yaml_data(
+            &serde_yaml::to_value(&wire).unwrap(),
+            None,
+            QueryLanguage::ClickHouseSql,
+        )
+        .unwrap();
+        assert_eq!(
+            json.effective_value_projection(),
+            config.effective_value_projection()
+        );
+        assert_eq!(
+            yaml.effective_value_projection(),
+            config.effective_value_projection()
+        );
+        let mut conflicting = wire;
+        conflicting["valueColumn"] = serde_json::json!("other_column");
+        assert!(AggregationConfig::deserialize_from_json(&conflicting).is_err());
+        assert!(AggregationConfig::from_yaml_data(
+            &serde_yaml::to_value(conflicting).unwrap(),
+            None,
+            QueryLanguage::ClickHouseSql
+        )
+        .is_err());
+        assert_ne!(config.policy_fingerprint(), column_identity);
+        config.value_projection = Some(ValueProjectionIdentity::Constant {
+            value: ScalarValue::Float64(f64::NAN),
+        });
+        assert!(config.population_filter_canonical().is_err());
     }
 }

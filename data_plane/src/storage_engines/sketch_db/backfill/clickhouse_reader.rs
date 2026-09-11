@@ -49,6 +49,7 @@ pub struct ClickHouseReader {
     config: ClickHouseReaderConfig,
     http: reqwest::Client,
     population: Option<asap_types::table_population::TablePopulation>,
+    value_projection: Option<asap_types::sds::ValueProjectionIdentity>,
     output_metric: Option<String>,
 }
 
@@ -73,6 +74,7 @@ impl ClickHouseReader {
             config,
             http: reqwest::Client::new(),
             population: None,
+            value_projection: None,
             output_metric: None,
         })
     }
@@ -116,6 +118,15 @@ impl ClickHouseReader {
                     .join(" AND ")
             },
         );
+        let value = match &self.value_projection {
+            Some(asap_types::sds::ValueProjectionIdentity::Constant {
+                value: planner_types::pre_asap::ScalarValue::Int64(_),
+            }) => "{projected_value:Int64}",
+            Some(asap_types::sds::ValueProjectionIdentity::Constant {
+                value: planner_types::pre_asap::ScalarValue::Float64(_),
+            }) => "{projected_value:Float64}",
+            _ => c.value_column.as_str(),
+        };
         format!(
             "SELECT {labels} AS labels, {timestamp} AS timestamp_ms, {value} AS value \
              FROM {database}.{table} WHERE {population} \
@@ -123,7 +134,7 @@ impl ClickHouseReader {
              ORDER BY labels, timestamp_ms FORMAT JSONEachRow",
             labels = c.labels_column,
             timestamp = c.timestamp_ms_column,
-            value = c.value_column,
+            value = value,
             database = c.database,
             table = c.table,
         )
@@ -149,13 +160,24 @@ pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactor
                 .table_timestamp_column
                 .clone()
                 .ok_or("table materialization has no timestamp projection")?;
-            source_config.value_column = materialization
-                .value_column
-                .clone()
-                .ok_or("table materialization has no value projection")?;
+            match materialization.effective_value_projection() {
+                asap_types::sds::ValueProjectionIdentity::Column { name } => {
+                    source_config.value_column = name.clone()
+                }
+                asap_types::sds::ValueProjectionIdentity::Constant {
+                    value: planner_types::pre_asap::ScalarValue::Int64(value),
+                } if value.unsigned_abs() > (1_u64 << 53) => {
+                    return Err("integer projection exceeds exact Float64 ingest range".into())
+                }
+                asap_types::sds::ValueProjectionIdentity::Constant { .. } => {}
+                asap_types::sds::ValueProjectionIdentity::SampleValue => {
+                    return Err("table materialization has no explicit value projection".into())
+                }
+            }
             materialization.population_filter_canonical()?;
             let mut reader = ClickHouseReader::new(source_config)?;
             reader.population = Some(materialization.table_population.clone().unwrap_or_default());
+            reader.value_projection = Some(materialization.effective_value_projection().clone());
             reader.output_metric = Some(materialization.metric.clone());
             Ok(Arc::new(reader) as Arc<dyn RawSampleReader>)
         }
@@ -183,6 +205,20 @@ impl RawSampleReader for ClickHouseReader {
             ("param_start_ms", start_ms.as_str()),
             ("param_end_ms", end_ms.as_str()),
         ]);
+        if let Some(asap_types::sds::ValueProjectionIdentity::Constant { value }) =
+            &self.value_projection
+        {
+            let value = match value {
+                planner_types::pre_asap::ScalarValue::Int64(value) => value.to_string(),
+                planner_types::pre_asap::ScalarValue::Float64(value) => value.to_string(),
+                _ => {
+                    return Err(RawSampleReaderError::Other {
+                        reason: "unsupported constant projection".into(),
+                    })
+                }
+            };
+            request = request.query(&[("param_projected_value", value)]);
+        }
         if let Some(population) = &self.population {
             for (index, predicate) in population.predicates.iter().enumerate() {
                 use planner_types::pre_asap::ScalarValue;
@@ -317,6 +353,16 @@ mod tests {
         let sql = reader.sql();
         assert!(sql.contains("WHERE 1 AND"));
         assert!(!sql.contains("{metric:String}"));
+    }
+
+    #[test]
+    fn constant_projection_uses_a_typed_parameter_without_a_fake_column() {
+        let mut reader = ClickHouseReader::new(config("samples")).unwrap();
+        reader.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Constant {
+            value: planner_types::pre_asap::ScalarValue::Int64(1),
+        });
+        assert!(reader.sql().contains("{projected_value:Int64} AS value"));
+        assert!(!reader.sql().contains(" value AS value"));
     }
 
     #[test]

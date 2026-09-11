@@ -190,7 +190,17 @@ impl PrometheusRemoteWriteReceiver {
             state.expiry_by_event_time.clear();
             state.max_event_timestamp_ms = None;
         }
+        let generation = self
+            .inner
+            .ingest
+            .physical_plan_snapshot()
+            .and_then(|plan| plan.precompute_plan.summary_catalog.clone())
+            .ok_or("finite completion requires a catalog generation")?;
         self.inner.ingest.router.drain().await?;
+        self.inner
+            .ingest
+            .sketch_index
+            .seal_finite_summary_input(&generation)?;
         trim_process_allocator();
         Ok(())
     }
@@ -322,10 +332,93 @@ impl PrometheusRemoteWriteReceiver {
         }
 
         let messages = route_messages(&new_samples, &self.inner.ingest, &physical_plan);
+        let generation = Arc::new(
+            physical_plan
+                .precompute_plan
+                .summary_catalog
+                .clone()
+                .ok_or(RemoteWriteError::InactivePhysicalPlan)?,
+        );
+        let snapshot = self.inner.ingest.hot_reload_config.snapshot();
+        let mut coordinates = std::collections::BTreeSet::new();
+        for message in &messages {
+            let WorkerMessage::GroupSamples {
+                policy_fp,
+                group_key,
+                samples,
+                ..
+            } = message
+            else {
+                continue;
+            };
+            let config = snapshot
+                .get_aggregation_config(policy_fp.as_u64())
+                .ok_or(RemoteWriteError::InactivePhysicalPlan)?;
+            let manager = crate::precompute_engine::window_manager::WindowManager::with_layout(
+                config.window_size,
+                config.slide_interval,
+                config.pane_origin_ms,
+                &config.window_layout,
+            );
+            let mut labels = group_key.as_population_labels();
+            if labels.is_empty() {
+                labels = config
+                    .grouping_labels
+                    .labels
+                    .iter()
+                    .cloned()
+                    .zip(group_key.values().labels)
+                    .collect();
+            }
+            let right_closed = config
+                .parameters
+                .get("promql_right_closed")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let affected = crate::precompute_engine::maintenance_runtime::affected_materializations(
+                &physical_plan.precompute_plan,
+                (*policy_fp).into(),
+            );
+            let mut starts = std::collections::BTreeSet::new();
+            for (_, timestamp, _) in samples {
+                let timestamp = if right_closed {
+                    timestamp.saturating_sub(1)
+                } else {
+                    *timestamp
+                };
+                starts.extend(manager.stored_bucket_starts(timestamp));
+            }
+            for start in starts {
+                let (start_ms, end_ms) = manager.stored_bucket_bounds(start);
+                for summary_definition_id in &affected {
+                    coordinates.insert(asap_types::sds::SummaryInstanceCoordinates {
+                        summary_definition_id: *summary_definition_id,
+                        time_range: asap_types::sds::HalfOpenTimeRange { start_ms, end_ms },
+                        group_values: labels.clone(),
+                    });
+                }
+            }
+        }
         self.inner
             .ingest
             .router
-            .try_route_group_batch_atomic(messages)?;
+            .try_route_group_batch_with_admission(messages, || {
+                if coordinates.is_empty() {
+                    return Ok(None);
+                }
+                let revision = self
+                    .inner
+                    .ingest
+                    .sketch_index
+                    .admit_summary_updates(&generation, coordinates)?;
+                Ok(Some(Arc::new(
+                    crate::storage_engines::types::SummaryInputRevision {
+                        generation,
+                        revision,
+                        first_revision: revision,
+                    },
+                )))
+            })?;
 
         // Commit dedup mutation only after the entire routed batch was
         // reserved successfully. A rejected/backpressured request must not
@@ -349,10 +442,12 @@ impl PrometheusRemoteWriteReceiver {
             .iter()
             .filter(|sample| sample.value.is_none())
             .count() as u64;
-        self.inner.stats.samples.fetch_add(
-            (new_samples.len() as u64).saturating_sub(stale_count),
-            Ordering::Relaxed,
-        );
+        let accepted_numeric_samples = (new_samples.len() as u64).saturating_sub(stale_count);
+        self.inner
+            .stats
+            .samples
+            .fetch_add(accepted_numeric_samples, Ordering::Relaxed);
+        crate::precompute_engine::metrics::record_accepted_samples(accepted_numeric_samples);
         self.inner
             .stats
             .stale_markers
@@ -786,11 +881,27 @@ mod tests {
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
+        let configs = streaming
+            .aggregation_configs
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let catalog = Arc::new(
+            asap_types::summary_catalog::SummaryCatalog::from_materializations(7, 3, &configs)
+                .unwrap(),
+        );
+        let reference = catalog.reference().unwrap();
+        let generation = asap_types::sds::CatalogGeneration {
+            schema_version: reference.schema_version,
+            plan_id: reference.plan_id,
+            plan_version: reference.plan_version,
+            snapshot_sha256: reference.snapshot_sha256,
+        };
         let active = ActivePhysicalPlan {
             envelope: envelope.clone(),
-            summary_catalog: None,
+            summary_catalog: Some(catalog),
             precompute_plan: PrecomputePlan {
-                summary_catalog: None,
+                summary_catalog: Some(generation),
                 envelope: envelope.clone(),
                 ingest: IngestContract {
                     protocol: IngestProtocol::PrometheusRemoteWriteV1,
@@ -860,7 +971,7 @@ mod tests {
             metric: "requests_total".into(),
             num_aggregates_to_retain: None,
             table_name: None,
-            value_column: None,
+            value_projection: None,
             table_population: None,
             table_timestamp_column: None,
             partitioning: None,
@@ -879,6 +990,18 @@ mod tests {
             sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
             observability: IngestObservability::default(),
         });
+        ingest
+            .sketch_index
+            .install_summary_catalog(
+                ingest
+                    .physical_plan_snapshot()
+                    .unwrap()
+                    .summary_catalog
+                    .as_ref()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
         (
             PrometheusRemoteWriteReceiver::new(PrometheusRemoteWriteConfig::default(), ingest),
             receiver,
@@ -896,10 +1019,13 @@ mod tests {
                 aggregation_sub_type: String::new(),
                 parameters: match aggregation_type {
                     AggregationType::CountMinSketchWithHeap => HashMap::from([
-                        ("width".into(), serde_json::json!(128)),
-                        ("depth".into(), serde_json::json!(5)),
+                        ("w".into(), serde_json::json!(128)),
+                        ("d".into(), serde_json::json!(5)),
                         ("heap_size".into(), serde_json::json!(2)),
                     ]),
+                    AggregationType::DatasketchesKLL => {
+                        HashMap::from([("k".into(), serde_json::json!(200))])
+                    }
                     _ => HashMap::new(),
                 },
                 grouping_labels: KeyByLabelNames::new(grouping),
@@ -916,7 +1042,7 @@ mod tests {
                 metric: "cpu_seconds_total".into(),
                 num_aggregates_to_retain: Some(80),
                 table_name: None,
-                value_column: None,
+                value_projection: None,
                 table_population: None,
                 table_timestamp_column: None,
                 partitioning: None,
@@ -1078,7 +1204,7 @@ mod tests {
         let drain = tokio::spawn(async move { handle.drain().await });
         assert!(matches!(
             worker.recv().await.unwrap(),
-            WorkerMessage::GroupSamples { .. }
+            WorkerMessage::Admitted { .. }
         ));
         let WorkerMessage::Drain(reply) = worker.recv().await.unwrap() else {
             panic!("expected barrier")
@@ -1261,10 +1387,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_population_blocks_partial_warm_read_until_both_workers_publish() {
+        use crate::precompute_engine::{
+            config::LateDataPolicy,
+            output_sink::SketchStoreSink,
+            worker::{Worker, WorkerRuntimeConfig},
+        };
+        use crate::query_engines::asap_query_engine::summary_executor::{
+            QueryExecutionContext, SummaryExecutorError,
+        };
+        use std::sync::atomic::{AtomicI64, AtomicUsize};
+        let (receiver, mut queued) = configured_receiver();
+        let request = WriteRequest {
+            timeseries: ["a", "b"]
+                .into_iter()
+                .map(|job| TimeSeries {
+                    labels: vec![
+                        Label {
+                            name: "__name__".into(),
+                            value: "requests_total".into(),
+                        },
+                        Label {
+                            name: "job".into(),
+                            value: job.into(),
+                        },
+                    ],
+                    samples: vec![Sample {
+                        timestamp: 100,
+                        value: 4.0,
+                    }],
+                    exemplars: vec![],
+                    histograms: vec![],
+                })
+                .collect(),
+        };
+        receiver.accept(&compressed(request)).unwrap();
+        let first = queued.recv().await.unwrap();
+        let second = queued.recv().await.unwrap();
+        let ingest = &receiver.inner.ingest;
+        let sink = Arc::new(SketchStoreSink::new(
+            ingest.sketch_index.clone(),
+            ingest.hot_reload_config.clone(),
+            ingest.series_resolver.clone(),
+        ));
+        let start_worker = |id| {
+            let (tx, rx) = mpsc::channel(4);
+            let worker = Worker::new(
+                id,
+                rx,
+                sink.clone(),
+                ingest.hot_reload_config.clone(),
+                WorkerRuntimeConfig {
+                    max_buffer_per_series: 100,
+                    allowed_lateness_ms: 0,
+                    pass_raw_samples: false,
+                    raw_mode_aggregation_id: 0,
+                    late_data_policy: LateDataPolicy::Drop,
+                    wall_clock_idle_grace_period_ms: i64::MAX,
+                    wall_clock_max_open_grace_period_ms: i64::MAX,
+                },
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicI64::new(i64::MIN)),
+            );
+            (tx, tokio::spawn(worker.run()))
+        };
+        let (fast, fast_task) = start_worker(0);
+        let (slow, slow_task) = start_worker(1);
+        fast.send(first).await.unwrap();
+        let (done, result) = tokio::sync::oneshot::channel();
+        fast.send(WorkerMessage::Drain(done)).await.unwrap();
+        result.await.unwrap().unwrap();
+        let policy = *ingest
+            .hot_reload_config
+            .snapshot()
+            .aggregation_configs
+            .keys()
+            .next()
+            .unwrap();
+        let binding = control_plane::query_plan::MaterializationBinding {
+            materialization: asap_types::PolicyFingerprint(policy).into(),
+            output_grouping: control_plane::query_plan::PhysicalGrouping::Reduce(
+                vec!["job".into()],
+            ),
+            item_labels: vec![],
+            window_ms: 60_000,
+            pane_origin_ms: Some(0),
+            readout_lookback_ms: None,
+        };
+        let context = QueryExecutionContext {
+            index: &ingest.sketch_index,
+            t0_ms: 0,
+            t1_ms: 60_000,
+            is_cumulative: true,
+            allowed_materializations: None,
+        };
+        assert!(matches!(
+            context.read_bound_materialization(&binding),
+            Err(SummaryExecutorError::Unsupported(
+                "materialization population has unpublished input"
+            ))
+        ));
+        slow.send(second).await.unwrap();
+        let (done, result) = tokio::sync::oneshot::channel();
+        slow.send(WorkerMessage::Drain(done)).await.unwrap();
+        result.await.unwrap().unwrap();
+        assert_eq!(
+            context.read_bound_materialization(&binding).unwrap().len(),
+            2
+        );
+        fast.send(WorkerMessage::Shutdown).await.unwrap();
+        slow.send(WorkerMessage::Shutdown).await.unwrap();
+        fast_task.await.unwrap();
+        slow_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn valid_request_routes_canonical_sample_to_installed_plan() {
         let (receiver, mut worker) = configured_receiver();
         receiver.accept(&one_sample(4.0)).unwrap();
         let message = worker.recv().await.expect("routed worker message");
+        let WorkerMessage::Admitted { input, revision } = message else {
+            panic!("missing admission receipt")
+        };
+        assert!(revision.revision > 0);
+        let message = *input;
         let WorkerMessage::GroupSamples {
             group_key, samples, ..
         } = message
