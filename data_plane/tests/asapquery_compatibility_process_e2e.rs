@@ -892,6 +892,7 @@ async fn run_shared_dashboard(multi_pane: bool) {
         };
         assert_eq!(remote_write(&client, &backend, &close_third).await, 204);
     }
+    drain_precompute(&client, &backend).await;
     let evaluation = base + if multi_pane { 10000 } else { 5000 };
     for (query, expected) in [
         (

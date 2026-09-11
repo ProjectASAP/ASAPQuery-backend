@@ -661,8 +661,8 @@ impl FidelityGuarantee {
         let u32_parameter = |names: &[&str], expected: u32| {
             names
                 .iter()
-                .find_map(|name| parameters.get(*name))
-                .is_none_or(|value| value.as_u64() == Some(u64::from(expected)))
+                .filter_map(|name| parameters.get(*name))
+                .all(|value| value.as_u64() == Some(u64::from(expected)))
         };
         match self {
             Self::KllRankError { k, .. } => u32_parameter(&["k", "K"], *k),
@@ -671,12 +671,12 @@ impl FidelityGuarantee {
             }
             Self::CmsFrequencyError { width, depth, .. }
             | Self::CountSketchFrequencyError { width, depth, .. } => {
-                u32_parameter(&["width"], *width) && u32_parameter(&["depth"], *depth)
+                u32_parameter(&["w", "width"], *width) && u32_parameter(&["d", "depth"], *depth)
             }
-            Self::DdSketchRelativeError { alpha } => parameters
-                .get("alpha")
-                .or_else(|| parameters.get("relative_accuracy"))
-                .is_none_or(|value| value.as_f64() == Some(*alpha)),
+            Self::DdSketchRelativeError { alpha } => ["alpha", "relative_accuracy"]
+                .iter()
+                .filter_map(|name| parameters.get(*name))
+                .all(|value| value.as_f64() == Some(*alpha)),
             _ => true,
         }
     }
@@ -713,6 +713,9 @@ pub struct DataDescriptor {
     pub id: DataDescriptorId,
     pub source: DataSourceIdentity,
     pub value_projection: ValueProjectionIdentity,
+    /// Table column containing Unix milliseconds. Absent for time-series sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_column: Option<String>,
     pub population_filter_canonical: String,
     pub group_by_keys: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -777,11 +780,13 @@ impl DataDescriptor {
             &group_by_keys,
             &observation_semantics,
             None,
+            None,
         );
         Self {
             id,
             source,
             value_projection,
+            timestamp_column: None,
             population_filter_canonical,
             group_by_keys,
             partitioning: None,
@@ -797,13 +802,27 @@ impl DataDescriptor {
             &self.group_by_keys,
             &self.observation_semantics,
             partitioning,
+            self.timestamp_column.as_deref(),
         );
         self
+    }
+    pub fn with_timestamp_column(mut self, column: Option<String>) -> Self {
+        self.timestamp_column = column;
+        let partitioning = self.partitioning;
+        self.with_partitioning(partitioning)
     }
     pub fn id(&self) -> &DataDescriptorId {
         &self.id
     }
     pub fn validate(&self) -> Result<(), SdsError> {
+        if let Some(column) = &self.timestamp_column {
+            if !matches!(self.source, DataSourceIdentity::Table { .. }) || column.is_empty() {
+                return Err(SdsError(
+                    "table timestamp projection requires a table and a column".into(),
+                ));
+            }
+            crate::table_population::validate_column_name(column).map_err(SdsError)?;
+        }
         if self.id
             != data_descriptor_id(
                 &self.source,
@@ -812,6 +831,7 @@ impl DataDescriptor {
                 &self.group_by_keys,
                 &self.observation_semantics,
                 self.partitioning,
+                self.timestamp_column.as_deref(),
             )
         {
             return Err(SdsError("data descriptor ID/content mismatch".into()));
@@ -826,6 +846,7 @@ fn data_descriptor_id(
     group_by: &BTreeSet<String>,
     observation_semantics: &str,
     partitioning: Option<PopulationPartitioning>,
+    timestamp_column: Option<&str>,
 ) -> DataDescriptorId {
     // Length framing keeps distinct typed sources, projections, predicates,
     // and grouping keys collision-free in the content identity.
@@ -840,6 +861,9 @@ fn data_descriptor_id(
     );
     if let Some(partitioning) = partitioning {
         key.push_str(&format!("|partition:{partitioning:?}"));
+    }
+    if let Some(column) = timestamp_column {
+        key.push_str(&format!("|timestamp-ms:{}:{column}", column.len()));
     }
     for name in group_by {
         key.push_str(&format!("|{}:{name}", name.len()));
@@ -1314,6 +1338,72 @@ mod tests {
             serde_json::from_str::<SummaryDefinitionId>("42").unwrap(),
             id
         );
+    }
+    /// Every supplied alias must agree with the declared fidelity, including runtime w/d keys.
+    #[test]
+    fn fidelity_rejects_conflicting_parameter_aliases() {
+        use serde_json::json;
+        let cases = [
+            (
+                FidelityGuarantee::CmsFrequencyError {
+                    width: 128,
+                    depth: 5,
+                    model: "cms".into(),
+                },
+                json!({"w":128,"d":5,"width":128,"depth":5}),
+                "w",
+                json!(256),
+            ),
+            (
+                FidelityGuarantee::CountSketchFrequencyError {
+                    width: 128,
+                    depth: 5,
+                    model: "cs".into(),
+                },
+                json!({"w":128,"d":5,"width":128,"depth":5}),
+                "d",
+                json!(4),
+            ),
+            (
+                FidelityGuarantee::KllRankError {
+                    k: 200,
+                    model: "kll".into(),
+                },
+                json!({"k":200,"K":200}),
+                "K",
+                json!(100),
+            ),
+            (
+                FidelityGuarantee::HllCardinalityError {
+                    precision: 12,
+                    model: "hll".into(),
+                },
+                json!({"precision":12,"p":12}),
+                "p",
+                json!(10),
+            ),
+            (
+                FidelityGuarantee::DdSketchRelativeError { alpha: 0.01 },
+                json!({"alpha":0.01,"relative_accuracy":0.01}),
+                "relative_accuracy",
+                json!(0.1),
+            ),
+        ];
+        for (fidelity, values, alias, conflict) in cases {
+            let mut parameters: BTreeMap<String, Value> = serde_json::from_value(values).unwrap();
+            assert!(fidelity.matches_parameters(&parameters));
+            parameters.insert(alias.into(), conflict);
+            assert!(!fidelity.matches_parameters(&parameters));
+        }
+        let cms = FidelityGuarantee::CmsFrequencyError {
+            width: 128,
+            depth: 5,
+            model: "cms".into(),
+        };
+        assert!(!cms.matches_parameters(&BTreeMap::from([
+            ("w".into(), json!(256)),
+            ("d".into(), json!(5))
+        ])));
     }
 }
 

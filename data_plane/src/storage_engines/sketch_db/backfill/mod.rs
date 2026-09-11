@@ -70,6 +70,9 @@ pub enum BackfillSource {
     /// Prometheus (or VictoriaMetrics / Thanos / Cortex) via the
     /// HTTP range-query API.
     Prometheus { url: String },
+    /// ClickHouse table read through the deployment's configured connection.
+    /// The source identity belongs to the job; credentials remain local.
+    ClickHouse { database: String, table: String },
     /// Rebuild from a different sketch already in the store. Used for
     /// lossless schema widenings (e.g. CMS(256) → CMS(2048)) where
     /// the source sketch is a strict subset of the target's
@@ -1120,6 +1123,10 @@ mod tests {
     #[test]
     fn backfill_source_roundtrips_through_serde() {
         for src in [
+            BackfillSource::ClickHouse {
+                database: "telemetry".into(),
+                table: "samples".into(),
+            },
             BackfillSource::Prometheus {
                 url: "u".to_string(),
             },
