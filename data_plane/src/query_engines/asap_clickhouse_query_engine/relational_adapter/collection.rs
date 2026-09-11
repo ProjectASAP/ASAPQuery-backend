@@ -3,7 +3,7 @@
 use planner_types::pre_asap::Column;
 
 /// Split native type arguments without splitting nested types or quoted names.
-fn arguments(input: &str) -> Option<Vec<&str>> {
+pub(super) fn arguments(input: &str) -> Option<Vec<&str>> {
     let mut result = Vec::new();
     let mut start = 0;
     let mut depth = 0_usize;

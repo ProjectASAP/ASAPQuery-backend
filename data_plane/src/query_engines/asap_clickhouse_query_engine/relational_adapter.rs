@@ -307,20 +307,11 @@ impl ClickHouseRelation {
 
 fn map_type_parts(actual: &str) -> Option<(&str, &str)> {
     let inner = actual.trim().strip_prefix("Map(")?.strip_suffix(')')?;
-    let mut depth = 0_i32;
-    let mut quoted = false;
-    for (index, ch) in inner.char_indices() {
-        match ch {
-            '\'' => quoted = !quoted,
-            '(' if !quoted => depth += 1,
-            ')' if !quoted => depth -= 1,
-            ',' if !quoted && depth == 0 => {
-                return Some((inner[..index].trim(), inner[index + 1..].trim()))
-            }
-            _ => {}
-        }
-    }
-    None
+    let args = collection::arguments(inner)?;
+    let [key, value] = args.as_slice() else {
+        return None;
+    };
+    Some((*key, *value))
 }
 
 fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: bool) -> bool {
