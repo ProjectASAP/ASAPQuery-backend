@@ -896,6 +896,11 @@ mod source_window_cohort_tests {
             *reduction = Reduction::PerEntity;
         }
         assert!(validate_maintenance_reduction(&config, &node).is_ok());
+        config.partitioning = Some(crate::sds::PopulationPartitioning::Grouped);
+        if let ExecutableOperatorPayload::SummaryAgg { reduction, .. } = &mut node.payload {
+            *reduction = Reduction::by(vec![0]);
+        }
+        assert!(validate_maintenance_reduction(&config, &node).is_err());
         config.partitioning = None;
         assert!(validate_maintenance_reduction(&config, &node).is_err());
         node.payload = ExecutableOperatorPayload::SummaryMerge;

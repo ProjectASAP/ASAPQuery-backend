@@ -1015,8 +1015,7 @@ mod tests {
 
         assert_eq!(
             expected_sid, live_sid,
-            "backfill and live ingest MUST mint the same sid for the same \
-             (metric, grouping-values, agg_kind) tuple"
+            "live sink must use the configured codec and policy identity"
         );
     }
 }
