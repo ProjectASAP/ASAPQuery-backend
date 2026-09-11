@@ -3,7 +3,7 @@
 //! Set `CLICKHOUSE_URL` (for example `http://127.0.0.1:8123`) to run it.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     io::Write,
     net::TcpListener,
     process::{Child, Command, Stdio},
@@ -51,50 +51,9 @@ async fn wait_http(client: &reqwest::Client, url: &str, child: &mut Child) {
     panic!("data plane did not become ready at {url}");
 }
 
-fn mixed_workload(
-    sql: &str,
-) -> (
-    control_plane::clickhouse::ClickHouseSqlWorkload,
-    asap_types::PrecomputeMaterialization,
-) {
-    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
-    use control_plane::physical::compiler::{
-        PlanEnvelope, PrecomputePlan, TransmissionPlan, BACKEND_COMPAT, PLANNER_REVISION,
-    };
+fn mixed_workload(sql: &str) -> control_plane::clickhouse::ClickHouseSqlAutomaticWorkload {
+    use control_plane::physical::compiler::{PlanEnvelope, BACKEND_COMPAT, PLANNER_REVISION};
     use planner_types::pre_asap::{Column, DataType, Schema};
-
-    let mut config = PrecomputeMaterialization::new(
-        AggregationType::Sum,
-        String::new(),
-        HashMap::from([("variant".into(), serde_json::json!(1))]),
-        KeyByLabelNames::empty(),
-        KeyByLabelNames::empty(),
-        KeyByLabelNames::empty(),
-        String::new(),
-        2,
-        2,
-        WindowKind::Tumbling,
-        String::new(),
-        "telemetry.value".into(),
-        None,
-        Some("telemetry".into()),
-        Some("value".into()),
-    );
-    config.pane_origin_ms = Some(0);
-    config.table_timestamp_column = Some("timestamp_ms".into());
-    config.table_population = Some(asap_types::table_population::TablePopulation {
-        predicates: vec![asap_types::table_population::TableColumnPredicate {
-            column: "metric".into(),
-            operator: planner_types::pre_asap::CompareOpKind::Eq,
-            value: planner_types::pre_asap::ScalarValue::Utf8("requests".into()),
-        }],
-    });
-    let sds = asap_types::summary_catalog::SummaryCatalog::from_materializations(
-        72,
-        1,
-        &[config.clone()],
-    )
-    .unwrap();
     let envelope = PlanEnvelope {
         plan_id: 72,
         plan_version: 1,
@@ -105,12 +64,6 @@ fn mixed_workload(
         planner_revision: PLANNER_REVISION.into(),
         capability_snapshot_id: "clickhouse-mixed-process-e2e".into(),
     };
-    let mut precompute =
-        PrecomputePlan::build_backend_local(envelope.clone(), vec![config.clone()]).unwrap();
-    precompute.summary_catalog = Some(sds.reference().unwrap());
-    let mut transmission =
-        TransmissionPlan::build(envelope, &precompute, &BTreeMap::new()).unwrap();
-    transmission.summary_catalog = Some(sds.reference().unwrap());
     let schema = |time: &str, value: &str| {
         Schema::with_time_index(
             vec![
@@ -122,35 +75,30 @@ fn mixed_workload(
             vec![],
         )
     };
-    (
-        control_plane::clickhouse::ClickHouseSqlWorkload {
-            sds,
-            precompute_plan: precompute,
-            transmission_plan: transmission,
-            tables: HashMap::from([
-                ("telemetry".into(), schema("timestamp_ms", "value")),
-                (
-                    "divisors".into(),
-                    Schema::with_time_index(
-                        vec![
-                            Column::new("timestamp", DataType::Int64, false),
-                            Column::new("divisor", DataType::Float64, false),
-                        ],
-                        0,
-                        vec![],
-                    ),
+    control_plane::clickhouse::ClickHouseSqlAutomaticWorkload {
+        envelope,
+        tables: HashMap::from([
+            ("telemetry".into(), schema("timestamp_ms", "value")),
+            (
+                "divisors".into(),
+                Schema::with_time_index(
+                    vec![
+                        Column::new("timestamp", DataType::Int64, false),
+                        Column::new("divisor", DataType::Float64, false),
+                    ],
+                    0,
+                    vec![],
                 ),
-            ]),
-            accuracy: planner_types::types::AccuracyTarget::Exact,
-            queries: vec![control_plane::clickhouse::ClickHouseSqlWorkloadEntry {
-                sql: sql.into(),
-                start_ms: 0,
-                end_ms: 2_000,
-                cumulative: true,
-            }],
-        },
-        config,
-    )
+            ),
+        ]),
+        accuracy: planner_types::types::AccuracyTarget::Exact,
+        queries: vec![control_plane::clickhouse::ClickHouseSqlWorkloadEntry {
+            sql: sql.into(),
+            start_ms: 0,
+            end_ms: 2_000,
+            cumulative: true,
+        }],
+    }
 }
 
 #[tokio::test]
@@ -235,10 +183,23 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
     }
     let exact = exact_request.send().await.unwrap().bytes().await.unwrap();
 
-    let (workload, config) = mixed_workload(sql);
-    let publication = control_plane::clickhouse::compile_clickhouse_workload(&workload)
-        .await
+    let workload = mixed_workload(sql);
+    let (publication, selection_trace) =
+        control_plane::clickhouse::compile_automatic_clickhouse_workload(&workload)
+            .await
+            .unwrap();
+    if let Ok(path) = std::env::var("CLICKHOUSE_PLANNING_ARTIFACT") {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "publication": &publication, "selection_trace": &selection_trace,
+            }))
+            .unwrap(),
+        )
         .unwrap();
+    }
+    assert_eq!(publication.precompute_plan.materializations.len(), 1);
+    let config = publication.precompute_plan.materializations[0].clone();
     let entry = publication.query_plan.entries.values().next().unwrap();
     assert!(entry.nodes.values().any(|node| matches!(
         node,

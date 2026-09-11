@@ -408,13 +408,43 @@ impl QueryPlanEntry {
         fixed_evaluation: FixedEvaluationRange,
         instant: InstantExecution,
         fallback: FallbackPolicy,
-        mut bind: F,
+        bind: F,
     ) -> Result<Self, QueryPlanError>
     where
         F: FnMut(
             &Rc<SummaryNode>,
             &SummaryFamilyType,
         ) -> Result<MaterializationBinding, QueryPlanError>,
+    {
+        Self::compile_bound_relational_mapped(
+            query_id,
+            canonical_query,
+            root,
+            fixed_evaluation,
+            instant,
+            fallback,
+            bind,
+            |_, _| {},
+        )
+    }
+
+    /// Preserve Planner-to-runtime node identities for installed SQL DAGs.
+    pub fn compile_bound_relational_mapped<F, G>(
+        query_id: String,
+        canonical_query: String,
+        root: &Rc<SummaryNode>,
+        fixed_evaluation: FixedEvaluationRange,
+        instant: InstantExecution,
+        fallback: FallbackPolicy,
+        mut bind: F,
+        mut lowered: G,
+    ) -> Result<Self, QueryPlanError>
+    where
+        F: FnMut(
+            &Rc<SummaryNode>,
+            &SummaryFamilyType,
+        ) -> Result<MaterializationBinding, QueryPlanError>,
+        G: FnMut(&Rc<SummaryNode>, QueryNodeId),
     {
         let mut compiler = DagCompiler {
             next_id: 0,
@@ -423,7 +453,7 @@ impl QueryPlanEntry {
             bind: &mut bind,
             logical_source: None,
             preserve_relational: true,
-            lowered: None,
+            lowered: Some(&mut lowered),
         };
         let root = compiler.lower(root)?;
         Ok(Self {

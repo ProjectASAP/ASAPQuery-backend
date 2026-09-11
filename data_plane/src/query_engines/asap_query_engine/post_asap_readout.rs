@@ -584,42 +584,51 @@ fn execute_physical_query_payload(
     t1_ms: u64,
     is_cumulative: bool,
 ) -> Result<PostAsapReadoutOutcome, LoweringSkip> {
-    let runtime = PhysicalQueryRuntime {
-        language: entry.language,
-        catalog: index.summary_catalog_snapshot(),
-        context: QueryExecutionContext {
-            index,
-            t0_ms,
-            t1_ms,
-            is_cumulative,
-            allowed_materializations: None,
-        },
-    };
-    let output = physical_dag::execute_from(entry, root, &runtime)
-        .map_err(|error| LoweringSkip::ExecuteFailed(format!("{error:?}")))?;
-    match output {
-        PhysicalQueryOutput::Scalar(_) => Err(LoweringSkip::ExecuteFailed(
-            "scalar-only query is not a warm vector result".into(),
-        )),
-        PhysicalQueryOutput::Value(values, coverage) => {
-            let mut series = Vec::new();
-            for (group_key, value) in &values {
-                series.extend(summary_value_to_series(group_key, value));
-            }
-            Ok(PostAsapReadoutOutcome { series, coverage })
-        }
-        PhysicalQueryOutput::State { groups, .. } => {
-            let mut coverage = None;
-            let mut series = Vec::new();
-            for (group_key, state) in &groups {
-                fold_coverage(&mut coverage, state.exact_coverage());
-                if let Some(value) = state.exact_value(&None) {
-                    series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
+    let revision = index.summary_update_revision();
+    let result = (|| {
+        let runtime = PhysicalQueryRuntime {
+            language: entry.language,
+            catalog: index.summary_catalog_snapshot(),
+            context: QueryExecutionContext {
+                index,
+                t0_ms,
+                t1_ms,
+                is_cumulative,
+                allowed_materializations: None,
+            },
+        };
+        let output = physical_dag::execute_from(entry, root, &runtime)
+            .map_err(|error| LoweringSkip::ExecuteFailed(format!("{error:?}")))?;
+        match output {
+            PhysicalQueryOutput::Scalar(_) => Err(LoweringSkip::ExecuteFailed(
+                "scalar-only query is not a warm vector result".into(),
+            )),
+            PhysicalQueryOutput::Value(values, coverage) => {
+                let mut series = Vec::new();
+                for (group_key, value) in &values {
+                    series.extend(summary_value_to_series(group_key, value));
                 }
+                Ok(PostAsapReadoutOutcome { series, coverage })
             }
-            Ok(PostAsapReadoutOutcome { series, coverage })
+            PhysicalQueryOutput::State { groups, .. } => {
+                let mut coverage = None;
+                let mut series = Vec::new();
+                for (group_key, state) in &groups {
+                    fold_coverage(&mut coverage, state.exact_coverage());
+                    if let Some(value) = state.exact_value(&None) {
+                        series.push((group_key.clone(), vec![(t1_ms as i64, value)]));
+                    }
+                }
+                Ok(PostAsapReadoutOutcome { series, coverage })
+            }
         }
+    })();
+    if !revision.matches(index.summary_update_revision()) {
+        return Err(LoweringSkip::ExecuteFailed(
+            "summary input changed during query DAG evaluation".into(),
+        ));
     }
+    result
 }
 
 /// Plan and execute an instant query without consulting the legacy candidate
