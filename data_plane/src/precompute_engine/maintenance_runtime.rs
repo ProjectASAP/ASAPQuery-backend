@@ -56,13 +56,18 @@ type PendingOutput = (
     Box<dyn AggregateCore>,
 );
 
+enum MaintenanceInputs<'a> {
+    Live {
+        definition: asap_types::sds::SummaryDefinitionId,
+        state: SummaryState,
+    },
+    Frozen(&'a [crate::storage_engines::sketch_db::index::FrozenExactWindows]),
+}
+
 struct OperatorAdapter<'a> {
     binding: &'a BackendExecutableBinding,
-    source_definition: asap_types::sds::SummaryDefinitionId,
-    source: SummaryState,
+    inputs: MaintenanceInputs<'a>,
     configs: &'a [asap_types::aggregation_config::AggregationConfig],
-    immutable_windows: Option<Arc<[(i64, SummaryState)]>>,
-    singleton_population_complete: bool,
 }
 
 impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
@@ -72,13 +77,10 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
         &self,
         node: &ExecutableDagNode,
     ) -> Result<Option<MaintenanceValue>, String> {
-        if !matches!(
-            self.binding.node(node.id),
-            Some(BackendNodeBinding::Materialization { summary_definition })
-                if *summary_definition == self.source_definition
-        ) {
-            return Ok(None);
-        }
+        let definition = match self.binding.node(node.id) {
+            Some(BackendNodeBinding::Materialization { summary_definition }) => *summary_definition,
+            _ => return Ok(None),
+        };
         let family = node.output_schema.fields.iter().find_map(|field| {
             (!matches!(
                 field.dtype,
@@ -86,16 +88,34 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
             ))
             .then(|| field.dtype.clone())
         });
-        if let Some(states) = &self.immutable_windows {
-            return Ok(Some(MaintenanceValue::SummaryWindows {
-                states: Arc::clone(states),
-                family: family.ok_or("immutable source lacks a summary schema")?,
-            }));
+        match &self.inputs {
+            MaintenanceInputs::Live {
+                definition: source,
+                state,
+            } if definition == *source => Ok(Some(MaintenanceValue::Summary {
+                state: Arc::clone(state),
+                family,
+            })),
+            MaintenanceInputs::Live { .. } => Ok(None),
+            MaintenanceInputs::Frozen(inputs) => {
+                let mut matching = inputs.iter().filter(|input| input.definition == definition);
+                let Some(input) = matching.next() else {
+                    return Ok(None);
+                };
+                if matching.next().is_some() {
+                    return Err("maintenance frontier requires explicit population routing".into());
+                }
+                Ok(Some(MaintenanceValue::SummaryWindows {
+                    states: input
+                        .windows
+                        .iter()
+                        .map(|((_, end), state)| (*end as i64, Arc::clone(state)))
+                        .collect::<Vec<_>>()
+                        .into(),
+                    family: family.ok_or("immutable source lacks a summary schema")?,
+                }))
+            }
         }
-        Ok(Some(MaintenanceValue::Summary {
-            state: Arc::clone(&self.source),
-            family,
-        }))
     }
 
     fn execute(
@@ -109,7 +129,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                 operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
                 timing: planner_types::post_asap::ExecutionTiming::MaintenanceTime,
             } => {
-                if self.immutable_windows.is_none() {
+                if !matches!(&self.inputs, MaintenanceInputs::Frozen(_)) {
                     return Err(
                         "maintenance finalization requires immutable completed input windows"
                             .into(),
@@ -124,7 +144,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                 let MaintenanceValue::Rows { values, name } = value.as_ref() else {
                     return Err("maintenance SummaryAgg requires a typed update evaluator; finalize summary state before applying an update".into());
                 };
-                if self.immutable_windows.is_none() {
+                if !matches!(&self.inputs, MaintenanceInputs::Frozen(_)) {
                     return Err(
                         "maintenance aggregation requires immutable completed input windows".into(),
                     );
@@ -144,19 +164,24 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                     .iter()
                     .find(|config| config.policy_fingerprint() == target.fingerprint())
                     .ok_or("maintenance SummaryAgg lacks installed accumulator configuration")?;
-                let source_config = self
-                    .configs
-                    .iter()
-                    .find(|config| {
-                        config.policy_fingerprint() == self.source_definition.fingerprint()
-                    })
-                    .ok_or("maintenance input lacks installed source configuration")?;
-                validate_maintenance_grouping(
-                    config,
-                    source_config,
-                    node,
-                    self.singleton_population_complete,
-                )?;
+                let MaintenanceInputs::Frozen(sources) = &self.inputs else {
+                    return Err("maintenance aggregation requires frozen sources".into());
+                };
+                for source in *sources {
+                    let source_config = self
+                        .configs
+                        .iter()
+                        .find(|config| {
+                            config.policy_fingerprint() == source.definition.fingerprint()
+                        })
+                        .ok_or("maintenance input lacks installed source configuration")?;
+                    validate_maintenance_grouping(
+                        config,
+                        source_config,
+                        node,
+                        source.singleton_population_complete,
+                    )?;
+                }
                 if config.accumulator_spec().map_err(|e| e.to_string())?.family != *family {
                     return Err(
                         "maintenance SummaryAgg family differs from installed configuration".into(),
@@ -449,13 +474,12 @@ fn prepare_frozen_maintenance_sink(
     installed: &asap_types::executable_plan::InstalledPostAsapDag,
     configs: &[asap_types::PrecomputeMaterialization],
     sink: PostAsapNodeId,
-    input: &crate::storage_engines::sketch_db::index::FrozenExactWindows,
+    inputs: &[crate::storage_engines::sketch_db::index::FrozenExactWindows],
     output_window: (u64, u64),
 ) -> Result<
     (
         planner_types::post_asap::ExecutableDag,
         MaterializationCommitKey,
-        Vec<(i64, SummaryState)>,
     ),
     String,
 > {
@@ -472,15 +496,17 @@ fn prepare_frozen_maintenance_sink(
         .derived_input
         .as_ref()
         .ok_or("immutable sink is not a derived materialization")?;
-    if expected_input.inputs != BTreeSet::from([input.definition]) {
+    if expected_input.inputs != inputs.iter().map(|input| input.definition).collect() {
         return Err("immutable sink requires synchronized input definitions".into());
     }
     if output_window.0 >= output_window.1
         || output_window.1 - output_window.0 != config.stored_window_ms()
-        || input
-            .windows
-            .keys()
-            .any(|(start, end)| *start < output_window.0 || *end > output_window.1)
+        || inputs.iter().any(|input| {
+            input
+                .windows
+                .keys()
+                .any(|(start, end)| *start < output_window.0 || *end > output_window.1)
+        })
     {
         return Err("immutable inputs do not fit the installed output window".into());
     }
@@ -499,7 +525,7 @@ fn prepare_frozen_maintenance_sink(
         .iter()
         .filter_map(|(node, binding)| match binding {
             BackendNodeBinding::Materialization { summary_definition }
-                if *summary_definition == input.definition =>
+                if expected_input.inputs.contains(summary_definition) =>
             {
                 Some((*node, *summary_definition))
             }
@@ -514,15 +540,14 @@ fn prepare_frozen_maintenance_sink(
     if &actual_input != expected_input {
         return Err("immutable sink input program differs from its catalog identity".into());
     }
-    let digest = frozen_cohort_lineage(std::slice::from_ref(input), expected_input)?;
-    let states = input
-        .windows
-        .iter()
-        .map(|((_, end), state)| (*end as i64, Arc::clone(state)))
-        .collect();
+    let digest = frozen_cohort_lineage(inputs, expected_input)?;
+    let generation = &inputs
+        .first()
+        .ok_or("immutable input cohort is empty")?
+        .generation;
     let key = MaterializationCommitKey {
-        plan_id: input.generation.plan_id,
-        plan_version: input.generation.plan_version,
+        plan_id: generation.plan_id,
+        plan_version: generation.plan_version,
         summary_definition: target,
         window_start_ms: i64::try_from(output_window.0)
             .map_err(|_| "output window exceeds timestamp range")?,
@@ -530,26 +555,21 @@ fn prepare_frozen_maintenance_sink(
             .map_err(|_| "output window exceeds timestamp range")?,
         input_lineage: digest.to_vec(),
     };
-    Ok((dag, key, states))
+    Ok((dag, key))
 }
 
 fn execute_prepared_frozen_sink(
     installed: &asap_types::executable_plan::InstalledPostAsapDag,
     configs: &[asap_types::PrecomputeMaterialization],
     sink: PostAsapNodeId,
-    input: &crate::storage_engines::sketch_db::index::FrozenExactWindows,
+    inputs: &[crate::storage_engines::sketch_db::index::FrozenExactWindows],
     dag: &planner_types::post_asap::ExecutableDag,
     key: MaterializationCommitKey,
-    states: Vec<(i64, SummaryState)>,
 ) -> Result<SummaryState, String> {
-    let first = states.first().ok_or("immutable input is empty")?;
     let adapter = OperatorAdapter {
         binding: &installed.binding,
-        source_definition: input.definition,
-        source: Arc::clone(&first.1),
+        inputs: MaintenanceInputs::Frozen(inputs),
         configs,
-        immutable_windows: Some(states.into()),
-        singleton_population_complete: input.singleton_population_complete,
     };
     let value = execute_precompute_sink(
         dag,
@@ -571,14 +591,26 @@ fn evaluate_frozen_maintenance_sink(
     input: &crate::storage_engines::sketch_db::index::FrozenExactWindows,
     output_window: (u64, u64),
 ) -> Result<(SummaryState, [u8; 32]), String> {
-    let (dag, key, states) =
-        prepare_frozen_maintenance_sink(installed, configs, sink, input, output_window)?;
+    let (dag, key) = prepare_frozen_maintenance_sink(
+        installed,
+        configs,
+        sink,
+        std::slice::from_ref(input),
+        output_window,
+    )?;
     let digest = key
         .input_lineage
         .as_slice()
         .try_into()
         .map_err(|_| "invalid input digest")?;
-    let state = execute_prepared_frozen_sink(installed, configs, sink, input, &dag, key, states)?;
+    let state = execute_prepared_frozen_sink(
+        installed,
+        configs,
+        sink,
+        std::slice::from_ref(input),
+        &dag,
+        key,
+    )?;
     Ok((state, digest))
 }
 
@@ -659,8 +691,13 @@ pub fn execute_completed_maintenance(
         &[(source_sid, source, expected, group.clone())],
     )?;
     let frozen = cohort.pop().ok_or("immutable input cohort is empty")?;
-    let (dag, key, states) =
-        prepare_frozen_maintenance_sink(installed, configs, sink, &frozen, window)?;
+    let (dag, key) = prepare_frozen_maintenance_sink(
+        installed,
+        configs,
+        sink,
+        std::slice::from_ref(&frozen),
+        window,
+    )?;
     let digest = key
         .input_lineage
         .as_slice()
@@ -686,7 +723,14 @@ pub fn execute_completed_maintenance(
     )? {
         return Ok(false);
     }
-    let state = execute_prepared_frozen_sink(installed, configs, sink, &frozen, &dag, key, states)?;
+    let state = execute_prepared_frozen_sink(
+        installed,
+        configs,
+        sink,
+        std::slice::from_ref(&frozen),
+        &dag,
+        key,
+    )?;
     let mut output = crate::storage_engines::types::PrecomputedOutput::new(
         window.0,
         window.1,
@@ -1124,11 +1168,11 @@ impl MaintenanceDagSink {
             }
             let adapter = OperatorAdapter {
                 binding: &installed.binding,
-                source_definition,
-                source: Arc::clone(&source),
+                inputs: MaintenanceInputs::Live {
+                    definition: source_definition,
+                    state: Arc::clone(&source),
+                },
                 configs: &plan.precompute_plan.materializations,
-                immutable_windows: None,
-                singleton_population_complete: false,
             };
             for sink_node in &installed.binding.precompute_sinks {
                 // Derived summaries consume complete immutable windows at the
@@ -1499,6 +1543,87 @@ mod tests {
     }
 
     #[test]
+    fn frozen_adapter_resolves_each_materialized_frontier_without_aliasing() {
+        use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType, SummaryField};
+        let make = |id| crate::storage_engines::sketch_db::index::FrozenExactWindows {
+            sid: id,
+            definition: definition(id),
+            generation: Arc::new(asap_types::sds::CatalogGeneration {
+                schema_version: 2,
+                plan_id: 1,
+                plan_version: 1,
+                snapshot_sha256: "0".repeat(64),
+            }),
+            group: BTreeMap::new(),
+            windows: BTreeMap::from([((0, 1000), sum(id as f64))]),
+            singleton_population_complete: false,
+        };
+        let inputs = [make(1), make(2)];
+        let binding = BackendExecutableBinding {
+            nodes: [(1, definition(1)), (2, definition(2)), (3, definition(3))]
+                .into_iter()
+                .map(|(id, summary_definition)| {
+                    (
+                        PostAsapNodeId(id),
+                        BackendNodeBinding::Materialization { summary_definition },
+                    )
+                })
+                .collect(),
+            query_sink: PostAsapNodeId(3),
+            query_plan_sink: asap_types::query_plan::QueryNodeId(3),
+            precompute_sinks: vec![PostAsapNodeId(3)],
+        };
+        let adapter = OperatorAdapter {
+            binding: &binding,
+            inputs: MaintenanceInputs::Frozen(&inputs),
+            configs: &[],
+        };
+        let source_node = |id| {
+            let mut source = node(id);
+            source.output_schema.fields = vec![SummaryField {
+                name: "state".into(),
+                dtype: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
+                nullable: false,
+            }];
+            source
+        };
+        let first = adapter
+            .materialized_input(&source_node(1))
+            .unwrap()
+            .unwrap();
+        let second = adapter
+            .materialized_input(&source_node(2))
+            .unwrap()
+            .unwrap();
+        assert!(adapter
+            .materialized_input(&source_node(3))
+            .unwrap()
+            .is_none());
+        let merged = adapter
+            .execute(&node(3), &[Arc::new(first), Arc::new(second)])
+            .unwrap();
+        assert_eq!(
+            merged
+                .state()
+                .unwrap()
+                .query_statistic(
+                    asap_types::Statistic::Sum,
+                    &None,
+                    &std::collections::HashMap::new()
+                )
+                .unwrap(),
+            3.0
+        );
+        let ambiguous = [make(1), make(1)];
+        let adapter = OperatorAdapter {
+            binding: &binding,
+            inputs: MaintenanceInputs::Frozen(&ambiguous),
+            configs: &[],
+        };
+        assert!(adapter.materialized_input(&source_node(1)).is_err());
+    }
+
+    #[test]
     fn finalized_summary_update_builds_a_different_installed_family() {
         use planner_types::post_asap::{
             ExactKind, ExactParams, GroupingStrategy, SummaryFamilyType, SummaryField,
@@ -1551,13 +1676,25 @@ mod tests {
             query_plan_sink: control_plane::query_plan::QueryNodeId(3),
             precompute_sinks: vec![PostAsapNodeId(3)],
         };
+        let frozen_inputs = [
+            crate::storage_engines::sketch_db::index::FrozenExactWindows {
+                sid: 1,
+                definition: source_definition,
+                generation: Arc::new(asap_types::sds::CatalogGeneration {
+                    schema_version: 2,
+                    plan_id: 1,
+                    plan_version: 1,
+                    snapshot_sha256: "0".repeat(64),
+                }),
+                group: BTreeMap::new(),
+                windows: BTreeMap::from([((0, 1000), sum(7.0))]),
+                singleton_population_complete: false,
+            },
+        ];
         let adapter = OperatorAdapter {
             binding: &binding,
-            source_definition,
-            source: sum(7.0),
+            inputs: MaintenanceInputs::Frozen(&frozen_inputs),
             configs: &configs,
-            immutable_windows: Some(vec![(1000, sum(7.0))].into()),
-            singleton_population_complete: false,
         };
         let mut read = node(2);
         read.payload = ExecutableOperatorPayload::Value {
@@ -2106,11 +2243,11 @@ mod tests {
         };
         let adapter = OperatorAdapter {
             binding: &binding,
-            source_definition: definition(1),
-            source: sum(7.0),
+            inputs: MaintenanceInputs::Live {
+                definition: definition(1),
+                state: sum(7.0),
+            },
             configs: &[],
-            immutable_windows: None,
-            singleton_population_complete: false,
         };
         let mut aggregate = node(1);
         aggregate.operator = ExecutableOperator::SummaryAgg;
@@ -2431,11 +2568,11 @@ mod tests {
         let source = sum(2.0);
         let adapter = OperatorAdapter {
             binding: &binding,
-            source_definition: definition(1),
-            source,
+            inputs: MaintenanceInputs::Live {
+                definition: definition(1),
+                state: source,
+            },
             configs: &[],
-            immutable_windows: None,
-            singleton_population_complete: false,
         };
         let commits = CommitRegistry::default();
         let key = MaterializationCommitKey {
@@ -2506,11 +2643,11 @@ mod tests {
         };
         let adapter = OperatorAdapter {
             binding: &binding,
-            source_definition: definition(1),
-            source: sum(2.0),
+            inputs: MaintenanceInputs::Live {
+                definition: definition(1),
+                state: sum(2.0),
+            },
             configs: &[],
-            immutable_windows: None,
-            singleton_population_complete: false,
         };
         let commits = CommitRegistry::default();
         let key = MaterializationCommitKey {
