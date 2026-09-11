@@ -87,7 +87,36 @@ impl SketchStore {
         generation: &CatalogGeneration,
     ) -> Result<BTreeMap<u64, BTreeMap<BTreeMap<String, String>, BTreeSet<(u64, u64)>>>, String>
     {
+        self.maintenance_coordinates(definition, generation, false)
+    }
+
+    /// Prove the complete raw population before a group-aware consumer joins it.
+    /// Historical durable SIDs cannot disappear merely because restart did not
+    /// bind them to the current catalog.
+    pub(crate) fn complete_raw_maintenance_population(
+        &self,
+        definition: SummaryDefinitionId,
+        generation: &CatalogGeneration,
+    ) -> Result<BTreeMap<u64, BTreeMap<BTreeMap<String, String>, BTreeSet<(u64, u64)>>>, String>
+    {
+        self.maintenance_coordinates(definition, generation, true)
+    }
+
+    fn maintenance_coordinates(
+        &self,
+        definition: SummaryDefinitionId,
+        generation: &CatalogGeneration,
+        require_complete_population: bool,
+    ) -> Result<BTreeMap<u64, BTreeMap<BTreeMap<String, String>, BTreeSet<(u64, u64)>>>, String>
+    {
+        let admission = self
+            .admission
+            .read()
+            .map_err(|_| "admission registry poisoned")?;
         self.validate_routed_catalog_generation(Some(generation))?;
+        if require_complete_population && !admission.is_finite_complete() {
+            return Err("complete raw population requires a finite source closure".into());
+        }
         let handle = self
             .persistence_read
             .read()
@@ -105,13 +134,33 @@ impl SketchStore {
                 .filter(|(_, binding)| binding.metadata.policy_fp == definition.fingerprint())
                 .map(|(sid, _)| *sid),
         );
-        if population_ids.len() > 1 {
+        if !require_complete_population && population_ids.len() > 1 {
             return Err("immutable maintenance requires one durable physical population".into());
         }
         let completed = self
             .completed_windows
             .read()
             .map_err(|_| "completion registry poisoned")?;
+        if require_complete_population {
+            if population_ids.is_empty() {
+                return Err("raw population has no durable physical instances".into());
+            }
+            for sid in &population_ids {
+                let binding = instances
+                    .get(sid)
+                    .ok_or("durable population SID is not bound in this catalog")?;
+                if binding.catalog_generation.as_deref() != Some(generation)
+                    || !binding.metadata.is_writable()
+                    || matches!(
+                        binding.data_descriptor.source,
+                        asap_types::sds::DataSourceIdentity::Derived { .. }
+                    )
+                    || !completed.contains_key(sid)
+                {
+                    return Err("raw population contains an incomplete or foreign lifetime".into());
+                }
+            }
+        }
         let mut coordinates = BTreeMap::new();
         for (sid, binding) in instances.iter() {
             if binding.metadata.policy_fp != definition.fingerprint()
@@ -147,6 +196,11 @@ impl SketchStore {
                         .insert((record.start_ts, record.end_ts));
                 }
             }
+        }
+        if require_complete_population
+            && coordinates.keys().copied().collect::<BTreeSet<_>>() != population_ids
+        {
+            return Err("completed raw population is missing durable payload coordinates".into());
         }
         Ok(coordinates)
     }
@@ -498,6 +552,114 @@ mod tests {
     use asap_types::traits::SerializableToSink;
 
     #[test]
+    fn complete_population_keeps_every_sid_and_rejects_missing_live_binding() {
+        // Multiple SIDs are inventory entries, never an implicit singleton;
+        // removing a live binding cannot hide its retained durable population.
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-planning-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let mut first = plan.precompute_plan.materializations[0].clone();
+        first.aggregation_type = asap_types::AggregationType::Sum;
+        first.aggregation_sub_type = "sum".into();
+        first.grouping_labels = ["instance".to_string()].into_iter().collect();
+        let mut target = first.clone();
+        target.derived_input = Some(asap_types::derived_input::DerivedInputIdentity {
+            inputs: BTreeSet::from([first.policy_fingerprint().into()]),
+            program_sha256: "0".repeat(64),
+        });
+        let configs = [first.clone(), first, target];
+        let catalog =
+            asap_types::summary_catalog::SummaryCatalog::from_materializations(1, 1, &configs)
+                .unwrap();
+        let store = Arc::new(SketchStore::new());
+        store
+            .install_summary_catalog(Arc::new(catalog.clone()))
+            .unwrap();
+        let generation = store.active_catalog_generation().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = persistence::config::SketchStorePersistenceConfig::with_memory_limit(
+            1 << 24,
+            directory.path().to_path_buf(),
+        );
+        config.delete_older_than_ms = None;
+        config.hot_window_ms = None;
+        let mut persistence = store.start_persistence(config).unwrap();
+        for (index, config) in configs.iter().take(2).enumerate() {
+            let definition = config.policy_fingerprint().into();
+            let population = BTreeMap::from([("instance".to_string(), index.to_string())]);
+            let coordinate = asap_types::sds::SummaryInstanceCoordinates {
+                summary_definition_id: definition,
+                time_range: HalfOpenTimeRange {
+                    start_ms: 0,
+                    end_ms: 1000,
+                },
+                group_values: population.clone(),
+            };
+            let revision = store
+                .admit_summary_updates(&generation, BTreeSet::from([coordinate.clone()]))
+                .unwrap();
+            let mut output = PrecomputedOutput::new(0, 1000, None, config.policy_fingerprint());
+            output.catalog_generation = Some(Arc::clone(&generation));
+            output.population_labels = Some(population);
+            let mut sum = SumAccumulator::new();
+            sum.update(5.0 + index as f64);
+            let sid = 900 + index as u64;
+            store
+                .publish_admitted_summary_update(
+                    &generation,
+                    &coordinate,
+                    revision,
+                    revision,
+                    2000,
+                    |writer| writer.ingest_precompute_with_series_id(sid, config, &output, &sum),
+                )
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !store.seal_finite_summary_input(&generation).unwrap() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let definition = configs[0].policy_fingerprint().into();
+        let parts = persistence.manifest.live_parts().len();
+        let metadata = persistence
+            .flusher
+            .metadata_store()
+            .load_strict()
+            .unwrap()
+            .len();
+        let inventory = store
+            .complete_raw_maintenance_population(definition, &generation)
+            .unwrap();
+        assert_eq!(
+            inventory.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([900, 901])
+        );
+        assert!(inventory.values().all(|groups| groups.len() == 1));
+        assert!(store
+            .completed_maintenance_coordinates(definition, &generation)
+            .is_err());
+        store.instances.write().unwrap().remove(&901);
+        assert!(store
+            .complete_raw_maintenance_population(definition, &generation)
+            .is_err());
+        assert_eq!(persistence.manifest.live_parts().len(), parts);
+        assert_eq!(
+            persistence
+                .flusher
+                .metadata_store()
+                .load_strict()
+                .unwrap()
+                .len(),
+            metadata
+        );
+        persistence.shutdown();
+    }
+
+    #[test]
     fn cohort_requires_every_durable_source_in_one_catalog_generation() {
         // Neither a missing second window nor a new catalog may yield a
         // partially acquired cohort, even when the first source is complete.
@@ -701,6 +863,9 @@ mod tests {
                 )
                 .unwrap();
         }
+        assert!(store
+            .complete_raw_maintenance_population(source.policy_fingerprint().into(), &generation)
+            .is_err());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !store.seal_finite_summary_input(&generation).unwrap() {
             assert!(std::time::Instant::now() < deadline);
@@ -712,6 +877,13 @@ mod tests {
             .unwrap();
         assert_eq!(coordinates.len(), 1);
         assert_eq!(coordinates[&700].len(), 2);
+        assert_eq!(
+            store
+                .complete_raw_maintenance_population(source_id, &generation)
+                .unwrap(),
+            coordinates
+        );
+
         let group = BTreeMap::from([("instance".into(), "a".into())]);
         let frozen = store
             .read_frozen_exact_windows(
