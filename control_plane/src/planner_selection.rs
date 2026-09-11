@@ -194,6 +194,38 @@ pub fn select_workload_with_accuracy_model(
     evidence: &dyn AccuracyEvidenceProvider,
     accuracy_model: &dyn AccuracyModel,
 ) -> Result<Vec<(usize, Rc<SummaryNode>)>, SelectionError> {
+    select_workload_impl(roots, accuracy, cost_model, evidence, accuracy_model, None)
+}
+
+/// Return the candidate ranking and committed choices from the same search
+/// that produces the installed roots. Missing numeric costs remain explicit.
+pub fn select_workload_with_accuracy_model_and_trace(
+    roots: Vec<(usize, Rc<QueryExpr>)>,
+    accuracy: AccuracyTarget,
+    cost_model: &dyn CostModel,
+    evidence: &dyn AccuracyEvidenceProvider,
+    accuracy_model: &dyn AccuracyModel,
+) -> Result<(Vec<(usize, Rc<SummaryNode>)>, serde_json::Value), SelectionError> {
+    let mut trace = serde_json::Value::Null;
+    let selected = select_workload_impl(
+        roots,
+        accuracy,
+        cost_model,
+        evidence,
+        accuracy_model,
+        Some(&mut trace),
+    )?;
+    Ok((selected, trace))
+}
+
+fn select_workload_impl(
+    roots: Vec<(usize, Rc<QueryExpr>)>,
+    accuracy: AccuracyTarget,
+    cost_model: &dyn CostModel,
+    evidence: &dyn AccuracyEvidenceProvider,
+    accuracy_model: &dyn AccuracyModel,
+    trace: Option<&mut serde_json::Value>,
+) -> Result<Vec<(usize, Rc<SummaryNode>)>, SelectionError> {
     // Canonical CSE still runs inside search_workload_with_targets. Do not
     // offer CSE's per-invocation recompute alternative: this runtime currently
     // provisions continuously maintained, content-addressed state only.
@@ -218,6 +250,30 @@ pub fn select_workload_with_accuracy_model(
         accuracy_model,
     );
     let selection = space.global_selection(cost_model);
+    if let Some(trace) = trace {
+        let groups = space.cost_sorted(cost_model).iter().enumerate().map(|(index, group)| {
+            let chosen = selection.groups().find(|selected| Rc::ptr_eq(selected.target, group.target))
+                .and_then(|selected| selected.chosen);
+            let candidates = group.candidates.iter().zip(&group.costs).enumerate()
+                .map(|(rank, (candidate, cost))| serde_json::json!({
+                    "rank": rank,
+                    "strategy": candidate.strategy,
+                    "provenance": format!("{:?}", candidate.provenance),
+                    "rationale": candidate.rationale,
+                    "replacement_kind": match &candidate.replacement {
+                        Replacement::Summary(_) => "summary",
+                        Replacement::Rewrite(_) => "rewrite",
+                        Replacement::ExactComposition(_) => "exact_composition",
+                    },
+                    "estimated_cost": cost.is_finite().then_some(*cost),
+                    "estimated_cost_status": if cost.is_finite() { "available" } else { "not_reported_by_cost_model" },
+                    "selected": chosen.is_some_and(|chosen| std::ptr::eq(chosen, *candidate)),
+                })).collect::<Vec<_>>();
+            serde_json::json!({ "group_id": index, "consumer_count": group.consumer_count,
+                "candidates": candidates })
+        }).collect::<Vec<_>>();
+        *trace = serde_json::json!({ "schema_version": 1, "group_id_scope": "this_selection", "groups": groups });
+    }
     let roots = space
         .roots
         .iter()
