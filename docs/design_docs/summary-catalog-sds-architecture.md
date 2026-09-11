@@ -530,9 +530,12 @@ a fresh physical SID through the existing resolver. Raw state remains independen
 reusable, and retained old source populations cannot be omitted from a singleton proof.
 
 A per-entity source can feed global Reduce([]) only when the store proves that
-its entire finite population contains exactly one physical source SID. The
+its entire finite population contains exactly one physical source SID and one
+stored label population. This proof unions live bindings with all nonremoved
+strict durable metadata for the same summary definition, across catalog generations,
+before reserving any output. The
 reduction then removes source labels according to the installed output grouping.
-Multiple source SIDs fail closed; this is not general shuffle support. Physical
+Multiple source SIDs or stored groups fail closed; this is not general shuffle support. Physical
 SID metadata retains observed per-entity label names for durable decoding while
 the catalog retains the logical partitioning contract. SQL backfill job status
 alone is not this all-producer completion proof and does not trigger this path.
