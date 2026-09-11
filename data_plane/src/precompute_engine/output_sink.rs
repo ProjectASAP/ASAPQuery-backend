@@ -162,9 +162,43 @@ impl SketchStoreSink {
         let agg_cfg = &agg_cfg;
         let resolver = self.series_resolver.clone();
         let persist = || {
+            if let Some(sid) = output.series_id {
+                return self
+                    .sketch_index
+                    .ingest_precompute_with_series_id(sid, agg_cfg, output, accumulator)
+                    .inspect(|_| {
+                        crate::precompute_engine::metrics::record_materialized_outputs(1)
+                    });
+            }
+            self.sketch_index
+                .validate_routed_catalog_generation(output.catalog_generation.as_deref())
+                .ok()?;
             self.sketch_index
                 .ingest_precompute_for_agg_config(
-                    |metric, fp, ak| resolver.resolve(metric, fp, ak),
+                    |metric, fp, ak| {
+                        resolver
+                            .resolve_with_reactivation(metric, fp, ak, |sid| {
+                                self.sketch_index.validate_routed_catalog_generation(
+                                    output.catalog_generation.as_deref(),
+                                )?;
+                                let activation = self
+                                    .sketch_index
+                                    .authorize_series_reactivation(sid, output.policy_fp.into())?;
+                                if let Some(generation) = &activation {
+                                    if output.catalog_generation.as_deref()
+                                        != Some(generation.as_ref())
+                                    {
+                                        return Err(
+                                            "unbound or stale output cannot reactivate a series"
+                                                .into(),
+                                        );
+                                    }
+                                }
+                                Ok(activation)
+                            })
+                            .map_err(|error| warn!(%error, "series reactivation rejected"))
+                            .ok()
+                    },
                     agg_cfg,
                     output,
                     accumulator,
@@ -446,6 +480,100 @@ mod tests {
                 crate::storage_engines::sketch_db::data::Capability::ExactAgg(AggregationType::Sum)
             ),
             "ExactAgg sids carry an ExactAgg capability"
+        );
+    }
+
+    #[test]
+    fn sink_reactivates_catalog_series_without_reusing_retired_payload() {
+        let cfg = sum_agg_config(7, "cpu_seconds", &[]);
+        let fingerprint = cfg.policy_fingerprint();
+        let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
+            1,
+            1,
+            &[cfg.clone()],
+        )
+        .unwrap();
+        let store = Arc::new(SketchStore::new());
+        store
+            .install_summary_catalog(Arc::new(catalog.clone()))
+            .unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let resolver =
+            Arc::new(SeriesIdResolver::open(temporary.path().join("resolver.wal")).unwrap());
+        let sink = SketchStoreSink::new(
+            store.clone(),
+            HotReloadStreamingConfig::new(StreamingConfig::new(HashMap::from([(
+                fingerprint.0,
+                cfg,
+            )]))),
+            resolver,
+        );
+        let original_generation = Arc::new(catalog.reference().unwrap());
+        let output = || {
+            let mut output = PrecomputedOutput::new(1000, 2000, None, fingerprint);
+            output.catalog_generation = Some(Arc::clone(&original_generation));
+            output
+        };
+        sink.emit_batch(vec![(output(), Box::new(SumAccumulator::with_sum(7.0)))])
+            .unwrap();
+        let old_sid = store.series_ids_for_policy(fingerprint)[0];
+        store.remove_instance(old_sid).unwrap();
+        assert!(sink
+            .emit_batch(vec![(output(), Box::new(SumAccumulator::with_sum(11.0)))])
+            .is_err());
+        let mut stale_output = output();
+        stale_output.series_id = Some(old_sid);
+        stale_output.catalog_generation = Some(Arc::new(catalog.reference().unwrap()));
+        let mut next = catalog;
+        next.plan_version += 1;
+        let next_generation = Arc::new(next.reference().unwrap());
+        store.install_summary_catalog(Arc::new(next)).unwrap();
+        assert!(sink
+            .emit_batch(vec![(
+                stale_output.clone(),
+                Box::new(SumAccumulator::with_sum(99.0))
+            )])
+            .is_err());
+        let mut next_output = output();
+        next_output.catalog_generation = Some(next_generation);
+        sink.emit_batch(vec![(
+            next_output,
+            Box::new(SumAccumulator::with_sum(11.0)),
+        )])
+        .unwrap();
+        assert!(sink
+            .emit_batch(vec![(
+                stale_output,
+                Box::new(SumAccumulator::with_sum(99.0))
+            )])
+            .is_err());
+        let new_sid = store.series_ids_for_policy(fingerprint)[0];
+        // A derived/unbound stale output must not reuse an already rotated cache hit.
+        assert!(sink
+            .emit_batch(vec![(output(), Box::new(SumAccumulator::with_sum(101.0)))])
+            .is_err());
+        let mut stale_routed_output = output();
+        stale_routed_output.series_id = Some(new_sid);
+        assert!(sink
+            .emit_batch(vec![(
+                stale_routed_output,
+                Box::new(SumAccumulator::with_sum(103.0))
+            )])
+            .is_err());
+        let mut missing_generation = PrecomputedOutput::new(1000, 2000, None, fingerprint);
+        missing_generation.series_id = Some(new_sid);
+        assert!(sink
+            .emit_batch(vec![(
+                missing_generation,
+                Box::new(SumAccumulator::with_sum(107.0))
+            )])
+            .is_err());
+        assert_ne!(old_sid, new_sid);
+        assert!(store.query_exact_agg_range(old_sid, 1000, 2000).is_empty());
+        let values = store.query_exact_agg_range(new_sid, 1000, 2000);
+        assert_eq!(
+            values[0].1.values().next().unwrap().aux_stats().sum,
+            Some(11.0)
         );
     }
 
