@@ -209,6 +209,22 @@ impl PrecomputePlan {
         materializations: Vec<crate::PrecomputeMaterialization>,
         producer_ids: &[String],
     ) -> Result<Self, PrecomputePlanError> {
+        Self::build_complete(
+            envelope,
+            materializations,
+            producer_ids,
+            false,
+            BTreeMap::new(),
+        )
+    }
+
+    fn build_complete(
+        envelope: PlanEnvelope,
+        materializations: Vec<crate::PrecomputeMaterialization>,
+        producer_ids: &[String],
+        backend_local: bool,
+        executable_dags: BTreeMap<String, crate::executable_plan::InstalledPostAsapDag>,
+    ) -> Result<Self, PrecomputePlanError> {
         let schemas = materializations
             .iter()
             .map(|materialization| {
@@ -265,18 +281,29 @@ impl PrecomputePlan {
         let plan = Self {
             summary_catalog: None,
             envelope,
-            ingest: IngestContract {
-                protocol: IngestProtocol::ModifiedOtlpMetricsV1,
-                endpoint_path: "/v1/metrics".into(),
-                timestamp_unit: TimestampUnit::UnixNanoseconds,
-                require_plan_identity: true,
-                require_summary_definition_identity: true,
-                require_registered_producer: true,
+            ingest: if backend_local {
+                IngestContract {
+                    protocol: IngestProtocol::PrometheusRemoteWriteV1,
+                    endpoint_path: "/api/v1/write".into(),
+                    timestamp_unit: TimestampUnit::UnixMilliseconds,
+                    require_plan_identity: false,
+                    require_summary_definition_identity: false,
+                    require_registered_producer: false,
+                }
+            } else {
+                IngestContract {
+                    protocol: IngestProtocol::ModifiedOtlpMetricsV1,
+                    endpoint_path: "/v1/metrics".into(),
+                    timestamp_unit: TimestampUnit::UnixNanoseconds,
+                    require_plan_identity: true,
+                    require_summary_definition_identity: true,
+                    require_registered_producer: true,
+                }
             },
             schemas,
             producers,
             materializations,
-            executable_dags: BTreeMap::new(),
+            executable_dags,
         };
         plan.validate()?;
         Ok(plan)
@@ -288,18 +315,17 @@ impl PrecomputePlan {
         envelope: PlanEnvelope,
         materializations: Vec<crate::PrecomputeMaterialization>,
     ) -> Result<Self, PrecomputePlanError> {
-        let mut plan = Self::build(envelope, materializations, &["backend-local".into()])?;
-        plan.ingest = IngestContract {
-            protocol: IngestProtocol::PrometheusRemoteWriteV1,
-            endpoint_path: "/api/v1/write".into(),
-            timestamp_unit: TimestampUnit::UnixMilliseconds,
-            require_plan_identity: false,
-            require_summary_definition_identity: false,
-            require_registered_producer: false,
-        };
-        plan.producers.clear();
-        plan.validate()?;
-        Ok(plan)
+        Self::build_backend_local_with_dags(envelope, materializations, BTreeMap::new())
+    }
+
+    /// Construct the complete backend-local contract before validation. Derived
+    /// definitions are never validated without their actual executable bindings.
+    pub fn build_backend_local_with_dags(
+        envelope: PlanEnvelope,
+        materializations: Vec<crate::PrecomputeMaterialization>,
+        executable_dags: BTreeMap<String, crate::executable_plan::InstalledPostAsapDag>,
+    ) -> Result<Self, PrecomputePlanError> {
+        Self::build_complete(envelope, materializations, &[], true, executable_dags)
     }
 
     pub fn runtime_materializations(
