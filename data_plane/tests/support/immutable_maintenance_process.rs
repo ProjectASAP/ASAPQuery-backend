@@ -64,7 +64,9 @@ async fn single_source_maintenance_is_automatic_and_durable() {
     // Two independent deployments: singleton is supported; a second physical
     // input series must never be mistaken for a complete singleton population.
     for count in [1, 2] {
-        let directory = tempfile::tempdir().unwrap();
+        let mut directory = tempfile::tempdir().unwrap();
+        eprintln!("IMMUTABLE_PROCESS_ARTIFACT {}", directory.path().display());
+        directory.disable_cleanup(true);
         let artifact = directory.path().join("plan.json");
         let bootstrap = directory.path().join("bootstrap.json");
         let disk = directory.path().join("disk");
@@ -156,7 +158,11 @@ async fn single_source_maintenance_is_automatic_and_durable() {
             continue;
         }
         assert!(is_warm(&response), "{response}");
-        assert_eq!(response["data"]["result"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            response["data"]["result"].as_array().map(Vec::len),
+            Some(1),
+            "{response}"
+        );
         assert_eq!(
             response["data"]["result"][0]["metric"],
             serde_json::json!({})
