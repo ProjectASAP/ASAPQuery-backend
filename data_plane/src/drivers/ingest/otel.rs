@@ -606,6 +606,9 @@ fn resolve_bucket_sid_for_agg_config(
     point_labels: &HashMap<String, String>,
     captured_generation: Option<&asap_types::sds::CatalogGeneration>,
 ) -> Result<(u64, asap_types::PolicyFingerprint), String> {
+    if !config.population_key_encoding.is_legacy() {
+        return Err("canonical population requires typed OTLP label propagation".into());
+    }
     let grouping_pairs: Vec<(&str, &str)> = config
         .grouping_labels
         .iter()
@@ -614,7 +617,10 @@ fn resolve_bucket_sid_for_agg_config(
             (name.as_str(), v)
         })
         .collect();
-    let fp = crate::drivers::ingest::canonical_attrs_fingerprint(&grouping_pairs);
+    let fp = crate::drivers::ingest::population_attrs_fingerprint(
+        config.population_key_encoding,
+        &grouping_pairs,
+    )?;
     let agg_kind_canonical =
         crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
     let sid = ingest_state.series_resolver.resolve_with_reactivation(
@@ -2266,6 +2272,20 @@ fn preflight_summary_frames(
             .transmission_plan
             .validate_frame(&frame)
             .map_err(|error| error.to_string())?;
+
+        if active
+            .precompute_plan
+            .materializations
+            .iter()
+            .any(|config| {
+                config.policy_fingerprint() == frame.materialization.fingerprint()
+                    && !config.population_key_encoding.is_legacy()
+            })
+        {
+            return Err(
+                "canonical population is not supported by modified-OTLP summary routing".into(),
+            );
+        }
 
         let schema = active
             .precompute_plan

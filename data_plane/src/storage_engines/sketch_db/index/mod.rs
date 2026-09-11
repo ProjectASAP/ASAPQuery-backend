@@ -142,13 +142,22 @@ fn reconstruct_exact_agg(
 fn build_attrs_fp_and_label_map(
     agg_cfg: &asap_types::aggregation_config::AggregationConfig,
     output: &crate::storage_engines::types::PrecomputedOutput,
-) -> (String, BTreeMap<String, String>) {
+) -> Result<(String, BTreeMap<String, String>), String> {
     if let Some(labels) = &output.population_labels {
-        let attrs_fp = labels
+        let pairs = labels
             .iter()
-            .map(|(name, value)| format!("{name}={value};"))
-            .collect();
-        return (attrs_fp, labels.clone());
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        let attrs_fp = crate::drivers::ingest::population_attrs_fingerprint(
+            agg_cfg.population_key_encoding,
+            &pairs,
+        )?;
+        return Ok((attrs_fp, labels.clone()));
+    }
+    if !agg_cfg.population_key_encoding.is_legacy()
+        && agg_cfg.partitioning == Some(asap_types::sds::PopulationPartitioning::PerEntity)
+    {
+        return Err("canonical PerEntity output requires complete population labels".into());
     }
     let label_values_vec = output
         .key
@@ -165,7 +174,21 @@ fn build_attrs_fp_and_label_map(
         attrs_fp.push(';');
         label_values_map.insert(k.clone(), v.clone());
     }
-    (attrs_fp, label_values_map)
+    if !agg_cfg.population_key_encoding.is_legacy() {
+        if key_names.len() != label_values_vec.len() {
+            return Err("population key label arity mismatch".into());
+        }
+        let pairs = key_names
+            .iter()
+            .zip(label_values_vec.iter())
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect::<Vec<_>>();
+        attrs_fp = crate::drivers::ingest::population_attrs_fingerprint(
+            agg_cfg.population_key_encoding,
+            &pairs,
+        )?;
+    }
+    Ok((attrs_fp, label_values_map))
 }
 
 /// Metadata for one logical sketch instance, keyed by `series_id`.
@@ -2970,7 +2993,7 @@ impl SketchStore {
         // `WorkerMessage`; B7.7's backfill processor groups raw
         // samples by sid up-front) skip the resolver round-trip by
         // invoking the sid-direct sibling.
-        let (attrs_fp, _label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
+        let (attrs_fp, _label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output).ok()?;
         let agg_kind_canonical =
             crate::storage_engines::sketch_db::data::materialization_kind_for_config(agg_cfg);
         let sid = mint_sid(&agg_cfg.metric, &attrs_fp, &agg_kind_canonical).into()?;
@@ -2994,7 +3017,7 @@ impl SketchStore {
         output: &crate::storage_engines::types::PrecomputedOutput,
         instances: &mut HashMap<u64, SdsBinding>,
     ) -> Option<BTreeMap<String, String>> {
-        let (_attrs_fp, label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
+        let (_attrs_fp, label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output).ok()?;
         let key_names = &agg_cfg.grouping_labels.names();
         let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg);
         let (capability, accuracy) = agg_kind.capability_and_accuracy();

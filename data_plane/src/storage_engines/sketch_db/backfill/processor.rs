@@ -69,7 +69,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::debug;
 
-use crate::drivers::ingest::canonical_attrs_fingerprint;
+use crate::drivers::ingest::population_attrs_fingerprint;
 use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 use crate::precompute_engine::worker::parse_labels_from_series_key;
 use crate::storage_engines::types::{AggregateCore, HotReloadStreamingConfig, KeyByLabelValues};
@@ -127,13 +127,16 @@ fn resolve_backfill_bucket_sid(
     store: Option<&crate::storage_engines::sketch_db::index::SketchStore>,
     captured_generation: Option<&asap_types::sds::CatalogGeneration>,
 ) -> Result<u64, String> {
+    if !config.population_key_encoding.is_legacy() {
+        return Err("canonical population requires typed backfill label propagation".into());
+    }
     let labels = parse_labels_from_series_key(series_key);
     let grouping_pairs: Vec<(&str, &str)> = config
         .grouping_labels
         .iter()
         .map(|name| (name.as_str(), *labels.get(name.as_str()).unwrap_or(&"")))
         .collect();
-    let attrs_fp = canonical_attrs_fingerprint(&grouping_pairs);
+    let attrs_fp = population_attrs_fingerprint(config.population_key_encoding, &grouping_pairs)?;
     let agg_kind_canonical =
         crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
     resolver.resolve_with_reactivation(&config.metric, &attrs_fp, &agg_kind_canonical, |sid| {
@@ -948,20 +951,43 @@ mod tests {
     /// Replay and the actual live storage sink must resolve the same row.
     #[test]
     fn backfill_sid_matches_live_ingest_sid_for_same_grouping_values() {
+        for encoding in [
+            asap_types::PopulationKeyEncoding::LegacyDelimited,
+            asap_types::PopulationKeyEncoding::CanonicalLabelsV1,
+        ] {
+            assert_backfill_sid_matches_live(encoding);
+        }
+    }
+
+    fn assert_backfill_sid_matches_live(encoding: asap_types::PopulationKeyEncoding) {
         use crate::drivers::ingest::series_resolver::SeriesIdResolver;
 
-        let cfg = sum_config(1, "latency", vec!["svc", "zone"]);
+        let mut cfg = sum_config(1, "latency", vec!["svc", "zone"]);
+        cfg.population_key_encoding = encoding;
         let resolver = SeriesIdResolver::new();
 
         // Backfill side: derive sid via the new helper.
-        let backfill_sid = resolve_backfill_bucket_sid(
+        let backfill_result = resolve_backfill_bucket_sid(
             &resolver,
             &cfg,
             "latency{svc=\"a\",zone=\"z0\"}",
             None,
             None,
-        )
-        .unwrap();
+        );
+        let attrs =
+            population_attrs_fingerprint(encoding, &[("svc", "a"), ("zone", "z0")]).unwrap();
+        let expected_sid = resolver.resolve(
+            &cfg.metric,
+            &attrs,
+            &crate::storage_engines::sketch_db::data::materialization_kind_for_config(&cfg),
+        );
+        if encoding.is_legacy() {
+            assert_eq!(backfill_result.unwrap(), expected_sid);
+        } else {
+            assert!(backfill_result
+                .unwrap_err()
+                .contains("typed backfill label propagation"));
+        }
 
         // Exercise the actual live sink instead of duplicating its SID formula.
         let store = crate::storage_engines::sketch_db::index::SketchStore::new();
@@ -988,7 +1014,7 @@ mod tests {
             .expect("live sink write");
 
         assert_eq!(
-            backfill_sid, live_sid,
+            expected_sid, live_sid,
             "backfill and live ingest MUST mint the same sid for the same \
              (metric, grouping-values, agg_kind) tuple"
         );
