@@ -703,7 +703,7 @@ mod tests {
         )
         .unwrap();
         precompute.summary_catalog = Some(sds.reference().unwrap());
-        let mut transmission = control_plane::physical::compiler::TransmissionPlan::build(
+        let mut transmission = control_plane::physical::compiler::compile_transmission_plan(
             envelope.clone(),
             &precompute,
             &BTreeMap::new(),

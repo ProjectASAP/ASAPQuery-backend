@@ -768,13 +768,13 @@ async fn main() -> Result<()> {
             .collect(),
         executable_dags: Default::default(),
     };
-    let initial_transmission_plan = control_plane::physical::compiler::TransmissionPlan {
+    let initial_transmission_plan = asap_types::producer_plan::TransmissionPlan {
         summary_catalog: None,
         envelope: initial_precompute_plan.envelope.clone(),
-        frame_identity: control_plane::physical::compiler::FrameIdentityContract {
+        frame_identity: asap_types::producer_plan::FrameIdentityContract {
             identity_version: 1,
             sequence_scope:
-                control_plane::physical::compiler::SequenceScope::MaterializationSeriesProducerEpoch,
+                asap_types::producer_plan::SequenceScope::MaterializationSeriesProducerEpoch,
             require_checkpoint_for_full: true,
             require_base_checkpoint_for_delta: true,
         },

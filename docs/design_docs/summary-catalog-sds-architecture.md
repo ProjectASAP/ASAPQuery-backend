@@ -169,6 +169,13 @@ those types for existing callers and owns the `compile_bound*` and
 move into the shared contract. Data-plane engines import the shared types
 directly. No wrapper plan or second wire definition is introduced.
 
+`asap_types::producer_plan` owns the installed collector and transmission
+contracts, frame identities, runtime policy bounds and their validation. The
+control plane allocates sampling/GOS budgets and constructs transmission rules
+through `sampling_policy_from_accuracy_budget`, `gos_policy_from_accuracy_budget`
+and `compile_transmission_plan`. Producers and the data plane import the shared
+contracts directly; compilation is not a runtime dependency of those contracts.
+
 The implemented ownership split is:
 
 1. Move the SDS catalog contract into `asap_types`.

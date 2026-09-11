@@ -92,7 +92,7 @@ pub struct ActivePhysicalPlan {
     /// Present for authoritative installations; legacy bootstrap has no catalog.
     pub summary_catalog: Option<Arc<control_plane::physical::summary_catalog::SummaryCatalog>>,
     pub precompute_plan: asap_types::precompute_plan::PrecomputePlan,
-    pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
+    pub transmission_plan: asap_types::producer_plan::TransmissionPlan,
     pub runtime_config: Arc<StreamingConfig>,
     pub query_plan: Arc<asap_types::query_plan::QueryPlan>,
     pub storage_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
@@ -672,11 +672,9 @@ mod tests {
                 summary_catalog: None,
                 envelope: envelope.clone(),
                 ingest: asap_types::precompute_plan::IngestContract {
-                    protocol:
-                        asap_types::precompute_plan::IngestProtocol::ModifiedOtlpMetricsV1,
+                    protocol: asap_types::precompute_plan::IngestProtocol::ModifiedOtlpMetricsV1,
                     endpoint_path: "/v1/metrics".into(),
-                    timestamp_unit:
-                        asap_types::precompute_plan::TimestampUnit::UnixNanoseconds,
+                    timestamp_unit: asap_types::precompute_plan::TimestampUnit::UnixNanoseconds,
                     require_plan_identity: true,
                     require_summary_definition_identity: true,
                     require_registered_producer: true,
@@ -684,9 +682,9 @@ mod tests {
                 schemas: Vec::new(),
                 producers: Vec::new(),
                 executable_dags: Default::default(),
-            materializations: Vec::new(),
+                materializations: Vec::new(),
             },
-            transmission_plan: control_plane::physical::compiler::TransmissionPlan {
+            transmission_plan: asap_types::producer_plan::TransmissionPlan {
                 summary_catalog: None,
                 envelope: asap_types::precompute_plan::PlanEnvelope {
                     plan_id,
@@ -698,9 +696,10 @@ mod tests {
                     planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
                     capability_snapshot_id: "test".into(),
                 },
-                frame_identity: control_plane::physical::compiler::FrameIdentityContract {
+                frame_identity: asap_types::producer_plan::FrameIdentityContract {
                     identity_version: 1,
-                    sequence_scope: control_plane::physical::compiler::SequenceScope::MaterializationSeriesProducerEpoch,
+                    sequence_scope:
+                        asap_types::producer_plan::SequenceScope::MaterializationSeriesProducerEpoch,
                     require_checkpoint_for_full: true,
                     require_base_checkpoint_for_delta: true,
                 },

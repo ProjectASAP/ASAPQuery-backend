@@ -895,9 +895,10 @@ mod tests {
     }
 
     fn physical_config(streaming: StreamingConfig) -> HotReloadStreamingConfig {
+        use asap_types::producer_plan::{FrameIdentityContract, SequenceScope, TransmissionPlan};
         use control_plane::physical::compiler::{
-            FrameIdentityContract, IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan,
-            SequenceScope, TimestampUnit, TransmissionPlan, PLANNER_REVISION,
+            IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan, TimestampUnit,
+            PLANNER_REVISION,
         };
         let envelope = PlanEnvelope {
             plan_id: 7,
