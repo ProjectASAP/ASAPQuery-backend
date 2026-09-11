@@ -931,6 +931,14 @@ impl DataDescriptor {
     pub fn validate(&self) -> Result<(), SdsError> {
         self.value_projection.validate().map_err(SdsError)?;
         self.group_by_keys.validate().map_err(SdsError)?;
+        if matches!(self.source, DataSourceIdentity::TimeSeries { .. })
+            && !self.group_by_keys.is_legacy_labels()
+        {
+            return Err(SdsError(
+                "time-series grouping requires non-null string labels".into(),
+            ));
+        }
+
         if matches!(self.source, DataSourceIdentity::Table { .. }) {
             for column in self.group_by_keys.columns() {
                 crate::table_population::validate_column_name(&column.name).map_err(SdsError)?;

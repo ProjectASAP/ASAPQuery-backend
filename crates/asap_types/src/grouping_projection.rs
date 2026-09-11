@@ -174,8 +174,31 @@ mod identity_tests {
         assert_ne!(legacy.id, numeric.id);
         assert_ne!(legacy.id, nullable.id);
         assert_ne!(numeric.id, nullable.id);
-        numeric.validate().unwrap();
-        nullable.validate().unwrap();
+        assert!(numeric
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("string labels"));
+        assert!(nullable
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("string labels"));
+        for grouping in [numeric.group_by_keys, nullable.group_by_keys] {
+            let table = crate::sds::DataDescriptor::new_typed(
+                crate::sds::DataSourceIdentity::Table {
+                    table_ref: "samples".into(),
+                },
+                crate::sds::ValueProjectionIdentity::Column {
+                    name: "value".into(),
+                },
+                "",
+                Vec::<String>::new(),
+                "table.samples.v1",
+            )
+            .with_grouping_projection(grouping);
+            table.validate().unwrap();
+        }
     }
 }
 
