@@ -89,7 +89,8 @@ pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactor
         BackfillSource::ClickHouse { database, table } => {
             if database != &config.database {
                 return Err(RawSampleReaderError::Other {
-                    reason: "ClickHouse source database differs from the deployment database".into(),
+                    reason: "ClickHouse source database differs from the deployment database"
+                        .into(),
                 }
                 .into());
             }
