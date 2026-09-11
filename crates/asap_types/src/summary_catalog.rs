@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use crate::sds::{
     CatalogGeneration, DataDescriptor, DataDescriptorId, DataSourceIdentity, SummaryDefinitionId,
-    SummaryDescriptor, SummaryDescriptorId, ValueProjectionIdentity,
+    SummaryDescriptor, SummaryDescriptorId,
 };
 use crate::PolicyFingerprint;
 use crate::WindowMaterializationLayout;
@@ -111,12 +111,7 @@ impl SummaryCatalog {
                         table_ref: table_ref.clone(),
                     },
                 );
-                let value_projection = config
-                    .value_column
-                    .as_ref()
-                    .map_or(ValueProjectionIdentity::SampleValue, |name| {
-                        ValueProjectionIdentity::Column { name: name.clone() }
-                    });
+                let value_projection = config.effective_value_projection().clone();
                 let data = DataDescriptor::new_typed(
                     source,
                     value_projection,
@@ -260,6 +255,7 @@ impl SummaryCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sds::ValueProjectionIdentity;
     use crate::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
 
     fn config(metric: &str, filter: &str, window: u64) -> PrecomputeMaterialization {
@@ -289,7 +285,9 @@ mod tests {
         use planner_types::pre_asap::{CompareOpKind, ScalarValue};
         let mut requests = config("raw_samples.value", "", 60);
         requests.table_name = Some("raw_samples".into());
-        requests.value_column = Some("value".into());
+        requests.value_projection = Some(ValueProjectionIdentity::Column {
+            name: "value".into(),
+        });
         requests.table_population = Some(TablePopulation {
             predicates: vec![TableColumnPredicate {
                 column: "metric".into(),
@@ -308,7 +306,9 @@ mod tests {
             other_table.policy_fingerprint()
         );
         let mut other_value = requests.clone();
-        other_value.value_column = Some("other_value".into());
+        other_value.value_projection = Some(ValueProjectionIdentity::Column {
+            name: "other_value".into(),
+        });
         assert_ne!(
             requests.policy_fingerprint(),
             other_value.policy_fingerprint()

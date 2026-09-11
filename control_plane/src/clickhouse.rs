@@ -248,7 +248,8 @@ fn materialize_selected_sql(
     )
     .map_err(|error| error.to_string())?;
     config.table_name = Some(table);
-    config.value_column = Some(value);
+    config.value_projection =
+        Some(asap_types::sds::ValueProjectionIdentity::Column { name: value });
     config.table_timestamp_column = Some(timestamp);
     config.table_population = Some(population);
     config.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
@@ -632,7 +633,7 @@ fn select_materialization<'a>(
 ) -> Result<&'a asap_types::PrecomputeMaterialization, crate::query_plan::QueryPlanError> {
     let mut matches = materializations.iter().filter(|candidate| {
         candidate.table_name.as_deref() == Some(table_ref)
-            && candidate.value_column.as_deref() == Some(value_column)
+            && candidate.effective_value_projection().column() == Some(value_column)
             && candidate.population_filter_canonical().ok().as_deref() == Some(spatial_filter)
             && candidate
                 .accumulator_spec()

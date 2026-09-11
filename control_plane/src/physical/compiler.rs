@@ -5282,6 +5282,13 @@ mod tests {
         let roundtrip: PrecomputePlan =
             serde_json::from_slice(&serde_json::to_vec(original).unwrap()).unwrap();
         roundtrip.validate_against_catalog(catalog).unwrap();
+        let mut legacy = serde_json::to_value(original).unwrap();
+        for schema in legacy["schemas"].as_array_mut().unwrap() {
+            schema.as_object_mut().unwrap().remove("value_projection");
+            schema["value_column"] = serde_json::json!("SampleValue");
+        }
+        let decoded: PrecomputePlan = serde_json::from_value(legacy).unwrap();
+        decoded.validate_against_catalog(catalog).unwrap();
         let reject =
             |mutated: PrecomputePlan| assert!(mutated.validate_against_catalog(catalog).is_err());
         let mut bad = original.clone();
@@ -5290,7 +5297,9 @@ mod tests {
         };
         reject(bad);
         let mut bad = original.clone();
-        bad.schemas[0].value_column = planner_types::pre_asap::ColumnRef::Named("other".into());
+        bad.schemas[0].value_projection = asap_types::sds::ValueProjectionIdentity::Column {
+            name: "other".into(),
+        };
         reject(bad);
         let mut bad = original.clone();
         bad.schemas[0].group_by.push("other".into());
