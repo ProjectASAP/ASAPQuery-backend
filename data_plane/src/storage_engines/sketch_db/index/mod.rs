@@ -2711,10 +2711,10 @@ impl SketchStore {
 
         match self.instance(sid) {
             None => {
-                if let Some(generation) = &output.catalog_generation {
-                    if self.active_catalog_generation().as_deref() != Some(generation.as_ref()) {
-                        return None;
-                    }
+                if self.active_catalog_generation().as_deref()
+                    != output.catalog_generation.as_deref()
+                {
+                    return None;
                 }
 
                 let group_by_keys: BTreeSet<String> = key_names.iter().cloned().collect();
@@ -2756,6 +2756,9 @@ impl SketchStore {
         let instances = self.instances.read().ok()?;
         let binding = instances.get(&sid)?;
         if !binding.metadata.is_writable() || binding.metadata.policy_fp != output.policy_fp {
+            return None;
+        }
+        if binding.catalog_generation.is_some() && output.catalog_generation.is_none() {
             return None;
         }
         if let Some(captured) = output.catalog_generation.as_deref() {

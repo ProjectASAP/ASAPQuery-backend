@@ -352,13 +352,15 @@ impl WindowProcessor for BackfillWindowProcessor {
             } else {
                 Some(build_group_key_label_values(&group_key))
             };
-            let output = crate::storage_engines::types::PrecomputedOutput::new_backfilled(
+            let mut output = crate::storage_engines::types::PrecomputedOutput::new_backfilled(
                 window_range.0,
                 window_range.1,
                 key,
                 self.job_id,
                 PolicyFingerprint::from_config(&config),
             );
+            output.series_id = Some(sid);
+            output.catalog_generation = self.catalog_generation.clone();
             batch.push((sid, output, accumulator));
         }
 
@@ -385,7 +387,8 @@ impl WindowProcessor for BackfillWindowProcessor {
                             &config,
                             output,
                             accumulator.as_ref(),
-                        );
+                        )
+                        .ok_or("backfill summary state publication rejected")?;
                     }
                 }
                 None => {
@@ -866,6 +869,15 @@ mod tests {
         let hot = HotReloadStreamingConfig::from_arc(streaming.clone());
         let registry = Arc::new(BackfillRegistry::new());
         let sketch_index = Arc::new(SketchStore::new());
+        let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
+            1,
+            1,
+            &[cfg.clone()],
+        )
+        .unwrap();
+        sketch_index
+            .install_summary_catalog(Arc::new(catalog))
+            .unwrap();
         let resolver = Arc::new(SeriesIdResolver::new());
 
         let job_id = registry.create(

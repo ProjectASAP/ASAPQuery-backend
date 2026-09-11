@@ -560,6 +560,14 @@ mod tests {
                 Box::new(SumAccumulator::with_sum(103.0))
             )])
             .is_err());
+        let mut missing_generation = PrecomputedOutput::new(1000, 2000, None, fingerprint);
+        missing_generation.series_id = Some(new_sid);
+        assert!(sink
+            .emit_batch(vec![(
+                missing_generation,
+                Box::new(SumAccumulator::with_sum(107.0))
+            )])
+            .is_err());
         assert_ne!(old_sid, new_sid);
         assert!(store.query_exact_agg_range(old_sid, 1000, 2000).is_empty());
         let values = store.query_exact_agg_range(new_sid, 1000, 2000);
