@@ -44,6 +44,18 @@ snapshot workflow in [execution calibration](../../tools/o11y-execution/CALIBRAT
 `compile_workload_artifact` deliberately requires that version; do not bypass it
 by relabeling demo costs as measured evidence.
 
+For the existing observation → ERP-selected KLL → installed HTTP correctness
+fixture, see [ERP process validation](../developer_docs/erp-process-validation.md):
+
+```bash
+cargo test --locked -p data_plane --test asapquery_compatibility_process_e2e \
+  erp_planning_process -- --nocapture
+```
+
+Its `ERP_PLANNED` and `ERP_WARM` records expose the fitted observation, available
+profiles, selected parameters, installed identity and actual response. This is a
+separate correctness fixture, not measured evidence for the demo workload.
+
 ## b. Selected SDS → control-plane execution plans
 
 Run the normal snapshot compiler, without selecting a candidate index or
