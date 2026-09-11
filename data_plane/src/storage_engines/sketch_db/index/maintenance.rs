@@ -869,7 +869,7 @@ mod tests {
         let catalog =
             asap_types::summary_catalog::SummaryCatalog::from_materializations(1, 1, &configs)
                 .unwrap();
-        let store = Arc::new(SketchStore::new());
+        let mut store = Arc::new(SketchStore::new());
         store
             .install_summary_catalog(Arc::new(catalog.clone()))
             .unwrap();
@@ -994,6 +994,28 @@ mod tests {
         assert!(store
             .recover_complete_raw_maintenance_output(902, target, &complete, [42; 32], (1000, 2000))
             .is_err());
+        // Reconstruct the proof from durable sources after a real restart;
+        // recovery must reuse the committed output without rebuilding it.
+        persistence.shutdown();
+        store = Arc::new(SketchStore::new());
+        store
+            .install_summary_catalog(Arc::new(catalog.clone()))
+            .unwrap();
+        let mut restart_config =
+            persistence::config::SketchStorePersistenceConfig::with_memory_limit(
+                1 << 24,
+                directory.path().to_path_buf(),
+            );
+        restart_config.delete_older_than_ms = None;
+        restart_config.hot_window_ms = None;
+        persistence = store.start_persistence(restart_config).unwrap();
+        let complete = store
+            .read_complete_raw_maintenance_cohort(&generation, &definitions, (0, 1000))
+            .unwrap();
+        assert!(store
+            .recover_complete_raw_maintenance_output(902, target, &complete, [42; 32], (0, 1000))
+            .unwrap());
+        assert_eq!(persistence.manifest.live_parts().len(), published_parts);
         // A retained proof cannot authorize a subset after even an empty raw
         // lifetime is registered. No new target reservation may be created.
         let mut extra = PrecomputedOutput::new(0, 1000, None, configs[0].policy_fingerprint());
