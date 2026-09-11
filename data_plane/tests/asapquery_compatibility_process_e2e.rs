@@ -1658,3 +1658,6 @@ async fn collector_free_profile_serves_complete_matrix_and_falls_back_exactly() 
     assert!(metrics.contains("asap_remote_write_duplicates_total 33"));
     assert!(metrics.contains("asap_remote_write_rejected_requests_total 1"));
 }
+
+#[path = "support/univmon_erp_process.rs"]
+mod univmon_erp_process;
