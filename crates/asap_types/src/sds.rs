@@ -713,6 +713,9 @@ pub struct DataDescriptor {
     pub id: DataDescriptorId,
     pub source: DataSourceIdentity,
     pub value_projection: ValueProjectionIdentity,
+    /// Table column containing Unix milliseconds. Absent for time-series sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_column: Option<String>,
     pub population_filter_canonical: String,
     pub group_by_keys: BTreeSet<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -777,11 +780,13 @@ impl DataDescriptor {
             &group_by_keys,
             &observation_semantics,
             None,
+            None,
         );
         Self {
             id,
             source,
             value_projection,
+            timestamp_column: None,
             population_filter_canonical,
             group_by_keys,
             partitioning: None,
@@ -797,13 +802,27 @@ impl DataDescriptor {
             &self.group_by_keys,
             &self.observation_semantics,
             partitioning,
+            self.timestamp_column.as_deref(),
         );
         self
+    }
+    pub fn with_timestamp_column(mut self, column: Option<String>) -> Self {
+        self.timestamp_column = column;
+        let partitioning = self.partitioning;
+        self.with_partitioning(partitioning)
     }
     pub fn id(&self) -> &DataDescriptorId {
         &self.id
     }
     pub fn validate(&self) -> Result<(), SdsError> {
+        if let Some(column) = &self.timestamp_column {
+            if !matches!(self.source, DataSourceIdentity::Table { .. }) || column.is_empty() {
+                return Err(SdsError(
+                    "table timestamp projection requires a table and a column".into(),
+                ));
+            }
+            crate::table_population::validate_column_name(column).map_err(SdsError)?;
+        }
         if self.id
             != data_descriptor_id(
                 &self.source,
@@ -812,6 +831,7 @@ impl DataDescriptor {
                 &self.group_by_keys,
                 &self.observation_semantics,
                 self.partitioning,
+                self.timestamp_column.as_deref(),
             )
         {
             return Err(SdsError("data descriptor ID/content mismatch".into()));
@@ -826,6 +846,7 @@ fn data_descriptor_id(
     group_by: &BTreeSet<String>,
     observation_semantics: &str,
     partitioning: Option<PopulationPartitioning>,
+    timestamp_column: Option<&str>,
 ) -> DataDescriptorId {
     // Length framing keeps distinct typed sources, projections, predicates,
     // and grouping keys collision-free in the content identity.
@@ -840,6 +861,9 @@ fn data_descriptor_id(
     );
     if let Some(partitioning) = partitioning {
         key.push_str(&format!("|partition:{partitioning:?}"));
+    }
+    if let Some(column) = timestamp_column {
+        key.push_str(&format!("|timestamp-ms:{}:{column}", column.len()));
     }
     for name in group_by {
         key.push_str(&format!("|{}:{name}", name.len()));

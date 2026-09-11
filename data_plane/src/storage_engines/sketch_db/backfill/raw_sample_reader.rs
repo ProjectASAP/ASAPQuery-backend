@@ -1,37 +1,23 @@
 //! `RawSampleReader` — trait + mock implementation for reading raw
 //! samples from the exact DB during a [`BackfillJob`] run.
 //!
-//! Supports the future backfill scope ([`future-storage-and-compression.md`](../../../../../docs/design_docs/future-storage-and-compression.md)).
-//! and specifically §10.2's `BackfillSource` dispatch: every
-//! concrete source (S3+Gorilla, Prometheus, ClickHouse, OtherSketch)
-//! will eventually implement this trait so the worker pool (Phase 5c)
-//! and the rebuild logic (Phase 5e) are source-agnostic.
+//! Prometheus and ClickHouse implement the same worker-facing sample interface.
+//! S3/Gorilla and rebuilding from another stored sketch remain unsupported.
 //!
-//! ## Phase 5b scope (what this file covers)
+//! ## Contracts
 //!
 //! * `RawSample` struct — the decoded-sample shape used end-to-end
 //!   from exact-DB read through sketch replay.
 //! * `LabelFilter` struct — the subset of the series selector the
 //!   reader needs to apply (metric + grouping label equality).
-//!   Deliberately narrow: the full PromQL matcher language isn't
-//!   needed for backfill, and a narrow type simplifies every reader
-//!   implementation.
+//!   SQL populations and projections come from the installed materialization
+//!   when constructing the reader, rather than being interpreted as PromQL.
 //! * `RawSampleReader` trait — async `read_samples(range, filter)`
-//!   returning a `Vec<RawSample>`. Plain Vec (not a stream) so the
-//!   trait stays object-safe and easy to mock; Phase 5e can revisit
-//!   streaming if large ranges become a memory pressure.
+//!   returning a `Vec<RawSample>`. Each requested window is buffered; large
+//!   windows still require a future streaming processor interface.
 //! * `MockRawSampleReader` — in-memory implementation used by
 //!   Phase 5c's worker tests and Phase 5e's rebuild tests.
 //!
-//! ## Out of scope for 5b (future phases)
-//!
-//! * `PrometheusReader` / `S3GorillaReader` / `ClickHouseReader` —
-//!   real network-backed implementations, deferred until Phase 5e
-//!   needs them.
-//! * Streaming variant returning an `impl Stream<Item = RawSample>`
-//!   — Phase 5e decides based on observed memory behaviour.
-//! * `OtherSketch` variant lookup (reads from an existing
-//!   precompute rather than raw samples) — Phase 5e.
 
 use std::collections::HashMap;
 

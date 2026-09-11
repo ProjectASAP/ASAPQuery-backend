@@ -706,7 +706,7 @@ mod tests {
         use crate::storage_engines::types::{
             ActivePhysicalPlan, HotReloadActivePhysicalPlan, StreamingConfig,
         };
-        use control_plane::physical::executable_binding::{InstalledPostAsapDag, OwnedPostAsapDag};
+        use asap_types::executable_plan::{InstalledPostAsapDag, OwnedPostAsapDag};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[derive(Default)]
