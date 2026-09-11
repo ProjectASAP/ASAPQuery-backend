@@ -2587,7 +2587,16 @@ fn raw_time_series_input_contract(
 /// from the presence of this syntax.
 fn immutable_materialization_source(node: &SummaryNode) -> Option<Rc<SummaryNode>> {
     use planner_types::post_asap::{ExactKind, ExecutionTiming, SummaryInputExpr};
-    let SummaryExpr::SummaryAgg { child, input, .. } = &node.expr else {
+    let SummaryExpr::SummaryAgg {
+        child,
+        input,
+        family: SummaryFamilyType::Sketch(..),
+        ..
+    } = &node.expr
+    else {
+        // Existing exact spatial reductions execute over read-time values.
+        // They must not acquire a new durable maintenance dependency merely
+        // because Planner made the exact accumulator boundary explicit.
         return None;
     };
     if input.item.is_some()
@@ -2919,7 +2928,8 @@ fn collect_selected_materializations(
                     SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Sum, _),
                 ..
             } if !matches!(child.expr, SummaryExpr::KeepPreAsap(_))
-                && ((composable && matches!(child.expr, SummaryExpr::SummaryAgg { .. }))
+                && ((composable
+                    && crate::query_plan::exact_accumulator_value_source(child).is_some())
                     || crate::query_plan::exact_value_executable(node)) =>
             {
                 walk(child, readout, composable, grouping.clone(), selected)?;
