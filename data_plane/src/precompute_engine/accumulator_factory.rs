@@ -58,6 +58,16 @@ macro_rules! impl_clone_accumulator_methods {
 /// This provides a uniform interface over all accumulator types so that the
 /// worker loop doesn't need to know which concrete type it's dealing with.
 pub trait AccumulatorUpdater: Send {
+    /// Validate an immutable maintenance input before an updater can silently
+    /// discard a value outside its representable domain.
+    fn validate_single_input(&self, value: f64) -> Result<(), String> {
+        if value.is_finite() {
+            Ok(())
+        } else {
+            Err("accumulator input must be finite".into())
+        }
+    }
+
     /// Feed a single (value, timestamp_ms) pair — for SingleSubpopulation types.
     fn update_single(&mut self, value: f64, timestamp_ms: i64);
 
@@ -332,6 +342,16 @@ impl DDSketchAccumulatorUpdater {
 }
 
 impl AccumulatorUpdater for DDSketchAccumulatorUpdater {
+    fn validate_single_input(&self, value: f64) -> Result<(), String> {
+        let (minimum, maximum) =
+            asap_sketchlib::sketches::ddsketch::ddsketch_indexable_bounds(self.alpha);
+        if value.is_finite() && value > 0.0 && value >= minimum && value <= maximum {
+            Ok(())
+        } else {
+            Err("DDS maintenance input is outside its positive representable domain".into())
+        }
+    }
+
     fn update_single(&mut self, value: f64, _timestamp_ms: i64) {
         // sketch-core's DdSketch (the inner of DDSketchAccumulator)
         // exposes `update(f64)` for single-value ingestion. The
@@ -1251,6 +1271,17 @@ mod tests {
     use super::*;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
+
+    #[test]
+    fn immutable_dds_inputs_reject_nonpositive_and_unrepresentable_values() {
+        let updater = DDSketchAccumulatorUpdater::new(0.01);
+        for value in [-20.0, -0.0, 0.0, f64::NAN, f64::INFINITY, f64::MAX] {
+            assert!(updater.validate_single_input(value).is_err());
+        }
+        for value in [0.5, 20.0, 40.0] {
+            assert!(updater.validate_single_input(value).is_ok());
+        }
+    }
 
     /// Both cardinality implementations consume values, with a single signed-zero identity.
     #[test]
