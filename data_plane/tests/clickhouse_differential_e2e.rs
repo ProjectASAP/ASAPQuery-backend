@@ -492,7 +492,7 @@ async fn run_mixed_aggregate(aggregate: &str) {
 }
 
 #[tokio::test]
-async fn array_sql_executes_local_element_after_typed_exact_leaf() {
+async fn collection_sql_executes_local_elements_after_typed_exact_leaf() {
     use asap_types::query_plan::QueryPlanNode;
     use planner_types::{
         post_asap::ValueOperation,
@@ -507,8 +507,8 @@ async fn array_sql_executes_local_element_after_typed_exact_leaf() {
     let client = reqwest::Client::new();
     let table = format!("asap_collection_elements_{}", std::process::id());
     for sql in [
-        format!("CREATE TABLE default.{table}(timestamp Int64, samples Array(Float64), nullable_samples Array(Nullable(Float64)), position Nullable(Int64)) ENGINE=Memory"),
-        format!("INSERT INTO default.{table} VALUES (100,[10,20],[10,20],-1),(200,[3.5],[3.5],9),(300,[],[],1),(400,[7.5],[NULL],1),(500,[1],[1],NULL),(2000,[999],[999],1)"),
+        format!("CREATE TABLE default.{table}(timestamp Int64, samples Array(Float64), nullable_samples Array(Nullable(Float64)), tuples Array(Tuple(ts Int64, value Nullable(Float64))), position Nullable(Int64)) ENGINE=Memory"),
+        format!("INSERT INTO default.{table} VALUES (100,[10,20],[10,20],[(1,5.5)],-1),(200,[3.5],[3.5],[(1,NULL)],9),(300,[],[],[],1),(400,[7.5],[NULL],[(1,3.5)],1),(500,[1],[1],[(1,9.5)],NULL),(2000,[999],[999],[(1,999)],1)"),
     ] {
         let mut request = client.post(&clickhouse_url).body(sql);
         if let Some(user) = &user { request = request.basic_auth(user, password.as_ref()); }
@@ -517,7 +517,7 @@ async fn array_sql_executes_local_element_after_typed_exact_leaf() {
         let body = response.text().await.unwrap();
         assert!(status.is_success(), "native collection fixture: {body}");
     }
-    let sql = format!("SELECT arrayElement(samples, position) AS result, arrayElement(nullable_samples, position) AS nullable_result FROM {table} WHERE timestamp >= 0 AND timestamp < 2000 ORDER BY result NULLS FIRST");
+    let sql = format!("SELECT arrayElement(samples, position) AS result, arrayElement(nullable_samples, position) AS nullable_result, tupleElement(arrayElement(tuples, 1), 'value') AS tuple_result FROM {table} WHERE timestamp >= 0 AND timestamp < 2000 ORDER BY result NULLS FIRST");
     let mut workload = mixed_workload(&sql);
     workload.tables = HashMap::from([(
         table.clone(),
@@ -538,6 +538,22 @@ async fn array_sql_executes_local_element_after_typed_exact_leaf() {
                     },
                     false,
                 ),
+                Column::new(
+                    "tuples",
+                    DataType::List {
+                        element: Box::new(Column::new(
+                            "item",
+                            DataType::Struct {
+                                fields: vec![
+                                    Column::new("ts", DataType::Int64, false),
+                                    Column::new("value", DataType::Float64, true),
+                                ],
+                            },
+                            false,
+                        )),
+                    },
+                    false,
+                ),
                 Column::new("position", DataType::Int64, true),
             ],
             0,
@@ -554,11 +570,13 @@ async fn array_sql_executes_local_element_after_typed_exact_leaf() {
         .nodes
         .values()
         .any(|node| matches!(node, QueryPlanNode::ExternalExact { .. })));
-    assert!(entry.nodes.values().any(|node| {
-        let QueryPlanNode::Relational { operation, .. } = node else { return false; };
-        let ValueOperation::Project { cols, .. } = serde_json::from_value(operation.clone()).unwrap() else { return false; };
-        cols.iter().any(|column| matches!(&column.expr, QueryExpr::FunctionCall { name, .. } if name == "asap_element_access"))
-    }), "Planner-selected DAG must preserve local element evaluation");
+    for function in ["asap_element_access", "asap_struct_field"] {
+        assert!(entry.nodes.values().any(|node| {
+            let QueryPlanNode::Relational { operation, .. } = node else { return false; };
+            let ValueOperation::Project { cols, .. } = serde_json::from_value(operation.clone()).unwrap() else { return false; };
+            cols.iter().any(|column| matches!(&column.expr, QueryExpr::FunctionCall { name, .. } if name == function))
+        }), "Planner-selected DAG must preserve local {function} evaluation");
+    }
     eprintln!(
         "collection Planner selection: {}",
         serde_json::to_string(&trace).unwrap()
@@ -628,11 +646,11 @@ async fn array_sql_executes_local_element_after_typed_exact_leaf() {
     let expected_rows = expected["data"].as_array().unwrap();
     assert_eq!(actual_rows.len(), expected_rows.len());
     for (actual, expected) in actual_rows.iter().zip(expected_rows) {
-        for field in ["result", "nullable_result"] {
+        for field in ["result", "nullable_result", "tuple_result"] {
             if expected[field].is_null() {
                 assert!(actual[field].is_null());
             } else {
-                // Both declared columns are Float64; JSON 20 and 20.0 encode
+                // The declared result columns are Float64; JSON 20 and 20.0 encode
                 // the same value despite different serde_json Number variants.
                 assert_eq!(
                     actual[field].as_f64().unwrap().to_bits(),
@@ -644,7 +662,7 @@ async fn array_sql_executes_local_element_after_typed_exact_leaf() {
     }
     assert_eq!(
         actual["data"],
-        serde_json::json!([{ "result":null, "nullable_result":null },{ "result":0.0, "nullable_result":null },{ "result":0.0, "nullable_result":null },{ "result":7.5, "nullable_result":null },{ "result":20.0, "nullable_result":20.0 }])
+        serde_json::json!([{ "result":null, "nullable_result":null, "tuple_result":9.5 },{ "result":0.0, "nullable_result":null, "tuple_result":null },{ "result":0.0, "nullable_result":null, "tuple_result":null },{ "result":7.5, "nullable_result":null, "tuple_result":3.5 },{ "result":20.0, "nullable_result":20.0, "tuple_result":5.5 }])
     );
     let mut cleanup = client
         .post(&clickhouse_url)
