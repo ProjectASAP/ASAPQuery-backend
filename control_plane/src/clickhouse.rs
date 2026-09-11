@@ -136,9 +136,11 @@ pub async fn compile_automatic_clickhouse_workload(
     let mut materializations = std::collections::BTreeMap::new();
     let mut selection_traces = std::collections::BTreeMap::new();
     for query in &request.queries {
+        validate_sql_evaluation(query)?;
         // Selection runs once. Compilation installs only SummaryAgg nodes
         // actually visited in this selected DAG, never a scripted family.
-        let mut planned = plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
+        let mut planned =
+            plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
         selection_traces.insert(
             planned.canonical_sql.clone(),
             std::mem::take(&mut planned.selection_trace),
@@ -328,6 +330,7 @@ where
         &planner_types::post_asap::SummaryFamilyType,
     ) -> Result<MaterializationBinding, crate::query_plan::QueryPlanError>,
 {
+    validate_sql_evaluation(query)?;
     let PhysicalExpr::Committed(crate::physical::post_asap::PostAsapPlan::Summary(root)) =
         planned.physical
     else {
@@ -391,6 +394,17 @@ where
         ));
     }
     Ok((executable, installed))
+}
+
+fn validate_sql_evaluation(
+    query: &ClickHouseSqlWorkloadEntry,
+) -> Result<(), ClickHousePlanningError> {
+    if query.start_ms >= query.end_ms || query.end_ms > i64::MAX as u64 {
+        return Err(ClickHousePlanningError::Lower(
+            "SQL evaluation requires start_ms < end_ms within signed Unix milliseconds".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn bind_selected_node(
@@ -760,6 +774,19 @@ mod tests {
                 .to_string()
                 .contains("ambiguous")
         );
+    }
+
+    #[test]
+    fn sql_evaluation_rejects_empty_reversed_and_unrepresentable_ranges() {
+        for (start_ms, end_ms) in [(2, 1), (1, 1), (0, u64::MAX)] {
+            assert!(validate_sql_evaluation(&ClickHouseSqlWorkloadEntry {
+                sql: "SELECT sum(value) FROM telemetry".into(),
+                start_ms,
+                end_ms,
+                cumulative: true,
+            })
+            .is_err());
+        }
     }
 
     #[tokio::test]
