@@ -1,9 +1,9 @@
 //! Catalog consistency checks for the precompute execution plan.
-use super::compiler::*;
-use super::summary_catalog::SummaryCatalog;
-use asap_types::sds::{
+use super::*;
+use crate::sds::{
     DataSourceIdentity, SummaryDefinitionId, SummaryDescriptor, ValueProjectionIdentity,
 };
+use crate::summary_catalog::SummaryCatalog;
 use planner_types::pre_asap::{ColumnRef, Source};
 use std::collections::BTreeSet;
 fn invalid(reason: impl Into<String>) -> PrecomputePlanError {
@@ -86,10 +86,11 @@ impl PrecomputePlan {
                 .map_or(ValueProjectionIdentity::SampleValue, |name| {
                     ValueProjectionIdentity::Column { name: name.clone() }
                 });
-            if data.source != expected_source
+            if data.partitioning != config.partitioning
+                || data.source != expected_source
                 || data.value_projection != expected_projection
                 || data.population_filter_canonical
-                    != asap_types::utils::normalize_spatial_filter(&config.spatial_filter)
+                    != crate::utils::normalize_spatial_filter(&config.spatial_filter)
                 || data.group_by_keys != config.grouping_labels.labels.iter().cloned().collect()
             {
                 return Err(invalid("source/population/grouping differs from catalog"));
@@ -133,9 +134,9 @@ impl PrecomputePlan {
                 .filter(|v| *v > 0)
                 .ok_or_else(|| invalid("invalid slide interval"))?;
             let expected_slide = match config.window_type {
-                asap_types::WindowKind::Tumbling => None,
-                asap_types::WindowKind::Sliding => Some(slide),
-                asap_types::WindowKind::Session => {
+                crate::WindowKind::Tumbling => None,
+                crate::WindowKind::Sliding => Some(slide),
+                crate::WindowKind::Session => {
                     return Err(invalid("session lifecycle is not supported"))
                 }
             };

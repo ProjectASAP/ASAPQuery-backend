@@ -741,6 +741,15 @@ pub enum ValueProjectionIdentity {
     Column { name: String },
 }
 
+/// Whether a materialization preserves source entities or pools a population.
+/// Grouped label names remain in `DataDescriptor::group_by_keys`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PopulationPartitioning {
+    PerEntity,
+    Grouped,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataDescriptor {
@@ -749,6 +758,8 @@ pub struct DataDescriptor {
     pub value_projection: ValueProjectionIdentity,
     pub population_filter_canonical: String,
     pub group_by_keys: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitioning: Option<PopulationPartitioning>,
     /// Versioned contract for timestamp interpretation and
     /// missing/duplicate/invalid observation handling.
     pub observation_semantics: String,
@@ -808,6 +819,7 @@ impl DataDescriptor {
             &population_filter_canonical,
             &group_by_keys,
             &observation_semantics,
+            None,
         );
         Self {
             id,
@@ -815,8 +827,21 @@ impl DataDescriptor {
             value_projection,
             population_filter_canonical,
             group_by_keys,
+            partitioning: None,
             observation_semantics,
         }
+    }
+    pub fn with_partitioning(mut self, partitioning: Option<PopulationPartitioning>) -> Self {
+        self.partitioning = partitioning;
+        self.id = data_descriptor_id(
+            &self.source,
+            &self.value_projection,
+            &self.population_filter_canonical,
+            &self.group_by_keys,
+            &self.observation_semantics,
+            partitioning,
+        );
+        self
     }
     pub fn id(&self) -> &DataDescriptorId {
         &self.id
@@ -829,6 +854,7 @@ impl DataDescriptor {
                 &self.population_filter_canonical,
                 &self.group_by_keys,
                 &self.observation_semantics,
+                self.partitioning,
             )
         {
             return Err(SdsError("data descriptor ID/content mismatch".into()));
@@ -842,6 +868,7 @@ fn data_descriptor_id(
     filter: &str,
     group_by: &BTreeSet<String>,
     observation_semantics: &str,
+    partitioning: Option<PopulationPartitioning>,
 ) -> DataDescriptorId {
     // Length framing keeps distinct typed sources, projections, predicates,
     // and grouping keys collision-free in the content identity.
@@ -854,6 +881,9 @@ fn data_descriptor_id(
         projection.len(),
         filter.len()
     );
+    if let Some(partitioning) = partitioning {
+        key.push_str(&format!("|partition:{partitioning:?}"));
+    }
     for name in group_by {
         key.push_str(&format!("|{}:{name}", name.len()));
     }
@@ -1327,5 +1357,31 @@ mod tests {
             serde_json::from_str::<SummaryDefinitionId>("42").unwrap(),
             id
         );
+    }
+}
+
+#[cfg(test)]
+mod partition_identity_tests {
+    use super::*;
+    #[test]
+    fn entity_and_global_population_have_distinct_identity() {
+        let legacy = DataDescriptor::new_typed(
+            DataSourceIdentity::TimeSeries { metric: "m".into() },
+            ValueProjectionIdentity::SampleValue,
+            "",
+            Vec::<String>::new(),
+            "v1",
+        );
+        let entity = legacy
+            .clone()
+            .with_partitioning(Some(PopulationPartitioning::PerEntity));
+        let grouped = legacy
+            .clone()
+            .with_partitioning(Some(PopulationPartitioning::Grouped));
+        assert_ne!(entity.id, grouped.id);
+        assert_ne!(entity.id, legacy.id);
+        assert_eq!(legacy.clone().with_partitioning(None).id, legacy.id);
+        entity.validate().unwrap();
+        grouped.validate().unwrap();
     }
 }

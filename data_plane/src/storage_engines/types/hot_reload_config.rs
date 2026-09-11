@@ -88,10 +88,10 @@ use crate::storage_engines::types::StreamingConfig;
 pub struct ActivePhysicalPlan {
     /// Authoritative generation and lifecycle identity shared by every plan
     /// projection in this immutable snapshot.
-    pub envelope: control_plane::physical::compiler::PlanEnvelope,
+    pub envelope: asap_types::precompute_plan::PlanEnvelope,
     /// Present for authoritative installations; legacy bootstrap has no catalog.
     pub summary_catalog: Option<Arc<control_plane::physical::summary_catalog::SummaryCatalog>>,
-    pub precompute_plan: control_plane::physical::compiler::PrecomputePlan,
+    pub precompute_plan: asap_types::precompute_plan::PrecomputePlan,
     pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
     pub runtime_config: Arc<StreamingConfig>,
     pub query_plan: Arc<control_plane::query_plan::QueryPlan>,
@@ -655,7 +655,7 @@ mod tests {
         activation_unix_ms: u64,
         expiry_unix_ms: Option<u64>,
     ) -> ActivePhysicalPlan {
-        let envelope = control_plane::physical::compiler::PlanEnvelope {
+        let envelope = asap_types::precompute_plan::PlanEnvelope {
             plan_id,
             plan_version,
             generated_at_unix_ms: activation_unix_ms,
@@ -668,15 +668,15 @@ mod tests {
         ActivePhysicalPlan {
             envelope: envelope.clone(),
             summary_catalog: None,
-            precompute_plan: control_plane::physical::compiler::PrecomputePlan {
+            precompute_plan: asap_types::precompute_plan::PrecomputePlan {
                 summary_catalog: None,
                 envelope: envelope.clone(),
-                ingest: control_plane::physical::compiler::IngestContract {
+                ingest: asap_types::precompute_plan::IngestContract {
                     protocol:
-                        control_plane::physical::compiler::IngestProtocol::ModifiedOtlpMetricsV1,
+                        asap_types::precompute_plan::IngestProtocol::ModifiedOtlpMetricsV1,
                     endpoint_path: "/v1/metrics".into(),
                     timestamp_unit:
-                        control_plane::physical::compiler::TimestampUnit::UnixNanoseconds,
+                        asap_types::precompute_plan::TimestampUnit::UnixNanoseconds,
                     require_plan_identity: true,
                     require_summary_definition_identity: true,
                     require_registered_producer: true,
@@ -688,7 +688,7 @@ mod tests {
             },
             transmission_plan: control_plane::physical::compiler::TransmissionPlan {
                 summary_catalog: None,
-                envelope: control_plane::physical::compiler::PlanEnvelope {
+                envelope: asap_types::precompute_plan::PlanEnvelope {
                     plan_id,
                     plan_version,
                     generated_at_unix_ms: activation_unix_ms,

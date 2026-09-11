@@ -2690,7 +2690,7 @@ mod tests {
             generated_at_unix_ms: 0,
             activation_unix_ms: 1,
             expiry_unix_ms: None,
-            backend_compat: control_plane::physical::compiler::BACKEND_COMPAT.into(),
+            backend_compat: asap_types::precompute_plan::BACKEND_COMPAT.into(),
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
@@ -3673,6 +3673,7 @@ aggregations:
                 num_aggregates_to_retain: None,
                 table_name: None,
                 value_column: None,
+                partitioning: None,
             };
             // PR 5: streaming-config is keyed on the policy
             // fingerprint. Build a marker→fingerprint map so the test
@@ -5865,7 +5866,7 @@ async fn handle_health(State(state): State<AppState>) -> axum::response::Respons
             && active.expiry_unix_ms().is_none_or(|expiry| now < expiry);
         let ingest_ready = matches!(
             active.precompute_plan.ingest.protocol,
-            control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
+            asap_types::precompute_plan::IngestProtocol::PrometheusRemoteWriteV1
         ) && active.precompute_plan.ingest.endpoint_path == "/api/v1/write";
         if !lifecycle_ready || !ingest_ready {
             return (
@@ -6069,7 +6070,7 @@ pub fn build_active_physical_plan(
                 .iter()
                 .find(|config| config.policy_fingerprint() == binding.materialization.fingerprint())
                 .ok_or_else(|| "query binding has no precompute definition".to_string())?;
-            if binding.window_ms != materialization.slide_interval.saturating_mul(1_000) {
+            if binding.window_ms != materialization.stored_window_ms() {
                 return Err(
                     "query physical pane duration differs from installed precompute definition"
                         .into(),
@@ -6187,7 +6188,7 @@ async fn handle_post_physical_plan(
         && (active.plan_id() == 0
             || !matches!(
                 active.precompute_plan.ingest.protocol,
-                control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
+                asap_types::precompute_plan::IngestProtocol::PrometheusRemoteWriteV1
             )
             || active.precompute_plan.ingest.endpoint_path != "/api/v1/write")
     {

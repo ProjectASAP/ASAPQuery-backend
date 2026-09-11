@@ -3,6 +3,7 @@ pub mod accuracy;
 pub mod aggregation_config;
 pub mod aggregation_type;
 pub mod enums;
+pub mod executable_plan;
 pub mod key_by_label_names;
 pub mod monitor_spec;
 pub mod policy_fingerprint;
@@ -27,3 +28,5 @@ pub use policy_registry::PolicyRegistry;
 pub use query_requirements::*;
 pub use routing_index::RoutingIndex;
 pub use storage_backend::*;
+
+pub mod precompute_plan;

@@ -205,11 +205,7 @@ impl QueryPlan {
     }
 }
 
-/// Stable identity inside one query entry. Edges are IDs so common
-/// subexpressions remain shared after serialization.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(transparent)]
-pub struct QueryNodeId(pub u64);
+pub use asap_types::executable_plan::QueryNodeId;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]

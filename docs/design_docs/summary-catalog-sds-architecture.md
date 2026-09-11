@@ -148,6 +148,19 @@ readout and fallback routing, and the common deployment envelope carries their
 shared plan identity. Consumers atomically install one catalog snapshot with
 the plans that reference it.
 
+`asap_types::executable_plan` owns the installed semantic-DAG representation,
+physical node bindings, and `QueryNodeId`. Its `OwnedPostAsapDag` is a Send/Sync
+representation for shared runtime snapshots; it is not Planner's
+`PostAsapDagDocument` envelope. The owned representation preserves semantic
+node IDs and typed operator tags while serializing Planner payloads that contain
+process-local `Rc` pointers. The control plane constructs it and checks its
+bindings against QueryPlan; precompute execution consumes the shared contract.
+`PrecomputePlan`, its envelope, ingest, producer, state schema, and catalog
+consistency checks live in `asap_types::precompute_plan`. The compiler chooses
+materializations and placement; data-plane installation uses the shared
+contract. `QueryPlan` definitions still reside in the control-plane
+crate while their remaining compilation methods are separated from wire types.
+
 The implemented ownership split is:
 
 1. Move the SDS catalog contract into `asap_types`.

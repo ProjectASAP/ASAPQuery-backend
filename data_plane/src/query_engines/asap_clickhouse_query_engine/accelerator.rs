@@ -647,17 +647,17 @@ mod tests {
                 Box::new(SumAccumulator::with_sum(3.0)),
             );
         }
-        let envelope = control_plane::physical::compiler::PlanEnvelope {
+        let envelope = asap_types::precompute_plan::PlanEnvelope {
             plan_id: 41,
             plan_version: 1,
             generated_at_unix_ms: 0,
             activation_unix_ms: 0,
             expiry_unix_ms: None,
-            backend_compat: control_plane::physical::compiler::BACKEND_COMPAT.into(),
+            backend_compat: asap_types::precompute_plan::BACKEND_COMPAT.into(),
             planner_revision: control_plane::physical::compiler::PLANNER_REVISION.into(),
             capability_snapshot_id: "clickhouse-test".into(),
         };
-        let mut precompute = control_plane::physical::compiler::PrecomputePlan::build(
+        let mut precompute = asap_types::precompute_plan::PrecomputePlan::build(
             envelope.clone(),
             vec![config],
             &["fixture".into()],

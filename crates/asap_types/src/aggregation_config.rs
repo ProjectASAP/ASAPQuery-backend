@@ -100,6 +100,8 @@ pub struct PrecomputeMaterialization {
     pub aggregation_sub_type: String,
     pub parameters: HashMap<String, Value>,
     pub grouping_labels: KeyByLabelNames,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitioning: Option<crate::sds::PopulationPartitioning>,
     pub aggregated_labels: KeyByLabelNames,
     pub rollup_labels: KeyByLabelNames,
     pub original_yaml: String,
@@ -162,6 +164,15 @@ impl AggregationIdInfo {
 pub type AggregationConfig = PrecomputeMaterialization;
 
 impl PrecomputeMaterialization {
+    /// Temporal extent of one stored base state, independent of emission cadence.
+    pub fn stored_window_ms(&self) -> u64 {
+        match &self.window_layout {
+            WindowMaterializationLayout::FullWindow => self.window_size,
+            layout => layout.base_pane_secs(),
+        }
+        .saturating_mul(1_000)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         aggregation_type: AggregationType,
@@ -189,6 +200,7 @@ impl PrecomputeMaterialization {
             aggregation_sub_type,
             parameters,
             grouping_labels,
+            partitioning: None,
             aggregated_labels,
             rollup_labels,
             original_yaml,
@@ -317,6 +329,11 @@ impl PrecomputeMaterialization {
             table_name,
             value_column,
         );
+        config.partitioning = data
+            .get("partitioning")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?;
         config.pane_origin_ms = pane_origin_ms;
         Ok(config)
     }
@@ -456,6 +473,11 @@ impl PrecomputeMaterialization {
             table_name,
             value_column,
         );
+        config.partitioning = aggregation_data
+            .get("partitioning")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_yaml::from_value(value.clone()))
+            .transpose()?;
         config.pane_origin_ms = pane_origin_ms;
         Ok(config)
     }
@@ -469,6 +491,7 @@ impl SerializableToSink for PrecomputeMaterialization {
             "aggregationType": self.aggregation_type,
             "aggregationSubType": self.aggregation_sub_type,
             "parameters": self.parameters,
+            "partitioning": self.partitioning,
             "originalYaml": self.original_yaml,
             "windowSize": self.window_size,
             "slideInterval": self.slide_interval,

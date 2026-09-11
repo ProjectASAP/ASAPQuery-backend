@@ -12,6 +12,7 @@ asap_types.workspace = true
 # resolver). For now this dep just makes the control_plane crate
 # compile in the workspace and importable from main.rs.
 control_plane = { path = "../control_plane" }
+sha2 = "0.10"
 
 # Step C (data_plane/docs/l4node-plan-executor-design.md): data_plane
 # vendors its own `SummaryExecutor`/`execute` (see

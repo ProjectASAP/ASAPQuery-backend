@@ -2425,10 +2425,8 @@ fn take_summary_frame_identity(
     })
 }
 
-fn state_encoding_for_wire(
-    encoding: i32,
-) -> Option<control_plane::physical::compiler::StateEncoding> {
-    use control_plane::physical::compiler::StateEncoding;
+fn state_encoding_for_wire(encoding: i32) -> Option<asap_types::precompute_plan::StateEncoding> {
+    use asap_types::precompute_plan::StateEncoding;
     match encoding {
         ENCODING_PROTO | ENCODING_PROTO_DELTA => Some(StateEncoding::SketchlibProtobufV1),
         ENCODING_MSGPACK | ENCODING_MSGPACK_DELTA => Some(StateEncoding::SketchCoreMsgpackV1),
