@@ -1466,9 +1466,7 @@ mod tests {
             .unwrap();
         let binding = asap_types::query_plan::MaterializationBinding {
             materialization: asap_types::PolicyFingerprint(policy).into(),
-            output_grouping: asap_types::query_plan::PhysicalGrouping::Reduce(
-                vec!["job".into()],
-            ),
+            output_grouping: asap_types::query_plan::PhysicalGrouping::Reduce(vec!["job".into()]),
             item_labels: vec![],
             window_ms: 60_000,
             pane_origin_ms: Some(0),
