@@ -16,6 +16,49 @@ pub(crate) struct FrozenExactWindows {
 }
 
 impl SketchStore {
+    /// Acquire a complete immutable read set before any output is reserved.
+    /// Individual payloads are immutable; checking the shared generation again
+    /// after all reads prevents a catalog transition from mixing incarnations.
+    pub(crate) fn read_frozen_exact_cohort(
+        &self,
+        generation: &Arc<CatalogGeneration>,
+        expected_definitions: &BTreeSet<SummaryDefinitionId>,
+        requests: &[(
+            u64,
+            SummaryDefinitionId,
+            BTreeSet<(u64, u64)>,
+            BTreeMap<String, String>,
+        )],
+    ) -> Result<Vec<FrozenExactWindows>, String> {
+        if requests.is_empty() || requests.len() > 65_536 {
+            return Err("immutable input cohort has invalid population count".into());
+        }
+        let supplied = requests
+            .iter()
+            .map(|(_, definition, _, _)| *definition)
+            .collect();
+        if expected_definitions != &supplied {
+            return Err("immutable input cohort differs from installed input definitions".into());
+        }
+        let mut ordered: Vec<_> = requests.iter().collect();
+        ordered.sort_by(|left, right| (left.1, left.0, &left.3).cmp(&(right.1, right.0, &right.3)));
+        if ordered
+            .windows(2)
+            .any(|pair| (pair[0].1, pair[0].0, &pair[0].3) == (pair[1].1, pair[1].0, &pair[1].3))
+        {
+            return Err("immutable input cohort repeats a physical population".into());
+        }
+        self.validate_routed_catalog_generation(Some(generation.as_ref()))?;
+        let inputs = ordered
+            .into_iter()
+            .map(|(sid, definition, windows, group)| {
+                self.read_frozen_exact_windows(*sid, *definition, generation, windows, group)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.validate_routed_catalog_generation(Some(generation.as_ref()))?;
+        Ok(inputs)
+    }
+
     fn durable_maintenance_population_ids(
         &self,
         definition: SummaryDefinitionId,
@@ -412,6 +455,102 @@ mod tests {
     use asap_types::traits::SerializableToSink;
 
     #[test]
+    fn cohort_requires_every_durable_source_in_one_catalog_generation() {
+        // Neither a missing second window nor a new catalog may yield a
+        // partially acquired cohort, even when the first source is complete.
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-planning-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let mut first = plan.precompute_plan.materializations[0].clone();
+        first.aggregation_type = asap_types::AggregationType::Sum;
+        first.aggregation_sub_type = "sum".into();
+        first.grouping_labels = std::iter::empty::<String>().collect();
+        let mut second = first.clone();
+        second.metric = "cohort_second".into();
+        let configs = [first, second];
+        let catalog =
+            asap_types::summary_catalog::SummaryCatalog::from_materializations(1, 1, &configs)
+                .unwrap();
+        let store = Arc::new(SketchStore::new());
+        store
+            .install_summary_catalog(Arc::new(catalog.clone()))
+            .unwrap();
+        let generation = store.active_catalog_generation().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = persistence::config::SketchStorePersistenceConfig::with_memory_limit(
+            1 << 24,
+            directory.path().to_path_buf(),
+        );
+        config.delete_older_than_ms = None;
+        config.hot_window_ms = None;
+        let mut persistence = store.start_persistence(config).unwrap();
+        let mut requests = Vec::new();
+        for (index, config) in configs.iter().enumerate() {
+            let definition = config.policy_fingerprint().into();
+            let coordinate = asap_types::sds::SummaryInstanceCoordinates {
+                summary_definition_id: definition,
+                time_range: HalfOpenTimeRange {
+                    start_ms: 0,
+                    end_ms: 1000,
+                },
+                group_values: BTreeMap::new(),
+            };
+            let revision = store
+                .admit_summary_updates(&generation, BTreeSet::from([coordinate.clone()]))
+                .unwrap();
+            let mut output = PrecomputedOutput::new(0, 1000, None, config.policy_fingerprint());
+            output.catalog_generation = Some(Arc::clone(&generation));
+            let mut sum = SumAccumulator::new();
+            sum.update(5.0 + index as f64);
+            let sid = 900 + index as u64;
+            store
+                .publish_admitted_summary_update(
+                    &generation,
+                    &coordinate,
+                    revision,
+                    revision,
+                    2000,
+                    |writer| writer.ingest_precompute_with_series_id(sid, config, &output, &sum),
+                )
+                .unwrap();
+            requests.push((
+                sid,
+                definition,
+                BTreeSet::from([(0, 1000)]),
+                BTreeMap::new(),
+            ));
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !store.seal_finite_summary_input(&generation).unwrap() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let definitions = requests.iter().map(|request| request.1).collect();
+        let parts = persistence.manifest.live_parts().len();
+        let cohort = store
+            .read_frozen_exact_cohort(&generation, &definitions, &requests)
+            .unwrap();
+        assert_eq!(cohort.len(), 2);
+        assert!(cohort.iter().all(|input| input.generation == generation));
+        requests[1].2.insert((1000, 2000));
+        assert!(store
+            .read_frozen_exact_cohort(&generation, &definitions, &requests)
+            .is_err());
+        assert_eq!(persistence.manifest.live_parts().len(), parts);
+        let mut next = catalog;
+        next.plan_version += 1;
+        store.install_summary_catalog(Arc::new(next)).unwrap();
+        requests[1].2.remove(&(1000, 2000));
+        assert!(store
+            .read_frozen_exact_cohort(&generation, &definitions, &requests)
+            .is_err());
+        persistence.shutdown();
+    }
+
+    #[test]
     fn one_sid_with_two_populations_cannot_publish_a_partial_global_summary() {
         let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
@@ -502,6 +641,47 @@ mod tests {
             )
             .unwrap();
         assert!(!frozen.singleton_population_complete);
+        // The read set is deterministic and all-or-nothing, independently of
+        // the later routing decision (which still rejects this global reduce).
+        let request = |name: &str| {
+            (
+                700,
+                source_id,
+                BTreeSet::from([(0, 60_000)]),
+                BTreeMap::from([("instance".to_string(), name.to_string())]),
+            )
+        };
+        let cohort = store
+            .read_frozen_exact_cohort(
+                &generation,
+                &BTreeSet::from([source_id]),
+                &[request("b"), request("a")],
+            )
+            .unwrap();
+        assert_eq!(cohort.len(), 2);
+        assert_eq!(cohort[0].group["instance"], "a");
+        assert_eq!(cohort[1].group["instance"], "b");
+        assert!(store
+            .read_frozen_exact_cohort(
+                &generation,
+                &BTreeSet::from([source_id]),
+                &[request("a"), request("a")]
+            )
+            .is_err());
+        assert!(store
+            .read_frozen_exact_cohort(
+                &generation,
+                &BTreeSet::from([source_id, target.policy_fingerprint().into()]),
+                &[request("a")]
+            )
+            .is_err());
+        assert!(store
+            .read_frozen_exact_cohort(
+                &generation,
+                &BTreeSet::from([source_id]),
+                &[request("a"), request("absent")]
+            )
+            .is_err());
         let parts_before = persistence.manifest.live_parts().len();
         let resolver = crate::drivers::ingest::series_resolver::SeriesIdResolver::new();
         for _ in 0..2 {

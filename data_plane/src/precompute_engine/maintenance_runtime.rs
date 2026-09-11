@@ -608,8 +608,12 @@ pub fn execute_completed_maintenance(
     let generation = store
         .active_catalog_generation()
         .ok_or("maintenance requires an authoritative catalog")?;
-    let frozen =
-        store.read_frozen_exact_windows(source_sid, source, &generation, &expected, group)?;
+    let mut cohort = store.read_frozen_exact_cohort(
+        &generation,
+        &derived.inputs,
+        &[(source_sid, source, expected, group.clone())],
+    )?;
+    let frozen = cohort.pop().ok_or("immutable input cohort is empty")?;
     let (dag, key, states) =
         prepare_frozen_maintenance_sink(installed, configs, sink, &frozen, window)?;
     let digest = key

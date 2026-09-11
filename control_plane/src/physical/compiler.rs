@@ -1239,18 +1239,18 @@ impl PhysicalCompiler {
                                 query_id: query.query_id.clone(),
                                 reason: "derived source config missing".into(),
                             })?;
-                    asap_types::precompute_plan::validated_source_window_cohort(
-                        &runtime_materialization,
-                        &[source_config],
-                    )
-                    .map_err(|error| CompileError::Query {
-                        query_id: query.query_id.clone(),
-                        reason: error.to_string(),
-                    })?;
-                    if runtime_materialization.window_size != runtime_materialization.slide_interval
+                    if runtime_materialization.window_size != source_config.window_size
+                        || runtime_materialization.slide_interval != source_config.slide_interval
+                        || runtime_materialization.pane_origin_ms != source_config.pane_origin_ms
+                        || runtime_materialization.window_size
+                            != runtime_materialization.slide_interval
+                        || runtime_materialization.stored_window_ms()
+                            != source_config.stored_window_ms()
+                        || source_config.stored_window_ms()
+                            != source_config.window_size.saturating_mul(1_000)
                     {
                         return Err(CompileError::Query { query_id: query.query_id.clone(),
-                            reason: "immutable scalar composition runtime requires nonoverlapping windows".into() });
+                            reason: "immutable scalar composition requires matching full nonoverlapping windows".into() });
                     }
                     let SummaryExpr::SummaryAgg { child, .. } = &selected.node.expr else {
                         unreachable!()
