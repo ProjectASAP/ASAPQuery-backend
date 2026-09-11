@@ -2096,7 +2096,11 @@ fn emit_edge_yaml_asap_edge(
                     e.insert("rows".into(), Value::Number((*depth as u64).into()));
                     e.insert("cols".into(), Value::Number((*width as u64).into()));
                 }
-                Some(SketchParams::Kmv { .. } | SketchParams::Theta { .. }) => unreachable!(
+                Some(
+                    SketchParams::UnivMon { .. }
+                    | SketchParams::Kmv { .. }
+                    | SketchParams::Theta { .. },
+                ) => unreachable!(
                     "5-sketch routing: non-sketch or unsupported SketchParams; \
                      no Bind* rule in this repo produces one"
                 ),
@@ -2860,10 +2864,12 @@ fn build_edge_processor_block(
             m.insert("encoding".into(), Value::String("msgpack".into()));
             m.insert("delta_transmission".into(), Value::Bool(true));
         }
-        SketchParams::Kmv { .. } | SketchParams::Theta { .. } => unreachable!(
-            "edge sketch processor config requested for a non-sketch or unsupported \
+        SketchParams::UnivMon { .. } | SketchParams::Kmv { .. } | SketchParams::Theta { .. } => {
+            unreachable!(
+                "edge sketch processor config requested for a non-sketch or unsupported \
              SketchAlgorithm; no Bind* rule in this repo produces one"
-        ),
+            )
+        }
     }
 
     Value::Mapping(m)
@@ -2903,7 +2909,7 @@ fn gateway_merge_processor_name(mp: &GatewayMergeProcessor) -> String {
         SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap => {
             "countsketchmerge".to_string()
         }
-        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => unreachable!(
+        SketchAlgorithm::UnivMon | SketchAlgorithm::Kmv | SketchAlgorithm::Theta => unreachable!(
             "gateway_merge_processor_name: non-sketch or unsupported SketchAlgorithm; \
              no Bind* rule in this repo produces one"
         ),
@@ -3050,6 +3056,8 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
 /// `aggregations` list by the same `PolicyFingerprint` recipe.
 fn build_backend_readout_json(r: &BackendReadout) -> JsonValue {
     match &r.op {
+        SketchQuery::FrequencyL2 => json!({"op": "frequency_l2"}),
+        SketchQuery::FrequencyEntropy => json!({"op": "frequency_entropy"}),
         SketchQuery::Quantile { q } => json!({
             "op": "quantile",
             "q": q,
@@ -3128,7 +3136,7 @@ fn sketch_algorithm_to_backend_type(kind: &SketchAlgorithm) -> &'static str {
         SketchAlgorithm::CountSketch => "CountSketch",
         SketchAlgorithm::CmsWithHeap => "CountMinSketchWithHeap",
         SketchAlgorithm::Cms => "CountMinSketch",
-        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => unreachable!(
+        SketchAlgorithm::UnivMon | SketchAlgorithm::Kmv | SketchAlgorithm::Theta => unreachable!(
             "sketch_algorithm_to_backend_type: unsupported SketchAlgorithm; \
              no Bind* rule in this repo produces one"
         ),
@@ -3147,7 +3155,7 @@ fn sketch_algorithm_tag(kind: &SketchAlgorithm) -> &'static str {
         SketchAlgorithm::Hll => "hll",
         SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap => "cms",
         SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap => "count_sketch",
-        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => unreachable!(
+        SketchAlgorithm::UnivMon | SketchAlgorithm::Kmv | SketchAlgorithm::Theta => unreachable!(
             "sketch_algorithm_tag: non-sketch or unsupported SketchAlgorithm; \
              no Bind* rule in this repo produces one"
         ),
@@ -3191,10 +3199,12 @@ fn sketch_params_to_json(p: &SketchParams) -> JsonValue {
         }),
         // Exact accumulators never reach here -- see
         // `sketch_kind_to_backend_type`'s doc.
-        SketchParams::Kmv { .. } | SketchParams::Theta { .. } => unreachable!(
-            "sketch_params_to_json: non-sketch or unsupported SummaryParams; \
+        SketchParams::UnivMon { .. } | SketchParams::Kmv { .. } | SketchParams::Theta { .. } => {
+            unreachable!(
+                "sketch_params_to_json: non-sketch or unsupported SummaryParams; \
              no Bind* rule in this repo produces one"
-        ),
+            )
+        }
     }
 }
 

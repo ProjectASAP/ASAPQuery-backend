@@ -311,6 +311,32 @@ impl AggregationConfig {
                 ),
                 false,
             ),
+            UnivMon => {
+                let param =
+                    |name: &str, default: u64, max: u64| -> Result<u32, AccumulatorSpecError> {
+                        let value = self
+                            .parameters
+                            .get(name)
+                            .map_or(Some(default), |v| v.as_u64())
+                            .ok_or(AccumulatorSpecError::UnmappedAggregationType(UnivMon))?;
+                        if value == 0 || value > max {
+                            return Err(AccumulatorSpecError::UnmappedAggregationType(UnivMon));
+                        }
+                        Ok(value as u32)
+                    };
+                (
+                    independent_sketch(
+                        SketchAlgorithm::UnivMon,
+                        SketchParams::UnivMon {
+                            heap_size: param("heap_size", 32, u32::MAX as u64)?,
+                            sketch_rows: param("sketch_rows", 5, 20)?,
+                            sketch_cols: param("sketch_cols", 1024, u32::MAX as u64)?,
+                            layers: param("layers", 4, 64)? as u8,
+                        },
+                    ),
+                    false,
+                )
+            }
             HLL => {
                 let precision = match self.parameters.get("precision") {
                     None => 14,

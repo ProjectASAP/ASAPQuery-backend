@@ -783,6 +783,8 @@ pub enum ExactReadout {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum QueryReadout {
+    FrequencyL2,
+    FrequencyEntropy,
     Quantile {
         q: f64,
     },
@@ -799,6 +801,8 @@ pub enum QueryReadout {
 impl From<SketchQuery> for QueryReadout {
     fn from(query: SketchQuery) -> Self {
         match query {
+            SketchQuery::FrequencyL2 => Self::FrequencyL2,
+            SketchQuery::FrequencyEntropy => Self::FrequencyEntropy,
             SketchQuery::Quantile { q } => Self::Quantile { q },
             SketchQuery::PointCount { key, value } => Self::PointCount { key, value },
             SketchQuery::Cardinality => Self::Cardinality,
@@ -810,6 +814,8 @@ impl From<SketchQuery> for QueryReadout {
 impl From<QueryReadout> for SketchQuery {
     fn from(query: QueryReadout) -> Self {
         match query {
+            QueryReadout::FrequencyL2 => Self::FrequencyL2,
+            QueryReadout::FrequencyEntropy => Self::FrequencyEntropy,
             QueryReadout::Quantile { q } => Self::Quantile { q },
             QueryReadout::PointCount { key, value } => Self::PointCount { key, value },
             QueryReadout::Cardinality => Self::Cardinality,

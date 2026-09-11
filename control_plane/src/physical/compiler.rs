@@ -37,7 +37,7 @@ use crate::query_plan::{
 use crate::types_v2::AccuracyTarget;
 use planner_types::pre_asap::Source;
 
-pub const PLANNER_REVISION: &str = "0deceda3e776216c5542d638d958b159f22e27ce";
+pub const PLANNER_REVISION: &str = env!("ASAPPLANNER_REVISION");
 pub const BACKEND_REVISION: &str = env!("ASAPQUERY_BACKEND_REVISION");
 pub const BACKEND_COMPAT: &str = "asap-query-backend.v1";
 /// Matches the data plane's default persistence memory limit. A backend-local
@@ -648,15 +648,6 @@ impl PrecomputePlan {
                     materialization: materialization.policy_fp_u64(),
                     reason: "window kind disagrees with size and slide".into(),
                 });
-            }
-            // HLL is supported as an ingested sketch envelope, not as a raw
-            // accumulator. Validate here so external installs cannot bypass it.
-            if self.ingest.protocol == IngestProtocol::PrometheusRemoteWriteV1
-                && materialization.aggregation_type == asap_types::AggregationType::HLL
-            {
-                return Err(PrecomputePlanError::UnsupportedFamily(
-                    materialization.policy_fp_u64(),
-                ));
             }
             if !materializations.insert(materialization.policy_fingerprint().into()) {
                 return Err(PrecomputePlanError::DuplicateMaterialization(
@@ -3141,7 +3132,9 @@ pub(super) fn state_encodings(family: &SummaryFamilyType) -> Vec<StateEncoding> 
         SummaryFamilyType::Sketch(kind, _)
             if matches!(
                 kind.algorithm(),
-                SketchAlgorithm::CmsWithHeap | SketchAlgorithm::CountSketchWithHeap
+                SketchAlgorithm::CmsWithHeap
+                    | SketchAlgorithm::CountSketchWithHeap
+                    | SketchAlgorithm::UnivMon
             ) =>
         {
             vec![StateEncoding::SketchCoreMsgpackV1]
@@ -3336,6 +3329,11 @@ fn retained_state_bytes(materialization: &asap_types::PrecomputeMaterialization)
                 + parameter(&["heap_size"], 1) * 256
         }
         A::DatasketchesKLL => parameter(&["k"], 200) * 32,
+        A::UnivMon => {
+            parameter(&["layers"], 4)
+                * (parameter(&["sketch_rows"], 5) * parameter(&["sketch_cols"], 1024) * 16
+                    + parameter(&["heap_size"], 32) * 256)
+        }
         A::HydraKLL => parameter(&["k"], 200) * parameter(&["col", "cols"], 1) * 32,
         A::HLL => 1u128 << parameter(&["precision", "p"], 14).min(24),
         A::DDSketch => 64 * 1024,
@@ -4059,6 +4057,13 @@ pub(crate) fn physical_materialization_family(family: &SummaryFamilyType) -> Sum
 fn sketch_params_json(params: &planner_types::post_asap::SketchParams) -> Value {
     use planner_types::post_asap::SketchParams as P;
     match params {
+        P::UnivMon {
+            heap_size,
+            sketch_rows,
+            sketch_cols,
+            layers,
+        } => json!({"heap_size": heap_size, "sketch_rows": sketch_rows,
+                "sketch_cols": sketch_cols, "layers": layers}),
         P::Kll { k } => json!({"k": k}),
         P::Cms { width, depth } => json!({"width": width, "depth": depth}),
         P::Hll { precision } => json!({"precision": precision}),
@@ -5857,7 +5862,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_local_hll_rejected_but_envelope_ingest_supported() {
+    fn backend_local_hll_and_envelope_ingest_are_supported() {
         let bundle = PhysicalCompiler
             .compile(
                 request("q", "quantile_over_time(0.99, m[1m])"),
@@ -5882,14 +5887,8 @@ mod tests {
             require_registered_producer: false,
         };
         envelope_plan.producers.clear();
-        assert!(matches!(
-            envelope_plan.validate(),
-            Err(PrecomputePlanError::UnsupportedFamily(_))
-        ));
-        assert!(matches!(
-            PrecomputePlan::build_backend_local(bundle.envelope, materializations),
-            Err(PrecomputePlanError::UnsupportedFamily(_))
-        ));
+        envelope_plan.validate().unwrap();
+        PrecomputePlan::build_backend_local(bundle.envelope, materializations).unwrap();
     }
 
     #[test]
