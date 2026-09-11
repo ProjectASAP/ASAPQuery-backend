@@ -1,0 +1,247 @@
+[
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/driver-checkout.txt",
+    "bytes": 41,
+    "sha256": "18a3dd592033f38652545dcaa36ab404a40c7a83768110c09d9b7321d7982789"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/inputs.sha256",
+    "bytes": 247,
+    "sha256": "fadb2b1c95f0d398eb2a116ed66b77a061561977dc589c1f447da7fcdd1c426e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/runtime-source-commit.txt",
+    "bytes": 9,
+    "sha256": "6b594b65f78fb97ed820c019b4644fe9d783ad3a9d17394a1748ee7571421adf"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-1-q05/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-1-q05/q05/requests.jsonl",
+    "bytes": 3548372,
+    "sha256": "6d6f7c36aa924d1c52d533a023d304169bf8179d09340f120d55337fcd3c7f99"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-1-q05/q05/result.json",
+    "bytes": 5260,
+    "sha256": "1ac6780718e6fb66b159c92a44901783ce2c7033327bcd8ea75d84dfa3f4bb2f"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-1-q06/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-1-q06/q06/requests.jsonl",
+    "bytes": 2604895,
+    "sha256": "f671c3032885973cb521e4b7af450f5698391dc004a82fbc6d611c1dd7037724"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-1-q06/q06/result.json",
+    "bytes": 4320,
+    "sha256": "de50b85a5325560ef63243a0bd7073d67a9a31afa574ce7f7e40bfb4f6da9816"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-1-q23/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-1-q23/q23/requests.jsonl",
+    "bytes": 2905541,
+    "sha256": "ee05883c651673b36df8608dc31d421d51e37c597f5d8a47cd0d2ea434bf53ba"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-1-q23/q23/result.json",
+    "bytes": 4620,
+    "sha256": "8100b7054f0c8f161bd986148c9fc661c7ded2ce90c33125f5aae6a6b944b8e7"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-2-q05/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-2-q05/q05/requests.jsonl",
+    "bytes": 3548547,
+    "sha256": "65fc261c415cc3485a58bf301e0a7ffef2bb2c8a4c22e69122ed63a25555c53f"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-2-q05/q05/result.json",
+    "bytes": 5260,
+    "sha256": "4ae2305987f4f538fd4da13f817aa11942ebbb3308ad9b29ebd83c28c2e94978"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-2-q06/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-2-q06/q06/requests.jsonl",
+    "bytes": 2606114,
+    "sha256": "c4345d24793e863c2e9af41901854e6ce0145c626c1e44f5e1e6df7310c37b33"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-2-q06/q06/result.json",
+    "bytes": 4320,
+    "sha256": "c9e2985833acbed36c264bbcbc8ca43d75b3629b402c73a9f642a63a4a760d24"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-2-q23/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-2-q23/q23/requests.jsonl",
+    "bytes": 2906164,
+    "sha256": "8fa00d84d1d2f5264d13168e39825cd97419cfa9c903a604d56ceb6651694d7c"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-2-q23/q23/result.json",
+    "bytes": 4620,
+    "sha256": "bd5f276af8c3c0cc30d7204924a926cb5c710c75d698f6e69a0572b3a1171d9b"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-3-q05/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-3-q05/q05/requests.jsonl",
+    "bytes": 3547588,
+    "sha256": "58046878910dbf4d93d4d3ff569e1f40423086260237cbaa23845993e44ff2a0"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-3-q05/q05/result.json",
+    "bytes": 5262,
+    "sha256": "04459d12a190f6a6fcb9bc4ef2eb460845df5759e9a629d68e21d20330e7ad41"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-3-q06/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-3-q06/q06/requests.jsonl",
+    "bytes": 2606081,
+    "sha256": "212c6e2c61640348dd362e3f9bc5744cff9e7ef54c10545f6221b7bae43c4e7d"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-3-q06/q06/result.json",
+    "bytes": 4320,
+    "sha256": "d754143c030aabd1be105dc46888c96dd0ad8a30b598db0f4202797e7358f337"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-3-q23/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-3-q23/q23/requests.jsonl",
+    "bytes": 2905867,
+    "sha256": "5a0554274d325f6ddec93830e7af7f28798e9e893ed4b5868e984cc67d87b1e7"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-matched/trial-3-q23/q23/result.json",
+    "bytes": 4619,
+    "sha256": "7269fd8c20b6277d96ed7ffbb9c5272e20e1cc219ecacedf9f8146be16be8c52"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/inputs.sha256",
+    "bytes": 397,
+    "sha256": "c70dc43ef6d8772e796a6f10c840bdd82a012b140ff9faa7af2e77a9961a9212"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-1-asap/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-1-asap/q05/requests.jsonl",
+    "bytes": 1227891,
+    "sha256": "d81cd271bdacd5f3f07c2cb3bee149d9e4ebac04768e0f9f5b818e8e19cccb98"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-1-asap/q05/result.json",
+    "bytes": 5414,
+    "sha256": "d5ecb41643d21f22eb812ffc2c85e5f4ede6518663d05fa47bc8033f71ff6695"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-1-native/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-1-native/requests.jsonl",
+    "bytes": 1250315,
+    "sha256": "df3329158c97f5ac95e125c153c19bcece3a4a59e8f93cf60939db905f23e32e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-1-native/result.json",
+    "bytes": 403,
+    "sha256": "d572fdfc34a5208af4c263f878084860d3c0ab469e8a78f9c2d6f0ffc5286f85"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-2-asap/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-2-asap/q05/requests.jsonl",
+    "bytes": 1227892,
+    "sha256": "53619e372243b06b374695712aedbbd009599107a2166b56743bcd66c1eb3725"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-2-asap/q05/result.json",
+    "bytes": 5414,
+    "sha256": "d397f396056ad8d433ca51c41b6dd7d65ee565ae8af9a0a847e35187310dd21d"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-2-native/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-2-native/requests.jsonl",
+    "bytes": 1249755,
+    "sha256": "9979477f6c16d9cf51c23fa46243b0a5c5ac0609684e44790806e947f3495bca"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-2-native/result.json",
+    "bytes": 402,
+    "sha256": "75e34dc04bd0ee64381cd9b99bd4c5e1c5dab1ddbeac013df169b88143739a97"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-3-asap/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-3-asap/q05/requests.jsonl",
+    "bytes": 1227890,
+    "sha256": "2f196c6f74c13ec8453ec2c1bbb0b1a58e3449aa307ad63edabb94e73a4d7295"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-3-asap/q05/result.json",
+    "bytes": 5414,
+    "sha256": "a58f6e47deae4a301399472d41b37983d81f751ee722820234654d5331295fa3"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-3-native/clickhouse-runtime.json",
+    "bytes": 162,
+    "sha256": "2d019b9f4b287881e48052ed6b581fa6e1624f5d3541b58d0d6ef3cd252c986e"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-3-native/requests.jsonl",
+    "bytes": 1249777,
+    "sha256": "f2956c2a5a70f16088dbc38b750d0ebe531ae8117313f83b0bc6b766edd35328"
+  },
+  {
+    "path": "/mydata/clickhouse-o11y-main-results/original27-deployment-pairs/trial-3-native/result.json",
+    "bytes": 402,
+    "sha256": "d86b54ee3db980d3501e37c51f0e0bc7289b952866a6e9ac34798ab917827810"
+  }
+]
