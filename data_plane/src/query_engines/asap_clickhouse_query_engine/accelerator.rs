@@ -331,6 +331,10 @@ mod tests {
             request: &ClickHouseQueryRequest,
         ) -> Result<ClickHouseRawResponse, super::super::fallback::ClickHouseFallbackError>
         {
+            assert_eq!(
+                request.parameters.get("output_format_json_quote_denormals"),
+                Some(&"1".into())
+            );
             assert_eq!(request.parameters.get("param_from"), Some(&"0".into()));
             assert_eq!(request.parameters.get("param_to"), Some(&"2000".into()));
             Ok(ClickHouseRawResponse {

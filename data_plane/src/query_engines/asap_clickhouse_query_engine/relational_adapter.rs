@@ -1113,6 +1113,13 @@ mod tests {
         };
         for value in ["inf", "-inf", "nan"] {
             assert!(json_cell(
+                &serde_json::json!(value),
+                &DataType::Float64,
+                true,
+                "Nullable(Float64)"
+            )
+            .is_err());
+            assert!(json_cell(
                 &serde_json::json!([value]),
                 &dtype,
                 false,
