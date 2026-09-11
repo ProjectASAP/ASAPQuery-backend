@@ -191,7 +191,7 @@ impl FrameLineageTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use control_plane::physical::compiler::StateEncoding;
+    use asap_types::precompute_plan::StateEncoding;
 
     fn frame(sequence: u64, kind: SummaryFrameKind) -> SummaryFrameIdentity {
         SummaryFrameIdentity {

@@ -242,7 +242,7 @@ impl PrometheusRemoteWriteReceiver {
         if physical_plan.precompute_plan.envelope.plan_id == 0
             || !matches!(
                 physical_plan.precompute_plan.ingest.protocol,
-                control_plane::physical::compiler::IngestProtocol::PrometheusRemoteWriteV1
+                asap_types::precompute_plan::IngestProtocol::PrometheusRemoteWriteV1
             )
             || physical_plan.precompute_plan.ingest.endpoint_path != "/api/v1/write"
         {
@@ -779,7 +779,7 @@ mod tests {
             generated_at_unix_ms: 1,
             activation_unix_ms: 1,
             expiry_unix_ms: None,
-            backend_compat: control_plane::physical::compiler::BACKEND_COMPAT.into(),
+            backend_compat: asap_types::precompute_plan::BACKEND_COMPAT.into(),
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
