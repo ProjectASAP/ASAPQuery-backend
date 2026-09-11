@@ -182,6 +182,7 @@ impl PrecomputeMaterialization {
             if self.table_name.is_none() || column.is_empty() {
                 return Err("table timestamp projection requires a table and a column".into());
             }
+            crate::table_population::validate_column_name(column)?;
         }
         if self.table_name.is_some() && !self.spatial_filter.is_empty() {
             return Err("table populations cannot use a PromQL label filter".into());

@@ -20,16 +20,7 @@ pub struct TableColumnPredicate {
 impl TablePopulation {
     pub fn validate(&self) -> Result<(), String> {
         for predicate in &self.predicates {
-            if predicate.column.is_empty()
-                || !predicate.column.as_bytes()[0].is_ascii_alphabetic()
-                    && !predicate.column.starts_with('_')
-                || !predicate
-                    .column
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-            {
-                return Err("table population column is not an unqualified identifier".into());
-            }
+            validate_column_name(&predicate.column)?;
             if !matches!(
                 predicate.operator,
                 CompareOpKind::Eq
@@ -64,6 +55,18 @@ impl TablePopulation {
         predicates.dedup();
         format!("sql.and.v1:[{}]", predicates.join(","))
     }
+}
+
+pub(crate) fn validate_column_name(column: &str) -> Result<(), String> {
+    if column.is_empty()
+        || !column.as_bytes()[0].is_ascii_alphabetic() && !column.starts_with('_')
+        || !column
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err("table column is not an unqualified identifier".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
