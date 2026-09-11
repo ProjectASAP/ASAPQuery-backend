@@ -25,6 +25,8 @@ def main():
         if output.exists():
             existing = json.loads(output.read_text())
             recorded = existing.get("args", existing.get("provenance", {}).get("args", {}))
+            if "--build-erp" in extra and existing.get("provenance", {}).get("resource_time_basis") != "process_cpu_seconds":
+                raise ValueError(f"ERP CPU evidence must be recalibrated: {output}")
             if not recorded.get("backend_revision") or ("--build-erp" not in extra and recorded.get("backend_revision") != args.revision):
                 raise ValueError(f"stale output: {output}")
         else:
@@ -38,7 +40,7 @@ def main():
         ("google", run("google-profile.json", ["--build-erp", "--input-tsv", str(args.google_replay)])),
     ]
     combined = {"artifact": {"schema_version": 1, "producer_version": args.revision, "records": []},
-                "shapes": {}, "generation_seconds": 0, "provenance": {"sources": []}}
+                "shapes": {}, "generation_seconds": 0, "provenance": {"sources": [], "resource_time_basis": "process_cpu_seconds"}}
     for name, catalog in catalogs:
         for key, value in catalog["shapes"].items():
             combined["shapes"][f"{name}/{key}"] = value

@@ -1,5 +1,11 @@
 # Top-K dashboard results
 
+The committed v2 artifacts are historical wall-time measurements. Their ERP
+`*_cpu_seconds` fields were populated from elapsed wall time and must not be
+used as CPU evidence. The corrected runner measures process CPU time and rejects
+those old catalogs; recalibration into a fresh output directory is required.
+No corrected performance numbers have been substituted into the historical report.
+
 The v1 measurements are withdrawn. They used hardcoded ERP parameters and
 contained sampling, event-order, timestamp-alignment, and memory-accounting
 errors. Their raw files remain recoverable in git history at `c91d19e2` but must

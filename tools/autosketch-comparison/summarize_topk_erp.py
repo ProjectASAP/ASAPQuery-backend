@@ -108,11 +108,15 @@ def main():
         plt.close(fig)
         text += [f"![{name} measured results]({name}.svg)", ""]
     catalog=json.loads((root/"catalog.json").read_text())
+    if catalog.get("provenance", {}).get("resource_time_basis") != "process_cpu_seconds":
+        text[2:2] = ["Historical timing limitation: this catalog wrote wall time into ERP CPU fields. These artifacts are not CPU evidence; recalibrate before using the corrected selector.", ""]
+    else:
+        text += ["ERP operation resources use process CPU time. Profile construction and dashboard latency use elapsed wall time.", ""]
     text += ["## Profile construction and scope", "", "| Catalog source | Measured construction seconds |", "|---|---:|"]
     for source in catalog["provenance"]["sources"]:
         text.append(f"| {source['name']} | {source['generation_seconds']:.6g} |")
     text += ["", "For a user dataset without an existing profile, cold-start cost includes its profile construction plus loading and selection. Google profiling replays the same calibration prefix three times; these are timing repetitions, not independent distribution samples. Synthetic profiles use three independent streams. No held-out events enter profile construction or shape observation.", "",
-             "This PR evaluates measured configuration selection through the real Planner ERP selector and shared/independent 30-second pane execution. It does not implement production online shape observation, arbitrary pane-width search, drift-triggered replanning, or a formal recall guarantee. The benchmark adapter emits ERP-compatible evidence; it is not an invocation of the sketch-bench executable. Memory is minimized first; empirical CPU costs are composed and recorded as estimates, not used as a competing optimization objective. Timings are sequential wall measurements on a shared host; consult manifest.json for revisions, commands and checksums.", ""]
+             "This PR evaluates measured configuration selection through the real Planner ERP selector and shared/independent 30-second pane execution. It does not implement production online shape observation, arbitrary pane-width search, drift-triggered replanning, or a formal recall guarantee. The benchmark adapter emits ERP-compatible evidence; it is not an invocation of the sketch-bench executable. Memory is minimized first; empirical CPU costs are composed and recorded as estimates, not used as a competing optimization objective. Dashboard timings are elapsed wall measurements; ERP CPU provenance is stated above; consult manifest.json for revisions, commands and checksums.", ""]
     (root/"report.md").write_text("\n".join(text))
 
 
