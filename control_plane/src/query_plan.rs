@@ -991,6 +991,9 @@ where
                         | planner_types::post_asap::ValueOperation::Filter { .. }
                         | planner_types::post_asap::ValueOperation::Sort { .. }
                         | planner_types::post_asap::ValueOperation::Limit { .. }
+                        | planner_types::post_asap::ValueOperation::Exact(
+                            planner_types::post_asap::ExactOperation::Aggregate { .. }
+                        )
                 ) =>
             {
                 QueryPlanNode::Relational {
