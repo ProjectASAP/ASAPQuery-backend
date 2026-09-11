@@ -145,6 +145,14 @@ impl FlusherShared {
                     ));
                 }
                 self.validate_reserved_part(record.sid, previous)?;
+                if !self
+                    .manifest
+                    .live_parts()
+                    .iter()
+                    .any(|part| part.part_id == previous.part_id)
+                {
+                    return Err(invalid("completed immutable part is no longer published"));
+                }
                 return Ok(ImmutableWindowPublication {
                     part_id: previous.part_id,
                     already_published: true,
@@ -431,6 +439,11 @@ mod tests {
         different.entries[0].sketch_bytes.push(4);
         assert!(handle
             .publish_immutable_window(&record(), [7; 32], &different)
+            .is_err());
+        let part_id = handle.manifest().live_parts()[0].part_id;
+        handle.manifest().append_delete(part_id).unwrap();
+        assert!(handle
+            .publish_immutable_window(&record(), [7; 32], &snapshot())
             .is_err());
     }
     #[test]
