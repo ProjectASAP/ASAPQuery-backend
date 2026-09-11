@@ -161,50 +161,52 @@ impl SketchStoreSink {
         };
         let agg_cfg = &agg_cfg;
         let resolver = self.series_resolver.clone();
-        let persist = || {
-            if let Some(sid) = output.series_id {
-                return self
-                    .sketch_index
-                    .ingest_precompute_with_series_id(sid, agg_cfg, output, accumulator)
-                    .inspect(|_| {
-                        crate::precompute_engine::metrics::record_materialized_outputs(1)
-                    });
-            }
-            self.sketch_index
-                .validate_routed_catalog_generation(output.catalog_generation.as_deref())
-                .ok()?;
-            self.sketch_index
-                .ingest_precompute_for_agg_config(
-                    |metric, fp, ak| {
-                        resolver
-                            .resolve_with_reactivation(metric, fp, ak, |sid| {
-                                self.sketch_index.validate_routed_catalog_generation(
-                                    output.catalog_generation.as_deref(),
-                                )?;
-                                let activation = self
-                                    .sketch_index
-                                    .authorize_series_reactivation(sid, output.policy_fp.into())?;
-                                if let Some(generation) = &activation {
-                                    if output.catalog_generation.as_deref()
-                                        != Some(generation.as_ref())
-                                    {
-                                        return Err(
+        let persist =
+            |writer: &crate::storage_engines::sketch_db::index::SummaryPublicationWriter<'_>| {
+                if let Some(sid) = output.series_id {
+                    return writer
+                        .ingest_precompute_with_series_id(sid, agg_cfg, output, accumulator)
+                        .inspect(|_| {
+                            crate::precompute_engine::metrics::record_materialized_outputs(1)
+                        });
+                }
+                self.sketch_index
+                    .validate_routed_catalog_generation(output.catalog_generation.as_deref())
+                    .ok()?;
+                writer
+                    .ingest_precompute_for_agg_config(
+                        |metric, fp, ak| {
+                            resolver
+                                .resolve_with_reactivation(metric, fp, ak, |sid| {
+                                    self.sketch_index.validate_routed_catalog_generation(
+                                        output.catalog_generation.as_deref(),
+                                    )?;
+                                    let activation =
+                                        self.sketch_index.authorize_series_reactivation(
+                                            sid,
+                                            output.policy_fp.into(),
+                                        )?;
+                                    if let Some(generation) = &activation {
+                                        if output.catalog_generation.as_deref()
+                                            != Some(generation.as_ref())
+                                        {
+                                            return Err(
                                             "unbound or stale output cannot reactivate a series"
                                                 .into(),
                                         );
+                                        }
                                     }
-                                }
-                                Ok(activation)
-                            })
-                            .map_err(|error| warn!(%error, "series reactivation rejected"))
-                            .ok()
-                    },
-                    agg_cfg,
-                    output,
-                    accumulator,
-                )
-                .inspect(|_| crate::precompute_engine::metrics::record_materialized_outputs(1))
-        };
+                                    Ok(activation)
+                                })
+                                .map_err(|error| warn!(%error, "series reactivation rejected"))
+                                .ok()
+                        },
+                        agg_cfg,
+                        output,
+                        accumulator,
+                    )
+                    .inspect(|_| crate::precompute_engine::metrics::record_materialized_outputs(1))
+            };
         if let Some(revision) = &output.input_revision {
             let group_values = output.population_labels.clone().unwrap_or_else(|| {
                 agg_cfg
@@ -243,7 +245,9 @@ impl SketchStoreSink {
             }
             true
         } else {
-            persist().is_some()
+            self.sketch_index
+                .publish_unadmitted_summary_update(persist)
+                .is_some()
         }
     }
 }

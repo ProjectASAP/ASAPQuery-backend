@@ -13,6 +13,14 @@ struct WindowRevision {
     pending: BTreeSet<u64>,
 }
 
+#[derive(Default, PartialEq, Eq)]
+enum FiniteInputState {
+    #[default]
+    Open,
+    Closing,
+    Complete,
+}
+
 #[derive(Default)]
 pub(super) struct AdmissionInventory {
     generation: Option<CatalogGeneration>,
@@ -21,7 +29,7 @@ pub(super) struct AdmissionInventory {
     metadata_bytes: usize,
     replay_floors: BTreeMap<SummaryDefinitionId, i64>,
     observed_extent: Option<HalfOpenTimeRange>,
-    finite_complete: bool,
+    finite_input: FiniteInputState,
     published_series: BTreeMap<u64, u64>,
     pending_revisions: usize,
 }
@@ -37,7 +45,7 @@ impl AdmissionInventory {
             self.metadata_bytes = 0;
             self.replay_floors.clear();
             self.observed_extent = None;
-            self.finite_complete = false;
+            self.finite_input = FiniteInputState::Open;
             self.published_series.clear();
             self.pending_revisions = 0;
             self.revision = self.revision.saturating_add(1);
@@ -54,7 +62,7 @@ impl AdmissionInventory {
         if self.generation.as_ref() != Some(generation) {
             return Err("summary admission catalog generation differs".into());
         }
-        if self.finite_complete {
+        if self.is_finite_closed() {
             return Err("finite summary input is closed".into());
         }
         let mut added = 0usize;
@@ -225,9 +233,21 @@ impl AdmissionInventory {
 
     pub(super) fn seal_finite(&mut self, generation: &CatalogGeneration) -> Result<(), String> {
         let revision = self.validate_finite(generation)?;
-        self.finite_complete = true;
+        self.finite_input = FiniteInputState::Complete;
         self.revision = revision;
         Ok(())
+    }
+
+    pub(super) fn begin_finite_close(&mut self) {
+        self.finite_input = FiniteInputState::Closing;
+    }
+
+    pub(super) fn is_finite_closed(&self) -> bool {
+        self.finite_input != FiniteInputState::Open
+    }
+
+    pub(super) fn is_finite_complete(&self) -> bool {
+        self.finite_input == FiniteInputState::Complete
     }
 
     pub(super) fn known_empty(
@@ -236,7 +256,7 @@ impl AdmissionInventory {
         series_id: u64,
         range: HalfOpenTimeRange,
     ) -> bool {
-        self.finite_complete
+        self.finite_input == FiniteInputState::Complete
             && self.published_series.contains_key(&series_id)
             && self.observed_extent.is_some_and(|extent| {
                 range.start_ms >= extent.start_ms && range.end_ms <= extent.end_ms

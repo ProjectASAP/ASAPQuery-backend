@@ -585,6 +585,36 @@ impl SidMetadataStore {
         }
     }
 
+    /// One bounded generation checkpoint closes raw producers across restart.
+    /// Catalog activation with another generation does not inherit this seal.
+    pub(crate) fn persist_finite_closure(
+        &self,
+        generation: &asap_types::sds::CatalogGeneration,
+    ) -> PersistResult<()> {
+        let _writer = self
+            .writer
+            .lock()
+            .map_err(|_| PersistError::Internal("SID metadata writer poisoned".into()))?;
+        let bytes = serde_json::to_vec(generation)
+            .map_err(|error| PersistError::Serialize(error.to_string()))?;
+        Self::write_atomic_at(
+            &self.path.with_file_name("finite_input_generation.json"),
+            &bytes,
+        )
+    }
+
+    pub(crate) fn load_finite_closure(
+        &self,
+    ) -> PersistResult<Option<asap_types::sds::CatalogGeneration>> {
+        match fs::read(self.path.with_file_name("finite_input_generation.json")) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+                PersistError::Format(format!("invalid finite input checkpoint: {error}"))
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -750,10 +780,14 @@ impl SidMetadataStore {
     }
 
     fn write_atomic(&self, bytes: &[u8]) -> PersistResult<()> {
-        if let Some(parent) = self.path.parent() {
+        Self::write_atomic_at(&self.path, bytes)
+    }
+
+    fn write_atomic_at(path: &Path, bytes: &[u8]) -> PersistResult<()> {
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = self.path.with_extension("json.tmp");
+        let tmp = path.with_extension("json.tmp");
         {
             let mut f = OpenOptions::new()
                 .create(true)
@@ -763,8 +797,8 @@ impl SidMetadataStore {
             f.write_all(bytes)?;
             f.sync_all()?;
         }
-        fs::rename(&tmp, &self.path)?;
-        if let Some(parent) = self.path.parent() {
+        fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() {
             File::open(parent)?.sync_all()?;
         }
         Ok(())
