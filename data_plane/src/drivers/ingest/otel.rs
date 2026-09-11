@@ -623,6 +623,9 @@ fn resolve_bucket_sid_for_agg_config(
         &fp,
         &agg_kind_canonical,
         |sid| {
+            ingest_state
+                .sketch_index
+                .validate_routed_catalog_generation(captured_generation)?;
             let activation = ingest_state
                 .sketch_index
                 .authorize_series_reactivation(sid, config.policy_fingerprint().into())?;
@@ -1279,6 +1282,11 @@ async fn route_modified_otlp_sketches_to_precompute(
                             &fp,
                             &agg_kind_canonical,
                             |sid| {
+                                ingest_state
+                                    .sketch_index
+                                    .validate_routed_catalog_generation(
+                                        catalog_generation.as_deref(),
+                                    )?;
                                 let activation = ingest_state
                                     .sketch_index
                                     .authorize_series_reactivation(sid, definition)?;

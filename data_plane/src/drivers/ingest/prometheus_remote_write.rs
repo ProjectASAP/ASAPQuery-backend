@@ -711,6 +711,9 @@ fn route_messages(
             let sid = ingest
                 .series_resolver
                 .resolve_with_reactivation(&config.metric, attrs_fp, &materialization_kind, |sid| {
+                    ingest.sketch_index.validate_routed_catalog_generation(
+                        physical_plan.precompute_plan.summary_catalog.as_ref(),
+                    )?;
                     let activation = ingest
                         .sketch_index
                         .authorize_series_reactivation(sid, policy_fp.into())?;
@@ -1096,6 +1099,10 @@ mod tests {
             sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
             observability: IngestObservability::default(),
         });
+        ingest
+            .sketch_index
+            .install_summary_catalog(physical_plan.summary_catalog.as_ref().unwrap().clone())
+            .unwrap();
         let request = WriteRequest {
             timeseries: ["api", "order", "payment", "user", "webapp"]
                 .into_iter()

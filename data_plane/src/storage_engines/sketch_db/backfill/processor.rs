@@ -139,6 +139,7 @@ fn resolve_backfill_bucket_sid(
         crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
     resolver.resolve_with_reactivation(&config.metric, &attrs_fp, &agg_kind_canonical, |sid| {
         store.map_or(Ok(None), |store| {
+            store.validate_routed_catalog_generation(captured_generation)?;
             let activation =
                 store.authorize_series_reactivation(sid, config.policy_fingerprint().into())?;
             if activation

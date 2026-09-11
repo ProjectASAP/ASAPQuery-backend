@@ -2495,6 +2495,21 @@ impl SketchStore {
             .map(|(_, generation)| generation)
     }
 
+    /// Resolving a logical key may already return a replacement physical SID.
+    /// Validate producer provenance before either a cache hit or a rotation.
+    pub(crate) fn validate_routed_catalog_generation(
+        &self,
+        captured: Option<&asap_types::sds::CatalogGeneration>,
+    ) -> Result<(), String> {
+        if self.active_catalog_generation().as_deref() != captured {
+            return Err(
+                "unbound or stale producer cannot resolve the active catalog's physical series"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     /// Return the current generation only when it explicitly reintroduces a
     /// previously removed logical materialization. Ordinary same-generation
     /// writes and missing provenance cannot start a new physical lifetime.
@@ -2735,9 +2750,24 @@ impl SketchStore {
             Some(_) => {}
         }
 
-        // Registration can reject a tombstoned physical lifetime. Never append
-        // payload when that metadata admission failed.
-        self.instance(sid)?;
+        // Keep the physical lifetime alive through publication. Removal takes
+        // this same lock exclusively, so it cannot race metadata validation and
+        // recreate orphan payload after the tombstone commits.
+        let instances = self.instances.read().ok()?;
+        let binding = instances.get(&sid)?;
+        if !binding.metadata.is_writable() || binding.metadata.policy_fp != output.policy_fp {
+            return None;
+        }
+        if let Some(captured) = output.catalog_generation.as_deref() {
+            // Existing unchanged series may drain their birth generation or
+            // accept the currently installed generation. A replacement born in
+            // a newer generation cannot accept an older unbound cache hit.
+            if binding.catalog_generation.as_deref() != Some(captured)
+                && self.active_catalog_generation().as_deref() != Some(captured)
+            {
+                return None;
+            }
+        }
 
         if let Some(retained_windows) = agg_cfg.num_aggregates_to_retain {
             let required_horizon_ms = retained_windows

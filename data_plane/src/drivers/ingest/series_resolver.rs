@@ -197,7 +197,7 @@ impl SeriesIdResolver {
     /// Advance a tombstoned physical series after the storage engine has
     /// authorized reactivation in a different installed catalog generation.
     /// The logical cache key remains unchanged. Persistence failure leaves
-    /// the old binding intact; concurrent retries observe one replacement.
+    /// the old binding intact. Concurrent activation requires fresh authorization.
     pub fn rotate_for_catalog_activation(
         &self,
         metric_name: &str,
@@ -218,7 +218,10 @@ impl SeriesIdResolver {
             )
         })?;
         if *binding != previous_sid {
-            return Ok(*binding);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "physical series changed after catalog authorization; retry routing",
+            ));
         }
         let replacement = self
             .next_sid
@@ -380,7 +383,6 @@ impl SeriesResolverPersistence for NoopPersistence {
 #[derive(Debug)]
 pub struct FilePersistence {
     file: Mutex<File>,
-    path: PathBuf,
     generations: Mutex<BTreeMap<String, Arc<asap_types::sds::CatalogGeneration>>>,
 }
 
@@ -486,7 +488,6 @@ impl FilePersistence {
         file.seek(SeekFrom::End(0))?;
         Ok(Self {
             file: Mutex::new(file),
-            path,
             generations: Mutex::new(BTreeMap::new()),
         })
     }
@@ -935,15 +936,13 @@ mod persistence_tests {
             .map(|_| {
                 let resolver = Arc::clone(&resolver);
                 std::thread::spawn(move || {
-                    resolver
-                        .rotate_for_catalog_activation(
-                            "m",
-                            "group=a",
-                            TEST_AGG,
-                            previous,
-                            &generation(),
-                        )
-                        .unwrap()
+                    resolver.rotate_for_catalog_activation(
+                        "m",
+                        "group=a",
+                        TEST_AGG,
+                        previous,
+                        &generation(),
+                    )
                 })
             })
             .collect();
@@ -951,10 +950,20 @@ mod persistence_tests {
             .into_iter()
             .map(|thread| thread.join().unwrap())
             .collect();
-        assert!(ids.iter().all(|sid| *sid == ids[0] && *sid != previous));
+        let successful: Vec<_> = ids
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .copied()
+            .collect();
+        assert_eq!(successful.len(), 1);
+        assert_ne!(successful[0], previous);
+        assert!(ids
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .all(|error| error.kind() == std::io::ErrorKind::WouldBlock));
         drop(resolver);
         let reopened = SeriesIdResolver::open(path.clone()).unwrap();
-        assert_eq!(reopened.resolve("m", "group=a", TEST_AGG), ids[0]);
+        assert_eq!(reopened.resolve("m", "group=a", TEST_AGG), successful[0]);
         let records = FilePersistence::open(path).unwrap().replay().unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(

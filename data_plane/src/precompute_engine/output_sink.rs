@@ -171,10 +171,16 @@ impl SketchStoreSink {
                     });
             }
             self.sketch_index
+                .validate_routed_catalog_generation(output.catalog_generation.as_deref())
+                .ok()?;
+            self.sketch_index
                 .ingest_precompute_for_agg_config(
                     |metric, fp, ak| {
                         resolver
                             .resolve_with_reactivation(metric, fp, ak, |sid| {
+                                self.sketch_index.validate_routed_catalog_generation(
+                                    output.catalog_generation.as_deref(),
+                                )?;
                                 let activation = self
                                     .sketch_index
                                     .authorize_series_reactivation(sid, output.policy_fp.into())?;
@@ -502,7 +508,12 @@ mod tests {
             )]))),
             resolver,
         );
-        let output = || PrecomputedOutput::new(1000, 2000, None, fingerprint);
+        let original_generation = Arc::new(catalog.reference().unwrap());
+        let output = || {
+            let mut output = PrecomputedOutput::new(1000, 2000, None, fingerprint);
+            output.catalog_generation = Some(Arc::clone(&original_generation));
+            output
+        };
         sink.emit_batch(vec![(output(), Box::new(SumAccumulator::with_sum(7.0)))])
             .unwrap();
         let old_sid = store.series_ids_for_policy(fingerprint)[0];
@@ -537,6 +548,18 @@ mod tests {
             )])
             .is_err());
         let new_sid = store.series_ids_for_policy(fingerprint)[0];
+        // A derived/unbound stale output must not reuse an already rotated cache hit.
+        assert!(sink
+            .emit_batch(vec![(output(), Box::new(SumAccumulator::with_sum(101.0)))])
+            .is_err());
+        let mut stale_routed_output = output();
+        stale_routed_output.series_id = Some(new_sid);
+        assert!(sink
+            .emit_batch(vec![(
+                stale_routed_output,
+                Box::new(SumAccumulator::with_sum(103.0))
+            )])
+            .is_err());
         assert_ne!(old_sid, new_sid);
         assert!(store.query_exact_agg_range(old_sid, 1000, 2000).is_empty());
         let values = store.query_exact_agg_range(new_sid, 1000, 2000);
