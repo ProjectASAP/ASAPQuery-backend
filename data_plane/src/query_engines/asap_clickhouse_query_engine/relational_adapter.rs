@@ -1,5 +1,7 @@
 //! ClickHouse row semantics for planner-owned relational wrappers.
 
+mod aggregate;
+
 use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
 
 use arrow::{
@@ -400,6 +402,20 @@ impl ClickHouseRelationalAdapter {
     ) -> Result<ClickHouseRelation, ClickHouseRelationalError> {
         let schema = scalar_schema(&input.fields);
         match operation {
+            ValueOperation::Exact(planner_types::post_asap::ExactOperation::Aggregate {
+                reduction,
+                measures,
+                having,
+                ..
+            }) => {
+                return aggregate::apply(
+                    reduction,
+                    measures,
+                    having.as_ref(),
+                    output_schema,
+                    input,
+                );
+            }
             ValueOperation::Project { cols, .. } => {
                 let mut rows = Vec::with_capacity(input.rows.len());
                 for row in &input.rows {
