@@ -102,6 +102,15 @@ impl CatalogClickHouseAccelerator {
                 parameters.insert(format!("param_{name}"), end_ms.to_string());
             }
             parameters.insert("default_format".into(), "JSONCompact".into());
+            parameters.insert(
+                "output_format_json_map_as_array_of_tuples".into(),
+                "1".into(),
+            );
+            parameters.insert(
+                "output_format_json_named_tuples_as_objects".into(),
+                "0".into(),
+            );
+            parameters.insert("output_format_json_quote_64bit_integers".into(), "0".into());
             if let Some(database) = request_context.database() {
                 parameters.insert("database".into(), database.into());
             }

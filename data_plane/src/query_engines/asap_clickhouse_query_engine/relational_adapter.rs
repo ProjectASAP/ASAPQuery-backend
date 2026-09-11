@@ -4,7 +4,8 @@ use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampMillisecondArray,
+        ArrayRef, BooleanArray, Float64Array, Int64Array, MapArray, StringArray, StructArray,
+        TimestampMillisecondArray,
     },
     datatypes::{DataType as ArrowDataType, Field, Schema},
     record_batch::RecordBatch,
@@ -45,6 +46,7 @@ enum Cell {
     Utf8(String),
     Bool(bool),
     Timestamp(i64),
+    Map(Vec<(Cell, Cell)>),
 }
 
 fn json_cell(
@@ -69,6 +71,26 @@ fn json_cell(
             .map(|value| Cell::Utf8(value.into()))
             .ok_or_else(invalid),
         DataType::Bool => value.as_bool().map(Cell::Bool).ok_or_else(invalid),
+        DataType::Map {
+            key,
+            value: value_type,
+            value_nullable,
+        } => {
+            let (key_type, item_type) = map_type_parts(clickhouse_type).ok_or_else(invalid)?;
+            let entries = value.as_array().ok_or_else(invalid)?;
+            let mut result = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let pair = entry
+                    .as_array()
+                    .filter(|pair| pair.len() == 2)
+                    .ok_or_else(invalid)?;
+                result.push((
+                    json_cell(&pair[0], key, false, key_type)?,
+                    json_cell(&pair[1], value_type, *value_nullable, item_type)?,
+                ));
+            }
+            Ok(Cell::Map(result))
+        }
         DataType::Timestamp => parse_clickhouse_timestamp(value, clickhouse_type)
             .map(Cell::Timestamp)
             .ok_or_else(invalid),
@@ -251,6 +273,24 @@ impl ClickHouseRelation {
     }
 }
 
+fn map_type_parts(actual: &str) -> Option<(&str, &str)> {
+    let inner = actual.trim().strip_prefix("Map(")?.strip_suffix(')')?;
+    let mut depth = 0_i32;
+    let mut quoted = false;
+    for (index, ch) in inner.char_indices() {
+        match ch {
+            '\'' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth -= 1,
+            ',' if !quoted && depth == 0 => {
+                return Some((inner[..index].trim(), inner[index + 1..].trim()))
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: bool) -> bool {
     let Some(mut actual) = actual else {
         return false;
@@ -271,6 +311,14 @@ fn clickhouse_type_matches(actual: Option<&str>, expected: &DataType, nullable: 
         DataType::Float64 => actual == "Float64",
         DataType::Utf8 => actual == "String",
         DataType::Bool => actual == "Bool",
+        DataType::Map {
+            key,
+            value,
+            value_nullable,
+        } => map_type_parts(actual).is_some_and(|(key_type, value_type)| {
+            clickhouse_type_matches(Some(key_type), key, false)
+                && clickhouse_type_matches(Some(value_type), value, *value_nullable)
+        }),
         DataType::Timestamp => {
             actual == "Int64"
                 || actual == "DateTime"
@@ -490,7 +538,17 @@ fn row_from_value(
         .iter()
         .map(|(name, dtype, nullable)| {
             if let Some(value) = group.get(name) {
-                return Ok(Cell::Utf8(value.clone()));
+                let encoded = asap_types::grouping_projection::decode_table_group_value(value)
+                    .map_err(|error| {
+                        ClickHouseRelationalError::Invalid(format!(
+                            "invalid typed group {name}: {error}"
+                        ))
+                    })?;
+                let column_type = super::clickhouse_result_adapter::clickhouse_type(
+                    &arrow_type(dtype),
+                    *nullable,
+                );
+                return json_cell(&encoded, dtype, *nullable, &column_type);
             }
             if *dtype == DataType::Timestamp {
                 return Ok(Cell::Timestamp(timestamp));
@@ -649,6 +707,24 @@ fn cell_cmp(left: &Cell, right: &Cell) -> Option<Ordering> {
         (Cell::Utf8(left), Cell::Utf8(right)) => Some(left.cmp(right)),
         (Cell::Bool(left), Cell::Bool(right)) => Some(left.cmp(right)),
         (Cell::Timestamp(left), Cell::Timestamp(right)) => Some(left.cmp(right)),
+        (Cell::Map(left), Cell::Map(right)) => {
+            for ((left_key, left_value), (right_key, right_value)) in left.iter().zip(right) {
+                let order = cell_cmp(left_key, right_key)?;
+                if order != Ordering::Equal {
+                    return Some(order);
+                }
+                let order = match (left_value, right_value) {
+                    (Cell::Null, Cell::Null) => Ordering::Equal,
+                    (Cell::Null, _) => Ordering::Greater,
+                    (_, Cell::Null) => Ordering::Less,
+                    _ => cell_cmp(left_value, right_value)?,
+                };
+                if order != Ordering::Equal {
+                    return Some(order);
+                }
+            }
+            Some(left.len().cmp(&right.len()))
+        }
         _ => None,
     }
 }
@@ -667,6 +743,24 @@ fn arrow_type(dtype: &DataType) -> ArrowDataType {
         DataType::Float64 => ArrowDataType::Float64,
         DataType::Utf8 => ArrowDataType::Utf8,
         DataType::Bool => ArrowDataType::Boolean,
+        DataType::Map {
+            key,
+            value,
+            value_nullable,
+        } => ArrowDataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                ArrowDataType::Struct(
+                    vec![
+                        Field::new("key", arrow_type(key), false),
+                        Field::new("value", arrow_type(value), *value_nullable),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        ),
         DataType::Timestamp => {
             ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None)
         }
@@ -696,6 +790,57 @@ fn build_array(
         DataType::Float64 => Arc::new(Float64Array::from(values!(Float64))) as ArrayRef,
         DataType::Utf8 => Arc::new(StringArray::from(values!(Utf8))) as ArrayRef,
         DataType::Bool => Arc::new(BooleanArray::from(values!(Bool))) as ArrayRef,
+        DataType::Map { key, value, .. } => {
+            let mut offsets = vec![0_i32];
+            let mut valid = Vec::with_capacity(rows.len());
+            let mut entries = Vec::new();
+            for row in rows {
+                match row.get(column) {
+                    Some(Cell::Map(pairs)) => {
+                        valid.push(true);
+                        entries.extend(
+                            pairs
+                                .iter()
+                                .map(|(key, value)| vec![key.clone(), value.clone()]),
+                        );
+                    }
+                    Some(Cell::Null) => valid.push(false),
+                    _ => {
+                        return Err(ClickHouseRelationalError::Invalid(
+                            "incompatible map value".into(),
+                        ))
+                    }
+                }
+                offsets.push(i32::try_from(entries.len()).map_err(|_| {
+                    ClickHouseRelationalError::Invalid("map offset exceeds Arrow limit".into())
+                })?);
+            }
+            let ArrowDataType::Map(field, ordered) = arrow_type(dtype) else {
+                unreachable!()
+            };
+            let ArrowDataType::Struct(fields) = field.data_type() else {
+                unreachable!()
+            };
+            let values = StructArray::try_new(
+                fields.clone(),
+                vec![
+                    build_array(&entries, 0, key)?,
+                    build_array(&entries, 1, value)?,
+                ],
+                None,
+            )
+            .map_err(|error| ClickHouseRelationalError::Arrow(error.to_string()))?;
+            Arc::new(
+                MapArray::try_new(
+                    field,
+                    arrow::buffer::OffsetBuffer::new(offsets.into()),
+                    values,
+                    Some(arrow::buffer::NullBuffer::from(valid)),
+                    ordered,
+                )
+                .map_err(|error| ClickHouseRelationalError::Arrow(error.to_string()))?,
+            ) as ArrayRef
+        }
         DataType::Timestamp => {
             Arc::new(TimestampMillisecondArray::from(values!(Timestamp))) as ArrayRef
         }
@@ -783,6 +928,49 @@ mod tests {
             schema,
             guarantee: None,
         })
+    }
+
+    /// Map entries remain ordered pairs, including duplicate keys and null values.
+    #[test]
+    fn map_transport_retains_duplicate_keys_and_null_values() {
+        use super::super::clickhouse_result_adapter::{ClickHouseFormat, ClickHouseQueryResult};
+        let dtype = DataType::Map {
+            key: Box::new(DataType::Utf8),
+            value: Box::new(DataType::Utf8),
+            value_nullable: true,
+        };
+        let cell = json_cell(
+            &serde_json::json!([["job", "a"], ["job", "b"], ["zone", null]]),
+            &dtype,
+            false,
+            "Map(String, Nullable(String))",
+        )
+        .unwrap();
+        let Cell::Map(entries) = &cell else {
+            panic!("expected map")
+        };
+        assert_eq!(entries.len(), 3);
+        let array = build_array(&[vec![cell]], 0, &dtype).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "labels",
+                arrow_type(&dtype),
+                false,
+            )])),
+            vec![array],
+        )
+        .unwrap();
+        let result = ClickHouseQueryResult {
+            batches: vec![batch],
+        };
+        let body = String::from_utf8(result.encode(ClickHouseFormat::Json).unwrap()).unwrap();
+        assert!(body.contains("Map(String, Nullable(String))"), "{body}");
+        assert!(body.contains("\"job\":\"a\",\"job\":\"b\""), "{body}");
+        assert!(body.contains("\"zone\":null"), "{body}");
+        assert_eq!(
+            String::from_utf8(result.encode(ClickHouseFormat::TabSeparated).unwrap()).unwrap(),
+            "{'job':'a','job':'b','zone':NULL}\n"
+        );
     }
 
     #[test]

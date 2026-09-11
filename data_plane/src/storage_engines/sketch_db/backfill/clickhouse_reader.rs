@@ -51,6 +51,7 @@ pub struct ClickHouseReader {
     population: Option<asap_types::table_population::TablePopulation>,
     value_projection: Option<asap_types::sds::ValueProjectionIdentity>,
     output_metric: Option<String>,
+    grouping_projection: Option<asap_types::GroupingProjection>,
 }
 
 #[derive(Deserialize)]
@@ -58,6 +59,7 @@ pub struct ClickHouseReader {
 enum ClickHouseLabels {
     Series(String),
     Map(std::collections::BTreeMap<String, String>),
+    Columns(Vec<(String, String)>),
 }
 
 #[derive(Deserialize)]
@@ -76,11 +78,27 @@ impl ClickHouseReader {
             population: None,
             value_projection: None,
             output_metric: None,
+            grouping_projection: None,
         })
     }
 
     fn sql(&self) -> String {
         let c = &self.config;
+        let labels = self.grouping_projection.as_ref().map_or_else(
+            || c.labels_column.clone(),
+            |grouping| {
+                let entries = grouping
+                    .columns()
+                    .iter()
+                    .map(|column| {
+                        let value = format!("base64Encode(toJSONString({}))", column.name);
+                        format!("'{}', {value}", column.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("map({entries})")
+            },
+        );
         let population = self.population.as_ref().map_or_else(
             || format!("{} = {{metric:String}}", c.metric_column),
             |population| {
@@ -132,7 +150,7 @@ impl ClickHouseReader {
              FROM {database}.{table} WHERE {population} \
              AND {timestamp} >= {{start_ms:Int64}} AND {timestamp} < {{end_ms:Int64}} \
              ORDER BY labels, timestamp_ms FORMAT JSONEachRow",
-            labels = c.labels_column,
+            labels = labels,
             timestamp = c.timestamp_ms_column,
             value = value,
             database = c.database,
@@ -153,8 +171,13 @@ pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactor
                 }
                 .into());
             }
-            if !materialization.grouping_labels.is_legacy_labels() {
-                return Err("typed table grouping requires a typed grouping reader".into());
+            materialization.grouping_labels.validate_table_columns()?;
+            for column in materialization.grouping_labels.columns() {
+                if column.nullable {
+                    return Err(
+                        "nullable table grouping requires an explicit null-key encoding".into(),
+                    );
+                }
             }
             let mut source_config = config.clone();
             source_config.database = database.clone();
@@ -182,6 +205,7 @@ pub fn clickhouse_reader_factory(config: ClickHouseReaderConfig) -> ReaderFactor
             reader.population = Some(materialization.table_population.clone().unwrap_or_default());
             reader.value_projection = Some(materialization.effective_value_projection().clone());
             reader.output_metric = Some(materialization.metric.clone());
+            reader.grouping_projection = Some(materialization.grouping_labels.clone());
             Ok(Arc::new(reader) as Arc<dyn RawSampleReader>)
         }
         source => fallback(source, materialization),
@@ -208,6 +232,13 @@ impl RawSampleReader for ClickHouseReader {
             ("param_start_ms", start_ms.as_str()),
             ("param_end_ms", end_ms.as_str()),
         ]);
+        if self.grouping_projection.is_some() {
+            request = request.query(&[
+                ("output_format_json_map_as_array_of_tuples", "1"),
+                ("output_format_json_named_tuples_as_objects", "0"),
+                ("output_format_json_quote_64bit_integers", "0"),
+            ]);
+        }
         if let Some(asap_types::sds::ValueProjectionIdentity::Constant { value }) =
             &self.value_projection
         {
@@ -261,8 +292,24 @@ impl RawSampleReader for ClickHouseReader {
                 serde_json::from_str(line).map_err(|error| RawSampleReaderError::Decode {
                     reason: error.to_string(),
                 })?;
+            let labels = match row.labels {
+                ClickHouseLabels::Columns(columns) => {
+                    let count = columns.len();
+                    let labels = columns
+                        .into_iter()
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    if labels.len() != count {
+                        return Err(RawSampleReaderError::Decode {
+                            reason: "duplicate source grouping columns".into(),
+                        });
+                    }
+                    ClickHouseLabels::Map(labels)
+                }
+                labels => labels,
+            };
             let sample = RawSample {
-                labels: match row.labels {
+                labels: match labels {
+                    ClickHouseLabels::Columns(_) => unreachable!("columns normalized above"),
                     ClickHouseLabels::Series(series) => {
                         if self.population.is_some() {
                             let metric = self.output_metric.as_deref().unwrap_or(&filter.metric);
@@ -412,9 +459,7 @@ mod tests {
             },
             &typed,
         );
-        assert!(
-            matches!(rejected, Err(error) if error.to_string().contains("typed grouping reader"))
-        );
+        assert!(matches!(rejected, Err(error) if error.to_string().contains("null-key encoding")));
 
         assert!(factory(
             &BackfillSource::ClickHouse {

@@ -220,14 +220,34 @@ fn materialize_selected_sql(
     use planner_types::{post_asap::SummaryExpr, pre_asap::Reduction};
     let SummaryExpr::SummaryAgg {
         reduction: Reduction::Reduce(keys),
+        child,
         ..
     } = &node.expr
     else {
         return Err("SQL materialization requires a supported reduction".into());
     };
-    if keys.is_without() || !keys.keys().is_empty() {
-        return Err("SQL grouped source projection requires a typed grouping reader".into());
+    if keys.is_without() {
+        return Err("SQL grouping exclusion requires a resolved projection".into());
     }
+    let SummaryExpr::KeepPreAsap(source) = &child.expr else {
+        return Err("SQL grouping requires a typed source subtree".into());
+    };
+    let source_schema = source.output_schema().map_err(|error| error.to_string())?;
+    let mut columns = Vec::new();
+    for key in keys.keys() {
+        let mut column = source_schema
+            .columns
+            .get(*key)
+            .cloned()
+            .ok_or("SQL grouping column is absent from source schema")?;
+        if column.nullable {
+            return Err("nullable table grouping requires an explicit null-key encoding".into());
+        }
+        column.table = None;
+        columns.push(column);
+    }
+    let grouping = asap_types::GroupingProjection::new(columns);
+    grouping.validate()?;
     let (table, value, window, population, timestamp) =
         clickhouse_materialization_leaf_contract(node, query.start_ms, query.end_ms)?;
     let window_secs = window.ok_or("SQL materialization requires a bounded window")?;
@@ -237,7 +257,7 @@ fn materialize_selected_sql(
         family: crate::physical::compiler::physical_materialization_family(family),
         window_secs,
         spatial_filter: String::new(),
-        grouping: Vec::new(),
+        grouping: grouping.names(),
         item_label: None,
         heap_update_mode: None,
         aggregation_input: AggregationInput::Raw,
@@ -248,6 +268,7 @@ fn materialize_selected_sql(
     )
     .map_err(|error| error.to_string())?;
     config.table_name = Some(table);
+    config.grouping_labels = grouping;
     config.value_projection = Some(value);
     config.table_timestamp_column = Some(timestamp);
     config.table_population = Some(population);

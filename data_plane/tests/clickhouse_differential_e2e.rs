@@ -152,7 +152,7 @@ async fn exact_proxy_matches_clickhouse_for_sql_and_grafana_smoke_queries() {
 
 #[tokio::test]
 async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
-    for aggregate in ["sum(value)", "count(*)"] {
+    for aggregate in ["sum(value)", "count(*)", "max(value)"] {
         run_mixed_aggregate(aggregate).await;
     }
 }
@@ -167,6 +167,13 @@ async fn run_mixed_aggregate(aggregate: &str) {
     let client = reqwest::Client::new();
     eprintln!("checking mixed aggregate {aggregate}");
     let sql = format!("SELECT sums.timestamp, sums.total / divisors.divisor AS ratio FROM (SELECT 2000 AS timestamp, {aggregate} AS total FROM telemetry WHERE metric = 'requests' AND timestamp_ms >= 0 AND timestamp_ms < 2000) AS sums INNER JOIN divisors ON sums.timestamp = divisors.timestamp");
+    let grouped = aggregate == "max(value)";
+    let sql = if grouped {
+        "SELECT labels, max(value) AS value FROM telemetry WHERE metric = 'requests' AND timestamp_ms >= 0 AND timestamp_ms < 2000 GROUP BY labels ORDER BY labels".to_string()
+    } else {
+        sql
+    };
+    let format = if grouped { "JSON" } else { "TabSeparated" };
     let value_type = if aggregate == "count(*)" {
         "Nullable(Float64)"
     } else {
@@ -199,13 +206,31 @@ async fn run_mixed_aggregate(aggregate: &str) {
     }
     let mut exact_request = client
         .post(&clickhouse_url)
-        .body(format!("{sql} FORMAT TabSeparated"));
+        .body(format!("{sql} FORMAT {format}"));
     if let Some(user) = &user {
         exact_request = exact_request.basic_auth(user, password.as_ref());
     }
     let exact = exact_request.send().await.unwrap().bytes().await.unwrap();
 
     let mut workload = mixed_workload(&sql);
+    if grouped {
+        use planner_types::pre_asap::{Column, DataType};
+        workload
+            .tables
+            .get_mut("telemetry")
+            .unwrap()
+            .columns
+            .push(Column::new(
+                "labels",
+                DataType::Map {
+                    key: Box::new(DataType::Utf8),
+                    value: Box::new(DataType::Utf8),
+                    value_nullable: false,
+                },
+                false,
+            ));
+    }
+
     workload.tables.get_mut("telemetry").unwrap().columns[1].nullable = aggregate == "count(*)";
     if aggregate == "count(*)" {
         let mut nullable_count = mixed_workload(&sql.replace("count(*)", "count(value)"));
@@ -242,10 +267,13 @@ async fn run_mixed_aggregate(aggregate: &str) {
         );
     }
     let entry = publication.query_plan.entries.values().next().unwrap();
-    assert!(entry.nodes.values().any(|node| matches!(
-        node,
-        control_plane::query_plan::QueryPlanNode::ExternalExact { .. }
-    )));
+    assert_eq!(
+        entry.nodes.values().any(|node| matches!(
+            node,
+            control_plane::query_plan::QueryPlanNode::ExternalExact { .. }
+        )),
+        !grouped
+    );
     assert!(entry.nodes.values().any(|node| matches!(
         node,
         control_plane::query_plan::QueryPlanNode::ReadMaterialization { .. }
@@ -282,7 +310,7 @@ async fn run_mixed_aggregate(aggregate: &str) {
         .arg("0")
         .arg("--output-dir")
         .arg(output.path())
-        .stdout(Stdio::null())
+        .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("RUST_LOG", "data_plane=info");
     if let Some(user) = &user {
@@ -376,7 +404,7 @@ async fn run_mixed_aggregate(aggregate: &str) {
 
     let mut mutated_request = client
         .post(&clickhouse_url)
-        .body(format!("{sql} FORMAT TabSeparated"));
+        .body(format!("{sql} FORMAT {format}"));
     if let Some(user) = &user {
         mutated_request = mutated_request.basic_auth(user, password.as_ref());
     }
@@ -388,7 +416,7 @@ async fn run_mixed_aggregate(aggregate: &str) {
 
     let mut mixed = client
         .get(format!("http://127.0.0.1:{sql_port}/"))
-        .query(&[("query", sql.as_str())]);
+        .query(&[("query", sql.as_str()), ("default_format", format)]);
     if let Some(user) = &user {
         mixed = mixed.header("x-clickhouse-user", user);
     }
@@ -411,9 +439,30 @@ async fn run_mixed_aggregate(aggregate: &str) {
         .to_owned();
     let actual = response.bytes().await.unwrap();
     assert!(status.is_success(), "mixed listener returned {status}");
-    assert_eq!(execution, "hybrid", "failure reason: {failure_reason}");
     assert_eq!(
-        actual, exact,
-        "compiled mixed result must equal pre-mutation exact baseline"
+        execution,
+        if grouped { "warm" } else { "hybrid" },
+        "failure reason: {failure_reason}"
     );
+    if grouped {
+        let actual: serde_json::Value = serde_json::from_slice(&actual).unwrap();
+        let exact: serde_json::Value = serde_json::from_slice(&exact).unwrap();
+        assert_eq!(actual["meta"], exact["meta"]);
+        let actual_rows = actual["data"].as_array().unwrap();
+        let exact_rows = exact["data"].as_array().unwrap();
+        assert_eq!(actual_rows.len(), exact_rows.len());
+        for (actual, exact) in actual_rows.iter().zip(exact_rows) {
+            assert_eq!(actual["labels"], exact["labels"]);
+            assert_eq!(
+                actual["value"].as_f64().unwrap().to_bits(),
+                exact["value"].as_f64().unwrap().to_bits()
+            );
+        }
+        assert_eq!(actual["data"].as_array().unwrap().len(), 2);
+    } else {
+        assert_eq!(
+            actual, exact,
+            "compiled mixed result must equal pre-mutation exact baseline"
+        );
+    }
 }

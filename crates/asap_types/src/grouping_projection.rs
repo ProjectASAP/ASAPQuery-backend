@@ -24,6 +24,13 @@ impl GroupingProjection {
         }
         Ok(())
     }
+    pub fn validate_table_columns(&self) -> Result<(), String> {
+        self.validate()?;
+        for column in self.columns() {
+            crate::table_population::validate_column_name(&column.name)?;
+        }
+        Ok(())
+    }
     pub fn push(&mut self, name: String) {
         self.0.push(Column::new(name, DataType::Utf8, false));
         self.0.sort_by(|a, b| a.name.cmp(&b.name));
@@ -221,5 +228,44 @@ pub(crate) fn serialize_config_grouping<S: Serializer>(
         grouping.label_names().serialize(serializer)
     } else {
         grouping.serialize(serializer)
+    }
+}
+
+/// Table group values travel through the string-key index as lossless JSON bytes.
+/// Map values use ordered key/value pairs, preserving duplicate keys.
+pub const TABLE_GROUP_OBSERVATION_SEMANTICS: &str = "asap.table-column-groups.base64-json.v1";
+
+pub fn encode_table_group_value(value: &serde_json::Value) -> Result<String, String> {
+    use base64::Engine;
+    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+pub fn decode_table_group_value(encoded: &str) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| error.to_string())?;
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+    /// The grouping codec preserves null, escaping, duplicate map keys and exact integers.
+    #[test]
+    fn typed_group_codec_is_lossless_at_numeric_and_string_boundaries() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!("a,\"b\\c\n"),
+            serde_json::json!(i64::MAX),
+            serde_json::json!(i64::MIN),
+            serde_json::json!([["k", i64::MAX], ["k", null]]),
+        ] {
+            let encoded = encode_table_group_value(&value).unwrap();
+            assert!(!encoded.contains(['\"', ',', '\\']));
+            assert_eq!(decode_table_group_value(&encoded).unwrap(), value);
+        }
+        assert!(decode_table_group_value("not base64").is_err());
     }
 }
