@@ -325,6 +325,31 @@ mod tests {
     }
 
     #[test]
+    fn typed_struct_field_renders_native_lookup() {
+        let schema = Schema::new(vec![Column::new(
+            "sample",
+            DataType::Struct {
+                fields: vec![
+                    Column::new("ts", DataType::Int64, false),
+                    Column::new("value", DataType::Float64, true),
+                ],
+            },
+            false,
+        )]);
+        let expr = QueryExpr::FunctionCall {
+            name: "asap_struct_field".into(),
+            args: vec![
+                QueryExpr::Column(0),
+                QueryExpr::Literal(ScalarValue::Utf8("value".into())),
+            ],
+        };
+        assert_eq!(
+            scalar(&expr, &schema).unwrap(),
+            "tupleElement(`sample`, 'value')"
+        );
+    }
+
+    #[test]
     fn unsupported_scalar_is_not_forwarded_as_arbitrary_native_code() {
         let schema = Schema::new(vec![]);
         let expr = QueryExpr::FunctionCall {
