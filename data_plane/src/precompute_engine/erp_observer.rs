@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 const MAX_POPULATIONS: usize = 128;
 const MAX_KEYS: usize = 65_536;
+const MAX_POPULATION_METADATA_BYTES: usize = 1_048_576;
 
 struct Population {
     coordinates: SummaryInstanceCoordinates,
@@ -23,6 +24,7 @@ struct Observations {
     populations: BTreeMap<SummaryInstanceId, Population>,
     extent: BTreeMap<SummaryDefinitionId, (i64, i64)>,
     total_keys: usize,
+    metadata_bytes: usize,
     invalid: Option<String>,
 }
 
@@ -96,6 +98,25 @@ impl RuntimeErpObserver {
                 population.observer = ErpShapeObserver::new(1).unwrap();
             }
             return;
+        }
+        if !state.populations.contains_key(&id) {
+            let bytes = coordinates
+                .group_values
+                .iter()
+                .try_fold(0usize, |total, (key, value)| {
+                    total
+                        .checked_add(key.len())
+                        .and_then(|n| n.checked_add(value.len()))
+                });
+            let total = bytes.and_then(|bytes| state.metadata_bytes.checked_add(bytes));
+            if total.is_none_or(|bytes| bytes > MAX_POPULATION_METADATA_BYTES) {
+                state.invalid = Some("ERP population metadata budget exceeded".into());
+                for population in state.populations.values_mut() {
+                    population.observer = ErpShapeObserver::new(1).unwrap();
+                }
+                return;
+            }
+            state.metadata_bytes = total.unwrap();
         }
         let population = state.populations.entry(id).or_insert_with(|| Population {
             source: format!(
