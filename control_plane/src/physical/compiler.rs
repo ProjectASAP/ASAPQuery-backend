@@ -2207,7 +2207,7 @@ impl PhysicalCompiler {
                 cumulative_readout: true,
             };
             let mut entry = if request.hybrid_execution {
-                QueryPlanEntry::compile_bound_composable_mapped(
+                crate::query_plan::compile_bound_composable_mapped(
                     query.query_id.clone(),
                     canonical.clone(),
                     &query.post_asap,
@@ -2224,7 +2224,7 @@ impl PhysicalCompiler {
                     },
                 )
             } else {
-                QueryPlanEntry::compile_bound_mapped(
+                crate::query_plan::compile_bound_mapped(
                     query.query_id.clone(),
                     canonical.clone(),
                     &query.post_asap,

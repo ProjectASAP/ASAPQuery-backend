@@ -817,7 +817,7 @@ mod tests {
                 rules: Vec::new(),
             },
             runtime_config: Arc::new(streaming),
-            query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
+            query_plan: Arc::new(asap_types::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(BackendStorageRouting::empty()),
         };
         HotReloadStreamingConfig::from_active(HotReloadActivePhysicalPlan::new(active))

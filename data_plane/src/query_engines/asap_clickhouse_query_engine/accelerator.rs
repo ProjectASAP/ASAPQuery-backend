@@ -64,14 +64,14 @@ impl CatalogClickHouseAccelerator {
 
     async fn prepare_external_exact(
         &self,
-        entry: &control_plane::query_plan::QueryPlanEntry,
+        entry: &asap_types::query_plan::QueryPlanEntry,
         start_ms: u64,
         end_ms: u64,
         request_context: &ClickHouseQueryRequest,
     ) -> Result<PreparedExternalLeaves, String> {
         let mut prepared = PreparedExternalLeaves::new();
         let leaves = entry.nodes.iter().filter_map(|(id, node)| match node {
-            control_plane::query_plan::QueryPlanNode::ExternalExact { request, inputs }
+            asap_types::query_plan::QueryPlanNode::ExternalExact { request, inputs }
                 if request.language == asap_types::QueryLanguage::ClickHouseSql
                     && inputs.is_empty() =>
             {
@@ -85,7 +85,7 @@ impl CatalogClickHouseAccelerator {
                 .as_ref()
                 .ok_or_else(|| "ClickHouse exact subtree endpoint unavailable".to_owned())?;
             let schema = match &bound.output {
-                control_plane::query_plan::ExternalExactOutput::Relation { schema } => {
+                asap_types::query_plan::ExternalExactOutput::Relation { schema } => {
                     serde_json::from_value(schema.clone()).map_err(|error| error.to_string())?
                 }
                 _ => return Err("ClickHouse exact subtree must produce a relation".into()),
@@ -272,14 +272,14 @@ mod tests {
         precompute_engine::operators::SumAccumulator,
         storage_engines::sketch_db::index::{AggKind, Capability, SketchInstanceMetadata},
     };
-    use asap_types::summary_catalog::SummaryCatalog;
-    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
-    use axum::http::Method;
-    use control_plane::query_plan::{
+    use asap_types::query_plan::{
         ClickHousePlanningContext, ExactReadout, ExternalExactOutput, ExternalExactRequest,
         FallbackPolicy, FixedEvaluationRange, InstantExecution, MaterializationBinding,
         PhysicalGrouping, QueryLanguage, QueryNodeId, QueryPlan, QueryPlanEntry, QueryPlanNode,
     };
+    use asap_types::summary_catalog::SummaryCatalog;
+    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    use axum::http::Method;
 
     struct FixedExactSubtree;
 

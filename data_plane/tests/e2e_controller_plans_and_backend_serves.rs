@@ -90,8 +90,7 @@ async fn post_full_config(client: &reqwest::Client, stack: &FullStack, json: &Js
     {
         entry.instant.lookback_ms = 1000;
         for node in entry.nodes.values_mut() {
-            if let control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } = node
-            {
+            if let asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding } = node {
                 binding.readout_lookback_ms = Some(1000);
             }
         }

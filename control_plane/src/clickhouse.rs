@@ -342,7 +342,7 @@ where
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
     let mut materialization_nodes = std::collections::BTreeMap::new();
     let mut query_nodes = std::collections::BTreeMap::new();
-    let executable = QueryPlanEntry::compile_bound_relational_mapped(
+    let executable = crate::query_plan::compile_bound_relational_mapped(
         query.sql.clone(),
         planned.canonical_sql.clone(),
         &root,

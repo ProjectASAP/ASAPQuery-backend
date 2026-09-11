@@ -31,3 +31,5 @@ pub use routing_index::RoutingIndex;
 pub use storage_backend::*;
 
 pub mod precompute_plan;
+
+pub mod query_plan;

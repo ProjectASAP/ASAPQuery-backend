@@ -94,7 +94,7 @@ pub struct ActivePhysicalPlan {
     pub precompute_plan: asap_types::precompute_plan::PrecomputePlan,
     pub transmission_plan: control_plane::physical::compiler::TransmissionPlan,
     pub runtime_config: Arc<StreamingConfig>,
-    pub query_plan: Arc<control_plane::query_plan::QueryPlan>,
+    pub query_plan: Arc<asap_types::query_plan::QueryPlan>,
     pub storage_routing: Arc<crate::storage_engines::types::BackendStorageRouting>,
 }
 
@@ -707,7 +707,7 @@ mod tests {
                 rules: Vec::new(),
             },
             runtime_config: Arc::new(StreamingConfig::new(HashMap::new())),
-            query_plan: Arc::new(control_plane::query_plan::QueryPlan {
+            query_plan: Arc::new(asap_types::query_plan::QueryPlan {
                 plan_id,
                 plan_version,
                 clickhouse_context: None,

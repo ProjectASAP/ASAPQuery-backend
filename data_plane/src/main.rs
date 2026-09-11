@@ -779,7 +779,7 @@ async fn main() -> Result<()> {
             precompute_plan: initial_precompute_plan,
             transmission_plan: initial_transmission_plan,
             runtime_config: streaming_config.clone(),
-            query_plan: Arc::new(control_plane::query_plan::QueryPlan::empty()),
+            query_plan: Arc::new(asap_types::query_plan::QueryPlan::empty()),
             storage_routing: Arc::new(
                 data_plane::storage_engines::types::BackendStorageRouting::empty(),
             ),

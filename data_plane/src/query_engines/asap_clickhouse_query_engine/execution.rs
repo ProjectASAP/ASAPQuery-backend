@@ -9,8 +9,8 @@ use crate::{
     },
     storage_engines::sketch_db::index::SketchStore,
 };
+use asap_types::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use asap_types::summary_catalog::SummaryCatalog;
-use control_plane::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use planner_types::post_asap::ValueOperation;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -65,8 +65,7 @@ fn execute_relation_subtree(
             if request.language != asap_types::QueryLanguage::ClickHouseSql {
                 return Err("ClickHouse DAG contains an external leaf for another language".into());
             }
-            let control_plane::query_plan::ExternalExactOutput::Relation { schema } =
-                &request.output
+            let asap_types::query_plan::ExternalExactOutput::Relation { schema } = &request.output
             else {
                 return Err("ClickHouse external leaf must declare relation output".into());
             };
@@ -249,7 +248,7 @@ pub fn execute_sql_dag_with_external(
             Some(QueryPlanNode::Relational { output_schema, .. })
             | Some(QueryPlanNode::RelationalJoin { output_schema, .. }) => output_schema.clone(),
             Some(QueryPlanNode::ExternalExact { request, .. }) => {
-                let control_plane::query_plan::ExternalExactOutput::Relation { schema } =
+                let asap_types::query_plan::ExternalExactOutput::Relation { schema } =
                     &request.output
                 else {
                     return ClickHouseDagOutcome::Fallback(ClickHouseDagFallback::UnsupportedPlan(

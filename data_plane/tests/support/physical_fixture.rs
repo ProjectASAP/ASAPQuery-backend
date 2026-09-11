@@ -104,7 +104,7 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
             query_plan.entries.insert(
                 canonical.clone(),
                 QueryPlanEntry {
-                    language: control_plane::query_plan::QueryLanguage::PromQl,
+                    language: asap_types::query_plan::QueryLanguage::PromQl,
                     query_id: canonical.clone(),
                     canonical_query: canonical,
                     fixed_evaluation: None,

@@ -106,7 +106,8 @@ Evidence:
 [selection adapter](../../control_plane/src/planner_selection.rs),
 [physical compiler](../../control_plane/src/physical/compiler.rs),
 [legacy workload adapter](../../control_plane/src/physical/workload_planner.rs),
-[QueryPlan](../../control_plane/src/query_plan.rs), and
+[shared QueryPlan](../../crates/asap_types/src/query_plan.rs),
+[query lowering](../../control_plane/src/query_plan.rs), and
 [bound serving executor](../../data_plane/src/query_engines/asap_query_engine/post_asap_readout.rs).
 The selection adapter explicitly commits a ranked Planner candidate downstream.
 Consequently, the figure does not imply that the Planner library deploys or

@@ -203,11 +203,11 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
     let entry = publication.query_plan.entries.values().next().unwrap();
     assert!(entry.nodes.values().any(|node| matches!(
         node,
-        control_plane::query_plan::QueryPlanNode::ExternalExact { .. }
+        asap_types::query_plan::QueryPlanNode::ExternalExact { .. }
     )));
     assert!(entry.nodes.values().any(|node| matches!(
         node,
-        control_plane::query_plan::QueryPlanNode::ReadMaterialization { .. }
+        asap_types::query_plan::QueryPlanNode::ReadMaterialization { .. }
     )));
     let install = publication.install_request(None, Vec::new()).unwrap();
 
