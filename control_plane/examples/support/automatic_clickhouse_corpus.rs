@@ -46,12 +46,11 @@ fn publication_inputs(
     }
 }
 
-#[tokio::main]
-async fn main() {
+pub async fn run() {
     let path = std::env::args_os()
-        .nth(1)
+        .nth(2)
         .map(PathBuf::from)
-        .expect("usage: audit_clickhouse_corpus CORPUS.json");
+        .expect("usage: audit_clickhouse_corpus --automatic CORPUS.json");
     let corpus: Corpus = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     let schema = Schema::with_time_index(
         vec![

@@ -54,7 +54,9 @@ The release runtime was built from `c825e804`; driver checkout `eff81f48` adds f
 
 ## Reproduction
 
-Use [the importer](import_openmetrics.py) with the source capture above, then [the automatic corpus compiler](../../control_plane/examples/audit_automatic_clickhouse_corpus.rs). [The process driver](run_automatic.py) stages and activates each compiled publication and submits typed backfill jobs. [The matched runner](run_matched.sh) pins the container image, resource limits, executable hash, and input matrix, and restarts ClickHouse before each measured query/trial.
+Compile publications with `cargo run -p control_plane --example audit_clickhouse_corpus -- --automatic tools/o11y-sql-main-eval/corpus.json`. The automatic mode shares the existing audit executable, avoiding an additional large evaluation binary during workspace checks.
+
+Use [the importer](import_openmetrics.py) with the source capture above, then [the automatic corpus compiler](../../control_plane/examples/support/automatic_clickhouse_corpus.rs). [The process driver](run_automatic.py) stages and activates each compiled publication and submits typed backfill jobs. [The matched runner](run_matched.sh) pins the container image, resource limits, executable hash, and input matrix, and restarts ClickHouse before each measured query/trial.
 
 Raw execution artifacts remain at `/mydata/clickhouse-o11y-main-results/original27-map-runtime/`; raw timing traces remain at `/mydata/clickhouse-o11y-main-results/original27-matched/`. Reproducing the exact capture requires that source file; a fresh upstream capture can have different values and cardinality.
 
