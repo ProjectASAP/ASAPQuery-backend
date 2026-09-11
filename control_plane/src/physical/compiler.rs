@@ -2189,7 +2189,7 @@ impl PhysicalCompiler {
                         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1_000)),
                         materialization: fingerprint.into(),
                         output_grouping: PhysicalGrouping::Reduce(
-                            materialization.grouping_labels.labels.clone(),
+                            materialization.grouping_labels.names(),
                         ),
                         item_labels: materialization.aggregated_labels.labels.clone(),
                         window_ms: stored_interval_ms,
@@ -2835,7 +2835,7 @@ fn retained_partition_count(
             materialization.aggregation_type,
             A::Increase | A::MultipleIncrease | A::MinMax | A::MultipleMinMax
         )
-        || !materialization.grouping_labels.labels.is_empty()
+        || !materialization.grouping_labels.names().is_empty()
     {
         u128::from(input_cardinality.unwrap_or(1).max(1))
     } else {
@@ -3869,7 +3869,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(heaps.len(), 1, "unpartitioned TopK owns one global CMS");
-        assert!(heaps[0].grouping_labels.labels.is_empty());
+        assert!(heaps[0].grouping_labels.names().is_empty());
         assert_eq!(heaps[0].aggregated_labels.labels, vec!["job"]);
         assert_eq!(heaps[0].parameters["weight_scale"], 1_000_000);
         assert_eq!(retained_partition_count(heaps[0], Some(5)), 1);

@@ -144,7 +144,7 @@ pub struct StateSchemaContract {
         deserialize_with = "crate::sds::deserialize_state_value_projection"
     )]
     pub value_projection: crate::sds::ValueProjectionIdentity,
-    pub group_by: Vec<String>,
+    pub group_by: crate::GroupingProjection,
     pub window: StateWindowContract,
     pub encodings: Vec<StateEncoding>,
 }
@@ -234,7 +234,7 @@ impl PrecomputePlan {
                     family,
                     source,
                     value_projection,
-                    group_by: materialization.grouping_labels.labels.clone(),
+                    group_by: materialization.grouping_labels.clone(),
                     window: StateWindowContract {
                         kind: materialization.window_type,
                         size_ms: materialization.window_size.saturating_mul(1_000),
@@ -390,6 +390,10 @@ impl PrecomputePlan {
         let mut materializations = BTreeSet::new();
         for materialization in &self.materializations {
             materialization
+                .grouping_labels
+                .validate()
+                .map_err(PrecomputePlanError::CatalogContract)?;
+            materialization
                 .window_layout
                 .validate(materialization.window_size, materialization.slide_interval)
                 .map_err(|reason| PrecomputePlanError::InvalidWindowLayout {
@@ -474,7 +478,7 @@ impl PrecomputePlan {
                 || schema.family != family
                 || schema.source != source
                 || schema.value_projection != value_projection
-                || schema.group_by != materialization.grouping_labels.labels
+                || schema.group_by != materialization.grouping_labels
                 || schema.window.kind != materialization.window_type
                 || schema.window.size_ms != materialization.window_size.saturating_mul(1_000)
                 || schema.window.slide_ms

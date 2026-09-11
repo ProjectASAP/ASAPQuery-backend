@@ -278,14 +278,14 @@ impl IngestState {
         labels: &std::collections::HashMap<String, String>,
         config: &AggregationConfig,
     ) -> Arc<crate::precompute_engine::group_key::GroupKey> {
-        crate::precompute_engine::group_key::intern_pairs(config.grouping_labels.labels.iter().map(
-            |name| {
+        crate::precompute_engine::group_key::intern_pairs(
+            config.grouping_labels.iter().map(|name| {
                 (
                     name.as_str(),
                     labels.get(name).map(String::as_str).unwrap_or(""),
                 )
-            },
-        ))
+            }),
+        )
     }
 }
 
@@ -296,7 +296,7 @@ fn extract_group_key(
     config: &AggregationConfig,
 ) -> Arc<crate::precompute_engine::group_key::GroupKey> {
     let labels = parse_labels_from_series_key(series_key);
-    crate::precompute_engine::group_key::intern_pairs(config.grouping_labels.labels.iter().map(
+    crate::precompute_engine::group_key::intern_pairs(config.grouping_labels.iter().map(
         |name| {
             (
                 name.as_str(),

@@ -184,13 +184,23 @@ compatibility DTO while older sidecars are read.
 
 The implemented `SummaryDescriptor` currently contains one `SummaryOperator`,
 one derived `FidelityGuarantee`, and a numeric state-schema version. The
-implemented `DataDescriptor` contains metric name, canonical population filter,
-grouping keys and versioned observation semantics. The shared contract now also
+implemented `DataDescriptor` contains typed source and value projections, a
+canonical population filter, typed grouping columns and versioned observation
+semantics. The shared contract now also
 defines `SummaryInstance`, `ObservedSummaryInventory`, placement, completeness,
 state references, catalog generation and ephemeral leases. The control-plane
 reconciler emits create, update, recover, retire, garbage-collect, promote and
 expire actions. Summary payloads and the application of those actions remain in
 the SummaryStore runtime.
+
+The same `GroupingProjection` supplies source columns to precompute configuration,
+`DataDescriptor` and the state-schema contract. Each column retains the Planner's
+name, type and nullability; routing derives names without storing a second list.
+Legacy label lists decode as non-null UTF-8 columns and keep their existing
+identities. A changed type or nullability changes catalog and policy identity.
+A SQL map column is one grouping value, not a set of PromQL labels. Typed
+ClickHouse group transport remains a separate execution capability: the current
+reader rejects non-label projections until that transport is implemented.
 
 `DataDescriptor`, precompute configuration and state-schema validation share
 `ValueProjectionIdentity`: sample value, named column, or a finite numeric

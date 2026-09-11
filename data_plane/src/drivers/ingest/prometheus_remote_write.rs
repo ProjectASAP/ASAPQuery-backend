@@ -363,9 +363,7 @@ impl PrometheusRemoteWriteReceiver {
             let mut labels = group_key.as_population_labels();
             if labels.is_empty() {
                 labels = config
-                    .grouping_labels
-                    .labels
-                    .iter()
+                    .grouping_labels.iter()
                     .cloned()
                     .zip(group_key.values().labels)
                     .collect();
@@ -669,9 +667,7 @@ fn route_messages(
                 Vec::new()
             } else {
                 config
-                    .grouping_labels
-                    .labels
-                    .iter()
+                    .grouping_labels.iter()
                     .map(|name| {
                         (
                             name.as_str(),
@@ -957,7 +953,7 @@ mod tests {
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
             parameters: HashMap::new(),
-            grouping_labels: KeyByLabelNames::new(vec!["job".into()]),
+            grouping_labels: KeyByLabelNames::new(vec!["job".into()]).into(),
             aggregated_labels: KeyByLabelNames::empty(),
             rollup_labels: KeyByLabelNames::empty(),
             original_yaml: String::new(),
@@ -1028,7 +1024,7 @@ mod tests {
                     }
                     _ => HashMap::new(),
                 },
-                grouping_labels: KeyByLabelNames::new(grouping),
+                grouping_labels: KeyByLabelNames::new(grouping).into(),
                 aggregated_labels: KeyByLabelNames::new(aggregated),
                 rollup_labels: KeyByLabelNames::empty(),
                 original_yaml: String::new(),

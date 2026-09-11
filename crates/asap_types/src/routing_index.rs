@@ -102,7 +102,7 @@ impl RoutingIndex {
         let mut hit = None;
         for fp in self.candidates_for_metric(metric) {
             let cfg = self.get(*fp)?;
-            let policy_keys: BTreeSet<_> = cfg.grouping_labels.labels.iter().cloned().collect();
+            let policy_keys: BTreeSet<_> = cfg.grouping_labels.iter().cloned().collect();
             if cfg.aggregation_type != agg_type
                 || &policy_keys != group_by_keys
                 || !cfg.spatial_filter_normalized.is_empty()

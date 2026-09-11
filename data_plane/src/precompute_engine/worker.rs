@@ -1273,7 +1273,7 @@ pub fn extract_key_from_series(series_key: &str, config: &AggregationConfig) -> 
     let labels = parse_labels_from_series_key(series_key);
     let mut values = Vec::new();
 
-    for label_name in &config.grouping_labels.labels {
+    for label_name in &config.grouping_labels.names() {
         if let Some(val) = labels.get(label_name.as_str()) {
             values.push(val.to_string());
         } else {

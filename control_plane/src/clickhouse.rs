@@ -150,7 +150,7 @@ pub async fn compile_automatic_clickhouse_workload(
                 .map_err(crate::query_plan::QueryPlanError::Invalid)?;
             let binding = MaterializationBinding {
                 materialization: config.policy_fingerprint().into(),
-                output_grouping: PhysicalGrouping::Reduce(config.grouping_labels.labels.clone()),
+                output_grouping: PhysicalGrouping::Reduce(config.grouping_labels.names()),
                 window_ms: config.slide_interval * 1000,
                 pane_origin_ms: config.pane_origin_ms,
                 readout_lookback_ms: Some(query.end_ms - query.start_ms),
@@ -433,7 +433,7 @@ fn bind_selected_node(
     }
     Ok(MaterializationBinding {
         materialization: selected.policy_fingerprint().into(),
-        output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.labels.clone()),
+        output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.names()),
         window_ms: selected.slide_interval.saturating_mul(1000),
         pane_origin_ms: selected.pane_origin_ms,
         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1000)),
