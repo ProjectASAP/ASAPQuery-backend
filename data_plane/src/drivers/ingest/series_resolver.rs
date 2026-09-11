@@ -461,6 +461,7 @@ impl FilePersistence {
                             )?;
                         }
                         ReadOne::Eof | ReadOne::Torn => break,
+                        ReadOne::Io(error) => return Err(error),
                         ReadOne::Corrupt => {
                             return Err(std::io::Error::new(
                                 std::io::ErrorKind::InvalidData,
@@ -712,6 +713,7 @@ enum ReadOne {
     Eof,
     Torn,
     Corrupt,
+    Io(std::io::Error),
 }
 
 fn read_one_record(f: &mut File) -> ReadOne {
@@ -719,7 +721,7 @@ fn read_one_record(f: &mut File) -> ReadOne {
     match f.read_exact(&mut sid_buf) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return ReadOne::Eof,
-        Err(_) => return ReadOne::Torn,
+        Err(error) => return ReadOne::Io(error),
     }
     let sid = u64::from_le_bytes(sid_buf);
     if sid == 0 {
@@ -727,40 +729,64 @@ fn read_one_record(f: &mut File) -> ReadOne {
     }
 
     let mut len_buf = [0u8; 4];
-    if f.read_exact(&mut len_buf).is_err() {
-        return ReadOne::Torn;
+    if let Err(error) = f.read_exact(&mut len_buf) {
+        return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            ReadOne::Torn
+        } else {
+            ReadOne::Io(error)
+        };
     }
     let metric_len = u32::from_le_bytes(len_buf) as usize;
     if metric_len > MAX_METRIC_LEN {
         return ReadOne::Corrupt;
     }
     let mut metric_bytes = vec![0u8; metric_len];
-    if f.read_exact(&mut metric_bytes).is_err() {
-        return ReadOne::Torn;
+    if let Err(error) = f.read_exact(&mut metric_bytes) {
+        return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            ReadOne::Torn
+        } else {
+            ReadOne::Io(error)
+        };
     }
 
-    if f.read_exact(&mut len_buf).is_err() {
-        return ReadOne::Torn;
+    if let Err(error) = f.read_exact(&mut len_buf) {
+        return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            ReadOne::Torn
+        } else {
+            ReadOne::Io(error)
+        };
     }
     let fp_len = u32::from_le_bytes(len_buf) as usize;
     if fp_len > MAX_FP_LEN {
         return ReadOne::Corrupt;
     }
     let mut fp_bytes = vec![0u8; fp_len];
-    if f.read_exact(&mut fp_bytes).is_err() {
-        return ReadOne::Torn;
+    if let Err(error) = f.read_exact(&mut fp_bytes) {
+        return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            ReadOne::Torn
+        } else {
+            ReadOne::Io(error)
+        };
     }
 
-    if f.read_exact(&mut len_buf).is_err() {
-        return ReadOne::Torn;
+    if let Err(error) = f.read_exact(&mut len_buf) {
+        return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            ReadOne::Torn
+        } else {
+            ReadOne::Io(error)
+        };
     }
     let agg_kind_len = u32::from_le_bytes(len_buf) as usize;
     if agg_kind_len > MAX_AGG_KIND_LEN {
         return ReadOne::Corrupt;
     }
     let mut agg_kind_bytes = vec![0u8; agg_kind_len];
-    if f.read_exact(&mut agg_kind_bytes).is_err() {
-        return ReadOne::Torn;
+    if let Err(error) = f.read_exact(&mut agg_kind_bytes) {
+        return if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            ReadOne::Torn
+        } else {
+            ReadOne::Io(error)
+        };
     }
 
     let metric = match String::from_utf8(metric_bytes) {
@@ -777,7 +803,7 @@ fn read_one_record(f: &mut File) -> ReadOne {
     };
     let new_offset = match f.stream_position() {
         Ok(p) => p,
-        Err(_) => return ReadOne::Torn,
+        Err(error) => return ReadOne::Io(error),
     };
     ReadOne::Ok(
         ResolverRecord {
@@ -973,6 +999,17 @@ mod persistence_tests {
         assert_eq!(resolver.resolve("m", "group=a", TEST_AGG), 9);
         assert_eq!(resolver.resolve("m", "group=b", TEST_AGG), 10);
         assert_eq!(&std::fs::read(path).unwrap()[..8], WAL_MAGIC);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_io_failure_is_not_an_incomplete_tail() {
+        let dir = TempDir::new().unwrap();
+        let mut unreadable_stream = File::open(dir.path()).unwrap();
+        assert!(matches!(
+            read_one_record(&mut unreadable_stream),
+            ReadOne::Io(_)
+        ));
     }
 
     #[test]
