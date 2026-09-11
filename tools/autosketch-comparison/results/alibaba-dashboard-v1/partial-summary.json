@@ -1,0 +1,128 @@
+[
+  {
+    "baseline": "exact-pane",
+    "trial": 0,
+    "planning_seconds": 1.626e-06,
+    "timing": {
+      "update_seconds": 66.95970047499998,
+      "eviction_seconds": 0.00081425,
+      "merge_seconds": 10.347375136000002,
+      "readout_seconds": 4.072553656000004,
+      "update_cpu_seconds": 66.95161961400005,
+      "eviction_cpu_seconds": 0.0008164140001457043,
+      "merge_cpu_seconds": 10.346511886000474,
+      "readout_cpu_seconds": 4.07254965700022,
+      "oracle_seconds": 49.220122571000054,
+      "input_and_harness_seconds": 216.01516684899997
+    },
+    "dashboard_mean_wall_ms": 40.05535775555554,
+    "retained_payload_bytes": 15922624,
+    "violations": 0,
+    "queries": 2160
+  },
+  {
+    "baseline": "exact-scan",
+    "trial": 0,
+    "planning_seconds": 8.72e-07,
+    "timing": {
+      "update_seconds": 7.899018516999996,
+      "eviction_seconds": 0.30838235899999955,
+      "merge_seconds": 0.0,
+      "readout_seconds": 2270.7782982009944,
+      "update_cpu_seconds": 7.898184770998892,
+      "eviction_cpu_seconds": 0.3077688989980541,
+      "merge_cpu_seconds": 0.0,
+      "readout_cpu_seconds": 2270.595280212998,
+      "oracle_seconds": 17.968918075999955,
+      "input_and_harness_seconds": 216.04903621000557
+    },
+    "dashboard_mean_wall_ms": 6307.71749500278,
+    "retained_payload_bytes": 2348135360,
+    "violations": 0,
+    "queries": 2160
+  },
+  {
+    "baseline": "analytical",
+    "trial": 0,
+    "planning_seconds": 2.1814e-05,
+    "timing": {
+      "update_seconds": 1076.9588152080003,
+      "eviction_seconds": 0.0018835839999999998,
+      "merge_seconds": 10.390858476000014,
+      "readout_seconds": 9.678348765999997,
+      "update_cpu_seconds": 1076.8823193899982,
+      "eviction_cpu_seconds": 0.0018798149988534796,
+      "merge_cpu_seconds": 10.390405374000238,
+      "readout_cpu_seconds": 9.67805126399574,
+      "oracle_seconds": 18.347953276000037,
+      "input_and_harness_seconds": 212.38830023199966
+    },
+    "dashboard_mean_wall_ms": 55.74779789444449,
+    "retained_payload_bytes": 9231872,
+    "violations": 1102,
+    "queries": 2160
+  },
+  {
+    "baseline": "auto",
+    "trial": 0,
+    "planning_seconds": 1383.901148486,
+    "timing": {
+      "update_seconds": 3287.9167060079926,
+      "eviction_seconds": 0.009425498999999992,
+      "merge_seconds": 10.71824751299999,
+      "readout_seconds": 1.154458342000002,
+      "update_cpu_seconds": 3287.6831921400003,
+      "eviction_cpu_seconds": 0.009438816002309114,
+      "merge_cpu_seconds": 10.717830613987019,
+      "readout_cpu_seconds": 1.154758453988336,
+      "oracle_seconds": 18.136026475000033,
+      "input_and_harness_seconds": 210.79589021100747
+    },
+    "dashboard_mean_wall_ms": 32.97973848611114,
+    "retained_payload_bytes": 19329696,
+    "violations": 378,
+    "queries": 2160
+  },
+  {
+    "baseline": "erp-no-sharing",
+    "trial": 0,
+    "planning_seconds": 0.060953508,
+    "timing": {
+      "update_seconds": 3289.571188779998,
+      "eviction_seconds": 0.008859914000000023,
+      "merge_seconds": 10.69003110499999,
+      "readout_seconds": 1.1503160920000002,
+      "update_cpu_seconds": 3289.3569344899965,
+      "eviction_cpu_seconds": 0.008879829994693,
+      "merge_cpu_seconds": 10.689577841991934,
+      "readout_cpu_seconds": 1.1504891999992992,
+      "oracle_seconds": 18.135466565000012,
+      "input_and_harness_seconds": 209.69392052500194
+    },
+    "dashboard_mean_wall_ms": 32.88985332500002,
+    "retained_payload_bytes": 19329696,
+    "violations": 378,
+    "queries": 2160
+  },
+  {
+    "baseline": "erp",
+    "trial": 0,
+    "planning_seconds": 0.056584864,
+    "timing": {
+      "update_seconds": 67.04034807200006,
+      "eviction_seconds": 0.0008611510000000003,
+      "merge_seconds": 10.230934717999995,
+      "readout_seconds": 3.929552898999993,
+      "update_cpu_seconds": 67.03456571799988,
+      "eviction_cpu_seconds": 0.0008664529998507198,
+      "merge_cpu_seconds": 10.230735887000673,
+      "readout_cpu_seconds": 3.9298726599998766,
+      "oracle_seconds": 18.086378475000007,
+      "input_and_harness_seconds": 212.39209196599998
+    },
+    "dashboard_mean_wall_ms": 39.334687824999996,
+    "retained_payload_bytes": 15922624,
+    "violations": 0,
+    "queries": 2160
+  }
+]

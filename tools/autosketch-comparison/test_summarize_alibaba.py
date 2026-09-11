@@ -1,6 +1,7 @@
 """Final reports must reject incomplete, inconsistent or smoke-sized evidence."""
 import copy
 import json
+import math
 from pathlib import Path
 import tempfile
 import unittest
@@ -25,6 +26,14 @@ class ValidationTests(unittest.TestCase):
     def test_valid_primitive_measurements_are_accepted(self):
         row, plan = self.fixture()
         validate_run(row, plan, 'service', 100, 20, 21)
+
+    def test_json_float_roundtrip_does_not_change_plan_identity(self):
+        row, plan = self.fixture()
+        row['deployment'] = {'planning_seconds': math.nextafter(.1, 1.)}
+        validate_run(row, plan, 'service', 100, 20, 21)
+        row['deployment']['planning_seconds'] = .2
+        with self.assertRaises(ValueError):
+            validate_run(row, plan, 'service', 100, 20, 21)
 
     def test_missing_samples_wrong_counts_and_shared_double_charges_fail(self):
         row, plan = self.fixture()

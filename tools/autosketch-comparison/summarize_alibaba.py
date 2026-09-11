@@ -27,11 +27,23 @@ def finite(value):
     return isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
 
 
+def same_json(a, b):
+    # Rust JSON parse/serialize can move measured floats by a few ULPs.
+    # Integer configuration fields and all structure still compare exactly.
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(same_json(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(same_json(x, y) for x, y in zip(a, b))
+    if isinstance(a, float) and isinstance(b, float):
+        return math.isfinite(a) and math.isfinite(b) and abs(a-b) <= 4 * max(math.ulp(a), math.ulp(b))
+    return a == b
+
+
 def validate_run(row, plan, workload, expected_events, calibration_files, total_files):
     """Reject missing endpoints, altered plans, bad timers, and fabricated success."""
     require(row['status'] == 'complete', 'incomplete run')
     require(row['workload'].lower() == workload, 'wrong workload')
-    require(row['deployment'] == plan, 'plan/run mismatch')
+    require(same_json(row['deployment'], plan), 'plan/run mismatch')
     require(finite(plan['planning_seconds']), 'invalid planning time')
     require(row['events'] == expected_events, 'input event count differs from dataset manifest')
     panels = 18 if workload == 'latency' else 6
