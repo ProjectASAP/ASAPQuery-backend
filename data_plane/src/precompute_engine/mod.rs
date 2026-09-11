@@ -2,6 +2,7 @@ pub mod accumulator_factory;
 pub mod config;
 pub mod coordination_checkpoint;
 mod engine;
+pub mod erp_observer;
 pub mod frame_lineage;
 pub mod group_key;
 pub mod ingest_handler;

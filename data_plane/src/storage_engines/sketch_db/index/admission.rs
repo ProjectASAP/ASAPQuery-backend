@@ -22,7 +22,7 @@ pub(super) struct AdmissionInventory {
     replay_floors: BTreeMap<SummaryDefinitionId, i64>,
     observed_extent: Option<HalfOpenTimeRange>,
     finite_complete: bool,
-    published_series: BTreeSet<u64>,
+    published_series: BTreeMap<u64, u64>,
     pending_revisions: usize,
 }
 
@@ -182,7 +182,7 @@ impl AdmissionInventory {
         if self.generation.as_ref() != Some(generation) {
             return Err("summary series publication catalog generation differs".into());
         }
-        if !self.published_series.contains(&series_id)
+        if !self.published_series.contains_key(&series_id)
             && self.published_series.len() >= Self::MAX_WINDOWS
         {
             return Err("summary admission series capacity exceeded".into());
@@ -198,11 +198,16 @@ impl AdmissionInventory {
             return Err("summary coordinate changed series identity".into());
         }
         window.series_id = Some(series_id);
-        self.published_series.insert(series_id);
+        let end = u64::try_from(coordinate.time_range.end_ms)
+            .map_err(|_| "published window end is outside storage timestamp range")?;
+        self.published_series
+            .entry(series_id)
+            .and_modify(|current| *current = (*current).max(end))
+            .or_insert(end);
         Ok(())
     }
 
-    pub(super) fn seal_finite(&mut self, generation: &CatalogGeneration) -> Result<(), String> {
+    pub(super) fn validate_finite(&self, generation: &CatalogGeneration) -> Result<u64, String> {
         if self.generation.as_ref() != Some(generation) {
             return Err("finite completion catalog generation differs".into());
         }
@@ -213,11 +218,15 @@ impl AdmissionInventory {
         {
             return Err("finite source has unpublished summary windows".into());
         }
-        self.finite_complete = true;
-        self.revision = self
-            .revision
+        self.revision
             .checked_add(1)
-            .ok_or("summary admission revision exhausted")?;
+            .ok_or_else(|| "summary admission revision exhausted".into())
+    }
+
+    pub(super) fn seal_finite(&mut self, generation: &CatalogGeneration) -> Result<(), String> {
+        let revision = self.validate_finite(generation)?;
+        self.finite_complete = true;
+        self.revision = revision;
         Ok(())
     }
 
@@ -228,7 +237,7 @@ impl AdmissionInventory {
         range: HalfOpenTimeRange,
     ) -> bool {
         self.finite_complete
-            && self.published_series.contains(&series_id)
+            && self.published_series.contains_key(&series_id)
             && self.observed_extent.is_some_and(|extent| {
                 range.start_ms >= extent.start_ms && range.end_ms <= extent.end_ms
             })
@@ -242,6 +251,10 @@ impl AdmissionInventory {
                     && coordinate.time_range.end_ms > range.start_ms
                     && state.series_id == Some(series_id)
             })
+    }
+
+    pub(super) fn published_frontiers(&self) -> &BTreeMap<u64, u64> {
+        &self.published_series
     }
 
     pub(super) fn revision(&self) -> u64 {
@@ -359,10 +372,17 @@ mod tests {
         inventory.retire_completed_before(coordinate.summary_definition_id, 1000);
         assert_eq!(inventory.windows.len(), 1);
         inventory
+            .record_series(&generation, &coordinate, 42)
+            .unwrap();
+        inventory
             .acknowledge(&generation, &coordinate, second)
             .unwrap();
         inventory.retire_completed_before(coordinate.summary_definition_id, 1000);
         assert!(inventory.windows.is_empty());
+        assert_eq!(
+            inventory.published_frontiers().get(&42),
+            Some(&(coordinate.time_range.end_ms as u64))
+        );
     }
 
     #[test]

@@ -228,7 +228,7 @@ impl GroupState {
     /// in QueryPlan so serving never infers semantics from PromQL text.
     pub fn exact_value_for(
         &self,
-        readout: control_plane::query_plan::ExactReadout,
+        readout: asap_types::query_plan::ExactReadout,
         key: &Option<KeyByLabelValues>,
         range_start_ms: u64,
         range_end_ms: u64,
@@ -237,23 +237,23 @@ impl GroupState {
             return None;
         };
         let stat = match (readout, agg_type) {
-            (control_plane::query_plan::ExactReadout::Count, AggregationType::Sum) => {
+            (asap_types::query_plan::ExactReadout::Count, AggregationType::Sum) => {
                 asap_types::Statistic::Count
             }
             (
-                control_plane::query_plan::ExactReadout::Sum,
+                asap_types::query_plan::ExactReadout::Sum,
                 AggregationType::Sum | AggregationType::MultipleSum,
             ) => asap_types::Statistic::Sum,
             (
-                control_plane::query_plan::ExactReadout::Increase,
+                asap_types::query_plan::ExactReadout::Increase,
                 AggregationType::Increase | AggregationType::MultipleIncrease,
             ) => asap_types::Statistic::Increase,
             (
-                control_plane::query_plan::ExactReadout::Rate,
+                asap_types::query_plan::ExactReadout::Rate,
                 AggregationType::Increase | AggregationType::MultipleIncrease,
             ) => asap_types::Statistic::Rate,
             (
-                control_plane::query_plan::ExactReadout::Max,
+                asap_types::query_plan::ExactReadout::Max,
                 AggregationType::MinMax | AggregationType::MultipleMinMax,
             ) => asap_types::Statistic::Max,
             _ => return None,
@@ -284,7 +284,7 @@ impl GroupState {
         if matches!(
             agg_type,
             AggregationType::MinMax | AggregationType::MultipleMinMax
-        ) && readout == control_plane::query_plan::ExactReadout::Max
+        ) && readout == asap_types::query_plan::ExactReadout::Max
         {
             return entries
                 .iter()
@@ -312,7 +312,7 @@ impl GroupState {
             ("range_end_ms".to_string(), range_end_ms.to_string()),
         ]);
         let merged = merged?;
-        if readout == control_plane::query_plan::ExactReadout::Count {
+        if readout == asap_types::query_plan::ExactReadout::Count {
             return merged.aux_stats().count.map(|count| count as f64);
         }
         merged.query_statistic(stat, key, &query_kwargs).ok()
@@ -406,7 +406,7 @@ impl SummaryValue {
 }
 
 fn validate_binding_phase(
-    binding: &control_plane::query_plan::MaterializationBinding,
+    binding: &asap_types::query_plan::MaterializationBinding,
     evaluation_ms: u64,
 ) -> Result<(), SummaryExecutorError> {
     if i64::try_from(binding.window_ms).is_err() {
@@ -435,9 +435,9 @@ impl QueryExecutionContext<'_> {
     /// are integrity checks and never broaden the candidate set.
     pub fn read_bound_materialization(
         &self,
-        binding: &control_plane::query_plan::MaterializationBinding,
+        binding: &asap_types::query_plan::MaterializationBinding,
     ) -> Result<Vec<(BTreeMap<String, String>, GroupState)>, SummaryExecutorError> {
-        use control_plane::query_plan::PhysicalGrouping;
+        use asap_types::query_plan::PhysicalGrouping;
 
         let inventory_revision = self.index.summary_update_revision();
         let query_range = asap_types::sds::HalfOpenTimeRange {
@@ -1410,10 +1410,10 @@ mod tests {
 
     #[test]
     fn pane_only_reads_require_the_planned_evaluation_phase() {
-        let binding = control_plane::query_plan::MaterializationBinding {
+        let binding = asap_types::query_plan::MaterializationBinding {
             item_labels: Vec::new(),
             materialization: asap_types::PolicyFingerprint(7).into(),
-            output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
+            output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
             window_ms: 60_000,
             pane_origin_ms: Some(7_000),
             readout_lookback_ms: Some(60_000),
@@ -1421,7 +1421,7 @@ mod tests {
         validate_binding_phase(&binding, 67_000).unwrap();
         assert!(validate_binding_phase(&binding, 68_000).is_err());
 
-        let legacy = control_plane::query_plan::MaterializationBinding {
+        let legacy = asap_types::query_plan::MaterializationBinding {
             item_labels: Vec::new(),
             pane_origin_ms: None,
             ..binding
@@ -1819,7 +1819,7 @@ mod tests {
         use crate::precompute_engine::operators::univmon_accumulator::UnivMonAccumulator;
         use crate::storage_engines::sketch_db::index::SketchEncoding;
         use crate::storage_engines::types::SerializableToSink;
-        use control_plane::query_plan::{MaterializationBinding, PhysicalGrouping};
+        use asap_types::query_plan::{MaterializationBinding, PhysicalGrouping};
         let index = SketchStore::new();
         let fp = asap_types::PolicyFingerprint(701);
         let mut meta = kll_meta(1, "m", &["job"]);

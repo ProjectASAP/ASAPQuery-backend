@@ -103,6 +103,8 @@ pub struct PrecomputeMaterialization {
     pub grouping_labels: crate::GroupingProjection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partitioning: Option<crate::sds::PopulationPartitioning>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_input: Option<crate::derived_input::DerivedInputIdentity>,
     pub aggregated_labels: KeyByLabelNames,
     pub rollup_labels: KeyByLabelNames,
     pub original_yaml: String,
@@ -200,9 +202,39 @@ impl PrecomputeMaterialization {
         .saturating_mul(1_000)
     }
 
+    pub fn source_identity(&self) -> crate::sds::DataSourceIdentity {
+        use crate::sds::DataSourceIdentity;
+        if let Some(input) = &self.derived_input {
+            DataSourceIdentity::Derived {
+                input: input.clone(),
+            }
+        } else if let Some(table_ref) = &self.table_name {
+            DataSourceIdentity::Table {
+                table_ref: table_ref.clone(),
+            }
+        } else {
+            DataSourceIdentity::TimeSeries {
+                metric: self.metric.clone(),
+            }
+        }
+    }
+
     pub fn population_filter_canonical(&self) -> Result<String, String> {
+        if let Some(input) = &self.derived_input {
+            input.validate()?;
+            if self.table_name.is_some()
+                || self.table_population.is_some()
+                || self.table_timestamp_column.is_some()
+                || !self.spatial_filter.is_empty()
+            {
+                return Err("derived inputs cannot also declare a raw source/filter".into());
+            }
+        }
         self.effective_value_projection().validate()?;
-        if self.value_projection.is_some() && self.table_name.is_none() {
+        if self.value_projection.is_some()
+            && self.table_name.is_none()
+            && self.derived_input.is_none()
+        {
             return Err("explicit table value projection requires a table source".into());
         }
         if let Some(column) = &self.table_timestamp_column {
@@ -255,6 +287,7 @@ impl PrecomputeMaterialization {
             parameters,
             grouping_labels: grouping_labels.into(),
             partitioning: None,
+            derived_input: None,
             aggregated_labels,
             rollup_labels,
             original_yaml,
@@ -400,6 +433,11 @@ impl PrecomputeMaterialization {
             table_name,
             value_column,
         );
+        config.derived_input = data
+            .get("derived_input")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()?;
         config.partitioning = data
             .get("partitioning")
             .filter(|value| !value.is_null())
@@ -595,6 +633,11 @@ impl PrecomputeMaterialization {
             table_name,
             value_column,
         );
+        config.derived_input = aggregation_data
+            .get("derived_input")
+            .filter(|v| !v.is_null())
+            .map(|v| serde_yaml::from_value(v.clone()))
+            .transpose()?;
         config.partitioning = aggregation_data
             .get("partitioning")
             .filter(|value| !value.is_null())
@@ -640,6 +683,9 @@ impl SerializableToSink for PrecomputeMaterialization {
             "metric": self.metric,
         });
 
+        if let Some(input) = &self.derived_input {
+            json["derived_input"] = serde_json::json!(input);
+        }
         // Only include numAggregatesToRetain if it's Some
         if let Some(num_aggregates) = self.num_aggregates_to_retain {
             json["numAggregatesToRetain"] = serde_json::json!(num_aggregates);

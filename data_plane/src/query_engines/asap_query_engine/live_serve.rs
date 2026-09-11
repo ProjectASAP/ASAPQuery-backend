@@ -160,7 +160,7 @@ pub fn serve_instant_from_summary_executor(
 
 pub fn serve_from_query_plan(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &asap_types::query_plan::QueryPlanEntry,
     t0_ms: u64,
     t1_ms: u64,
     is_cumulative: bool,
@@ -181,7 +181,7 @@ pub fn serve_from_query_plan(
 /// timestamps never leak into the public range response.
 pub fn serve_range_steps_from_query_plan(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &asap_types::query_plan::QueryPlanEntry,
     start_ms: u64,
     end_ms: u64,
     step_ms: u64,
@@ -263,7 +263,7 @@ fn coverage_covers_closed_windows(
 
 pub fn serve_instant_from_query_plan(
     index: &SketchStore,
-    entry: &control_plane::query_plan::QueryPlanEntry,
+    entry: &asap_types::query_plan::QueryPlanEntry,
     now_ms: u64,
 ) -> Result<(ASAPTierResult, u64), LoweringSkip> {
     if !summary_executor_live_enabled() {
@@ -447,27 +447,27 @@ mod tests {
                 Box::new(crate::precompute_engine::operators::SumAccumulator::with_sum(value)),
             );
         }
-        let entry = control_plane::query_plan::QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
+        let entry = asap_types::query_plan::QueryPlanEntry {
+            language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "q-sum".into(),
             canonical_query: "sum_over_time(bytes[1s])".into(),
             fixed_evaluation: None,
-            root: control_plane::query_plan::QueryNodeId(0),
+            root: asap_types::query_plan::QueryNodeId(0),
             nodes: BTreeMap::from([
                 (
-                    control_plane::query_plan::QueryNodeId(0),
-                    control_plane::query_plan::QueryPlanNode::ExactReadout {
-                        input: control_plane::query_plan::QueryNodeId(1),
-                        readout: control_plane::query_plan::ExactReadout::Sum,
+                    asap_types::query_plan::QueryNodeId(0),
+                    asap_types::query_plan::QueryPlanNode::ExactReadout {
+                        input: asap_types::query_plan::QueryNodeId(1),
+                        readout: asap_types::query_plan::ExactReadout::Sum,
                     },
                 ),
                 (
-                    control_plane::query_plan::QueryNodeId(1),
-                    control_plane::query_plan::QueryPlanNode::ReadMaterialization {
-                        binding: control_plane::query_plan::MaterializationBinding {
+                    asap_types::query_plan::QueryNodeId(1),
+                    asap_types::query_plan::QueryPlanNode::ReadMaterialization {
+                        binding: asap_types::query_plan::MaterializationBinding {
                             item_labels: Vec::new(),
                             materialization: policy.into(),
-                            output_grouping: control_plane::query_plan::PhysicalGrouping::PerEntity,
+                            output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
                             window_ms: 1_000,
                             pane_origin_ms: Some(0),
                             readout_lookback_ms: Some(1_000),
@@ -475,12 +475,12 @@ mod tests {
                     },
                 ),
             ]),
-            instant: control_plane::query_plan::InstantExecution {
+            instant: asap_types::query_plan::InstantExecution {
                 lookback_ms: 1_000,
                 full_history: false,
                 cumulative_readout: true,
             },
-            fallback: control_plane::query_plan::FallbackPolicy::ExactBackend,
+            fallback: asap_types::query_plan::FallbackPolicy::ExactBackend,
         };
 
         let result = serve_range_steps_from_query_plan(&idx, &entry, 1_000, 3_000, 1_000)

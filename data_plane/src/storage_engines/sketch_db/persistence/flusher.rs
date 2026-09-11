@@ -32,7 +32,7 @@ use super::{PersistError, PersistResult};
 /// Handle to a running flusher thread. Dropping the handle signals
 /// shutdown and joins the thread.
 pub struct FlusherHandle {
-    inner: Arc<FlusherShared>,
+    pub(super) inner: Arc<FlusherShared>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -56,6 +56,14 @@ pub(crate) struct FlusherShared {
     /// are flaky on fast CI runners where a flush tick completes in
     /// <1 ms).
     pub back_pressure_wait_count: AtomicU64,
+}
+
+impl FlusherShared {
+    pub(super) fn allocate_part_id(&self) -> PersistResult<u64> {
+        self.next_part_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| PersistError::Internal("part ID exhausted".into()))
+    }
 }
 
 impl FlusherHandle {
@@ -84,12 +92,23 @@ impl FlusherHandle {
     {
         // Pick a starting part_id: one past the max currently in the
         // manifest (so IDs are monotonically increasing across restarts).
+        let reserved = sid_metadata.load_strict()?.into_iter().flat_map(|r| {
+            [r.pending_immutable, r.last_immutable]
+                .into_iter()
+                .flatten()
+                .map(|p| p.part_id)
+        });
         let next_id = manifest
             .live_parts()
             .iter()
             .map(|p| p.part_id)
+            .chain(reserved)
             .max()
-            .map(|m| m + 1)
+            .map(|m| {
+                m.checked_add(1)
+                    .ok_or_else(|| PersistError::Internal("part ID exhausted".into()))
+            })
+            .transpose()?
             .unwrap_or(1);
 
         let shared = Arc::new(FlusherShared {
@@ -296,8 +315,11 @@ fn run_tick<S: EpochSource>(shared: &Arc<FlusherShared>, source: &S) -> PersistR
     // it becomes flushable this same tick. (Without `hot_window_ms` the
     // durable tier is purely memory-pressure driven and phase 1 below
     // handles eviction.)
-    if let Some(hot) = cfg.hot_window_ms {
-        let cutoff = now.saturating_sub(hot);
+    let flush_cutoff = cfg
+        .hot_window_ms
+        .map(|hot| now.saturating_sub(hot))
+        .max(source.flush_before_ms());
+    if let Some(cutoff) = flush_cutoff {
         source.seal_aged_epochs(cutoff);
     }
 
@@ -325,8 +347,7 @@ fn run_tick<S: EpochSource>(shared: &Arc<FlusherShared>, source: &S) -> PersistR
     }
 
     // Phase 2: time watermark (any epoch older than now - hot_window).
-    if let Some(hot) = cfg.hot_window_ms {
-        let cutoff = now.saturating_sub(hot);
+    if let Some(cutoff) = flush_cutoff {
         for r in &all {
             if r.end_ts < cutoff
                 && !selected
@@ -367,7 +388,7 @@ fn run_tick<S: EpochSource>(shared: &Arc<FlusherShared>, source: &S) -> PersistR
 
         if !snapshots.is_empty() {
             // Build one part for the tick.
-            let part_id = shared.next_part_id.fetch_add(1, Ordering::Relaxed);
+            let part_id = shared.allocate_part_id()?;
             let part_dir = part_dir_path(&parts_root(&cfg.disk_path), part_id);
             let entries_total: usize = snapshots.iter().map(|s| s.len()).sum();
             let size_bytes_estimate: u64 = snapshots.iter().map(|s| s.approx_bytes as u64).sum();
@@ -425,6 +446,18 @@ fn run_tick<S: EpochSource>(shared: &Arc<FlusherShared>, source: &S) -> PersistR
             .live_parts()
             .into_iter()
             .filter(|p| p.max_ts < cutoff)
+            .collect();
+        // Read reservations after capturing candidates: a newly published part
+        // cannot enter the older candidate set after this check.
+        let reserved: std::collections::HashSet<_> = shared
+            .sid_metadata
+            .load_strict()?
+            .into_iter()
+            .filter_map(|record| record.pending_immutable.map(|pending| pending.part_id))
+            .collect();
+        let expired: Vec<_> = expired
+            .into_iter()
+            .filter(|part| !reserved.contains(&part.part_id))
             .collect();
         for p in &expired {
             shared.manifest.append_delete(p.part_id)?;

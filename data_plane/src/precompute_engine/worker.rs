@@ -150,6 +150,7 @@ pub struct WorkerRuntimeConfig {
 /// `(metric, attrs_fingerprint, agg_kind_canonical)` identity contract on
 /// `SeriesIdResolver`, so one sid uniquely names one bucket.
 pub struct Worker {
+    erp_observer: Option<Arc<super::erp_observer::RuntimeErpObserver>>,
     current_input_revision: Option<Arc<crate::storage_engines::types::SummaryInputRevision>>,
     current_catalog_generation: Option<Arc<asap_types::sds::CatalogGeneration>>,
     id: usize,
@@ -187,6 +188,12 @@ pub struct Worker {
 }
 
 impl Worker {
+    pub fn set_erp_observer(
+        &mut self,
+        observer: Option<Arc<super::erp_observer::RuntimeErpObserver>>,
+    ) {
+        self.erp_observer = observer;
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: usize,
@@ -207,6 +214,7 @@ impl Worker {
             wall_clock_max_open_grace_period_ms,
         } = runtime_config;
         Self {
+            erp_observer: None,
             current_input_revision: None,
             current_catalog_generation: None,
             id,
@@ -594,6 +602,24 @@ impl Worker {
                             record_late_input("append_correction", "raw_sample");
                             let mut updater = create_accumulator_updater(&state.config);
                             apply_sample(&mut *updater, series_key, *val, *ts, &state.config);
+                            if let (Some(observer), Some(revision)) =
+                                (&self.erp_observer, &input_revision)
+                            {
+                                observer.observe(
+                                    &revision.generation,
+                                    asap_types::sds::SummaryInstanceCoordinates {
+                                        summary_definition_id: policy_fp.into(),
+                                        time_range: asap_types::sds::HalfOpenTimeRange {
+                                            start_ms: bucket_start,
+                                            end_ms: bucket_end,
+                                        },
+                                        group_values: group_key.as_population_labels(),
+                                    },
+                                    &state.config,
+                                    *ts,
+                                    *val,
+                                );
+                            }
                             let key = build_group_key_label_values(group_key);
                             let output = precomputed_output_for_group(
                                 window_start as u64,
@@ -626,6 +652,23 @@ impl Worker {
                     .or_insert_with(|| create_accumulator_updater(&state.config));
                 if let Some(value) = value {
                     apply_sample(&mut **updater, series_key, value, *ts, &state.config);
+                    if let (Some(observer), Some(revision)) = (&self.erp_observer, &input_revision)
+                    {
+                        observer.observe(
+                            &revision.generation,
+                            asap_types::sds::SummaryInstanceCoordinates {
+                                summary_definition_id: policy_fp.into(),
+                                time_range: asap_types::sds::HalfOpenTimeRange {
+                                    start_ms: bucket_start,
+                                    end_ms: bucket_end,
+                                },
+                                group_values: group_key.as_population_labels(),
+                            },
+                            &state.config,
+                            *ts,
+                            value,
+                        );
+                    }
                 }
             }
         }

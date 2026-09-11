@@ -162,8 +162,19 @@ bindings against QueryPlan; precompute execution consumes the shared contract.
 `PrecomputePlan`, its envelope, ingest, producer, state schema, and catalog
 consistency checks live in `asap_types::precompute_plan`. The compiler chooses
 materializations and placement; data-plane installation uses the shared
-contract. `QueryPlan` definitions still reside in the control-plane
-crate while their remaining compilation methods are separated from wire types.
+contract. `asap_types::query_plan` owns QueryPlan, materialization bindings,
+logical operator DTOs, and activation validation. The control plane reexports
+those types for existing callers and owns the `compile_bound*` and
+`logical::compile_logical` functions; Planner traversal and AST lowering do not
+move into the shared contract. Data-plane engines import the shared types
+directly. No wrapper plan or second wire definition is introduced.
+
+`asap_types::producer_plan` owns the installed collector and transmission
+contracts, frame identities, runtime policy bounds and their validation. The
+control plane allocates sampling/GOS budgets and constructs transmission rules
+through `sampling_policy_from_accuracy_budget`, `gos_policy_from_accuracy_budget`
+and `compile_transmission_plan`. Producers and the data plane import the shared
+contracts directly; compilation is not a runtime dependency of those contracts.
 
 The implemented ownership split is:
 
@@ -402,6 +413,37 @@ Instance. Merge compatibility additionally requires the operator's merge rules,
 compatible data scopes and valid instance coverage; sharing descriptors alone
 does not authorize merging overlapping observations.
 
+### Catalog-scoped runtime ERP evidence
+
+A runtime observation describes the input of one allocated summary, not an
+entire deployment. `ErpPopulationObservations` identifies its catalog generation,
+summary definition, observation time, input window and separate summary-instance
+populations. The control plane resolves the `DataDescriptor` from its successfully
+activated catalog; a telemetry payload cannot provide replacement descriptors.
+Alternative sketch parameters may use this evidence only when the compiler
+verifies the same data and update semantics.
+
+The typed physical-plan HTTP endpoints accept `target: backend_local_remote_write`
+with an empty `collector_ids` list. Omitting `target` preserves the distributed
+collector deployment. Both paths use catalog publication and activation. Typed
+activations are serialized, and the accepted catalog is retained only after the
+backend acknowledges activation, including ClickHouse publications.
+
+An ERP `observed_shape_source.population_scope` supplies the expected catalog
+and definition, input semantics, and explicit `max_age_ms` /
+`max_future_skew_ms` bounds. Each compilation reads the latest runtime record
+again. Missing, stale, malformed, foreign or incomplete observations invalidate
+all population fits. This is an ERP miss handled by theoretical sizing or exact
+execution; it must not restore an older fit or match the artifact's legacy
+distribution descriptor. Offline single-shape inputs remain a separate path.
+
+The initial eligibility is deliberately limited to verified raw per-series
+frequency/cardinality readouts over a complete matching window. A 30-second pane
+observation does not certify a one-hour input distribution. These checks do not
+implement an autonomous drift-triggered replan scheduler, continuous source
+completion, or durable restoration of the control plane's active catalog. After
+a control-plane restart, live evidence remains ineligible until an authoritative
+catalog has been activated again.
 
 ### Retired physical series and catalog reactivation
 
@@ -429,3 +471,49 @@ This is an explicit lifetime transition, not cross-generation recovery of arbitr
 summary state. Legacy records without trustworthy catalog provenance remain
 unbound. Tombstone reclamation still requires coordinated removal of old physical
 parts and is not implemented by this transition.
+
+### Derived summary input identity
+
+A summary computed from another summary has a different data source from the
+original raw table or metric. `PrecomputeMaterialization.derived_input` and
+`DataSourceIdentity::Derived` use the same `DerivedInputIdentity`: the referenced
+`SummaryDefinitionId`s and a SHA-256 of the maintenance program. The executable
+program remains in `OwnedPostAsapDag`; the catalog does not retain another copy.
+
+The signature replaces materialized input frontiers with stable summary IDs and
+hashes the remaining node payloads, schemas, guarantees, and edge semantics. It
+excludes query names, plan-local node numbering, and catalog generations. Literal
+leaves are hashed directly; raw input leaves still require catalog frontiers. A changed
+input definition or transformation creates a new identity. Existing raw-source
+identities retain their previous byte representation. Catalog validation rejects
+missing input definitions and dependency cycles.
+
+This contract is a prerequisite, not enabled summary-over-summary execution.
+Installation currently rejects derived inputs so they cannot accidentally receive
+raw samples through the legacy metric router. Enabling them requires the immutable
+maintenance consumer and durable output deduplication protocol; neither raw-table
+substitution nor treating late correction fragments as new observations is valid.
+
+### Immutable completed windows
+
+Finite Remote Write completion now fences the SummaryStore append boundary,
+not just the receiver queue. After all admitted outputs are published, the store
+records the greatest published window end for each physical SeriesId. Sketch and
+exact-state writes ending at or before that boundary are rejected, including
+writes arriving through other producers. A later window remains writable. Observed SDS inventory reports only these frozen
+instances as `Complete`; ordinary emitted panes remain `Unknown`.
+
+The boundary is monotone in the existing SeriesId metadata sidecar and is restored
+before recovered identities become writable. A stale background metadata flush
+cannot reopen a completed window. The guard belongs to the physical lifetime;
+a catalog-authorized replacement SeriesId has its own boundary.
+
+With persistence enabled, completion explicitly requests the existing flusher to
+make the completed prefix durable, even if it is still inside the hot tier.
+Completion waits until the corresponding epochs have been evicted after part and
+manifest publication; only then does it persist the immutable boundary. An
+in-memory deployment provides no restart guarantee. Maintenance consumers still
+must atomically publish their output identity before claiming replay-safe consumption.
+The existing finite-source completeness proof still rejects untracked writes or
+pending admitted work. Continuous producer watermarks and derived-state commit
+transactions are separate from this finite-input boundary.

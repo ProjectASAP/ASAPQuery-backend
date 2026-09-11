@@ -1,5 +1,7 @@
 //! Shared SDS metadata contracts. Summary payload bytes remain storage-engine
 //! owned; catalogs and inventories contain identities and state references only.
+pub const TIMESTAMPED_OBSERVATION_SEMANTICS: &str = "asap.timestamped-observations.v2";
+
 use crate::{AggregationType, PrecomputeMaterialization};
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryFamilyType};
 use serde::{Deserialize, Serialize};
@@ -113,6 +115,20 @@ pub struct SummaryInstanceCoordinates {
     pub summary_definition_id: SummaryDefinitionId,
     pub time_range: HalfOpenTimeRange,
     pub group_values: BTreeMap<String, String>,
+}
+
+impl SummaryInstanceCoordinates {
+    pub fn instance_id(&self) -> Result<SummaryInstanceId, SdsError> {
+        let bytes =
+            serde_json::to_vec(&self.group_values).map_err(|error| SdsError(error.to_string()))?;
+        SummaryInstanceId::new(format!(
+            "summary-instance:v1:{}:{}:{}:{}",
+            self.summary_definition_id.as_u64(),
+            self.time_range.start_ms,
+            self.time_range.end_ms,
+            xxhash_rust::xxh64::xxh64(&bytes, 0)
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -729,8 +745,15 @@ impl FidelityGuarantee {
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "snake_case")]
 pub enum DataSourceIdentity {
-    TimeSeries { metric: String },
-    Table { table_ref: String },
+    TimeSeries {
+        metric: String,
+    },
+    Table {
+        table_ref: String,
+    },
+    Derived {
+        input: crate::derived_input::DerivedInputIdentity,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -829,7 +852,7 @@ impl DataDescriptor {
     pub fn time_series_metric(&self) -> Option<&str> {
         match &self.source {
             DataSourceIdentity::TimeSeries { metric } => Some(metric),
-            DataSourceIdentity::Table { .. } => None,
+            DataSourceIdentity::Table { .. } | DataSourceIdentity::Derived { .. } => None,
         }
     }
 
@@ -929,6 +952,9 @@ impl DataDescriptor {
         &self.id
     }
     pub fn validate(&self) -> Result<(), SdsError> {
+        if let DataSourceIdentity::Derived { input } = &self.source {
+            input.validate().map_err(SdsError)?;
+        }
         self.value_projection.validate().map_err(SdsError)?;
         self.group_by_keys.validate().map_err(SdsError)?;
         if matches!(self.source, DataSourceIdentity::TimeSeries { .. })
