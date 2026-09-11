@@ -5236,10 +5236,17 @@ mod tests {
                 .unwrap();
             assert!(!store.seal_finite_summary_input(&generation).unwrap());
             assert!(!store.completed_windows.read().unwrap().contains_key(&851));
+            let checkpoint = directory.path().join("finite_input_generation.json");
+            std::fs::create_dir(&checkpoint).unwrap();
             assert!(wait_until(
-                || store.seal_finite_summary_input(&generation).unwrap(),
+                || store.seal_finite_summary_input(&generation).is_err(),
                 Duration::from_secs(5)
             ));
+            assert!(store.admission.read().unwrap().is_finite_closed());
+            assert!(!store.admission.read().unwrap().is_finite_complete());
+            assert!(!store.append_sample(851, BTreeMap::new(), (30_000, 60_000), sample(2)));
+            std::fs::remove_dir(&checkpoint).unwrap();
+            assert!(store.seal_finite_summary_input(&generation).unwrap());
             assert!(!persistence.manifest.live_parts().is_empty());
             persistence.shutdown();
         }
