@@ -286,6 +286,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                 }
                 for (timestamp_ms, value) in values.values().flatten() {
                     let weight = evaluate_weight(&input.weight, *value, name)?;
+                    updater.validate_single_input(weight)?;
                     updater.update_single(weight, *timestamp_ms);
                 }
                 let timestamp = values
@@ -3575,6 +3576,68 @@ mod tests {
         };
         assert!(matches!(adapter.execute(&aggregate, &[Arc::new(rows)]),
             Err(error) if error.contains("one explicitly reduced output population")));
+    }
+
+    #[test]
+    fn dds_maintenance_rejects_nonpositive_population_before_returning_summary() {
+        use planner_types::post_asap::{GroupingStrategy, SummaryUpdate};
+        use planner_types::pre_asap::{ColumnRef, Reduction};
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../docs/examples/asapquery-planning-snapshot.json"
+            ))
+            .unwrap();
+        let mut config = snapshot.compile().unwrap().precompute_plan.materializations[0].clone();
+        config.aggregation_type = asap_types::AggregationType::DDSketch;
+        config.parameters.clear();
+        config
+            .parameters
+            .insert("relative_accuracy".into(), "0.01".into());
+        config.aggregation_sub_type.clear();
+        config.grouping_labels = std::iter::empty::<String>().collect();
+        config.partitioning = Some(asap_types::sds::PopulationPartitioning::Grouped);
+        let family = config.accumulator_spec().unwrap().family;
+        let binding = BackendExecutableBinding {
+            nodes: BTreeMap::from([(
+                PostAsapNodeId(1),
+                BackendNodeBinding::Materialization {
+                    summary_definition: config.policy_fingerprint().into(),
+                },
+            )]),
+            query_sink: PostAsapNodeId(1),
+            query_plan_sink: asap_types::query_plan::QueryNodeId(1),
+            precompute_sinks: vec![PostAsapNodeId(1)],
+        };
+        let configs = [config];
+        let adapter = OperatorAdapter {
+            binding: &binding,
+            inputs: MaintenanceInputs::Frozen(&[]),
+            configs: &configs,
+        };
+        let mut aggregate = node(1);
+        aggregate.payload = ExecutableOperatorPayload::SummaryAgg {
+            family,
+            input: SummaryUpdate::column(ColumnRef::SampleValue),
+            reduction: Reduction::by(vec![]),
+            grouping: GroupingStrategy::default(),
+        };
+        for rejected in [-20.0, 0.0, f64::MAX] {
+            let rows = MaintenanceValue::Rows {
+                values: [("a", 20.0), ("b", rejected)]
+                    .into_iter()
+                    .map(|(group, value)| {
+                        (
+                            BTreeMap::from([("instance".into(), group.into())]),
+                            vec![(1000, value)],
+                        )
+                    })
+                    .collect(),
+                name: "value".into(),
+                timestamped: true,
+            };
+            assert!(matches!(adapter.execute(&aggregate, &[Arc::new(rows)]),
+                Err(error) if error.contains("positive representable domain")));
+        }
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 ## Testing
 
+- [E2E physical-DAG walkthrough for Milind](evaluation/e2e-physical-dag.md)
+
 - [Manual component and whole-system E2E tests](03-how-to-guides/manual-e2e-tests.md)
 - [ASAPQuery vs. AutoSketch evaluation plan](evaluation/autosketch-comparison.md)
 

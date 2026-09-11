@@ -34,8 +34,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ProjectASAP/asap_sketchlib
-          # PR #139: standard-update compatibility check used by UnivMon restore.
-          ref: c0de315754f9a6c77dd7a25aca0b2b62f0aec276
+          # PR #140: explicit interpolated DDS readout; includes #139 UnivMon compatibility.
+          ref: 8c03d7c68b7150710c79e70a6421971275614561
           path: asap_sketchlib
 
       - name: Install Rust components

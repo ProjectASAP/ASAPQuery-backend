@@ -8,6 +8,10 @@ The query backend of the **ASAP** observability system.
 Design documents, developer workflows, and user guides are indexed in the
 [ASAPQuery-backend documentation](docs/README.md).
 
+Start with the [E2E physical-DAG walkthrough for Milind](docs/evaluation/e2e-physical-dag.md)
+for workload/ERP inputs, selected plans, remote-write replay, instance identity
+and query inspection.
+
 ASAPQuery-backend exposes a **single PromQL HTTP surface** that
 internally dispatches to one of two engines based on the control plane's
 plan and the query's shape:
@@ -236,7 +240,7 @@ that produced the current architecture:
   ASAPPlanner's post-ASAP IR plus backend physical placement
 - **JSONL cold-fallback path** — deleted; the configured exact backend is the
   explicit fallback described by
-  [query-engine implementation design](docs/developer_docs/query-engine/design.md).
+  [query-engine implementation design](docs/developer_docs/query-engine/query-engine.md).
 - **`StorageBackend::ColdJsonlFallback`** enum variant — removed
 - **Backend-local cost-model line item for cold-tier scan bytes** —
   removed (controller's tier-spanning cost model is the source of

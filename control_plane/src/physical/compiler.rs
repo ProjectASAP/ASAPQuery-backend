@@ -1095,6 +1095,24 @@ impl PhysicalCompiler {
                     })
                 }
             }
+            // Choose the population protocol before any source fingerprint or
+            // derived frontier binding is created. Only the actual selected
+            // global maintenance program and its raw inputs opt into it.
+            let mut canonical_nodes = std::collections::HashSet::new();
+            if environment.target == PhysicalDeploymentTarget::BackendLocalRemoteWrite {
+                for state in &selected {
+                    if matches!(&state.node.expr, SummaryExpr::SummaryAgg {
+                        reduction: planner_types::pre_asap::Reduction::Reduce(keys), ..
+                    } if keys.is_empty())
+                    {
+                        if let Some(sources) = immutable_materialization_sources(&state.node) {
+                            canonical_nodes.insert(Rc::as_ptr(&state.node) as usize);
+                            canonical_nodes
+                                .extend(sources.iter().map(|source| Rc::as_ptr(source) as usize));
+                        }
+                    }
+                }
+            }
             for (ordinal, selected) in selected.into_iter().enumerate() {
                 let mut branch_query = query.clone();
                 branch_query.window_secs = selected.window_secs.unwrap_or(query.window_secs);
@@ -1179,6 +1197,10 @@ impl PhysicalCompiler {
                 aggregation.window_secs = window_implementation.window_secs;
                 let mut runtime_materialization =
                     scoped_materialization(&aggregation, &selected.node)?;
+                if canonical_nodes.contains(&(Rc::as_ptr(&selected.node) as usize)) {
+                    runtime_materialization.population_key_encoding =
+                        asap_types::PopulationKeyEncoding::CanonicalLabelsV1;
+                }
                 runtime_materialization.window_size = window_implementation.window_secs;
                 runtime_materialization.slide_interval = window_implementation.slide_secs;
                 runtime_materialization.window_type =
@@ -3793,6 +3815,23 @@ mod tests {
         deployment.collector_ids.clear();
         let plan = PhysicalCompiler.compile(workload, deployment).unwrap();
         assert_eq!(plan.precompute_plan.materializations.len(), 3);
+        assert!(plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .all(|config| config.population_key_encoding
+                == asap_types::PopulationKeyEncoding::CanonicalLabelsV1));
+        let mut mixed = plan.precompute_plan.clone();
+        mixed
+            .materializations
+            .iter_mut()
+            .find(|config| config.derived_input.is_none())
+            .unwrap()
+            .population_key_encoding = asap_types::PopulationKeyEncoding::LegacyDelimited;
+        assert!(
+            mixed.validate().is_err(),
+            "canonical target cannot use legacy source identity"
+        );
         let derived = plan
             .precompute_plan
             .materializations
