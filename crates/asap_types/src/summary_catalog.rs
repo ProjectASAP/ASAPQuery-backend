@@ -323,6 +323,9 @@ mod tests {
         invalid_labels.table_population = None;
         invalid_labels.spatial_filter = "job=\"requests\"".into();
         assert!(SummaryCatalog::from_materializations(1, 1, &[invalid_labels]).is_err());
+        let mut invalid_time = requests.clone();
+        invalid_time.table_timestamp_column = Some("time; DROP TABLE samples".into());
+        assert!(SummaryCatalog::from_materializations(1, 1, &[invalid_time]).is_err());
         let catalog =
             SummaryCatalog::from_materializations(1, 1, &[requests, errors, other_time]).unwrap();
         assert_eq!(catalog.data_descriptors.len(), 3);

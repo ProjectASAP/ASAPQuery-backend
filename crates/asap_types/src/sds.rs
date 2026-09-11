@@ -821,6 +821,7 @@ impl DataDescriptor {
                     "table timestamp projection requires a table and a column".into(),
                 ));
             }
+            crate::table_population::validate_column_name(column).map_err(SdsError)?;
         }
         if self.id
             != data_descriptor_id(
