@@ -363,7 +363,8 @@ impl PrometheusRemoteWriteReceiver {
             let mut labels = group_key.as_population_labels();
             if labels.is_empty() {
                 labels = config
-                    .grouping_labels.iter()
+                    .grouping_labels
+                    .iter()
                     .cloned()
                     .zip(group_key.values().labels)
                     .collect();
@@ -667,7 +668,8 @@ fn route_messages(
                 Vec::new()
             } else {
                 config
-                    .grouping_labels.iter()
+                    .grouping_labels
+                    .iter()
                     .map(|name| {
                         (
                             name.as_str(),

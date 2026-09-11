@@ -127,7 +127,8 @@ fn resolve_backfill_bucket_sid(
 ) -> u64 {
     let labels = parse_labels_from_series_key(series_key);
     let grouping_pairs: Vec<(&str, &str)> = config
-        .grouping_labels.iter()
+        .grouping_labels
+        .iter()
         .map(|name| (name.as_str(), *labels.get(name.as_str()).unwrap_or(&"")))
         .collect();
     let attrs_fp = canonical_attrs_fingerprint(&grouping_pairs);

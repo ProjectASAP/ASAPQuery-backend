@@ -2666,8 +2666,7 @@ impl SketchStore {
         let target_metric = agg_cfg.metric.as_str();
         let target_agg_type = agg_cfg.aggregation_type;
         let target_params = canonical_parameters(&agg_cfg.parameters);
-        let target_group_keys: BTreeSet<String> =
-            agg_cfg.grouping_labels.iter().cloned().collect();
+        let target_group_keys: BTreeSet<String> = agg_cfg.grouping_labels.iter().cloned().collect();
 
         // Collect the matching sids under a short read lock; then call
         // `remove_instance` per sid (which takes its own write lock).
