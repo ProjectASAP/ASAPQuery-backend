@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use control_plane::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
+use asap_types::query_plan::{QueryNodeId, QueryPlanEntry, QueryPlanNode};
 use thiserror::Error;
 
 pub trait QueryNodeRuntime {
@@ -146,7 +146,7 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::BTreeMap;
 
-    use control_plane::query_plan::{FallbackPolicy, InstantExecution, QueryReadout};
+    use asap_types::query_plan::{FallbackPolicy, InstantExecution, QueryReadout};
 
     use super::*;
 
@@ -204,7 +204,7 @@ mod tests {
         .into_iter()
         .collect();
         let entry = QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
+            language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "up".into(),
             fixed_evaluation: None,
@@ -277,7 +277,7 @@ mod tests {
         .into_iter()
         .collect();
         let entry = QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
+            language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "q".into(),
             canonical_query: "up".into(),
             fixed_evaluation: None,

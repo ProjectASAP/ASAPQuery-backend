@@ -1,7 +1,7 @@
 //! Fetch installed exact cuts from Prometheus before composing them with ASAP state.
 use super::logical_dag::{PreparedLeaf, PreparedLeaves, Value};
 use crate::query_engines::EngineError;
-use control_plane::query_plan::{
+use asap_types::query_plan::{
     logical::LogicalOperator, ExternalExactInput, ExternalExactRequest, QueryLanguage, QueryNodeId,
     QueryPlanEntry, QueryPlanNode,
 };
@@ -441,10 +441,10 @@ pub(super) async fn prepare_external(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use control_plane::query_plan::{FallbackPolicy, InstantExecution};
+    use asap_types::query_plan::{FallbackPolicy, InstantExecution};
     fn entry(nodes: BTreeMap<QueryNodeId, QueryPlanNode>) -> QueryPlanEntry {
         QueryPlanEntry {
-            language: control_plane::query_plan::QueryLanguage::PromQl,
+            language: asap_types::query_plan::QueryLanguage::PromQl,
             query_id: "remote-cut".into(),
             canonical_query: "a / b".into(),
             fixed_evaluation: None,
@@ -491,7 +491,7 @@ mod tests {
                 request: ExternalExactRequest {
                     language: QueryLanguage::MetricsQl,
                     expression: "sum(rate(m[5m]))".into(),
-                    output: control_plane::query_plan::ExternalExactOutput::InstantVector,
+                    output: asap_types::query_plan::ExternalExactOutput::InstantVector,
                     parameters: BTreeMap::new(),
                     start_parameter: None,
                     end_parameter: None,
@@ -526,7 +526,7 @@ mod tests {
                     request: ExternalExactRequest {
                         language: QueryLanguage::PromQl,
                         expression: query.into(),
-                        output: control_plane::query_plan::ExternalExactOutput::InstantVector,
+                        output: asap_types::query_plan::ExternalExactOutput::InstantVector,
                         parameters: BTreeMap::new(),
                         start_parameter: None,
                         end_parameter: None,
@@ -630,7 +630,7 @@ mod tests {
 
     #[tokio::test]
     async fn candidate_exact_is_discovered_and_prepared_behind_candidate_topk_root() {
-        use control_plane::query_plan::{logical::Grouping, CandidateCompleteness};
+        use asap_types::query_plan::{logical::Grouping, CandidateCompleteness};
         let mut entry = candidate_entry("sum by (job) (rate(m[5m]))");
         entry.nodes.insert(
             QueryNodeId(2),
@@ -751,7 +751,7 @@ mod tests {
     #[tokio::test]
     async fn exact_leaf_calls_prometheus_and_combines_with_prepared_summary() {
         // A successful exact branch remains an intermediate, not a whole-root fallback.
-        use control_plane::query_plan::logical::BinaryOperation;
+        use asap_types::query_plan::logical::BinaryOperation;
         use std::sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -866,7 +866,7 @@ mod tests {
             index::{Capability, SketchInstanceMetadata},
         };
         use crate::storage_engines::types::{KeyByLabelValues, Measurement};
-        use control_plane::query_plan::{
+        use asap_types::query_plan::{
             logical::BinaryOperation, ExactReadout, MaterializationBinding, PhysicalGrouping,
         };
         use std::sync::{

@@ -334,6 +334,17 @@ impl PrecomputePlan {
         if !valid_ingest {
             return Err(PrecomputePlanError::UnsupportedIngestEndpoint);
         }
+        // Derived input identity is portable, but raw ingress cannot execute it.
+        // Installation stays closed until the immutable maintenance consumer is wired.
+        if self
+            .materializations
+            .iter()
+            .any(|config| config.derived_input.is_some())
+        {
+            return Err(PrecomputePlanError::CatalogContract(
+                "derived summary input requires an immutable maintenance consumer".into(),
+            ));
+        }
         for (query_id, installed) in &self.executable_dags {
             if query_id != &installed.document.query_id {
                 return Err(PrecomputePlanError::CatalogContract(

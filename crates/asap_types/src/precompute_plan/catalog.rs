@@ -1,6 +1,6 @@
 //! Catalog consistency checks for the precompute execution plan.
 use super::*;
-use crate::sds::{DataSourceIdentity, SummaryDefinitionId, SummaryDescriptor};
+use crate::sds::{SummaryDefinitionId, SummaryDescriptor};
 use crate::summary_catalog::SummaryCatalog;
 use planner_types::pre_asap::Source;
 use std::collections::BTreeSet;
@@ -70,14 +70,7 @@ impl PrecomputePlan {
                 return Err(invalid("pane origin differs from catalog definition"));
             }
             let data = &catalog.data_descriptors[&binding.data_descriptor_id];
-            let expected_source = config.table_name.as_ref().map_or_else(
-                || DataSourceIdentity::TimeSeries {
-                    metric: config.metric.clone(),
-                },
-                |table_ref| DataSourceIdentity::Table {
-                    table_ref: table_ref.clone(),
-                },
-            );
+            let expected_source = config.source_identity();
             if config.table_name.is_some()
                 && !config.grouping_labels.is_empty()
                 && data.observation_semantics

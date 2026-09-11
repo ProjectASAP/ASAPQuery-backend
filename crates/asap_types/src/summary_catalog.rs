@@ -103,14 +103,7 @@ impl SummaryCatalog {
             .map(|config| {
                 let summary = SummaryDescriptor::from_config(config)
                     .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
-                let source = config.table_name.as_ref().map_or_else(
-                    || DataSourceIdentity::TimeSeries {
-                        metric: config.metric.clone(),
-                    },
-                    |table_ref| DataSourceIdentity::Table {
-                        table_ref: table_ref.clone(),
-                    },
-                );
+                let source = config.source_identity();
                 let value_projection = config.effective_value_projection().clone();
                 let data = DataDescriptor::new_typed(
                     source,
@@ -252,6 +245,54 @@ impl SummaryCatalog {
             {
                 return Err(SummaryCatalogError::MissingDescriptor(id.as_u64()));
             }
+        }
+        if !self
+            .data_descriptors
+            .values()
+            .any(|data| matches!(data.source, DataSourceIdentity::Derived { .. }))
+        {
+            return Ok(());
+        }
+        // Dependencies must refer to this snapshot and form an acyclic graph.
+        let mut pending = std::collections::BTreeMap::new();
+        let mut consumers: std::collections::BTreeMap<_, Vec<_>> =
+            std::collections::BTreeMap::new();
+        for (id, binding) in &self.materializations {
+            let dependencies = match &self.data_descriptors[&binding.data_descriptor_id].source {
+                DataSourceIdentity::Derived { input } => input.inputs.clone(),
+                _ => Default::default(),
+            };
+            for source in &dependencies {
+                if !self.materializations.contains_key(source) {
+                    return Err(SummaryCatalogError::Descriptor(
+                        "derived input references missing summary".into(),
+                    ));
+                }
+                consumers.entry(*source).or_default().push(*id);
+            }
+            pending.insert(*id, dependencies.len());
+        }
+        let mut ready: Vec<_> = pending
+            .iter()
+            .filter_map(|(id, count)| (*count == 0).then_some(*id))
+            .collect();
+        let mut visited = 0;
+        while let Some(id) = ready.pop() {
+            visited += 1;
+            for consumer in consumers.get(&id).into_iter().flatten() {
+                let count = pending
+                    .get_mut(consumer)
+                    .expect("catalog dependency target");
+                *count -= 1;
+                if *count == 0 {
+                    ready.push(*consumer);
+                }
+            }
+        }
+        if visited != pending.len() {
+            return Err(SummaryCatalogError::Descriptor(
+                "derived summary dependencies have a cycle".into(),
+            ));
         }
         Ok(())
     }
