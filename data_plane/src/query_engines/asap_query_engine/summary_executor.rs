@@ -1045,7 +1045,18 @@ fn sketch_query_value(rs: &SummaryState, query: &SketchQuery) -> Result<f64, Sum
         SketchQuery::FrequencyL2 | SketchQuery::FrequencyEntropy => Err(
             SummaryExecutorError::Unsupported("frequency moment readout requires UnivMon"),
         ),
-        SketchQuery::Quantile { q } => Ok(rs.quantile(*q)),
+        SketchQuery::Quantile { q } => match rs {
+            // Typed PromQL/continuous-percentile readout uses interpolation;
+            // portable DDS `quantile` deliberately retains lower-rank parity.
+            SummaryState::Dd(sketch) => {
+                sketch
+                    .quantile_interpolated(*q)
+                    .ok_or(SummaryExecutorError::Unsupported(
+                        "DDS interpolated quantile is unavailable",
+                    ))
+            }
+            _ => Ok(rs.quantile(*q)),
+        },
         SketchQuery::Cardinality => Ok(rs.cardinality()),
         // `key: ColumnRef::SampleValue, value: None` means "no specific
         // item" -- the bare bucket total. `key: Named(_), value: Some(v)`
@@ -1947,6 +1958,40 @@ mod tests {
             )
             .expect("candidate lookup");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn typed_dds_quantile_interpolates_without_changing_portable_rank_semantics() {
+        let mut sketch = asap_sketchlib::DdSketch::new(0.01);
+        assert!(sketch_query_value(
+            &SummaryState::Dd(sketch.clone()),
+            &SketchQuery::Quantile { q: 0.9 }
+        )
+        .is_err());
+        sketch.update(20.0);
+        for q in [0.0, 0.5, 0.9, 1.0] {
+            let value = sketch_query_value(
+                &SummaryState::Dd(sketch.clone()),
+                &SketchQuery::Quantile { q },
+            )
+            .unwrap();
+            assert!((value - 20.0).abs() <= 0.2);
+        }
+        sketch.update(40.0);
+        assert!(sketch.quantile(0.9).unwrap() < 21.0);
+        for (q, expected) in [(0.0, 20.0), (0.5, 30.0), (0.9, 38.0), (1.0, 40.0)] {
+            let value = sketch_query_value(
+                &SummaryState::Dd(sketch.clone()),
+                &SketchQuery::Quantile { q },
+            )
+            .unwrap();
+            assert!((value - expected).abs() <= expected * 0.01);
+        }
+        assert!(sketch_query_value(
+            &SummaryState::Dd(sketch),
+            &SketchQuery::Quantile { q: f64::NAN }
+        )
+        .is_err());
     }
 
     #[test]

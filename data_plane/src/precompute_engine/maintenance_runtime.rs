@@ -286,6 +286,7 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                 }
                 for (timestamp_ms, value) in values.values().flatten() {
                     let weight = evaluate_weight(&input.weight, *value, name)?;
+                    updater.validate_single_input(weight)?;
                     updater.update_single(weight, *timestamp_ms);
                 }
                 let timestamp = values
