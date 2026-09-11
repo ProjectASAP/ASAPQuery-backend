@@ -766,6 +766,11 @@ mod source_window_cohort_tests {
     fn full_sliding_cohort_preserves_explicit_windows_and_identity() {
         let target = full_window();
         let source = full_window();
+        let mut missing_origin = source.clone();
+        missing_origin.pane_origin_ms = None;
+        assert!(validated_source_window_cohort(&missing_origin, &[&missing_origin]).is_err());
+        missing_origin.slide_interval = missing_origin.window_size;
+        assert!(validated_source_window_cohort(&missing_origin, &[&missing_origin]).is_ok());
         let result = validated_source_window_cohort(&target, &[&source]).unwrap();
         assert!(std::ptr::eq(result[0], &source));
         let mut other = source.clone();
