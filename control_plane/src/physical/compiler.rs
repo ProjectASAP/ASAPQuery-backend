@@ -1145,6 +1145,81 @@ impl PhysicalCompiler {
                     query_id: query.query_id.clone(),
                     reason,
                 })?;
+                if let Some(source) = immutable_materialization_source(&selected.node) {
+                    if environment.target != PhysicalDeploymentTarget::BackendLocalRemoteWrite {
+                        return Err(CompileError::Query {
+                            query_id: query.query_id.clone(),
+                            reason: "immutable derived state requires backend-local execution"
+                                .into(),
+                        });
+                    }
+                    let compiled = executable_dags[query_index].as_ref().expect("compiled DAG");
+                    let source_node =
+                        compiled
+                            .node_ids
+                            .node_id(&source)
+                            .ok_or_else(|| CompileError::Query {
+                                query_id: query.query_id.clone(),
+                                reason: "derived source absent from selected DAG".into(),
+                            })?;
+                    let source_id = node_bindings
+                        .get(&(query_index, source_node))
+                        .copied()
+                        .ok_or_else(|| CompileError::Query {
+                            query_id: query.query_id.clone(),
+                            reason: "derived input source was not installed before its consumer"
+                                .into(),
+                        })?;
+                    let source_config: &asap_types::PrecomputeMaterialization =
+                        compiled_materializations
+                            .iter()
+                            .find(|config: &&asap_types::PrecomputeMaterialization| {
+                                config.policy_fingerprint() == source_id
+                            })
+                            .ok_or_else(|| CompileError::Query {
+                                query_id: query.query_id.clone(),
+                                reason: "derived source config missing".into(),
+                            })?;
+                    if runtime_materialization.window_size != source_config.window_size
+                        || runtime_materialization.slide_interval != source_config.slide_interval
+                        || runtime_materialization.pane_origin_ms != source_config.pane_origin_ms
+                        || runtime_materialization.window_size
+                            != runtime_materialization.slide_interval
+                        || runtime_materialization.stored_window_ms()
+                            != source_config.stored_window_ms()
+                        || source_config.stored_window_ms()
+                            != source_config.window_size.saturating_mul(1_000)
+                    {
+                        return Err(CompileError::Query { query_id: query.query_id.clone(),
+                            reason: "immutable scalar composition requires matching full nonoverlapping windows".into() });
+                    }
+                    let SummaryExpr::SummaryAgg { child, .. } = &selected.node.expr else {
+                        unreachable!()
+                    };
+                    let input_node = compiled
+                        .node_ids
+                        .node_id(child)
+                        .expect("selected input node");
+                    let document = asap_types::executable_plan::OwnedPostAsapDag::from_executable(
+                        query.query_id.clone(),
+                        &compiled.dag,
+                    )
+                    .map_err(|reason| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason,
+                    })?;
+                    runtime_materialization.derived_input = Some(
+                        asap_types::derived_input::DerivedInputIdentity::from_dag(
+                            &document,
+                            input_node,
+                            &BTreeMap::from([(source_node, source_id.into())]),
+                        )
+                        .map_err(|reason| CompileError::Query {
+                            query_id: query.query_id.clone(),
+                            reason,
+                        })?,
+                    );
+                }
                 let materialization = runtime_materialization.policy_fingerprint();
                 let consumer_query_ids = state_consumers
                     .iter()
@@ -1242,7 +1317,9 @@ impl PhysicalCompiler {
                     }
                 } else {
                     shared_materializations.insert(materialization, shared_contract);
-                    collector_materializations.push(collector_materialization);
+                    if runtime_materialization.derived_input.is_none() {
+                        collector_materializations.push(collector_materialization);
+                    }
                 }
             }
         }
@@ -2371,6 +2448,48 @@ pub(crate) fn materialization_leaf_contract(
     }
 }
 
+/// The first immutable-input capability accepts one exact accumulator readout.
+/// Population/window closure is checked by the installed runtime, not inferred
+/// from the presence of this syntax.
+fn immutable_materialization_source(node: &SummaryNode) -> Option<Rc<SummaryNode>> {
+    use planner_types::post_asap::{ExactKind, ExecutionTiming, SummaryInputExpr};
+    let SummaryExpr::SummaryAgg { child, input, .. } = &node.expr else {
+        return None;
+    };
+    if input.item.is_some()
+        || !matches!(
+            input.weight,
+            SummaryInputExpr::Column(planner_types::pre_asap::ColumnRef::SampleValue)
+        )
+    {
+        return None;
+    }
+    let SummaryExpr::ValueOperation {
+        child: source,
+        operation: planner_types::post_asap::ValueOperation::FinalizeExactAccumulator,
+        timing: ExecutionTiming::MaintenanceTime,
+    } = &child.expr
+    else {
+        return None;
+    };
+    if !matches!(&source.expr, SummaryExpr::SummaryAgg {
+        family: SummaryFamilyType::ExactAggregate(ExactKind::Sum | ExactKind::Count, _),
+        child, ..
+    } if matches!(child.expr, SummaryExpr::KeepPreAsap(_)))
+    {
+        return None;
+    }
+    Some(Rc::clone(source))
+}
+
+fn selected_input_contract(node: &SummaryNode) -> Result<(String, Option<u64>, String), String> {
+    if let Some(source) = immutable_materialization_source(node) {
+        materialization_leaf_contract(&source)
+    } else {
+        materialization_leaf_contract(node)
+    }
+}
+
 struct SelectedMaterialization {
     node: Rc<SummaryNode>,
     metric: String,
@@ -2616,6 +2735,9 @@ fn collect_selected_materializations(
         } else {
             None
         };
+        if let Some(source) = immutable_materialization_source(node) {
+            walk(&source, None, composable, None, selected)?;
+        }
         match &node.expr {
             SummaryExpr::CandidateTopK {
                 candidates, values, ..
@@ -2653,7 +2775,8 @@ fn collect_selected_materializations(
                 walk(child, readout, composable, grouping.clone(), selected)?;
             }
             SummaryExpr::SummaryAgg { child, .. }
-                if !matches!(child.expr, SummaryExpr::KeepPreAsap(_)) => {}
+                if !matches!(child.expr, SummaryExpr::KeepPreAsap(_))
+                    && immutable_materialization_source(node).is_none() => {}
             SummaryExpr::SummaryAgg {
                 family:
                     SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _),
@@ -2730,12 +2853,12 @@ fn collect_selected_materializations(
                             parameters["weight_scale"] = 1_000_000.into();
                         }
                     }
-                    let (metric, window_secs, spatial_filter) =
-                        match materialization_leaf_contract(node) {
-                            Ok(contract) => contract,
-                            Err(_) if composable => return Ok(()),
-                            Err(error) => return Err(error),
-                        };
+                    let (metric, window_secs, spatial_filter) = match selected_input_contract(node)
+                    {
+                        Ok(contract) => contract,
+                        Err(_) if composable => return Ok(()),
+                        Err(error) => return Err(error),
+                    };
                     selected.push(SelectedMaterialization {
                         node: Rc::clone(node),
                         metric,
@@ -2756,12 +2879,11 @@ fn collect_selected_materializations(
                 family: SummaryFamilyType::ExactAggregate(kind, params),
                 ..
             } => {
-                let (metric, window_secs, spatial_filter) =
-                    match materialization_leaf_contract(node) {
-                        Ok(contract) => contract,
-                        Err(_) if composable => return Ok(()),
-                        Err(error) => return Err(error),
-                    };
+                let (metric, window_secs, spatial_filter) = match selected_input_contract(node) {
+                    Ok(contract) => contract,
+                    Err(_) if composable => return Ok(()),
+                    Err(error) => return Err(error),
+                };
                 selected.push(SelectedMaterialization {
                     node: Rc::clone(node),
                     metric,
@@ -3404,6 +3526,38 @@ mod tests {
 
     fn request(query_id: &str, promql: &str) -> PlanningRequest {
         request_with_evidence(query_id, promql, None).expect("post-ASAP selection")
+    }
+
+    #[test]
+    fn immutable_nested_summary_keeps_actual_source_and_derived_bindings() {
+        let mut workload = request("nested", "quantile(0.9, sum_over_time(m[1m]))");
+        workload.hybrid_execution = true;
+        let states =
+            collect_selected_materializations(&workload.queries[0].post_asap, true).unwrap();
+        assert_eq!(states.len(), 2, "source and consumer must both be selected");
+        assert!(immutable_materialization_source(&states[0].node).is_none());
+        assert!(immutable_materialization_source(&states[1].node).is_some());
+        let mut deployment = environment(10_000);
+        deployment.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        deployment.collector_ids.clear();
+        let plan = PhysicalCompiler.compile(workload, deployment).unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 2);
+        let derived = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|m| m.derived_input.is_some())
+            .unwrap();
+        let source = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|m| m.derived_input.is_none())
+            .unwrap();
+        assert_eq!(
+            derived.derived_input.as_ref().unwrap().inputs,
+            BTreeSet::from([source.policy_fingerprint().into()])
+        );
     }
 
     /// Distinct range queries retain a per-series HLL selected by Planner.
