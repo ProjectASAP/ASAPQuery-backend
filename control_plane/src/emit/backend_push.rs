@@ -260,7 +260,7 @@ async fn push_documents_coupled(
         warn!(%error, "failed to bind compatibility PrecomputePlan to SummaryCatalog");
         return (false, false, 0);
     }
-    let transmission_plan = match crate::physical::compiler::TransmissionPlan::build(
+    let transmission_plan = match crate::physical::compiler::compile_transmission_plan(
         precompute_plan.envelope.clone(),
         &precompute_plan,
         &Default::default(),

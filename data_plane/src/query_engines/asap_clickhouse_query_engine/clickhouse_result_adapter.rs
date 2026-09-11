@@ -230,6 +230,7 @@ impl ClickHouseQueryResult {
 pub(super) fn clickhouse_type(data_type: &arrow::datatypes::DataType, nullable: bool) -> String {
     use arrow::datatypes::DataType;
     let base = match data_type {
+        DataType::Null => "Nothing".into(),
         DataType::Boolean => "Bool".into(),
         DataType::Int8 => "Int8".into(),
         DataType::Int16 => "Int16".into(),
@@ -307,6 +308,20 @@ mod tests {
         datatypes::{DataType, Field, Schema},
     };
     use std::sync::Arc;
+
+    #[test]
+    fn empty_map_bottom_type_uses_clickhouse_nothing() {
+        let entries = DataType::Struct(
+            vec![
+                Field::new("key", DataType::Null, false),
+                Field::new("value", DataType::Null, false),
+            ]
+            .into(),
+        );
+        let dtype = DataType::Map(Arc::new(Field::new("entries", entries, false)), false);
+        assert_eq!(clickhouse_type(&dtype, false), "Map(Nothing, Nothing)");
+        assert_eq!(clickhouse_type(&DataType::Null, true), "Nullable(Nothing)");
+    }
 
     #[test]
     fn map_timestamp_transport_is_not_assumed_to_match_native_formatting() {
