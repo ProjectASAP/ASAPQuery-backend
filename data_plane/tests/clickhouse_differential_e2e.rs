@@ -270,13 +270,13 @@ async fn run_mixed_aggregate(aggregate: &str) {
     assert_eq!(
         entry.nodes.values().any(|node| matches!(
             node,
-            control_plane::query_plan::QueryPlanNode::ExternalExact { .. }
+            asap_types::query_plan::QueryPlanNode::ExternalExact { .. }
         )),
         !grouped
     );
     assert!(entry.nodes.values().any(|node| matches!(
         node,
-        control_plane::query_plan::QueryPlanNode::ReadMaterialization { .. }
+        asap_types::query_plan::QueryPlanNode::ReadMaterialization { .. }
     )));
     let install = publication.install_request(None, Vec::new()).unwrap();
 

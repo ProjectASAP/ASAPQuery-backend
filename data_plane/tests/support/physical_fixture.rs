@@ -37,8 +37,12 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
     let mut precompute =
         PrecomputePlan::build(envelope.clone(), configs, &["fixture".into()]).unwrap();
     precompute.summary_catalog = Some(catalog.reference().unwrap());
-    let mut transmission =
-        TransmissionPlan::build(envelope, &precompute, &BTreeMap::new()).unwrap();
+    let mut transmission = control_plane::physical::compiler::compile_transmission_plan(
+        envelope,
+        &precompute,
+        &BTreeMap::new(),
+    )
+    .unwrap();
     transmission.summary_catalog = Some(catalog.reference().unwrap());
     let mut query_plan = QueryPlan {
         plan_id: 1,
@@ -104,7 +108,7 @@ pub fn artifact(config: &StreamingConfig) -> PhysicalPlanInstallRequest {
             query_plan.entries.insert(
                 canonical.clone(),
                 QueryPlanEntry {
-                    language: control_plane::query_plan::QueryLanguage::PromQl,
+                    language: asap_types::query_plan::QueryLanguage::PromQl,
                     query_id: canonical.clone(),
                     canonical_query: canonical,
                     fixed_evaluation: None,
