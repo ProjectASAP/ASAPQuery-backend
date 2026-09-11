@@ -12,6 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 type SummaryState = Arc<dyn AggregateCore>;
+type PendingOutput = (
+    Option<MaterializationCommitKey>,
+    PrecomputedOutput,
+    Box<dyn AggregateCore>,
+);
 
 struct OperatorAdapter<'a> {
     binding: &'a BackendExecutableBinding,
@@ -68,16 +73,23 @@ struct CommittedState {
 struct CommitRegistry(Mutex<BTreeMap<MaterializationCommitKey, CommittedState>>);
 
 impl CommitRegistry {
-    fn claim_publish(&self, key: &MaterializationCommitKey) -> Result<bool, String> {
+    fn publish(
+        &self,
+        key: &MaterializationCommitKey,
+        emit: impl FnOnce() -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Serialize acknowledgement with publication so a concurrent replay
+        // cannot skip an in-flight write that later fails.
         let mut commits = self.0.lock().map_err(|_| "commit registry poisoned")?;
         let committed = commits
             .get_mut(key)
             .ok_or_else(|| "maintenance result was not committed".to_string())?;
         if committed.published {
-            Ok(false)
+            Ok(())
         } else {
+            emit()?;
             committed.published = true;
-            Ok(true)
+            Ok(())
         }
     }
 }
@@ -132,9 +144,9 @@ impl MaintenanceDagSink {
         &self,
         output: PrecomputedOutput,
         state: Box<dyn AggregateCore>,
-    ) -> Result<Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>, String> {
+    ) -> Result<Vec<PendingOutput>, String> {
         let Some(plan) = self.plans.physical_plan_snapshot() else {
-            return Ok(vec![(output, state)]);
+            return Ok(vec![(None, output, state)]);
         };
         let source_definition: asap_types::sds::SummaryDefinitionId = output.policy_fp.into();
         let source: SummaryState = Arc::from(state);
@@ -220,9 +232,6 @@ impl MaintenanceDagSink {
                     &self.commits,
                 )
                 .map_err(schedule_error)?;
-                if !self.commits.claim_publish(&key)? {
-                    continue;
-                }
                 let target = match installed.binding.node(*sink_node) {
                     Some(BackendNodeBinding::Materialization { summary_definition }) => {
                         asap_types::PolicyFingerprint::from(*summary_definition)
@@ -231,13 +240,17 @@ impl MaintenanceDagSink {
                 };
                 let mut target_output = output.clone();
                 target_output.policy_fp = target;
-                derived.push((target_output, value.as_ref().as_ref().clone_boxed_core()));
+                derived.push((
+                    Some(key),
+                    target_output,
+                    value.as_ref().as_ref().clone_boxed_core(),
+                ));
             }
         }
         if matched {
             Ok(derived)
         } else {
-            Ok(vec![(output, (*source).clone_boxed_core())])
+            Ok(vec![(None, output, (*source).clone_boxed_core())])
         }
     }
 }
@@ -287,7 +300,25 @@ impl OutputSink for MaintenanceDagSink {
                     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?,
             );
         }
-        self.inner.emit_batch(transformed)
+        if transformed.iter().all(|(key, _, _)| key.is_none()) {
+            return self.inner.emit_batch(
+                transformed
+                    .into_iter()
+                    .map(|(_, output, state)| (output, state))
+                    .collect(),
+            );
+        }
+        // The generic sink can partially accept a batch. Acknowledge each
+        // maintained output independently so retries skip only accepted writes.
+        for (key, output, state) in transformed {
+            match key {
+                Some(key) => self
+                    .commits
+                    .publish(&key, || self.inner.emit_batch(vec![(output, state)]))?,
+                None => self.inner.emit_batch(vec![(output, state)])?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -337,6 +368,128 @@ mod tests {
         let mut accumulator = SumAccumulator::new();
         accumulator.update(value);
         Arc::new(accumulator)
+    }
+
+    // A failed downstream write must be retried, while accepted outputs remain
+    // idempotent when the same maintenance lineage is replayed.
+    #[test]
+    fn downstream_failure_does_not_acknowledge_maintenance_publication() {
+        use crate::storage_engines::types::{
+            ActivePhysicalPlan, HotReloadActivePhysicalPlan, StreamingConfig,
+        };
+        use control_plane::physical::executable_binding::{
+            InstalledPostAsapDag, PostAsapDagDocument,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct FailOnceSink {
+            attempts: AtomicUsize,
+            accepted: AtomicUsize,
+            fail_at: usize,
+        }
+        impl OutputSink for FailOnceSink {
+            fn emit_batch(
+                &self,
+                outputs: Vec<(PrecomputedOutput, Box<dyn AggregateCore>)>,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                if outputs.is_empty() {
+                    return Ok(());
+                }
+                if self.attempts.fetch_add(1, Ordering::SeqCst) == self.fail_at {
+                    return Err("temporary store failure".into());
+                }
+                self.accepted.fetch_add(outputs.len(), Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../docs/examples/asapquery-planning-snapshot.json"
+            ))
+            .unwrap();
+        let mut bundle = snapshot.compile().unwrap();
+        let mut query = node(2);
+        query.output_state = planner_types::post_asap::ExecutionDataState::READ_ROWS;
+        let dag = ExecutableDag {
+            nodes: vec![node(0), node(1), query],
+            edges: vec![edge(0, 1), edge(1, 2)],
+            root: PostAsapNodeId(2),
+        };
+        let binding = BackendExecutableBinding {
+            nodes: BTreeMap::from([
+                (
+                    PostAsapNodeId(0),
+                    BackendNodeBinding::Materialization {
+                        summary_definition: definition(1),
+                    },
+                ),
+                (
+                    PostAsapNodeId(1),
+                    BackendNodeBinding::Materialization {
+                        summary_definition: definition(2),
+                    },
+                ),
+                (
+                    PostAsapNodeId(2),
+                    BackendNodeBinding::Query {
+                        query_node: control_plane::query_plan::QueryNodeId(9),
+                    },
+                ),
+            ]),
+            query_sink: PostAsapNodeId(2),
+            query_plan_sink: control_plane::query_plan::QueryNodeId(9),
+            precompute_sinks: vec![PostAsapNodeId(1)],
+        };
+        bundle.precompute_plan.executable_dags = BTreeMap::from([(
+            "retry".into(),
+            InstalledPostAsapDag {
+                document: PostAsapDagDocument::from_executable("retry".into(), &dag).unwrap(),
+                binding,
+            },
+        )]);
+        let active = ActivePhysicalPlan {
+            envelope: bundle.precompute_plan.envelope.clone(),
+            summary_catalog: Some(Arc::new(bundle.summary_catalog)),
+            precompute_plan: bundle.precompute_plan,
+            transmission_plan: bundle.transmission_plan,
+            runtime_config: Arc::new(StreamingConfig::new(Default::default())),
+            query_plan: Arc::new(bundle.query_plan),
+            storage_routing: Arc::new(Default::default()),
+        };
+        for fail_at in [0, 1] {
+            let downstream = Arc::new(FailOnceSink {
+                fail_at,
+                ..Default::default()
+            });
+            let sink = MaintenanceDagSink::new(
+                downstream.clone(),
+                HotReloadStreamingConfig::from_active(HotReloadActivePhysicalPlan::new(
+                    active.clone(),
+                )),
+            );
+            let batch = || {
+                (0..2)
+                    .map(|i| {
+                        (
+                            PrecomputedOutput::new(
+                                i * 10,
+                                (i + 1) * 10,
+                                None,
+                                asap_types::PolicyFingerprint(1),
+                            ),
+                            sum(2.0).clone_boxed_core(),
+                        )
+                    })
+                    .collect()
+            };
+            assert!(sink.emit_batch(batch()).is_err());
+            sink.emit_batch(batch()).unwrap();
+            sink.emit_batch(batch()).unwrap();
+            assert_eq!(downstream.accepted.load(Ordering::SeqCst), 2);
+            assert_eq!(downstream.attempts.load(Ordering::SeqCst), 3);
+        }
     }
 
     #[test]
@@ -396,8 +549,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.as_ref().aux_stats().sum, Some(4.0));
-        assert!(commits.claim_publish(&key).unwrap());
-        assert!(!commits.claim_publish(&key).unwrap());
+        commits.publish(&key, || Ok(())).unwrap();
+        commits
+            .publish(&key, || panic!("accepted lineage must not publish twice"))
+            .unwrap();
     }
 
     #[test]
