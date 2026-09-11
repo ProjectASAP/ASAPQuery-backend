@@ -408,8 +408,9 @@ for tenant paths and unsupported constructs.
 
 Use a **dedicated test ClickHouse server** at `http://127.0.0.1:8123`, with
 credentials supplied through `CLICKHOUSE_USER`/`CLICKHOUSE_PASSWORD` if needed.
-The real process fixture creates and drops `default.telemetry` and
-`default.divisors`; do not point it at a production database. It loads samples,
+The real process fixture drops and recreates `default.telemetry` and
+`default.divisors` at the start of each scenario, and leaves the final tables
+on the dedicated server; do not point it at a production database. It loads samples,
 compiles an actual mixed query, publishes the shared plans, queries the backend,
 and cleans up its child backend. The native server remains yours to manage.
 
@@ -503,7 +504,10 @@ For recorded datasets, see the [replay guide](docs/user_guide/o11y-replay.md) an
 [execution calibration](tools/o11y-execution/CALIBRATION.md). Report correctness,
 fallbacks, build/update cost and whole-deployment resources separately from
 query latency. Manual examples leave evidence directories intact; remove them
-only when no longer needed.
+only when no longer needed. PID-file cleanup commands apply only to the
+still-running backend started by that manual run. The ClickHouse fixture leaves
+its final tables on your dedicated native server; remove those test tables or
+discard that test server separately after collecting evidence.
 
 ## Repository map
 
