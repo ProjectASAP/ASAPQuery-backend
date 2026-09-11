@@ -118,6 +118,7 @@ pub async fn compile_clickhouse_workload(
         tables: request.tables.clone(),
     };
     let mut entries = std::collections::BTreeMap::new();
+    let mut installed_dags = std::collections::BTreeMap::new();
     for query in &request.queries {
         let planned = plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
         let PhysicalExpr::Committed(crate::physical::post_asap::PostAsapPlan::Summary(root)) =
@@ -127,7 +128,11 @@ pub async fn compile_clickhouse_workload(
                 "SQL did not produce a summary DAG".into(),
             ));
         };
-        let executable = QueryPlanEntry::compile_bound_relational(
+        let semantic = planner_types::post_asap::compile_executable_dag_with_node_ids(&root)
+            .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+        let mut materialization_nodes = std::collections::BTreeMap::new();
+        let mut query_nodes = std::collections::BTreeMap::new();
+        let executable = QueryPlanEntry::compile_bound_relational_mapped(
             query.sql.clone(),
             planned.canonical_sql.clone(),
             &root,
@@ -142,9 +147,34 @@ pub async fn compile_clickhouse_workload(
                 cumulative_readout: query.cumulative,
             },
             FallbackPolicy::ExactBackend,
-            |node, family| bind_selected_node(node, family, query, request),
+            |node, family| {
+                let binding = bind_selected_node(node, family, query, request)?;
+                let id = semantic.node_ids.node_id(node).ok_or_else(|| {
+                    crate::query_plan::QueryPlanError::Invalid(
+                        "selected SQL node is absent from semantic DAG".into(),
+                    )
+                })?;
+                materialization_nodes.insert(id, binding.materialization);
+                Ok(binding)
+            },
+            |node, query_node| {
+                if let Some(id) = semantic.node_ids.node_id(node) {
+                    query_nodes.insert(id, query_node);
+                }
+            },
         )
         .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+        let installed = crate::physical::executable_binding::install_selected_dag(
+            query.sql.clone(),
+            &semantic.dag,
+            executable.root,
+            |id| materialization_nodes.get(&id).copied(),
+            |id| query_nodes.get(&id).copied(),
+        )
+        .map_err(ClickHousePlanningError::Lower)?;
+        crate::physical::executable_binding::validate_query_plan(&installed, &executable)
+            .map_err(ClickHousePlanningError::Lower)?;
+        installed_dags.insert(query.sql.clone(), installed);
         if executable
             .nodes
             .values()
@@ -154,32 +184,6 @@ pub async fn compile_clickhouse_workload(
                 "compiled SQL contains an unsupported operator; publication refused".into(),
             ));
         }
-        let bindings = executable.materialization_bindings();
-        let identities = bindings
-            .iter()
-            .map(|binding| {
-                request
-                    .sds
-                    .materializations
-                    .get(&binding.materialization)
-                    .ok_or_else(|| {
-                        ClickHousePlanningError::Lower(
-                            "compiled SQL binding is absent from SDS".into(),
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        // Descriptor references are already represented by each DAG's
-        // MaterializationBinding and validated through SummaryCatalog.
-        let _descriptor_ids = identities
-            .iter()
-            .map(|identity| {
-                (
-                    &identity.summary_descriptor_id,
-                    &identity.data_descriptor_id,
-                )
-            })
-            .collect::<Vec<_>>();
         let identity = QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &planned.canonical_sql);
         if entries.insert(identity.clone(), executable).is_some() {
             return Err(ClickHousePlanningError::Lower(format!(
@@ -187,9 +191,11 @@ pub async fn compile_clickhouse_workload(
             )));
         }
     }
+    let mut precompute_plan = request.precompute_plan.clone();
+    precompute_plan.executable_dags = installed_dags;
     let publication = crate::physical::publication::PhysicalPlanPublication {
         summary_catalog: request.sds.clone(),
-        precompute_plan: request.precompute_plan.clone(),
+        precompute_plan,
         collector_plans: Vec::new(),
         transmission_plan: request.transmission_plan.clone(),
         query_plan: QueryPlan {
@@ -632,6 +638,21 @@ mod tests {
             }],
         };
         let publication = compile_clickhouse_workload(&request).await.unwrap();
+        let installed = publication
+            .precompute_plan
+            .executable_dags
+            .get(&request.queries[0].sql)
+            .unwrap();
+        installed.validate().unwrap();
+        assert_eq!(installed.binding.precompute_sinks.len(), 1);
+        assert_eq!(
+            installed.binding.nodes.len(),
+            installed.document.nodes.len()
+        );
+        assert!(installed.binding.nodes.values().any(|binding| matches!(
+            binding,
+            crate::physical::executable_binding::BackendNodeBinding::Query { .. }
+        )));
         let entry = publication.query_plan.entries.values().next().unwrap();
         assert!(entry
             .nodes
