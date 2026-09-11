@@ -15,7 +15,7 @@ async fn single_source_maintenance_is_automatic_and_durable() {
     entry["time_selection"]["lookback"] = 60_000.into();
     fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
     let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
-        serde_json::from_value(fixture).unwrap();
+        serde_json::from_value(fixture.clone()).unwrap();
     let plan = snapshot.compile().unwrap();
     assert_eq!(plan.precompute_plan.materializations.len(), 2);
     let source = plan
@@ -191,6 +191,65 @@ async fn single_source_maintenance_is_automatic_and_durable() {
             .await,
             204,
             "closed generation accepted a new physical population after restart"
+        );
+        drop(restarted);
+        // Reopening admission in a new generation must not expose the prior
+        // singleton-derived output while new source populations can arrive.
+        let mut next_fixture = fixture.clone();
+        next_fixture["environment"]["plan_version"] = 2.into();
+        let next = serde_json::from_value::<
+            control_plane::physical::compiler::BackendLocalPlanningSnapshot,
+        >(next_fixture)
+        .unwrap()
+        .compile()
+        .unwrap();
+        let next_install = data_plane::drivers::query::servers::http::PhysicalPlanInstallRequest {
+            summary_catalog: next.summary_catalog,
+            collector_plans: next.collector_plans,
+            precompute_plan: next.precompute_plan,
+            transmission_plan: next.transmission_plan,
+            query_plan: next.query_plan,
+            storage_routing: None,
+            adaptation_evidence: vec![],
+        };
+        std::fs::write(&artifact, serde_json::to_vec(&next_install).unwrap()).unwrap();
+        let port = unused_port();
+        let backend = format!("http://127.0.0.1:{port}");
+        let mut next_generation = spawn(port);
+        wait_until_ready(
+            &client,
+            &format!("{backend}/api/v1/health"),
+            &mut next_generation.0,
+        )
+        .await;
+        let stale: Value = client
+            .get(format!("{backend}/api/v1/query"))
+            .query(&[("query", QUERY), ("time", "60")])
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            !is_warm(&stale),
+            "new generation reused old singleton output: {stale}"
+        );
+        assert_eq!(
+            remote_write(
+                &client,
+                &backend,
+                &WriteRequest {
+                    timeseries: vec![series_with_labels(
+                        "immutable_value",
+                        &[("instance", "next"), ("job", "worker")],
+                        &[(1_000, 17.0)]
+                    )]
+                }
+            )
+            .await,
+            204,
+            "new generation must reopen raw admission"
         );
     }
 }
