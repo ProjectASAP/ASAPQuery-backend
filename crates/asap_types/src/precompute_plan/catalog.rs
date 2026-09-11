@@ -87,7 +87,8 @@ impl PrecomputePlan {
                     .map_err(invalid)?;
             }
             let expected_projection = config.effective_value_projection();
-            if data.partitioning != config.partitioning
+            if data.population_key_encoding != config.population_key_encoding
+                || data.partitioning != config.partitioning
                 || data.timestamp_column != config.table_timestamp_column
                 || data.source != expected_source
                 || &data.value_projection != expected_projection

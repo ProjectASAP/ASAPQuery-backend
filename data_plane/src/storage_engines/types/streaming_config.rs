@@ -133,6 +133,11 @@ impl StreamingConfig {
                     num_aggregates_to_retain,
                     QueryLanguage::PromQl,
                 )?;
+                if !config.population_key_encoding.is_legacy() {
+                    anyhow::bail!(
+                        "legacy streaming input does not support this population key encoding"
+                    );
+                }
                 if config.derived_input.is_some() {
                     anyhow::bail!(
                         "legacy streaming input cannot execute a derived summary program"
@@ -205,6 +210,33 @@ mod tests {
         assert!(error
             .to_string()
             .contains("legacy streaming input cannot execute"));
+    }
+
+    #[test]
+    fn legacy_yaml_rejects_canonical_population_key_encoding() {
+        let data: Value = serde_yaml::from_str(
+            r#"
+aggregations:
+- aggregationType: Sum
+  aggregationSubType: ''
+  metric: m
+  population_key_encoding: canonical_labels_v1
+  labels:
+    grouping: [host]
+    rollup: []
+    aggregated: []
+  parameters: {}
+  windowSize: 60
+  windowType: tumbling
+  spatialFilter: ''
+"#,
+        )
+        .unwrap();
+        let error = StreamingConfig::from_yaml_data(&data).unwrap_err();
+        assert!(
+            error.to_string().contains("population key encoding"),
+            "{error}"
+        );
     }
 
     /// PR 5: a streaming-config YAML that omits `aggregationId`

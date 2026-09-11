@@ -410,6 +410,11 @@ impl PrecomputePlan {
             return Err(PrecomputePlanError::UnsupportedIngestEndpoint);
         }
         for config in &self.materializations {
+            if !config.population_key_encoding.is_legacy() {
+                return Err(PrecomputePlanError::CatalogContract(
+                    "population key encoding is not supported by the installed runtime".into(),
+                ));
+            }
             let Some(derived) = &config.derived_input else {
                 continue;
             };
@@ -762,6 +767,29 @@ mod source_window_cohort_tests {
         }))
         .unwrap()
     }
+    #[test]
+    fn canonical_population_encoding_is_not_yet_installable() {
+        let mut config = full_window();
+        config.slide_interval = config.window_size;
+        config.population_key_encoding =
+            crate::grouping_projection::PopulationKeyEncoding::CanonicalLabelsV1;
+        let envelope = PlanEnvelope {
+            plan_id: 1,
+            plan_version: 1,
+            generated_at_unix_ms: 0,
+            activation_unix_ms: 0,
+            expiry_unix_ms: None,
+            backend_compat: "test".into(),
+            planner_revision: "test".into(),
+            capability_snapshot_id: "test".into(),
+        };
+        let error = PrecomputePlan::build_backend_local(envelope, vec![config]).unwrap_err();
+        assert!(
+            error.to_string().contains("population key encoding"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn full_sliding_cohort_preserves_explicit_windows_and_identity() {
         let target = full_window();

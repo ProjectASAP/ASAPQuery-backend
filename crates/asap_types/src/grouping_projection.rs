@@ -3,6 +3,21 @@ use crate::KeyByLabelNames;
 use planner_types::pre_asap::{Column, DataType};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Version of the population-key routing contract. Choosing a new version
+/// changes materialization and data identity; it never migrates old SIDs.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PopulationKeyEncoding {
+    #[default]
+    LegacyDelimited,
+    CanonicalLabelsV1,
+}
+impl PopulationKeyEncoding {
+    pub fn is_legacy(&self) -> bool {
+        *self == Self::LegacyDelimited
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GroupingProjection(Vec<Column>);
 
