@@ -2734,7 +2734,7 @@ mod tests {
                     rules: Vec::new(),
                 },
                 runtime_config: streaming_config.clone(),
-                query_plan: Arc::new(control_plane::query_plan::QueryPlan {
+                query_plan: Arc::new(asap_types::query_plan::QueryPlan {
                     plan_id: 7,
                     plan_version: 1,
                     clickhouse_context: None,
@@ -6216,13 +6216,13 @@ async fn handle_post_physical_plan(
         .query_plan
         .entries
         .values()
-        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::MetricsQl)
+        .filter(|entry| entry.language == asap_types::query_plan::QueryLanguage::MetricsQl)
         .count();
     let clickhouse_plan_count = active
         .query_plan
         .entries
         .values()
-        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::ClickHouseSql)
+        .filter(|entry| entry.language == asap_types::query_plan::QueryLanguage::ClickHouseSql)
         .count();
     let plan_version = active.plan_version();
     let now = unix_time_ms();
@@ -6298,7 +6298,7 @@ async fn handle_activate_physical_plan(
         .query_plan
         .entries
         .values()
-        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::ClickHouseSql)
+        .filter(|entry| entry.language == asap_types::query_plan::QueryLanguage::ClickHouseSql)
         .count();
     if old.plan_id() != 0 {
         let draining_id = old.plan_id();
@@ -7179,7 +7179,7 @@ mod catalog_install_tests {
         let before = handle.snapshot();
         let mut candidate = request();
         candidate.query_plan.clickhouse_context =
-            Some(control_plane::query_plan::ClickHousePlanningContext {
+            Some(asap_types::query_plan::ClickHousePlanningContext {
                 tables: Default::default(),
                 accuracy: planner_types::types::AccuracyTarget::Exact,
             });
@@ -7188,8 +7188,8 @@ mod catalog_install_tests {
             .entries
             .pop_first()
             .expect("fixture has a query entry");
-        entry.language = control_plane::query_plan::QueryLanguage::ClickHouseSql;
-        entry.fixed_evaluation = Some(control_plane::query_plan::FixedEvaluationRange {
+        entry.language = asap_types::query_plan::QueryLanguage::ClickHouseSql;
+        entry.fixed_evaluation = Some(asap_types::query_plan::FixedEvaluationRange {
             start_ms: 0,
             end_ms: 1_000,
             cumulative: true,
@@ -7199,7 +7199,7 @@ mod catalog_install_tests {
             .nodes
             .values_mut()
             .find_map(|node| match node {
-                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
                     Some(binding)
                 }
                 _ => None,
@@ -7272,7 +7272,7 @@ mod catalog_install_tests {
             .values_mut()
             .flat_map(|entry| entry.nodes.values_mut())
             .find_map(|node| match node {
-                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
                     Some(binding)
                 }
                 _ => None,
@@ -7287,22 +7287,20 @@ mod catalog_install_tests {
         let mut request = request();
         let key = request.query_plan.entries.keys().next().unwrap().clone();
         let mut entry = request.query_plan.entries.remove(&key).unwrap();
-        entry.language = control_plane::query_plan::QueryLanguage::MetricsQl;
+        entry.language = asap_types::query_plan::QueryLanguage::MetricsQl;
         let binding = entry
             .nodes
             .values_mut()
             .find_map(|node| match node {
-                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
                     Some(binding)
                 }
                 _ => None,
             })
             .expect("demo has maintained summaries");
         binding.pane_origin_ms = Some(1);
-        let key = control_plane::query_plan::QueryPlan::catalog_key(
-            entry.language,
-            &entry.canonical_query,
-        );
+        let key =
+            asap_types::query_plan::QueryPlan::catalog_key(entry.language, &entry.canonical_query);
         request.query_plan.entries.insert(key, entry);
         let error = install(request).unwrap_err();
         assert!(error.contains("pane origin"), "{error}");

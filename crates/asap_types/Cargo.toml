@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+promql-parser.workspace = true
 base64 = "0.21"
 tracing.workspace = true
 serde.workspace = true

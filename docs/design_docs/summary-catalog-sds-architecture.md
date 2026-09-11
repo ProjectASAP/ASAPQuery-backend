@@ -162,8 +162,12 @@ bindings against QueryPlan; precompute execution consumes the shared contract.
 `PrecomputePlan`, its envelope, ingest, producer, state schema, and catalog
 consistency checks live in `asap_types::precompute_plan`. The compiler chooses
 materializations and placement; data-plane installation uses the shared
-contract. `QueryPlan` definitions still reside in the control-plane
-crate while their remaining compilation methods are separated from wire types.
+contract. `asap_types::query_plan` owns QueryPlan, materialization bindings,
+logical operator DTOs, and activation validation. The control plane reexports
+those types for existing callers and owns the `compile_bound*` and
+`logical::compile_logical` functions; Planner traversal and AST lowering do not
+move into the shared contract. Data-plane engines import the shared types
+directly. No wrapper plan or second wire definition is introduced.
 
 The implemented ownership split is:
 

@@ -654,7 +654,7 @@ mod tests {
         let binding = BackendExecutableBinding {
             nodes: BTreeMap::new(),
             query_sink: PostAsapNodeId(2),
-            query_plan_sink: control_plane::query_plan::QueryNodeId(2),
+            query_plan_sink: asap_types::query_plan::QueryNodeId(2),
             precompute_sinks: vec![PostAsapNodeId(1)],
         };
         let adapter = OperatorAdapter {
@@ -841,12 +841,12 @@ mod tests {
                 (
                     PostAsapNodeId(2),
                     BackendNodeBinding::Query {
-                        query_node: control_plane::query_plan::QueryNodeId(9),
+                        query_node: asap_types::query_plan::QueryNodeId(9),
                     },
                 ),
             ]),
             query_sink: PostAsapNodeId(2),
-            query_plan_sink: control_plane::query_plan::QueryNodeId(9),
+            query_plan_sink: asap_types::query_plan::QueryNodeId(9),
             precompute_sinks: vec![PostAsapNodeId(1)],
         };
         bundle.precompute_plan.executable_dags = BTreeMap::from([(
@@ -970,12 +970,12 @@ mod tests {
                 .chain([(
                     PostAsapNodeId(4),
                     BackendNodeBinding::Query {
-                        query_node: control_plane::query_plan::QueryNodeId(9),
+                        query_node: asap_types::query_plan::QueryNodeId(9),
                     },
                 )])
                 .collect(),
             query_sink: PostAsapNodeId(4),
-            query_plan_sink: control_plane::query_plan::QueryNodeId(9),
+            query_plan_sink: asap_types::query_plan::QueryNodeId(9),
             precompute_sinks: vec![PostAsapNodeId(3)],
         };
         let source = sum(2.0);
@@ -1043,12 +1043,12 @@ mod tests {
                 (
                     PostAsapNodeId(2),
                     BackendNodeBinding::Query {
-                        query_node: control_plane::query_plan::QueryNodeId(9),
+                        query_node: asap_types::query_plan::QueryNodeId(9),
                     },
                 ),
             ]),
             query_sink: PostAsapNodeId(2),
-            query_plan_sink: control_plane::query_plan::QueryNodeId(9),
+            query_plan_sink: asap_types::query_plan::QueryNodeId(9),
             precompute_sinks: vec![PostAsapNodeId(1)],
         };
         let adapter = OperatorAdapter {
