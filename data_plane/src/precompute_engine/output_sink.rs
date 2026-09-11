@@ -404,6 +404,7 @@ mod tests {
         // via `PolicyFingerprint::from_config`. Callers obtain the id
         // via `config.policy_fp_u64()`.
         AggregationConfig {
+            population_key_encoding: Default::default(),
             aggregation_type: AggregationType::Sum,
             aggregation_sub_type: String::new(),
             parameters: HashMap::new(),
