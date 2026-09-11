@@ -205,7 +205,7 @@ Compare complete series/label sets; never normalize away output-label errors.
 The finite multi-source stack has real single-population process coverage.
 Wider canonical multi-group activation is separately under validation: a
 20/40-group `quantile(0.9, ...)` probe exposed a DDS rank/interpolation mismatch
-(native result 38). Do not use the pending activation as a passed accuracy or
+(PromQL mathematical reference 38). Do not use the pending activation as a passed accuracy or
 performance result. The actual selected family's semantics and error bound must
 pass before that scope is described as supported.
 
