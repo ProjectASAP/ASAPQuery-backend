@@ -51,6 +51,67 @@ async fn wait_http(client: &reqwest::Client, url: &str, child: &mut Child) {
     panic!("data plane did not become ready at {url}");
 }
 
+async fn spawn_backend(
+    clickhouse_url: &str,
+    user: Option<&str>,
+    password: Option<&str>,
+    output: &std::path::Path,
+    bootstrap: &std::path::Path,
+    api_port: u16,
+    sql_port: u16,
+) -> ChildGuard {
+    let client = reqwest::Client::new();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_data_plane"));
+    command
+        .arg("--streaming-config")
+        .arg(bootstrap)
+        .arg("--http-port")
+        .arg(api_port.to_string())
+        .arg("--clickhouse-http-port")
+        .arg(sql_port.to_string())
+        .arg("--clickhouse-url")
+        .arg(&clickhouse_url)
+        .arg("--clickhouse-backfill-table")
+        .arg("deployment_default_not_the_job_table")
+        .arg("--clickhouse-backfill-database")
+        .arg("default")
+        .arg("--clickhouse-backfill-value-column")
+        .arg("wrong_value")
+        .arg("--enable-backfill-worker")
+        .arg("--precompute-allowed-lateness-ms")
+        .arg("0")
+        .arg("--precompute-flush-interval-ms")
+        .arg("50")
+        .arg("--persistence-delete-older-than-secs")
+        .arg("0")
+        .arg("--output-dir")
+        .arg(output)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .env("RUST_LOG", "data_plane=info");
+    if let Some(user) = user {
+        command.arg("--clickhouse-user").arg(user);
+    }
+    if let Some(password) = password {
+        command.arg("--clickhouse-password").arg(password);
+    }
+    let mut process = ChildGuard(command.spawn().unwrap());
+    wait_http(
+        &client,
+        &format!("http://127.0.0.1:{api_port}/api/v1/health"),
+        &mut process.0,
+    )
+    .await;
+    wait_http(
+        &client,
+        &format!("http://127.0.0.1:{sql_port}/ping"),
+        &mut process.0,
+    )
+    .await;
+
+    process
+}
+
 fn mixed_workload(sql: &str) -> control_plane::clickhouse::ClickHouseSqlAutomaticWorkload {
     use control_plane::physical::compiler::{PlanEnvelope, BACKEND_COMPAT, PLANNER_REVISION};
     use planner_types::pre_asap::{Column, DataType, Schema};
@@ -285,51 +346,14 @@ async fn run_mixed_aggregate(aggregate: &str) {
     let output = tempfile::tempdir().unwrap();
     let mut bootstrap = tempfile::NamedTempFile::new().unwrap();
     writeln!(bootstrap, "aggregations: []").unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_data_plane"));
-    command
-        .arg("--streaming-config")
-        .arg(bootstrap.path())
-        .arg("--http-port")
-        .arg(api_port.to_string())
-        .arg("--clickhouse-http-port")
-        .arg(sql_port.to_string())
-        .arg("--clickhouse-url")
-        .arg(&clickhouse_url)
-        .arg("--clickhouse-backfill-table")
-        .arg("deployment_default_not_the_job_table")
-        .arg("--clickhouse-backfill-database")
-        .arg("default")
-        .arg("--clickhouse-backfill-value-column")
-        .arg("wrong_value")
-        .arg("--enable-backfill-worker")
-        .arg("--precompute-allowed-lateness-ms")
-        .arg("0")
-        .arg("--precompute-flush-interval-ms")
-        .arg("50")
-        .arg("--persistence-delete-older-than-secs")
-        .arg("0")
-        .arg("--output-dir")
-        .arg(output.path())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .env("RUST_LOG", "data_plane=info");
-    if let Some(user) = &user {
-        command.arg("--clickhouse-user").arg(user);
-    }
-    if let Some(password) = &password {
-        command.arg("--clickhouse-password").arg(password);
-    }
-    let mut process = ChildGuard(command.spawn().unwrap());
-    wait_http(
-        &client,
-        &format!("http://127.0.0.1:{api_port}/api/v1/health"),
-        &mut process.0,
-    )
-    .await;
-    wait_http(
-        &client,
-        &format!("http://127.0.0.1:{sql_port}/ping"),
-        &mut process.0,
+    let _process = spawn_backend(
+        &clickhouse_url,
+        user.as_deref(),
+        password.as_deref(),
+        output.path(),
+        bootstrap.path(),
+        api_port,
+        sql_port,
     )
     .await;
 
@@ -465,4 +489,186 @@ async fn run_mixed_aggregate(aggregate: &str) {
             "compiled mixed result must equal pre-mutation exact baseline"
         );
     }
+}
+
+#[tokio::test]
+async fn collection_sql_executes_local_elements_after_typed_exact_leaf() {
+    use asap_types::query_plan::QueryPlanNode;
+    use planner_types::{
+        post_asap::ValueOperation,
+        pre_asap::{Column, DataType, QueryExpr, Schema},
+    };
+    let Ok(clickhouse_url) = std::env::var("CLICKHOUSE_URL") else {
+        eprintln!("skipping collection process E2E because CLICKHOUSE_URL is unset");
+        return;
+    };
+    let user = std::env::var("CLICKHOUSE_USER").ok();
+    let password = std::env::var("CLICKHOUSE_PASSWORD").ok();
+    let client = reqwest::Client::new();
+    let table = format!("asap_collection_elements_{}", std::process::id());
+    for sql in [
+        format!("CREATE TABLE default.{table}(timestamp Int64, samples Array(Float64), nullable_samples Array(Nullable(Float64)), tuples Array(Tuple(ts Int64, value Nullable(Float64))), position Nullable(Int64)) ENGINE=Memory"),
+        format!("INSERT INTO default.{table} VALUES (100,[10,20],[10,20],[(1,5.5)],-1),(200,[3.5],[3.5],[(1,NULL)],9),(300,[],[],[],1),(400,[7.5],[NULL],[(1,3.5)],1),(500,[1],[1],[(1,9.5)],NULL),(2000,[999],[999],[(1,999)],1)"),
+    ] {
+        let mut request = client.post(&clickhouse_url).body(sql);
+        if let Some(user) = &user { request = request.basic_auth(user, password.as_ref()); }
+        let response = request.send().await.unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "native collection fixture: {body}");
+    }
+    let sql = format!("SELECT arrayElement(samples, position) AS result, arrayElement(nullable_samples, position) AS nullable_result, tupleElement(arrayElement(tuples, 1), 'value') AS tuple_result FROM {table} WHERE timestamp >= 0 AND timestamp < 2000 ORDER BY result NULLS FIRST");
+    let mut workload = mixed_workload(&sql);
+    workload.tables = HashMap::from([(
+        table.clone(),
+        Schema::with_time_index(
+            vec![
+                Column::new("timestamp", DataType::Int64, false),
+                Column::new(
+                    "samples",
+                    DataType::List {
+                        element: Box::new(Column::new("item", DataType::Float64, false)),
+                    },
+                    false,
+                ),
+                Column::new(
+                    "nullable_samples",
+                    DataType::List {
+                        element: Box::new(Column::new("item", DataType::Float64, true)),
+                    },
+                    false,
+                ),
+                Column::new(
+                    "tuples",
+                    DataType::List {
+                        element: Box::new(Column::new(
+                            "item",
+                            DataType::Struct {
+                                fields: vec![
+                                    Column::new("ts", DataType::Int64, false),
+                                    Column::new("value", DataType::Float64, true),
+                                ],
+                            },
+                            false,
+                        )),
+                    },
+                    false,
+                ),
+                Column::new("position", DataType::Int64, true),
+            ],
+            0,
+            vec![],
+        ),
+    )]);
+    let (publication, trace) =
+        control_plane::clickhouse::compile_automatic_clickhouse_workload(&workload)
+            .await
+            .unwrap();
+    assert!(publication.precompute_plan.materializations.is_empty());
+    let entry = publication.query_plan.entries.values().next().unwrap();
+    assert!(entry
+        .nodes
+        .values()
+        .any(|node| matches!(node, QueryPlanNode::ExternalExact { .. })));
+    for function in ["asap_element_access", "asap_struct_field"] {
+        assert!(entry.nodes.values().any(|node| {
+            let QueryPlanNode::Relational { operation, .. } = node else { return false; };
+            let ValueOperation::Project { cols, .. } = serde_json::from_value(operation.clone()).unwrap() else { return false; };
+            cols.iter().any(|column| matches!(&column.expr, QueryExpr::FunctionCall { name, .. } if name == function))
+        }), "Planner-selected DAG must preserve local {function} evaluation");
+    }
+    eprintln!(
+        "collection Planner selection: {}",
+        serde_json::to_string(&trace).unwrap()
+    );
+    let install = publication.install_request(None, Vec::new()).unwrap();
+    let api_port = unused_port();
+    let sql_port = unused_port();
+    let output = tempfile::tempdir().unwrap();
+    let mut bootstrap = tempfile::NamedTempFile::new().unwrap();
+    writeln!(bootstrap, "aggregations: []").unwrap();
+    let _process = spawn_backend(
+        &clickhouse_url,
+        user.as_deref(),
+        password.as_deref(),
+        output.path(),
+        bootstrap.path(),
+        api_port,
+        sql_port,
+    )
+    .await;
+    let response = client
+        .post(format!("http://127.0.0.1:{api_port}/api/v1/physical-plan"))
+        .json(&install)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert!(status.is_success(), "stage collection publication: {body}");
+    let response = client
+        .post(format!(
+            "http://127.0.0.1:{api_port}/api/v1/physical-plan/activate"
+        ))
+        .json(&serde_json::json!({"plan_id":72,"plan_version":1}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let mut native = client
+        .post(&clickhouse_url)
+        .body(format!("{sql} FORMAT JSON"));
+    if let Some(user) = &user {
+        native = native.basic_auth(user, password.as_ref());
+    }
+    let expected: serde_json::Value = native.send().await.unwrap().json().await.unwrap();
+    let mut actual_request = client
+        .get(format!("http://127.0.0.1:{sql_port}/"))
+        .query(&[("query", sql.as_str()), ("default_format", "JSON")]);
+    if let Some(user) = &user {
+        actual_request = actual_request.basic_auth(user, password.as_ref());
+    }
+    let response = actual_request.send().await.unwrap();
+    assert!(response.status().is_success());
+    assert_eq!(
+        response.headers().get("x-asap-execution").unwrap(),
+        "exact_fallback"
+    );
+    assert_eq!(
+        response.headers().get("x-asap-execution-detail").unwrap(),
+        "external_dag"
+    );
+    let actual: serde_json::Value = response.json().await.unwrap();
+    for field in ["meta", "rows"] {
+        assert_eq!(actual[field], expected[field], "{field}");
+    }
+    let actual_rows = actual["data"].as_array().unwrap();
+    let expected_rows = expected["data"].as_array().unwrap();
+    assert_eq!(actual_rows.len(), expected_rows.len());
+    for (actual, expected) in actual_rows.iter().zip(expected_rows) {
+        for field in ["result", "nullable_result", "tuple_result"] {
+            if expected[field].is_null() {
+                assert!(actual[field].is_null());
+            } else {
+                // The declared result columns are Float64; JSON 20 and 20.0 encode
+                // the same value despite different serde_json Number variants.
+                assert_eq!(
+                    actual[field].as_f64().unwrap().to_bits(),
+                    expected[field].as_f64().unwrap().to_bits(),
+                    "{field}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        actual["data"],
+        serde_json::json!([{ "result":null, "nullable_result":null, "tuple_result":9.5 },{ "result":0.0, "nullable_result":null, "tuple_result":null },{ "result":0.0, "nullable_result":null, "tuple_result":null },{ "result":7.5, "nullable_result":null, "tuple_result":3.5 },{ "result":20.0, "nullable_result":20.0, "tuple_result":5.5 }])
+    );
+    let mut cleanup = client
+        .post(&clickhouse_url)
+        .body(format!("DROP TABLE default.{table}"));
+    if let Some(user) = &user {
+        cleanup = cleanup.basic_auth(user, password.as_ref());
+    }
+    assert!(cleanup.send().await.unwrap().status().is_success());
 }
