@@ -192,8 +192,8 @@ def main():
                     process.kill()
                     process.wait()
         (args.output / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
-        if args.repetitions and (not results or any(result.get('repeated') != {'warm': args.repetitions, 'equal': args.repetitions, 'failed': 0} for result in results)):
-            raise SystemExit('Formal replay failed: every requested repetition must be warm and equal')
+    if args.repetitions and (not results or any(result.get('repeated') != {'warm': args.repetitions, 'equal': args.repetitions, 'failed': 0} for result in results)):
+        raise SystemExit('Formal replay failed: every requested repetition must be warm and equal')
 
 if __name__ == '__main__':
     main()
