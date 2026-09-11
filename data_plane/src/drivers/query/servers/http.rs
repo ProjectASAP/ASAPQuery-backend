@@ -2602,18 +2602,35 @@ mod tests {
     #[tokio::test]
     async fn no_result_error_is_not_annotated_as_warm() {
         use axum::response::IntoResponse;
-        let body = serde_json::json!({"status":"error","data":null,
-            "errorType":"bad_data","error":"No result for query"});
-        let response =
-            super::annotate_data_source(axum::Json(body.clone()).into_response(), "asap_query")
-                .await;
-        let bytes = axum::body::to_bytes(response.into_body(), 4096)
-            .await
-            .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
-            body
-        );
+        for (status, body) in [
+            (
+                StatusCode::OK,
+                serde_json::json!({"status":"error","data":null,
+                "errorType":"bad_data","error":"No result for query"}),
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"status":"success","data":{"result":[]}}),
+            ),
+            (StatusCode::OK, serde_json::json!({"status":"success"})),
+            (
+                StatusCode::OK,
+                serde_json::json!({"status":"success","data":null}),
+            ),
+        ] {
+            let response = super::annotate_data_source(
+                (status, axum::Json(body.clone())).into_response(),
+                "asap_query",
+            )
+            .await;
+            assert!(!response.headers().contains_key("x-asap-execution"));
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(actual.get("infos").is_none());
+            assert_eq!(actual, body);
+        }
     }
     use super::*;
     use crate::drivers::ingest::prometheus_remote_write::{
