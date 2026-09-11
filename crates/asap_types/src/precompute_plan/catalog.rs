@@ -78,6 +78,21 @@ impl PrecomputePlan {
                     table_ref: table_ref.clone(),
                 },
             );
+            if config.table_name.is_some()
+                && !config.grouping_labels.is_empty()
+                && data.observation_semantics
+                    != crate::grouping_projection::TABLE_GROUP_OBSERVATION_SEMANTICS
+            {
+                return Err(invalid(
+                    "table grouping codec differs from installed contract",
+                ));
+            }
+            if config.table_name.is_some() {
+                config
+                    .grouping_labels
+                    .validate_table_group_codec()
+                    .map_err(invalid)?;
+            }
             let expected_projection = config.effective_value_projection();
             if data.partitioning != config.partitioning
                 || data.timestamp_column != config.table_timestamp_column

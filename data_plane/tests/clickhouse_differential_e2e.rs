@@ -152,6 +152,12 @@ async fn exact_proxy_matches_clickhouse_for_sql_and_grafana_smoke_queries() {
 
 #[tokio::test]
 async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
+    for aggregate in ["sum(value)", "count(*)", "max(value)"] {
+        run_mixed_aggregate(aggregate).await;
+    }
+}
+
+async fn run_mixed_aggregate(aggregate: &str) {
     let Ok(clickhouse_url) = std::env::var("CLICKHOUSE_URL") else {
         eprintln!("skipping mixed process E2E because CLICKHOUSE_URL is unset");
         return;
@@ -159,31 +165,83 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
     let user = std::env::var("CLICKHOUSE_USER").ok();
     let password = std::env::var("CLICKHOUSE_PASSWORD").ok();
     let client = reqwest::Client::new();
-    let sql = "SELECT sums.timestamp, sums.total / divisors.divisor AS ratio FROM (SELECT 2000 AS timestamp, sum(value) AS total FROM telemetry WHERE metric = 'requests' AND timestamp_ms >= 0 AND timestamp_ms < 2000) AS sums INNER JOIN divisors ON sums.timestamp = divisors.timestamp";
+    eprintln!("checking mixed aggregate {aggregate}");
+    let sql = format!("SELECT sums.timestamp, sums.total / divisors.divisor AS ratio FROM (SELECT 2000 AS timestamp, {aggregate} AS total FROM telemetry WHERE metric = 'requests' AND timestamp_ms >= 0 AND timestamp_ms < 2000) AS sums INNER JOIN divisors ON sums.timestamp = divisors.timestamp");
+    let grouped = aggregate == "max(value)";
+    let sql = if grouped {
+        "SELECT labels, max(value) AS value FROM telemetry WHERE metric = 'requests' AND timestamp_ms > 1999 - 2000 AND timestamp_ms <= 1999 GROUP BY labels ORDER BY labels".to_string()
+    } else {
+        sql
+    };
+    let format = if grouped { "JSON" } else { "TabSeparated" };
+    let value_type = if aggregate == "count(*)" {
+        "Nullable(Float64)"
+    } else {
+        "Float64"
+    };
+    let create_telemetry = format!("CREATE TABLE default.telemetry(metric String, labels Map(String,String), timestamp_ms Int64, value {value_type}, wrong_value Float64) ENGINE=Memory");
     for statement in [
         "DROP TABLE IF EXISTS default.telemetry",
         "DROP TABLE IF EXISTS default.divisors",
-        "CREATE TABLE default.telemetry(metric String, labels Map(String,String), timestamp_ms Int64, value Float64, wrong_value Float64) ENGINE=Memory",
+        create_telemetry.as_str(),
         "CREATE TABLE default.divisors(timestamp Int64, divisor Float64) ENGINE=Memory",
         "INSERT INTO default.telemetry VALUES ('requests',map('member','a'),0,2,10000),('requests',map('member','b'),1100,3,10000),('errors',map('member','c'),1100,99999,10000),('requests',map('member','a'),2000,88888,10000)",
         "INSERT INTO default.divisors VALUES (2000,10)",
     ] {
-        let mut request = client.post(&clickhouse_url).body(statement);
+        let mut request = client.post(&clickhouse_url).body(statement.to_owned());
         if let Some(user) = &user {
             request = request.basic_auth(user, password.as_ref());
         }
         let response = request.send().await.unwrap();
         assert!(response.status().is_success(), "ClickHouse setup: {statement}");
     }
+    if aggregate == "count(*)" {
+        let mut request = client.post(&clickhouse_url).body(
+            "INSERT INTO default.telemetry VALUES ('requests',map('member','nullable'),1200,NULL,10000)",
+        );
+        if let Some(user) = &user {
+            request = request.basic_auth(user, password.as_ref());
+        }
+        assert!(request.send().await.unwrap().status().is_success());
+    }
     let mut exact_request = client
         .post(&clickhouse_url)
-        .body(format!("{sql} FORMAT TabSeparated"));
+        .body(format!("{sql} FORMAT {format}"));
     if let Some(user) = &user {
         exact_request = exact_request.basic_auth(user, password.as_ref());
     }
     let exact = exact_request.send().await.unwrap().bytes().await.unwrap();
 
-    let workload = mixed_workload(sql);
+    let mut workload = mixed_workload(&sql);
+    if grouped {
+        use planner_types::pre_asap::{Column, DataType};
+        workload
+            .tables
+            .get_mut("telemetry")
+            .unwrap()
+            .columns
+            .push(Column::new(
+                "labels",
+                DataType::Map {
+                    key: Box::new(DataType::Utf8),
+                    value: Box::new(DataType::Utf8),
+                    value_nullable: false,
+                },
+                false,
+            ));
+    }
+
+    workload.tables.get_mut("telemetry").unwrap().columns[1].nullable = aggregate == "count(*)";
+    if aggregate == "count(*)" {
+        let mut nullable_count = mixed_workload(&sql.replace("count(*)", "count(value)"));
+        nullable_count.tables.get_mut("telemetry").unwrap().columns[1].nullable = true;
+        let result =
+            control_plane::clickhouse::compile_automatic_clickhouse_workload(&nullable_count).await;
+        assert!(
+            result.is_err(),
+            "nullable count(value) requires explicit null exclusion"
+        );
+    }
     let (publication, selection_trace) =
         control_plane::clickhouse::compile_automatic_clickhouse_workload(&workload)
             .await
@@ -200,11 +258,22 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
     }
     assert_eq!(publication.precompute_plan.materializations.len(), 1);
     let config = publication.precompute_plan.materializations[0].clone();
+    if aggregate == "count(*)" {
+        assert_eq!(
+            config.effective_value_projection(),
+            &asap_types::sds::ValueProjectionIdentity::Constant {
+                value: planner_types::pre_asap::ScalarValue::Int64(1),
+            }
+        );
+    }
     let entry = publication.query_plan.entries.values().next().unwrap();
-    assert!(entry.nodes.values().any(|node| matches!(
-        node,
-        control_plane::query_plan::QueryPlanNode::ExternalExact { .. }
-    )));
+    assert_eq!(
+        entry.nodes.values().any(|node| matches!(
+            node,
+            control_plane::query_plan::QueryPlanNode::ExternalExact { .. }
+        )),
+        !grouped
+    );
     assert!(entry.nodes.values().any(|node| matches!(
         node,
         control_plane::query_plan::QueryPlanNode::ReadMaterialization { .. }
@@ -241,7 +310,7 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
         .arg("0")
         .arg("--output-dir")
         .arg(output.path())
-        .stdout(Stdio::null())
+        .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("RUST_LOG", "data_plane=info");
     if let Some(user) = &user {
@@ -323,7 +392,7 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
     );
 
     let mut mutate = client.post(&clickhouse_url).body(
-        "ALTER TABLE default.telemetry UPDATE value = 999 WHERE 1 SETTINGS mutations_sync = 2",
+        "ALTER TABLE default.telemetry DELETE WHERE metric = 'requests' AND timestamp_ms = 0 SETTINGS mutations_sync = 2",
     );
     if let Some(user) = &user {
         mutate = mutate.basic_auth(user, password.as_ref());
@@ -335,7 +404,7 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
 
     let mut mutated_request = client
         .post(&clickhouse_url)
-        .body(format!("{sql} FORMAT TabSeparated"));
+        .body(format!("{sql} FORMAT {format}"));
     if let Some(user) = &user {
         mutated_request = mutated_request.basic_auth(user, password.as_ref());
     }
@@ -347,7 +416,7 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
 
     let mut mixed = client
         .get(format!("http://127.0.0.1:{sql_port}/"))
-        .query(&[("query", sql)]);
+        .query(&[("query", sql.as_str()), ("default_format", format)]);
     if let Some(user) = &user {
         mixed = mixed.header("x-clickhouse-user", user);
     }
@@ -370,9 +439,30 @@ async fn compiled_publication_executes_mixed_dag_in_data_plane_process() {
         .to_owned();
     let actual = response.bytes().await.unwrap();
     assert!(status.is_success(), "mixed listener returned {status}");
-    assert_eq!(execution, "hybrid", "failure reason: {failure_reason}");
     assert_eq!(
-        actual, exact,
-        "compiled mixed result must equal pre-mutation exact baseline"
+        execution,
+        if grouped { "warm" } else { "hybrid" },
+        "failure reason: {failure_reason}"
     );
+    if grouped {
+        let actual: serde_json::Value = serde_json::from_slice(&actual).unwrap();
+        let exact: serde_json::Value = serde_json::from_slice(&exact).unwrap();
+        assert_eq!(actual["meta"], exact["meta"]);
+        let actual_rows = actual["data"].as_array().unwrap();
+        let exact_rows = exact["data"].as_array().unwrap();
+        assert_eq!(actual_rows.len(), exact_rows.len());
+        for (actual, exact) in actual_rows.iter().zip(exact_rows) {
+            assert_eq!(actual["labels"], exact["labels"]);
+            assert_eq!(
+                actual["value"].as_f64().unwrap().to_bits(),
+                exact["value"].as_f64().unwrap().to_bits()
+            );
+        }
+        assert_eq!(actual["data"].as_array().unwrap().len(), 2);
+    } else {
+        assert_eq!(
+            actual, exact,
+            "compiled mixed result must equal pre-mutation exact baseline"
+        );
+    }
 }

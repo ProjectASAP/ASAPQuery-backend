@@ -5,6 +5,7 @@
 //! node IDs. Serving executes this graph without reconstructing Planner IR or
 //! searching for compatible materializations.
 
+mod clickhouse_exact;
 pub mod logical;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -990,6 +991,9 @@ where
                         | planner_types::post_asap::ValueOperation::Filter { .. }
                         | planner_types::post_asap::ValueOperation::Sort { .. }
                         | planner_types::post_asap::ValueOperation::Limit { .. }
+                        | planner_types::post_asap::ValueOperation::Exact(
+                            planner_types::post_asap::ExactOperation::Aggregate { .. }
+                        )
                 ) =>
             {
                 QueryPlanNode::Relational {
@@ -1324,48 +1328,28 @@ where
                 }
             }
             SummaryExpr::KeepPreAsap(expr) if self.preserve_relational => {
-                let planner_types::pre_asap::QueryExpr::Scan {
-                    source: planner_types::pre_asap::Source::Table { table_ref },
-                    predicates,
-                    schema,
+                let mut expression =
+                    clickhouse_exact::render(expr).map_err(QueryPlanError::UnsupportedNode)?;
+                let mut bounded = false;
+                if let planner_types::pre_asap::QueryExpr::Scan {
+                    predicates, schema, ..
                 } = expr.as_ref()
-                else {
-                    return Err(QueryPlanError::UnsupportedNode(
-                        "SQL exact cut is not a direct table scan".into(),
-                    ));
-                };
-                if !predicates.is_empty() {
-                    return Err(QueryPlanError::UnsupportedNode(
-                        "SQL exact table cut contains unrendered predicates".into(),
-                    ));
+                {
+                    if predicates.is_empty() {
+                        if let Some(column) = schema.time_index.and_then(|i| schema.columns.get(i))
+                        {
+                            let name = format!("`{}`", column.name.replace('`', "``"));
+                            expression.push_str(&format!(
+                                " WHERE {name} >= {{from:UInt64}} AND {name} <= {{to:UInt64}}"
+                            ));
+                            bounded = true;
+                        }
+                    }
                 }
-                fn quoted(identifier: &str) -> String {
-                    identifier
-                        .split('.')
-                        .map(|part| format!("`{}`", part.replace('`', "``")))
-                        .collect::<Vec<_>>()
-                        .join(".")
-                }
-                let columns = schema
-                    .columns
-                    .iter()
-                    .map(|column| quoted(&column.name))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let time_filter = schema.time_index.and_then(|index| {
-                    schema.columns.get(index).map(|source_column| {
-                        let column = quoted(&source_column.name);
-                        format!(" WHERE {column} >= {{from:UInt64}} AND {column} <= {{to:UInt64}}")
-                    })
-                });
                 QueryPlanNode::ExternalExact {
                     request: ExternalExactRequest {
                         language: QueryLanguage::ClickHouseSql,
-                        expression: format!(
-                            "SELECT {columns} FROM {}{}",
-                            quoted(table_ref),
-                            time_filter.unwrap_or_default()
-                        ),
+                        expression,
                         output: ExternalExactOutput::Relation {
                             schema: serde_json::to_value(&node.schema).map_err(|error| {
                                 QueryPlanError::Invalid(format!(
@@ -1374,8 +1358,8 @@ where
                             })?,
                         },
                         parameters: BTreeMap::new(),
-                        start_parameter: Some("from".into()),
-                        end_parameter: Some("to".into()),
+                        start_parameter: bounded.then(|| "from".into()),
+                        end_parameter: bounded.then(|| "to".into()),
                         input_contracts: Vec::new(),
                     },
                     inputs: Vec::new(),
@@ -1402,13 +1386,18 @@ where
                     reason: "unsupported exact operation over summary output".into(),
                 }
             }
+            // Relational count bindings validate their row population and value
+            // projection in the SQL compiler; the temporal restriction belongs
+            // to the PromQL observation-count path.
             SummaryExpr::SummaryAgg {
                 family:
                     SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Count, _),
                 ..
-            } if !exact_value_executable(node) => QueryPlanNode::ExactFallback {
-                reason: "only temporal observation counts are supported".into(),
-            },
+            } if !self.preserve_relational && !exact_value_executable(node) => {
+                QueryPlanNode::ExactFallback {
+                    reason: "only temporal observation counts are supported".into(),
+                }
+            }
             SummaryExpr::BinaryOp { .. } => QueryPlanNode::ExactFallback {
                 reason: "summary binary operation is not executable by the warm tier".into(),
             },
