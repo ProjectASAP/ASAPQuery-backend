@@ -168,6 +168,7 @@ def summarize(root):
     fig.tight_layout(rect=[0, 0, 1, .95])
     fig.savefig(root / 'figure-1-alibaba.svg'); fig.savefig(root / 'figure-1-alibaba.png', dpi=150)
     relative = root.relative_to(Path.cwd()).as_posix()
+    report_url = f'https://github.com/ProjectASAP/ASAPQuery-backend/blob/eval/alibaba-dashboard-observations/{relative}/report.md'
     body = f'''## Why
 
 Evaluate recurring window dashboards on real Alibaba call observations with explicit accuracy and planning costs.
@@ -186,7 +187,7 @@ The comparison did not execute this Alibaba observation contract and dashboard w
 
 ## After this PR
 
-Reviewers can reproduce preparation/search/replay and inspect [the report]({relative}/report.md), source hashes, raw measurements and figures. This PR is stacked on the existing dashboard-comparison branch.
+Reviewers can reproduce preparation/search/replay and inspect [the report]({report_url}), source hashes, raw measurements and figures. This PR is stacked on the existing dashboard-comparison branch.
 
 ## Verification
 

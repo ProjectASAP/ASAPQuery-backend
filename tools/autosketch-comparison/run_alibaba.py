@@ -77,6 +77,15 @@ def main():
     def save_manifest():
         manifest.write_text(json.dumps(provenance,indent=2)+'\n')
 
+    def ready(index):
+        path=args.directory/f'observations_{index}.json'
+        try:
+            record=json.loads(path.read_text())
+            replay=args.directory/f'observations_{index}.bin.gz'
+            return record['index']==index and replay.stat().st_size==record['replay_bytes']
+        except (FileNotFoundError,json.JSONDecodeError):
+            return False
+
     common=[str(binary),'--directory',str(args.directory),'--calibration-files',str(args.calibration_files),
             '--total-files',str(args.total_files),'--calibration-events',str(args.calibration_events),
             '--profile-trials',str(args.profile_trials),'--memory-budget-bytes','16000000000']
@@ -98,8 +107,8 @@ def main():
     try:
         save_manifest()
         data_deadline=time.monotonic()+args.data_wait_timeout_seconds
-        # Readiness is per-file atomic metadata, never a partially written gzip.
-        while not all((args.directory/f'observations_{i}.json').exists() for i in range(args.calibration_files)):
+        # Require readable metadata and the final renamed gzip, never a partial.
+        while not all(ready(i) for i in range(args.calibration_files)):
             if time.monotonic()>data_deadline:
                 raise TimeoutError('calibration data readiness deadline exceeded')
             count=sum((args.directory/f'observations_{i}.json').exists() for i in range(args.total_files))
@@ -114,7 +123,7 @@ def main():
         provenance['calibration_sha256']=digest(calibration);save_manifest()
         for workload in WORKLOADS:
             run(args.output/f'{workload}-catalog.json',['--stage','profile','--workload',workload,'--calibration',str(calibration),'--seed','42'])
-        while not all((args.directory/f'observations_{i}.json').exists() for i in range(args.total_files)):
+        while not all(ready(i) for i in range(args.total_files)):
             if time.monotonic()>data_deadline:
                 raise TimeoutError('held-out data readiness deadline exceeded')
             status('waiting_for_held_out_data',prepared_files=sum((args.directory/f'observations_{i}.json').exists() for i in range(args.total_files)))

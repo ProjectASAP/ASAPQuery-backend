@@ -211,7 +211,7 @@ python3 tools/autosketch-comparison/run_alibaba.py \
 ```
 
 Preparation stops before another archive if fewer than 12 GiB remain. The runner
-waits for atomic per-file metadata, checkpoints immutable artifacts, and stops
+waits for readable per-file metadata and finalized replay files, checkpoints immutable artifacts, and stops
 on command errors, changed binaries, or invalid results. Its optional
 `--publish-pr` flag is restricted to the full geometry and dedicated evaluation
 branch; it publishes only after all 54 real runs pass artifact validation.
