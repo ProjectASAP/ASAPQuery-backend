@@ -196,6 +196,18 @@ reconciler emits create, update, recover, retire, garbage-collect, promote and
 expire actions. Summary payloads and the application of those actions remain in
 the SummaryStore runtime.
 
+`DataDescriptor`, precompute configuration and state-schema validation share
+`ValueProjectionIdentity`: sample value, named column, or a finite numeric
+constant using the Planner's `ScalarValue`. A constant input such as `1` does
+not masquerade as a table column. Projection identity participates in catalog
+and policy identity; existing column identities remain unchanged. Older
+`value_column` config and state-schema fields are accepted only by wire adapters
+and become the same typed projection in memory. ClickHouse backfill binds a
+constant as a typed query parameter and applies the installed table population
+and timestamp projection. Its Float64 ingest boundary rejects integer constants
+outside the exactly representable range. This contract enables literal inputs;
+query lowering must still establish each aggregate's null and row semantics.
+
 The durable `sid_metadata.json` format is versioned independently. Version 2
 contains `summary_descriptors`, `data_descriptors`, and `bindings` tables. A
 binding stores only both descriptor IDs plus SID-local timestamps. Version-1
