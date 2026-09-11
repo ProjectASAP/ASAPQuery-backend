@@ -71,6 +71,13 @@ pub struct WorkloadCostEvidence {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AlternativeCost {
+    pub alternative_id: Option<String>,
+    #[serde(default)]
+    pub logical_root_ids: Vec<String>,
+    pub physical_alternative_id: Option<String>,
+    pub identity_unavailable_reason: Option<String>,
+    #[serde(default)]
+    pub status: String,
     pub plan_id: Option<u64>,
     pub total_cost: Option<f64>,
     pub unavailable_reason: Option<String>,
@@ -86,6 +93,8 @@ pub struct MaterializationSearchCoverage {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WorkloadCostComparison {
+    #[serde(default)]
+    pub logical_selection: Vec<Value>,
     #[serde(default, alias = "index_search_coverage")]
     pub materialization_search_coverage: Option<MaterializationSearchCoverage>,
     pub data_snapshot_id: String,
@@ -341,6 +350,8 @@ pub(crate) fn exact_source_metrics(
     Ok(metrics)
 }
 
+type PricedComponents = (Cost, BTreeMap<String, f64>);
+
 impl WorkloadCostEvidence {
     fn validate(&self, env: &DeploymentEnvironment) -> Result<(), CompileError> {
         if self.backend_revision != super::compiler::BACKEND_REVISION
@@ -369,21 +380,30 @@ impl WorkloadCostEvidence {
     fn price(
         &self,
         manifest: &WorkloadCostManifest,
-    ) -> Result<(Cost, BTreeMap<String, f64>), String> {
+    ) -> Result<PricedComponents, (&'static str, String)> {
         let quotes = self
             .quotes
             .iter()
             .filter(|quote| &quote.manifest == manifest)
             .collect::<Vec<_>>();
         if quotes.len() != 1 {
-            return Err("missing or ambiguous quote for exact manifest".into());
+            return Err((
+                "evidence_missing",
+                "missing or ambiguous quote for exact manifest".into(),
+            ));
         }
         let quote = quotes[0];
         if !quote.executable {
-            return Err("provider reports unavailable implementation".into());
+            return Err((
+                "rejected",
+                "provider reports unavailable implementation".into(),
+            ));
         }
         if !quote.unit_costs.keys().eq(manifest.components.keys()) {
-            return Err("incomplete or extraneous component evidence".into());
+            return Err((
+                "evidence_invalid",
+                "incomplete or extraneous component evidence".into(),
+            ));
         }
         let mut total = 0.0;
         let mut components = BTreeMap::new();
@@ -391,16 +411,134 @@ impl WorkloadCostEvidence {
             let unit = quote.unit_costs[id];
             let cost = unit * demand.multiplicity;
             if !unit.is_finite() || unit < 0.0 || !cost.is_finite() || cost < 0.0 {
-                return Err(format!("invalid cost for {id}"));
+                return Err(("evidence_invalid", format!("invalid cost for {id}")));
             }
             total += cost;
             components.insert(id.clone(), cost);
         }
         if !total.is_finite() {
-            return Err("cost overflow".into());
+            return Err(("evidence_invalid", "cost overflow".into()));
         }
         Ok((Cost(total), components))
     }
+}
+
+fn alternative_description(candidate: &PlanningRequest) -> AlternativeCost {
+    let root_ids = candidate
+        .queries
+        .iter()
+        .map(|query| crate::planner_selection::explained_root_id(&query.post_asap, &query.accuracy))
+        .collect::<Vec<_>>();
+    let complete = root_ids.iter().all(Option::is_some);
+    let mut logical_root_ids = root_ids.into_iter().flatten().collect::<Vec<_>>();
+    logical_root_ids.sort();
+    logical_root_ids.dedup();
+    AlternativeCost {
+        alternative_id: complete.then(|| {
+            crate::planner_selection::explain_identity(
+                "alternative",
+                &(
+                    &logical_root_ids,
+                    candidate.hybrid_execution,
+                    &candidate.materialization_policy,
+                ),
+            )
+        }),
+        logical_root_ids,
+        identity_unavailable_reason: (!complete)
+            .then(|| "canonical executable export unavailable for a logical root".into()),
+        physical_alternative_id: None,
+        status: "bind_failed".into(),
+        plan_id: None,
+        total_cost: None,
+        unavailable_reason: None,
+    }
+}
+
+fn bind_alternative(
+    candidate: PlanningRequest,
+    env: DeploymentEnvironment,
+    metricsql: bool,
+) -> Result<(PhysicalPlan, WorkloadCostManifest, AlternativeCost), Box<AlternativeCost>> {
+    let mut description = alternative_description(&candidate);
+    let queries = candidate.queries.clone();
+    let compiled = if metricsql {
+        PhysicalCompiler.compile_metricsql(candidate, env)
+    } else {
+        PhysicalCompiler.compile(candidate, env)
+    };
+    let plan = match compiled {
+        Ok(plan) => plan,
+        Err(error) => {
+            description.unavailable_reason = Some(error.to_string());
+            return Err(Box::new(description));
+        }
+    };
+    description.plan_id = Some(plan.envelope.plan_id);
+    // Reuse concrete catalog identities and selected window implementations.
+    // Deployment epochs/plan IDs and evidence prices do not identify semantics.
+    let mut bindings = plan
+        .lifecycle_estimates
+        .iter()
+        .map(|item| (item.materialization, item.window_implementation_id.clone()))
+        .collect::<Vec<_>>();
+    bindings.sort();
+    let mut placement = plan
+        .collector_plans
+        .iter()
+        .map(|collector| {
+            let mut states = collector
+                .materializations
+                .iter()
+                .map(|state| state.materialization)
+                .collect::<Vec<_>>();
+            states.sort();
+            (&collector.collector_id, states)
+        })
+        .collect::<Vec<_>>();
+    placement.sort();
+    description.physical_alternative_id = description.alternative_id.as_ref().map(|alternative| {
+        crate::planner_selection::explain_identity(
+            "physical",
+            &(
+                alternative,
+                bindings,
+                placement,
+                &plan.precompute_plan.ingest,
+            ),
+        )
+    });
+
+    match manifest(&plan, &queries) {
+        Ok(manifest) => {
+            description.status = "bound".into();
+            Ok((plan, manifest, description))
+        }
+        Err(error) => {
+            description.unavailable_reason = Some(error.to_string());
+            Err(Box::new(description))
+        }
+    }
+}
+
+/// Preserve failed bindings alongside quoteable manifests. This does not select or publish.
+pub fn prepare_manifests(
+    candidates: Vec<PlanningRequest>,
+    env: DeploymentEnvironment,
+    metricsql: bool,
+) -> (Vec<WorkloadCostManifest>, Vec<AlternativeCost>) {
+    let mut manifests = Vec::new();
+    let mut alternatives = Vec::new();
+    for candidate in candidates {
+        match bind_alternative(candidate, env.clone(), metricsql) {
+            Ok((_, manifest, description)) => {
+                manifests.push(manifest);
+                alternatives.push(description);
+            }
+            Err(description) => alternatives.push(*description),
+        }
+    }
+    (manifests, alternatives)
 }
 
 /// Compare complete Planner-authorized forests after binding. Infeasible or
@@ -445,8 +583,10 @@ fn select_with_frontend(
         exhaustive: leaves.len() < usize::BITS as usize && policies.len() == (1usize << leaves.len()),
         scope: "Backend materialization versus Prometheus exact-subquery masks over Planner-authorized leaves; native alternative separate; bounded inventory does not claim an unenumerated optimum".into(),
     });
+    let logical_selection = candidates[0].logical_selection.clone();
     let mut comparison_workload = None;
     let mut alternatives = Vec::new();
+    let mut best_index = 0;
     let mut best: Option<(
         Cost,
         PhysicalPlan,
@@ -454,33 +594,14 @@ fn select_with_frontend(
         BTreeMap<String, f64>,
     )> = None;
     for candidate in candidates {
-        let queries = candidate.queries.clone();
-        let plan = match if metricsql {
-            PhysicalCompiler.compile_metricsql(candidate, env.clone())
-        } else {
-            PhysicalCompiler.compile(candidate, env.clone())
-        } {
-            Ok(plan) => plan,
-            Err(error) => {
-                alternatives.push(AlternativeCost {
-                    plan_id: None,
-                    total_cost: None,
-                    unavailable_reason: Some(error.to_string()),
-                });
-                continue;
-            }
-        };
-        let manifest = match manifest(&plan, &queries) {
-            Ok(manifest) => manifest,
-            Err(error) => {
-                alternatives.push(AlternativeCost {
-                    plan_id: Some(plan.envelope.plan_id),
-                    total_cost: None,
-                    unavailable_reason: Some(error.to_string()),
-                });
-                continue;
-            }
-        };
+        let (plan, manifest, mut description) =
+            match bind_alternative(candidate, env.clone(), metricsql) {
+                Ok(bound) => bound,
+                Err(description) => {
+                    alternatives.push(*description);
+                    continue;
+                }
+            };
         let scope = (manifest.workload.clone(), manifest.horizon_seconds);
         if comparison_workload
             .as_ref()
@@ -493,25 +614,31 @@ fn select_with_frontend(
         comparison_workload = Some(scope);
         match evidence.price(&manifest) {
             Ok((cost, components)) => {
-                alternatives.push(AlternativeCost {
-                    plan_id: Some(plan.envelope.plan_id),
-                    total_cost: Some(cost.0),
-                    unavailable_reason: None,
-                });
+                description.status = "unselected".into();
+                description.total_cost = Some(cost.0);
+                alternatives.push(description);
                 if best.as_ref().is_none_or(|(previous, ..)| cost < *previous) {
+                    best_index = alternatives.len() - 1;
                     best = Some((cost, plan, manifest, components));
                 }
             }
-            Err(reason) => alternatives.push(AlternativeCost {
-                plan_id: Some(plan.envelope.plan_id),
-                total_cost: None,
-                unavailable_reason: Some(reason),
-            }),
+            Err((status, reason)) => {
+                description.status = status.into();
+                description.unavailable_reason = Some(reason);
+                alternatives.push(description);
+            }
         }
     }
-    let (_, mut plan, selected_manifest, component_costs) =
-        best.ok_or_else(|| invalid("no feasible completely costed alternative"))?;
+    let (_, mut plan, selected_manifest, component_costs) = best.ok_or_else(|| {
+        CompileError::Alternatives(
+            json!({"status": "all_infeasible", "logical_selection": logical_selection,
+            "alternatives": alternatives}),
+        )
+    })?;
+    // Exactly the winner retained by the existing strict-less-than selector.
+    alternatives[best_index].status = "selected".into();
     plan.cost_comparison = Some(WorkloadCostComparison {
+        logical_selection,
         materialization_search_coverage,
         data_snapshot_id: evidence.data_snapshot_id.clone(),
         model_version: evidence.model_version.clone(),
@@ -596,6 +723,86 @@ mod tests {
         snapshot.query_workload.repeating_queries.as_mut().unwrap()[0].query =
             planner_types::workload::Query("sum(sum_over_time(m[1m]))".into());
         snapshot
+    }
+
+    // IDs describe semantics; activation/version changes do not create new alternatives.
+    #[test]
+    fn explain_identity_is_stable_across_activations_and_distinguishes_native() {
+        let (request, mut env) = fixture().planning_request().unwrap();
+        let candidates = with_exact_alternative(request).unwrap();
+        let (_, first) = prepare_manifests(candidates.clone(), env.clone(), false);
+        env.plan_version += 1;
+        env.activation_unix_ms += 1;
+        let (_, second) = prepare_manifests(candidates, env, false);
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(&second) {
+            assert!(a.alternative_id.is_some());
+            assert!(a.physical_alternative_id.is_some());
+            assert_eq!(a.alternative_id, b.alternative_id);
+            assert_eq!(a.physical_alternative_id, b.physical_alternative_id);
+        }
+        assert_ne!(
+            first.first().unwrap().alternative_id,
+            first.last().unwrap().alternative_id
+        );
+    }
+
+    // Bind failures remain visible even when the native manifest is usable.
+    #[test]
+    fn explain_retains_failed_bindings_and_all_missing_quotes() {
+        let (mut request, env) = fixture().planning_request().unwrap();
+        request.hybrid_execution = false;
+        request.queries[0].window_implementations.clear();
+        let candidates = with_exact_alternative(request).unwrap();
+        let (manifests, explanations) = prepare_manifests(candidates, env, false);
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(explanations.len(), 2);
+        assert_eq!(explanations[0].status, "bind_failed");
+        assert!(explanations[0].unavailable_reason.is_some());
+        assert_eq!(explanations[1].status, "bound");
+
+        let (candidates, env, mut evidence) = quoted();
+        let count = candidates.len();
+        evidence.quotes.clear();
+        let CompileError::Alternatives(report) = select(candidates, env, &evidence).unwrap_err()
+        else {
+            panic!("expected structured all-infeasible report")
+        };
+        assert_eq!(report["status"], "all_infeasible");
+        let alternatives = report["alternatives"].as_array().unwrap();
+        assert_eq!(alternatives.len(), count);
+        assert!(alternatives
+            .iter()
+            .all(|item| item["status"] == "evidence_missing"));
+        assert!(!report["logical_selection"].as_array().unwrap().is_empty());
+    }
+
+    // Explanation records the same minimum quote selected by the existing algorithm.
+    #[test]
+    fn explain_links_selected_roots_without_changing_cost_choice() {
+        let (candidates, env, evidence) = quoted();
+        let expected = evidence
+            .quotes
+            .iter()
+            .map(|quote| {
+                let cost = evidence.price(&quote.manifest).unwrap().0 .0;
+                (cost, quote.manifest.plan_id)
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .unwrap();
+        let plan = select(candidates, env, &evidence).unwrap();
+        assert_eq!(plan.envelope.plan_id, expected.1);
+        let comparison = plan.cost_comparison.unwrap();
+        let selected = comparison
+            .alternatives
+            .iter()
+            .filter(|item| item.status == "selected")
+            .collect::<Vec<_>>();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].total_cost, Some(expected.0));
+        assert!(selected[0].alternative_id.is_some());
+        assert!(selected[0].physical_alternative_id.is_some());
+        assert_eq!(comparison.logical_selection, plan.logical_selection);
     }
 
     #[test]

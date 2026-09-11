@@ -616,6 +616,9 @@ struct PhysicalPlanQueryRequest {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CompileAndPublishPhysicalPlanRequest {
+    /// Opt-in additive response for quote preparation; the default remains a manifest array.
+    #[serde(default)]
+    explain: bool,
     #[serde(default = "default_physical_deployment_target")]
     target: physical::compiler::PhysicalDeploymentTarget,
     #[serde(default)]
@@ -686,6 +689,7 @@ impl PhysicalQueryFrontend {
 #[derive(Debug, Serialize)]
 struct CompileAndPublishPhysicalPlanResponse {
     cost_comparison: Option<physical::workload_cost::WorkloadCostComparison>,
+    logical_selection: Vec<serde_json::Value>,
     plan_id: u64,
     plan_version: u64,
     status: &'static str,
@@ -737,7 +741,7 @@ async fn compile_and_publish_physical_plan(
                 )
                     .into_response()
             }
-            Err(response) => return response.into_response(),
+            Err(response) => return physical_compile_failure(response),
         };
 
     let Some(backend) = st.backend_client.as_ref() else {
@@ -822,6 +826,7 @@ async fn compile_and_publish_physical_plan(
 
     Json(CompileAndPublishPhysicalPlanResponse {
         cost_comparison: bundle.cost_comparison,
+        logical_selection: bundle.logical_selection,
         plan_id: bundle.envelope.plan_id,
         plan_version: bundle.envelope.plan_version,
         status: "active",
@@ -904,7 +909,11 @@ fn compile_physical_plan_request(
         Vec<String>,
         Duration,
         Vec<physical::compiler::RuntimeAdaptationEvidence>,
-        Vec<physical::workload_cost::WorkloadCostManifest>,
+        (
+            Vec<physical::workload_cost::WorkloadCostManifest>,
+            Vec<physical::workload_cost::AlternativeCost>,
+            Vec<serde_json::Value>,
+        ),
     ),
     (StatusCode, String),
 > {
@@ -979,17 +988,19 @@ fn compile_physical_plan_request(
         });
     }
 
-    if let Err(error) = physical::compiler::select_workload_roots_with_erp(
+    let logical_selection = match physical::compiler::select_workload_roots_with_trace(
         &mut queries,
         canonical_roots,
         &request.evidence,
         &request.exact_composition_costs,
         request.erp.as_ref(),
     ) {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string()));
-    }
+        Ok(trace) => trace,
+        Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
+    };
 
     let planning_request = physical::compiler::PlanningRequest {
+        logical_selection,
         query_workload: None,
         queries,
         hybrid_execution: request.target
@@ -1016,15 +1027,12 @@ fn compile_physical_plan_request(
     };
     let candidates = physical::workload_cost::with_exact_alternative(planning_request.clone())
         .map_err(|error| (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()))?;
-    let manifests: Vec<_> = candidates
-        .iter()
-        .filter_map(|candidate| {
-            frontend
-                .compile(candidate.clone(), environment.clone())
-                .and_then(|plan| physical::workload_cost::manifest(&plan, &candidate.queries))
-                .ok()
-        })
-        .collect();
+    let logical_selection = planning_request.logical_selection.clone();
+    let (manifests, alternatives) = physical::workload_cost::prepare_manifests(
+        candidates.clone(),
+        environment.clone(),
+        matches!(frontend, PhysicalQueryFrontend::MetricsQl),
+    );
     let apply_timeout = Duration::from_millis(request.apply_timeout_ms);
     // Quote preparation enumerates feasible bindings; it does not select the
     // default warm candidate, which may be unavailable while exact is valid.
@@ -1032,7 +1040,9 @@ fn compile_physical_plan_request(
         if manifests.is_empty() {
             return Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "no bindable workload cost manifests".into(),
+                serde_json::json!({"status": "all_infeasible", "alternatives": alternatives,
+                    "logical_selection": planning_request.logical_selection})
+                .to_string(),
             ));
         }
         return Ok((
@@ -1040,7 +1050,7 @@ fn compile_physical_plan_request(
             request.collector_ids,
             apply_timeout,
             request.runtime_adaptation_evidence,
-            manifests,
+            (manifests, alternatives, logical_selection),
         ));
     }
     let compiled = match request.workload_cost_evidence {
@@ -1056,6 +1066,9 @@ fn compile_physical_plan_request(
     };
     let bundle = match compiled {
         Ok(bundle) => bundle,
+        Err(physical::compiler::CompileError::Alternatives(report)) => {
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, report.to_string()))
+        }
         Err(error) => return Err((StatusCode::UNPROCESSABLE_ENTITY, error.to_string())),
     };
     Ok((
@@ -1063,7 +1076,7 @@ fn compile_physical_plan_request(
         request.collector_ids,
         apply_timeout,
         request.runtime_adaptation_evidence,
-        manifests,
+        (manifests, alternatives, logical_selection),
     ))
 }
 
@@ -1080,6 +1093,15 @@ async fn handle_metricsql_workload_cost_manifests(
     workload_cost_manifests(request, PhysicalQueryFrontend::MetricsQl)
 }
 
+fn physical_compile_failure((status, message): (StatusCode, String)) -> Response {
+    if let Ok(report) = serde_json::from_str::<serde_json::Value>(&message) {
+        if report.get("status").and_then(|value| value.as_str()) == Some("all_infeasible") {
+            return (status, Json(report)).into_response();
+        }
+    }
+    (status, message).into_response()
+}
+
 fn workload_cost_manifests(
     request: CompileAndPublishPhysicalPlanRequest,
     frontend: PhysicalQueryFrontend,
@@ -1091,9 +1113,17 @@ fn workload_cost_manifests(
         )
             .into_response();
     }
+    let explain = request.explain;
     match compile_physical_plan_request(request, true, frontend) {
-        Ok((_, _, _, _, manifests)) => Json(manifests).into_response(),
-        Err(error) => error.into_response(),
+        Ok((_, _, _, _, (manifests, alternatives, logical_selection))) => {
+            if explain {
+                Json(serde_json::json!({"manifests": manifests, "alternatives": alternatives, "logical_selection": logical_selection}))
+                    .into_response()
+            } else {
+                Json(manifests).into_response()
+            }
+        }
+        Err(error) => physical_compile_failure(error),
     }
 }
 
@@ -2316,7 +2346,7 @@ mod api_tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as u64;
-        let request = serde_json::from_value(serde_json::json!({
+        let mut request_body = serde_json::json!({
             "queries": [{
                 "query_id": query.query_id, "query_string": query.query_string,
                 "metric": "m", "window_secs": 60, "accuracy": query.accuracy,
@@ -2326,14 +2356,31 @@ mod api_tests {
             "planner_revision": physical::compiler::PLANNER_REVISION,
             "max_evidence_age_ms": 60000, "plan_version": 1,
             "activation_unix_ms": now, "backend_compat": control_plane::physical::compiler::BACKEND_COMPAT
-        }))
-        .unwrap();
-        let response = handle_workload_cost_manifests(Json(request))
-            .await
-            .into_response();
-        assert_eq!(response.status(), StatusCode::OK);
-        let manifests = body_json(response).await;
-        assert_eq!(manifests.as_array().unwrap().len(), 1);
+        });
+        for explain in [false, true] {
+            request_body["explain"] = serde_json::json!(explain);
+            let request = serde_json::from_value(request_body.clone()).unwrap();
+            let response = handle_workload_cost_manifests(Json(request))
+                .await
+                .into_response();
+            assert_eq!(response.status(), StatusCode::OK);
+            let manifests = body_json(response).await;
+            if explain {
+                assert_eq!(manifests["manifests"].as_array().unwrap().len(), 1);
+                let alternatives = manifests["alternatives"].as_array().unwrap();
+                assert_eq!(alternatives.len(), 2);
+                assert_eq!(alternatives[0]["status"], "bind_failed");
+                assert!(alternatives[0]["unavailable_reason"].is_string());
+                assert_eq!(alternatives[1]["status"], "bound");
+                assert!(alternatives[1]["physical_alternative_id"].is_string());
+                assert!(!manifests["logical_selection"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty());
+            } else {
+                assert_eq!(manifests.as_array().unwrap().len(), 1);
+            }
+        }
     }
 
     #[test]
