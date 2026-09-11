@@ -457,7 +457,9 @@ fn intent_accuracy(intent: &AggIntent) -> AccuracyTarget {
     match intent {
         AggIntent::Quantile { accuracy, .. }
         | AggIntent::Cardinality { accuracy, .. }
-        | AggIntent::TopK { accuracy, .. } => accuracy.clone(),
+        | AggIntent::TopK { accuracy, .. }
+        | AggIntent::FrequencyL2 { accuracy, .. }
+        | AggIntent::FrequencyEntropy { accuracy, .. } => accuracy.clone(),
         AggIntent::Count { accuracy } => accuracy.clone(),
         _ => AccuracyTarget::Exact,
     }
@@ -675,7 +677,16 @@ impl CostModel for ControlPlaneCostModel {
                 (eps, params)
             }
         };
-        match self.erp_parameter_decision(kind, max_error, theoretical.clone()) {
+        let decision = match (
+            &self.erp,
+            super::super::erp::ReadoutEvidence::for_intent(&kind, intent),
+        ) {
+            (Some(policy), Some(readout)) => {
+                Some(policy.select_readout(kind, readout, max_error, theoretical.clone()))
+            }
+            _ => self.erp_parameter_decision(kind, max_error, theoretical.clone()),
+        };
+        match decision {
             Some(ErpParameterDecision::Empirical {
                 params,
                 record_id,

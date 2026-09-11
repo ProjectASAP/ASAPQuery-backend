@@ -2510,17 +2510,16 @@ pub fn select_workload_roots_with_erp(
         // confidence requirements through theoretical/exact fallback.
         let scoped_erp = erp.map(|policy| {
             let mut policy = policy.clone();
-            if !matches!(accuracy, AccuracyTarget::Epsilon(_))
-                || policy.error_metric != "max_rank_err"
-            {
+            if !matches!(accuracy, AccuracyTarget::Epsilon(_)) {
                 policy.artifact.records.clear();
             }
             // A benchmark of a different KLL implementation is not evidence
             // for the collector's sketchlib KLL, even with the same k.
-            policy
-                .artifact
-                .records
-                .retain(|row| row.sketch == "kll-percall" && row.implementation == "lib");
+            policy.artifact.records.retain(|row| {
+                (row.sketch == "kll-percall" && row.implementation == "lib")
+                    || (row.sketch == "univmon"
+                        && row.implementation == "asap-sketchlib-univmon-standard-v1")
+            });
             policy
         });
         let erp = scoped_erp.as_ref();
@@ -2570,16 +2569,39 @@ fn requires_exact_erp_fallback(
     accuracy: &AccuracyTarget,
     erp: &super::erp::ErpPlanningInput,
 ) -> bool {
-    fn walk(node: &SummaryNode, out: &mut Vec<(SketchAlgorithm, SketchParams)>) {
+    fn walk(
+        node: &SummaryNode,
+        out: &mut Vec<(
+            SketchAlgorithm,
+            SketchParams,
+            Option<super::erp::ReadoutEvidence>,
+        )>,
+    ) {
         match &node.expr {
-            SummaryExpr::SummaryAgg { family, child, .. } => {
-                if let SummaryFamilyType::Sketch(kind, _) = family {
-                    out.push((kind.algorithm().clone(), kind.params().clone()));
-                }
+            SummaryExpr::SummaryAgg { child, .. } => {
                 walk(child, out);
             }
-            SummaryExpr::SummaryEstimate { summary_input, .. }
-            | SummaryExpr::SummaryDelete { summary_input, .. }
+            SummaryExpr::SummaryEstimate {
+                summary_input,
+                query,
+                ..
+            } => {
+                for field in &summary_input.schema.fields {
+                    if node.guarantee.as_ref().is_some_and(|g| g.is_exact()) {
+                        continue;
+                    }
+                    let SummaryFamilyType::Sketch(kind, _) = &field.dtype else {
+                        continue;
+                    };
+                    out.push((
+                        kind.algorithm().clone(),
+                        kind.params().clone(),
+                        super::erp::ReadoutEvidence::for_query(kind.algorithm(), query),
+                    ));
+                }
+                walk(summary_input, out);
+            }
+            SummaryExpr::SummaryDelete { summary_input, .. }
             | SummaryExpr::ValueOperation {
                 child: summary_input,
                 ..
@@ -2618,9 +2640,13 @@ fn requires_exact_erp_fallback(
     };
     let mut sketches = Vec::new();
     walk(node, &mut sketches);
-    sketches.into_iter().any(|(algorithm, params)| {
+    sketches.into_iter().any(|(algorithm, params, readout)| {
+        let decision = match readout {
+            Some(readout) => erp.select_readout(algorithm, readout, max_error, params),
+            None => erp.select(algorithm, max_error, params),
+        };
         matches!(
-            erp.select(algorithm, max_error, params),
+            decision,
             super::erp::ErpParameterDecision::ExactFallback { .. }
         )
     })
