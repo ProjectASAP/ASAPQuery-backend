@@ -774,6 +774,8 @@ fn canonical_intent_kind_str(intent: &AggIntent) -> &'static str {
         AggIntent::Quantile { .. } => "quantile",
         AggIntent::TopK { .. } => "topk",
         AggIntent::Cardinality { .. } => "cardinality",
+        AggIntent::FrequencyL2 { .. } => "frequency_l2",
+        AggIntent::FrequencyEntropy { .. } => "frequency_entropy",
         AggIntent::Rate => "rate",
         AggIntent::IRate => "irate",
         AggIntent::Increase => "increase",

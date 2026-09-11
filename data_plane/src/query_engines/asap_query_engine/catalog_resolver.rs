@@ -91,7 +91,13 @@ impl ResolvedMaterialization<'_> {
                         && (0.0..=1.0).contains(q)
                         && matches!(aggregation_type, DatasketchesKLL | HydraKLL | DDSketch)
                 }
-                QueryReadout::Cardinality => *aggregation_type == HLL,
+                QueryReadout::Cardinality => matches!(aggregation_type, HLL | UnivMon),
+                QueryReadout::FrequencyL2 | QueryReadout::FrequencyEntropy => {
+                    *aggregation_type == UnivMon
+                }
+                QueryReadout::PointCount { value: None, .. } if *aggregation_type == UnivMon => {
+                    true
+                }
                 QueryReadout::PointCount { .. } => matches!(
                     aggregation_type,
                     CountMinSketch | CountMinSketchWithHeap | CountSketch | CountSketchWithHeap

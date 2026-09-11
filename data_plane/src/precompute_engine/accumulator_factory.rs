@@ -21,6 +21,8 @@ use asap_types::aggregation_config::AggregationConfig;
 // former local helpers (`kll_k_param`, `heap_size_param`,
 // `ddsketch_alpha_param`) is that module's own `AccumulatorSpec`
 // construction, so they aren't re-imported here.
+use super::operators::hll_sketch_accumulator::HllSketchAccumulator;
+use super::operators::univmon_accumulator::UnivMonAccumulator;
 use asap_types::accumulator_spec::{cms_params, AccumulatorSpecError};
 use planner_types::post_asap::{ExactKind, SketchAlgorithm, SketchParams, SummaryFamilyType};
 
@@ -1144,8 +1146,43 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
             )))
         }
 
-        // HLL has an envelope catalog identity but no raw updater; the
-        // backend-local plan builder rejects it before reaching this factory.
+        (SummaryFamilyType::Sketch(kind, _), false)
+            if kind.algorithm() == &SketchAlgorithm::UnivMon =>
+        {
+            let SketchParams::UnivMon {
+                heap_size,
+                sketch_rows,
+                sketch_cols,
+                layers,
+            } = kind.params()
+            else {
+                unreachable!("validated UnivMon family parameters")
+            };
+            Box::new(UnivMonUpdater {
+                acc: UnivMonAccumulator::new(
+                    *heap_size as usize,
+                    *sketch_rows as usize,
+                    *sketch_cols as usize,
+                    *layers as usize,
+                )
+                .expect("validated UnivMon dimensions"),
+            })
+        }
+
+        (SummaryFamilyType::Sketch(kind, _), false)
+            if kind.algorithm() == &SketchAlgorithm::Hll =>
+        {
+            let SketchParams::Hll { precision } = kind.params() else {
+                unreachable!("validated HLL family parameters")
+            };
+            Box::new(HllUpdater {
+                acc: HllSketchAccumulator::new(
+                    asap_sketchlib::HllVariant::Regular,
+                    u32::from(*precision),
+                ),
+            })
+        }
+
         // Other unsupported families retain the legacy warning fallback.
         (other_family, keyed) => {
             tracing::warn!(
@@ -1158,11 +1195,110 @@ pub fn create_accumulator_updater(config: &AggregationConfig) -> Box<dyn Accumul
     }
 }
 
+struct UnivMonUpdater {
+    acc: UnivMonAccumulator,
+}
+
+struct HllUpdater {
+    acc: HllSketchAccumulator,
+}
+
+impl AccumulatorUpdater for HllUpdater {
+    fn is_keyed(&self) -> bool {
+        false
+    }
+    fn memory_usage_bytes(&self) -> usize {
+        self.acc.approx_memory_bytes()
+    }
+    fn update_single(&mut self, value: f64, _: i64) {
+        if !value.is_nan() {
+            let bits = if value == 0.0 { 0 } else { value.to_bits() };
+            self.acc.inner.update(&bits.to_le_bytes());
+        }
+    }
+    fn update_keyed(&mut self, _: &KeyByLabelValues, value: f64, timestamp_ms: i64) {
+        self.update_single(value, timestamp_ms);
+    }
+    impl_clone_accumulator_methods!(acc);
+    fn reset(&mut self) {
+        self.acc.reset_to_empty();
+    }
+}
+
+impl AccumulatorUpdater for UnivMonUpdater {
+    fn is_keyed(&self) -> bool {
+        false
+    }
+    fn memory_usage_bytes(&self) -> usize {
+        self.acc.approx_memory_bytes()
+    }
+    fn update_single(&mut self, value: f64, _: i64) {
+        self.acc
+            .insert_sample(value)
+            .expect("UnivMon sample counter overflow");
+    }
+    fn update_keyed(&mut self, _: &KeyByLabelValues, value: f64, timestamp_ms: i64) {
+        self.update_single(value, timestamp_ms);
+    }
+    impl_clone_accumulator_methods!(acc);
+    fn reset(&mut self) {
+        self.acc.reset_to_empty();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use asap_types::enums::WindowKind;
     use asap_types::AggregationType;
+
+    /// Both cardinality implementations consume values, with a single signed-zero identity.
+    #[test]
+    fn hll_and_univmon_raw_updates_share_value_identity() {
+        for family in [AggregationType::HLL, AggregationType::UnivMon] {
+            let config = AggregationConfig::new(
+                family,
+                String::new(),
+                Default::default(),
+                asap_types::KeyByLabelNames::new(vec![]),
+                asap_types::KeyByLabelNames::new(vec![]),
+                asap_types::KeyByLabelNames::new(vec![]),
+                String::new(),
+                60,
+                60,
+                WindowKind::Tumbling,
+                "m".into(),
+                "m".into(),
+                None,
+                None,
+                None,
+            );
+            let mut updater = create_accumulator_updater(&config);
+            for value in [0.0, -0.0, 2.0, 2.0, f64::NAN] {
+                updater.update_single(value, 1000);
+            }
+            let state = updater.take_accumulator();
+            assert_eq!(state.get_accumulator_type(), family);
+            let estimate = state
+                .query_statistic(
+                    asap_types::Statistic::Cardinality,
+                    &None,
+                    &Default::default(),
+                )
+                .unwrap();
+            assert!((estimate - 2.0).abs() < 0.05, "{family:?}: {estimate}");
+            assert!(updater.memory_usage_bytes() >= 4096);
+            let empty = updater
+                .snapshot_accumulator()
+                .query_statistic(
+                    asap_types::Statistic::Cardinality,
+                    &None,
+                    &Default::default(),
+                )
+                .unwrap();
+            assert_eq!(empty, 0.0);
+        }
+    }
 
     #[test]
     fn test_sum_updater() {

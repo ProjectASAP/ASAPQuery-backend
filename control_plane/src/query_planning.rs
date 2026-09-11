@@ -169,6 +169,7 @@ fn planned_capability(
             return None;
         };
         Some(match kind.algorithm() {
+            planner_types::post_asap::SketchAlgorithm::UnivMon => return None,
             planner_types::post_asap::SketchAlgorithm::DDSketch => SketchAlgorithm::DDSketch,
             planner_types::post_asap::SketchAlgorithm::Kll => SketchAlgorithm::Kll,
             planner_types::post_asap::SketchAlgorithm::Hll => SketchAlgorithm::Hll,
@@ -193,6 +194,7 @@ fn planned_capability(
                 return None;
             };
             match query {
+                SketchQuery::FrequencyL2 | SketchQuery::FrequencyEntropy => return None,
                 SketchQuery::Quantile { .. } => Capability::QuantileApprox(Some(handle(family)?)),
                 SketchQuery::Cardinality => Capability::CardinalityApprox,
                 SketchQuery::PointCount { .. } => {

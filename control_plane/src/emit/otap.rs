@@ -325,7 +325,7 @@ fn build_asap_sketches_config(sp: &EdgeSketchProcessor, window_secs: Option<u64>
             m.insert("delta".into(), Value::Number(delta.into()));
             m.insert("delta_transmission".into(), Value::Bool(true));
         }
-        SketchParams::Kmv { .. } | SketchParams::Theta { .. } => {
+        SketchParams::UnivMon { .. } | SketchParams::Kmv { .. } | SketchParams::Theta { .. } => {
             unreachable!(
                 "edge sketch processor config requested for a non-sketch or unsupported \
                  SketchAlgorithm; no Bind* rule in this repo produces one"
@@ -342,7 +342,7 @@ fn sketch_algorithm_tag(kind: &SketchAlgorithm) -> &'static str {
         SketchAlgorithm::Hll => "hll",
         SketchAlgorithm::Cms | SketchAlgorithm::CmsWithHeap => "cms",
         SketchAlgorithm::CountSketch | SketchAlgorithm::CountSketchWithHeap => "count_sketch",
-        SketchAlgorithm::Kmv | SketchAlgorithm::Theta => {
+        SketchAlgorithm::UnivMon | SketchAlgorithm::Kmv | SketchAlgorithm::Theta => {
             unreachable!(
                 "edge sketch processor config requested for a non-sketch or unsupported \
                  SketchAlgorithm; no Bind* rule in this repo produces one"
