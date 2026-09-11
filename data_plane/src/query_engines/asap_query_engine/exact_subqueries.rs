@@ -167,15 +167,12 @@ fn inject_candidate_matcher(
             .collect::<Vec<_>>()
             .join("|")
     );
-    // promql-parser's AST formatter writes programmatically constructed
-    // matcher values verbatim between double quotes. Store the PromQL string
-    // escapes separately from the compiled regex so its formatted AST remains
-    // valid for dots, quotes, backslashes, and other literal label bytes.
-    let promql_pattern = pattern.replace('\\', "\\\\").replace('"', "\\\"");
+    // The pinned parser escapes matcher strings when formatting the AST.
+    // Keep the semantic regex value here; pre-escaping it changes which labels match.
     let matcher = Matcher::new(
         MatchOp::Re(regex::Regex::new(&pattern).map_err(|error| miss(error.to_string()))?),
         item_label,
-        &promql_pattern,
+        &pattern,
     );
     fn visit(expr: &mut Expr, matcher: &Matcher) {
         let append = |matchers: &mut promql_parser::label::Matchers| {
@@ -605,15 +602,12 @@ mod tests {
             .iter()
             .find(|matcher| matcher.name == "job" && matcher.value.starts_with("^(?:"))
             .unwrap();
-        assert!(candidate_matcher.value.contains(r"api\\.v1"));
-        assert!(candidate_matcher.value.contains(r"a\\|b"));
-        assert!(restricted.contains(r#"quote\"slash\\\\"#));
-        let semantic = regex::Regex::new(r#"^(?:api\.v1|quote"slash\\|a\|b)$"#).unwrap();
         for value in &values {
-            assert!(semantic.is_match(value), "{value:?}: {restricted}");
+            assert!(candidate_matcher.is_match(value), "{value:?}: {restricted}");
         }
-        assert!(!semantic.is_match("apiXv1"));
-        assert!(!semantic.is_match("a"));
+        assert!(!candidate_matcher.is_match("apiXv1"));
+        assert!(!candidate_matcher.is_match("a"));
+        assert!(!candidate_matcher.is_match("b"));
     }
 
     #[tokio::test]
