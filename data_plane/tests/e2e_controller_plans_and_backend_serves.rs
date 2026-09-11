@@ -74,9 +74,9 @@ async fn post_full_config(client: &reqwest::Client, stack: &FullStack, json: &Js
         .any(|c| c.metric == "http_requests_total_latency_ms")
     {
         for rule in &mut artifact.transmission_plan.rules {
-            rule.mode = control_plane::physical::compiler::TransmissionMode::Delta;
+            rule.mode = asap_types::producer_plan::TransmissionMode::Delta;
             rule.full_checkpoint_every_ms = Some(rule.emit_every_ms);
-            rule.runtime_policy.delta = Some(control_plane::physical::compiler::DeltaPolicy {
+            rule.runtime_policy.delta = Some(asap_types::producer_plan::DeltaPolicy {
                 absolute_threshold: 0.0,
                 gos: None,
             });
@@ -90,8 +90,7 @@ async fn post_full_config(client: &reqwest::Client, stack: &FullStack, json: &Js
     {
         entry.instant.lookback_ms = 1000;
         for node in entry.nodes.values_mut() {
-            if let control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } = node
-            {
+            if let asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding } = node {
                 binding.readout_lookback_ms = Some(1000);
             }
         }

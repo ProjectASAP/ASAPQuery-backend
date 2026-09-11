@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use crate::sds::{
     CatalogGeneration, DataDescriptor, DataDescriptorId, DataSourceIdentity, SummaryDefinitionId,
-    SummaryDescriptor, SummaryDescriptorId, ValueProjectionIdentity,
+    SummaryDescriptor, SummaryDescriptorId,
 };
 use crate::PolicyFingerprint;
 use crate::WindowMaterializationLayout;
@@ -103,29 +103,22 @@ impl SummaryCatalog {
             .map(|config| {
                 let summary = SummaryDescriptor::from_config(config)
                     .map_err(|error| SummaryCatalogError::Descriptor(error.to_string()))?;
-                let source = config.table_name.as_ref().map_or_else(
-                    || DataSourceIdentity::TimeSeries {
-                        metric: config.metric.clone(),
-                    },
-                    |table_ref| DataSourceIdentity::Table {
-                        table_ref: table_ref.clone(),
-                    },
-                );
-                let value_projection = config
-                    .value_column
-                    .as_ref()
-                    .map_or(ValueProjectionIdentity::SampleValue, |name| {
-                        ValueProjectionIdentity::Column { name: name.clone() }
-                    });
+                let source = config.source_identity();
+                let value_projection = config.effective_value_projection().clone();
                 let data = DataDescriptor::new_typed(
                     source,
                     value_projection,
                     config
                         .population_filter_canonical()
                         .map_err(SummaryCatalogError::Descriptor)?,
-                    config.grouping_labels.labels.clone(),
-                    "asap.timestamped-observations.v2",
+                    config.grouping_labels.names(),
+                    if config.table_name.is_some() && !config.grouping_labels.is_empty() {
+                        crate::grouping_projection::TABLE_GROUP_OBSERVATION_SEMANTICS
+                    } else {
+                        "asap.timestamped-observations.v2"
+                    },
                 )
+                .with_grouping_projection(config.grouping_labels.clone())
                 .with_partitioning(config.partitioning)
                 .with_timestamp_column(config.table_timestamp_column.clone());
                 Ok((
@@ -253,6 +246,54 @@ impl SummaryCatalog {
                 return Err(SummaryCatalogError::MissingDescriptor(id.as_u64()));
             }
         }
+        if !self
+            .data_descriptors
+            .values()
+            .any(|data| matches!(data.source, DataSourceIdentity::Derived { .. }))
+        {
+            return Ok(());
+        }
+        // Dependencies must refer to this snapshot and form an acyclic graph.
+        let mut pending = std::collections::BTreeMap::new();
+        let mut consumers: std::collections::BTreeMap<_, Vec<_>> =
+            std::collections::BTreeMap::new();
+        for (id, binding) in &self.materializations {
+            let dependencies = match &self.data_descriptors[&binding.data_descriptor_id].source {
+                DataSourceIdentity::Derived { input } => input.inputs.clone(),
+                _ => Default::default(),
+            };
+            for source in &dependencies {
+                if !self.materializations.contains_key(source) {
+                    return Err(SummaryCatalogError::Descriptor(
+                        "derived input references missing summary".into(),
+                    ));
+                }
+                consumers.entry(*source).or_default().push(*id);
+            }
+            pending.insert(*id, dependencies.len());
+        }
+        let mut ready: Vec<_> = pending
+            .iter()
+            .filter_map(|(id, count)| (*count == 0).then_some(*id))
+            .collect();
+        let mut visited = 0;
+        while let Some(id) = ready.pop() {
+            visited += 1;
+            for consumer in consumers.get(&id).into_iter().flatten() {
+                let count = pending
+                    .get_mut(consumer)
+                    .expect("catalog dependency target");
+                *count -= 1;
+                if *count == 0 {
+                    ready.push(*consumer);
+                }
+            }
+        }
+        if visited != pending.len() {
+            return Err(SummaryCatalogError::Descriptor(
+                "derived summary dependencies have a cycle".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -260,6 +301,7 @@ impl SummaryCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sds::ValueProjectionIdentity;
     use crate::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
 
     fn config(metric: &str, filter: &str, window: u64) -> PrecomputeMaterialization {
@@ -289,7 +331,9 @@ mod tests {
         use planner_types::pre_asap::{CompareOpKind, ScalarValue};
         let mut requests = config("raw_samples.value", "", 60);
         requests.table_name = Some("raw_samples".into());
-        requests.value_column = Some("value".into());
+        requests.value_projection = Some(ValueProjectionIdentity::Column {
+            name: "value".into(),
+        });
         requests.table_population = Some(TablePopulation {
             predicates: vec![TableColumnPredicate {
                 column: "metric".into(),
@@ -308,7 +352,9 @@ mod tests {
             other_table.policy_fingerprint()
         );
         let mut other_value = requests.clone();
-        other_value.value_column = Some("other_value".into());
+        other_value.value_projection = Some(ValueProjectionIdentity::Column {
+            name: "other_value".into(),
+        });
         assert_ne!(
             requests.policy_fingerprint(),
             other_value.policy_fingerprint()

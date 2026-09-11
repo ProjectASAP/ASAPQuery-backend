@@ -2679,9 +2679,10 @@ mod tests {
     }
 
     async fn setup_remote_write_test_server() -> (u16, PrometheusRemoteWriteReceiver) {
+        use asap_types::producer_plan::{FrameIdentityContract, SequenceScope, TransmissionPlan};
         use control_plane::physical::compiler::{
-            FrameIdentityContract, IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan,
-            SequenceScope, TimestampUnit, TransmissionPlan, PLANNER_REVISION,
+            IngestContract, IngestProtocol, PlanEnvelope, PrecomputePlan, TimestampUnit,
+            PLANNER_REVISION,
         };
         let streaming_config = Arc::new(StreamingConfig::default());
         let envelope = PlanEnvelope {
@@ -2694,12 +2695,20 @@ mod tests {
             planner_revision: PLANNER_REVISION.into(),
             capability_snapshot_id: "test".into(),
         };
+        let catalog = Arc::new(
+            asap_types::summary_catalog::SummaryCatalog::from_materializations(7, 1, &[]).unwrap(),
+        );
+        let generation = catalog.reference().unwrap();
+        let sketch_index = Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new());
+        sketch_index
+            .install_summary_catalog(Arc::clone(&catalog))
+            .unwrap();
         let active = crate::storage_engines::types::HotReloadActivePhysicalPlan::new(
             crate::storage_engines::types::ActivePhysicalPlan {
                 envelope: envelope.clone(),
-                summary_catalog: None,
+                summary_catalog: Some(Arc::clone(&catalog)),
                 precompute_plan: PrecomputePlan {
-                    summary_catalog: None,
+                    summary_catalog: Some(generation.clone()),
                     envelope: envelope.clone(),
                     ingest: IngestContract {
                         protocol: IngestProtocol::PrometheusRemoteWriteV1,
@@ -2715,7 +2724,7 @@ mod tests {
                     materializations: Vec::new(),
                 },
                 transmission_plan: TransmissionPlan {
-                    summary_catalog: None,
+                    summary_catalog: Some(generation),
                     envelope,
                     frame_identity: FrameIdentityContract {
                         identity_version: 1,
@@ -2726,7 +2735,7 @@ mod tests {
                     rules: Vec::new(),
                 },
                 runtime_config: streaming_config.clone(),
-                query_plan: Arc::new(control_plane::query_plan::QueryPlan {
+                query_plan: Arc::new(asap_types::query_plan::QueryPlan {
                     plan_id: 7,
                     plan_version: 1,
                     clickhouse_context: None,
@@ -2747,7 +2756,7 @@ mod tests {
             pass_raw_samples: false,
             sketch_snapshots: dashmap::DashMap::new(),
             series_resolver: Arc::new(crate::drivers::ingest::SeriesIdResolver::new()),
-            sketch_index: Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            sketch_index: Arc::clone(&sketch_index),
             observability: IngestObservability::default(),
         });
         let receiver =
@@ -2760,7 +2769,7 @@ mod tests {
                 adapter_config,
             },
             Arc::new(ASAPQueryEngine::new(15_000)),
-            Arc::new(crate::storage_engines::sketch_db::index::SketchStore::new()),
+            sketch_index,
         )
         .with_active_physical_plan(active)
         .with_remote_write(receiver.clone());
@@ -3657,7 +3666,7 @@ aggregations:
                 aggregation_type: AggregationType::Sum,
                 aggregation_sub_type: String::new(),
                 parameters: HashMap::new(),
-                grouping_labels: KeyByLabelNames::empty(),
+                grouping_labels: KeyByLabelNames::empty().into(),
                 aggregated_labels: KeyByLabelNames::empty(),
                 rollup_labels: KeyByLabelNames::empty(),
                 original_yaml: String::new(),
@@ -3671,8 +3680,9 @@ aggregations:
                 metric: metric.clone(),
                 num_aggregates_to_retain: None,
                 table_name: None,
-                value_column: None,
+                value_projection: None,
                 table_population: None,
+                derived_input: None,
                 table_timestamp_column: None,
                 partitioning: None,
             };
@@ -6037,7 +6047,7 @@ async fn handle_post_streaming_config(
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
-pub use control_plane::physical::publication::PhysicalPlanInstallRequest;
+pub use asap_types::plan_publication::PhysicalPlanInstallRequest;
 
 /// Decode and cross-validate every backend view before it can become visible.
 /// Used by both startup artifact loading and the staged HTTP install path.
@@ -6208,13 +6218,13 @@ async fn handle_post_physical_plan(
         .query_plan
         .entries
         .values()
-        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::MetricsQl)
+        .filter(|entry| entry.language == asap_types::query_plan::QueryLanguage::MetricsQl)
         .count();
     let clickhouse_plan_count = active
         .query_plan
         .entries
         .values()
-        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::ClickHouseSql)
+        .filter(|entry| entry.language == asap_types::query_plan::QueryLanguage::ClickHouseSql)
         .count();
     let plan_version = active.plan_version();
     let now = unix_time_ms();
@@ -6290,7 +6300,7 @@ async fn handle_activate_physical_plan(
         .query_plan
         .entries
         .values()
-        .filter(|entry| entry.language == control_plane::query_plan::QueryLanguage::ClickHouseSql)
+        .filter(|entry| entry.language == asap_types::query_plan::QueryLanguage::ClickHouseSql)
         .count();
     if old.plan_id() != 0 {
         let draining_id = old.plan_id();
@@ -7171,7 +7181,7 @@ mod catalog_install_tests {
         let before = handle.snapshot();
         let mut candidate = request();
         candidate.query_plan.clickhouse_context =
-            Some(control_plane::query_plan::ClickHousePlanningContext {
+            Some(asap_types::query_plan::ClickHousePlanningContext {
                 tables: Default::default(),
                 accuracy: planner_types::types::AccuracyTarget::Exact,
             });
@@ -7180,8 +7190,8 @@ mod catalog_install_tests {
             .entries
             .pop_first()
             .expect("fixture has a query entry");
-        entry.language = control_plane::query_plan::QueryLanguage::ClickHouseSql;
-        entry.fixed_evaluation = Some(control_plane::query_plan::FixedEvaluationRange {
+        entry.language = asap_types::query_plan::QueryLanguage::ClickHouseSql;
+        entry.fixed_evaluation = Some(asap_types::query_plan::FixedEvaluationRange {
             start_ms: 0,
             end_ms: 1_000,
             cumulative: true,
@@ -7191,7 +7201,7 @@ mod catalog_install_tests {
             .nodes
             .values_mut()
             .find_map(|node| match node {
-                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
                     Some(binding)
                 }
                 _ => None,
@@ -7264,7 +7274,7 @@ mod catalog_install_tests {
             .values_mut()
             .flat_map(|entry| entry.nodes.values_mut())
             .find_map(|node| match node {
-                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
                     Some(binding)
                 }
                 _ => None,
@@ -7279,22 +7289,20 @@ mod catalog_install_tests {
         let mut request = request();
         let key = request.query_plan.entries.keys().next().unwrap().clone();
         let mut entry = request.query_plan.entries.remove(&key).unwrap();
-        entry.language = control_plane::query_plan::QueryLanguage::MetricsQl;
+        entry.language = asap_types::query_plan::QueryLanguage::MetricsQl;
         let binding = entry
             .nodes
             .values_mut()
             .find_map(|node| match node {
-                control_plane::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
+                asap_types::query_plan::QueryPlanNode::ReadMaterialization { binding } => {
                     Some(binding)
                 }
                 _ => None,
             })
             .expect("demo has maintained summaries");
         binding.pane_origin_ms = Some(1);
-        let key = control_plane::query_plan::QueryPlan::catalog_key(
-            entry.language,
-            &entry.canonical_query,
-        );
+        let key =
+            asap_types::query_plan::QueryPlan::catalog_key(entry.language, &entry.canonical_query);
         request.query_plan.entries.insert(key, entry);
         let error = install(request).unwrap_err();
         assert!(error.contains("pane origin"), "{error}");

@@ -346,9 +346,7 @@ fn incompatible_evidence_preserves_deployment_behavior() {
 /// fallback even though the warm tier now supports exact additive binaries.
 #[test]
 fn binary_summary_has_explicit_warm_tier_fallback() {
-    use control_plane::query_plan::{
-        FallbackPolicy, InstantExecution, QueryPlanEntry, QueryPlanNode,
-    };
+    use control_plane::query_plan::{FallbackPolicy, InstantExecution, QueryPlanNode};
     use planner_types::{post_asap::BinaryOperator, pre_asap::BinaryOpKind};
     let child = bound(&model());
     let root = std::rc::Rc::new(SummaryNode {
@@ -363,7 +361,7 @@ fn binary_summary_has_explicit_warm_tier_fallback() {
         schema: child.schema.clone(),
         guarantee: None,
     });
-    let plan = QueryPlanEntry::compile_bound(
+    let plan = control_plane::query_plan::compile_bound(
         "test".into(),
         "left / right".into(),
         &root,

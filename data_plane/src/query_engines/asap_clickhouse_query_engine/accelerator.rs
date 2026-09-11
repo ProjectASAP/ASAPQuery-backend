@@ -64,14 +64,14 @@ impl CatalogClickHouseAccelerator {
 
     async fn prepare_external_exact(
         &self,
-        entry: &control_plane::query_plan::QueryPlanEntry,
+        entry: &asap_types::query_plan::QueryPlanEntry,
         start_ms: u64,
         end_ms: u64,
         request_context: &ClickHouseQueryRequest,
     ) -> Result<PreparedExternalLeaves, String> {
         let mut prepared = PreparedExternalLeaves::new();
         let leaves = entry.nodes.iter().filter_map(|(id, node)| match node {
-            control_plane::query_plan::QueryPlanNode::ExternalExact { request, inputs }
+            asap_types::query_plan::QueryPlanNode::ExternalExact { request, inputs }
                 if request.language == asap_types::QueryLanguage::ClickHouseSql
                     && inputs.is_empty() =>
             {
@@ -85,7 +85,7 @@ impl CatalogClickHouseAccelerator {
                 .as_ref()
                 .ok_or_else(|| "ClickHouse exact subtree endpoint unavailable".to_owned())?;
             let schema = match &bound.output {
-                control_plane::query_plan::ExternalExactOutput::Relation { schema } => {
+                asap_types::query_plan::ExternalExactOutput::Relation { schema } => {
                     serde_json::from_value(schema.clone()).map_err(|error| error.to_string())?
                 }
                 _ => return Err("ClickHouse exact subtree must produce a relation".into()),
@@ -102,6 +102,18 @@ impl CatalogClickHouseAccelerator {
                 parameters.insert(format!("param_{name}"), end_ms.to_string());
             }
             parameters.insert("default_format".into(), "JSONCompact".into());
+            parameters.insert(
+                "output_format_json_map_as_array_of_tuples".into(),
+                "1".into(),
+            );
+            parameters.insert(
+                "output_format_json_named_tuples_as_objects".into(),
+                "0".into(),
+            );
+            parameters.insert("output_format_json_quote_64bit_integers".into(), "0".into());
+            // Preserve the distinction between NULL and unsupported NaN/Inf.
+            // The typed decoder rejects quoted non-finite values and falls back.
+            parameters.insert("output_format_json_quote_denormals".into(), "1".into());
             if let Some(database) = request_context.database() {
                 parameters.insert("database".into(), database.into());
             }
@@ -135,6 +147,11 @@ impl CatalogClickHouseAccelerator {
 }
 
 fn requested_format(request: &ClickHouseQueryRequest) -> Result<ClickHouseFormat, String> {
+    if let Some(setting) = request.parameters.keys().find(|key| {
+        key.starts_with("output_format_") || key.as_str() == "format_tsv_null_representation"
+    }) {
+        return Err(format!("unsupported output setting {setting}"));
+    }
     match request
         .format()
         .unwrap_or("TabSeparated")
@@ -236,7 +253,9 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
                             }
                         }),
                     );
-                    let (execution, detail) = if prepared.is_empty() {
+                    let (execution, detail) = if entry.materialization_bindings().is_empty() {
+                        ("exact_fallback", "external_dag")
+                    } else if prepared.is_empty() {
                         ("warm", "asap")
                     } else {
                         ("hybrid", "hybrid")
@@ -268,18 +287,39 @@ impl ClickHouseAccelerator for CatalogClickHouseAccelerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_output_settings_cannot_silently_change_warm_format() {
+        let mut request = ClickHouseQueryRequest {
+            method: axum::http::Method::GET,
+            sql: "SELECT labels FROM samples".into(),
+            body: Bytes::new(),
+            parameters: BTreeMap::from([("default_format".into(), "JSON".into())]),
+            headers: HeaderMap::new(),
+        };
+        assert!(requested_format(&request).is_ok());
+        for setting in [
+            "output_format_json_map_as_array_of_tuples",
+            "output_format_json_quote_64bit_integers",
+            "format_tsv_null_representation",
+        ] {
+            request.parameters.insert(setting.into(), "1".into());
+            assert!(requested_format(&request).is_err());
+            request.parameters.remove(setting);
+        }
+    }
+
     use crate::{
         precompute_engine::operators::SumAccumulator,
         storage_engines::sketch_db::index::{AggKind, Capability, SketchInstanceMetadata},
     };
-    use asap_types::summary_catalog::SummaryCatalog;
-    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
-    use axum::http::Method;
-    use control_plane::query_plan::{
+    use asap_types::query_plan::{
         ClickHousePlanningContext, ExactReadout, ExternalExactOutput, ExternalExactRequest,
         FallbackPolicy, FixedEvaluationRange, InstantExecution, MaterializationBinding,
         PhysicalGrouping, QueryLanguage, QueryNodeId, QueryPlan, QueryPlanEntry, QueryPlanNode,
     };
+    use asap_types::summary_catalog::SummaryCatalog;
+    use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
+    use axum::http::Method;
 
     struct FixedExactSubtree;
 
@@ -290,6 +330,10 @@ mod tests {
             request: &ClickHouseQueryRequest,
         ) -> Result<ClickHouseRawResponse, super::super::fallback::ClickHouseFallbackError>
         {
+            assert_eq!(
+                request.parameters.get("output_format_json_quote_denormals"),
+                Some(&"1".into())
+            );
             assert_eq!(request.parameters.get("param_from"), Some(&"0".into()));
             assert_eq!(request.parameters.get("param_to"), Some(&"2000".into()));
             Ok(ClickHouseRawResponse {
@@ -665,7 +709,7 @@ mod tests {
         )
         .unwrap();
         precompute.summary_catalog = Some(sds.reference().unwrap());
-        let mut transmission = control_plane::physical::compiler::TransmissionPlan::build(
+        let mut transmission = control_plane::physical::compiler::compile_transmission_plan(
             envelope.clone(),
             &precompute,
             &BTreeMap::new(),
@@ -759,7 +803,9 @@ mod tests {
         cfg.pane_origin_ms = Some(0);
         cfg.table_name = Some("asap_e2e.samples".into());
         cfg.table_timestamp_column = Some("timestamp_ms".into());
-        cfg.value_column = Some("value".into());
+        cfg.value_projection = Some(asap_types::sds::ValueProjectionIdentity::Column {
+            name: "value".into(),
+        });
         let hot = crate::storage_engines::types::HotReloadStreamingConfig::from_arc(Arc::new(
             crate::storage_engines::types::StreamingConfig::new(HashMap::from([(
                 cfg.policy_fp_u64(),

@@ -37,9 +37,13 @@ operator-specific stores beside `SketchStore`.
 
 The target model has descriptor registries plus pane instances. Descriptor IDs
 are derived from canonical semantic content; display names and runtime SIDs are
-not descriptor identities. The current implementation uses the canonical string
-itself as the ID. A future hashed representation must preserve the same content
-identity and handle collisions explicitly.
+not descriptor identities. `SummaryDescriptorId` and `DataDescriptorId` currently
+contain versioned canonical semantic strings. `SummaryDefinitionId` is a distinct
+typed policy fingerprint, and `CatalogGeneration` identifies a publication using
+its digest and plan version. A physical `SeriesId` identifies one storage lifetime
+of a definition/group; it is neither a descriptor ID nor a pane instance ID.
+Changing descriptor encoding to a hash must preserve content identity and handle
+collisions explicitly.
 
 ```rust
 struct SummaryDescriptor {
@@ -158,8 +162,19 @@ bindings against QueryPlan; precompute execution consumes the shared contract.
 `PrecomputePlan`, its envelope, ingest, producer, state schema, and catalog
 consistency checks live in `asap_types::precompute_plan`. The compiler chooses
 materializations and placement; data-plane installation uses the shared
-contract. `QueryPlan` definitions still reside in the control-plane
-crate while their remaining compilation methods are separated from wire types.
+contract. `asap_types::query_plan` owns QueryPlan, materialization bindings,
+logical operator DTOs, and activation validation. The control plane reexports
+those types for existing callers and owns the `compile_bound*` and
+`logical::compile_logical` functions; Planner traversal and AST lowering do not
+move into the shared contract. Data-plane engines import the shared types
+directly. No wrapper plan or second wire definition is introduced.
+
+`asap_types::producer_plan` owns the installed collector and transmission
+contracts, frame identities, runtime policy bounds and their validation. The
+control plane allocates sampling/GOS budgets and constructs transmission rules
+through `sampling_policy_from_accuracy_budget`, `gos_policy_from_accuracy_budget`
+and `compile_transmission_plan`. Producers and the data plane import the shared
+contracts directly; compilation is not a runtime dependency of those contracts.
 
 The implemented ownership split is:
 
@@ -184,13 +199,35 @@ compatibility DTO while older sidecars are read.
 
 The implemented `SummaryDescriptor` currently contains one `SummaryOperator`,
 one derived `FidelityGuarantee`, and a numeric state-schema version. The
-implemented `DataDescriptor` contains metric name, canonical population filter,
-grouping keys and versioned observation semantics. The shared contract now also
+implemented `DataDescriptor` contains typed source and value projections, a
+canonical population filter, typed grouping columns and versioned observation
+semantics. The shared contract now also
 defines `SummaryInstance`, `ObservedSummaryInventory`, placement, completeness,
 state references, catalog generation and ephemeral leases. The control-plane
 reconciler emits create, update, recover, retire, garbage-collect, promote and
 expire actions. Summary payloads and the application of those actions remain in
 the SummaryStore runtime.
+
+The same `GroupingProjection` supplies source columns to precompute configuration,
+`DataDescriptor` and the state-schema contract. Each column retains the Planner's
+name, type and nullability; routing derives names without storing a second list.
+Legacy label lists decode as non-null UTF-8 columns and keep their existing
+identities. A changed type or nullability changes catalog and policy identity.
+A SQL map column is one grouping value, not a set of PromQL labels. Typed
+ClickHouse group transport remains a separate execution capability: the current
+reader rejects non-label projections until that transport is implemented.
+
+`DataDescriptor`, precompute configuration and state-schema validation share
+`ValueProjectionIdentity`: sample value, named column, or a finite numeric
+constant using the Planner's `ScalarValue`. A constant input such as `1` does
+not masquerade as a table column. Projection identity participates in catalog
+and policy identity; existing column identities remain unchanged. Older
+`value_column` config and state-schema fields are accepted only by wire adapters
+and become the same typed projection in memory. ClickHouse backfill binds a
+constant as a typed query parameter and applies the installed table population
+and timestamp projection. Its Float64 ingest boundary rejects integer constants
+outside the exactly representable range. This contract enables literal inputs;
+query lowering must still establish each aggregate's null and row semantics.
 
 The durable `sid_metadata.json` format is versioned independently. Version 2
 contains `summary_descriptors`, `data_descriptors`, and `bindings` tables. A
@@ -375,3 +412,113 @@ creates a new Data Descriptor. Advancing the time range creates a new Summary
 Instance. Merge compatibility additionally requires the operator's merge rules,
 compatible data scopes and valid instance coverage; sharing descriptors alone
 does not authorize merging overlapping observations.
+
+
+### Retired physical series and catalog reactivation
+
+A persisted removal tombstone prevents late fragments and stale metadata flushes
+from reopening the same physical `SeriesId`. A later installed catalog generation
+may authorize a fresh physical series for the same logical definition/group.
+The resolver writes that rotation and its catalog provenance before changing its
+cache; ordinary writes from the original generation cannot authorize rotation.
+The original physical ID remains tombstoned so old disk parts cannot enter the
+replacement's readout.
+
+Queued precompute inputs carry their captured catalog generation and physical
+series ID separately from an optional admission receipt. Workers preserve both
+on publication. A delayed output writes its original physical series, never a
+newly resolved replacement. Derived materializations resolve their own target
+series while retaining the source generation proof. Backfill processors capture
+the catalog generation when attached to the store; old jobs cannot authorize a
+new catalog's rotation. An older queued input that has not yet published its
+first storage instance is conservatively rejected after a catalog change. Already
+registered retained series can drain their birth generation or accept the current
+generation. Seamless re-planning of unpublished old inputs requires additional
+first-mint provenance; it is not guaranteed by this transition.
+
+This is an explicit lifetime transition, not cross-generation recovery of arbitrary
+summary state. Legacy records without trustworthy catalog provenance remain
+unbound. Tombstone reclamation still requires coordinated removal of old physical
+parts and is not implemented by this transition.
+
+### Derived summary input identity
+
+A summary computed from another summary has a different data source from the
+original raw table or metric. `PrecomputeMaterialization.derived_input` and
+`DataSourceIdentity::Derived` use the same `DerivedInputIdentity`: the referenced
+`SummaryDefinitionId`s and a SHA-256 of the maintenance program. The executable
+program remains in `OwnedPostAsapDag`; the catalog does not retain another copy.
+
+The signature replaces materialized input frontiers with stable summary IDs and
+hashes the remaining node payloads, schemas, guarantees, and edge semantics. It
+excludes query names, plan-local node numbering, and catalog generations. Literal
+leaves are hashed directly; raw input leaves still require catalog frontiers. A changed
+input definition or transformation creates a new identity. Existing raw-source
+identities retain their previous byte representation. Catalog validation rejects
+missing input definitions and dependency cycles.
+
+Installation still rejects derived inputs so they cannot accidentally receive
+raw samples through the legacy metric router. The explicit immutable maintenance
+entry point below must be wired into compiler construction and automatic
+scheduling before this guard is removed. Neither raw-table substitution nor
+treating late correction fragments as new observations is valid.
+
+### Immutable completed windows
+
+Finite Remote Write completion now fences the SummaryStore append boundary,
+not just the receiver queue. After all admitted outputs are published, the store
+records the greatest published window end for each physical SeriesId. Sketch and
+exact-state writes ending at or before that boundary are rejected, including
+writes arriving through other producers. A later window remains writable. Observed SDS inventory reports only these frozen
+instances as `Complete`; ordinary emitted panes remain `Unknown`.
+
+The boundary is monotone in the existing SeriesId metadata sidecar and is restored
+before recovered identities become writable. A stale background metadata flush
+cannot reopen a completed window. The guard belongs to the physical lifetime;
+a catalog-authorized replacement SeriesId has its own boundary.
+
+With persistence enabled, completion explicitly requests the existing flusher to
+make the completed prefix durable, even if it is still inside the hot tier.
+Completion waits until the corresponding epochs have been evicted after part and
+manifest publication; only then does it persist the immutable boundary. An
+in-memory deployment provides no restart guarantee. Maintenance consumers still
+must atomically publish their output identity before claiming replay-safe consumption.
+The existing finite-source completeness proof still rejects untracked writes or
+pending admitted work. Continuous producer watermarks and derived-state commit
+transactions are separate from this finite-input boundary.
+### Executing an immutable maintenance sink
+
+`precompute_engine::maintenance_runtime::execute_completed_maintenance` executes
+one installed semantic subDAG from a physical source whose required base windows
+are durably complete. SummaryStore validates the catalog generation, physical
+SeriesId, population, exact window coverage, and each part read. Missing, corrupt,
+or duplicate source windows are errors; this path cannot silently omit a pane as
+a query fallback helper might.
+
+The existing maintenance operator registry preserves a collection of source
+states until the DAG explicitly merges or finalizes it. Exact Sum/Count
+finalization with a declared Float64 output produces one row per source window; an unkeyed SummaryAgg consumes
+those rows together. Consequently `Finalize -> SummaryAgg` does not accidentally
+become one complete DAG evaluation per correction fragment. Live worker fragments
+remain ineligible for finalization.
+
+The engine resumes a matching durable pending part and looks up the stored input
+digest before computing a potentially randomized sketch. The existing flusher publishes a new result through its part
+reservation protocol; SummaryStore fences query reads and physical lifetime
+changes during publication. A concurrent identical completion reuses the durable
+result instead of comparing newly randomized bytes. Both pending recovery and a
+committed lookup restore the live completion boundary. Catalog-derived definitions
+reject additive sketch/precompute writes even beyond that boundary; only reserved
+publication may create their output state. The latest committed window can be
+retried after restart without adding another part.
+
+This is an explicit maintenance entry point, not automatic workload coverage.
+The initial consumer supports one source definition and population, complete
+non-overlapping base panes, Sum/Count finalization, and unkeyed aggregate updates.
+Compiler construction and automatic scheduling must use this entry point before
+derived installation is enabled. Cross-population reductions, synchronized
+multiple sources, general row operators, overlapping output-window replacement,
+and continuous producer watermarks remain unsupported. In particular, the SQL
+subquery's timestamp grouping and sampling predicate must not be replaced with an
+arbitrary tumbling aggregate. Historical completion-metadata GC and pinning source
+parts for recovery before a reserved output part exists remain lifecycle work.

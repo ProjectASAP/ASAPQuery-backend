@@ -97,6 +97,11 @@ pub struct EpochSnapshotEntry {
 /// * [`approx_memory_bytes`] is cheap (atomic load) and is kept in sync
 ///   with what the flusher has evicted.
 pub trait EpochSource: Send + Sync {
+    /// Explicit durability demand from a completed source, independent of the hot tier.
+    fn flush_before_ms(&self) -> Option<u64> {
+        None
+    }
+
     fn list_sealed_epochs(&self) -> Vec<SealedEpochRef>;
 
     /// Time-driven seal: roll every un-sealed `current_epoch` window

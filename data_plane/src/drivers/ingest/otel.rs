@@ -604,10 +604,10 @@ fn resolve_bucket_sid_for_agg_config(
     ingest_state: &Arc<IngestState>,
     config: &asap_types::aggregation_config::AggregationConfig,
     point_labels: &HashMap<String, String>,
-) -> (u64, asap_types::PolicyFingerprint) {
+    captured_generation: Option<&asap_types::sds::CatalogGeneration>,
+) -> Result<(u64, asap_types::PolicyFingerprint), String> {
     let grouping_pairs: Vec<(&str, &str)> = config
         .grouping_labels
-        .labels
         .iter()
         .map(|name| {
             let v = point_labels.get(name).map(|s| s.as_str()).unwrap_or("");
@@ -617,11 +617,28 @@ fn resolve_bucket_sid_for_agg_config(
     let fp = crate::drivers::ingest::canonical_attrs_fingerprint(&grouping_pairs);
     let agg_kind_canonical =
         crate::storage_engines::sketch_db::data::materialization_kind_for_config(config);
-    let sid = ingest_state
-        .series_resolver
-        .resolve(&config.metric, &fp, &agg_kind_canonical);
+    let sid = ingest_state.series_resolver.resolve_with_reactivation(
+        &config.metric,
+        &fp,
+        &agg_kind_canonical,
+        |sid| {
+            ingest_state
+                .sketch_index
+                .validate_routed_catalog_generation(captured_generation)?;
+            let activation = ingest_state
+                .sketch_index
+                .authorize_series_reactivation(sid, config.policy_fingerprint().into())?;
+            if activation
+                .as_deref()
+                .is_some_and(|generation| Some(generation) != captured_generation)
+            {
+                return Err("stale OTLP generation cannot reactivate series".into());
+            }
+            Ok(activation)
+        },
+    )?;
     let policy_fp = asap_types::PolicyFingerprint(config.policy_fp_u64());
-    (sid, policy_fp)
+    Ok((sid, policy_fp))
 }
 
 async fn route_otlp_to_precompute(
@@ -633,7 +650,15 @@ async fn route_otlp_to_precompute(
 
     // Snapshot the latest agg_configs from the hot-reload handle so
     // new aggregations are visible without restart.
-    let snap = ingest_state.config_snapshot();
+    let physical_plan_snapshot = ingest_state.physical_plan_snapshot();
+    let catalog_generation = physical_plan_snapshot
+        .as_ref()
+        .and_then(|plan| plan.precompute_plan.summary_catalog.clone())
+        .map(Arc::new);
+    let snap = physical_plan_snapshot
+        .as_ref()
+        .map(|plan| plan.runtime_config.clone())
+        .unwrap_or_else(|| ingest_state.config_snapshot());
     let agg_configs = snap.get_all_aggregation_configs();
     // Schema retirement #5 — the agg_id-keyed `SchemaRegistry` is
     // gone; sid-level lifecycle now lives on `SketchStore`. Reconcile
@@ -691,8 +716,18 @@ async fn route_otlp_to_precompute(
                 continue;
             }
             let group_key = IngestState::extract_group_key_for(&series_key, config);
-            let (sid, policy_fp) =
-                resolve_bucket_sid_for_agg_config(ingest_state, config, &point.labels);
+            let (sid, policy_fp) = match resolve_bucket_sid_for_agg_config(
+                ingest_state,
+                config,
+                &point.labels,
+                catalog_generation.as_deref(),
+            ) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    warn!(%error, "configured ingest series reactivation rejected");
+                    continue;
+                }
+            };
             by_bucket
                 .entry(sid)
                 .or_insert_with(|| ((sid, policy_fp, group_key.clone()), Vec::new()))
@@ -724,7 +759,7 @@ async fn route_otlp_to_precompute(
     if !raw_messages.is_empty() {
         if let Err(e) = ingest_state
             .router
-            .route_group_batch(raw_messages, ingest_received_at)
+            .route_group_batch(raw_messages, ingest_received_at, catalog_generation.clone())
             .await
         {
             warn!("OTLP raw-sample routing error: {}", e);
@@ -782,8 +817,18 @@ async fn route_otlp_to_precompute(
             // `reconcile_from_streaming_config` derives from the same
             // config (otherwise the bucket would be reachable but never
             // reconciled).
-            let (sid, policy_fp) =
-                resolve_bucket_sid_for_agg_config(ingest_state, config, &point.labels);
+            let (sid, policy_fp) = match resolve_bucket_sid_for_agg_config(
+                ingest_state,
+                config,
+                &point.labels,
+                catalog_generation.as_deref(),
+            ) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    warn!(%error, "configured ingest series reactivation rejected");
+                    continue;
+                }
+            };
             sketch_messages.push(WorkerMessage::AccumulatorInput {
                 sid,
                 policy_fp,
@@ -812,7 +857,11 @@ async fn route_otlp_to_precompute(
     if !sketch_messages.is_empty() {
         if let Err(e) = ingest_state
             .router
-            .route_group_batch(sketch_messages, ingest_received_at)
+            .route_group_batch(
+                sketch_messages,
+                ingest_received_at,
+                catalog_generation.clone(),
+            )
             .await
         {
             warn!("OTLP sketch routing error: {}", e);
@@ -875,6 +924,10 @@ async fn route_modified_otlp_sketches_to_precompute(
         .as_ref()
         .map(|plan| plan.runtime_config.clone())
         .unwrap_or_else(|| ingest_state.config_snapshot());
+    let catalog_generation = physical_plan_snapshot
+        .as_ref()
+        .and_then(|plan| plan.precompute_plan.summary_catalog.clone())
+        .map(Arc::new);
     let active_physical_plan = physical_plan_snapshot.filter(|plan| plan.plan_id() != 0);
     let lineage_batch_guard = active_physical_plan
         .as_ref()
@@ -1219,11 +1272,42 @@ async fn route_modified_otlp_sketches_to_precompute(
                             spatial_filter_canonical: String::new(),
                         };
                         let agg_kind_canonical = agg_kind.canonical_string();
-                        let assigned = ingest_state.series_resolver.resolve(
+                        let definition = frame_identity
+                            .as_ref()
+                            .map(|frame| frame.materialization)
+                            .unwrap_or_else(|| asap_types::PolicyFingerprint(0).into());
+                        let assigned = match ingest_state.series_resolver.resolve_with_reactivation(
                             &canonical_name,
                             &fp,
                             &agg_kind_canonical,
-                        );
+                            |sid| {
+                                ingest_state
+                                    .sketch_index
+                                    .validate_routed_catalog_generation(
+                                        catalog_generation.as_deref(),
+                                    )?;
+                                let activation = ingest_state
+                                    .sketch_index
+                                    .authorize_series_reactivation(sid, definition)?;
+                                if activation.as_deref().is_some_and(|generation| {
+                                    Some(generation) != catalog_generation.as_deref()
+                                }) {
+                                    return Err(
+                                        "stale OTLP generation cannot reactivate series".into()
+                                    );
+                                }
+                                Ok(activation)
+                            },
+                        ) {
+                            Ok(sid) => sid,
+                            Err(error) => {
+                                if dp.series_id != 0 {
+                                    unknown_sids.push(dp.series_id);
+                                }
+                                warn!(%error, "modified OTLP series reactivation rejected");
+                                continue;
+                            }
+                        };
                         if dp.series_id != 0 && dp.series_id != assigned {
                             // Sender's cached sid disagrees with the
                             // resolver's binding — sender's cache is
@@ -1630,7 +1714,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                                 crate::precompute_engine::frame_lineage::FrameLineageDecision::Apply,
                             ) => {
                                 if frame.kind
-                                    == control_plane::physical::compiler::SummaryFrameKind::Full
+                                    == asap_types::producer_plan::SummaryFrameKind::Full
                                 {
                                     ingest_state
                                         .sketch_index
@@ -1670,15 +1754,6 @@ async fn route_modified_otlp_sketches_to_precompute(
                         }
                     }
 
-                    ingest_state.sketch_snapshots.insert(
-                        series_key.clone(),
-                        crate::precompute_engine::ingest_handler::SnapshotCacheEntry {
-                            core: accumulator.clone_boxed_core(),
-                            window_start: dp.start_time_unix_nano,
-                        },
-                    );
-                    ingest_state.note_window_and_sweep(dp.start_time_unix_nano);
-
                     use crate::storage_engines::sketch_db::index::{
                         SketchEncoding, SketchSampleState,
                     };
@@ -1694,7 +1769,7 @@ async fn route_modified_otlp_sketches_to_precompute(
                     );
                     let encoding =
                         encoding_to_handle(dp.encoding).unwrap_or(SketchEncoding::ProtoFull);
-                    ingest_state.sketch_index.append_sample(
+                    if !ingest_state.sketch_index.append_sample(
                         sid,
                         label_values,
                         window,
@@ -1702,7 +1777,18 @@ async fn route_modified_otlp_sketches_to_precompute(
                             bytes: dp.sketch.clone(),
                             encoding,
                         },
+                    ) {
+                        return Err("summary window is immutable after completion".into());
+                    }
+
+                    ingest_state.sketch_snapshots.insert(
+                        series_key.clone(),
+                        crate::precompute_engine::ingest_handler::SnapshotCacheEntry {
+                            core: accumulator.clone_boxed_core(),
+                            window_start: dp.start_time_unix_nano,
+                        },
                     );
+                    ingest_state.note_window_and_sweep(dp.start_time_unix_nano);
 
                     // Collect the configs whose metric matches this DP.
                     // Detection is independent of the legacy dual-write
@@ -1753,8 +1839,18 @@ async fn route_modified_otlp_sketches_to_precompute(
                             // PERF-3 — `dp.attrs` is already a
                             // `HashMap<String, String>`; pass it directly
                             // instead of rebuilding `attrs_map` per config.
-                            let (bucket_sid, policy_fp) =
-                                resolve_bucket_sid_for_agg_config(ingest_state, config, &dp.attrs);
+                            let (bucket_sid, policy_fp) = match resolve_bucket_sid_for_agg_config(
+                                ingest_state,
+                                config,
+                                &dp.attrs,
+                                catalog_generation.as_deref(),
+                            ) {
+                                Ok(binding) => binding,
+                                Err(error) => {
+                                    warn!(%error, "configured ingest series reactivation rejected");
+                                    continue;
+                                }
+                            };
                             let acc_for_msg = if i + 1 == n {
                                 // Last (or only) match — move the owned
                                 // accumulator out, no clone.
@@ -1805,7 +1901,7 @@ async fn route_modified_otlp_sketches_to_precompute(
     if !messages.is_empty() {
         if let Err(e) = ingest_state
             .router
-            .route_group_batch(messages, ingest_received_at)
+            .route_group_batch(messages, ingest_received_at, catalog_generation.clone())
             .await
         {
             warn!("OTLP modified-proto sketch routing error: {}", e);
@@ -2157,7 +2253,7 @@ fn preflight_summary_frames(
         mut dp: ModifiedOtlpSketchDp,
         ingest_state: &IngestState,
         active: &crate::storage_engines::types::ActivePhysicalPlan,
-    ) -> Result<control_plane::physical::compiler::SummaryFrameIdentity, String> {
+    ) -> Result<asap_types::producer_plan::SummaryFrameIdentity, String> {
         let canonical_name = canonical_sketch_metric_name(metric_name, dp.algorithm.clone());
         let frame =
             take_summary_frame_identity(&mut dp.attrs, dp.start_time_unix_nano, dp.time_unix_nano)?;
@@ -2200,7 +2296,7 @@ fn preflight_summary_frames(
 
         // A malformed full snapshot must not be discovered after an earlier
         // frame in the request has already reached SketchStore.
-        if frame.kind == control_plane::physical::compiler::SummaryFrameKind::Full {
+        if frame.kind == asap_types::producer_plan::SummaryFrameKind::Full {
             decode_modified_otlp_sketch_bytes(dp.algorithm.clone(), dp.encoding, &dp.sketch)
                 .map_err(|error| format!("invalid full frame for {metric_name}: {error}"))?;
         } else {
@@ -2358,10 +2454,9 @@ fn take_summary_frame_identity(
     attrs: &mut HashMap<String, String>,
     window_start_unix_nano: u64,
     window_end_unix_nano: u64,
-) -> Result<control_plane::physical::compiler::SummaryFrameIdentity, String> {
-    use control_plane::physical::compiler::{
-        StateEncoding, SummaryFrameIdentity, SummaryFrameKind,
-    };
+) -> Result<asap_types::producer_plan::SummaryFrameIdentity, String> {
+    use asap_types::producer_plan::{SummaryFrameIdentity, SummaryFrameKind};
+    use control_plane::physical::compiler::StateEncoding;
 
     fn required(attrs: &mut HashMap<String, String>, key: &str) -> Result<String, String> {
         attrs
