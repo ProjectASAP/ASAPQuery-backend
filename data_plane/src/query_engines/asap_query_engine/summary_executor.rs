@@ -646,7 +646,7 @@ impl QueryExecutionContext<'_> {
                 <Self as SummaryExecutor>::merge_states(self, states).map(|state| (key, state))
             })
             .collect();
-        if inventory_revision != self.index.summary_update_revision() {
+        if !inventory_revision.matches(self.index.summary_update_revision()) {
             return Err(SummaryExecutorError::Unsupported(
                 "summary input changed during read",
             ));

@@ -572,7 +572,7 @@ fn execute_physical_query_payload(
             }
         }
     })();
-    if revision != index.summary_update_revision() {
+    if !revision.matches(index.summary_update_revision()) {
         return Err(LoweringSkip::ExecuteFailed(
             "summary input changed during query DAG evaluation".into(),
         ));
