@@ -120,6 +120,8 @@ async fn observed_shape_selects_installed_parameters_and_executes_remote_write()
             "ERP_PLANNED {}",
             serde_json::json!({
                 "query": QUERY, "available_profiles": policy.artifact.records,
+            "parameter_decision": format!("{:?}", policy.select(planner_types::post_asap::SketchAlgorithm::Kll, 0.2, planner_types::post_asap::SketchParams::Kll { k: 128 })),
+            "lifecycle_estimates": plan.lifecycle_estimates,
                 "observation": policy.observed_shape,
                 "selected_parameters": plan.precompute_plan.materializations[0].parameters,
                 "materialization": chosen.last(),
