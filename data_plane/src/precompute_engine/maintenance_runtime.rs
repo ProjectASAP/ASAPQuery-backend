@@ -6,7 +6,7 @@ use super::subdag_scheduler::{
     PrecomputeOperatorRegistry, ScheduleError,
 };
 use crate::storage_engines::types::{AggregateCore, HotReloadStreamingConfig, PrecomputedOutput};
-use control_plane::physical::executable_binding::{BackendExecutableBinding, BackendNodeBinding};
+use asap_types::executable_plan::{BackendExecutableBinding, BackendNodeBinding};
 use planner_types::post_asap::{ExecutableDagNode, ExecutableOperatorPayload, PostAsapNodeId};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -696,9 +696,7 @@ mod tests {
         use crate::storage_engines::types::{
             ActivePhysicalPlan, HotReloadActivePhysicalPlan, StreamingConfig,
         };
-        use control_plane::physical::executable_binding::{
-            InstalledPostAsapDag, PostAsapDagDocument,
-        };
+        use control_plane::physical::executable_binding::{InstalledPostAsapDag, OwnedPostAsapDag};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         #[derive(Default)]
@@ -774,7 +772,7 @@ mod tests {
         bundle.precompute_plan.executable_dags = BTreeMap::from([(
             "retry".into(),
             InstalledPostAsapDag {
-                document: PostAsapDagDocument::from_executable("retry".into(), &dag).unwrap(),
+                document: OwnedPostAsapDag::from_executable("retry".into(), &dag).unwrap(),
                 binding,
             },
         )]);
