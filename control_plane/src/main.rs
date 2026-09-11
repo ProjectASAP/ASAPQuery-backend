@@ -1102,13 +1102,6 @@ fn workload_cost_manifests(
 async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) -> impl IntoResponse {
     let wc = spec.workload.clone();
     let query_string = spec.query_string.clone();
-    // Captured before `spec` moves into `analyze` below -- L1 adoption
-    // (design-target-architecture.md Part B) needs a real AccuracyTarget
-    // for `parse_query_expr_canonical`; this is the one call site in the
-    // pipeline with an actual per-query accuracy value available, so
-    // thread it through rather than a flat deployment-wide default.
-    let accuracy =
-        control_plane::types_v2::accuracy_target_from_legacy_accuracy_sla(spec.accuracy_sla);
     let workload = match st.analyzer.analyze(spec) {
         Ok(w) => w,
         Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, e.to_string()).into_response(),
@@ -1139,22 +1132,18 @@ async fn handle_plan(State(st): State<AppState>, Json(spec): Json<QuerySpec>) ->
         let mut bound_physical: Option<control_plane::physical::post_asap::PhysicalExpr> = None;
         let mut plan_summary = None;
         if let Some(ref qs) = query_string {
-            match parse_query_expr_canonical(qs, accuracy) {
+            match parse_query_expr_canonical(qs, workload.accuracy.clone()) {
                 Err(e) => {
                     warn!(query = %qs, error = %e, "parse_query_expr_canonical failed; skipping algebra pipeline")
                 }
                 Ok(qe) => {
                     // L4 sketch binding: lower the optimised L3 tree to the
                     // sketch-bound `PhysicalExpr` IR — the typed L5's input.
-                    let accuracy = if workload.accuracy_sla >= 1.0 {
-                        control_plane::types_v2::AccuracyTarget::Exact
-                    } else {
-                        control_plane::types_v2::AccuracyTarget::Epsilon(
-                            1.0 - workload.accuracy_sla,
-                        )
-                    };
-                    bound_physical =
-                        control_plane::physical::post_asap::bind_query_expr(&qe, accuracy).ok();
+                    bound_physical = control_plane::physical::post_asap::bind_query_expr(
+                        &qe,
+                        workload.accuracy.clone(),
+                    )
+                    .ok();
                     // Cost summary for the JSON response.
                     let plan_node = SketchAllocator::new(budgets.clone(), raw_bps).allocate(qe);
                     plan_summary = Some(plan_node.summarise(raw_bps));
@@ -2447,6 +2436,58 @@ mod api_tests {
         assert!(body["valid_until"].as_str().is_some());
     }
 
+    /// HTTP and stored replan inputs share the resolved typed target, including delta.
+    #[tokio::test]
+    async fn plan_preserves_typed_accuracy_requirements() {
+        use control_plane::types_v2::AccuracyTarget;
+        for target in [
+            AccuracyTarget::Epsilon(0.05),
+            AccuracyTarget::EpsilonDelta {
+                epsilon: 0.05,
+                delta: 0.001,
+            },
+            AccuracyTarget::Exact,
+        ] {
+            let (state, app) = test_app();
+            let mut body = plan_spec("typed_accuracy_metric");
+            body["accuracy_sla"] = serde_json::json!(0.2);
+            body["accuracy"] = serde_json::to_value(&target).unwrap();
+            body["sketch_type"] = serde_json::to_value(types::SketchType::DDSketch).unwrap();
+            body["query_string"] =
+                serde_json::json!("quantile_over_time(0.9, typed_accuracy_metric[5m])");
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/plan")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let stored = state
+                .workload_store
+                .get_all_for_metric("typed_accuracy_metric");
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].1.accuracy, target);
+            let plans = state.store.get_all_for_metric("typed_accuracy_metric");
+            assert_eq!(plans.len(), 1);
+            if matches!(target, AccuracyTarget::Epsilon(_)) {
+                let types::SketchParams::DDSketch {
+                    relative_accuracy, ..
+                } = plans[0].1.agent_config.sketch_params
+                else {
+                    panic!("expected pinned DDS plan")
+                };
+                assert!((relative_accuracy - 0.05).abs() < 1e-12);
+            } else {
+                assert_eq!(plans[0].1.agent_config.output_mode, types::OutputMode::Raw);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn plan_invalid_spec_returns_422() {
         let (_, app) = test_app();
@@ -2528,6 +2569,7 @@ mod api_tests {
             time_window: std::time::Duration::from_secs(300),
             repeat_every: None,
             accuracy_sla: 0.01,
+            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,

@@ -100,6 +100,10 @@ pub fn pareto_frontier(
     weights: ObjectiveWeights,
     online_store: Option<&online::OnlineMetricsStore>,
 ) -> Vec<ParetoPoint> {
+    if !matches!(workload.accuracy, crate::types_v2::AccuracyTarget::Epsilon(epsilon) if epsilon > 0.0)
+    {
+        return Vec::new();
+    }
     let table: HashMap<SketchType, SketchCosts> = match online_store {
         Some(s) => online::effective_table(s),
         None => benchmark_table_pub(),
@@ -110,7 +114,7 @@ pub fn pareto_frontier(
     let mut points: Vec<ParetoPoint> = Vec::new();
 
     for st in candidates {
-        let params = default_sketch_params(&st, workload.accuracy_sla);
+        let params = default_sketch_params(&st, workload.error_bound());
         let (mode, window_duration) = select_window_strategy(workload);
 
         let mut plan = rules.plan(workload);
@@ -194,7 +198,7 @@ fn apply_delta(
             plan.agent_config.delta_transmission = true;
             plan.agent_config.delta_threshold = *threshold;
             plan.agent_config.gos = (plan.agent_config.sketch_type == SketchType::CountSketch)
-                .then(|| GosKnobs::derive(w.accuracy_sla, 1, 0.0, 1.0, false));
+                .then(|| GosKnobs::derive(w.error_bound(), 1, 0.0, 1.0, false));
         }
         _ => {
             plan.agent_config.delta_transmission = false;
@@ -246,6 +250,7 @@ mod tests {
             time_window: Duration::from_secs(300),
             repeat_every: None,
             accuracy_sla: 0.02,
+            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.02),
             latency_sla: None,
             sketch_type_override: None,
             exact_required: false,
@@ -366,6 +371,7 @@ mod tests {
     fn tight_sla_excludes_inaccurate_sketches() {
         let w = QueryWorkload {
             accuracy_sla: 0.001, // very tight — only DDSketch at 0.1% accuracy can meet this
+            accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.001),
             ..quantile_workload()
         };
         let f = pareto_frontier(&w, &default_wc(), ObjectiveWeights::default(), None);

@@ -167,6 +167,7 @@ fn build_workload_with_override(
         aggregations,
         time_window,
         repeat_every: None,
+        accuracy: control_plane::types_v2::AccuracyTarget::Epsilon(accuracy_sla),
         accuracy_sla,
         latency_sla: None,
         sketch_type_override,

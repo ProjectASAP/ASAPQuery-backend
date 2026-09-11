@@ -1196,6 +1196,7 @@ mod runtime_tests {
                 time_window: Duration::from_secs(60),
                 repeat_every: None,
                 accuracy_sla: 0.01,
+                accuracy: crate::types_v2::AccuracyTarget::Epsilon(0.01),
                 latency_sla: None,
                 sketch_type_override: override_family,
                 exact_required: false,

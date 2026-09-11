@@ -270,6 +270,9 @@ pub struct QueryWorkload {
     pub aggregations: Vec<AggType>,
     pub time_window: Duration,
     pub repeat_every: Option<Duration>,
+    /// Authoritative query requirement; never reconstructed from the legacy view.
+    pub accuracy: crate::types_v2::AccuracyTarget,
+    /// Deprecated confidence-style view retained for compatibility reporting only.
     pub accuracy_sla: f64,
     pub latency_sla: Option<Duration>,
     /// When set, the planner must use this sketch type instead of running
@@ -282,6 +285,17 @@ pub struct QueryWorkload {
     /// Quantile φ targets implied by the query (e.g. [0.5] for TWAP,
     /// [0.0, 1.0] for price range).  Empty for non-quantile workloads.
     pub quantiles: Vec<f64>,
+}
+
+impl QueryWorkload {
+    /// Scalar sizing input for legacy cost formulas, not a confidence guarantee.
+    pub fn error_bound(&self) -> f64 {
+        match self.accuracy {
+            crate::types_v2::AccuracyTarget::Exact => 0.0,
+            crate::types_v2::AccuracyTarget::Epsilon(epsilon)
+            | crate::types_v2::AccuracyTarget::EpsilonDelta { epsilon, .. } => epsilon,
+        }
+    }
 }
 
 // ── Sketch defaults (YAML-configurable) ──────────────────────────────────────

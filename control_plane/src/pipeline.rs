@@ -61,8 +61,8 @@ pub struct QuerySpec {
     // so the existing JSON API surface (POST /api/v1/plan handlers,
     // pre-population from `workloads.yaml`, the test fixtures elsewhere
     // in the control plane) keeps working without supplying them. The
-    // planner does not yet consume these — see `Analyzer::analyze` for
-    // the L1 cross-product validation that does fire today.
+    // accuracy target is consumed by parsing and binding. The other fields
+    // retain the partial support described in `Analyzer::analyze`.
     /// Stable identifier preserved across replan cycles. Optional;
     /// auto-derived from `metric_name + accuracy_sla` if omitted
     /// (existing API callers don't supply this).
@@ -117,12 +117,9 @@ impl Analyzer {
     }
 
     pub fn analyze(&self, spec: QuerySpec) -> anyhow::Result<QueryWorkload> {
-        if !(0.0..=1.0).contains(&spec.accuracy_sla) {
-            return Err(anyhow!(
-                "accuracy_sla must be in [0,1], got {}",
-                spec.accuracy_sla
-            ));
-        }
+        let accuracy =
+            crate::types_v2::resolve_accuracy_target(spec.accuracy.as_ref(), spec.accuracy_sla)
+                .map_err(|error| anyhow!(error))?;
 
         // ── design.md L1: shape × data cross-product check ─────────────────
         // The cross-product table in design.md §6 enumerates which
@@ -150,39 +147,24 @@ impl Analyzer {
             _ => {}
         }
 
-        // ── design.md accuracy precedence: typed `accuracy` > legacy ───────
-        // When the caller supplies `accuracy: Some(AccuracyTarget)` it
-        // takes precedence. Otherwise the legacy `accuracy_sla: f64`
-        // field is translated into the typed form. The downstream
-        // planner currently consumes the legacy `f64` field; we keep
-        // it populated either way so cost-model behaviour does not
-        // regress for callers that supply the new field. Once the
-        // planner switches to consuming `AccuracyTarget` directly
-        // (separate downstream PR), this back-translation stops being
-        // needed.
-        let accuracy_sla = match &spec.accuracy {
-            Some(AccuracyTarget::Exact) => 1.0,
-            Some(AccuracyTarget::Epsilon(eps)) => (1.0 - eps).clamp(0.0, 1.0),
-            Some(AccuracyTarget::EpsilonDelta { epsilon, .. }) => (1.0 - epsilon).clamp(0.0, 1.0),
-            None => spec.accuracy_sla,
+        // Compatibility reporting only: all semantic consumers use `accuracy`.
+        let accuracy_sla = if spec.accuracy.is_none() {
+            spec.accuracy_sla
+        } else {
+            match accuracy {
+                AccuracyTarget::Exact => 1.0,
+                AccuracyTarget::Epsilon(epsilon) | AccuracyTarget::EpsilonDelta { epsilon, .. } => {
+                    1.0 - epsilon
+                }
+            }
         };
 
         // ── Step 1: parse query_string if provided ─────────────────────────
-        // Real `spec.accuracy` when the caller supplied one (L1 adoption,
-        // design-target-architecture.md Part B needs an explicit
-        // AccuracyTarget); the deployment-wide `Epsilon(0.01)` default
-        // otherwise, matching this same fallback's use elsewhere.
+        // Parsing and downstream binding receive this same resolved target.
         let parsed = spec
             .query_string
             .as_deref()
-            .map(|q| {
-                query_parser::parse_query(
-                    q,
-                    spec.accuracy
-                        .clone()
-                        .unwrap_or(AccuracyTarget::Epsilon(0.01)),
-                )
-            })
+            .map(|q| query_parser::parse_query(q, accuracy.clone()))
             .transpose()
             .with_context(|| "failed to parse query_string")?;
 
@@ -268,14 +250,8 @@ impl Analyzer {
             .map(|p| p.quantiles.clone())
             .unwrap_or_default();
 
-        // Note: `(planner not yet using this)` — these are populated for
-        // downstream consumers but the planner / cost model still keys
-        // off `accuracy_sla`, `time_window`, `aggregations`, etc. The
-        // L4-aware downstream PR will switch the cost model to read
-        // `spec.accuracy`, the L5 stage allocator to gate on
-        // `spec.shape`, and the leaf planner to gate on `spec.data`.
+        // These remaining compatibility fields do not yet feed the flat planner.
         let _ = (
-            &spec.accuracy,
             &spec.shape,
             &spec.data,
             &spec.id,
@@ -291,6 +267,7 @@ impl Analyzer {
             aggregations,
             time_window,
             repeat_every,
+            accuracy,
             accuracy_sla,
             latency_sla,
             sketch_type_override: spec.sketch_type,
@@ -663,6 +640,82 @@ mod tests {
 
     /// Typed `accuracy: Some(Exact)` clamps the SLA to 1.0 regardless of
     /// the legacy field's value.
+    /// A typed confidence requirement is validated without clamping or dropping delta.
+    #[test]
+    fn invalid_typed_accuracy_is_rejected() {
+        for target in [
+            AccuracyTarget::Epsilon(f64::NAN),
+            AccuracyTarget::Epsilon(-0.1),
+            AccuracyTarget::EpsilonDelta {
+                epsilon: 0.05,
+                delta: 0.0,
+            },
+            AccuracyTarget::EpsilonDelta {
+                epsilon: 0.05,
+                delta: 1.0,
+            },
+        ] {
+            let mut spec = basic_spec();
+            spec.accuracy = Some(target);
+            assert!(Analyzer::new().analyze(spec).is_err());
+        }
+    }
+
+    /// Typed requirements survive public analysis and determine the actual bound DDS size.
+    #[test]
+    fn typed_accuracy_survives_analysis_and_binding() {
+        use crate::physical::post_asap::deployment_expr::{PhysicalExpr, PostAsapPlan};
+        use planner_types::post_asap::{SketchParams, SummaryExpr, SummaryFamilyType};
+        for target in [
+            AccuracyTarget::Epsilon(0.05),
+            AccuracyTarget::EpsilonDelta {
+                epsilon: 0.05,
+                delta: 0.001,
+            },
+            AccuracyTarget::Exact,
+        ] {
+            let mut spec = basic_spec();
+            spec.accuracy_sla = 0.2;
+            spec.accuracy = Some(target.clone());
+            let mut workload = Analyzer::new().analyze(spec).unwrap();
+            assert_eq!(workload.accuracy, target);
+            // Mutating the deprecated reporting view cannot affect semantic binding.
+            workload.accuracy_sla = 0.9999;
+            let bound = crate::physical::workload_planner::bind_workload_typed(&workload);
+            if target == AccuracyTarget::Exact {
+                assert!(
+                    bound.is_none(),
+                    "exact quantile must not become an approximate sketch"
+                );
+                assert_eq!(
+                    crate::physical::workload_planner::DeploymentPlanCompiler::new()
+                        .plan(&workload)
+                        .agent_config
+                        .output_mode,
+                    crate::types::OutputMode::Raw
+                );
+            } else {
+                let Some(PhysicalExpr::Committed(PostAsapPlan::Summary(root))) = bound else {
+                    panic!("expected bound quantile")
+                };
+                let SummaryExpr::SummaryEstimate { summary_input, .. } = &root.expr else {
+                    panic!("expected quantile readout")
+                };
+                let SummaryExpr::SummaryAgg {
+                    family: SummaryFamilyType::Sketch(kind, _),
+                    ..
+                } = &summary_input.expr
+                else {
+                    panic!("expected sketch state")
+                };
+                let SketchParams::DDSketch { alpha } = kind.params() else {
+                    panic!("expected DDS")
+                };
+                assert!((alpha - 0.05).abs() < 1e-12, "actual alpha={alpha}");
+            }
+        }
+    }
+
     #[test]
     fn typed_accuracy_exact_clamps_to_one() {
         let mut spec = basic_spec();
