@@ -134,49 +134,24 @@ impl SeriesIdResolver {
     /// stale via `unknown_series_ids` and re-resolve with attrs.
     ///
     /// Persistence failures are logged at WARN and do NOT propagate —
-    /// the resolver stays in-memory-correct. Next restart will not
-    /// recover the lost mint, and the agent will hit the eviction
-    /// recovery path (one extra round trip with attrs).
+    /// the returned identity is ephemeral and is not cached. Catalog-bound
+    /// callers use `try_resolve` and receive the persistence failure instead.
     pub fn resolve(
         &self,
         metric_name: &str,
         attrs_fingerprint: &str,
         agg_kind_canonical: &str,
     ) -> u64 {
-        let key = (
-            metric_name.to_string(),
-            attrs_fingerprint.to_string(),
-            agg_kind_canonical.to_string(),
-        );
-        // Fast path: read-only check on the cache before taking the
-        // bucket's write lock. DashMap's `get` takes a shard read lock;
-        // the common case (a hit on a known identity) never serializes
-        // against other resolve calls.
-        if let Some(existing) = self.cache.get(&key) {
-            return *existing;
-        }
-        // Slow path: bucket write lock + mint + persist + insert.
-        // `entry().or_insert_with` ensures only ONE caller runs the
-        // closure for a given key, even under concurrent load. The
-        // persistence append happens inside the closure so the binding
-        // is durable before any caller observes the sid.
-        let entry = self.cache.entry(key).or_insert_with(|| {
-            let sid = self.next_sid.fetch_add(1, Ordering::Relaxed);
-            if let Err(e) =
-                self.persistence
-                    .append(sid, metric_name, attrs_fingerprint, agg_kind_canonical)
-            {
-                warn!(
-                    metric = %metric_name,
-                    sid,
-                    error = %e,
-                    "resolver persistence append failed; binding is \
-                     in-memory-only and will not survive restart",
-                );
+        match self.try_resolve(metric_name, attrs_fingerprint, agg_kind_canonical) {
+            Ok(sid) => sid,
+            Err(error) => {
+                // Compatibility callers still receive an ephemeral ID, but it
+                // must never enter the shared cache used by strict producers.
+                let sid = self.next_sid.fetch_add(1, Ordering::Relaxed);
+                warn!(%error, sid, "resolver persistence failed; returning uncached ephemeral identity");
+                sid
             }
-            sid
-        });
-        *entry
+        }
     }
 
     /// Persist a new binding before exposing it to catalog-bound producers.
@@ -1223,9 +1198,10 @@ mod persistence_tests {
             .cache
             .contains_key(&("strict".into(), "k=v;".into(), TEST_AGG.into())));
         let sid = r.resolve("m", "k=v;", TEST_AGG);
-        assert_eq!(sid, 2, "resolver returns the sid despite persistence error");
-        // Second call hits the cache; no second append attempt.
+        assert!(sid > 0, "legacy resolver returns an uncached ephemeral sid");
+        assert!(r.try_resolve("m", "k=v;", TEST_AGG).is_err());
+        assert_eq!(r.lookup("m", "k=v;", TEST_AGG), None);
         let sid2 = r.resolve("m", "k=v;", TEST_AGG);
-        assert_eq!(sid, sid2);
+        assert_ne!(sid, sid2);
     }
 }
