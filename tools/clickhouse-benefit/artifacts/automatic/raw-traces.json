@@ -1,0 +1,26 @@
+[
+  {
+    "path": "/mydata/clickhouse-automatic-benefit-study/fine-1s-matched-trialcontrolled-sum-1.json",
+    "sha256": "a957d60fec6132ea843ef8a3548740e4287dee1e22968a89609a903a6c7de52a"
+  },
+  {
+    "path": "/mydata/clickhouse-automatic-benefit-study/fine-1s-matched-trialcontrolled-sum-2.json",
+    "sha256": "d7256007455ab6a25672e2d9970e717e9fec5cc8014463f7faa7f0f8d8a40886"
+  },
+  {
+    "path": "/mydata/clickhouse-automatic-benefit-study/fine-1s-matched-trialcontrolled-sum-3.json",
+    "sha256": "db529845c5e1fd91c0080e3b7ced9649dbf3ec84c99469692dce46fd792c0aa2"
+  },
+  {
+    "path": "/mydata/clickhouse-automatic-benefit-study/fine-1s-matched-trialcontrolled-max-1.json",
+    "sha256": "8735b24def194437e90301667e9d2b806021a92724dc6d87350cf3ebe0ecc2b6"
+  },
+  {
+    "path": "/mydata/clickhouse-automatic-benefit-study/fine-1s-matched-trialcontrolled-max-2.json",
+    "sha256": "6c1b86e861bbc16cf1ed44b1297ca8b985163802f135c06790c86653aa4b0c49"
+  },
+  {
+    "path": "/mydata/clickhouse-automatic-benefit-study/fine-1s-matched-trialcontrolled-max-3.json",
+    "sha256": "cd00d30dd2d3ab4c17cbba223d1b6837c7ce6492fb2ecbee84fc85d59dd6428c"
+  }
+]

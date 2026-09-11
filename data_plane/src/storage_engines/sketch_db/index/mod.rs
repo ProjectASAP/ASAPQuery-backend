@@ -155,7 +155,7 @@ fn build_attrs_fp_and_label_map(
         .as_ref()
         .map(|k| k.labels.clone())
         .unwrap_or_default();
-    let key_names = &agg_cfg.grouping_labels.labels;
+    let key_names = &agg_cfg.grouping_labels.names();
     let mut attrs_fp = String::new();
     let mut label_values_map: BTreeMap<String, String> = BTreeMap::new();
     for (k, v) in key_names.iter().zip(label_values_vec.iter()) {
@@ -689,6 +689,16 @@ pub struct SketchStore {
     /// has sealed epochs to persist) with retention-drop disabled (the
     /// flush-then-evict loop is the memory bound).
     persistence_read: RwLock<Option<Arc<PersistenceReadHandle>>>,
+    persistence_metadata: RwLock<Option<Arc<persistence::metadata::SidMetadataStore>>>,
+    removed_sids: RwLock<
+        BTreeMap<
+            u64,
+            (
+                Option<Arc<asap_types::sds::CatalogGeneration>>,
+                Option<SummaryDefinitionId>,
+            ),
+        >,
+    >,
     /// Seal cadence in distinct windows, applied to every per-sid
     /// `SidStoreData` once persistence is enabled. `0` (the default)
     /// disables cadence sealing. Set by [`Self::enable_persistence_mode`].
@@ -781,6 +791,10 @@ impl SketchStore {
             .map(str::to_owned);
         // Fixed lock order: instances → policy_to_series_ids → metric_to_series_ids.
         let mut instances = self.instances.write().unwrap();
+        if self.removed_sids.read().unwrap().contains_key(&sid) {
+            tracing::warn!(sid, "rejecting reuse of a removed summary instance ID");
+            return;
+        }
         let mut policy_idx = self.policy_to_series_ids.write().unwrap();
         let mut metric_idx = self.metric_to_series_ids.write().unwrap();
         instances.insert(sid, instance);
@@ -2396,21 +2410,68 @@ impl SketchStore {
             .collect()
     }
 
+    fn metadata_record(&self, m: &SdsBinding) -> Option<persistence::metadata::SidMetaRecord> {
+        let mut record =
+            crate::storage_engines::sketch_db::index::persistence::metadata::SidMetaRecord::new(
+                m.sid,
+                m.metric_name.clone(),
+                m.group_by_keys.iter().cloned().collect(),
+                &m.agg_kind,
+                m.first_seen_unix_ms,
+            );
+        if !m.policy_fp.is_unset() {
+            record.summary_definition_id = Some(SummaryDefinitionId::from(m.policy_fp));
+            record.catalog_generation = Some(Arc::clone(m.catalog_generation.as_ref()?));
+        }
+        record.retired_at_ms = m.retired_at_ms;
+        record.expires_at_ms = m.expires_at_ms;
+        Some(record)
+    }
+
+    fn persist_lifecycle(&self, instance: &SdsBinding, removed: bool) -> Result<(), String> {
+        let Some(writer) = self.persistence_metadata.read().unwrap().clone() else {
+            return Ok(());
+        };
+        // A retired definition can disappear from the desired catalog before
+        // its stored instances are collected. Preserve its persisted provenance
+        // rather than rebinding it to the new catalog generation.
+        let mut record = match self.metadata_record(instance) {
+            Some(record) => record,
+            None => writer
+                .load()
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .find(|record| record.sid == instance.sid)
+                .ok_or("cannot persist lifecycle without catalog identity")?,
+        };
+        record.retired_at_ms = instance.retired_at_ms;
+        record.expires_at_ms = instance.expires_at_ms;
+        record.removed = removed;
+        writer.upsert_all(&[record]).map_err(|error| {
+            tracing::error!(sid = instance.sid, %error, "durable summary lifecycle publication failed");
+            error.to_string()
+        })
+    }
+
     /// Force `sid` into `Retired` status, scheduling expiry
     /// `retention` from now. Idempotent — re-retiring a Retired or
     /// Expired sid is a no-op and returns the unchanged metadata.
-    /// Returns `None` if the sid is unknown.
+    /// Returns `None` if the sid is unknown or durable lifecycle publication fails.
     pub fn force_retire(
         &self,
         sid: u64,
         retention: Duration,
     ) -> Option<Arc<SketchInstanceMetadata>> {
+        let _mutation = self.begin_state_mutation();
         let mut map = self.instances.write().ok()?;
         let instance = map.get_mut(&sid)?;
-        let meta = Arc::make_mut(&mut instance.metadata);
+        let mut next = instance.clone();
+        let meta = Arc::make_mut(&mut next.metadata);
         if matches!(meta.status(), AggStatus::Active) {
             meta.retire(retention);
         }
+        self.persist_lifecycle(&next, false).ok()?;
+        *instance = next;
         Some(Arc::clone(&instance.metadata))
     }
 
@@ -2423,11 +2484,70 @@ impl SketchStore {
         let _mutation = self.begin_state_mutation();
         let mut map = self.instances.write().ok()?;
         let instance = map.get_mut(&sid)?;
-        let meta = Arc::make_mut(&mut instance.metadata);
+        let mut next = instance.clone();
+        let meta = Arc::make_mut(&mut next.metadata);
         let now = now_ms();
-        meta.retired_at_ms = Some(now);
-        meta.expires_at_ms = Some(now);
+        meta.retired_at_ms = Some(meta.retired_at_ms.unwrap_or(now).min(now));
+        meta.expires_at_ms = Some(meta.expires_at_ms.unwrap_or(now).min(now));
+        self.persist_lifecycle(&next, false).ok()?;
+        *instance = next;
         Some(Arc::clone(&instance.metadata))
+    }
+
+    pub(crate) fn active_catalog_generation(
+        &self,
+    ) -> Option<Arc<asap_types::sds::CatalogGeneration>> {
+        self.descriptors
+            .authoritative_snapshot()
+            .map(|(_, generation)| generation)
+    }
+
+    /// Resolving a logical key may already return a replacement physical SID.
+    /// Validate producer provenance before either a cache hit or a rotation.
+    pub(crate) fn validate_routed_catalog_generation(
+        &self,
+        captured: Option<&asap_types::sds::CatalogGeneration>,
+    ) -> Result<(), String> {
+        if self.active_catalog_generation().as_deref() != captured {
+            return Err(
+                "unbound or stale producer cannot resolve the active catalog's physical series"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Return the current generation only when it explicitly reintroduces a
+    /// previously removed logical materialization. Ordinary same-generation
+    /// writes and missing provenance cannot start a new physical lifetime.
+    pub(crate) fn authorize_series_reactivation(
+        &self,
+        sid: u64,
+        definition: SummaryDefinitionId,
+    ) -> Result<Option<Arc<asap_types::sds::CatalogGeneration>>, String> {
+        let removed = self
+            .removed_sids
+            .read()
+            .map_err(|_| "series tombstone lock poisoned")?;
+        let Some((old_generation, old_definition)) = removed.get(&sid) else {
+            return Ok(None);
+        };
+        let (catalog, generation) = self
+            .descriptors
+            .authoritative_snapshot()
+            .ok_or("series reactivation requires an authoritative catalog")?;
+        if *old_definition != Some(definition)
+            || !catalog.materializations.contains_key(&definition)
+        {
+            return Err("series reactivation does not match the installed materialization".into());
+        }
+        let old_generation = old_generation
+            .as_ref()
+            .ok_or("removed series has no catalog provenance")?;
+        if old_generation.as_ref() == generation.as_ref() {
+            return Err("same-generation append cannot reactivate a removed series".into());
+        }
+        Ok(Some(generation))
     }
 
     /// Drop a sid's metadata + its series state + both secondary-index
@@ -2450,6 +2570,19 @@ impl SketchStore {
         let removed = {
             // Fixed lock order: instances → policy_to_series_ids → metric_to_series_ids.
             let mut instances = self.instances.write().ok()?;
+            if let Some(instance) = instances.get(&sid) {
+                self.persist_lifecycle(instance, true).ok()?;
+                let record = self.metadata_record(instance);
+                self.removed_sids.write().ok()?.insert(
+                    sid,
+                    (
+                        record
+                            .as_ref()
+                            .and_then(|value| value.catalog_generation.clone()),
+                        record.and_then(|value| value.summary_definition_id),
+                    ),
+                );
+            }
             let mut policy_idx = self.policy_to_series_ids.write().unwrap();
             let mut metric_idx = self.metric_to_series_ids.write().unwrap();
             let removed = instances.remove(&sid);
@@ -2537,9 +2670,9 @@ impl SketchStore {
     /// once a sid is retired by [`crate::storage_engines::sketch_db::lifecycle::reconcile_from_streaming_config`]
     /// further writes are rejected here so the eviction sweep can
     /// drop residual state cleanly.
-    pub fn ingest_precompute_for_agg_config(
+    pub fn ingest_precompute_for_agg_config<R: Into<Option<u64>>>(
         &self,
-        mint_sid: impl FnOnce(&str, &str, &str) -> u64,
+        mint_sid: impl FnOnce(&str, &str, &str) -> R,
         agg_cfg: &asap_types::aggregation_config::AggregationConfig,
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
@@ -2553,7 +2686,7 @@ impl SketchStore {
         let (attrs_fp, _label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
         let agg_kind_canonical =
             crate::storage_engines::sketch_db::data::materialization_kind_for_config(agg_cfg);
-        let sid = mint_sid(&agg_cfg.metric, &attrs_fp, &agg_kind_canonical);
+        let sid = mint_sid(&agg_cfg.metric, &attrs_fp, &agg_kind_canonical).into()?;
         self.ingest_precompute_with_series_id(sid, agg_cfg, output, accumulator)
     }
 
@@ -2579,12 +2712,18 @@ impl SketchStore {
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
         let (_attrs_fp, label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
-        let key_names = &agg_cfg.grouping_labels.labels;
+        let key_names = &agg_cfg.grouping_labels.names();
         let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg);
         let (capability, accuracy) = agg_kind.capability_and_accuracy();
 
         match self.instance(sid) {
             None => {
+                if self.active_catalog_generation().as_deref()
+                    != output.catalog_generation.as_deref()
+                {
+                    return None;
+                }
+
                 let group_by_keys: BTreeSet<String> = key_names.iter().cloned().collect();
                 // PR 6 follow-up: ExactAgg-backed sids carry an
                 // `ExactAgg(agg_type)` capability so the analyzer can
@@ -2612,10 +2751,32 @@ impl SketchStore {
                     policy_fp: output.policy_fp,
                 });
             }
-            Some(existing) if !existing.is_writable() => {
+            Some(existing) if !existing.is_writable() || existing.policy_fp != output.policy_fp => {
                 return None;
             }
             Some(_) => {}
+        }
+
+        // Keep the physical lifetime alive through publication. Removal takes
+        // this same lock exclusively, so it cannot race metadata validation and
+        // recreate orphan payload after the tombstone commits.
+        let instances = self.instances.read().ok()?;
+        let binding = instances.get(&sid)?;
+        if !binding.metadata.is_writable() || binding.metadata.policy_fp != output.policy_fp {
+            return None;
+        }
+        if binding.catalog_generation.is_some() && output.catalog_generation.is_none() {
+            return None;
+        }
+        if let Some(captured) = output.catalog_generation.as_deref() {
+            // Existing unchanged series may drain their birth generation or
+            // accept the currently installed generation. A replacement born in
+            // a newer generation cannot accept an older unbound cache hit.
+            if binding.catalog_generation.as_deref() != Some(captured)
+                && self.active_catalog_generation().as_deref() != Some(captured)
+            {
+                return None;
+            }
         }
 
         if let Some(retained_windows) = agg_cfg.num_aggregates_to_retain {
@@ -2673,8 +2834,7 @@ impl SketchStore {
         let target_metric = agg_cfg.metric.as_str();
         let target_agg_type = agg_cfg.aggregation_type;
         let target_params = canonical_parameters(&agg_cfg.parameters);
-        let target_group_keys: BTreeSet<String> =
-            agg_cfg.grouping_labels.labels.iter().cloned().collect();
+        let target_group_keys: BTreeSet<String> = agg_cfg.grouping_labels.iter().cloned().collect();
 
         // Collect the matching sids under a short read lock; then call
         // `remove_instance` per sid (which takes its own write lock).
@@ -2715,9 +2875,8 @@ impl SketchStore {
 /// impl on `SketchStore` and writes parts under `disk_path/parts/`.
 ///
 /// Drop or call [`Self::shutdown`] to stop the flusher cleanly. The
-/// `part_cache` field is exposed so the query path can be wired up to
-/// read-back from disk in a subsequent sub-PR; today it sits idle
-/// because the in-memory `query_range` doesn't yet consult it.
+/// `part_cache` backs disk reads; `query_range` combines durable parts with
+/// live in-memory state through the installed persistence read handle.
 pub struct SketchIndexPersistence {
     pub manifest: Arc<crate::storage_engines::sketch_db::index::persistence::Manifest>,
     pub part_cache: crate::storage_engines::sketch_db::index::persistence::cache::PartCache,
@@ -2748,6 +2907,27 @@ impl SketchStore {
             cache::PartCache, flusher::FlusherHandle, recovery, Manifest,
         };
 
+        // Publish the writer before recovery or any background work so a
+        // concurrent lifecycle operation cannot succeed without persistence.
+        let metadata_writer =
+            Arc::new(persistence::metadata::SidMetadataStore::new(&cfg.disk_path));
+        {
+            // Registration and lifecycle changes take this lock first too.
+            let _instances = self.instances.write().unwrap();
+            *self.persistence_metadata.write().unwrap() = Some(Arc::clone(&metadata_writer));
+            self.removed_sids.write().unwrap().extend(
+                metadata_writer
+                    .load()?
+                    .into_iter()
+                    .filter(|record| record.removed)
+                    .map(|record| {
+                        (
+                            record.sid,
+                            (record.catalog_generation, record.summary_definition_id),
+                        )
+                    }),
+            );
+        }
         let (_loaded_manifest, report) = recovery::recover(&cfg.disk_path)?;
         tracing::info!(
             live = report.live_parts,
@@ -2792,7 +2972,12 @@ impl SketchStore {
             }),
         );
 
-        let flusher = FlusherHandle::start(cfg, Arc::clone(&manifest), Arc::clone(self))?;
+        let flusher = FlusherHandle::start_with_metadata(
+            cfg,
+            Arc::clone(&manifest),
+            Arc::clone(self),
+            metadata_writer,
+        )?;
 
         Ok(SketchIndexPersistence {
             manifest,
@@ -2827,10 +3012,39 @@ impl SketchStore {
 
         let mut registered = 0usize;
         for rec in records {
+            if rec.removed || rec.expires_at_ms.is_some_and(|expiry| expiry <= now_ms()) {
+                continue;
+            }
             // Don't clobber a live-registered instance.
             if self.instance(rec.sid).is_some() {
                 continue;
             }
+            let catalog = self.descriptors.authoritative_snapshot();
+            let policy_fp = match (
+                &rec.summary_definition_id,
+                &rec.catalog_generation,
+                &catalog,
+            ) {
+                (Some(definition), Some(generation), Some((catalog, installed_generation))) => {
+                    if generation != installed_generation
+                        || !catalog.materializations.contains_key(definition)
+                    {
+                        tracing::warn!(
+                            sid = rec.sid,
+                            "persisted summary catalog provenance differs; leaving state unbound"
+                        );
+                        continue;
+                    }
+                    definition.fingerprint()
+                }
+                // Legacy deployments without an authoritative plan retain their
+                // legacy path. Never promote such state into a catalog binding.
+                (None, None, None) => PolicyFingerprint::UNSET,
+                _ => {
+                    tracing::warn!(sid = rec.sid, "persisted summary has no matching authoritative identity; leaving state unbound");
+                    continue;
+                }
+            };
             let Some(agg_kind) = rec.agg_kind() else {
                 tracing::warn!(
                     sid = rec.sid,
@@ -2848,16 +3062,13 @@ impl SketchStore {
                 agg_kind,
                 accuracy,
                 first_seen_unix_ms: rec.first_seen_unix_ms,
-                retired_at_ms: None,
-                expires_at_ms: None,
-                // The sidecar doesn't carry the policy fingerprint; the
-                // recovered sid is reachable through the
-                // `instances_matching(metric, gbk)` walk regardless (the
-                // policy_fp reverse index is an optimization, not a
-                // correctness requirement for the query path).
-                policy_fp: PolicyFingerprint::UNSET,
+                retired_at_ms: rec.retired_at_ms,
+                expires_at_ms: rec.expires_at_ms,
+                policy_fp,
             });
-            registered += 1;
+            if self.instance(rec.sid).is_some() {
+                registered += 1;
+            }
         }
         registered
     }
@@ -2931,15 +3142,7 @@ impl crate::storage_engines::sketch_db::index::persistence::EpochSource for Sket
     {
         let g = self.instances.read().ok()?;
         let m = g.get(&sid)?;
-        Some(
-            crate::storage_engines::sketch_db::index::persistence::metadata::SidMetaRecord::new(
-                m.sid,
-                m.metric_name.clone(),
-                m.group_by_keys.iter().cloned().collect(),
-                &m.agg_kind,
-                m.first_seen_unix_ms,
-            ),
-        )
+        self.metadata_record(m)
     }
 
     fn snapshot_sealed_epoch(
@@ -4409,6 +4612,248 @@ mod tests {
     }
 
     #[test]
+    fn catalog_recovery_keeps_legacy_and_foreign_generation_state_unbound() {
+        use crate::storage_engines::sketch_db::index::persistence::metadata::{
+            SidMetaRecord, SidMetadataStore,
+        };
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let metadata = meta_with_policy(507, fingerprint);
+        let record = SidMetaRecord::new(
+            metadata.sid,
+            metadata.metric_name.clone(),
+            metadata.group_by_keys.iter().cloned().collect(),
+            &metadata.agg_kind,
+            0,
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let sidecar = SidMetadataStore::new(tmp.path());
+        sidecar.upsert_all(&[record.clone()]).unwrap();
+        let store = SketchStore::new();
+        store
+            .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
+            .unwrap();
+        assert_eq!(store.register_recovered_disk_series(tmp.path()), 0);
+        assert!(store.instance(507).is_none());
+        let mut foreign = record;
+        foreign.summary_definition_id = Some(fingerprint.into());
+        let reference = plan.summary_catalog.reference().unwrap();
+        foreign.catalog_generation = Some(Arc::new(CatalogGeneration {
+            schema_version: reference.schema_version,
+            plan_id: reference.plan_id,
+            plan_version: reference.plan_version + 1,
+            snapshot_sha256: reference.snapshot_sha256,
+        }));
+        sidecar.upsert_all(&[foreign]).unwrap();
+        assert_eq!(store.register_recovered_disk_series(tmp.path()), 0);
+        assert!(store.series_ids_for_policy(fingerprint).is_empty());
+    }
+
+    #[test]
+    fn catalog_reactivation_uses_new_physical_series_without_old_disk_payload() {
+        use crate::drivers::ingest::series_resolver::SeriesIdResolver;
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let definition = fingerprint.into();
+        let mut next_catalog = plan.summary_catalog.clone();
+        next_catalog.plan_version += 1;
+        let directory = tempfile::tempdir().unwrap();
+        let disk = directory.path().join("state");
+        let wal = directory.path().join("resolver.wal");
+        let old_sid;
+        let new_sid;
+        {
+            let resolver = SeriesIdResolver::open(wal.clone()).unwrap();
+            let store = Arc::new(SketchStore::new());
+            store
+                .install_summary_catalog(Arc::new(plan.summary_catalog))
+                .unwrap();
+            let mut persistence = store.start_persistence(durable_cfg(disk.clone())).unwrap();
+            old_sid = resolver.resolve("metric", "group", "family");
+            store.register(meta_with_policy(old_sid, fingerprint));
+            for pane in 0..4 {
+                store.append_sample(
+                    old_sid,
+                    BTreeMap::new(),
+                    (pane * 30_000, (pane + 1) * 30_000),
+                    sample(1),
+                );
+            }
+            assert!(wait_until(
+                || !persistence.manifest.live_parts().is_empty(),
+                Duration::from_secs(5)
+            ));
+            let old_parts = persistence.manifest.live_parts().len();
+            store.remove_instance(old_sid).unwrap();
+            assert!(resolver
+                .resolve_with_reactivation("metric", "group", "family", |sid| store
+                    .authorize_series_reactivation(sid, definition))
+                .is_err());
+            store
+                .install_summary_catalog(Arc::new(next_catalog.clone()))
+                .unwrap();
+            new_sid = resolver
+                .resolve_with_reactivation("metric", "group", "family", |sid| {
+                    store.authorize_series_reactivation(sid, definition)
+                })
+                .unwrap();
+            assert_ne!(new_sid, old_sid);
+            store.register(meta_with_policy(new_sid, fingerprint));
+            for pane in 0..4 {
+                store.append_sample(
+                    new_sid,
+                    BTreeMap::new(),
+                    (pane * 30_000, (pane + 1) * 30_000),
+                    sample(2),
+                );
+            }
+            assert!(wait_until(
+                || persistence.manifest.live_parts().len() > old_parts,
+                Duration::from_secs(5)
+            ));
+            persistence.shutdown();
+        }
+        let resolver = SeriesIdResolver::open(wal).unwrap();
+        assert_eq!(resolver.resolve("metric", "group", "family"), new_sid);
+        let recovered = Arc::new(SketchStore::new());
+        recovered
+            .install_summary_catalog(Arc::new(next_catalog))
+            .unwrap();
+        let _persistence = recovered.start_persistence(durable_cfg(disk)).unwrap();
+        assert!(recovered.query_range(old_sid, 0, 90_000).is_empty());
+        let rows = recovered.query_range(new_sid, 0, 90_000);
+        assert!(!rows.is_empty());
+        assert!(rows
+            .iter()
+            .flat_map(|row| row.samples.values())
+            .flatten()
+            .all(|sample| sample.bytes == vec![2]));
+    }
+
+    #[test]
+    fn force_expire_never_extends_existing_lifecycle_deadlines() {
+        let store = SketchStore::new();
+        let mut metadata = meta(799);
+        metadata.retired_at_ms = Some(1);
+        metadata.expires_at_ms = Some(2);
+        store.register(metadata);
+        let expired = store.force_expire(799).unwrap();
+        assert_eq!(expired.retired_at_ms, Some(1));
+        assert_eq!(expired.expires_at_ms, Some(2));
+    }
+
+    #[test]
+    fn failed_durable_lifecycle_write_preserves_live_instance() {
+        let store = SketchStore::new();
+        store.register(meta(800));
+        let directory = tempfile::tempdir().unwrap();
+        let writer = Arc::new(persistence::metadata::SidMetadataStore::new(
+            directory.path(),
+        ));
+        // A directory in place of the sidecar causes the real writer to fail.
+        std::fs::create_dir(writer.path()).unwrap();
+        *store.persistence_metadata.write().unwrap() = Some(writer);
+        assert!(store.force_retire(800, Duration::from_secs(60)).is_none());
+        assert!(store.force_expire(800).is_none());
+        assert!(store.remove_instance(800).is_none());
+        let instance = store.instance(800).unwrap();
+        assert!(instance.retired_at_ms.is_none());
+        assert!(instance.expires_at_ms.is_none());
+    }
+
+    #[test]
+    fn durable_lifecycle_is_not_resurrected_by_restart_or_a_stale_flush() {
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_str(include_str!(
+                "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+            ))
+            .unwrap();
+        let plan = snapshot.compile().unwrap();
+        let fingerprint = plan.precompute_plan.materializations[0].policy_fingerprint();
+        let directory = tempfile::tempdir().unwrap();
+        let disk = directory.path().to_path_buf();
+        let expected_retirement;
+        {
+            let store = Arc::new(SketchStore::new());
+            store
+                .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
+                .unwrap();
+            for sid in [801, 802, 803] {
+                store.register(meta_with_policy(sid, fingerprint));
+            }
+            let mut persistence = store.start_persistence(durable_cfg(disk.clone())).unwrap();
+            for sid in [801, 802, 803] {
+                for pane in 0..4 {
+                    store.append_sample(
+                        sid,
+                        BTreeMap::new(),
+                        (pane * 30_000, (pane + 1) * 30_000),
+                        sample(1),
+                    );
+                }
+            }
+            assert!(wait_until(
+                || !persistence.manifest.live_parts().is_empty(),
+                Duration::from_secs(5)
+            ));
+            let stale: Vec<_> = {
+                let instances = store.instances.read().unwrap();
+                [801, 802, 803]
+                    .iter()
+                    .map(|sid| store.metadata_record(&instances[sid]).unwrap())
+                    .collect()
+            };
+            expected_retirement = store.force_retire(801, Duration::from_secs(3600)).unwrap();
+            assert!(store.force_expire(802).is_some());
+            assert!(store.remove_instance(803).is_some());
+            store.register(meta_with_policy(803, fingerprint));
+            assert!(
+                store.instance(803).is_none(),
+                "removed SID reused before restart"
+            );
+            // This models a flush that captured metadata before the lifecycle
+            // operation and reaches the shared writer afterward.
+            persistence
+                .flusher
+                .metadata_store()
+                .upsert_all(&stale)
+                .unwrap();
+            persistence.shutdown();
+        }
+        let recovered = Arc::new(SketchStore::new());
+        recovered
+            .install_summary_catalog(Arc::new(plan.summary_catalog))
+            .unwrap();
+        let _persistence = recovered.start_persistence(durable_cfg(disk)).unwrap();
+        let retired = recovered.instance(801).unwrap();
+        assert_eq!(retired.retired_at_ms, expected_retirement.retired_at_ms);
+        assert_eq!(retired.expires_at_ms, expected_retirement.expires_at_ms);
+        assert!(
+            recovered.instance(802).is_none(),
+            "expired state resurrected"
+        );
+        assert!(
+            recovered.instance(803).is_none(),
+            "removed state resurrected"
+        );
+        recovered.register(meta_with_policy(803, fingerprint));
+        assert!(
+            recovered.instance(803).is_none(),
+            "removed SID reused after restart"
+        );
+    }
+
+    #[test]
     fn observed_inventory_includes_durable_instances_after_restart() {
         let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
             serde_json::from_str(include_str!(
@@ -4426,6 +4871,9 @@ mod tests {
 
         {
             let store = Arc::new(SketchStore::new());
+            store
+                .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
+                .unwrap();
             store.register(metadata.clone());
             let mut persistence = store.start_persistence(durable_cfg(disk.clone())).unwrap();
             for index in 0..4u64 {
@@ -4448,9 +4896,10 @@ mod tests {
         recovered
             .install_summary_catalog(Arc::new(plan.summary_catalog))
             .unwrap();
-        recovered.register(metadata);
         let persistence = recovered.start_persistence(durable_cfg(disk)).unwrap();
         assert!(!persistence.manifest.live_parts().is_empty());
+        assert_eq!(recovered.series_ids_for_policy(fingerprint), vec![506]);
+        assert!(!recovered.query_range(506, 0, 120_000).is_empty());
         let inventory = recovered
             .observed_summary_inventory("backend-a", "store-a", &producers, 1, 100)
             .unwrap();
