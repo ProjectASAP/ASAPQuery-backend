@@ -2516,6 +2516,8 @@ pub fn select_workload_roots_with_erp(
             // for the collector's sketchlib KLL, even with the same k.
             policy.artifact.records.retain(|row| {
                 (row.sketch == "kll-percall" && row.implementation == "lib")
+                    || (row.sketch == "hll"
+                        && row.implementation == "asap-sketchlib-hll-regular-v1")
                     || (row.sketch == "univmon"
                         && row.implementation == "asap-sketchlib-univmon-standard-v1")
             });

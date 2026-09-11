@@ -183,7 +183,7 @@ impl ReadoutEvidence {
         use planner_types::pre_asap::AggIntent;
         match (algorithm, intent) {
             (SketchAlgorithm::Kll, AggIntent::Quantile { .. }) => Some(Self::QuantileRank),
-            (SketchAlgorithm::UnivMon, AggIntent::Cardinality { .. }) => {
+            (SketchAlgorithm::Hll | SketchAlgorithm::UnivMon, AggIntent::Cardinality { .. }) => {
                 Some(Self::DistinctRelative)
             }
             (SketchAlgorithm::UnivMon, AggIntent::FrequencyL2 { .. }) => {
@@ -203,7 +203,9 @@ impl ReadoutEvidence {
         use planner_types::post_asap::SketchQuery;
         match (algorithm, query) {
             (SketchAlgorithm::Kll, SketchQuery::Quantile { .. }) => Some(Self::QuantileRank),
-            (SketchAlgorithm::UnivMon, SketchQuery::Cardinality) => Some(Self::DistinctRelative),
+            (SketchAlgorithm::Hll | SketchAlgorithm::UnivMon, SketchQuery::Cardinality) => {
+                Some(Self::DistinctRelative)
+            }
             (SketchAlgorithm::UnivMon, SketchQuery::FrequencyL2) => Some(Self::FrequencyL2Relative),
             (SketchAlgorithm::UnivMon, SketchQuery::FrequencyEntropy) => {
                 Some(Self::EntropyAbsoluteBits)
@@ -807,6 +809,38 @@ mod tests {
             shape_match: None,
             runtime: ErpRuntimeCapabilities::default(),
         }
+    }
+
+    #[test]
+    fn hll_cardinality_uses_measured_relative_error_not_rse() {
+        use asap_aware_mapping::AccuracyModel;
+        use planner_types::post_asap::*;
+        let mut policy = input(ErpAccuracyMode::Hybrid);
+        let row = &mut policy.artifact.records[0];
+        row.sketch = "hll".into();
+        row.parameters = serde_json::json!({"precision":12});
+        row.error_metrics = BTreeMap::from([("max_cardinality_relative_error".into(), 0.04)]);
+        let family = SummaryFamilyType::Sketch(
+            SketchKind::new(SketchAlgorithm::Hll, SketchParams::Hll { precision: 12 }),
+            GroupingStrategy::PerSubpopulationInstance,
+        );
+        let model = ErpAccuracyModel {
+            policy: Some(&policy),
+            max_error: 0.05,
+        };
+        let guarantee = model
+            .local_guarantee(&family, &SketchQuery::Cardinality)
+            .unwrap();
+        assert_eq!(guarantee.metric, ErrorMetric::Cardinality);
+        assert_eq!(guarantee.bound, BoundExpr::Constant { value: 0.04 });
+        assert!(matches!(
+            guarantee.failure_probability,
+            ProbabilityExpr::Unknown { .. }
+        ));
+        assert_eq!(
+            ReadoutEvidence::for_query(SketchAlgorithm::Hll, &SketchQuery::FrequencyEntropy),
+            None
+        );
     }
 
     /// Contract fixture only; the process test measures real sketch errors.
