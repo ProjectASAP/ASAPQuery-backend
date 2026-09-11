@@ -358,6 +358,57 @@ mod original_tests {
             assert!(rendered.contains("1788891296000"));
             assert!(rendered.contains("`ts_ms`"));
             assert!(!rendered.contains("{from:"));
+            if sql.contains("sum(value)") && sql.contains("argMax") {
+                use crate::physical::post_asap::{PhysicalExpr, PostAsapPlan};
+                use crate::query_plan::{
+                    FallbackPolicy, FixedEvaluationRange, InstantExecution, QueryPlanEntry,
+                    QueryPlanError, QueryPlanNode,
+                };
+                let planned =
+                    crate::clickhouse::plan_clickhouse_sql(sql, &catalog, AccuracyTarget::Exact)
+                        .await
+                        .unwrap();
+                let PhysicalExpr::Committed(PostAsapPlan::Summary(root)) = planned.physical else {
+                    panic!("missing selected SQL DAG")
+                };
+                let entry = QueryPlanEntry::compile_bound_relational(
+                    "test".into(),
+                    planned.canonical_sql,
+                    &root,
+                    FixedEvaluationRange {
+                        start_ms: 1788890996000,
+                        end_ms: 1788891296000,
+                        cumulative: false,
+                    },
+                    InstantExecution {
+                        lookback_ms: 300000,
+                        full_history: false,
+                        cumulative_readout: false,
+                    },
+                    FallbackPolicy::ExactBackend,
+                    |_, _| Err(QueryPlanError::Invalid("unexpected summary binding".into())),
+                )
+                .unwrap();
+                assert!(
+                    !entry
+                        .nodes
+                        .values()
+                        .any(|node| matches!(node, QueryPlanNode::Logical { .. })),
+                    "SQL must not acquire PromQL operators"
+                );
+                assert!(entry.nodes.values().any(|node| match node {
+                    QueryPlanNode::Relational { operation, .. } => matches!(
+                        serde_json::from_value::<planner_types::post_asap::ValueOperation>(
+                            operation.clone()
+                        )
+                        .unwrap(),
+                        planner_types::post_asap::ValueOperation::Exact(
+                            planner_types::post_asap::ExactOperation::Aggregate { .. }
+                        )
+                    ),
+                    _ => false,
+                }));
+            }
         }
     }
     #[test]
