@@ -25,11 +25,11 @@ goes directly to exact execution. Selection and fallback reasons are emitted as
 structured tracing events. ERP observations remain empirical and must not be
 rendered as formal `(epsilon, delta)` guarantees.
 
-ERP exact mode matches the complete distribution JSON by equality. This is the
-default for user-provided datasets: sketch-bench retains their logical dataset
-ID and selected window, so evidence from an unrelated trace cannot be reused.
-A caller detects drift by supplying its latest descriptor with every new plan generation. A
-changed descriptor cannot reuse the old profile accidentally.
+Without an observation, ERP matches the complete distribution JSON by equality.
+With an observation, Planner first checks a matching empirical fingerprint and
+then evaluates all admissible fitted families against benchmark shapes. Custom
+datasets can use bounded shape matching when their exact fingerprint is absent.
+A caller supplies a fresh observation with every new plan generation.
 
 ## Validation and current scope
 
@@ -49,13 +49,14 @@ seed 42, and measured maximum rank error 0.051. Its ten resource trials are
 timings are machine-specific. This is a reproducible integration fixture,
 not evidence of a distribution-independent error bound.
 
-Shape-aware mode uses an extensible descriptor with `family`, `parameters`,
-`cardinality`, and `benchmark_events`. Synthetic catalogs may include uniform,
-Zipf/discrete power law, continuous power law, normal, and later families.
-Only equal families with equal parameter keys are candidates for interpolation.
-Runtime observation currently classifies frequency ranks as uniform or Zipf;
-callers may instead provide a fitted shape for other families. If classification
-is unavailable, the backend uses exact dataset matching or Hybrid fallback.
+Shape-aware mode consumes Planner's shared `ErpShapeObservation`, with multiple
+family/parameter fits, goodness-of-fit, fit-quality confidence, cardinality and
+observed events. Benchmark rows retain `ErpDataShape`. The bounded keyed observer
+fits uniform and Zipf rank masses without collapsing them into one family.
+Numeric-value distribution fitting is a separate observation problem: unique
+numeric values alone do not reveal a normal or uniform value distribution.
+Callers may supply other families through the same shared contract. Unsupported,
+ambiguous and out-of-distribution observations use the configured fallback.
 
 Run from the backend repository:
 
