@@ -365,6 +365,8 @@ pub struct ErpPlanningInput {
     #[serde(default)]
     pub observed_populations:
         Option<asap_types::erp_observation::ErpPopulationObservations<ErpObservedShape>>,
+    #[serde(skip)]
+    pub resolved_data_descriptor: Option<std::sync::Arc<asap_types::sds::DataDescriptor>>,
     /// Runtime-samples ring key from which the backend resolves the freshest
     /// `erp_observed_shape` payload before compiling a plan.
     #[serde(default)]
@@ -907,6 +909,7 @@ mod tests {
             mode,
             observed_shape: None,
             observed_populations: None,
+            resolved_data_descriptor: None,
             observed_shape_source: None,
             shape_match: None,
             runtime: ErpRuntimeCapabilities::default(),
