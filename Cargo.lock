@@ -373,7 +373,7 @@ dependencies = [
 [[package]]
 name = "asap-aware-mapping"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=23270ba33009953b6c1e293ba95c6a430ab8d222#23270ba33009953b6c1e293ba95c6a430ab8d222"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=e78572c57e6c3eea2a9017f968fbc65a9196d56e#e78572c57e6c3eea2a9017f968fbc65a9196d56e"
 dependencies = [
  "asap-types",
  "serde",
@@ -384,7 +384,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-promql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=23270ba33009953b6c1e293ba95c6a430ab8d222#23270ba33009953b6c1e293ba95c6a430ab8d222"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=e78572c57e6c3eea2a9017f968fbc65a9196d56e#e78572c57e6c3eea2a9017f968fbc65a9196d56e"
 dependencies = [
  "asap-types",
  "promql-parser",
@@ -393,7 +393,7 @@ dependencies = [
 [[package]]
 name = "asap-frontend-sql"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=23270ba33009953b6c1e293ba95c6a430ab8d222#23270ba33009953b6c1e293ba95c6a430ab8d222"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=e78572c57e6c3eea2a9017f968fbc65a9196d56e#e78572c57e6c3eea2a9017f968fbc65a9196d56e"
 dependencies = [
  "asap-sql-function-catalog",
  "asap-types",
@@ -415,12 +415,12 @@ dependencies = [
 [[package]]
 name = "asap-sql-function-catalog"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=23270ba33009953b6c1e293ba95c6a430ab8d222#23270ba33009953b6c1e293ba95c6a430ab8d222"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=e78572c57e6c3eea2a9017f968fbc65a9196d56e#e78572c57e6c3eea2a9017f968fbc65a9196d56e"
 
 [[package]]
 name = "asap-types"
 version = "0.1.0"
-source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=23270ba33009953b6c1e293ba95c6a430ab8d222#23270ba33009953b6c1e293ba95c6a430ab8d222"
+source = "git+https://github.com/ProjectASAP/ASAPPlanner?rev=e78572c57e6c3eea2a9017f968fbc65a9196d56e#e78572c57e6c3eea2a9017f968fbc65a9196d56e"
 dependencies = [
  "serde",
  "serde_json",

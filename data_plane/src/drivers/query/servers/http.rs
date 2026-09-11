@@ -1736,6 +1736,14 @@ async fn annotate_data_source(response: Response, data_source_id: &'static str) 
             return Response::from_parts(parts, axum::body::Body::from(bytes));
         }
     };
+    if data_source_id == "asap_query"
+        && (!parts.status.is_success()
+            || value.get("status").and_then(serde_json::Value::as_str) != Some("success")
+            || value.get("data").is_none_or(serde_json::Value::is_null))
+    {
+        // Dispatch to the local engine is not a successful warm execution.
+        return Response::from_parts(parts, axum::body::Body::from(bytes));
+    }
     if data_source_id == "asap_query" {
         if let Some(provenance) = extract_logical_provenance(&mut value) {
             let (route, detail) = match provenance {
@@ -2591,6 +2599,39 @@ async fn handle_range_query_post(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn no_result_error_is_not_annotated_as_warm() {
+        use axum::response::IntoResponse;
+        for (status, body) in [
+            (
+                StatusCode::OK,
+                serde_json::json!({"status":"error","data":null,
+                "errorType":"bad_data","error":"No result for query"}),
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({"status":"success","data":{"result":[]}}),
+            ),
+            (StatusCode::OK, serde_json::json!({"status":"success"})),
+            (
+                StatusCode::OK,
+                serde_json::json!({"status":"success","data":null}),
+            ),
+        ] {
+            let response = super::annotate_data_source(
+                (status, axum::Json(body.clone())).into_response(),
+                "asap_query",
+            )
+            .await;
+            assert!(!response.headers().contains_key("x-asap-execution"));
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(actual.get("infos").is_none());
+            assert_eq!(actual, body);
+        }
+    }
     use super::*;
     use crate::drivers::ingest::prometheus_remote_write::{
         Label, PrometheusRemoteWriteConfig, PrometheusRemoteWriteReceiver, Sample, TimeSeries,

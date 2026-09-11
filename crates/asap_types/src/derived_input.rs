@@ -327,7 +327,7 @@ mod tests {
         .is_err());
     }
     #[test]
-    fn installation_rejects_derived_inputs_until_immutable_consumer_is_enabled() {
+    fn installation_rejects_derived_inputs_without_an_installed_maintenance_dag() {
         use crate::precompute_plan::{PlanEnvelope, PrecomputePlan};
         let mut config = config();
         config.derived_input = Some(DerivedInputIdentity {
@@ -346,7 +346,9 @@ mod tests {
         };
         let error =
             PrecomputePlan::build(envelope, vec![config], &["producer".into()]).unwrap_err();
-        assert!(error.to_string().contains("immutable maintenance consumer"));
+        assert!(error
+            .to_string()
+            .contains("installed aligned immutable maintenance DAG"));
     }
     #[test]
     fn literal_leaves_are_hashed_without_inventing_materialization_references() {

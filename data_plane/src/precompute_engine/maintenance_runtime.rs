@@ -62,6 +62,7 @@ struct OperatorAdapter<'a> {
     source: SummaryState,
     configs: &'a [asap_types::aggregation_config::AggregationConfig],
     immutable_windows: Option<Arc<[(i64, SummaryState)]>>,
+    singleton_population_complete: bool,
 }
 
 impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
@@ -150,14 +151,12 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
                         config.policy_fingerprint() == self.source_definition.fingerprint()
                     })
                     .ok_or("maintenance input lacks installed source configuration")?;
-                if config.grouping_labels != source_config.grouping_labels
-                    || config.partitioning != source_config.partitioning
-                {
-                    return Err(
-                        "maintenance transform requires explicit target window/group routing"
-                            .into(),
-                    );
-                }
+                validate_maintenance_grouping(
+                    config,
+                    source_config,
+                    node,
+                    self.singleton_population_complete,
+                )?;
                 if config.accumulator_spec().map_err(|e| e.to_string())?.family != *family {
                     return Err(
                         "maintenance SummaryAgg family differs from installed configuration".into(),
@@ -194,6 +193,31 @@ impl PrecomputeOperatorRegistry<MaintenanceValue> for OperatorAdapter<'_> {
     }
 }
 
+fn validate_maintenance_grouping(
+    target: &asap_types::PrecomputeMaterialization,
+    source: &asap_types::PrecomputeMaterialization,
+    node: &ExecutableDagNode,
+    singleton_population_complete: bool,
+) -> Result<(), String> {
+    if target.grouping_labels == source.grouping_labels
+        && target.partitioning == source.partitioning
+    {
+        return Ok(());
+    }
+    if singleton_population_complete
+        && target.grouping_labels.is_empty()
+        && target.partitioning == Some(asap_types::sds::PopulationPartitioning::Grouped)
+        && source.partitioning == Some(asap_types::sds::PopulationPartitioning::PerEntity)
+        && target.stored_window_ms() == source.stored_window_ms()
+        && matches!(&node.payload, ExecutableOperatorPayload::SummaryAgg {
+            reduction: planner_types::pre_asap::Reduction::Reduce(keys), ..
+        } if keys.is_empty())
+    {
+        return Ok(());
+    }
+    Err("maintenance population reduction requires a complete singleton source or synchronized grouping".into())
+}
+
 fn evaluate_weight(
     expression: &planner_types::post_asap::SummaryInputExpr,
     value: f64,
@@ -227,6 +251,9 @@ fn finalize_exact(
             state,
             family: Some(family),
         } => {
+            if node.output_schema.time_index.is_some() {
+                return Err("timestamped finalization requires source window timestamps".into());
+            }
             // Single-state merge execution has no row timestamp. Immutable
             // execution supplies SummaryWindows with the actual window ends.
             (vec![(0, state)], family)
@@ -251,13 +278,36 @@ fn finalize_exact(
             )
         }
     };
-    let [field] = node.output_schema.fields.as_slice() else {
-        return Err("exact maintenance finalization requires one scalar output column".into());
+    let fields = &node.output_schema.fields;
+    let field = match node.output_schema.time_index {
+        None if fields.len() == 1 => &fields[0],
+        Some(time_index) if fields.len() == 2 && time_index < 2 => {
+            let timestamp = &fields[time_index];
+            let value = &fields[1 - time_index];
+            if timestamp.nullable
+                || timestamp.name == value.name
+                || !matches!(
+                    timestamp.dtype,
+                    SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Timestamp)
+                )
+            {
+                return Err("finalization timestamp column differs from its typed schema".into());
+            }
+            value
+        }
+        _ => {
+            return Err(
+                "exact maintenance finalization requires one value and optional declared timestamp"
+                    .into(),
+            )
+        }
     };
-    if !matches!(
-        field.dtype,
-        SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Float64)
-    ) {
+    if field.nullable
+        || !matches!(
+            field.dtype,
+            SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Float64)
+        )
+    {
         return Err(
             "exact maintenance finalization currently requires a Float64 output column".into(),
         );
@@ -454,6 +504,7 @@ fn execute_prepared_frozen_sink(
         source: Arc::clone(&first.1),
         configs,
         immutable_windows: Some(states.into()),
+        singleton_population_complete: input.singleton_population_complete,
     };
     let value = execute_precompute_sink(
         dag,
@@ -566,6 +617,17 @@ pub fn execute_completed_maintenance(
         .as_slice()
         .try_into()
         .map_err(|_| "invalid input digest")?;
+    let target_node = dag
+        .nodes
+        .iter()
+        .find(|node| node.id == sink)
+        .ok_or("maintenance target node is absent")?;
+    validate_maintenance_grouping(
+        target_config,
+        source_config,
+        target_node,
+        frozen.singleton_population_complete,
+    )?;
     if store.recover_frozen_maintenance_output(
         target_sid,
         target_config,
@@ -602,6 +664,138 @@ pub fn execute_completed_maintenance(
         &frozen,
         digest,
     )
+}
+
+/// Schedule retained, aligned completed windows from the installed DAG after
+/// the finite source barrier. Missing panes remain unavailable to query reads.
+pub(crate) fn execute_finite_maintenance(
+    store: &crate::storage_engines::sketch_db::index::SketchStore,
+    resolver: &crate::drivers::ingest::series_resolver::SeriesIdResolver,
+    plan: &asap_types::precompute_plan::PrecomputePlan,
+) -> Result<(), String> {
+    let generation = plan
+        .summary_catalog
+        .as_ref()
+        .ok_or("finite maintenance requires a catalog generation")?;
+    for installed in plan.executable_dags.values() {
+        for sink in &installed.binding.precompute_sinks {
+            let Some(BackendNodeBinding::Materialization {
+                summary_definition: target,
+            }) = installed.binding.node(*sink)
+            else {
+                continue;
+            };
+            let config = plan
+                .materializations
+                .iter()
+                .find(|config| config.policy_fingerprint() == target.fingerprint())
+                .ok_or("maintenance target configuration is absent")?;
+            let Some(derived) = &config.derived_input else {
+                continue;
+            };
+            if derived.inputs.len() != 1 {
+                return Err("finite maintenance requires one source definition".into());
+            }
+            let source = *derived.inputs.first().unwrap();
+            let source_config = plan
+                .materializations
+                .iter()
+                .find(|config| config.policy_fingerprint() == source.fingerprint())
+                .ok_or("maintenance source configuration is absent")?;
+            if source_config.derived_input.is_some() {
+                return Err(
+                    "multi-stage finite maintenance requires topological scheduling".into(),
+                );
+            }
+            let width = config.stored_window_ms();
+            let pane = source_config.stored_window_ms();
+            if width == 0 || pane == 0 || width % pane != 0 || width / pane > 65_536 {
+                return Err("finite maintenance window extent is unsupported".into());
+            }
+            let sources = store.completed_maintenance_coordinates(source, generation)?;
+            if sources.len() > 1 || sources.values().any(|populations| populations.len() != 1) {
+                return Err(
+                    "finite maintenance requires exactly one physical source population".into(),
+                );
+            }
+            let existing = store.completed_maintenance_coordinates(*target, generation)?;
+            for (source_sid, populations) in sources {
+                for (group, windows) in populations {
+                    let output_group: BTreeMap<_, _> = config
+                        .grouping_labels
+                        .iter()
+                        .map(|key| {
+                            group
+                                .get(key)
+                                .cloned()
+                                .map(|value| (key.clone(), value))
+                                .ok_or("maintenance output grouping key is absent")
+                        })
+                        .collect::<Result<_, _>>()?;
+                    let pairs: Vec<_> = output_group
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str()))
+                        .collect();
+                    let attrs = crate::drivers::ingest::canonical_attrs_fingerprint(&pairs);
+                    let kind =
+                        crate::storage_engines::sketch_db::data::materialization_kind_for_config(
+                            config,
+                        );
+                    let target_sid = resolver.resolve_with_reactivation(
+                        &config.metric,
+                        &attrs,
+                        &kind,
+                        |sid| {
+                            store.validate_routed_catalog_generation(Some(generation))?;
+                            let activation = store.authorize_series_reactivation(sid, *target)?;
+                            if activation
+                                .as_deref()
+                                .is_some_and(|actual| actual != generation)
+                            {
+                                return Err("finite maintenance generation changed".into());
+                            }
+                            Ok(activation)
+                        },
+                    )?;
+                    for (start, _) in &windows {
+                        if (*start as i128 - config.pane_origin_ms.unwrap_or(0) as i128)
+                            .rem_euclid(width as i128)
+                            != 0
+                        {
+                            continue;
+                        }
+                        let Some(end) = start.checked_add(width) else {
+                            continue;
+                        };
+                        if !(0..width / pane).all(|offset| {
+                            let begin = start + offset * pane;
+                            windows.contains(&(begin, begin + pane))
+                        }) {
+                            continue;
+                        }
+                        if existing
+                            .get(&target_sid)
+                            .and_then(|groups| groups.get(&output_group))
+                            .is_some_and(|present| present.contains(&(*start, end)))
+                        {
+                            continue;
+                        }
+                        execute_completed_maintenance(
+                            &store,
+                            installed,
+                            &plan.materializations,
+                            *sink,
+                            source_sid,
+                            target_sid,
+                            (*start, end),
+                            &group,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 struct CommittedState {
@@ -885,8 +1079,19 @@ impl MaintenanceDagSink {
                 source: Arc::clone(&source),
                 configs: &plan.precompute_plan.materializations,
                 immutable_windows: None,
+                singleton_population_complete: false,
             };
             for sink_node in &installed.binding.precompute_sinks {
+                // Derived summaries consume complete immutable windows at the
+                // completion barrier, never additive worker fragments.
+                if matches!(installed.binding.node(*sink_node),
+                    Some(BackendNodeBinding::Materialization { summary_definition })
+                        if plan.precompute_plan.materializations.iter().any(|config|
+                            config.policy_fingerprint() == summary_definition.fingerprint()
+                                && config.derived_input.is_some()))
+                {
+                    continue;
+                }
                 if !depends_on_any(&dag, *sink_node, &source_nodes) {
                     continue;
                 }
@@ -1241,6 +1446,7 @@ mod tests {
             source: sum(7.0),
             configs: &configs,
             immutable_windows: Some(vec![(1000, sum(7.0))].into()),
+            singleton_population_complete: false,
         };
         let mut read = node(2);
         read.payload = ExecutableOperatorPayload::Value {
@@ -1436,8 +1642,8 @@ mod tests {
                     revision,
                     revision,
                     120_000,
-                    || {
-                        store.ingest_precompute_with_series_id(
+                    |writer| {
+                        writer.ingest_precompute_with_series_id(
                             600,
                             &durable_configs[0],
                             &output,
@@ -1461,6 +1667,30 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        let mut rejected_output =
+            PrecomputedOutput::new(2000, 3000, None, durable_configs[0].policy_fingerprint());
+        rejected_output.catalog_generation = Some(Arc::clone(&generation));
+        rejected_output.input_revision = Some(Arc::new(
+            crate::storage_engines::types::precomputed_output::SummaryInputRevision {
+                generation: Arc::clone(&generation),
+                first_revision: 1,
+                revision: 1,
+            },
+        ));
+        assert!(store
+            .ingest_precompute_with_series_id(
+                600,
+                &durable_configs[0],
+                &rejected_output,
+                sum(99.0).as_ref()
+            )
+            .is_none());
+        assert_eq!(
+            store
+                .completed_maintenance_coordinates(source_definition, &generation)
+                .unwrap(),
+            BTreeMap::from([(600, BTreeMap::from([(BTreeMap::new(), expected.clone())]))])
+        );
         let frozen = store
             .read_frozen_exact_windows(
                 600,
@@ -1604,6 +1834,38 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(target_entries, 1);
+        let next_catalog = Arc::new(
+            asap_types::summary_catalog::SummaryCatalog::from_materializations(
+                1,
+                2,
+                &durable_configs,
+            )
+            .unwrap(),
+        );
+        restored.install_summary_catalog(next_catalog).unwrap();
+        let next_generation = restored.active_catalog_generation().unwrap();
+        assert!(restored
+            .series_ids_for_policy(durable_configs[1].policy_fingerprint())
+            .is_empty());
+        assert!(restored
+            .authorize_series_reactivation(601, durable_configs[1].policy_fingerprint().into())
+            .unwrap()
+            .is_some());
+        let mut new_population =
+            PrecomputedOutput::new(0, 1000, None, durable_configs[0].policy_fingerprint());
+        new_population.catalog_generation = Some(next_generation);
+        assert_eq!(
+            restored.ingest_precompute_with_series_id(
+                602,
+                &durable_configs[0],
+                &new_population,
+                sum(20.0).as_ref()
+            ),
+            Some(602)
+        );
+        assert!(restored
+            .series_ids_for_policy(durable_configs[1].policy_fingerprint())
+            .is_empty());
         persistence.shutdown();
         assert!(evaluate_weight(
             &SummaryInputExpr::Column(planner_types::pre_asap::ColumnRef::Named("missing".into())),
@@ -1656,6 +1918,69 @@ mod tests {
     }
 
     #[test]
+    fn finalization_preserves_declared_timestamp_and_rejects_ambiguous_columns() {
+        use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType, SummaryField};
+        use planner_types::pre_asap::DataType;
+        let input = Arc::new(MaintenanceValue::SummaryWindows {
+            states: vec![(60_000, sum(10.0))].into(),
+            family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
+        });
+        let mut read = node(2);
+        read.output_schema.fields = vec![
+            SummaryField {
+                name: "ts".into(),
+                dtype: SummaryFamilyType::Plain(DataType::Timestamp),
+                nullable: false,
+            },
+            SummaryField {
+                name: "value".into(),
+                dtype: SummaryFamilyType::Plain(DataType::Float64),
+                nullable: false,
+            },
+        ];
+        read.output_schema.time_index = Some(0);
+        let MaintenanceValue::Rows { values, name } =
+            finalize_exact(&read, &[Arc::clone(&input)]).unwrap()
+        else {
+            panic!("expected typed rows")
+        };
+        assert_eq!(values, vec![(60_000, 10.0)]);
+        assert_eq!(name, "value");
+        let mut malformed = Vec::new();
+        let mut copy = read.clone();
+        copy.output_schema.time_index = None;
+        malformed.push(copy);
+        let mut copy = read.clone();
+        copy.output_schema.time_index = Some(2);
+        malformed.push(copy);
+        let mut copy = read.clone();
+        copy.output_schema.time_index = Some(1);
+        malformed.push(copy);
+        let mut copy = read.clone();
+        copy.output_schema
+            .fields
+            .push(copy.output_schema.fields[1].clone());
+        malformed.push(copy);
+        let mut copy = read.clone();
+        copy.output_schema.fields[1].nullable = true;
+        malformed.push(copy);
+        let mut copy = read.clone();
+        copy.output_schema.fields[1].name = "ts".into();
+        malformed.push(copy);
+        for malformed in malformed {
+            assert!(finalize_exact(&malformed, &[Arc::clone(&input)]).is_err());
+        }
+        let untimed = Arc::new(MaintenanceValue::Summary {
+            state: sum(10.0),
+            family: Some(SummaryFamilyType::ExactAggregate(
+                ExactKind::Sum,
+                ExactParams::Sum,
+            )),
+        });
+        assert!(finalize_exact(&read, &[untimed]).is_err());
+    }
+
+    #[test]
     fn summary_aggregation_does_not_silently_reuse_input_family() {
         use planner_types::post_asap::{
             ExactKind, ExactParams, GroupingStrategy, SummaryFamilyType, SummaryUpdate,
@@ -1674,6 +1999,7 @@ mod tests {
             source: sum(7.0),
             configs: &[],
             immutable_windows: None,
+            singleton_population_complete: false,
         };
         let mut aggregate = node(1);
         aggregate.operator = ExecutableOperator::SummaryAgg;
@@ -1998,6 +2324,7 @@ mod tests {
             source,
             configs: &[],
             immutable_windows: None,
+            singleton_population_complete: false,
         };
         let commits = CommitRegistry::default();
         let key = MaterializationCommitKey {
@@ -2072,6 +2399,7 @@ mod tests {
             source: sum(2.0),
             configs: &[],
             immutable_windows: None,
+            singleton_population_complete: false,
         };
         let commits = CommitRegistry::default();
         let key = MaterializationCommitKey {
@@ -2112,7 +2440,12 @@ pub(crate) fn affected_materializations(
         let mut frontier = reachable.iter().copied().collect::<Vec<_>>();
         while let Some(producer) = frontier.pop() {
             for edge in &installed.document.edges {
-                if edge.producer == producer && reachable.insert(edge.consumer) {
+                let immutable = matches!(installed.binding.node(edge.consumer),
+                    Some(BackendNodeBinding::Materialization { summary_definition })
+                        if plan.materializations.iter().any(|config|
+                            config.policy_fingerprint() == summary_definition.fingerprint()
+                                && config.derived_input.is_some()));
+                if edge.producer == producer && !immutable && reachable.insert(edge.consumer) {
                     frontier.push(edge.consumer);
                 }
             }

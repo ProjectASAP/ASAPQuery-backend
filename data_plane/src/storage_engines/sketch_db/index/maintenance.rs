@@ -12,9 +12,102 @@ pub(crate) struct FrozenExactWindows {
     pub(crate) generation: Arc<CatalogGeneration>,
     pub(crate) group: BTreeMap<String, String>,
     pub(crate) windows: BTreeMap<(u64, u64), Arc<dyn AggregateCore>>,
+    pub(crate) singleton_population_complete: bool,
 }
 
 impl SketchStore {
+    fn durable_maintenance_population_ids(
+        &self,
+        definition: SummaryDefinitionId,
+    ) -> Result<BTreeSet<u64>, String> {
+        let metadata = self
+            .persistence_metadata
+            .read()
+            .map_err(|_| "persistence metadata registry poisoned")?;
+        let writer = metadata
+            .as_ref()
+            .ok_or("immutable population proof requires durable metadata")?;
+        Ok(writer
+            .load_strict()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|record| !record.removed && record.summary_definition_id == Some(definition))
+            .map(|record| record.sid)
+            .collect())
+    }
+
+    /// Enumerate durable source coordinates; the consumer revalidates exact
+    /// coverage and incarnation before reading or publishing any state.
+    pub(crate) fn completed_maintenance_coordinates(
+        &self,
+        definition: SummaryDefinitionId,
+        generation: &CatalogGeneration,
+    ) -> Result<BTreeMap<u64, BTreeMap<BTreeMap<String, String>, BTreeSet<(u64, u64)>>>, String>
+    {
+        self.validate_routed_catalog_generation(Some(generation))?;
+        let handle = self
+            .persistence_read
+            .read()
+            .map_err(|_| "persistence registry poisoned")?
+            .clone()
+            .ok_or("immutable maintenance requires durable input state")?;
+        let instances = self
+            .instances
+            .read()
+            .map_err(|_| "instance registry poisoned")?;
+        let mut population_ids = self.durable_maintenance_population_ids(definition)?;
+        population_ids.extend(
+            instances
+                .iter()
+                .filter(|(_, binding)| binding.metadata.policy_fp == definition.fingerprint())
+                .map(|(sid, _)| *sid),
+        );
+        if population_ids.len() > 1 {
+            return Err("immutable maintenance requires one durable physical population".into());
+        }
+        let completed = self
+            .completed_windows
+            .read()
+            .map_err(|_| "completion registry poisoned")?;
+        let mut coordinates = BTreeMap::new();
+        for (sid, binding) in instances.iter() {
+            if binding.metadata.policy_fp != definition.fingerprint()
+                || binding.catalog_generation.as_deref() != Some(generation)
+                || !binding.metadata.is_writable()
+            {
+                continue;
+            }
+            let Some(end) = completed.get(sid).copied() else {
+                continue;
+            };
+            let keys: Vec<_> = binding.metadata.group_by_keys.iter().cloned().collect();
+            for part in handle.manifest.live_parts_overlapping(0, end) {
+                let reader = handle
+                    .part_cache
+                    .get_or_load(part.part_id)
+                    .map_err(|e| e.to_string())?;
+                for record in reader.index_records() {
+                    if record.agg_id != *sid || record.end_ts > end {
+                        continue;
+                    }
+                    let entry = reader.load_entry(&record).map_err(|e| e.to_string())?;
+                    if entry.label.as_ref().map_or(0, |label| label.labels.len()) != keys.len() {
+                        return Err(
+                            "immutable input label arity differs from its descriptor".into()
+                        );
+                    }
+                    coordinates
+                        .entry(*sid)
+                        .or_insert_with(BTreeMap::new)
+                        .entry(Self::rebuild_label_map(&keys, &entry.label))
+                        .or_insert_with(BTreeSet::new)
+                        .insert((record.start_ts, record.end_ts));
+                }
+            }
+        }
+        Ok(coordinates)
+    }
+
     pub(crate) fn read_frozen_exact_windows(
         &self,
         sid: u64,
@@ -39,7 +132,11 @@ impl SketchStore {
         self.validate_routed_catalog_generation(Some(generation.as_ref()))?;
         // Do not retain either lock while opening parts. The immutable frontier
         // is monotone, and final publication rechecks the catalog incarnation.
-        let keys = {
+        let admission = self
+            .admission
+            .read()
+            .map_err(|_| "admission registry poisoned")?;
+        let (keys, singleton_population_complete) = {
             let bindings = self
                 .instances
                 .read()
@@ -51,8 +148,24 @@ impl SketchStore {
             {
                 return Err("immutable input identity or lifetime differs".into());
             }
-            binding.metadata.group_by_keys.clone()
+            let mut population_ids = self.durable_maintenance_population_ids(definition)?;
+            population_ids.extend(
+                bindings
+                    .iter()
+                    .filter(|(_, candidate)| {
+                        candidate.metadata.policy_fp == definition.fingerprint()
+                    })
+                    .map(|(sid, _)| *sid),
+            );
+            let singleton = admission.is_finite_complete()
+                && !matches!(
+                    binding.data_descriptor.source,
+                    asap_types::sds::DataSourceIdentity::Derived { .. }
+                )
+                && population_ids == BTreeSet::from([sid]);
+            (binding.metadata.group_by_keys.clone(), singleton)
         };
+        drop(admission);
         if group.keys().cloned().collect::<BTreeSet<_>>() != keys {
             return Err("immutable input population does not match its descriptor".into());
         }
@@ -73,6 +186,7 @@ impl SketchStore {
             .clone()
             .ok_or("immutable maintenance requires durable input state")?;
         let mut windows = BTreeMap::new();
+        let mut observed_populations = BTreeSet::new();
         for part in handle.manifest.live_parts_overlapping(start_ms, end_ms) {
             let reader = handle
                 .part_cache
@@ -86,7 +200,9 @@ impl SketchStore {
                 if entry.label.as_ref().map_or(0, |label| label.labels.len()) != keys.len() {
                     return Err("immutable input label arity differs from its descriptor".into());
                 }
-                if Self::rebuild_label_map(&keys, &entry.label) != *group {
+                let population = Self::rebuild_label_map(&keys, &entry.label);
+                observed_populations.insert(population.clone());
+                if population != *group {
                     continue;
                 }
                 let state = reconstruct_exact_agg(&entry.sketch_type_name, &entry.sketch_bytes)
@@ -111,6 +227,8 @@ impl SketchStore {
             generation: Arc::clone(generation),
             group: group.clone(),
             windows,
+            singleton_population_complete: singleton_population_complete
+                && observed_populations.len() == 1,
         })
     }
 }
@@ -246,7 +364,10 @@ impl SketchStore {
                     labels: labels.into_values().collect(),
                 }),
                 sketch_type_name: state.type_name().to_string(),
-                encoding_tag: 0,
+                encoding_tag: match binding.metadata.agg_kind {
+                    AggKind::Sketch { .. } => encoding_to_tag(SketchEncoding::MsgpackFull),
+                    AggKind::ExactAgg { .. } => 0,
+                },
                 sketch_bytes: bytes,
             }],
         };
@@ -289,6 +410,224 @@ mod tests {
     use crate::precompute_engine::operators::SumAccumulator;
     use crate::storage_engines::types::PrecomputedOutput;
     use asap_types::traits::SerializableToSink;
+
+    #[test]
+    fn one_sid_with_two_populations_cannot_publish_a_partial_global_summary() {
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let mut entry = fixture["query_workload"]["repeating_queries"][3].clone();
+        entry["query"] = "quantile(0.9, sum_over_time(immutable_value[1m]))".into();
+        entry["demand"]["fixed_interval_at"]["interval"] = 60_000.into();
+        entry["demand"]["fixed_interval_at"]["evaluation_phase"] = 0.into();
+        entry["time_selection"]["lookback"] = 60_000.into();
+        fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_value(fixture).unwrap();
+        let plan = snapshot.compile().unwrap();
+        let source = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| config.derived_input.is_none())
+            .unwrap();
+        let target = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| config.derived_input.is_some())
+            .unwrap();
+        let store = Arc::new(SketchStore::new());
+        store
+            .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
+            .unwrap();
+        let generation = store.active_catalog_generation().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = persistence::config::SketchStorePersistenceConfig::with_memory_limit(
+            1 << 24,
+            directory.path().to_path_buf(),
+        );
+        config.delete_older_than_ms = None;
+        config.hot_window_ms = None;
+        let mut persistence = store.start_persistence(config).unwrap();
+        for instance in ["a", "b"] {
+            let population = BTreeMap::from([("instance".to_string(), instance.to_string())]);
+            let coordinate = asap_types::sds::SummaryInstanceCoordinates {
+                summary_definition_id: source.policy_fingerprint().into(),
+                time_range: HalfOpenTimeRange {
+                    start_ms: 0,
+                    end_ms: 60_000,
+                },
+                group_values: population.clone(),
+            };
+            let revision = store
+                .admit_summary_updates(&generation, BTreeSet::from([coordinate.clone()]))
+                .unwrap();
+            let mut output = PrecomputedOutput::new(0, 60_000, None, source.policy_fingerprint());
+            output.population_labels = Some(population);
+            output.catalog_generation = Some(Arc::clone(&generation));
+            let mut sum = SumAccumulator::new();
+            sum.update(5.0);
+            store
+                .publish_admitted_summary_update(
+                    &generation,
+                    &coordinate,
+                    revision,
+                    revision,
+                    120_000,
+                    |writer| writer.ingest_precompute_with_series_id(700, source, &output, &sum),
+                )
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !store.seal_finite_summary_input(&generation).unwrap() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let source_id = source.policy_fingerprint().into();
+        let coordinates = store
+            .completed_maintenance_coordinates(source_id, &generation)
+            .unwrap();
+        assert_eq!(coordinates.len(), 1);
+        assert_eq!(coordinates[&700].len(), 2);
+        let group = BTreeMap::from([("instance".into(), "a".into())]);
+        let frozen = store
+            .read_frozen_exact_windows(
+                700,
+                source_id,
+                &generation,
+                &BTreeSet::from([(0, 60_000)]),
+                &group,
+            )
+            .unwrap();
+        assert!(!frozen.singleton_population_complete);
+        let parts_before = persistence.manifest.live_parts().len();
+        let resolver = crate::drivers::ingest::series_resolver::SeriesIdResolver::new();
+        for _ in 0..2 {
+            assert!(
+                crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
+                    &store,
+                    &resolver,
+                    &plan.precompute_plan
+                )
+                .is_err()
+            );
+        }
+        assert!(store
+            .series_ids_for_policy(target.policy_fingerprint())
+            .is_empty());
+        assert_eq!(persistence.manifest.live_parts().len(), parts_before);
+        let records = store
+            .persistence_metadata
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .load_strict()
+            .unwrap();
+        assert!(records.iter().all(|record| record.summary_definition_id
+            != Some(target.policy_fingerprint().into())
+            && record.pending_immutable.is_none()));
+        persistence.shutdown();
+
+        // A catalog transition deliberately leaves old-generation payload
+        // unbound on restart. It must still count against singleton proof.
+        let mut next_catalog = plan.summary_catalog.clone();
+        next_catalog.plan_version += 1;
+        let restarted = Arc::new(SketchStore::new());
+        restarted
+            .install_summary_catalog(Arc::new(next_catalog))
+            .unwrap();
+        let next_generation = restarted.active_catalog_generation().unwrap();
+        let mut restart_config =
+            persistence::config::SketchStorePersistenceConfig::with_memory_limit(
+                1 << 24,
+                directory.path().to_path_buf(),
+            );
+        restart_config.delete_older_than_ms = None;
+        restart_config.hot_window_ms = None;
+        let mut restored = restarted.start_persistence(restart_config).unwrap();
+        let population = BTreeMap::from([("instance".to_string(), "new".to_string())]);
+        let coordinate = asap_types::sds::SummaryInstanceCoordinates {
+            summary_definition_id: source_id,
+            time_range: HalfOpenTimeRange {
+                start_ms: 0,
+                end_ms: 60_000,
+            },
+            group_values: population.clone(),
+        };
+        let revision = restarted
+            .admit_summary_updates(&next_generation, BTreeSet::from([coordinate.clone()]))
+            .unwrap();
+        let mut output = PrecomputedOutput::new(0, 60_000, None, source.policy_fingerprint());
+        output.population_labels = Some(population.clone());
+        output.catalog_generation = Some(Arc::clone(&next_generation));
+        let mut sum = SumAccumulator::new();
+        sum.update(9.0);
+        restarted
+            .publish_admitted_summary_update(
+                &next_generation,
+                &coordinate,
+                revision,
+                revision,
+                120_000,
+                |writer| writer.ingest_precompute_with_series_id(702, source, &output, &sum),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !restarted
+            .seal_finite_summary_input(&next_generation)
+            .unwrap()
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            restarted
+                .durable_maintenance_population_ids(source_id)
+                .unwrap(),
+            BTreeSet::from([700, 702])
+        );
+        assert!(
+            !restarted
+                .read_frozen_exact_windows(
+                    702,
+                    source_id,
+                    &next_generation,
+                    &BTreeSet::from([(0, 60_000)]),
+                    &population
+                )
+                .unwrap()
+                .singleton_population_complete
+        );
+        let mut next_plan = plan.precompute_plan.clone();
+        next_plan.summary_catalog = Some(next_generation.as_ref().clone());
+        let parts_before = restored.manifest.live_parts().len();
+        assert!(
+            crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
+                &restarted, &resolver, &next_plan
+            )
+            .is_err()
+        );
+        assert!(restarted
+            .series_ids_for_policy(target.policy_fingerprint())
+            .is_empty());
+        assert_eq!(restored.manifest.live_parts().len(), parts_before);
+        assert!(restarted
+            .persistence_metadata
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .load_strict()
+            .unwrap()
+            .iter()
+            .all(|record| record.summary_definition_id
+                != Some(target.policy_fingerprint().into())
+                && record.pending_immutable.is_none()));
+        restored.shutdown();
+    }
 
     #[test]
     fn committed_recovery_restores_live_seal_and_rejects_additive_derived_writes() {
@@ -361,6 +700,7 @@ mod tests {
             generation,
             group: BTreeMap::new(),
             windows: BTreeMap::new(),
+            singleton_population_complete: false,
         };
         assert!(store
             .recover_frozen_maintenance_output(601, &target, &input, [7; 32], (0, 1000))

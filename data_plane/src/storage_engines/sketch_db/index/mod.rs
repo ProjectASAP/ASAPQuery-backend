@@ -737,6 +737,47 @@ pub enum SeriesLookup {
     Unknown,
 }
 
+/// Borrowed write access issued only while the store holds its admission guard.
+/// Receipt fields are data, not evidence that this synchronization is held.
+pub(crate) struct SummaryPublicationWriter<'a>(&'a SketchStore);
+
+impl SummaryPublicationWriter<'_> {
+    pub(crate) fn ingest_precompute_with_series_id(
+        &self,
+        sid: u64,
+        config: &asap_types::PrecomputeMaterialization,
+        output: &crate::storage_engines::types::PrecomputedOutput,
+        state: &dyn crate::storage_engines::types::AggregateCore,
+    ) -> Option<u64> {
+        self.0
+            .ingest_precompute_with_admission(sid, config, output, state)
+    }
+
+    pub(crate) fn ingest_precompute_for_agg_config<R: Into<Option<u64>>>(
+        &self,
+        mint: impl FnOnce(&str, &str, &str) -> R,
+        config: &asap_types::PrecomputeMaterialization,
+        output: &crate::storage_engines::types::PrecomputedOutput,
+        state: &dyn crate::storage_engines::types::AggregateCore,
+    ) -> Option<u64> {
+        self.0
+            .ingest_precompute_config_with_admission(mint, config, output, state)
+    }
+
+    #[cfg(test)]
+    fn append_sample(
+        &self,
+        sid: u64,
+        labels: BTreeMap<String, String>,
+        window: TimestampRange,
+        sample: SketchSampleState,
+    ) -> bool {
+        let _instances = self.0.instances.read().unwrap();
+        self.0
+            .append_sample_with_binding(sid, labels, window, sample)
+    }
+}
+
 impl SketchStore {
     pub fn new() -> Self {
         Self::default()
@@ -818,15 +859,28 @@ impl SketchStore {
     ) -> Result<(), String> {
         let reference = catalog.reference().map_err(|error| error.to_string())?;
         let mut inventory = self.admission.write().unwrap();
-        self.descriptors
-            .install_catalog(Arc::clone(&catalog))
-            .map_err(|error| error.to_string())?;
-        inventory.install(CatalogGeneration {
+        let generation = CatalogGeneration {
             schema_version: reference.schema_version,
             plan_id: reference.plan_id,
             plan_version: reference.plan_version,
             snapshot_sha256: reference.snapshot_sha256,
-        });
+        };
+        let closed = self
+            .persistence_metadata
+            .read()
+            .unwrap()
+            .as_ref()
+            .map(|writer| writer.load_finite_closure())
+            .transpose()
+            .map_err(|error| error.to_string())?
+            .flatten();
+        self.descriptors
+            .install_catalog(Arc::clone(&catalog))
+            .map_err(|error| error.to_string())?;
+        inventory.install(generation.clone());
+        if closed.as_ref() == Some(&generation) {
+            inventory.seal_finite(&generation)?;
+        }
         Ok(())
     }
 
@@ -852,6 +906,17 @@ impl SketchStore {
             .admit(generation, coordinates)
     }
 
+    pub(crate) fn publish_unadmitted_summary_update(
+        &self,
+        persist: impl FnOnce(&SummaryPublicationWriter<'_>) -> Option<u64>,
+    ) -> Option<u64> {
+        let admission = self.admission.read().ok()?;
+        if admission.is_finite_closed() {
+            return None;
+        }
+        persist(&SummaryPublicationWriter(self))
+    }
+
     pub(crate) fn publish_admitted_summary_update(
         &self,
         generation: &CatalogGeneration,
@@ -859,7 +924,7 @@ impl SketchStore {
         first_revision: u64,
         revision: u64,
         replay_horizon_ms: u64,
-        persist: impl FnOnce() -> Option<u64>,
+        persist: impl FnOnce(&SummaryPublicationWriter<'_>) -> Option<u64>,
     ) -> Result<(), String> {
         // Fence installation and read validation across the state write: an old
         // producer cannot mutate a new generation before its receipt is rejected.
@@ -867,7 +932,8 @@ impl SketchStore {
         if inventory.validate_publication(generation, coordinate, first_revision, revision)? {
             return Ok(());
         }
-        let series_id = persist().ok_or("summary state publication failed")?;
+        let series_id =
+            persist(&SummaryPublicationWriter(self)).ok_or("summary state publication failed")?;
         inventory.record_series(generation, coordinate, series_id)?;
         inventory.acknowledge(generation, coordinate, revision)?;
         self.admitted_mutations
@@ -889,6 +955,10 @@ impl SketchStore {
         // Closing a receiver alone is insufficient: the fence also rejects writes
         // from every other producer once these physical windows are complete.
         let mut inventory = self.admission.write().unwrap();
+        inventory.validate_finite(generation)?;
+        if inventory.is_finite_complete() {
+            return Ok(true);
+        }
         let frontiers = inventory.published_frontiers().clone();
         let instances = self.instances.read().unwrap();
         let mut records = Vec::new();
@@ -928,9 +998,15 @@ impl SketchStore {
                 return Ok(false);
             }
         }
+        // A failed durable close remains closed to raw writers but is not a
+        // usable completion proof. Retrying the barrier finishes persistence.
+        inventory.begin_finite_close();
         if let Some(writer) = self.persistence_metadata.read().unwrap().as_ref() {
             writer
                 .upsert_all(&records)
+                .map_err(|error| error.to_string())?;
+            writer
+                .persist_finite_closure(generation)
                 .map_err(|error| error.to_string())?;
         }
         inventory.seal_finite(generation)?;
@@ -1025,12 +1101,34 @@ impl SketchStore {
         if policy_fp.is_unset() {
             return Vec::new();
         }
-        self.policy_to_series_ids
+        let candidates: Vec<_> = self
+            .policy_to_series_ids
             .read()
             .unwrap()
             .get(&policy_fp)
             .map(|set| set.iter().copied().collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let generation = self.active_catalog_generation();
+        let instances = self.instances.read().unwrap();
+        candidates
+            .into_iter()
+            .filter(|sid| {
+                instances.get(sid).is_some_and(|binding| {
+                    Self::instance_visible_in_generation(binding, generation.as_deref())
+                })
+            })
+            .collect()
+    }
+
+    fn instance_visible_in_generation(
+        binding: &SdsBinding,
+        generation: Option<&CatalogGeneration>,
+    ) -> bool {
+        !matches!(
+            binding.data_descriptor.source,
+            asap_types::sds::DataSourceIdentity::Derived { .. }
+        ) || generation
+            .is_some_and(|generation| binding.catalog_generation.as_deref() == Some(generation))
     }
 
     /// Live policy count — number of distinct fingerprints with at
@@ -1096,6 +1194,9 @@ impl SketchStore {
         let durable = self.persistence_read.read().unwrap().clone();
         let mut reported = BTreeMap::new();
         for (series_id, binding) in instances.iter() {
+            if !Self::instance_visible_in_generation(binding, Some(&generation)) {
+                continue;
+            }
             let summary_definition_id = SummaryDefinitionId::from(binding.metadata.policy_fp);
             if binding.metadata.policy_fp.is_unset()
                 || !catalog
@@ -1273,6 +1374,12 @@ impl SketchStore {
         window: TimestampRange,
         sample: SketchSampleState,
     ) -> bool {
+        // Hold the existing admission guard through append so the global
+        // finite barrier cannot race an unadmitted producer's last write.
+        let admission = self.admission.read().unwrap();
+        if admission.is_finite_closed() {
+            return false;
+        }
         let instances = self.instances.read().unwrap();
         if instances.get(&sid).is_some_and(|binding| {
             matches!(
@@ -1342,6 +1449,12 @@ impl SketchStore {
         window: TimestampRange,
         payload: Box<dyn crate::storage_engines::types::AggregateCore>,
     ) -> bool {
+        // Hold the existing admission guard through append so the global
+        // finite barrier cannot race an unadmitted producer's last write.
+        let admission = self.admission.read().unwrap();
+        if admission.is_finite_closed() {
+            return false;
+        }
         let instances = self.instances.read().unwrap();
         if instances.get(&sid).is_some_and(|binding| {
             matches!(
@@ -2256,17 +2369,24 @@ impl SketchStore {
         metric_name: &str,
         required_keys: &BTreeSet<String>,
     ) -> Vec<u64> {
-        let metric_idx = self.metric_to_series_ids.read().unwrap();
-        let Some(candidate_sids) = metric_idx.get(metric_name) else {
-            return Vec::new();
-        };
+        let candidate_sids: Vec<_> = self
+            .metric_to_series_ids
+            .read()
+            .unwrap()
+            .get(metric_name)
+            .map(|sids| sids.iter().copied().collect())
+            .unwrap_or_default();
+        let generation = self.active_catalog_generation();
         let instances = self.instances.read().unwrap();
         candidate_sids
             .iter()
             .filter(|sid| {
                 instances
                     .get(sid)
-                    .map(|m| required_keys.is_subset(&m.group_by_keys))
+                    .map(|m| {
+                        required_keys.is_subset(&m.group_by_keys)
+                            && Self::instance_visible_in_generation(m, generation.as_deref())
+                    })
                     .unwrap_or(false)
             })
             .copied()
@@ -2645,6 +2765,30 @@ impl SketchStore {
         sid: u64,
         definition: SummaryDefinitionId,
     ) -> Result<Option<Arc<asap_types::sds::CatalogGeneration>>, String> {
+        if let Some(binding) = self
+            .instances
+            .read()
+            .map_err(|_| "instance registry poisoned")?
+            .get(&sid)
+        {
+            if matches!(
+                binding.data_descriptor.source,
+                asap_types::sds::DataSourceIdentity::Derived { .. }
+            ) {
+                let (catalog, generation) = self
+                    .descriptors
+                    .authoritative_snapshot()
+                    .ok_or("derived reactivation requires an authoritative catalog")?;
+                if binding.metadata.policy_fp != definition.fingerprint()
+                    || !catalog.materializations.contains_key(&definition)
+                {
+                    return Err("derived reactivation differs from its installed definition".into());
+                }
+                if binding.catalog_generation.as_deref() != Some(generation.as_ref()) {
+                    return Ok(Some(generation));
+                }
+            }
+        }
         let removed = self
             .removed_sids
             .read()
@@ -2797,6 +2941,20 @@ impl SketchStore {
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
+        let admission = self.admission.read().ok()?;
+        if admission.is_finite_closed() {
+            return None;
+        }
+        self.ingest_precompute_config_with_admission(mint_sid, agg_cfg, output, accumulator)
+    }
+
+    fn ingest_precompute_config_with_admission<R: Into<Option<u64>>>(
+        &self,
+        mint_sid: impl FnOnce(&str, &str, &str) -> R,
+        agg_cfg: &asap_types::PrecomputeMaterialization,
+        output: &crate::storage_engines::types::PrecomputedOutput,
+        accumulator: &dyn crate::storage_engines::types::AggregateCore,
+    ) -> Option<u64> {
         // B7.7 — this wrapper now derives the sid via `mint_sid` and
         // delegates to `ingest_precompute_with_series_id`. Callers that
         // already hold the bucket sid (B7.6's worker passes it on the
@@ -2807,7 +2965,7 @@ impl SketchStore {
         let agg_kind_canonical =
             crate::storage_engines::sketch_db::data::materialization_kind_for_config(agg_cfg);
         let sid = mint_sid(&agg_cfg.metric, &attrs_fp, &agg_kind_canonical).into()?;
-        self.ingest_precompute_with_series_id(sid, agg_cfg, output, accumulator)
+        self.ingest_precompute_with_admission(sid, agg_cfg, output, accumulator)
     }
 
     fn register_precompute_output(
@@ -2829,7 +2987,20 @@ impl SketchStore {
                     return None;
                 }
 
-                let group_by_keys: BTreeSet<String> = key_names.iter().cloned().collect();
+                let group_by_keys: BTreeSet<String> = if agg_cfg.partitioning
+                    == Some(asap_types::sds::PopulationPartitioning::PerEntity)
+                {
+                    // The catalog describes per-entity partitioning; physical
+                    // SID metadata must retain the observed label names used
+                    // to decode its value-only durable population key.
+                    output
+                        .population_labels
+                        .as_ref()
+                        .map(|labels| labels.keys().cloned().collect())
+                        .unwrap_or_else(|| key_names.iter().cloned().collect())
+                } else {
+                    key_names.iter().cloned().collect()
+                };
                 // PR 6 follow-up: ExactAgg-backed sids carry an
                 // `ExactAgg(agg_type)` capability so the analyzer can
                 // route ASAP-tier-answerable exact intents (Sum / Rate /
@@ -2883,6 +3054,20 @@ impl SketchStore {
         &self,
         sid: u64,
         agg_cfg: &asap_types::aggregation_config::AggregationConfig,
+        output: &crate::storage_engines::types::PrecomputedOutput,
+        accumulator: &dyn crate::storage_engines::types::AggregateCore,
+    ) -> Option<u64> {
+        let admission = self.admission.read().ok()?;
+        if admission.is_finite_closed() {
+            return None;
+        }
+        self.ingest_precompute_with_admission(sid, agg_cfg, output, accumulator)
+    }
+
+    fn ingest_precompute_with_admission(
+        &self,
+        sid: u64,
+        agg_cfg: &asap_types::PrecomputeMaterialization,
         output: &crate::storage_engines::types::PrecomputedOutput,
         accumulator: &dyn crate::storage_engines::types::AggregateCore,
     ) -> Option<u64> {
@@ -3048,6 +3233,17 @@ impl SketchStore {
         // concurrent lifecycle operation cannot succeed without persistence.
         let metadata_writer =
             Arc::new(persistence::metadata::SidMetadataStore::new(&cfg.disk_path));
+        // Restore the generation-wide raw admission barrier before exposing
+        // recovered state or accepting another producer after restart.
+        if let Some(closed) = metadata_writer.load_finite_closure()? {
+            if self.active_catalog_generation().as_deref() == Some(&closed) {
+                self.admission
+                    .write()
+                    .unwrap()
+                    .seal_finite(&closed)
+                    .map_err(persistence::PersistError::Internal)?;
+            }
+        }
         {
             // Registration and lifecycle changes take this lock first too.
             let _instances = self.instances.write().unwrap();
@@ -4945,8 +5141,8 @@ mod tests {
                 revision,
                 revision,
                 120_000,
-                || {
-                    store
+                |writer| {
+                    writer
                         .append_sample(850, BTreeMap::new(), (0, 30_000), sample(1))
                         .then_some(850)
                 },
@@ -5031,8 +5227,8 @@ mod tests {
                     revision,
                     revision,
                     120_000,
-                    || {
-                        store
+                    |writer| {
+                        writer
                             .append_sample(851, BTreeMap::new(), (0, 30_000), sample(1))
                             .then_some(851)
                     },
@@ -5040,10 +5236,17 @@ mod tests {
                 .unwrap();
             assert!(!store.seal_finite_summary_input(&generation).unwrap());
             assert!(!store.completed_windows.read().unwrap().contains_key(&851));
+            let checkpoint = directory.path().join("finite_input_generation.json");
+            std::fs::create_dir(&checkpoint).unwrap();
             assert!(wait_until(
-                || store.seal_finite_summary_input(&generation).unwrap(),
+                || store.seal_finite_summary_input(&generation).is_err(),
                 Duration::from_secs(5)
             ));
+            assert!(store.admission.read().unwrap().is_finite_closed());
+            assert!(!store.admission.read().unwrap().is_finite_complete());
+            assert!(!store.append_sample(851, BTreeMap::new(), (30_000, 60_000), sample(2)));
+            std::fs::remove_dir(&checkpoint).unwrap();
+            assert!(store.seal_finite_summary_input(&generation).unwrap());
             assert!(!persistence.manifest.live_parts().is_empty());
             persistence.shutdown();
         }
@@ -5055,6 +5258,14 @@ mod tests {
             .start_persistence(durable_cfg(directory.path().to_path_buf()))
             .unwrap();
         assert!(!restored.append_sample(851, BTreeMap::new(), (0, 30_000), sample(2)));
+        // Finite closure also rejects a new future window and a newly arriving
+        // physical series after restart; per-window frontiers alone cannot.
+        assert!(!restored.append_sample(851, BTreeMap::new(), (30_000, 60_000), sample(2)));
+        restored.register(meta(852));
+        assert!(!restored.append_sample(852, BTreeMap::new(), (30_000, 60_000), sample(2)));
+        assert!(restored
+            .publish_unadmitted_summary_update(|_| panic!("closed callback ran"))
+            .is_none());
         let rows = restored.query_range(851, 0, 30_000);
         assert_eq!(rows.len(), 1);
         let payloads: Vec<_> = rows

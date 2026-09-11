@@ -225,6 +225,19 @@ impl PrometheusRemoteWriteReceiver {
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+        let plan = self
+            .inner
+            .ingest
+            .physical_plan_snapshot()
+            .ok_or("finite maintenance requires an installed physical plan")?;
+        if plan.precompute_plan.summary_catalog.as_ref() != Some(&generation) {
+            return Err("finite maintenance generation changed during drain".into());
+        }
+        crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
+            &self.inner.ingest.sketch_index,
+            &self.inner.ingest.series_resolver,
+            &plan.precompute_plan,
+        )?;
         if let Some(observer) = self.inner.ingest.router.erp_observer() {
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -664,6 +677,7 @@ fn route_messages(
     let configs = snapshot
         .get_all_aggregation_configs()
         .values()
+        .filter(|config| config.derived_input.is_none())
         .filter_map(|config| {
             compile_spatial_filter(&config.spatial_filter_normalized)
                 .ok()

@@ -25,6 +25,8 @@ mod erp_planning_process;
 mod distinct_planning_process;
 #[path = "support/durable_summary_process.rs"]
 mod durable_summary_process;
+#[path = "support/immutable_maintenance_process.rs"]
+mod immutable_maintenance_process;
 
 struct ChildGuard(Child);
 
