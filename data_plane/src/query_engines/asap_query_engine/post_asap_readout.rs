@@ -4,6 +4,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::utils::arithmetic::evaluate_float64_arithmetic as arithmetic;
+
 use crate::query_engines::asap_query_engine::summary_exec::{execute, ExecOutcome};
 use asap_types::query_plan::{QueryNodeId, QueryPlanNode};
 use control_plane::types_v2::AccuracyTarget;
@@ -408,19 +410,6 @@ fn expand_item_readout(
 > {
     let coverage = value.coverage();
     Ok((expand_item_rows(group_key, value, item_labels)?, coverage))
-}
-
-fn arithmetic(operator: &planner_types::pre_asap::ArithmeticOpKind, left: f64, right: f64) -> f64 {
-    use planner_types::pre_asap::ArithmeticOpKind::*;
-    match operator {
-        Add => left + right,
-        Sub => left - right,
-        Mul => left * right,
-        Div => left / right,
-        Mod => left % right,
-        Pow => left.powf(right),
-        Atan2 => left.atan2(right),
-    }
 }
 
 fn binary_values(
