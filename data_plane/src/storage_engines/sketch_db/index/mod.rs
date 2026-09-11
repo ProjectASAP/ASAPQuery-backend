@@ -4851,7 +4851,7 @@ mod tests {
         let before_failed_seal = store.summary_update_revision();
         std::fs::create_dir(writer.path()).unwrap();
         assert!(store.seal_finite_summary_input(&generation).is_err());
-        assert_eq!(store.summary_update_revision(), before_failed_seal);
+        assert!(store.summary_update_revision().matches(before_failed_seal));
         assert!(!store.completed_windows.read().unwrap().contains_key(&850));
         std::fs::remove_dir(writer.path()).unwrap();
         store.seal_finite_summary_input(&generation).unwrap();
