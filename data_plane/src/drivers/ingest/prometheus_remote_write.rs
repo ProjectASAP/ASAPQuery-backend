@@ -225,8 +225,9 @@ impl PrometheusRemoteWriteReceiver {
             return Err("finite maintenance generation changed during drain".into());
         }
         crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
-            &self.inner.ingest,
-            &plan,
+            &self.inner.ingest.sketch_index,
+            &self.inner.ingest.series_resolver,
+            &plan.precompute_plan,
         )?;
         trim_process_allocator();
         Ok(())

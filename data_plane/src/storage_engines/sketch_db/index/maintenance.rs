@@ -374,6 +374,127 @@ mod tests {
     use asap_types::traits::SerializableToSink;
 
     #[test]
+    fn one_sid_with_two_populations_cannot_publish_a_partial_global_summary() {
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
+        ))
+        .unwrap();
+        let mut entry = fixture["query_workload"]["repeating_queries"][3].clone();
+        entry["query"] = "quantile(0.9, sum_over_time(immutable_value[1m]))".into();
+        entry["demand"]["fixed_interval_at"]["interval"] = 60_000.into();
+        entry["demand"]["fixed_interval_at"]["evaluation_phase"] = 0.into();
+        entry["time_selection"]["lookback"] = 60_000.into();
+        fixture["query_workload"]["repeating_queries"] = serde_json::json!([entry]);
+        let snapshot: control_plane::physical::compiler::BackendLocalPlanningSnapshot =
+            serde_json::from_value(fixture).unwrap();
+        let plan = snapshot.compile().unwrap();
+        let source = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| config.derived_input.is_none())
+            .unwrap();
+        let target = plan
+            .precompute_plan
+            .materializations
+            .iter()
+            .find(|config| config.derived_input.is_some())
+            .unwrap();
+        let store = Arc::new(SketchStore::new());
+        store
+            .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
+            .unwrap();
+        let generation = store.active_catalog_generation().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = persistence::config::SketchStorePersistenceConfig::with_memory_limit(
+            1 << 24,
+            directory.path().to_path_buf(),
+        );
+        config.delete_older_than_ms = None;
+        config.hot_window_ms = None;
+        let mut persistence = store.start_persistence(config).unwrap();
+        for instance in ["a", "b"] {
+            let population = BTreeMap::from([("instance".to_string(), instance.to_string())]);
+            let coordinate = asap_types::sds::SummaryInstanceCoordinates {
+                summary_definition_id: source.policy_fingerprint().into(),
+                time_range: HalfOpenTimeRange {
+                    start_ms: 0,
+                    end_ms: 60_000,
+                },
+                group_values: population.clone(),
+            };
+            let revision = store
+                .admit_summary_updates(&generation, BTreeSet::from([coordinate.clone()]))
+                .unwrap();
+            let mut output = PrecomputedOutput::new(0, 60_000, None, source.policy_fingerprint());
+            output.population_labels = Some(population);
+            output.catalog_generation = Some(Arc::clone(&generation));
+            let mut sum = SumAccumulator::new();
+            sum.update(5.0);
+            store
+                .publish_admitted_summary_update(
+                    &generation,
+                    &coordinate,
+                    revision,
+                    revision,
+                    120_000,
+                    |writer| writer.ingest_precompute_with_series_id(700, source, &output, &sum),
+                )
+                .unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !store.seal_finite_summary_input(&generation).unwrap() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let source_id = source.policy_fingerprint().into();
+        let coordinates = store
+            .completed_maintenance_coordinates(source_id, &generation)
+            .unwrap();
+        assert_eq!(coordinates.len(), 1);
+        assert_eq!(coordinates[&700].len(), 2);
+        let group = BTreeMap::from([("instance".into(), "a".into())]);
+        let frozen = store
+            .read_frozen_exact_windows(
+                700,
+                source_id,
+                &generation,
+                &BTreeSet::from([(0, 60_000)]),
+                &group,
+            )
+            .unwrap();
+        assert!(!frozen.singleton_population_complete);
+        let parts_before = persistence.manifest.live_parts().len();
+        let resolver = crate::drivers::ingest::series_resolver::SeriesIdResolver::new();
+        for _ in 0..2 {
+            assert!(
+                crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
+                    &store,
+                    &resolver,
+                    &plan.precompute_plan
+                )
+                .is_err()
+            );
+        }
+        assert!(store
+            .series_ids_for_policy(target.policy_fingerprint())
+            .is_empty());
+        assert_eq!(persistence.manifest.live_parts().len(), parts_before);
+        let records = store
+            .persistence_metadata
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .load_strict()
+            .unwrap();
+        assert!(records.iter().all(|record| record.summary_definition_id
+            != Some(target.policy_fingerprint().into())
+            && record.pending_immutable.is_none()));
+        persistence.shutdown();
+    }
+
+    #[test]
     fn committed_recovery_restores_live_seal_and_rejects_additive_derived_writes() {
         // A durable sidecar may survive an I/O error before the caller updates
         // its live seal. Recovery must repair admission, not only return a hit.

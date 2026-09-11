@@ -251,6 +251,9 @@ fn finalize_exact(
             state,
             family: Some(family),
         } => {
+            if node.output_schema.time_index.is_some() {
+                return Err("timestamped finalization requires source window timestamps".into());
+            }
             // Single-state merge execution has no row timestamp. Immutable
             // execution supplies SummaryWindows with the actual window ends.
             (vec![(0, state)], family)
@@ -275,13 +278,36 @@ fn finalize_exact(
             )
         }
     };
-    let [field] = node.output_schema.fields.as_slice() else {
-        return Err("exact maintenance finalization requires one scalar output column".into());
+    let fields = &node.output_schema.fields;
+    let field = match node.output_schema.time_index {
+        None if fields.len() == 1 => &fields[0],
+        Some(time_index) if fields.len() == 2 && time_index < 2 => {
+            let timestamp = &fields[time_index];
+            let value = &fields[1 - time_index];
+            if timestamp.nullable
+                || timestamp.name == value.name
+                || !matches!(
+                    timestamp.dtype,
+                    SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Timestamp)
+                )
+            {
+                return Err("finalization timestamp column differs from its typed schema".into());
+            }
+            value
+        }
+        _ => {
+            return Err(
+                "exact maintenance finalization requires one value and optional declared timestamp"
+                    .into(),
+            )
+        }
     };
-    if !matches!(
-        field.dtype,
-        SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Float64)
-    ) {
+    if field.nullable
+        || !matches!(
+            field.dtype,
+            SummaryFamilyType::Plain(planner_types::pre_asap::DataType::Float64)
+        )
+    {
         return Err(
             "exact maintenance finalization currently requires a Float64 output column".into(),
         );
@@ -643,15 +669,15 @@ pub fn execute_completed_maintenance(
 /// Schedule retained, aligned completed windows from the installed DAG after
 /// the finite source barrier. Missing panes remain unavailable to query reads.
 pub(crate) fn execute_finite_maintenance(
-    ingest: &super::ingest_handler::IngestState,
-    plan: &crate::storage_engines::types::ActivePhysicalPlan,
+    store: &crate::storage_engines::sketch_db::index::SketchStore,
+    resolver: &crate::drivers::ingest::series_resolver::SeriesIdResolver,
+    plan: &asap_types::precompute_plan::PrecomputePlan,
 ) -> Result<(), String> {
     let generation = plan
-        .precompute_plan
         .summary_catalog
         .as_ref()
         .ok_or("finite maintenance requires a catalog generation")?;
-    for installed in plan.precompute_plan.executable_dags.values() {
+    for installed in plan.executable_dags.values() {
         for sink in &installed.binding.precompute_sinks {
             let Some(BackendNodeBinding::Materialization {
                 summary_definition: target,
@@ -660,7 +686,6 @@ pub(crate) fn execute_finite_maintenance(
                 continue;
             };
             let config = plan
-                .precompute_plan
                 .materializations
                 .iter()
                 .find(|config| config.policy_fingerprint() == target.fingerprint())
@@ -673,7 +698,6 @@ pub(crate) fn execute_finite_maintenance(
             }
             let source = *derived.inputs.first().unwrap();
             let source_config = plan
-                .precompute_plan
                 .materializations
                 .iter()
                 .find(|config| config.policy_fingerprint() == source.fingerprint())
@@ -688,17 +712,13 @@ pub(crate) fn execute_finite_maintenance(
             if width == 0 || pane == 0 || width % pane != 0 || width / pane > 65_536 {
                 return Err("finite maintenance window extent is unsupported".into());
             }
-            let sources = ingest
-                .sketch_index
-                .completed_maintenance_coordinates(source, generation)?;
+            let sources = store.completed_maintenance_coordinates(source, generation)?;
             if sources.len() > 1 || sources.values().any(|populations| populations.len() != 1) {
                 return Err(
                     "finite maintenance requires exactly one physical source population".into(),
                 );
             }
-            let existing = ingest
-                .sketch_index
-                .completed_maintenance_coordinates(*target, generation)?;
+            let existing = store.completed_maintenance_coordinates(*target, generation)?;
             for (source_sid, populations) in sources {
                 for (group, windows) in populations {
                     let output_group: BTreeMap<_, _> = config
@@ -721,17 +741,13 @@ pub(crate) fn execute_finite_maintenance(
                         crate::storage_engines::sketch_db::data::materialization_kind_for_config(
                             config,
                         );
-                    let target_sid = ingest.series_resolver.resolve_with_reactivation(
+                    let target_sid = resolver.resolve_with_reactivation(
                         &config.metric,
                         &attrs,
                         &kind,
                         |sid| {
-                            ingest
-                                .sketch_index
-                                .validate_routed_catalog_generation(Some(generation))?;
-                            let activation = ingest
-                                .sketch_index
-                                .authorize_series_reactivation(sid, *target)?;
+                            store.validate_routed_catalog_generation(Some(generation))?;
+                            let activation = store.authorize_series_reactivation(sid, *target)?;
                             if activation
                                 .as_deref()
                                 .is_some_and(|actual| actual != generation)
@@ -765,9 +781,9 @@ pub(crate) fn execute_finite_maintenance(
                             continue;
                         }
                         execute_completed_maintenance(
-                            &ingest.sketch_index,
+                            &store,
                             installed,
-                            &plan.precompute_plan.materializations,
+                            &plan.materializations,
                             *sink,
                             source_sid,
                             target_sid,
@@ -1899,6 +1915,69 @@ mod tests {
         assert!(
             matches!(finalize_exact(&read, &[integer_state]), Err(error) if error.contains("Float64"))
         );
+    }
+
+    #[test]
+    fn finalization_preserves_declared_timestamp_and_rejects_ambiguous_columns() {
+        use planner_types::post_asap::{ExactKind, ExactParams, SummaryFamilyType, SummaryField};
+        use planner_types::pre_asap::DataType;
+        let input = Arc::new(MaintenanceValue::SummaryWindows {
+            states: vec![(60_000, sum(10.0))].into(),
+            family: SummaryFamilyType::ExactAggregate(ExactKind::Sum, ExactParams::Sum),
+        });
+        let mut read = node(2);
+        read.output_schema.fields = vec![
+            SummaryField {
+                name: "ts".into(),
+                dtype: SummaryFamilyType::Plain(DataType::Timestamp),
+                nullable: false,
+            },
+            SummaryField {
+                name: "value".into(),
+                dtype: SummaryFamilyType::Plain(DataType::Float64),
+                nullable: false,
+            },
+        ];
+        read.output_schema.time_index = Some(0);
+        let MaintenanceValue::Rows { values, name } =
+            finalize_exact(&read, &[Arc::clone(&input)]).unwrap()
+        else {
+            panic!("expected typed rows")
+        };
+        assert_eq!(values, vec![(60_000, 10.0)]);
+        assert_eq!(name, "value");
+        let mut malformed = Vec::new();
+        let mut copy = read.clone();
+        copy.output_schema.time_index = None;
+        malformed.push(copy);
+        let mut copy = read.clone();
+        copy.output_schema.time_index = Some(2);
+        malformed.push(copy);
+        let mut copy = read.clone();
+        copy.output_schema.time_index = Some(1);
+        malformed.push(copy);
+        let mut copy = read.clone();
+        copy.output_schema
+            .fields
+            .push(copy.output_schema.fields[1].clone());
+        malformed.push(copy);
+        let mut copy = read.clone();
+        copy.output_schema.fields[1].nullable = true;
+        malformed.push(copy);
+        let mut copy = read.clone();
+        copy.output_schema.fields[1].name = "ts".into();
+        malformed.push(copy);
+        for malformed in malformed {
+            assert!(finalize_exact(&malformed, &[Arc::clone(&input)]).is_err());
+        }
+        let untimed = Arc::new(MaintenanceValue::Summary {
+            state: sum(10.0),
+            family: Some(SummaryFamilyType::ExactAggregate(
+                ExactKind::Sum,
+                ExactParams::Sum,
+            )),
+        });
+        assert!(finalize_exact(&read, &[untimed]).is_err());
     }
 
     #[test]
