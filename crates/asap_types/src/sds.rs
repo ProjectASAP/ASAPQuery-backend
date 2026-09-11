@@ -1,5 +1,7 @@
 //! Shared SDS metadata contracts. Summary payload bytes remain storage-engine
 //! owned; catalogs and inventories contain identities and state references only.
+pub const TIMESTAMPED_OBSERVATION_SEMANTICS: &str = "asap.timestamped-observations.v2";
+
 use crate::{AggregationType, PrecomputeMaterialization};
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryFamilyType};
 use serde::{Deserialize, Serialize};

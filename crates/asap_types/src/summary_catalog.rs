@@ -124,7 +124,7 @@ impl SummaryCatalog {
                         .population_filter_canonical()
                         .map_err(SummaryCatalogError::Descriptor)?,
                     config.grouping_labels.labels.clone(),
-                    "asap.timestamped-observations.v2",
+                    crate::sds::TIMESTAMPED_OBSERVATION_SEMANTICS,
                 )
                 .with_partitioning(config.partitioning)
                 .with_timestamp_column(config.table_timestamp_column.clone());

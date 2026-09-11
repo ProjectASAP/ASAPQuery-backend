@@ -2506,6 +2506,7 @@ fn observed_population_matches_root(
         && data.value_projection == ValueProjectionIdentity::SampleValue
         && data.partitioning == Some(PopulationPartitioning::PerEntity)
         && data.group_by_keys.is_empty()
+        && data.observation_semantics == asap_types::sds::TIMESTAMPED_OBSERVATION_SEMANTICS
         && observed.window_end_ms.checked_sub(observed.window_start_ms)
             == i64::try_from(window.saturating_mul(1000)).ok()
 }

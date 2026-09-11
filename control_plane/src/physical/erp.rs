@@ -426,6 +426,30 @@ impl ErpPlanningInput {
                 .materializations
                 .get(&populations.summary_definition_id)
                 .ok_or("ERP evidence summary is absent from the active catalog")?;
+            let summary = catalog
+                .summary_descriptors
+                .get(&materialization.summary_descriptor_id)
+                .ok_or("ERP summary descriptor is absent from the active catalog")?;
+            let actual_semantics = match &summary.operator {
+                asap_types::sds::SummaryOperator::Configured {
+                    aggregation_type: asap_types::AggregationType::HLL,
+                    ..
+                } => Some(
+                    asap_types::erp_observation::ErpObservationInputSemantics::ScalarSampleValue,
+                ),
+                asap_types::sds::SummaryOperator::Configured {
+                    aggregation_type: asap_types::AggregationType::UnivMon,
+                    ..
+                } => Some(
+                    asap_types::erp_observation::ErpObservationInputSemantics::UnitSampleFrequency,
+                ),
+                _ => None,
+            };
+            if actual_semantics != Some(populations.input_semantics) {
+                return Err(
+                    "ERP observation semantics differ from the installed summary operator".into(),
+                );
+            }
             let data = catalog
                 .data_descriptors
                 .get(&materialization.data_descriptor_id)
