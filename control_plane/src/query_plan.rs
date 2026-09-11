@@ -742,11 +742,30 @@ where
                     grouping: physical_grouping(reduction, child)?,
                 }
             }
-            SummaryExpr::SummaryAgg { child, .. }
-                if !matches!(child.expr, SummaryExpr::KeepPreAsap(_)) =>
-            {
-                QueryPlanNode::ExactFallback {
-                    reason: "unsupported exact operation over summary output".into(),
+            SummaryExpr::SummaryAgg {
+                child,
+                family,
+                reduction,
+                ..
+            } if !matches!(child.expr, SummaryExpr::KeepPreAsap(_)) => {
+                // A compiled immutable dependency is already materialized. Its
+                // query reads that binding instead of replaying maintenance.
+                match (self.bind)(node, family) {
+                    Ok(mut binding) => {
+                        binding.output_grouping = physical_grouping(reduction, child)?;
+                        if let Some(readout) = exact_readout(family) {
+                            let input = QueryNodeId(self.next_id);
+                            self.next_id += 1;
+                            self.nodes
+                                .insert(input, QueryPlanNode::ReadMaterialization { binding });
+                            QueryPlanNode::ExactReadout { input, readout }
+                        } else {
+                            QueryPlanNode::ReadMaterialization { binding }
+                        }
+                    }
+                    Err(_) => QueryPlanNode::ExactFallback {
+                        reason: "unsupported exact operation over summary output".into(),
+                    },
                 }
             }
             // Relational count bindings validate their row population and value

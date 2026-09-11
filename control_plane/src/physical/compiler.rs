@@ -3602,6 +3602,15 @@ mod tests {
             derived.derived_input.as_ref().unwrap().inputs,
             BTreeSet::from([source.policy_fingerprint().into()])
         );
+        let entry = plan.query_plan.entries.values().next().unwrap();
+        assert!(entry.nodes.values().any(|node| matches!(
+            node,
+            crate::query_plan::QueryPlanNode::ReadMaterialization { .. }
+        )));
+        assert!(!entry
+            .nodes
+            .values()
+            .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExactFallback { .. })));
     }
 
     /// Distinct range queries retain a per-series HLL selected by Planner.
