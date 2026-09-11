@@ -133,6 +133,11 @@ impl StreamingConfig {
                     num_aggregates_to_retain,
                     QueryLanguage::PromQl,
                 )?;
+                if config.derived_input.is_some() {
+                    anyhow::bail!(
+                        "legacy streaming input cannot execute a derived summary program"
+                    );
+                }
                 // PR 5: the map key IS the policy-fingerprint u64.
                 // `AggregationConfig::policy_fp_u64()` is the canonical
                 // accessor for this value.
@@ -189,6 +194,17 @@ mod tests {
         let yaml = "{\"aggregation_configs\":{},\"storage_backend\":\"gorilla_object_store\"}";
         let cfg: StreamingConfig = serde_json::from_str(yaml).expect("Phase-5 decode");
         assert_eq!(cfg.storage_backend(), StorageBackend::GorillaObjectStore);
+    }
+
+    #[test]
+    fn legacy_yaml_rejects_derived_summary_input() {
+        let data = serde_yaml::from_str::<Value>(&format!(
+            "aggregations:\n- aggregationType: Sum\n  aggregationSubType: ''\n  metric: outer\n  labels: {{grouping: [], rollup: [], aggregated: []}}\n  parameters: {{}}\n  windowSize: 10\n  windowType: tumbling\n  spatialFilter: ''\n  derived_input:\n    inputs: [1]\n    program_sha256: '{}'\n", "a".repeat(64)
+        )).unwrap();
+        let error = StreamingConfig::from_yaml_data(&data).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("legacy streaming input cannot execute"));
     }
 
     /// PR 5: a streaming-config YAML that omits `aggregationId`
