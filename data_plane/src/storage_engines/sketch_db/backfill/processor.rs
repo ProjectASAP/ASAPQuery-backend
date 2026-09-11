@@ -93,7 +93,7 @@ use super::BackfillRegistry;
 fn extract_group_key(series_key: &str, config: &AggregationConfig) -> String {
     let labels = parse_labels_from_series_key(series_key);
     let mut values = Vec::new();
-    for label_name in &config.grouping_labels.labels {
+    for label_name in &config.grouping_labels.names() {
         if let Some(val) = labels.get(label_name.as_str()) {
             values.push(*val);
         } else {
@@ -130,7 +130,6 @@ fn resolve_backfill_bucket_sid(
     let labels = parse_labels_from_series_key(series_key);
     let grouping_pairs: Vec<(&str, &str)> = config
         .grouping_labels
-        .labels
         .iter()
         .map(|name| (name.as_str(), *labels.get(name.as_str()).unwrap_or(&"")))
         .collect();

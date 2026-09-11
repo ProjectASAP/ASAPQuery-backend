@@ -209,7 +209,6 @@ impl SketchStoreSink {
             let group_values = output.population_labels.clone().unwrap_or_else(|| {
                 agg_cfg
                     .grouping_labels
-                    .labels
                     .iter()
                     .cloned()
                     .zip(output.key.clone().unwrap_or_default().labels)
@@ -406,7 +405,8 @@ mod tests {
             parameters: HashMap::new(),
             grouping_labels: KeyByLabelNames::new(
                 grouping_keys.iter().map(|s| s.to_string()).collect(),
-            ),
+            )
+            .into(),
             aggregated_labels: KeyByLabelNames::empty(),
             rollup_labels: KeyByLabelNames::empty(),
             original_yaml: String::new(),

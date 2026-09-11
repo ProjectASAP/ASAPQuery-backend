@@ -4,7 +4,7 @@ use crate::{AggregationType, PrecomputeMaterialization};
 use planner_types::post_asap::{SketchAlgorithm, SketchParams, SummaryFamilyType};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SdsError(pub String);
@@ -775,7 +775,7 @@ pub struct DataDescriptor {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp_column: Option<String>,
     pub population_filter_canonical: String,
-    pub group_by_keys: BTreeSet<String>,
+    pub group_by_keys: crate::GroupingProjection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partitioning: Option<PopulationPartitioning>,
     /// Versioned contract for timestamp interpretation and
@@ -851,6 +851,19 @@ impl DataDescriptor {
             observation_semantics,
         }
     }
+    pub fn with_grouping_projection(mut self, grouping: crate::GroupingProjection) -> Self {
+        self.group_by_keys = grouping;
+        self.id = data_descriptor_id(
+            &self.source,
+            &self.value_projection,
+            &self.population_filter_canonical,
+            &self.group_by_keys,
+            &self.observation_semantics,
+            self.partitioning,
+            self.timestamp_column.as_deref(),
+        );
+        self
+    }
     pub fn with_partitioning(mut self, partitioning: Option<PopulationPartitioning>) -> Self {
         self.partitioning = partitioning;
         self.id = data_descriptor_id(
@@ -874,6 +887,20 @@ impl DataDescriptor {
     }
     pub fn validate(&self) -> Result<(), SdsError> {
         self.value_projection.validate().map_err(SdsError)?;
+        self.group_by_keys.validate().map_err(SdsError)?;
+        if matches!(self.source, DataSourceIdentity::TimeSeries { .. })
+            && !self.group_by_keys.is_legacy_labels()
+        {
+            return Err(SdsError(
+                "time-series grouping requires non-null string labels".into(),
+            ));
+        }
+
+        if matches!(self.source, DataSourceIdentity::Table { .. }) {
+            for column in self.group_by_keys.columns() {
+                crate::table_population::validate_column_name(&column.name).map_err(SdsError)?;
+            }
+        }
         if let Some(column) = &self.timestamp_column {
             if !matches!(self.source, DataSourceIdentity::Table { .. }) || column.is_empty() {
                 return Err(SdsError(
@@ -902,7 +929,7 @@ fn data_descriptor_id(
     source: &DataSourceIdentity,
     value_projection: &ValueProjectionIdentity,
     filter: &str,
-    group_by: &BTreeSet<String>,
+    group_by: &crate::GroupingProjection,
     observation_semantics: &str,
     partitioning: Option<PopulationPartitioning>,
     timestamp_column: Option<&str>,
@@ -924,8 +951,13 @@ fn data_descriptor_id(
     if let Some(column) = timestamp_column {
         key.push_str(&format!("|timestamp-ms:{}:{column}", column.len()));
     }
-    for name in group_by {
+    for name in group_by.names() {
         key.push_str(&format!("|{}:{name}", name.len()));
+    }
+    if !group_by.is_legacy_labels() {
+        let typed =
+            canonical(&serde_json::to_value(group_by).expect("group projection serializes"));
+        key.push_str(&format!("|group-types:{}:{typed}", typed.len()));
     }
     key.push_str(&format!(
         "|{}:{observation_semantics}",
@@ -937,6 +969,7 @@ fn data_descriptor_id(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn completion(epoch: u64) -> SummaryWindowCompletion {
         SummaryWindowCompletion {

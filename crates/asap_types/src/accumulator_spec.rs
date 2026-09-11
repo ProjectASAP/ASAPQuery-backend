@@ -403,7 +403,7 @@ impl AggregationConfig {
         };
 
         let grouping = if keyed {
-            Some(self.grouping_labels.clone())
+            Some(self.grouping_labels.label_names())
         } else {
             None
         };

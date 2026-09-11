@@ -197,7 +197,7 @@ fn signature_from_agg_config(cfg: &AggregationConfig) -> Vec<u8> {
         parameters_canonical: canonical_parameters(&cfg.parameters),
         spatial_filter_canonical: cfg.spatial_filter_normalized.clone(),
     };
-    let group_by_keys: BTreeSet<String> = cfg.grouping_labels.labels.iter().cloned().collect();
+    let group_by_keys: BTreeSet<String> = cfg.grouping_labels.iter().cloned().collect();
     signature_bytes(&cfg.metric, &agg_kind, &group_by_keys)
 }
 

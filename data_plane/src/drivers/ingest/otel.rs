@@ -608,7 +608,6 @@ fn resolve_bucket_sid_for_agg_config(
 ) -> Result<(u64, asap_types::PolicyFingerprint), String> {
     let grouping_pairs: Vec<(&str, &str)> = config
         .grouping_labels
-        .labels
         .iter()
         .map(|name| {
             let v = point_labels.get(name).map(|s| s.as_str()).unwrap_or("");
