@@ -818,6 +818,15 @@ impl SketchStore {
     /// where the two indexes were written under separate sequential
     /// locks). See the index-field doc comments for the full invariant.
     pub fn register(&self, meta: SketchInstanceMetadata) {
+        let mut instances = self.instances.write().unwrap();
+        self.register_with_instances(meta, &mut instances);
+    }
+
+    fn register_with_instances(
+        &self,
+        meta: SketchInstanceMetadata,
+        instances: &mut HashMap<u64, SdsBinding>,
+    ) -> bool {
         let sid = meta.sid;
         let policy_fp = meta.policy_fp;
         // A non-legacy materialization must resolve through the installed
@@ -827,7 +836,7 @@ impl SketchStore {
             Ok(instance) => instance,
             Err(error) => {
                 tracing::warn!(sid, %error, "rejecting SummaryStore registration outside the active SummaryCatalog");
-                return;
+                return false;
             }
         };
         let metric_name = instance
@@ -835,10 +844,9 @@ impl SketchStore {
             .time_series_metric()
             .map(str::to_owned);
         // Fixed lock order: instances → policy_to_series_ids → metric_to_series_ids.
-        let mut instances = self.instances.write().unwrap();
         if self.removed_sids.read().unwrap().contains_key(&sid) {
             tracing::warn!(sid, "rejecting reuse of a removed summary instance ID");
-            return;
+            return false;
         }
         let mut policy_idx = self.policy_to_series_ids.write().unwrap();
         let mut metric_idx = self.metric_to_series_ids.write().unwrap();
@@ -849,6 +857,7 @@ impl SketchStore {
         if let Some(metric_name) = metric_name {
             metric_idx.entry(metric_name).or_default().insert(sid);
         }
+        true
     }
 
     /// Install one authoritative catalog snapshot for future registrations.
@@ -2974,12 +2983,23 @@ impl SketchStore {
         agg_cfg: &asap_types::PrecomputeMaterialization,
         output: &crate::storage_engines::types::PrecomputedOutput,
     ) -> Option<BTreeMap<String, String>> {
+        let mut instances = self.instances.write().ok()?;
+        self.register_precompute_output_with_instances(sid, agg_cfg, output, &mut instances)
+    }
+
+    fn register_precompute_output_with_instances(
+        &self,
+        sid: u64,
+        agg_cfg: &asap_types::PrecomputeMaterialization,
+        output: &crate::storage_engines::types::PrecomputedOutput,
+        instances: &mut HashMap<u64, SdsBinding>,
+    ) -> Option<BTreeMap<String, String>> {
         let (_attrs_fp, label_values_map) = build_attrs_fp_and_label_map(agg_cfg, output);
         let key_names = &agg_cfg.grouping_labels.names();
         let agg_kind = crate::storage_engines::sketch_db::data::agg_kind_for_config(agg_cfg);
         let (capability, accuracy) = agg_kind.capability_and_accuracy();
 
-        match self.instance(sid) {
+        match instances.get(&sid) {
             None => {
                 if self.active_catalog_generation().as_deref()
                     != output.catalog_generation.as_deref()
@@ -3009,23 +3029,28 @@ impl SketchStore {
                 // unconditionally `None`, which meant ASAP-tier ExactAgg
                 // state was reachable only through the legacy precompute
                 // query path; capability-matching couldn't see it.
-                self.register(SketchInstanceMetadata {
-                    sid,
-                    metric_name: agg_cfg.metric.clone(),
-                    group_by_keys,
-                    capability: Some(capability),
-                    agg_kind,
-                    accuracy,
-                    first_seen_unix_ms: output.start_timestamp as i64,
-                    retired_at_ms: None,
-                    expires_at_ms: None,
-                    // Trust the caller's output — it carries the
-                    // policy fingerprint computed at emit time
-                    // (precompute worker / backfill processor).
-                    // Falling back to `from_config(&agg_cfg)` here
-                    // would also be correct but redundant.
-                    policy_fp: output.policy_fp,
-                });
+                if !self.register_with_instances(
+                    SketchInstanceMetadata {
+                        sid,
+                        metric_name: agg_cfg.metric.clone(),
+                        group_by_keys,
+                        capability: Some(capability),
+                        agg_kind,
+                        accuracy,
+                        first_seen_unix_ms: output.start_timestamp as i64,
+                        retired_at_ms: None,
+                        expires_at_ms: None,
+                        // Trust the caller's output — it carries the
+                        // policy fingerprint computed at emit time
+                        // (precompute worker / backfill processor).
+                        // Falling back to `from_config(&agg_cfg)` here
+                        // would also be correct but redundant.
+                        policy_fp: output.policy_fp,
+                    },
+                    instances,
+                ) {
+                    return None;
+                }
             }
             Some(existing) if !existing.is_writable() || existing.policy_fp != output.policy_fp => {
                 return None;

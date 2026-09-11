@@ -277,24 +277,71 @@ impl SketchStore {
 }
 
 impl SketchStore {
+    fn validate_frozen_cohort_bindings<'a>(
+        &self,
+        config: &asap_types::PrecomputeMaterialization,
+        sources: &'a [FrozenExactWindows],
+        instances: &HashMap<u64, SdsBinding>,
+    ) -> Result<&'a Arc<CatalogGeneration>, String> {
+        let generation = &sources
+            .first()
+            .ok_or("immutable publication input cohort is empty")?
+            .generation;
+        let definitions = sources.iter().map(|source| source.definition).collect();
+        if config
+            .derived_input
+            .as_ref()
+            .is_none_or(|input| input.inputs != definitions)
+        {
+            return Err(
+                "immutable publication input definitions differ from installed identity".into(),
+            );
+        }
+        let mut populations = BTreeSet::new();
+        for source in sources {
+            if &source.generation != generation
+                || !populations.insert((source.definition, source.sid, &source.group))
+            {
+                return Err(
+                    "immutable publication input cohort has mixed generations or duplicates".into(),
+                );
+            }
+            let binding = instances
+                .get(&source.sid)
+                .ok_or("immutable source was removed")?;
+            if binding.metadata.policy_fp != source.definition.fingerprint()
+                || binding.catalog_generation.as_deref() != Some(generation.as_ref())
+                || !binding.metadata.is_writable()
+            {
+                return Err("immutable source identity or lifetime changed".into());
+            }
+        }
+        self.validate_routed_catalog_generation(Some(generation.as_ref()))?;
+        Ok(generation)
+    }
+
     pub(crate) fn recover_frozen_maintenance_output(
         &self,
         sid: u64,
         config: &asap_types::PrecomputeMaterialization,
-        source: &FrozenExactWindows,
+        sources: &[FrozenExactWindows],
         digest: [u8; 32],
         window: (u64, u64),
     ) -> Result<bool, String> {
-        self.validate_routed_catalog_generation(Some(source.generation.as_ref()))?;
+        let _admission = self
+            .admission
+            .read()
+            .map_err(|_| "admission registry poisoned")?;
         let instances = self
             .instances
             .read()
             .map_err(|_| "instance registry poisoned")?;
+        let generation = self.validate_frozen_cohort_bindings(config, sources, &instances)?;
         let Some(binding) = instances.get(&sid) else {
             return Ok(false);
         };
         if binding.metadata.policy_fp != config.policy_fingerprint()
-            || binding.catalog_generation.as_deref() != Some(source.generation.as_ref())
+            || binding.catalog_generation.as_deref() != Some(generation.as_ref())
             || !binding.metadata.is_writable()
         {
             return Err("immutable output identity or lifetime changed".into());
@@ -345,41 +392,37 @@ impl SketchStore {
         config: &asap_types::PrecomputeMaterialization,
         output: &crate::storage_engines::types::PrecomputedOutput,
         state: &dyn AggregateCore,
-        source: &FrozenExactWindows,
+        sources: &[FrozenExactWindows],
         input_digest: [u8; 32],
     ) -> Result<bool, String> {
         use persistence::source::{EpochSnapshot, EpochSnapshotEntry};
-        if config
-            .derived_input
-            .as_ref()
-            .is_none_or(|derived| derived.inputs != BTreeSet::from([source.definition]))
-            || output.policy_fp != config.policy_fingerprint()
-            || output.catalog_generation.as_deref() != Some(source.generation.as_ref())
+        // One guard excludes source retirement through target registration
+        // and commit; admission excludes catalog transitions in the same span.
+        let _admission = self
+            .admission
+            .read()
+            .map_err(|_| "admission registry poisoned")?;
+        let mut instances = self
+            .instances
+            .write()
+            .map_err(|_| "instance registry poisoned")?;
+        let generation = self.validate_frozen_cohort_bindings(config, sources, &instances)?;
+        if output.policy_fp != config.policy_fingerprint()
+            || output.catalog_generation.as_deref() != Some(generation.as_ref())
         {
             return Err("derived publication differs from its installed input identity".into());
         }
         let labels = self
-            .register_precompute_output(sid, config, output)
+            .register_precompute_output_with_instances(sid, config, output, &mut instances)
             .ok_or("derived output registration failed")?;
         let _mutation = self.begin_state_mutation();
-        let instances = self
-            .instances
-            .read()
-            .map_err(|_| "instance registry poisoned")?;
-        let source_binding = instances
-            .get(&source.sid)
-            .ok_or("immutable source was removed")?;
         let binding = instances.get(&sid).ok_or("derived output was removed")?;
-        if source_binding.metadata.policy_fp != source.definition.fingerprint()
-            || source_binding.catalog_generation.as_deref() != Some(source.generation.as_ref())
-            || source_binding.metadata.status() == AggStatus::Expired
-            || !binding.metadata.is_writable()
+        if !binding.metadata.is_writable()
             || binding.metadata.policy_fp != output.policy_fp
-            || binding.catalog_generation.as_deref() != Some(source.generation.as_ref())
+            || binding.catalog_generation.as_deref() != Some(generation.as_ref())
         {
             return Err("derived publication physical lifetime changed".into());
         }
-        self.validate_routed_catalog_generation(Some(source.generation.as_ref()))?;
         let mut completed = self
             .completed_windows
             .write()
@@ -470,7 +513,15 @@ mod tests {
         first.grouping_labels = std::iter::empty::<String>().collect();
         let mut second = first.clone();
         second.metric = "cohort_second".into();
-        let configs = [first, second];
+        let mut target = first.clone();
+        target.derived_input = Some(asap_types::derived_input::DerivedInputIdentity {
+            inputs: BTreeSet::from([
+                first.policy_fingerprint().into(),
+                second.policy_fingerprint().into(),
+            ]),
+            program_sha256: "0".repeat(64),
+        });
+        let configs = [first, second, target];
         let catalog =
             asap_types::summary_catalog::SummaryCatalog::from_materializations(1, 1, &configs)
                 .unwrap();
@@ -488,7 +539,7 @@ mod tests {
         config.hot_window_ms = None;
         let mut persistence = store.start_persistence(config).unwrap();
         let mut requests = Vec::new();
-        for (index, config) in configs.iter().enumerate() {
+        for (index, config) in configs.iter().take(2).enumerate() {
             let definition = config.policy_fingerprint().into();
             let coordinate = asap_types::sds::SummaryInstanceCoordinates {
                 summary_definition_id: definition,
@@ -540,6 +591,37 @@ mod tests {
             .read_frozen_exact_cohort(&generation, &definitions, &requests)
             .is_err());
         assert_eq!(persistence.manifest.live_parts().len(), parts);
+        let target = &configs[2];
+        let mut output = PrecomputedOutput::new(0, 1000, None, target.policy_fingerprint());
+        output.catalog_generation = Some(Arc::clone(&generation));
+        let mut sum = SumAccumulator::new();
+        sum.update(11.0);
+        assert!(store
+            .publish_frozen_maintenance_output(902, target, &output, &sum, &cohort, [42; 32])
+            .unwrap());
+        assert!(store
+            .recover_frozen_maintenance_output(902, target, &cohort, [42; 32], (0, 1000))
+            .unwrap());
+        let published_parts = persistence.manifest.live_parts().len();
+        store.force_expire(901).unwrap();
+        assert!(store
+            .publish_frozen_maintenance_output(903, target, &output, &sum, &cohort, [42; 32])
+            .is_err());
+        assert!(store
+            .recover_frozen_maintenance_output(902, target, &cohort, [42; 32], (0, 1000))
+            .is_err());
+        assert!(!store.instances.read().unwrap().contains_key(&903));
+        assert_eq!(persistence.manifest.live_parts().len(), published_parts);
+        assert!(!store
+            .persistence_metadata
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .load_strict()
+            .unwrap()
+            .iter()
+            .any(|record| record.sid == 903));
         let mut next = catalog;
         next.plan_version += 1;
         store.install_summary_catalog(Arc::new(next)).unwrap();
@@ -831,7 +913,7 @@ mod tests {
         let catalog = asap_types::summary_catalog::SummaryCatalog::from_materializations(
             1,
             1,
-            &[source_config, target.clone()],
+            &[source_config.clone(), target.clone()],
         )
         .unwrap();
         let store = Arc::new(SketchStore::new());
@@ -847,6 +929,11 @@ mod tests {
         let generation = store.active_catalog_generation().unwrap();
         let mut output = PrecomputedOutput::new(0, 1000, None, target.policy_fingerprint());
         output.catalog_generation = Some(Arc::clone(&generation));
+        let mut source_output = output.clone();
+        source_output.policy_fp = source_config.policy_fingerprint();
+        store
+            .register_precompute_output(600, &source_config, &source_output)
+            .unwrap();
         store
             .register_precompute_output(601, &target, &output)
             .unwrap();
@@ -883,7 +970,13 @@ mod tests {
             singleton_population_complete: false,
         };
         assert!(store
-            .recover_frozen_maintenance_output(601, &target, &input, [7; 32], (0, 1000))
+            .recover_frozen_maintenance_output(
+                601,
+                &target,
+                std::slice::from_ref(&input),
+                [7; 32],
+                (0, 1000)
+            )
             .unwrap());
         assert_eq!(
             store.completed_windows.read().unwrap().get(&601),
