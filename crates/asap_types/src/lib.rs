@@ -3,6 +3,7 @@ pub mod accuracy;
 pub mod aggregation_config;
 pub mod aggregation_type;
 pub mod enums;
+pub mod erp_observation;
 pub mod executable_plan;
 pub mod key_by_label_names;
 pub mod monitor_spec;
