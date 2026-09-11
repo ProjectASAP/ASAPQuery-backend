@@ -75,8 +75,9 @@ rejected before automatic planning. Grouped table projections, complex table
 types, and arbitrary boundary fragments remain unsupported here. Such inputs
 must not be presented as accelerated workload coverage.
 
-SQL `count(*)` now installs an exact Count state through the same catalog and
-readout DAG as other summaries. It includes rows with a NULL value column.
+SQL `count(*)` now installs an exact row-count materialization through the same
+catalog and readout DAG as other summaries. The selected Count intent uses the
+existing physical SUM accumulator over typed constant `1`. It includes rows with a NULL value column.
 Planner rejects nullable `count(value)` until per-aggregate null exclusion is
 represented; it must not silently become row count. Non-Float64 named sources
 are rejected because the current Float64 ingest path cannot preserve arbitrary
