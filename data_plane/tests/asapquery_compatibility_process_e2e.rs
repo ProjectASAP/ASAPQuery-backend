@@ -21,6 +21,9 @@ use tokio::sync::Mutex;
 #[path = "support/erp_planning_process.rs"]
 mod erp_planning_process;
 
+#[path = "support/durable_summary_process.rs"]
+mod durable_summary_process;
+
 struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
