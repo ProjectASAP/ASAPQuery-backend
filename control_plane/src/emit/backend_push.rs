@@ -464,7 +464,12 @@ async fn push_cumulative_entries(
     let materializations = match cumulative_be
         .aggregations
         .iter()
-        .map(crate::physical::compiler::aggregation_config_for_materialization)
+        .map(|aggregation| {
+            crate::physical::compiler::aggregation_config_for_materialization(
+                aggregation,
+                asap_types::QueryLanguage::PromQl,
+            )
+        })
         .collect::<anyhow::Result<Vec<_>>>()
     {
         Ok(materializations) => materializations,
