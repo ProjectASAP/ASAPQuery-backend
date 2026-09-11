@@ -28,7 +28,7 @@ pub fn validated_source_window_cohort<'a>(
         || full_ms == 0
         || target.slide_interval == 0
         || target.slide_interval > target.window_size
-        || target.pane_origin_ms.is_none()
+        || (target.slide_interval < target.window_size && target.pane_origin_ms.is_none())
         || target.stored_window_ms() != full_ms
         || (target.slide_interval < target.window_size
             && !matches!(
