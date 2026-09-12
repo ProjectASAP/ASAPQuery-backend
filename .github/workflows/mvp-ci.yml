@@ -17,6 +17,11 @@ jobs:
     name: MVP backend
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      # The full workspace links multiple DataFusion-heavy process test binaries.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - name: Checkout ASAPQuery-backend
         uses: actions/checkout@v4
@@ -73,10 +78,21 @@ jobs:
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        # Preserve the existing warning policy while expanding runtime coverage.
+        run: cargo clippy --workspace --all-targets
+
+      - name: Build process-test control plane
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        working-directory: ASAPQuery-backend
+        run: cargo build -p control_plane --bin control_plane
 
       - name: Test workspace
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo test --workspace
+        # Persistence tests wait on background flushers with bounded deadlines.
+        # Match scripts/e2e.sh to avoid competing flushers exhausting those waits.
+        run: |
+          export ASAP_E2E_CONTROL_PLANE_BIN="$PWD/target/debug/control_plane"
+          cargo test --workspace -- --test-threads=1
