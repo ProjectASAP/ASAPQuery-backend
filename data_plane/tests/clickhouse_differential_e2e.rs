@@ -491,6 +491,144 @@ async fn run_mixed_aggregate(aggregate: &str) {
     }
 }
 
+// Real process coverage for publication, source backfill, template reuse and fallback.
+#[tokio::test]
+async fn moving_windows_match_clickhouse_after_automatic_publication() {
+    use control_plane::clickhouse::ClickHouseSqlWorkloadEntry;
+    let Ok(clickhouse_url) = std::env::var("CLICKHOUSE_URL") else {
+        eprintln!("skipping moving-window process E2E because CLICKHOUSE_URL is unset");
+        return;
+    };
+    let user = std::env::var("CLICKHOUSE_USER").ok();
+    let password = std::env::var("CLICKHOUSE_PASSWORD").ok();
+    let client = reqwest::Client::new();
+    let native = |sql: String| {
+        let mut request = client.post(&clickhouse_url).body(sql);
+        if let Some(user) = &user {
+            request = request.basic_auth(user, password.as_ref());
+        }
+        async move {
+            let response = request.send().await.unwrap();
+            let status = response.status();
+            let body = response.bytes().await.unwrap();
+            assert!(status.is_success(), "native ClickHouse: {status} {body:?}");
+            body
+        }
+    };
+    native("DROP TABLE IF EXISTS default.moving_telemetry".into()).await;
+    native("CREATE TABLE default.moving_telemetry(metric String, timestamp_ms Int64, value Float64) ENGINE=Memory".into()).await;
+    native("INSERT INTO default.moving_telemetry VALUES ('requests',0,2),('requests',1000,3),('requests',2000,5),('requests',3000,7),('requests',4000,11),('requests',5000,13),('requests',6000,17),('requests',7000,19),('requests',8000,999)".into()).await;
+    let sql = |start, end| {
+        format!("SELECT sum(value) AS value FROM moving_telemetry WHERE metric = 'requests' AND timestamp_ms >= {start} AND timestamp_ms < {end}")
+    };
+    let mut workload = mixed_workload(&sql(0, 2000));
+    let schema = workload.tables.remove("telemetry").unwrap();
+    workload.tables.insert("moving_telemetry".into(), schema);
+    workload.queries.push(ClickHouseSqlWorkloadEntry {
+        sql: sql(2000, 4000),
+        start_ms: 2000,
+        end_ms: 4000,
+        cumulative: true,
+    });
+    let (publication, _) =
+        control_plane::clickhouse::compile_automatic_clickhouse_workload(&workload)
+            .await
+            .unwrap();
+    assert_eq!(publication.query_plan.entries.len(), 2);
+    assert_eq!(publication.precompute_plan.materializations.len(), 2);
+    let api_port = unused_port();
+    let sql_port = unused_port();
+    let output = tempfile::tempdir().unwrap();
+    let mut bootstrap = tempfile::NamedTempFile::new().unwrap();
+    writeln!(bootstrap, "aggregations: []").unwrap();
+    let _process = spawn_backend(
+        &clickhouse_url,
+        user.as_deref(),
+        password.as_deref(),
+        output.path(),
+        bootstrap.path(),
+        api_port,
+        sql_port,
+    )
+    .await;
+    let api = format!("http://127.0.0.1:{api_port}");
+    let install = publication.install_request(None, Vec::new()).unwrap();
+    client
+        .post(format!("{api}/api/v1/physical-plan"))
+        .json(&install)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    client
+        .post(format!("{api}/api/v1/physical-plan/activate"))
+        .json(&serde_json::json!({"plan_id": 72, "plan_version": 1}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    for config in &publication.precompute_plan.materializations {
+        let start = config.pane_origin_ms.unwrap();
+        client
+            .post(format!("{api}/api/v1/db/backfill"))
+            .json(&serde_json::json!({
+                "agg_id": config.policy_fp_u64(), "start_ms": start, "end_ms": 6000,
+                "source": {"ClickHouse": {"database": "default", "table": "moving_telemetry"}},
+                "windows_total": (6000 - start) / 2000,
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+    }
+    let mut complete = false;
+    for _ in 0..400 {
+        let jobs: serde_json::Value = client
+            .get(format!("{api}/api/v1/db/backfill/jobs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let jobs = jobs["jobs"].as_array().unwrap();
+        assert!(
+            jobs.iter().all(|job| job["status"] != "failed"),
+            "backfill failed: {jobs:?}"
+        );
+        if jobs.len() == 2 && jobs.iter().all(|job| job["status"] == "complete") {
+            complete = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(complete, "moving-window backfill timed out");
+    for (query, expected, route) in [
+        (sql(0, 2000), 5.0, "warm"),
+        (sql(2000, 4000), 12.0, "warm"),
+        (sql(4000, 6000), 24.0, "warm"),
+        ("SELECT sum(value) AS value FROM moving_telemetry WHERE metric = 'requests' AND timestamp_ms > 5999 - 2000 AND timestamp_ms <= 5999".into(), 24.0, "warm"),
+        (sql(6000, 8000), 36.0, "exact_fallback"),
+    ] {
+        let exact = native(format!("{query} FORMAT TabSeparated")).await;
+        let mut request = client.get(format!("http://127.0.0.1:{sql_port}/"))
+            .query(&[("query", query.as_str()), ("default_format", "TabSeparated")]);
+        if let Some(user) = &user { request = request.header("x-clickhouse-user", user); }
+        if let Some(password) = &password { request = request.header("x-clickhouse-key", password); }
+        let response = request.send().await.unwrap().error_for_status().unwrap();
+        assert_eq!(response.headers()["x-asap-execution"], route, "{query}");
+        let actual = response.bytes().await.unwrap();
+        let number = |bytes: &[u8]| std::str::from_utf8(bytes).unwrap().trim().parse::<f64>().unwrap();
+        assert_eq!(number(&exact), expected, "native boundary oracle: {query}");
+        assert_eq!(number(&actual), expected, "ASAP: {query}");
+        eprintln!("moving-window verified: route={route}, value={expected}, query={query}");
+    }
+    native("DROP TABLE default.moving_telemetry".into()).await;
+}
+
 #[tokio::test]
 async fn collection_sql_executes_local_elements_after_typed_exact_leaf() {
     use asap_types::query_plan::QueryPlanNode;

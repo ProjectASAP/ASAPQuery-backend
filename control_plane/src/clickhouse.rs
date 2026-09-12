@@ -83,10 +83,121 @@ pub async fn canonicalize_clickhouse_sql(
     Ok(canonical_sql_identity(&canonical))
 }
 
-/// Identity derived from ASAPPlanner's resolved canonical AST. Equivalent SQL
-/// formatting therefore maps to one catalog key without reparsing at serving.
+/// Resolve a request once, retaining the fixed identity for older publications.
+pub async fn bind_clickhouse_sql(
+    sql: &str,
+    catalog: &SqlCatalog,
+    accuracy: AccuracyTarget,
+) -> Result<(String, String, Option<(u64, u64)>), ClickHousePlanningError> {
+    let canonical = lower_sql_dialect(sql, catalog, SqlDialect::ClickhouseSQL, accuracy)
+        .await
+        .map_err(|error| ClickHousePlanningError::Lower(error.to_string()))?;
+    let fixed = format!("{canonical:?}");
+    let binding = moving_window(&canonical);
+    Ok(match binding {
+        Some((identity, range)) => (fixed, identity, Some(range)),
+        None => (fixed.clone(), fixed, None),
+    })
+}
+
+/// Only the source bounds of a single-table aggregate are runtime parameters.
+/// Expressions in projections, aggregate arguments and other predicates stay
+/// in the identity, so changing them cannot reuse the installed computation.
 pub fn canonical_sql_identity(canonical: &QueryExpr) -> String {
-    format!("{canonical:?}")
+    moving_window(canonical)
+        .map(|(identity, _)| identity)
+        .unwrap_or_else(|| format!("{canonical:?}"))
+}
+
+fn moving_window(canonical: &QueryExpr) -> Option<(String, (u64, u64))> {
+    use planner_types::pre_asap::{CompareOpKind, ScalarValue, Source};
+    let mut template = canonical.clone();
+    let aggregate = match &mut template {
+        QueryExpr::Project { child, .. } => Rc::make_mut(child),
+        expr => expr,
+    };
+    let QueryExpr::Aggregate { child, .. } = aggregate else {
+        return None;
+    };
+    let QueryExpr::Scan {
+        source: Source::Table { .. },
+        predicates,
+        schema,
+    } = Rc::make_mut(child)
+    else {
+        return None;
+    };
+    let time = schema.time_index?;
+    fn bounds(
+        expr: &QueryExpr,
+        time: usize,
+        lower: &mut Option<i64>,
+        upper: &mut Option<i64>,
+    ) -> Option<()> {
+        match expr {
+            QueryExpr::BoolAnd(children) => {
+                for child in children {
+                    bounds(child, time, lower, upper)?;
+                }
+            }
+            QueryExpr::Compare { left, op, right } if matches!(left.as_ref(), QueryExpr::Column(col) if *col == time) =>
+            {
+                let value = constant_int64(right)?;
+                let (target, value) = match op {
+                    CompareOpKind::Ge => (lower, value),
+                    CompareOpKind::Gt => (lower, value.checked_add(1)?),
+                    CompareOpKind::Lt => (upper, value),
+                    CompareOpKind::Le => (upper, value.checked_add(1)?),
+                    _ => return None,
+                };
+                // Redundant bounds are deliberately not generalized.
+                if target.replace(value).is_some() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+        Some(())
+    }
+    let (mut lower, mut upper) = (None, None);
+    for predicate in predicates.iter() {
+        bounds(&predicate.0, time, &mut lower, &mut upper)?;
+    }
+    let (start, end) = (u64::try_from(lower?).ok()?, u64::try_from(upper?).ok()?);
+    if start >= end {
+        return None;
+    }
+    fn normalize(expr: &mut QueryExpr, time: usize, width: i64) {
+        match expr {
+            QueryExpr::BoolAnd(children) => {
+                for child in children {
+                    normalize(child, time, width);
+                }
+            }
+            QueryExpr::Compare { left, op, right } if matches!(left.as_ref(), QueryExpr::Column(col) if *col == time) =>
+            {
+                // `bounds` has checked the integer expressions and overflow.
+                // Preserve membership by converting both edges to [start,end).
+                let value = match op {
+                    CompareOpKind::Ge | CompareOpKind::Gt => {
+                        *op = CompareOpKind::Ge;
+                        0
+                    }
+                    CompareOpKind::Lt | CompareOpKind::Le => {
+                        *op = CompareOpKind::Lt;
+                        width
+                    }
+                    _ => return,
+                };
+                *right = Rc::new(QueryExpr::Literal(ScalarValue::Int64(value)));
+            }
+            _ => {}
+        }
+    }
+    for predicate in predicates {
+        normalize(Rc::make_mut(&mut predicate.0), time, (end - start) as i64);
+    }
+    Some((format!("moving-window-v1:{template:?}"), (start, end)))
 }
 
 pub use asap_frontend_sql::SqlCatalog as ClickHouseSqlCatalog;
@@ -132,6 +243,7 @@ pub async fn compile_automatic_clickhouse_workload(
         tables: request.tables.clone(),
     };
     let mut entries = std::collections::BTreeMap::new();
+    let mut window_templates = std::collections::BTreeMap::<String, Vec<String>>::new();
     let mut installed_dags = std::collections::BTreeMap::new();
     let mut materializations = std::collections::BTreeMap::new();
     let mut selection_traces = std::collections::BTreeMap::new();
@@ -141,10 +253,8 @@ pub async fn compile_automatic_clickhouse_workload(
         // actually visited in this selected DAG, never a scripted family.
         let mut planned =
             plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
-        selection_traces.insert(
-            planned.canonical_sql.clone(),
-            std::mem::take(&mut planned.selection_trace),
-        );
+        let selection_trace = std::mem::take(&mut planned.selection_trace);
+        let template = planned.canonical_sql.clone();
         let (entry, installed) = compile_selected_sql(query, planned, |node, family| {
             let config = materialize_selected_sql(node, family, query)
                 .map_err(crate::query_plan::QueryPlanError::Invalid)?;
@@ -161,6 +271,8 @@ pub async fn compile_automatic_clickhouse_workload(
                 .or_insert(config);
             Ok(binding)
         })?;
+        index_sql_template(&mut window_templates, template, &entry);
+        selection_traces.insert(entry.canonical_query.clone(), selection_trace);
         let key = QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &entry.canonical_query);
         if entries.insert(key, entry).is_some() {
             return Err(ClickHousePlanningError::Lower(
@@ -199,6 +311,7 @@ pub async fn compile_automatic_clickhouse_workload(
             plan_id: request.envelope.plan_id,
             plan_version: request.envelope.plan_version,
             clickhouse_context: Some(ClickHousePlanningContext {
+                window_templates,
                 tables: request.tables.clone(),
                 accuracy: request.accuracy.clone(),
             }),
@@ -293,12 +406,15 @@ pub async fn compile_clickhouse_workload(
         tables: request.tables.clone(),
     };
     let mut entries = std::collections::BTreeMap::new();
+    let mut window_templates = std::collections::BTreeMap::<String, Vec<String>>::new();
     let mut installed_dags = std::collections::BTreeMap::new();
     for query in &request.queries {
         let planned = plan_clickhouse_sql(&query.sql, &catalog, request.accuracy.clone()).await?;
+        let template = planned.canonical_sql.clone();
         let (executable, installed) = compile_selected_sql(query, planned, |node, family| {
             bind_selected_node(node, family, query, request)
         })?;
+        index_sql_template(&mut window_templates, template, &executable);
         installed_dags.insert(query.sql.clone(), installed);
         let identity =
             QueryPlan::catalog_key(QueryLanguage::ClickHouseSql, &executable.canonical_query);
@@ -319,6 +435,7 @@ pub async fn compile_clickhouse_workload(
             plan_id: request.sds.plan_id,
             plan_version: request.sds.plan_version,
             clickhouse_context: Some(ClickHousePlanningContext {
+                window_templates,
                 tables: request.tables.clone(),
                 accuracy: request.accuracy.clone(),
             }),
@@ -329,6 +446,25 @@ pub async fn compile_clickhouse_workload(
         .validate()
         .map_err(ClickHousePlanningError::Lower)?;
     Ok(publication)
+}
+
+fn index_sql_template(
+    templates: &mut std::collections::BTreeMap<String, Vec<String>>,
+    template: String,
+    entry: &QueryPlanEntry,
+) {
+    // External subqueries still contain fixed SQL literals.
+    if template.starts_with("moving-window-v1:")
+        && !entry
+            .nodes
+            .values()
+            .any(|node| matches!(node, crate::query_plan::QueryPlanNode::ExternalExact { .. }))
+    {
+        templates
+            .entry(template)
+            .or_default()
+            .push(entry.canonical_query.clone());
+    }
 }
 
 fn compile_selected_sql<F>(
@@ -362,7 +498,7 @@ where
     let mut query_nodes = std::collections::BTreeMap::new();
     let executable = crate::query_plan::compile_bound_relational_mapped(
         query.sql.clone(),
-        planned.canonical_sql.clone(),
+        format!("{:?}", planned.canonical),
         &root,
         FixedEvaluationRange {
             start_ms: query.start_ms,
@@ -744,6 +880,90 @@ mod tests {
     use asap_types::{AggregationType, KeyByLabelNames, PrecomputeMaterialization, WindowKind};
     use planner_types::pre_asap::{Column, DataType, Schema};
 
+    // A dashboard refresh must reuse the installed identity without treating
+    // value thresholds or window length as runtime parameters.
+    #[tokio::test]
+    async fn moving_sql_window_reuses_identity() {
+        let catalog = SqlCatalog {
+            tables: HashMap::from([(
+                "telemetry".into(),
+                Schema {
+                    columns: vec![
+                        Column::new("timestamp_ms", DataType::Int64, false),
+                        Column::new("value", DataType::Float64, false),
+                    ],
+                    time_index: Some(0),
+                    ..Default::default()
+                },
+            )]),
+        };
+        let identity = |start, end, threshold| {
+            format!(
+            "SELECT sum(value) FROM telemetry WHERE timestamp_ms >= {start} AND timestamp_ms < {end} AND value > {threshold}"
+        )
+        };
+        let first =
+            canonicalize_clickhouse_sql(&identity(1000, 3000, 5), &catalog, AccuracyTarget::Exact)
+                .await
+                .unwrap();
+        let shifted =
+            canonicalize_clickhouse_sql(&identity(2000, 4000, 5), &catalog, AccuracyTarget::Exact)
+                .await
+                .unwrap();
+        assert_eq!(first, shifted);
+        let wider =
+            canonicalize_clickhouse_sql(&identity(1000, 4000, 5), &catalog, AccuracyTarget::Exact)
+                .await
+                .unwrap();
+        let threshold =
+            canonicalize_clickhouse_sql(&identity(2000, 4000, 6), &catalog, AccuracyTarget::Exact)
+                .await
+                .unwrap();
+        assert_ne!(first, wider);
+        assert_ne!(first, threshold);
+        let (_, template, range) =
+            bind_clickhouse_sql(&identity(2000, 4000, 5), &catalog, AccuracyTarget::Exact)
+                .await
+                .unwrap();
+        assert_eq!(template, first);
+        assert_eq!(range, Some((2000, 4000)));
+
+        // Dashboard bounds may use arithmetic and an inclusive upper edge.
+        let (_, inclusive, range) = bind_clickhouse_sql(
+            "SELECT sum(value) FROM telemetry WHERE timestamp_ms > 3999 - 2000 AND timestamp_ms <= 3999 AND value > 5",
+            &catalog,
+            AccuracyTarget::Exact,
+        ).await.unwrap();
+        assert_eq!(inclusive, first);
+        assert_eq!(range, Some((2000, 4000)));
+
+        // Projection constants are query semantics, never time parameters.
+        let projected = |start, end| {
+            format!("SELECT sum(value), {start} AS window_start FROM telemetry WHERE timestamp_ms >= {start} AND timestamp_ms < {end}")
+        };
+        assert_ne!(
+            canonicalize_clickhouse_sql(&projected(1000, 3000), &catalog, AccuracyTarget::Exact)
+                .await
+                .unwrap(),
+            canonicalize_clickhouse_sql(&projected(2000, 4000), &catalog, AccuracyTarget::Exact)
+                .await
+                .unwrap(),
+        );
+        // Unsupported bound shapes and non-aggregate scans retain fixed keys.
+        for sql in [
+            "SELECT sum(value) FROM telemetry",
+            "SELECT sum(value) FROM telemetry WHERE timestamp_ms >= 1000 AND timestamp_ms <= 9223372036854775807",
+            "SELECT value FROM telemetry WHERE timestamp_ms >= 1000 AND timestamp_ms < 3000",
+        ] {
+            let (fixed, template, range) =
+                bind_clickhouse_sql(sql, &catalog, AccuracyTarget::Exact)
+                    .await
+                    .unwrap();
+            assert_eq!(fixed, template);
+            assert_eq!(range, None);
+        }
+    }
+
     fn materialization(
         agg: AggregationType,
         value_column: &str,
@@ -1054,6 +1274,109 @@ mod tests {
             }],
         };
         let publication = compile_clickhouse_workload(&request).await.unwrap();
+        // A simple installed aggregate publishes the same key as a refresh.
+        let simple_sql =
+            "SELECT sum(value) FROM telemetry WHERE timestamp_ms >= 0 AND timestamp_ms < 2000";
+        let simple = compile_clickhouse_workload(&ClickHouseSqlWorkload {
+            sds: request.sds.clone(),
+            precompute_plan: request.precompute_plan.clone(),
+            transmission_plan: request.transmission_plan.clone(),
+            tables: request.tables.clone(),
+            accuracy: request.accuracy.clone(),
+            queries: vec![ClickHouseSqlWorkloadEntry {
+                sql: simple_sql.into(),
+                start_ms: 0,
+                end_ms: 2000,
+                cumulative: true,
+            }],
+        })
+        .await
+        .unwrap();
+        let shifted = canonicalize_clickhouse_sql(
+            "SELECT sum(value) FROM telemetry WHERE timestamp_ms >= 2000 AND timestamp_ms < 4000",
+            &SqlCatalog {
+                tables: request.tables.clone(),
+            },
+            AccuracyTarget::Exact,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            simple
+                .query_plan
+                .clickhouse_context
+                .as_ref()
+                .unwrap()
+                .window_templates[&shifted]
+                .len(),
+            1
+        );
+        assert!(shifted.starts_with("moving-window-v1:"));
+        // Different windows remain distinct publications even with one template.
+        let windows = || {
+            vec![
+            ClickHouseSqlWorkloadEntry { sql: simple_sql.into(), start_ms: 0, end_ms: 2000, cumulative: true },
+            ClickHouseSqlWorkloadEntry {
+                sql: "SELECT sum(value) FROM telemetry WHERE timestamp_ms >= 2000 AND timestamp_ms < 4000".into(),
+                start_ms: 2000, end_ms: 4000, cumulative: true,
+            },
+        ]
+        };
+        let multiple = compile_clickhouse_workload(&ClickHouseSqlWorkload {
+            sds: request.sds.clone(),
+            precompute_plan: request.precompute_plan.clone(),
+            transmission_plan: request.transmission_plan.clone(),
+            tables: request.tables.clone(),
+            accuracy: request.accuracy.clone(),
+            queries: windows(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(multiple.query_plan.entries.len(), 2);
+        let (multiple_auto, multiple_traces) =
+            compile_automatic_clickhouse_workload(&ClickHouseSqlAutomaticWorkload {
+                envelope: request.precompute_plan.envelope.clone(),
+                tables: request.tables.clone(),
+                accuracy: request.accuracy.clone(),
+                queries: windows(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(multiple_auto.query_plan.entries.len(), 2);
+        for plan in [&multiple.query_plan, &multiple_auto.query_plan] {
+            let identities = &plan.clickhouse_context.as_ref().unwrap().window_templates[&shifted];
+            assert_eq!(identities.len(), 2);
+            assert_ne!(identities[0], identities[1]);
+            for identity in identities {
+                assert!(plan.lookup_clickhouse(identity).is_ok());
+            }
+        }
+        assert_eq!(multiple_traces.len(), 2);
+        assert_eq!(multiple_auto.precompute_plan.executable_dags.len(), 2);
+        multiple_auto.validate().unwrap();
+        let bindings = multiple_auto
+            .query_plan
+            .entries
+            .values()
+            .map(|entry| entry.materialization_bindings()[0].materialization)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            bindings.len(),
+            2,
+            "different pane origins must retain distinct materializations"
+        );
+        let mut invalid = multiple_auto.clone();
+        invalid
+            .query_plan
+            .clickhouse_context
+            .as_mut()
+            .unwrap()
+            .window_templates
+            .values_mut()
+            .next()
+            .unwrap()
+            .push("missing concrete query".into());
+        assert!(invalid.validate().is_err());
         let (automatic, traces) =
             compile_automatic_clickhouse_workload(&ClickHouseSqlAutomaticWorkload {
                 envelope: request.precompute_plan.envelope.clone(),
@@ -1138,6 +1461,8 @@ mod tests {
             crate::physical::executable_binding::BackendNodeBinding::Query { .. }
         )));
         let entry = publication.query_plan.entries.values().next().unwrap();
+        // External SQL retains its literal time range until it can be bound.
+        assert!(!entry.canonical_query.starts_with("moving-window-v1:"));
         assert!(entry
             .nodes
             .values()

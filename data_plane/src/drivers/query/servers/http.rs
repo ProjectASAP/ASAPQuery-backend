@@ -7257,6 +7257,7 @@ mod catalog_install_tests {
         let mut candidate = request();
         candidate.query_plan.clickhouse_context =
             Some(asap_types::query_plan::ClickHousePlanningContext {
+                window_templates: Default::default(),
                 tables: Default::default(),
                 accuracy: planner_types::types::AccuracyTarget::Exact,
             });

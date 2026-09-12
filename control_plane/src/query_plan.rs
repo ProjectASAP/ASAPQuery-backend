@@ -1124,6 +1124,7 @@ mod tests {
             plan_id: 0,
             plan_version: 0,
             clickhouse_context: Some(ClickHousePlanningContext {
+                window_templates: Default::default(),
                 tables: Default::default(),
                 accuracy: planner_types::types::AccuracyTarget::Exact,
             }),
