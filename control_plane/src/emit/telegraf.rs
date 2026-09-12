@@ -273,10 +273,8 @@ mod toml_minimal {
                 }
                 // Validate value: string (balanced quotes), bool, or
                 // unquoted scalar (number / fraction).
-                if val.starts_with('"') {
-                    if !val.ends_with('"') || val.len() < 2 {
-                        return Err(anyhow!("line {}: unbalanced \" in: {raw}", lineno + 1));
-                    }
+                if val.starts_with('"') && (!val.ends_with('"') || val.len() < 2) {
+                    return Err(anyhow!("line {}: unbalanced \" in: {raw}", lineno + 1));
                 }
             }
             Ok(Document)

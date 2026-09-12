@@ -25,8 +25,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use asap_types::sds::{
     CatalogGeneration, HalfOpenTimeRange, InstanceCompleteness, InstanceLifecycle,
-    ObservedSummaryInventory, SummaryDefinitionId, SummaryInstance, SummaryInstanceId,
-    SummaryInstanceStatus, SummaryPlacement, SummaryStateReference,
+    ObservedSummaryInventory, SummaryDefinitionId, SummaryInstance, SummaryInstanceStatus,
+    SummaryPlacement, SummaryStateReference,
 };
 use asap_types::PolicyFingerprint;
 use dashmap::DashMap;
@@ -351,7 +351,10 @@ impl ReductionRollupSeries {
         }
         let anchor = *self.anchor_start_ms.get_or_insert(window.0);
         let base_width = *self.base_width_ms.get_or_insert(width);
-        if width != base_width || window.0 < anchor || (window.0 - anchor) % base_width != 0 {
+        if width != base_width
+            || window.0 < anchor
+            || !(window.0 - anchor).is_multiple_of(base_width)
+        {
             self.valid = false;
             return;
         }
@@ -380,7 +383,7 @@ impl ReductionRollupSeries {
                 None => break,
             };
             let ordinal = (node_start - anchor) / level_width;
-            if ordinal % 2 == 0 || node_start < level_width {
+            if ordinal.is_multiple_of(2) || node_start < level_width {
                 break;
             }
             let left_start = node_start - level_width;

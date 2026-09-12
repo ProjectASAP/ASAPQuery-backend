@@ -142,11 +142,10 @@ pub(crate) fn validate_payload(
         let node = &entry.nodes[&id];
         let state_ids = match node {
             QueryPlanNode::ReadMaterialization { binding } => {
-                if !resolved.contains_key(&binding.materialization) {
-                    resolved.insert(
-                        binding.materialization,
-                        resolve(catalog, binding.materialization)?,
-                    );
+                if let std::collections::btree_map::Entry::Vacant(entry) =
+                    resolved.entry(binding.materialization)
+                {
+                    entry.insert(resolve(catalog, binding.materialization)?);
                 }
                 BTreeSet::from([binding.materialization])
             }

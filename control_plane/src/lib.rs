@@ -10,6 +10,19 @@
 //! to provide the standalone binary entrypoint for any deployments that
 //! still want to run the control plane out-of-process.
 //!
+#![allow(
+    clippy::collapsible_match,
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::field_reassign_with_default,
+    clippy::large_enum_variant,
+    clippy::map_identity,
+    clippy::result_large_err,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::vec_init_then_push
+)]
+
 //! ## 2026-05 layered-cleanup refactor — old → new module mapping
 //!
 //! The internal module layout was restructured to mirror

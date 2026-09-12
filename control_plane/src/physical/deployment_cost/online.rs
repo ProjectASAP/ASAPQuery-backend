@@ -130,7 +130,7 @@ pub fn effective_table(store: &OnlineMetricsStore) -> HashMap<SketchType, Sketch
                 let eff = map
                     .get(st)
                     .map(|o| o.effective_costs(b))
-                    .unwrap_or_else(|| b.clone());
+                    .unwrap_or_else(|| *b);
                 (st.clone(), eff)
             })
             .collect(),

@@ -663,17 +663,31 @@ impl FidelityGuarantee {
         use FidelityGuarantee::*;
         use SketchAlgorithm as S;
 
-        let configured = |aggregation_type| match (aggregation_type, self) {
-            (A::UnivMon, UnivMonFrequency { .. }) => true,
-            (A::Sum | A::MultipleSum | A::MinMax | A::MultipleMinMax, Exact) => true,
-            (A::Increase | A::MultipleIncrease, ExactCounter { .. }) => true,
-            (A::DatasketchesKLL | A::HydraKLL, KllRankError { .. }) => true,
-            (A::DDSketch, DdSketchRelativeError { .. }) => true,
-            (A::HLL, HllCardinalityError { .. }) => true,
-            (A::CountMinSketch | A::CountMinSketchWithHeap, CmsFrequencyError { .. }) => true,
-            (A::CountSketch | A::CountSketchWithHeap, CountSketchFrequencyError { .. }) => true,
-            (A::SingleSubpopulation | A::MultipleSubpopulation, Unknown { .. }) => true,
-            _ => false,
+        let configured = |aggregation_type| {
+            matches!(
+                (aggregation_type, self),
+                (A::UnivMon, UnivMonFrequency { .. })
+                    | (
+                        A::Sum | A::MultipleSum | A::MinMax | A::MultipleMinMax,
+                        Exact
+                    )
+                    | (A::Increase | A::MultipleIncrease, ExactCounter { .. })
+                    | (A::DatasketchesKLL | A::HydraKLL, KllRankError { .. })
+                    | (A::DDSketch, DdSketchRelativeError { .. })
+                    | (A::HLL, HllCardinalityError { .. })
+                    | (
+                        A::CountMinSketch | A::CountMinSketchWithHeap,
+                        CmsFrequencyError { .. }
+                    )
+                    | (
+                        A::CountSketch | A::CountSketchWithHeap,
+                        CountSketchFrequencyError { .. }
+                    )
+                    | (
+                        A::SingleSubpopulation | A::MultipleSubpopulation,
+                        Unknown { .. }
+                    )
+            )
         };
 
         match operator {

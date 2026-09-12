@@ -111,6 +111,12 @@ fn default_data_shape() -> DataShape {
 
 pub struct Analyzer;
 
+impl Default for Analyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Analyzer {
     pub fn new() -> Self {
         Self

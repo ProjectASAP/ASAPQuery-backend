@@ -407,7 +407,7 @@ async fn production_control_plane_to_data_plane_otlp_to_promql() {
 
     let output_dir = tempfile::tempdir().expect("create data-plane output directory");
     let mut bootstrap = tempfile::NamedTempFile::new().expect("create bootstrap config");
-    write!(bootstrap, "aggregations: []\n").expect("write bootstrap config");
+    writeln!(bootstrap, "aggregations: []").expect("write bootstrap config");
 
     let data_child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
         .arg("--streaming-config")

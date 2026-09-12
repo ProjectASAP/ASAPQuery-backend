@@ -199,6 +199,12 @@ pub struct DeploymentCostPlanner {
     online_store: Option<online::OnlineMetricsStore>,
 }
 
+impl Default for DeploymentCostPlanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeploymentCostPlanner {
     pub fn new() -> Self {
         Self {

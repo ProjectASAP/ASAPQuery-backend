@@ -71,19 +71,15 @@ use std::rc::Rc;
 /// namespace. `from_header` accepts both forms during transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum AgentRuntime {
     /// Default — OTel-collector contrib build (existing behaviour).
+    #[default]
     AsapOtel,
     /// otap-dataflow Rust runtime.
     AsapOtap,
     /// Telegraf runtime.
     AsapTelegraf,
-}
-
-impl Default for AgentRuntime {
-    fn default() -> Self {
-        AgentRuntime::AsapOtel
-    }
 }
 
 impl AgentRuntime {

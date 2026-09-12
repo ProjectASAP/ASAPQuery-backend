@@ -404,6 +404,7 @@ dependencies = [
 [[package]]
 name = "asap-precompute-rs"
 version = "0.1.0"
+source = "git+https://github.com/ProjectASAP/ASAPCollector?branch=main#1d8efd07e40fc151cbd4678a5c6aa9774b1aed34"
 dependencies = [
  "asap_sketchlib",
  "prost",
@@ -441,6 +442,7 @@ dependencies = [
 [[package]]
 name = "asap_sketchlib"
 version = "0.3.0"
+source = "git+https://github.com/ProjectASAP/asap_sketchlib?branch=main#026cd18c7b8c23ae6c46d4d683151ba562b8cd3a"
 dependencies = [
  "bytes",
  "prost",

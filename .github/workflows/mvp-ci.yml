@@ -28,21 +28,6 @@ jobs:
         with:
           path: ASAPQuery-backend
 
-      - name: Checkout ASAPCollector dependency
-        uses: actions/checkout@v4
-        with:
-          repository: ProjectASAP/ASAPCollector
-          path: ASAPCollector
-          token: ${{ secrets.ASAP_CI_REPO_TOKEN }}
-
-      - name: Checkout asap_sketchlib dependency
-        uses: actions/checkout@v4
-        with:
-          repository: ProjectASAP/asap_sketchlib
-          # PR #140: explicit interpolated DDS readout; includes #139 UnivMon compatibility.
-          ref: 8c03d7c68b7150710c79e70a6421971275614561
-          path: asap_sketchlib
-
       - name: Install Rust components
         run: rustup component add rustfmt clippy
 

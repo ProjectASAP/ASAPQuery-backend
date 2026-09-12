@@ -1873,7 +1873,7 @@ fn encode_dd_delta_against_empty(sk: &asap_sketchlib::DdSketch) -> Vec<u8> {
         .filter(|(_, &c)| c != 0)
         .map(|(i, &c)| DdSketchBucketDelta {
             index: sk.store_offset + i as i32,
-            d_count: c as u64,
+            d_count: c,
         })
         .collect();
     PbDelta { buckets }.encode_to_vec()

@@ -91,9 +91,10 @@ pub struct TransmissionRule {
 }
 
 /// How the collector admits updates before sketch maintenance.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SamplingPolicy {
+    #[default]
     Disabled,
     Fixed {
         /// Probability in `(0, 1]`; `1` is valid but should normally be
@@ -101,12 +102,6 @@ pub enum SamplingPolicy {
         probability: f64,
         estimator: SamplingEstimator,
     },
-}
-
-impl Default for SamplingPolicy {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,7 +162,7 @@ pub struct AdaptiveU64Bounds {
 /// Guardrails for telemetry-driven runtime adaptation. This is an
 /// authorization contract, not an instruction to mutate the active plan.
 /// Every accepted change becomes a staged successor PhysicalPlan.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeAdaptationPolicy {
     pub enabled: bool,
@@ -178,21 +173,6 @@ pub struct RuntimeAdaptationPolicy {
     pub emit_every_ms: Option<AdaptiveU64Bounds>,
     pub delta_threshold: Option<AdaptiveF64Bounds>,
     pub gos_epsilon_staleness: Option<AdaptiveF64Bounds>,
-}
-
-impl Default for RuntimeAdaptationPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            not_before_unix_ms: 0,
-            max_evidence_age_ms: 0,
-            min_evidence_samples: 0,
-            sample_probability: None,
-            emit_every_ms: None,
-            delta_threshold: None,
-            gos_epsilon_staleness: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -659,12 +639,9 @@ fn validate_runtime_rule_policy(
             "enabled adaptation requires non-zero evidence age and sample-count requirements",
         ));
     }
-    validate_f64_bounds(adaptation.sample_probability.as_ref(), 0.0, 1.0)
-        .map_err(|reason| invalid(reason))?;
-    validate_f64_bounds(adaptation.delta_threshold.as_ref(), 0.0, f64::MAX)
-        .map_err(|reason| invalid(reason))?;
-    validate_f64_bounds(adaptation.gos_epsilon_staleness.as_ref(), 0.0, 1.0)
-        .map_err(|reason| invalid(reason))?;
+    validate_f64_bounds(adaptation.sample_probability.as_ref(), 0.0, 1.0).map_err(&invalid)?;
+    validate_f64_bounds(adaptation.delta_threshold.as_ref(), 0.0, f64::MAX).map_err(&invalid)?;
+    validate_f64_bounds(adaptation.gos_epsilon_staleness.as_ref(), 0.0, 1.0).map_err(&invalid)?;
     if let Some(bounds) = &adaptation.emit_every_ms {
         if bounds.min == 0
             || bounds.min > bounds.max

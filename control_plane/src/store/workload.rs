@@ -21,6 +21,12 @@ pub struct WorkloadStore {
     inner: RwLock<HashMap<WorkloadKey, (QueryWorkload, WorkloadCharacteristics)>>,
 }
 
+impl Default for WorkloadStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkloadStore {
     pub fn new() -> Self {
         Self {

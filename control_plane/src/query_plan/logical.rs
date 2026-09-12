@@ -1327,18 +1327,16 @@ fn assign_retention(entry: &mut QueryPlanEntry) -> Result<(), QueryPlanError> {
             .ok_or_else(|| invalid("missing index ancestor"))?;
         let mut child_depth = depth;
         if let QueryPlanNode::Logical { operator, .. } = node {
-            match operator {
-                LogicalOperator::Subquery {
-                    range_ms,
-                    offset_ms,
-                    ..
-                } => {
-                    child_depth = depth
-                        .checked_add(*range_ms)
-                        .and_then(|v| v.checked_add((*offset_ms).max(0) as u64))
-                        .ok_or_else(|| invalid("retention overflow"))?;
-                }
-                _ => {}
+            if let LogicalOperator::Subquery {
+                range_ms,
+                offset_ms,
+                ..
+            } = operator
+            {
+                child_depth = depth
+                    .checked_add(*range_ms)
+                    .and_then(|v| v.checked_add((*offset_ms).max(0) as u64))
+                    .ok_or_else(|| invalid("retention overflow"))?;
             }
         }
         pending.extend(node.inputs().iter().map(|child| (*child, child_depth)));

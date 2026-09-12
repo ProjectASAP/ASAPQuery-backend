@@ -48,7 +48,10 @@ impl WindowMaterializationLayout {
         }
         match self {
             Self::Pane { pane_secs } => {
-                if *pane_secs == 0 || window_secs % pane_secs != 0 || slide_secs % pane_secs != 0 {
+                if *pane_secs == 0
+                    || !window_secs.is_multiple_of(*pane_secs)
+                    || !slide_secs.is_multiple_of(*pane_secs)
+                {
                     return Err("pane size must divide both window size and slide".into());
                 }
             }
@@ -58,8 +61,8 @@ impl WindowMaterializationLayout {
                 levels_secs,
             } => {
                 if *base_pane_secs == 0
-                    || window_secs % base_pane_secs != 0
-                    || slide_secs % base_pane_secs != 0
+                    || !window_secs.is_multiple_of(*base_pane_secs)
+                    || !slide_secs.is_multiple_of(*base_pane_secs)
                     || levels_secs.is_empty()
                 {
                     return Err(
@@ -69,7 +72,10 @@ impl WindowMaterializationLayout {
                 }
                 let mut previous = *base_pane_secs;
                 for level in levels_secs {
-                    if *level <= previous || *level % previous != 0 || window_secs % level != 0 {
+                    if *level <= previous
+                        || *level % previous != 0
+                        || !window_secs.is_multiple_of(*level)
+                    {
                         return Err(
                             "rollup levels must increase by integral factors and divide the window"
                                 .into(),
