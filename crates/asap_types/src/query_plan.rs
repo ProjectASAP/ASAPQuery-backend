@@ -429,6 +429,11 @@ impl QueryPlanEntry {
                 }
             }
             if let QueryPlanNode::ReadMaterialization { binding } = node {
+                if binding.full_window_slide_ms.is_some_and(|slide| {
+                    slide == 0 || slide > binding.window_ms || slide > i64::MAX as u64
+                }) {
+                    return Err(QueryPlanError::Invalid("invalid full-window slide".into()));
+                }
                 if binding.readout_lookback_ms == Some(0) {
                     return Err(QueryPlanError::Invalid(
                         "zero semantic readout lookback".into(),
@@ -465,6 +470,10 @@ pub enum FallbackPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MaterializationBinding {
+    /// Full-window snapshots must be read individually on this slide grid;
+    /// absence denotes non-overlapping pane composition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_window_slide_ms: Option<u64>,
     pub materialization: SummaryDefinitionId,
     /// Query operator grouping applied while folding those SIDs.
     pub output_grouping: PhysicalGrouping,

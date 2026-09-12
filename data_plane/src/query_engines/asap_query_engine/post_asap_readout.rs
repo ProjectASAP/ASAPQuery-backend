@@ -1000,6 +1000,7 @@ mod tests {
                     QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: MaterializationBinding {
+                            full_window_slide_ms: None,
                             materialization: config.policy_fingerprint().into(),
                             output_grouping: PhysicalGrouping::PerEntity,
                             item_labels: vec![],
@@ -1056,6 +1057,7 @@ mod tests {
             asap_types::query_plan::FallbackPolicy::ExactBackend,
             |_node, _family| {
                 Ok(asap_types::query_plan::MaterializationBinding {
+                    full_window_slide_ms: None,
                     item_labels: Vec::new(),
                     materialization: asap_types::PolicyFingerprint(123).into(),
                     output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
@@ -1301,6 +1303,7 @@ mod tests {
                     asap_types::query_plan::QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: asap_types::query_plan::MaterializationBinding {
+                            full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
@@ -1397,6 +1400,7 @@ mod tests {
                     asap_types::query_plan::QueryNodeId(1),
                     QueryPlanNode::ReadMaterialization {
                         binding: asap_types::query_plan::MaterializationBinding {
+                            full_window_slide_ms: None,
                             item_labels: Vec::new(),
                             materialization: policy.into(),
                             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,

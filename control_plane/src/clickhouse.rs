@@ -259,6 +259,7 @@ pub async fn compile_automatic_clickhouse_workload(
             let config = materialize_selected_sql(node, family, query)
                 .map_err(crate::query_plan::QueryPlanError::Invalid)?;
             let binding = MaterializationBinding {
+                full_window_slide_ms: None,
                 materialization: config.policy_fingerprint().into(),
                 output_grouping: PhysicalGrouping::Reduce(config.grouping_labels.names()),
                 window_ms: config.slide_interval * 1000,
@@ -599,6 +600,7 @@ fn bind_selected_node(
         ));
     }
     Ok(MaterializationBinding {
+        full_window_slide_ms: None,
         materialization: selected.policy_fingerprint().into(),
         output_grouping: PhysicalGrouping::Reduce(selected.grouping_labels.names()),
         window_ms: selected.slide_interval.saturating_mul(1000),

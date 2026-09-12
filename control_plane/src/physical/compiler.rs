@@ -1622,6 +1622,8 @@ impl PhysicalCompiler {
                         )));
                     }
                     Ok(MaterializationBinding {
+                        full_window_slide_ms: matches!(materialization.window_layout, asap_types::WindowMaterializationLayout::FullWindow)
+                            .then_some(materialization.slide_interval.saturating_mul(1_000)),
                         readout_lookback_ms: source_window.map(|seconds| seconds.saturating_mul(1_000)),
                         materialization: fingerprint.into(),
                         output_grouping: PhysicalGrouping::Reduce(
@@ -1680,6 +1682,34 @@ impl PhysicalCompiler {
                         crate::query_plan::QueryPlanNode::Logical {
                             operator,
                             inputs: vec![],
+                        },
+                    )]),
+                    instant,
+                    fallback: FallbackPolicy::ExactBackend,
+                })
+            } else if !request.hybrid_execution
+                && executable_dags[query_index].is_none()
+                && !collect_selected_materializations(&query.post_asap, request.hybrid_execution)
+                    .map_err(|reason| CompileError::Query {
+                        query_id: query.query_id.clone(),
+                        reason,
+                    })?
+                    .is_empty()
+            {
+                // The selected state has no supported physical implementation.
+                // Keep native semantics instead of lowering an unbound summary.
+                let root = crate::query_plan::QueryNodeId(0);
+                Ok(crate::query_plan::QueryPlanEntry {
+                    language: crate::query_plan::QueryLanguage::PromQl,
+                    query_id: query.query_id.clone(),
+                    canonical_query: canonical.clone(),
+                    fixed_evaluation: None,
+                    root,
+                    nodes: BTreeMap::from([(
+                        root,
+                        crate::query_plan::QueryPlanNode::ExactFallback {
+                            reason: "selected summary has no supported physical implementation"
+                                .into(),
                         },
                     )]),
                     instant,
@@ -3696,6 +3726,26 @@ pub(crate) mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // Unsupported extrema state must retain exact routing instead of failing plan compilation (#701).
+    #[test]
+    fn unsupported_minimum_retains_native_execution() {
+        let mut env = environment(10_000);
+        env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
+        env.collector_ids.clear();
+        for hybrid in [false, true] {
+            let mut input = request("minimum", "min_over_time(data[5m])");
+            input.hybrid_execution = hybrid;
+            let plan = PhysicalCompiler.compile(input, env.clone()).unwrap();
+            assert!(plan.precompute_plan.materializations.is_empty());
+            assert!(plan.query_plan.entries.values().all(|entry| {
+                matches!(entry.nodes.get(&entry.root), Some(crate::query_plan::QueryPlanNode::ExactFallback { .. }))
+                || matches!(entry.nodes.get(&entry.root), Some(crate::query_plan::QueryPlanNode::Logical {
+                    operator: asap_types::query_plan::logical::LogicalOperator::ExactSubquery { query }, ..
+                }) if query == "min_over_time(data[5m])")
+            }));
+        }
     }
 
     // Complete deployment quotes must preserve one producer with two window readouts.
@@ -6644,17 +6694,18 @@ pub(crate) mod tests {
     #[test]
     fn multiple_readouts_share_one_precompute_materialization() {
         let mut planning_request = request("q-p90", "quantile_over_time(0.90, m[1m])");
-        let second = request("q-p99", "quantile_over_time(0.99, m[1m])")
-            .queries
-            .into_iter()
-            .next()
-            .unwrap();
-        planning_request.queries.push(second);
+        for (id, q) in [("q-p50", 0.5), ("q-p95", 0.95), ("q-p99", 0.99)] {
+            planning_request.queries.push(
+                request(id, &format!("quantile_over_time({q}, m[1m])"))
+                    .queries
+                    .remove(0),
+            );
+        }
         let bundle = PhysicalCompiler
             .compile(planning_request, environment(10_000))
             .unwrap();
 
-        assert_eq!(bundle.query_plan.entries.len(), 2);
+        assert_eq!(bundle.query_plan.entries.len(), 4);
         assert_eq!(bundle.summary_catalog.materializations.len(), 1);
         assert_eq!(bundle.precompute_plan.materializations.len(), 1);
         assert_eq!(bundle.precompute_plan.schemas.len(), 1);

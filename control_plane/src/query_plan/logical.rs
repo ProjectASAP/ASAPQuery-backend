@@ -647,6 +647,7 @@ mod hybrid_tests {
                         crate::physical::compiler::materialization_leaf_contract(node)
                             .map_err(QueryPlanError::Invalid)?;
                     Ok(MaterializationBinding {
+                        full_window_slide_ms: None,
                         item_labels: Vec::new(),
                         materialization: asap_types::PolicyFingerprint(
                             if spatial_filter.is_empty() { 7 } else { 8 },

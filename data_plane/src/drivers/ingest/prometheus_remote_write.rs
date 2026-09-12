@@ -1620,6 +1620,7 @@ mod tests {
             .next()
             .unwrap();
         let binding = asap_types::query_plan::MaterializationBinding {
+            full_window_slide_ms: None,
             materialization: asap_types::PolicyFingerprint(policy).into(),
             output_grouping: asap_types::query_plan::PhysicalGrouping::Reduce(vec!["job".into()]),
             item_labels: vec![],

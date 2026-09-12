@@ -416,7 +416,7 @@ fn validate_binding_phase(
     }
     planner_types::post_asap::validate_pane_coverage(
         &planner_types::post_asap::PanePhaseBinding {
-            pane_width_ms: binding.window_ms,
+            pane_width_ms: binding.full_window_slide_ms.unwrap_or(binding.window_ms),
             pane_origin_ms: binding.pane_origin_ms,
         },
         i64::try_from(evaluation_ms).ok(),
@@ -457,6 +457,12 @@ impl QueryExecutionContext<'_> {
             ));
         }
         validate_binding_phase(binding, self.t1_ms)?;
+        let full_window = binding.full_window_slide_ms.is_some();
+        if full_window && self.t1_ms.saturating_sub(self.t0_ms) != binding.window_ms {
+            return Err(SummaryExecutorError::Unsupported(
+                "full-window snapshot requires its exact semantic range",
+            ));
+        }
 
         enum Candidate {
             Sketch(DeltaSketchKind),
@@ -529,7 +535,7 @@ impl QueryExecutionContext<'_> {
             matched_metadata += 1;
             match candidate {
                 Candidate::Sketch(kind) => {
-                    let Some(series) = self
+                    let Some(mut series) = self
                         .index
                         .query_range(sid, self.t0_ms, self.t1_ms)
                         .into_iter()
@@ -538,6 +544,14 @@ impl QueryExecutionContext<'_> {
                         check_panes(Vec::new())?;
                         continue;
                     };
+                    if full_window {
+                        // Overlap retrieval is useful for legacy queries, but merging
+                        // overlapping snapshots counts observations repeatedly.
+                        series.samples.retain(|end, _| *end == self.t1_ms as i64);
+                        if series.samples.is_empty() {
+                            return Err(SummaryExecutorError::NoCandidates);
+                        }
+                    }
                     check_panes(series.samples.keys().copied().collect())?;
                     let key = match &binding.output_grouping {
                         PhysicalGrouping::PerEntity => series.series_label_values.clone(),
@@ -1422,6 +1436,7 @@ mod tests {
     #[test]
     fn pane_only_reads_require_the_planned_evaluation_phase() {
         let binding = asap_types::query_plan::MaterializationBinding {
+            full_window_slide_ms: None,
             item_labels: Vec::new(),
             materialization: asap_types::PolicyFingerprint(7).into(),
             output_grouping: asap_types::query_plan::PhysicalGrouping::PerEntity,
@@ -1432,7 +1447,16 @@ mod tests {
         validate_binding_phase(&binding, 67_000).unwrap();
         assert!(validate_binding_phase(&binding, 68_000).is_err());
 
+        // A full snapshot can slide more frequently than its stored width.
+        let full = asap_types::query_plan::MaterializationBinding {
+            full_window_slide_ms: Some(1_000),
+            ..binding.clone()
+        };
+        validate_binding_phase(&full, 68_000).unwrap();
+        assert!(validate_binding_phase(&full, 68_500).is_err());
+
         let legacy = asap_types::query_plan::MaterializationBinding {
+            full_window_slide_ms: None,
             item_labels: Vec::new(),
             pane_origin_ms: None,
             ..binding
@@ -1831,83 +1855,101 @@ mod tests {
         use crate::storage_engines::sketch_db::index::SketchEncoding;
         use crate::storage_engines::types::SerializableToSink;
         use asap_types::query_plan::{MaterializationBinding, PhysicalGrouping};
-        let index = SketchStore::new();
-        let fp = asap_types::PolicyFingerprint(701);
-        let mut meta = kll_meta(1, "m", &["job"]);
-        meta.policy_fp = fp;
-        meta.agg_kind = AggKind::Sketch {
-            algorithm: SketchAlgorithm::UnivMon,
-            config: SketchConfig::UnivMon {
-                heap_size: 32,
-                sketch_rows: 5,
-                sketch_cols: 1024,
-                layers: 4,
-            },
-            spatial_filter_canonical: String::new(),
-        };
-        meta.accuracy = None;
-        meta.capability = Some(Capability::CardinalityApprox);
-        index.register(meta);
-        for (start, values) in [(0, [1.0, 2.0]), (1000, [2.0, 3.0])] {
-            let mut state = UnivMonAccumulator::new(32, 5, 1024, 4).unwrap();
-            for value in values {
-                state.insert_sample(value).unwrap();
-            }
-            index.append_sample(
-                1,
-                BTreeMap::from([("job".into(), "a".into())]),
-                (start, start + 1000),
-                SketchSampleState {
-                    bytes: state.serialize_to_bytes(),
-                    encoding: SketchEncoding::MsgpackFull,
+        for full_window in [false, true] {
+            let index = SketchStore::new();
+            let fp = asap_types::PolicyFingerprint(701);
+            let mut meta = kll_meta(1, "m", &["job"]);
+            meta.policy_fp = fp;
+            meta.agg_kind = AggKind::Sketch {
+                algorithm: SketchAlgorithm::UnivMon,
+                config: SketchConfig::UnivMon {
+                    heap_size: 32,
+                    sketch_rows: 5,
+                    sketch_cols: 1024,
+                    layers: 4,
                 },
-            );
-        }
-        let context = QueryExecutionContext {
-            index: &index,
-            t0_ms: 0,
-            t1_ms: 2000,
-            is_cumulative: true,
-            allowed_materializations: Some(BTreeSet::from([fp])),
-        };
-        let binding = MaterializationBinding {
-            materialization: fp.into(),
-            output_grouping: PhysicalGrouping::PerEntity,
-            item_labels: vec![],
-            window_ms: 1000,
-            pane_origin_ms: Some(0),
-            readout_lookback_ms: Some(2000),
-        };
-        let states = context.read_bound_materialization(&binding).unwrap();
-        assert_eq!(states.len(), 1);
-        assert_eq!(states[0].0.get("job").unwrap(), "a");
-        for (query, expected) in [
-            (
-                SketchQuery::PointCount {
-                    key: ColumnRef::SampleValue,
-                    value: None,
-                },
-                4.0,
-            ),
-            (SketchQuery::Cardinality, 3.0),
-            (SketchQuery::FrequencyL2, 6.0f64.sqrt()),
-            (SketchQuery::FrequencyEntropy, 1.5),
-        ] {
-            let SummaryValue::Points(points, _) =
-                context.readout_bound(&states[0].1, &query).unwrap()
-            else {
-                panic!("expected scalar points")
+                spatial_filter_canonical: String::new(),
             };
-            assert_eq!(points.len(), 1);
-            assert!(
-                (points[0].1 - expected).abs() < 0.05,
-                "{query:?}: {:?}",
-                points
-            );
+            meta.accuracy = None;
+            meta.capability = Some(Capability::CardinalityApprox);
+            index.register(meta);
+            let windows = if full_window {
+                vec![(0, vec![99.0, 99.0]), (1000, vec![1.0, 2.0, 2.0, 3.0])]
+            } else {
+                vec![(0, vec![1.0, 2.0]), (1000, vec![2.0, 3.0])]
+            };
+            for (start, values) in windows {
+                let mut state = UnivMonAccumulator::new(32, 5, 1024, 4).unwrap();
+                for value in values {
+                    state.insert_sample(value).unwrap();
+                }
+                index.append_sample(
+                    1,
+                    BTreeMap::from([("job".into(), "a".into())]),
+                    (start, start + if full_window { 2000 } else { 1000 }),
+                    SketchSampleState {
+                        bytes: state.serialize_to_bytes(),
+                        encoding: SketchEncoding::MsgpackFull,
+                    },
+                );
+            }
+            let context = QueryExecutionContext {
+                index: &index,
+                t0_ms: if full_window { 1000 } else { 0 },
+                t1_ms: if full_window { 3000 } else { 2000 },
+                is_cumulative: true,
+                allowed_materializations: Some(BTreeSet::from([fp])),
+            };
+            let binding = MaterializationBinding {
+                full_window_slide_ms: full_window.then_some(1000),
+                materialization: fp.into(),
+                output_grouping: PhysicalGrouping::PerEntity,
+                item_labels: vec![],
+                window_ms: if full_window { 2000 } else { 1000 },
+                pane_origin_ms: Some(0),
+                readout_lookback_ms: Some(2000),
+            };
+            let states = context.read_bound_materialization(&binding).unwrap();
+            assert_eq!(states.len(), 1);
+            assert_eq!(states[0].0.get("job").unwrap(), "a");
+            for (query, expected) in [
+                (
+                    SketchQuery::PointCount {
+                        key: ColumnRef::SampleValue,
+                        value: None,
+                    },
+                    4.0,
+                ),
+                (SketchQuery::Cardinality, 3.0),
+                (SketchQuery::FrequencyL2, 6.0f64.sqrt()),
+                (SketchQuery::FrequencyEntropy, 1.5),
+            ] {
+                let SummaryValue::Points(points, _) =
+                    context.readout_bound(&states[0].1, &query).unwrap()
+                else {
+                    panic!("expected scalar points")
+                };
+                assert_eq!(points.len(), 1);
+                assert!(
+                    (points[0].1 - expected).abs() < 0.05,
+                    "{query:?}: {:?}",
+                    points
+                );
+            }
+            if full_window {
+                let missing = QueryExecutionContext {
+                    t0_ms: 2000,
+                    t1_ms: 4000,
+                    index: context.index,
+                    is_cumulative: true,
+                    allowed_materializations: context.allowed_materializations.clone(),
+                };
+                assert!(missing.read_bound_materialization(&binding).is_err());
+            }
+            let mut unknown = binding;
+            unknown.materialization = asap_types::PolicyFingerprint(702).into();
+            assert!(context.read_bound_materialization(&unknown).is_err());
         }
-        let mut unknown = binding;
-        unknown.materialization = asap_types::PolicyFingerprint(702).into();
-        assert!(context.read_bound_materialization(&unknown).is_err());
     }
 
     fn ctx(index: &SketchStore) -> QueryExecutionContext<'_> {
