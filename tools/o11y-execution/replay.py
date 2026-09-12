@@ -95,7 +95,7 @@ _SAMPLE = re.compile(r'([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?\s+(\S+)\s+(\d+(?:
 _LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\[\\"n])*)"')
 
 
-def iter_samples(lines):
+def iter_samples(lines, require_global_order=True):
     """Strict OpenMetrics subset: seconds converted losslessly to Remote Write milliseconds."""
     seen, latest, yielded = {}, -1, False
     for number, line in enumerate(lines, 1):
@@ -123,7 +123,7 @@ def iter_samples(lines):
             raise ValueError(f"submillisecond timestamp at line {number}")
         value, timestamp = float(value), int(millis)
         key = tuple(sorted(labels.items()))
-        if not math.isfinite(value) or timestamp > 2**63 - 1 or timestamp < latest or timestamp <= seen.get(key, -1):
+        if not math.isfinite(value) or timestamp > 2**63 - 1 or (require_global_order and timestamp < latest) or timestamp <= seen.get(key, -1):
             raise ValueError(f"nonfinite, duplicate, or out-of-order sample at line {number}")
         latest, seen[key] = timestamp, timestamp
         yielded = True

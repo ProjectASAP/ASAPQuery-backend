@@ -9,10 +9,64 @@ import accuracy_suite
 import dataset
 import load_dataset  # Makes the existing replay module available.
 import replay
+import planned_run
 from planned_run import prepare
 
 
 class PlannedTests(unittest.TestCase):
+    def test_series_ordered_trace_reaches_production_replay(self):
+        """Globally interleaved trace times remain unchanged and replay in time order."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            records = [("google_cluster_cpu_rate", {"service": "job-a", "task": task, "host": "h"}, ts, value)
+                       for task, samples in [("a", [(0, 1.0), (120000, 2.0)]),
+                                             ("b", [(0, 3.0), (120000, 4.0)])]
+                       for ts, value in samples]
+            dataset.write(root / "data", records, 4, {"dataset": "google"})
+            original = (root / "data/samples.openmetrics").read_bytes()
+            manifest = accuracy_suite.corpus("google")
+            (root / "queries.json").write_text(json.dumps(manifest))
+            (root / "snapshot.json").write_text(json.dumps({
+                "snapshot_version": 2,
+                "query_workload": {"repeating_queries": [{"query": "sum_over_time(google_cluster_cpu_rate[1m])"}]},
+                "workload_cost_evidence": {"quotes": [{"test_placeholder": True}]}}))
+            argv = ["planned_run.py", "--data", str(root / "data"), "--manifest", str(root / "queries.json"),
+                    "--snapshot", str(root / "snapshot.json"), "--query-id", "google/1m/False/temporal_sum",
+                    "--compiler", "compiler", "--data-plane", "backend", "--prometheus", "prometheus",
+                    "--cpu-affinity", "0", "--output", str(root / "run")]
+            def replay_command(command):
+                path = Path(command[command.index("--metrics") + 1])
+                with path.open() as source:
+                    samples = list(replay.iter_samples(source))
+                self.assertEqual([row[2] for row in samples], [0, 0, 120000, 120000])
+                actual = {(labels["task"], timestamp, value) for labels, value, timestamp in samples}
+                self.assertEqual(actual, {(labels["task"], timestamp, value)
+                                          for _, labels, timestamp, value in records})
+                return type("Completed", (), {"returncode": 1})()
+            with patch("sys.argv", argv), patch.object(planned_run.subprocess, "run", side_effect=replay_command):
+                self.assertEqual(planned_run.main(), 1)
+            self.assertEqual((root / "data/samples.openmetrics").read_bytes(), original)
+
+    def test_ordered_metrics_use_original_file(self):
+        """Ordered synthetic data needs no copy or timestamp changes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "samples.openmetrics"
+            source.write_text('x{task="a"} 1 0\nx{task="b"} 2 0\nx{task="a"} 3 0.1\n# EOF\n')
+            self.assertEqual(planned_run.prepare_metrics(source, root), source)
+            self.assertEqual(list(root.iterdir()), [source])
+
+    def test_sort_does_not_hide_invalid_per_series_order(self):
+        """Sorting must not repair duplicate or backwards samples within a series."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "samples.openmetrics"
+            for timestamp in ["0", "0.1"]:
+                source.write_text(f'x{{task="a"}} 1 0.1\nx{{task="b"}} 2 0\nx{{task="a"}} 3 {timestamp}\n')
+                with self.assertRaisesRegex(ValueError, "out-of-order"):
+                    planned_run.prepare_metrics(source, root)
+                self.assertEqual(list(root.iterdir()), [source])
+
     def test_complete_window_and_costed_registration_are_required(self):
         """Reject unpriced plans and repetitions whose first window predates the data."""
         with tempfile.TemporaryDirectory() as tmp:

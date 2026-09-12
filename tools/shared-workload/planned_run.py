@@ -1,11 +1,19 @@
 #!/usr/bin/env python3
 """Run one PromQL acceptance case through the production compiler and owned services."""
 import argparse
+from contextlib import closing
+from decimal import Decimal
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
+import tempfile
 import sys
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "o11y-execution"))
+from replay import iter_samples
 
 
 def save(path, value):
@@ -46,6 +54,37 @@ def prepare(data, manifest, query_id, snapshot, end_ms, repetitions):
                    "queries": [{"id": query_id, "query": query["promql"], "eval_timestamp_ms": end}]}
 
 
+def prepare_metrics(source, output):
+    """Keep ordered input unchanged; sort valid interleaved series on disk."""
+    ordered, previous = True, -1
+    with source.open() as lines:
+        for _, _, timestamp in iter_samples(lines, require_global_order=False):
+            ordered = ordered and timestamp >= previous
+            previous = timestamp
+    if ordered:
+        return source
+    destination = output / "samples-ordered.openmetrics"
+    # SQLite keeps the sort off the Python heap for historical trace exports.
+    with tempfile.TemporaryDirectory(prefix="trace-sort-", dir=output) as temporary:
+        with closing(sqlite3.connect(str(Path(temporary) / "samples.sqlite"))) as database:
+            database.execute("PRAGMA cache_size=-8192")
+            database.execute("CREATE TABLE samples (timestamp INTEGER, ordinal INTEGER, line TEXT, PRIMARY KEY (timestamp, ordinal)) WITHOUT ROWID")
+            def rows():
+                with source.open() as lines:
+                    for ordinal, line in enumerate(lines):
+                        if not line.strip() or line.lstrip().startswith("#"):
+                            continue
+                        timestamp = int(Decimal(line.rsplit(None, 1)[1]) * 1000)
+                        yield timestamp, ordinal, line.rstrip("\n")
+            database.executemany("INSERT INTO samples VALUES (?, ?, ?)", rows())
+            database.commit()
+            with destination.open("x") as target:
+                for (line,) in database.execute("SELECT line FROM samples ORDER BY timestamp, ordinal"):
+                    target.write(line + "\n")
+                target.write("# EOF\n")
+    return destination
+
+
 def acceptance(folder):
     replay = folder / "trial-1/replay"
     readiness = json.loads((replay / "summary-readiness.json").read_text())
@@ -81,11 +120,16 @@ def main():
     query, corpus = prepare(args.data, json.loads(args.manifest.read_text()), args.query_id,
                             json.loads(args.snapshot.read_text()), args.end_ms, args.repetitions)
     args.output.mkdir(parents=True, exist_ok=False)
+    metrics = prepare_metrics(args.data / "samples.openmetrics", args.output)
+    save(args.output / "metrics-input.json", {"source": str((args.data / "samples.openmetrics").resolve()),
+         "source_sha256": sha256(args.data / "samples.openmetrics"),
+         "replay_input": str(metrics.resolve()), "replay_sha256": sha256(metrics),
+         "globally_sorted_copy": metrics != args.data / "samples.openmetrics"})
     corpus_path = args.output / "corpus.json"
     save(corpus_path, corpus)
     results = args.output / "run"
     command = [sys.executable, str(Path(__file__).resolve().parents[1] / "o11y-execution/run_comparison.py"),
-               "--metrics", str((args.data / "samples.openmetrics").resolve()), "--queries", str(corpus_path.resolve()),
+               "--metrics", str(metrics.resolve()), "--queries", str(corpus_path.resolve()),
                "--snapshot", str(args.snapshot.resolve()), "--compiler", str(args.compiler.resolve()),
                "--data-plane", str(args.data_plane.resolve()), "--prometheus", str(args.prometheus.resolve()),
                "--output", str(results.resolve()), "--cpu-affinity", args.cpu_affinity,

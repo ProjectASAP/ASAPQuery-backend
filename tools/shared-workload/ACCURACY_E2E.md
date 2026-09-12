@@ -350,6 +350,11 @@ registering exactly the selected query. Use `calibrate_runtime.py
 --wait-for-completion` for deadline-free calibration. Candidate calibration does
 not manually select the evaluation winner. The driver rejects discovery/demo
 snapshots without deployment cost quotes, invalid data hashes and partial windows.
+Trace exports may be ordered within each series without being globally ordered.
+The driver validates per-series ordering and, when needed, creates a timestamp-sorted
+copy using a disk-backed sort. It preserves sample values, labels and timestamps;
+`metrics-input.json` records both input hashes. Already ordered input is used directly.
+Reserve temporary disk space for the trace copy and sort database.
 Its owned replay uses `--backend-first --wait-for-completion
 --require-summary-ready`; no client query timeout, subprocess deadline or
 timeout-based forced shutdown is used. Owned servers receive normal termination
