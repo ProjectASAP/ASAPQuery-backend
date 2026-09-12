@@ -685,8 +685,9 @@ pub fn with_exact_alternative(
     if already_selected {
         return Ok(alternatives);
     }
-    let mut maintained = alternatives.last().expect("exact alternative").clone();
-    let roots: Vec<_> = maintained
+    let roots: Vec<_> = alternatives
+        .last()
+        .expect("exact alternative")
         .queries
         .iter()
         .map(|q| match &q.post_asap.expr {
@@ -695,17 +696,39 @@ pub fn with_exact_alternative(
         })
         .collect();
     let strategy = asap_aware_mapping::current_series::CurrentSeriesStrategy::new(&roots);
-    let mut changed = false;
-    for (query, root) in maintained.queries.iter_mut().zip(&roots) {
-        if let Some(candidate) = strategy.candidate(root) {
-            query.post_asap = candidate;
-            changed = true;
+    let candidates: Vec<_> = roots.iter().map(|root| strategy.candidate(root)).collect();
+    if candidates.iter().any(Option::is_some) {
+        // Current-series rules are compatible with window summaries in other
+        // workload roots. Preserve each priced temporal alternative and mask.
+        let maintained: Vec<_> = alternatives
+            .iter()
+            .map(|alternative| {
+                let mut candidate = alternative.clone();
+                for (query, selected) in candidate.queries.iter_mut().zip(&candidates) {
+                    if let Some(selected) = selected {
+                        query.post_asap = std::rc::Rc::clone(selected);
+                    }
+                }
+                if candidates.iter().all(Option::is_some) {
+                    candidate.hybrid_execution = false;
+                    candidate.materialization_policy = None;
+                }
+                candidate
+            })
+            .collect();
+        for candidate in maintained {
+            if !alternatives.iter().any(|existing| {
+                existing.hybrid_execution == candidate.hybrid_execution
+                    && existing.materialization_policy == candidate.materialization_policy
+                    && existing
+                        .queries
+                        .iter()
+                        .zip(&candidate.queries)
+                        .all(|(a, b)| a.post_asap == b.post_asap)
+            }) {
+                alternatives.push(candidate);
+            }
         }
-    }
-    if changed {
-        maintained.hybrid_execution = false;
-        maintained.materialization_policy = None;
-        alternatives.push(maintained);
     }
     Ok(alternatives)
 }

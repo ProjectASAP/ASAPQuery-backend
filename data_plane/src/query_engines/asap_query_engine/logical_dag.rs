@@ -552,6 +552,31 @@ fn binary(
     left: Value,
     right: Value,
 ) -> Result<Value, EngineError> {
+    if operation == BinaryOperation::CheckedDiv {
+        let valid = |value: &Value, denominator: bool| match value {
+            Value::Scalar(v) => v.is_finite() && (!denominator || *v != 0.0),
+            Value::Vector(rows) => rows
+                .iter()
+                .all(|(_, v)| v.is_finite() && (!denominator || *v != 0.0)),
+            Value::Matrix(..) => false,
+        };
+        if boolean || !valid(&left, false) || !valid(&right, true) {
+            return Err(miss(
+                "relative division domain requires finite operands and a nonzero divisor",
+            ));
+        }
+        let result = binary(BinaryOperation::Div, false, left, right)?;
+        let normal = match &result {
+            Value::Scalar(v) => v.is_normal(),
+            Value::Vector(rows) => rows.iter().all(|(_, v)| v.is_normal()),
+            Value::Matrix(..) => false,
+        };
+        return if normal {
+            Ok(result)
+        } else {
+            Err(miss("relative division result requires exact evaluation outside normal floating-point range"))
+        };
+    }
     let arithmetic = matches!(
         operation,
         BinaryOperation::Add
@@ -748,6 +773,37 @@ mod topk_tests {
             .iter()
             .map(|(key, value)| ((*key).into(), (*value).into()))
             .collect()
+    }
+
+    // A conditional accuracy certificate must fall back rather than return an unbounded ratio.
+    #[test]
+    fn checked_relative_division_enforces_its_execution_domain() {
+        for (a, b) in [
+            (1., 0.),
+            (0., 0.),
+            (1., f64::INFINITY),
+            (f64::NAN, 2.),
+            (f64::MAX, f64::MIN_POSITIVE),
+            (f64::MIN_POSITIVE, f64::MAX),
+        ] {
+            assert!(binary(
+                BinaryOperation::CheckedDiv,
+                false,
+                Value::Scalar(a),
+                Value::Scalar(b)
+            )
+            .is_err());
+        }
+        let Value::Scalar(value) = binary(
+            BinaryOperation::CheckedDiv,
+            false,
+            Value::Scalar(5.),
+            Value::Scalar(10.),
+        )
+        .unwrap() else {
+            panic!("scalar");
+        };
+        assert_eq!(value, 0.5);
     }
 
     #[test]

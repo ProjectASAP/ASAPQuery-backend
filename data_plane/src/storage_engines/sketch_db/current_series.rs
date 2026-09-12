@@ -41,7 +41,7 @@ struct Member {
 #[derive(Default)]
 struct Group {
     ordered: BTreeSet<Ranked>,
-    cached: Option<(Vec<f64>, Vector)>,
+    cached: Option<(Vec<f64>, Vector, f64, f64)>,
 }
 struct Population {
     definition: SeriesPopulation,
@@ -196,10 +196,17 @@ impl Population {
                     .take(self.definition.max_k as usize)
                     .map(|r| (r.labels.clone(), r.value))
                     .collect();
-                group.cached = Some((values, top));
+                let sum = compensated_sum(group.ordered.iter().map(|r| r.value));
+                let count = group.ordered.len() as f64;
+                let average = if sum.is_finite() {
+                    sum / count
+                } else {
+                    compensated_sum(group.ordered.iter().map(|r| r.value / count))
+                };
+                group.cached = Some((values, top, sum, average));
                 self.cache_builds += 1;
             }
-            let (values, top) = group.cached.as_ref().unwrap();
+            let (values, top, sum, average) = group.cached.as_ref().unwrap();
             match readout {
                 SeriesReadout::Quantile { q } => {
                     let value = if *q < 0. {
@@ -216,10 +223,32 @@ impl Population {
                     result.push((labels.clone(), value));
                 }
                 SeriesReadout::TopK { k } => result.extend(top.iter().take(*k as usize).cloned()),
+                SeriesReadout::Sum => result.push((labels.clone(), *sum)),
+                SeriesReadout::Count => result.push((labels.clone(), group.ordered.len() as f64)),
+                SeriesReadout::Average => result.push((labels.clone(), *average)),
             }
         }
         result
     }
+}
+
+// Rebuild shared statistics after replacement/expiry, avoiding subtraction drift.
+fn compensated_sum(values: impl Iterator<Item = f64>) -> f64 {
+    let (mut sum, mut correction) = (0.0_f64, 0.0);
+    for value in values {
+        let next = sum + value;
+        if next.is_finite() {
+            correction += if sum.abs() >= value.abs() {
+                (sum - next) + value
+            } else {
+                (value - next) + sum
+            };
+        } else {
+            correction = 0.0;
+        }
+        sum = next;
+    }
+    sum + correction
 }
 
 #[derive(Default)]
@@ -422,6 +451,43 @@ mod tests {
             );
         }
     }
+    // Equal sample values still represent two series; replacements and stale markers retract them.
+    #[test]
+    fn sum_count_average_follow_current_series_membership() {
+        let p = definition();
+        let plan = plan(&p);
+        let mut store = CurrentSeriesStore::default();
+        warm(&mut store, &plan);
+        for (at, samples, expected) in [
+            (
+                301_000,
+                vec![sample("y", "api", 301_000, Some(1.))],
+                [7., 3., 7. / 3.],
+            ),
+            (
+                302_000,
+                vec![sample("z", "api", 302_000, None)],
+                [2., 2., 1.],
+            ),
+        ] {
+            store.ingest(&plan, &samples);
+            for (readout, truth) in [
+                SeriesReadout::Sum,
+                SeriesReadout::Count,
+                SeriesReadout::Average,
+            ]
+            .into_iter()
+            .zip(expected)
+            {
+                let values = store.read((7, 1), &p, &readout, at).unwrap();
+                assert!(
+                    (values[0].1 - truth).abs() < 1e-12,
+                    "{readout:?}: {values:?}"
+                );
+            }
+        }
+    }
+
     /// Four quantiles reuse one distribution, and smaller k reads the shared maximum-k prefix.
     #[test]
     fn quantiles_and_topk_share_state_and_promote_after_updates_and_staleness() {

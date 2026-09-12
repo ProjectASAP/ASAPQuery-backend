@@ -288,8 +288,11 @@ impl QueryNodeRuntime for PhysicalQueryRuntime<'_> {
                                         let mut labels = key.clone();
                                         if self.language
                                             == control_plane::query_plan::QueryLanguage::MetricsQl
-                                            && *readout
-                                                != control_plane::query_plan::ExactReadout::Max
+                                            && !matches!(
+                                                readout,
+                                                control_plane::query_plan::ExactReadout::Max
+                                                    | control_plane::query_plan::ExactReadout::Min
+                                            )
                                         {
                                             labels.remove("__name__");
                                         }
@@ -1089,40 +1092,19 @@ mod tests {
     }
 
     #[test]
-    fn global_merge_shape_now_merges_instead_of_being_declined() {
-        // The exact ASAPController#163 shape: two HLL sids, no explicit
-        // by(), an aggregation-operator query. This test previously
-        // asserted `ambiguous_merge_risk == true` and TWO unmerged series
-        // -- i.e. it pinned the old workaround, where an empty `by` left
-        // `find_candidates` unable to tell "reduce everything" apart from
-        // "no grouping concept," so `live_serve` declined to serve the
-        // shape at all.
-        //
-        // With `Reduction` (ASAPController#165) that ambiguity is gone:
-        // `count(...)` is a genuine aggregation operator, so it lowers to
-        // `Reduce([])` and `resolve_group_key` gives every candidate the
-        // SAME group key -- the two sids MERGE into one answer, which is
-        // what the query actually asked for. No gate, no fallback.
+    fn count_cannot_be_answered_by_merging_hll_registers() {
         let idx = SketchStore::new();
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
-        let outcome =
-            execute_post_asap_readout(&idx, "count(unique_users)", 1_000, 2_000, true, accuracy())
-                .expect("should execute");
-        assert_eq!(
-            outcome.series.len(),
-            1,
-            "a by-less count() is a full reduction -- both HLL sids must merge into ONE \
-             series, not stay split (and not be declined), got {:?}",
-            outcome.series
-        );
-        // Disjoint item sets {a,b,c} + {d,e,f} -> merged cardinality ~6.
-        let (_group, points) = &outcome.series[0];
-        let card = points[0].1;
-        assert!(
-            (4.0..=8.0).contains(&card),
-            "merged cardinality {card} should be ~6 (both sids' disjoint items), not ~3"
-        );
+        assert!(execute_post_asap_readout(
+            &idx,
+            "count(unique_users)",
+            1_000,
+            2_000,
+            true,
+            accuracy()
+        )
+        .is_err());
     }
 
     #[test]

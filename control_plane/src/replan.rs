@@ -662,6 +662,7 @@ impl Replanner {
             planner_types::post_asap::ExactKind::Count => {
                 planner_types::post_asap::ExactParams::Count
             }
+            planner_types::post_asap::ExactKind::Min => planner_types::post_asap::ExactParams::Min,
             planner_types::post_asap::ExactKind::MinMax => {
                 planner_types::post_asap::ExactParams::MinMax
             }

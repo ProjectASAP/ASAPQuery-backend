@@ -41,11 +41,9 @@
 //!
 //! Backend-specific execution details remain deliberately separate:
 //!
-//! - **Min/max direction.** Planner's `ExactParams::MinMax` carries no fields —
-//!   upstream doesn't model a direction axis. `accumulator_factory.rs`
-//!   keeps reading `AggregationConfig::aggregation_sub_type` directly
-//!   for this one bit (`eq_ignore_ascii_case("max")`), exactly as it did
-//!   before this refactor.
+//! - **Min/max direction.** Planner's `ExactKind::Min` and legacy maximum
+//!   `ExactKind::MinMax` map to the shared wire accumulator with an explicit
+//!   aggregation subtype. The physical compiler preserves this typed direction.
 //! - **HydraKLL's `(row, col)` tiling.** `SketchParams::Kll` carries
 //!   only `k` — upstream has no concept of the CMS-like grid-of-KLL-cells
 //!   layout `HydraKllSketchAccumulator` uses to parallelize a keyed KLL
@@ -234,7 +232,11 @@ impl AggregationConfig {
                 false,
             ),
             MinMax => (
-                SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax),
+                if sub_type.eq_ignore_ascii_case("min") {
+                    SummaryFamilyType::ExactAggregate(ExactKind::Min, ExactParams::Min)
+                } else {
+                    SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax)
+                },
                 false,
             ),
             DatasketchesKLL => (
@@ -255,7 +257,11 @@ impl AggregationConfig {
                 true,
             ),
             MultipleMinMax => (
-                SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax),
+                if sub_type.eq_ignore_ascii_case("min") {
+                    SummaryFamilyType::ExactAggregate(ExactKind::Min, ExactParams::Min)
+                } else {
+                    SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax)
+                },
                 true,
             ),
             HydraKLL => {
@@ -391,7 +397,11 @@ impl AggregationConfig {
                     false,
                 ),
                 "Min" | "min" | "Max" | "max" => (
-                    SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax),
+                    if sub_type.eq_ignore_ascii_case("min") {
+                        SummaryFamilyType::ExactAggregate(ExactKind::Min, ExactParams::Min)
+                    } else {
+                        SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax)
+                    },
                     false,
                 ),
                 "Increase" | "increase" => (
@@ -419,7 +429,11 @@ impl AggregationConfig {
                     true,
                 ),
                 "Min" | "min" | "Max" | "max" => (
-                    SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax),
+                    if sub_type.eq_ignore_ascii_case("min") {
+                        SummaryFamilyType::ExactAggregate(ExactKind::Min, ExactParams::Min)
+                    } else {
+                        SummaryFamilyType::ExactAggregate(ExactKind::MinMax, ExactParams::MinMax)
+                    },
                     true,
                 ),
                 "Increase" | "increase" => (

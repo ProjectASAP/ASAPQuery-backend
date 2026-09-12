@@ -256,6 +256,10 @@ impl GroupState {
                 asap_types::query_plan::ExactReadout::Max,
                 AggregationType::MinMax | AggregationType::MultipleMinMax,
             ) => asap_types::Statistic::Max,
+            (
+                asap_types::query_plan::ExactReadout::Min,
+                AggregationType::MinMax | AggregationType::MultipleMinMax,
+            ) => asap_types::Statistic::Min,
             _ => return None,
         };
 
@@ -284,8 +288,10 @@ impl GroupState {
         if matches!(
             agg_type,
             AggregationType::MinMax | AggregationType::MultipleMinMax
-        ) && readout == asap_types::query_plan::ExactReadout::Max
-        {
+        ) && matches!(
+            readout,
+            asap_types::query_plan::ExactReadout::Max | asap_types::query_plan::ExactReadout::Min
+        ) {
             return entries
                 .iter()
                 .flat_map(|windows| windows.values())
@@ -296,7 +302,11 @@ impl GroupState {
                 })
                 .collect::<Option<Vec<_>>>()?
                 .into_iter()
-                .reduce(f64::max);
+                .reduce(if readout == asap_types::query_plan::ExactReadout::Min {
+                    f64::min
+                } else {
+                    f64::max
+                });
         }
         let mut merged: Option<Box<dyn AggregateCore>> = None;
         for windows in entries {
@@ -448,10 +458,11 @@ impl QueryExecutionContext<'_> {
                 SummaryExecutorError::Unsupported("query end exceeds signed event time")
             })?,
         };
-        if self
-            .index
-            .has_pending_summary_updates(binding.materialization, query_range)
-        {
+        if self.index.has_pending_summary_updates(
+            binding.materialization,
+            query_range,
+            binding.full_window_slide_ms.is_some(),
+        ) {
             return Err(SummaryExecutorError::Unsupported(
                 "materialization population has unpublished input",
             ));
@@ -551,6 +562,13 @@ impl QueryExecutionContext<'_> {
                         if series.samples.is_empty() {
                             return Err(SummaryExecutorError::NoCandidates);
                         }
+                    } else {
+                        // The legacy index includes a preceding frame for delta
+                        // decoding. Certified panes reset their base per window;
+                        // that preceding population is not part of this query.
+                        series
+                            .samples
+                            .retain(|end, _| *end > self.t0_ms as i64 && *end <= self.t1_ms as i64);
                     }
                     check_panes(series.samples.keys().copied().collect())?;
                     let key = match &binding.output_grouping {
@@ -577,10 +595,40 @@ impl QueryExecutionContext<'_> {
                         let coverage = self
                             .index
                             .exact_agg_coverage_bounds(sid, self.t0_ms, self.t1_ms);
+                        if coverage.is_none()
+                            && full_window
+                            && self.index.full_summary_window_known_empty(
+                                binding.materialization,
+                                sid,
+                                query_range,
+                            )
+                        {
+                            continue;
+                        }
                         if coverage != Some((self.t0_ms, self.t1_ms)) {
-                            return Err(SummaryExecutorError::Unsupported(
-                                "counter SDS requires full-pane query coverage",
-                            ));
+                            validate_binding_phase(binding, self.t0_ms)?;
+                            let empty = |start: u64, end: u64| {
+                                start == end
+                                    || self.index.summary_window_known_empty(
+                                        binding.materialization,
+                                        sid,
+                                        asap_types::sds::HalfOpenTimeRange {
+                                            start_ms: start as i64,
+                                            end_ms: end as i64,
+                                        },
+                                    )
+                            };
+                            let edges_are_empty = coverage.is_some_and(|(start, end)| {
+                                start >= self.t0_ms
+                                    && end <= self.t1_ms
+                                    && empty(self.t0_ms, start)
+                                    && empty(end, self.t1_ms)
+                            });
+                            if !edges_are_empty {
+                                return Err(SummaryExecutorError::Unsupported(
+                                    "counter SDS requires full-pane query coverage",
+                                ));
+                            }
                         }
                     }
                     if matches!(
@@ -1876,7 +1924,11 @@ mod tests {
             let windows = if full_window {
                 vec![(0, vec![99.0, 99.0]), (1000, vec![1.0, 2.0, 2.0, 3.0])]
             } else {
-                vec![(0, vec![1.0, 2.0]), (1000, vec![2.0, 3.0])]
+                vec![
+                    (0, vec![99.0, 99.0]),
+                    (1000, vec![1.0, 2.0]),
+                    (2000, vec![2.0, 3.0]),
+                ]
             };
             for (start, values) in windows {
                 let mut state = UnivMonAccumulator::new(32, 5, 1024, 4).unwrap();
@@ -1895,8 +1947,8 @@ mod tests {
             }
             let context = QueryExecutionContext {
                 index: &index,
-                t0_ms: if full_window { 1000 } else { 0 },
-                t1_ms: if full_window { 3000 } else { 2000 },
+                t0_ms: 1000,
+                t1_ms: 3000,
                 is_cumulative: true,
                 allowed_materializations: Some(BTreeSet::from([fp])),
             };

@@ -87,6 +87,9 @@ pub(super) fn operator(
     let readout = match readout {
         CurrentSeriesReadout::Quantile { q } => SeriesReadout::Quantile { q: *q },
         CurrentSeriesReadout::TopK { k } => SeriesReadout::TopK { k: *k as u64 },
+        CurrentSeriesReadout::Sum => SeriesReadout::Sum,
+        CurrentSeriesReadout::Count => SeriesReadout::Count,
+        CurrentSeriesReadout::Average => SeriesReadout::Average,
     };
     Ok(Some(LogicalOperator::CurrentSeries {
         population,

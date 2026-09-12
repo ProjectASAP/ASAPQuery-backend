@@ -494,32 +494,13 @@ mod tests {
     }
 
     #[test]
-    fn flag_on_global_merge_shape_is_served_merged_not_declined() {
-        // Previously `flag_on_ambiguous_shape_falls_back`, asserting
-        // `result.is_none()`: the grouping-ambiguity gate declined this
-        // shape because an empty `by` couldn't be told apart from "reduce
-        // everything" (ASAPController#163). With `Reduction` (#165) the
-        // executor resolves it -- `count(...)` lowers to `Reduce([])`, both
-        // sids share one group key, and the new path serves the correctly
-        // merged answer instead of falling back.
+    fn count_does_not_use_hll_distinct_cardinality() {
         let idx = SketchStore::new();
         register_hll(&idx, 1, "svc-a", &["a", "b", "c"]);
         register_hll(&idx, 2, "svc-b", &["d", "e", "f"]);
-        let result =
-            try_serve_from_summary_executor(&idx, "count(unique_users)", 1_000, 2_000, true);
-        let result = result
-            .expect("global-merge shape is no longer ambiguous -- it must be served, not declined");
-        assert_eq!(
-            result.series.len(),
-            1,
-            "a by-less count() must merge both sids into ONE series, got {:?}",
-            result.series
-        );
-        // Disjoint item sets {a,b,c} + {d,e,f} -> merged cardinality ~6.
-        let card = result.series[0].1[0].1;
         assert!(
-            (4.0..=8.0).contains(&card),
-            "merged cardinality {card} should be ~6 (both sids), not ~3 (one sid)"
+            try_serve_from_summary_executor(&idx, "count(unique_users)", 1_000, 2_000, true)
+                .is_none()
         );
     }
 

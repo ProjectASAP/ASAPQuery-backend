@@ -108,6 +108,8 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
         .map(|query| {
             let mut entry = template.clone();
             entry["query"] = (*query).into();
+            // Each observed population must match the five-second calibration workload.
+            entry["demand"]["fixed_interval_at"]["interval"] = 5000.into();
             entry["requirements"]["accuracy"] = serde_json::json!({"explicit": {"Epsilon": 0.2}});
             entry
         })
@@ -252,8 +254,7 @@ async fn measured_readout_evidence_selects_and_executes_univmon() {
         .enumerate()
         .map(|(i, v)| (base + 1 + i as i64, *v))
         .collect();
-    // Declared finite source includes the preceding boundary; this sample is
-    // outside the query's left-open range and does not alter its truth.
+    // Bracket the calibrated population; these boundary samples are outside it.
     samples.insert(0, (base, 0.0));
     assert_eq!(
         remote_write(

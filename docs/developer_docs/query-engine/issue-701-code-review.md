@@ -1,68 +1,97 @@
-# Issue 701: windows, extrema, and composed quantile guarantees
+# Issues 701 and 702: Planner candidates and backend execution
 
-Reviewed against backend main `674b9573` plus PR 700 and Planner PR 404
-(`ea721e889b79e9ca22741a4d0370e9929bcf5b89`). The issue's original output was
-produced by the removed v1 inspection path. This review uses executable code.
+Audience: developers reviewing Planner PR 404 and backend PR 700. The issues used
+removed version-1 snapshots. Deployment now uses schema 2 with complete physical
+workload cost evidence; these fixes do not restore the unpriced deployment path.
 
-## Window identity and runtime reads
+## Rule ownership
 
-The current compiler derives pane and full-window alternatives from the query
-lookback and evaluation cadence when the cadence divides the lookback. Thus a
-300-second lookback evaluated every 30 seconds need not use tumbling 300-second
-state. Complete workload cost evidence still determines the selected alternative.
+ASAPPlanner constructs the candidate DAG and its accuracy contract. The backend
+lowers its typed operators, shares compatible physical state, prices complete
+alternatives, and enforces runtime population and coverage constraints.
 
-A separate runtime defect remained: full-window snapshots of width 5 seconds,
-sliding every second, were retrieved through an overlap scan and cumulatively
-merged. A process TopK regression returned 1500 instead of 200 for one item.
-The query binding now carries the full-window slide explicitly, validates it
-against the installed producer, checks evaluation phase on the slide grid, and
-reads only the snapshot ending at the requested evaluation time. Missing snapshots
-and incompatible ranges fail closed. Pane reads retain non-overlapping composition.
-Old full-window artifacts without this binding must be recompiled before install.
+- `ExactKind::Min` distinguishes minimum from the legacy maximum family. The
+  compiler emits the matching accumulator subtype and minimum readout.
+- The temporal-average rule emits independently maintained sum and observation
+  count, exact finalization, and division. The backend can share their sum/count
+  producer without inventing an average rewrite.
+- Current-series rules emit `MaintainCurrentSeries` and `ReadCurrentSeries` for
+  quantile, TopK, sum, count, and average, globally or grouped. The backend keeps
+  each series' latest live value and handles replacement, stale markers, expiry,
+  and bounded resources. This is exact current-population state, not an
+  append-only temporal DDSketch. Counts include equal-valued distinct series.
+- Explicitly exact TopK over temporal aggregates can consume maintained exact
+  values. Existing approximate heap-sketch candidates retain their selection path.
+- Current-series alternatives can coexist with temporal materializations in the
+  same workload. Equivalent current-only alternatives are deduplicated so they do
+  not produce ambiguous cost quotes.
 
-## min_over_time
+## Sliding-window execution
 
-Planner currently represents Min and Max using the same ExactKind::MinMax family.
-The backend's materialized readout supports Max; the physical compiler filters
-out unsupported Min state. The legacy non-composable lowering then attempted to
-bind the removed state and failed with `materialized query has no compiled
-executable DAG`.
+The semantic lookback and evaluation cadence generate distinct pane and
+full-window alternatives. Complete cost evidence chooses the physical layout.
+Full-window bindings retain the slide and validate the requested phase/range.
+Only the snapshot ending at the requested evaluation is read; overlapping full
+snapshots must not be merged or treated as required pending work for that read.
+Pane layouts retain their non-overlapping coverage checks and exclude the legacy
+index's preceding carry-in frame from the query population. The bound-read
+regression includes an out-of-range preceding population and verifies that its
+counts and values do not enter the result.
 
-The fix retains an explicit native fallback when all selected state lacks a
-physical implementation. It does not reinterpret Min as Max or claim accelerated
-Min support. Composable lowering retains its existing native dependency behavior.
-Full accelerated Min needs an unambiguous Planner readout contract and matching
-backend lowering, maintenance, and serving support.
+Unsigned storage excludes pre-epoch window starts from admission and publication.
+Finite empty-window proofs use exact window identity for full-window layouts,
+retain the replay/retention floor, and never equate missing unclosed input with
+an empty population. Historical process checks explicitly declare their required
+staleness/retention margin.
 
-## Quantiles and division
+## Quantile expression guarantees
 
-Multiple quantiles of the same population can share one maintained sketch.
-The compiler regression covers q=0.5, 0.9, 0.95, and 0.99 with one materialization.
-This does not imply the ratio inherits a component's relative-error bound.
+Point quantiles with compatible population and accuracy requirements share state.
+Sharing alone does not make division preserve a component error bound.
+For numerator error `a` and denominator error `b < 1`, a sufficient relative
+ratio bound is `(a + b) / (1 - b)`. Independence is unnecessary for this
+algebraic bound; probabilistic failures still require joint accounting.
 
-If both nonzero quantile values have relative errors at most alpha, the ratio
-of their estimates differs from the true ratio by at most
-`2 * alpha / (1 - alpha)` in relative terms. No independence assumption is used.
-At alpha=1%, this sufficient bound is about 2.0202%. A sufficient component bound
-for a 1% ratio target is alpha <= `0.01 / 2.01`, about 0.4975%, together with a
-valid nonzero-denominator/domain contract. Sharing a sketch alone supplies no
-proof of cancellation. Probabilistic guarantees also need a joint success bound;
-rank error, such as a KLL guarantee, is not relative value error.
+Planner's checked relative-division candidate sizes DDSketch operands against the
+whole expression budget. A 1% ratio needs component accuracy slightly below
+`0.01 / 2.01`, approximately 0.4975%, including floating-point slack. Average /
+quantile uses the same composition rule with an exact numerator. Rank-only KLL
+certificates do not establish this relative-value guarantee.
 
-Planner currently lacks this domain-aware division proof and conservatively
-retains native execution. Even adding the formula would not make 1%-component
-sketches satisfy a requested 1% ratio guarantee in general.
+The compiler lowers the typed checked division. Runtime requires finite operands,
+a nonzero denominator, and a finite normal result. Unmet domain or coverage
+conditions route to exact execution. An ordinary division is not silently given
+a stronger guarantee.
 
-## Remaining integration failures
+## Acceptance coverage
 
-After the snapshot-read fix, the compatibility process suite reports 10 passing,
-3 failing, and 1 previously ignored Collector-schema test. The failures are:
+Compiler regressions cover typed minimum, shared quantiles, average, and both
+ratio forms. Runtime regressions cover current-series membership, checked-division
+domain failures, storage-domain windows, pending full-window isolation, and finite
+empty-window evidence. The process workload combines the issue query families,
+ten quantiles, 15-minute and 5-minute windows, and consecutive evaluations while
+input remains open. `ASAP_CURRENT_SERIES_PROMETHEUS_URL` enables real Prometheus
+result comparison against Prometheus 3.x; the boundary-aligned fixture rejects a
+2.x oracle because that version includes the left boundary, unlike the installed
+PromQL window contract. See the [Prometheus migration guide](https://prometheus.io/docs/prometheus/3.5/migration/).
+Test quotes are synthetic correctness preferences, not measured performance or
+speedup evidence.
 
-- Counter range execution rejects missing full-pane coverage.
-- Finite persisted-summary drain reports unpublished summary windows.
-- UnivMon producer observations do not select UnivMon on replanning.
+The UnivMon integration fixture brackets one complete calibration population and
+uses the same window cadence for the producer observation. A partial sliding tail
+must not be asserted to match the complete calibration distribution.
 
-These remain open; this change does not claim the complete compatibility matrix
-passes. The three previously failing window/TopK-related executions include two
-TopK algorithms and a multi-pane fixture whose explicit slide required updating.
-No latency or end-to-end speedup measurement is claimed here.
+Validation on 2026-09-12:
+
+- Planner `cargo +1.98.0 test --workspace`: 1,097 passed.
+- Backend `cargo +1.98.0 test --workspace --lib`: 2,098 passed; the subsequent
+  focused pane-population regression also passed.
+- Compatibility process suite with a fresh Prometheus 3.5.0 remote-write oracle:
+  14 passed, 1 previously ignored Collector-schema integration. The mixed test
+  checks 46 queries at two successive evaluations and two zero-denominator
+  fallbacks; the current-series test also compares replacement/staleness updates.
+- Workspace/all-targets clippy passed with warnings denied; affected data-plane
+  checks were repeated after the final pane-read correction.
+
+These are correctness results. No measured performance win is claimed. The
+separately ignored Collector schema integration remains outside these fixes.

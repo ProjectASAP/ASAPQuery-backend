@@ -2073,15 +2073,9 @@ mod asap_tier_classify_tests {
         env.encode_to_vec()
     }
 
-    /// REGRESSION of the HLL `count(metric)` "No result" e2e failure
-    /// (`controller_plan_to_query_full_roundtrip_hll`) isolated to the
-    /// engine layer. `count(unique_users_per_min)` is the distinct-count
-    /// idiom. The Planner DAG represents this as a cardinality readout,
-    /// so the executor returns the HLL distinct-count directly. A single
-    /// FULL HLL frame (~500 users) is used so
-    /// the instant projection reads the real estimate.
+    /// Temporal distinct reads HLL cardinality; PromQL count counts vector rows.
     #[tokio::test]
-    async fn execute_count_hll_returns_cardinality_not_rowcount() {
+    async fn execute_temporal_distinct_hll_returns_cardinality() {
         let idx = Arc::new(SketchStore::new());
         let sid = 7500u64;
         idx.register(hll_meta(sid, "unique_users_per_min"));
@@ -2101,14 +2095,17 @@ mod asap_tier_classify_tests {
         );
 
         let engine = build_engine_with_index(idx);
-        let result = engine.execute("count(unique_users_per_min)").await.expect(
-            "count(hll_metric) must dispatch to the Cardinality family \
+        let result = engine
+            .execute("distinct_over_time(unique_users_per_min[1m])")
+            .await
+            .expect(
+                "distinct_over_time must dispatch to the Cardinality family \
                  via the candidate capability (empty trace function) and \
                  return the HLL distinct-count, NOT capability-miss",
-        );
+            );
         assert!(
             result_nonempty(&result),
-            "count(unique_users_per_min) over an HLL sid must return a \
+            "distinct_over_time(unique_users_per_min[1m]) over an HLL sid must return a \
              non-empty cardinality estimate (regression: empty `asap_query` \
              No-result)"
         );
@@ -2156,15 +2153,9 @@ mod asap_tier_classify_tests {
         .encode_to_vec()
     }
 
-    /// FIX 2 — GLOBAL HLL distinct rollup. `count(hll_metric)` with no `by`
-    /// must MERGE the per-series HLL registers (register-wise max) across ALL
-    /// matched series and estimate ONCE — the distinct UNION cardinality. Two
-    /// series share an overlapping prefix of items and each carry disjoint
-    /// items, so summing per-series estimates would over-count the overlap.
-    /// The merged global estimate must land within HLL error of the true
-    /// union, and be strictly below the naive per-series sum.
+    /// Per-series temporal distinct must not turn into global distinct-series count.
     #[tokio::test]
-    async fn execute_count_hll_global_merges_registers_across_series() {
+    async fn execute_temporal_distinct_preserves_series_populations() {
         let idx = Arc::new(SketchStore::new());
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -2178,7 +2169,6 @@ mod asap_tier_classify_tests {
         let precision = 14u32; // ~0.8% standard error; legal for epsilon=0.01
         let a_items: Vec<String> = (0..600).map(|i| format!("u-{i}")).collect();
         let b_items: Vec<String> = (400..1000).map(|i| format!("u-{i}")).collect();
-        let true_union = 1000.0_f64;
 
         for (sid, items) in [(8200u64, &a_items), (8201u64, &b_items)] {
             let mut meta = hll_meta(sid, "unique_users_global");
@@ -2187,10 +2177,11 @@ mod asap_tier_classify_tests {
                 config: SketchConfig::Hll { precision },
                 spatial_filter_canonical: String::new(),
             };
+            meta.group_by_keys.insert("instance".into());
             idx.register(meta);
             idx.append_sample(
                 sid,
-                BTreeMap::new(),
+                BTreeMap::from([("instance".into(), sid.to_string())]),
                 (w_start, w_end),
                 SketchSampleState {
                     bytes: encode_hll_from_items(precision, items),
@@ -2201,44 +2192,23 @@ mod asap_tier_classify_tests {
 
         let engine = build_engine_with_index(idx);
         let result = engine
-            .execute("count(unique_users_global)")
+            .execute("distinct_over_time(unique_users_global[1m])")
             .await
-            .expect("global count(hll_metric) must answer, not capability-miss");
-
-        // GLOBAL distinct is a single scalar — exactly one element.
-        let est = match &result {
+            .unwrap();
+        let estimates: Vec<_> = match result {
             crate::query_engines::query_result::QueryResult::Vector(v) => {
-                assert_eq!(
-                    v.values.len(),
-                    1,
-                    "global count() must collapse to ONE merged estimate, got {} \
-                     (per-series leak): {v:?}",
-                    v.values.len()
-                );
-                v.values[0].value
+                v.values.iter().map(|v| v.value).collect()
             }
-            crate::query_engines::query_result::QueryResult::Matrix(m) => {
-                assert_eq!(m.values.len(), 1, "one merged series");
-                m.values[0].samples.last().map(|s| s.value).unwrap_or(0.0)
-            }
+            crate::query_engines::query_result::QueryResult::Matrix(m) => m
+                .values
+                .iter()
+                .map(|v| v.samples.last().unwrap().value)
+                .collect(),
         };
-
-        // Within HLL error of the true union (p=12 → ~1.04/sqrt(2^12) ≈ 1.6%;
-        // allow a generous 8% band for the estimator's finite-sample noise).
-        let rel_err = (est - true_union).abs() / true_union;
-        assert!(
-            rel_err < 0.08,
-            "global merged estimate {est} must be within HLL error of the \
-             true union {true_union} (rel_err {rel_err:.4})"
-        );
-
-        // And strictly below the naive per-series sum (600 + 600 = 1200),
-        // proving registers were MERGED (max), not the estimates SUMMED.
-        assert!(
-            est < 1150.0,
-            "merged global estimate {est} must be well below the per-series \
-             sum (~1200) — proves register-merge, not estimate-sum"
-        );
+        assert_eq!(estimates.len(), 2);
+        for estimate in estimates {
+            assert!((estimate - 600.0).abs() / 600.0 < 0.08);
+        }
     }
 
     /// REPRODUCTION (root-cause hunt): `quantile_over_time(0.99,

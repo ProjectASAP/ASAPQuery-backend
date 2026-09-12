@@ -780,7 +780,7 @@ fn has_unsafe_raw_entity_leaf(
                 let preserves_series_state = matches!(
                     family,
                     SummaryFamilyType::ExactAggregate(
-                        ExactKind::Increase | ExactKind::Rate | ExactKind::MinMax,
+                        ExactKind::Increase | ExactKind::Rate | ExactKind::MinMax | ExactKind::Min,
                         _
                     )
                 );
@@ -1096,19 +1096,6 @@ impl PhysicalCompiler {
                                 .iter()
                                 .any(|candidate| candidate.window_secs == window)
                         }))
-                        && (!matches!(
-                            state.family,
-                            SummaryFamilyType::ExactAggregate(
-                                planner_types::post_asap::ExactKind::MinMax,
-                                _
-                            )
-                        ) || crate::query_plan::logical::selected_range_max_materialization(
-                            &query.query_string,
-                            &state.node,
-                        )
-                        .ok()
-                        .flatten()
-                        .is_some())
                         && request.materialization_policy.as_ref().is_none_or(|policy| {
                             let key = crate::query_plan::logical::selected_counter_materialization(
                                 &query.query_string,
@@ -1749,7 +1736,11 @@ impl PhysicalCompiler {
                         }
                     },
                 )
-            }?;
+            }
+            .map_err(|error| CompileError::Query {
+                query_id: query.query_string.clone(),
+                reason: error.to_string(),
+            })?;
             if request.hybrid_execution {
                 // Any Planner-selected leaf without a physical summary binding
                 // is an exact subtree boundary. Deployed plans never retain a
@@ -3728,24 +3719,31 @@ pub(crate) mod tests {
         );
     }
 
-    // Unsupported extrema state must retain exact routing instead of failing plan compilation (#701).
+    // The Planner's minimum state lowers without reconstructing direction from text.
     #[test]
-    fn unsupported_minimum_retains_native_execution() {
+    fn minimum_retains_its_typed_direction() {
         let mut env = environment(10_000);
         env.target = PhysicalDeploymentTarget::BackendLocalRemoteWrite;
         env.collector_ids.clear();
-        for hybrid in [false, true] {
-            let mut input = request("minimum", "min_over_time(data[5m])");
-            input.hybrid_execution = hybrid;
-            let plan = PhysicalCompiler.compile(input, env.clone()).unwrap();
-            assert!(plan.precompute_plan.materializations.is_empty());
-            assert!(plan.query_plan.entries.values().all(|entry| {
-                matches!(entry.nodes.get(&entry.root), Some(crate::query_plan::QueryPlanNode::ExactFallback { .. }))
-                || matches!(entry.nodes.get(&entry.root), Some(crate::query_plan::QueryPlanNode::Logical {
-                    operator: asap_types::query_plan::logical::LogicalOperator::ExactSubquery { query }, ..
-                }) if query == "min_over_time(data[5m])")
-            }));
-        }
+        let mut input = request("minimum", "min_over_time(data[1m])");
+        input.hybrid_execution = true;
+        let plan = PhysicalCompiler.compile(input, env).unwrap();
+        assert_eq!(plan.precompute_plan.materializations.len(), 1);
+        assert_eq!(
+            plan.precompute_plan.materializations[0].aggregation_sub_type,
+            "min"
+        );
+        assert!(plan
+            .query_plan
+            .entries
+            .values()
+            .all(|entry| entry.nodes.values().any(|node| matches!(
+                node,
+                crate::query_plan::QueryPlanNode::ExactReadout {
+                    readout: crate::query_plan::ExactReadout::Min,
+                    ..
+                }
+            ))));
     }
 
     // Complete deployment quotes must preserve one producer with two window readouts.
@@ -3817,6 +3815,47 @@ pub(crate) mod tests {
             quotes,
         });
         snapshot
+    }
+
+    // Issue workloads must expose executable maintained candidates under the schema-2 API.
+    #[test]
+    fn issue_701_702_temporal_workloads_have_warm_candidates() {
+        for text in [
+            "avg_over_time(data[5m])",
+            "min_over_time(data[5m])",
+            "quantile_over_time(0.9,data[5m])/quantile_over_time(0.5,data[5m])",
+            "avg_over_time(data[5m])/quantile_over_time(0.5,data[5m])",
+        ] {
+            let mut snapshot = planning_snapshot();
+            let entry = &mut snapshot.query_workload.repeating_queries.as_mut().unwrap()[0];
+            entry.query = Query(text.into());
+            entry.time_selection.lookback = Some(DurationMs(300_000));
+            if !text.contains("quantile") {
+                entry.requirements.accuracy = AccuracyRequirement::Explicit(AccuracyTarget::Exact);
+            }
+            let (request, environment) = snapshot.planning_request().unwrap();
+            let candidates = super::super::workload_cost::with_exact_alternative(request).unwrap();
+            let mut reasons = vec![];
+            assert!(
+                candidates.into_iter().any(|candidate| {
+                    match PhysicalCompiler.compile(candidate, environment.clone()) {
+                        Ok(plan) => {
+                            !plan.precompute_plan.materializations.is_empty()
+                                && plan
+                                    .query_plan
+                                    .entries
+                                    .values()
+                                    .all(|entry| !entry.materialization_bindings().is_empty())
+                        }
+                        Err(error) => {
+                            reasons.push(error.to_string());
+                            false
+                        }
+                    }
+                }),
+                "no warm candidate for {text}: {reasons:?}"
+            );
+        }
     }
 
     /// Optional counter masks must retain the workload's mandatory sketch bindings.
@@ -4563,7 +4602,9 @@ pub(crate) mod tests {
         let mut workload = request("confidence", "distinct_over_time(m[1m])");
         workload.hybrid_execution = true;
         let result = PhysicalCompiler.compile_metricsql(workload, deployment);
-        assert!(matches!(result, Err(CompileError::QueryPlan(_))));
+        assert!(
+            matches!(result, Err(CompileError::Query { reason, .. }) if reason.contains("native residual substitution requires an exact selected value"))
+        );
     }
 
     #[test]
@@ -5368,6 +5409,7 @@ pub(crate) mod tests {
                 lhs: selected.clone(),
                 rhs: selected.clone(),
                 operator: planner_types::post_asap::BinaryOperator {
+                    checked_relative_division: false,
                     kind: planner_types::pre_asap::BinaryOpKind::Arithmetic(
                         planner_types::pre_asap::ArithmeticOpKind::Add,
                     ),

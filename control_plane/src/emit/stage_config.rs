@@ -2969,7 +2969,7 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
             match kind {
                 ExactKind::Sum => "Sum",
                 ExactKind::Count => "Count",
-                ExactKind::MinMax => "MinMax",
+                ExactKind::MinMax | ExactKind::Min => "MinMax",
                 ExactKind::Increase => "Increase",
                 ExactKind::Rate => "Rate",
                 ExactKind::IRate => "IRate",
@@ -3029,7 +3029,7 @@ pub(crate) fn build_backend_aggregation_json(agg: &BackendAggregation) -> JsonVa
                 planner_types::post_asap::ExactKind::MinMax,
                 _
             )
-        ) { "max" } else { "" },
+        ) { "max" } else if matches!(&agg.family, planner_types::post_asap::SummaryFamilyType::ExactAggregate(planner_types::post_asap::ExactKind::Min, _)) { "min" } else { "" },
         "metric": agg.metric_name,
         "labels": {
             "grouping": agg.grouping,

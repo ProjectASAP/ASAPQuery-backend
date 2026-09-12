@@ -39,6 +39,10 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
         queries.push(format!("topk({k}, a)"));
         queries.push(format!("topk by (job) ({k}, a)"));
     }
+    for operation in ["sum", "count", "avg"] {
+        queries.push(format!("{operation}(a)"));
+        queries.push(format!("{operation} by (job) (a)"));
+    }
     snapshot.query_workload.repeating_queries = Some(
         queries
             .iter()
@@ -90,11 +94,21 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
         quotes,
     });
     let planned = snapshot.clone().compile().unwrap();
-    assert!(planned
-        .query_plan
-        .entries
-        .values()
-        .all(|e| serde_json::to_string(e).unwrap().contains("current_series")));
+    assert!(
+        planned
+            .query_plan
+            .entries
+            .values()
+            .all(|e| serde_json::to_string(e).unwrap().contains("current_series")),
+        "non-current entries: {:?}",
+        planned
+            .query_plan
+            .entries
+            .values()
+            .filter(|e| !serde_json::to_string(e).unwrap().contains("current_series"))
+            .map(|e| (&e.canonical_query, &e.nodes))
+            .collect::<Vec<_>>()
+    );
     let output = tempfile::tempdir().unwrap();
     let path = output.path().join("snapshot.json");
     std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
@@ -239,6 +253,16 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
             "{body}"
         );
     }
+    for operation in ["sum", "count", "avg"] {
+        for text in [
+            format!("{operation}(a)"),
+            format!("{operation} by (job) (a)"),
+        ] {
+            let body = query(&client, &base, &text, end).await;
+            assert!(is_warm(&body), "{text}: {body}");
+            compare_native(&client, &native, &text, end, &body).await;
+        }
+    }
     let metrics = client
         .get(format!("{base}/metrics"))
         .send()
@@ -291,6 +315,16 @@ async fn current_series_quantiles_topk_share_and_replace_values() {
             &body,
         )
         .await;
+        for operation in ["sum", "count", "avg"] {
+            for text in [
+                format!("{operation}(a)"),
+                format!("{operation} by (job) (a)"),
+            ] {
+                let body = query(&client, &base, &text, end + offset).await;
+                assert!(is_warm(&body), "{text}: {body}");
+                compare_native(&client, &native, &text, end + offset, &body).await;
+            }
+        }
         let body = query(&client, &base, "quantile by (job) (0.5, a)", end + offset).await;
         assert!(is_warm(&body), "{body}");
         compare_native(

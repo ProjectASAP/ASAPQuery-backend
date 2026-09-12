@@ -46,4 +46,7 @@ impl SeriesPopulation {
 pub enum SeriesReadout {
     Quantile { q: f64 },
     TopK { k: u64 },
+    Sum,
+    Count,
+    Average,
 }

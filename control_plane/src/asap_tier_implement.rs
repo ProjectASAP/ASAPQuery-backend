@@ -258,21 +258,13 @@ mod tests {
     }
 
     #[test]
-    fn avg_over_time_is_not_yet_realizable_matching_capability_for_today() {
-        // Avg = Sum / Count needs a cross-policy join implement_tree_in_with
-        // doesn't build (matches capability_for(&AggIntent::Avg) => None
-        // on the flat path -- see asap_tier_analysis.rs and lower.rs's
-        // AggFunc::Avg comment). Use avg_over_time (a range-vector
-        // function), not bare instant avg(...) -- only the former is
-        // guaranteed to lower through AggFunc::Avg in this frontend.
+    fn avg_over_time_realizes_exact_sum_divided_by_count() {
         let roots = implement_promql_for_asap_tier("avg_over_time(http_requests_total[5m])")
             .expect("parses and implements");
         assert_eq!(roots.len(), 1);
-        assert!(
-            matches!(roots[0].expr, SummaryExpr::KeepPreAsap(_)),
-            "Avg has no ASAP-tier realization yet on either path: {:?}",
-            roots[0].expr,
-        );
+        assert!(matches!(roots[0].expr, SummaryExpr::BinaryOp { .. }));
+        assert!(roots[0].guarantee.as_ref().unwrap().is_exact());
+        planner_types::post_asap::compile_executable_dag(&roots[0]).unwrap();
     }
 
     #[test]

@@ -97,6 +97,8 @@ pub enum BinaryOperation {
     Sub,
     Mul,
     Div,
+    /// Division with the Planner relative-value certificate domain checks.
+    CheckedDiv,
     Mod,
     Pow,
     Equal,

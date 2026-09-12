@@ -80,6 +80,10 @@ impl ResolvedMaterialization<'_> {
                 ExactReadout::Increase | ExactReadout::Rate => {
                     matches!(aggregation_type, Increase | MultipleIncrease)
                 }
+                ExactReadout::Min => {
+                    matches!(aggregation_type, MinMax | MultipleMinMax)
+                        && aggregation_sub_type.eq_ignore_ascii_case("min")
+                }
                 ExactReadout::Max => {
                     matches!(aggregation_type, MinMax | MultipleMinMax)
                         && aggregation_sub_type.eq_ignore_ascii_case("max")

@@ -390,11 +390,12 @@ where
             } if measures.len() == 1 => {
                 use planner_types::pre_asap::AggIntent;
                 let operation = match &measures[0] {
-                    AggIntent::Sum { .. } => logical::Aggregation::Sum,
-                    AggIntent::Count { .. } => logical::Aggregation::Count,
-                    AggIntent::Min { .. } => logical::Aggregation::Min,
-                    AggIntent::Max { .. } => logical::Aggregation::Max,
-                    AggIntent::Avg { .. } => logical::Aggregation::Avg,
+                    AggIntent::Sum { .. } => Some(logical::Aggregation::Sum),
+                    AggIntent::Count { .. } => Some(logical::Aggregation::Count),
+                    AggIntent::Min { .. } => Some(logical::Aggregation::Min),
+                    AggIntent::Max { .. } => Some(logical::Aggregation::Max),
+                    AggIntent::Avg { .. } => Some(logical::Aggregation::Avg),
+                    AggIntent::TopK { .. } => None,
                     _ => {
                         return Err(QueryPlanError::Invalid(
                             "unsupported exact value aggregation".into(),
@@ -422,14 +423,23 @@ where
                             })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let grouping = logical::Grouping {
+                    labels,
+                    without: keys.is_without(),
+                };
+                let operator = if let AggIntent::TopK { k, .. } = &measures[0] {
+                    logical::LogicalOperator::TopKSelection {
+                        k: *k as u64,
+                        grouping,
+                    }
+                } else {
+                    logical::LogicalOperator::Aggregate {
+                        operation: operation.expect("aggregate operation"),
+                        grouping,
+                    }
+                };
                 QueryPlanNode::Logical {
-                    operator: logical::LogicalOperator::Aggregate {
-                        operation,
-                        grouping: logical::Grouping {
-                            labels,
-                            without: keys.is_without(),
-                        },
-                    },
+                    operator,
                     inputs: vec![self.lower(child)?],
                 }
             }
@@ -611,7 +621,7 @@ where
                 rhs,
                 operator,
                 timing: planner_types::post_asap::ExecutionTiming::ReadTime,
-            } if self.logical_source.is_some() => {
+            } if self.logical_source.is_some() || operator.checked_relative_division => {
                 let operator = logical::binary_operator(operator)?;
                 QueryPlanNode::Logical {
                     operator,
@@ -887,6 +897,7 @@ fn exact_readout(family: &SummaryFamilyType) -> Option<ExactReadout> {
         SummaryFamilyType::ExactAggregate(ExactKind::Increase, _) => Some(ExactReadout::Increase),
         SummaryFamilyType::ExactAggregate(ExactKind::Rate, _) => Some(ExactReadout::Rate),
         SummaryFamilyType::ExactAggregate(ExactKind::MinMax, _) => Some(ExactReadout::Max),
+        SummaryFamilyType::ExactAggregate(ExactKind::Min, _) => Some(ExactReadout::Min),
         _ => None,
     }
 }
@@ -970,7 +981,12 @@ pub(crate) fn exact_value_executable(node: &SummaryNode) -> bool {
                     && matches!(reduction, Reduction::PerEntity)
                     && matches!(
                         kind,
-                        ExactKind::Sum | ExactKind::Count | ExactKind::Increase | ExactKind::Rate
+                        ExactKind::Sum
+                            | ExactKind::Count
+                            | ExactKind::Increase
+                            | ExactKind::Rate
+                            | ExactKind::Min
+                            | ExactKind::MinMax
                     )
             } else {
                 // Raw producer grouping may move through additive reductions,
