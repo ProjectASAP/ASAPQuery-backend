@@ -216,7 +216,10 @@ pub fn stamp(
                 ("plan_id", "1".into()),
                 ("plan_version", "1".into()),
                 ("backend_compat", BACKEND_COMPAT.into()),
-                ("materialization", schema.materialization.0.to_string()),
+                (
+                    "materialization",
+                    schema.materialization.0.as_u64().to_string(),
+                ),
                 ("schema_id", schema.schema_id.clone()),
                 ("producer_id", "fixture".into()),
                 ("producer_epoch", "fixture".into()),
