@@ -361,6 +361,12 @@ pub struct DeploymentPlanCompiler {
     pub sketch_defaults: SketchDefaults,
 }
 
+impl Default for DeploymentPlanCompiler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeploymentPlanCompiler {
     pub fn new() -> Self {
         Self {

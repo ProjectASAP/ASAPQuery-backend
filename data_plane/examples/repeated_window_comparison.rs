@@ -86,6 +86,7 @@ fn workload(args: &Args, trial: usize) -> Vec<Vec<usize>> {
         .collect()
 }
 
+#[allow(clippy::type_complexity)]
 fn replay(path: &std::path::Path) -> Result<(Vec<Vec<usize>>, usize), Box<dyn std::error::Error>> {
     let contents = std::fs::read_to_string(path)?;
     let mut rows = Vec::new();
@@ -288,7 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     if args.window_panes.is_empty()
-        || args.window_panes.iter().any(|window| *window == 0)
+        || args.window_panes.contains(&0)
         || !args.window_panes.windows(2).all(|pair| pair[0] < pair[1])
         || args.panes < *args.window_panes.last().unwrap()
         || (args.input_tsv.is_none() && (args.events_per_pane == 0 || args.cardinality == 0))

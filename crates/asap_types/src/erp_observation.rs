@@ -91,7 +91,7 @@ impl EmpiricalFrequencyObservation {
         if self.sorted_counts.len() > 65_536
             || self.interval_counts.len() > 256
             || self.sorted_counts.is_empty()
-            || self.sorted_counts.iter().any(|n| *n == 0)
+            || self.sorted_counts.contains(&0)
             || self.sorted_counts.windows(2).any(|w| w[0] < w[1])
         {
             return None;

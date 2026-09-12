@@ -489,7 +489,7 @@ async fn handle_socket(
             let mut buf = Vec::with_capacity(1 + payload.len());
             buf.push(0u8);
             buf.extend_from_slice(&payload);
-            if ws_tx.send(Message::Binary(buf.into())).await.is_err() {
+            if ws_tx.send(Message::Binary(buf)).await.is_err() {
                 break;
             }
             info!(agent = %writer_id, message = %description, "message pushed (OpAMP protobuf)");

@@ -369,7 +369,7 @@ async fn execute_or_fallback(state: &ServerState, request: &ClickHouseQueryReque
                 .headers_mut()
                 .entry("x-asap-execution-detail")
                 .or_insert(axum::http::HeaderValue::from_static("asap"));
-            return response;
+            response
         }
         ClickHouseAccelerationOutcome::Fallback(reason) => {
             tracing::info!(

@@ -17,26 +17,16 @@ jobs:
     name: MVP backend
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # The full workspace links multiple DataFusion-heavy process test binaries.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
     steps:
       - name: Checkout ASAPQuery-backend
         uses: actions/checkout@v4
         with:
           path: ASAPQuery-backend
-
-      - name: Checkout ASAPCollector dependency
-        uses: actions/checkout@v4
-        with:
-          repository: ProjectASAP/ASAPCollector
-          path: ASAPCollector
-          token: ${{ secrets.ASAP_CI_REPO_TOKEN }}
-
-      - name: Checkout asap_sketchlib dependency
-        uses: actions/checkout@v4
-        with:
-          repository: ProjectASAP/asap_sketchlib
-          # PR #140: explicit interpolated DDS readout; includes #139 UnivMon compatibility.
-          ref: 8c03d7c68b7150710c79e70a6421971275614561
-          path: asap_sketchlib
 
       - name: Install Rust components
         run: rustup component add rustfmt clippy
@@ -57,39 +47,39 @@ jobs:
           # post-step can package `target`; registry/git inputs are sufficient.
           cache-targets: false
 
-      - name: Check formatting
+      - name: Check workspace formatting
         working-directory: ASAPQuery-backend
-        run: cargo fmt -p control_plane -p data_plane -- --check
+        # `--all` also follows this workspace's sibling path dependencies.
+        # Keep the gate scoped to every backend-owned workspace member.
+        run: cargo fmt -p control_plane -p data_plane -p asap_types -p asap_otel_proto -- --check
 
-      - name: Check control plane and data plane
+      - name: Check workspace
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo check -p control_plane -p data_plane
+        run: cargo check --workspace
 
-      - name: Lint control plane and data plane
+      - name: Lint workspace
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo clippy -p control_plane -p data_plane --all-targets
+        # Preserve the existing warning policy while expanding runtime coverage.
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Test MVP control plane
+      - name: Build process-test control plane
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
         working-directory: ASAPQuery-backend
-        run: cargo test -p control_plane
+        run: cargo build -p control_plane --bin control_plane
 
-      # Compiling the data plane is not evidence that it runs: plan
-      # installation, maintenance execution, persistence recovery and query
-      # routing all live in these library tests, and none of them were gated
-      # before. `--lib` deliberately excludes `data_plane/tests/`, which needs
-      # live ClickHouse / Prometheus / VictoriaMetrics endpoints.
-      - name: Test shared types and data plane
+      - name: Test workspace
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
-          # Several storage tests wait on background flusher / sealer threads.
-          # Hosted runners are small and noisy, so give those waits headroom;
-          # a passing wait still returns as soon as its condition holds.
+          # Give background flusher/sealer waits headroom on hosted runners.
           ASAP_TEST_TIMEOUT_SCALE: "4"
         working-directory: ASAPQuery-backend
-        run: cargo test -p asap_types -p data_plane --lib
+        # Persistence tests wait on background flushers with bounded deadlines.
+        # Match scripts/e2e.sh to avoid competing flushers exhausting those waits.
+        run: |
+          export ASAP_E2E_CONTROL_PLANE_BIN="$PWD/target/debug/control_plane"
+          cargo test --workspace -- --test-threads=1

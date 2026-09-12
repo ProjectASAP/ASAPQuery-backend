@@ -38,6 +38,12 @@ pub enum StoreError {
     NoPrevious(String, AggRole),
 }
 
+impl Default for PlanStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PlanStore {
     pub fn new() -> Self {
         Self {

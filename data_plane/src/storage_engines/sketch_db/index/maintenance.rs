@@ -1069,16 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn one_sid_with_two_populations_publishes_one_complete_global_summary() {
-        // Two logical populations share a physical sid. A global reduce over
-        // them is publishable exactly when EVERY population contributes the
-        // window — `read_complete_raw_maintenance_cohort` enumerates the whole
-        // durable population set and fails on the first one that is missing,
-        // so the reduce sees both or it sees nothing. The partial publication
-        // this test used to assert against is therefore unreachable here; what
-        // still has to hold is that the complete reduce publishes ONCE, with
-        // both populations' state in it, and that a later lifetime which
-        // repeats a logical population is still refused (second half).
+    fn complete_populations_publish_once_and_reject_foreign_generation() {
         let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
             "../../../../../docs/examples/asapquery-compatibility-demo-snapshot.json"
         ))
@@ -1117,7 +1108,7 @@ mod tests {
         config.delete_older_than_ms = None;
         config.hot_window_ms = None;
         let mut persistence = store.start_persistence(config).unwrap();
-        for instance in ["a", "b"] {
+        for (instance, value) in [("a", 5.0), ("b", 15.0)] {
             let population = BTreeMap::from([("instance".to_string(), instance.to_string())]);
             let coordinate = asap_types::sds::SummaryInstanceCoordinates {
                 summary_definition_id: source.policy_fingerprint().into(),
@@ -1134,9 +1125,7 @@ mod tests {
             output.population_labels = Some(population);
             output.catalog_generation = Some(Arc::clone(&generation));
             let mut sum = SumAccumulator::new();
-            // Distinct per-population values: a summary built from only one of
-            // them reads back as 5 or 7, never as the pair.
-            sum.update(if instance == "a" { 5.0 } else { 7.0 });
+            sum.update(value);
             store
                 .publish_admitted_summary_update(
                     &generation,
@@ -1181,8 +1170,7 @@ mod tests {
             )
             .unwrap();
         assert!(!frozen.singleton_population_complete);
-        // The read set is deterministic and all-or-nothing, independently of
-        // the routing decision that consumes it.
+        // The global reduction must consume both populations in one read set.
         let request = |name: &str| {
             (
                 700,
@@ -1222,6 +1210,7 @@ mod tests {
                 &[request("a"), request("absent")]
             )
             .is_err());
+        let parts_before = persistence.manifest.live_parts().len();
         let resolver = crate::drivers::ingest::series_resolver::SeriesIdResolver::new();
         crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
             &store,
@@ -1229,97 +1218,78 @@ mod tests {
             &plan.precompute_plan,
         )
         .unwrap();
-
-        // One target series, one output population (the global reduce erases
-        // the source grouping), one window.
-        let target_id = target.policy_fingerprint().into();
-        let target_sids = store.series_ids_for_policy(target.policy_fingerprint());
-        assert_eq!(target_sids.len(), 1, "one global output series");
+        let targets = store.series_ids_for_policy(target.policy_fingerprint());
+        assert_eq!(targets.len(), 1);
+        let target_sid = targets[0];
         let published = store
-            .completed_maintenance_coordinates(target_id, &generation)
+            .completed_maintenance_coordinates(target.policy_fingerprint().into(), &generation)
             .unwrap();
-        assert_eq!(published.len(), 1);
-        let groups = &published[&target_sids[0]];
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[&BTreeMap::new()], BTreeSet::from([(0, 60_000)]));
-
-        // The reduce consumed BOTH populations: the cohort the publication
-        // path reads is the whole durable population set for this window, and
-        // it carries the two distinct per-population sums. (Published summary
-        // state is sketch-encoded, and the immutable read-back path decodes
-        // exact accumulators only — the reduced VALUE is asserted against this
-        // same cohort contract by
-        // `precompute_engine::maintenance_runtime::tests`.)
-        let cohort = store
-            .read_complete_raw_maintenance_cohort(
-                &generation,
-                &BTreeSet::from([source_id]),
-                (0, 60_000),
-            )
-            .unwrap();
-        assert_eq!(cohort.inputs().len(), 2);
-        let contributions: Vec<(String, f64)> = cohort
-            .inputs()
-            .iter()
-            .map(|input| {
-                (
-                    input.group["instance"].clone(),
-                    input.windows[&(0, 60_000)]
-                        .query_statistic(
-                            asap_types::Statistic::Sum,
-                            &None,
-                            &std::collections::HashMap::new(),
-                        )
-                        .unwrap(),
-                )
-            })
-            .collect();
         assert_eq!(
-            contributions,
-            vec![("a".to_string(), 5.0), ("b".to_string(), 7.0)]
+            published,
+            BTreeMap::from([(
+                target_sid,
+                BTreeMap::from([(BTreeMap::new(), BTreeSet::from([(0, 60_000)]))]),
+            )])
         );
-
-        // Idempotent: a re-run republishes nothing and writes no new part.
-        let parts_after_publication = persistence.manifest.live_parts().len();
+        let assert_complete_output = |store: &SketchStore| {
+            use crate::precompute_engine::operators::DDSketchAccumulator;
+            use crate::storage_engines::sketch_db::data::SketchEncoding;
+            let rows = store.query_range(target_sid, 0, 60_000);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].series_label_values.is_empty());
+            assert_eq!(rows[0].samples.len(), 1);
+            let frames = &rows[0].samples[&60_000];
+            assert_eq!(frames.len(), 1);
+            let sketch = match frames[0].encoding {
+                SketchEncoding::MsgpackFull => {
+                    DDSketchAccumulator::from_msgpack_bytes(&frames[0].bytes).unwrap()
+                }
+                SketchEncoding::ProtoFull => {
+                    DDSketchAccumulator::from_sketchlib_proto_bytes(&frames[0].bytes).unwrap()
+                }
+                other => panic!("unexpected derived encoding: {other:?}"),
+            };
+            assert_eq!(sketch.inner.total_count(), 2);
+            for (q, expected) in [(0.0, 5.0), (1.0, 15.0)] {
+                let actual = sketch.inner.quantile(q).unwrap();
+                assert!((actual - expected).abs() <= expected * sketch.inner.wire_alpha());
+            }
+            frames[0].bytes.clone()
+        };
+        let bytes = assert_complete_output(&store);
+        assert_eq!(persistence.manifest.live_parts().len(), parts_before + 1);
         crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
             &store,
             &resolver,
             &plan.precompute_plan,
         )
         .unwrap();
-        assert_eq!(
-            persistence.manifest.live_parts().len(),
-            parts_after_publication
-        );
-        assert_eq!(
-            store
-                .completed_maintenance_coordinates(target_id, &generation)
-                .unwrap(),
-            published
-        );
-        assert_eq!(
-            store.series_ids_for_policy(target.policy_fingerprint()),
-            target_sids
-        );
-        // The published output is durable and committed, not left pending.
-        let records = store
-            .persistence_metadata
-            .read()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .load_strict()
-            .unwrap();
-        let published_target_sids: BTreeSet<u64> = records
-            .iter()
-            .filter(|record| !record.removed && record.summary_definition_id == Some(target_id))
-            .map(|record| record.sid)
-            .collect();
-        assert_eq!(published_target_sids.len(), 1);
-        assert!(records
-            .iter()
-            .all(|record| record.pending_immutable.is_none()));
+        assert_eq!(assert_complete_output(&store), bytes);
+        assert_eq!(persistence.manifest.live_parts().len(), parts_before + 1);
         persistence.shutdown();
+
+        // Replaying the same generation after recovery must reuse the output.
+        let recovered = Arc::new(SketchStore::new());
+        recovered
+            .install_summary_catalog(Arc::new(plan.summary_catalog.clone()))
+            .unwrap();
+        let mut recovery_config =
+            persistence::config::SketchStorePersistenceConfig::with_memory_limit(
+                1 << 24,
+                directory.path().to_path_buf(),
+            );
+        recovery_config.delete_older_than_ms = None;
+        recovery_config.hot_window_ms = None;
+        let mut recovery = recovered.start_persistence(recovery_config).unwrap();
+        crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
+            &recovered,
+            &resolver,
+            &plan.precompute_plan,
+        )
+        .unwrap();
+        assert_eq!(assert_complete_output(&recovered), bytes);
+        assert_eq!(recovery.manifest.live_parts().len(), parts_before + 1);
+        recovery.shutdown();
 
         // A catalog transition deliberately leaves old-generation payload
         // unbound on restart. It must still count against singleton proof.
@@ -1395,6 +1365,17 @@ mod tests {
         let mut next_plan = plan.precompute_plan.clone();
         next_plan.summary_catalog = Some(next_generation.as_ref().clone());
         let parts_before = restored.manifest.live_parts().len();
+        let durable_records = || {
+            restored
+                .flusher
+                .metadata_store()
+                .load_strict()
+                .unwrap()
+                .into_iter()
+                .map(|record| (record.sid, serde_json::to_value(record).unwrap()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let records_before = durable_records();
         assert!(
             crate::precompute_engine::maintenance_runtime::execute_finite_maintenance(
                 &restarted, &resolver, &next_plan
@@ -1405,27 +1386,7 @@ mod tests {
             .series_ids_for_policy(target.policy_fingerprint())
             .is_empty());
         assert_eq!(restored.manifest.live_parts().len(), parts_before);
-        let after_restart = restarted
-            .persistence_metadata
-            .read()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .load_strict()
-            .unwrap();
-        // The refused lifetime publishes nothing NEW: the durable target state
-        // is exactly what the earlier complete reduce committed.
-        assert_eq!(
-            after_restart
-                .iter()
-                .filter(|record| !record.removed && record.summary_definition_id == Some(target_id))
-                .map(|record| record.sid)
-                .collect::<BTreeSet<u64>>(),
-            published_target_sids
-        );
-        assert!(after_restart
-            .iter()
-            .all(|record| record.pending_immutable.is_none()));
+        assert_eq!(durable_records(), records_before);
         restored.shutdown();
     }
 

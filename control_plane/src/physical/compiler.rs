@@ -4606,7 +4606,7 @@ mod tests {
             assert_eq!(bindings.len(), 1);
             for collector in &bundle.collector_plans {
                 assert_eq!(collector.materializations.len(), 1);
-                assert!(bindings.contains(&collector.materializations[0].materialization.into()));
+                assert!(bindings.contains(&collector.materializations[0].materialization));
             }
         }
     }

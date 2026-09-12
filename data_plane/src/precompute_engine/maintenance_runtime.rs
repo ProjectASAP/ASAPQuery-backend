@@ -2910,6 +2910,8 @@ mod tests {
                 SketchStorePersistenceConfig::with_memory_limit(1 << 24, directory.path().into());
             config.delete_older_than_ms = None;
             config.hot_window_ms = None;
+            // Keep the background flush cadence well inside the seal deadline.
+            config.flush_interval = std::time::Duration::from_millis(5);
             config
         };
         let store = Arc::new(SketchStore::new());

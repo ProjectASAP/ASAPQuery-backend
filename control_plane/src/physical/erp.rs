@@ -56,7 +56,7 @@ impl ErpObservedShape {
     ) -> Option<Self> {
         let events = empirical.event_count()?;
         let counts = &empirical.sorted_counts;
-        let exponent = fit_zipf_exponent(&counts);
+        let exponent = fit_zipf_exponent(counts);
         let fits = [("uniform", 0.0), ("zipf", exponent)]
             .into_iter()
             // Zipf(0) is exactly uniform; duplicate models are not ambiguity.

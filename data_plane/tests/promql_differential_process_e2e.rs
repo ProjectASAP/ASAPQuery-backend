@@ -5,6 +5,9 @@
 //! backend ingests that sketch, and its public instant/range PromQL responses
 //! are compared with an independent exact quantile oracle over the raw values.
 
+#[path = "support/physical_fixture.rs"]
+mod physical_fixture;
+
 use std::io::Write;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
@@ -191,7 +194,7 @@ async fn production_backend_matches_raw_oracle_and_range_endpoint() {
       aggregated: []
     metric: differential_e2e_latency_ms
     parameters:
-      relativeAccuracy: 0.01
+      relative_accuracy: 0.01
     windowSize: 1
     windowType: tumbling
     spatialFilter: ''
@@ -199,7 +202,17 @@ async fn production_backend_matches_raw_oracle_and_range_endpoint() {
     )
     .expect("write streaming config");
 
+    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
+        &serde_yaml::from_slice(&std::fs::read(config.path()).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let install = physical_fixture::artifact(&runtime);
+    let mut physical = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&mut physical, &install).unwrap();
+
     let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
+        .arg("--physical-plan")
+        .arg(physical.path())
         .arg("--streaming-config")
         .arg(config.path())
         .arg("--http-port")
@@ -235,19 +248,19 @@ async fn production_backend_matches_raw_oracle_and_range_endpoint() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock");
-    // Both observations are genuinely in the past. The second identical
-    // fixture advances the event-time watermark and closes the first window
-    // without fabricating a future timestamp or introducing a zero-valued
-    // range sample that has no counterpart in the raw oracle.
-    let sample_ns = (now - Duration::from_secs(2)).as_nanos() as u64;
-    for body in [
-        ddsketch_export(METRIC, sample_ns, &raw_values),
-        ddsketch_export(METRIC, sample_ns + 1_000_000_000, &raw_values),
-    ] {
+    // Twenty-one complete panes cover every ten-second window in the
+    // instant/range comparison. Repeating the distribution preserves its quantile.
+    let sample_ns = (now - Duration::from_secs(2)).as_secs() * 1_000_000_000;
+    for seconds_ago in (0..=20).rev() {
+        let body = ddsketch_export(METRIC, sample_ns - seconds_ago * 1_000_000_000, &raw_values);
         client
             .post(format!("http://127.0.0.1:{otlp_http_port}/v1/metrics"))
             .header("content-type", "application/x-protobuf")
-            .body(body)
+            .body({
+                let mut request = ExportMetricsServiceRequest::decode(body.as_slice()).unwrap();
+                physical_fixture::stamp(&mut request, &install);
+                request.encode_to_vec()
+            })
             .send()
             .await
             .expect("POST modified OTLP")
@@ -259,7 +272,15 @@ async fn production_backend_matches_raw_oracle_and_range_endpoint() {
     let instant_url = format!("{query_base}/api/v1/query");
     let mut instant = Value::Null;
     for _ in 0..50 {
-        instant = get_json(&client, &instant_url, &[("query", query.clone())]).await;
+        instant = get_json(
+            &client,
+            &instant_url,
+            &[
+                ("query", query.clone()),
+                ("time", (sample_ns / 1_000_000_000).to_string()),
+            ],
+        )
+        .await;
         if first_instant(&instant).is_some() {
             break;
         }

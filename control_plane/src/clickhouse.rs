@@ -1379,7 +1379,8 @@ mod tests {
             2,
             ("variant", serde_json::json!(1)),
         );
-        let sds = SummaryCatalog::from_materializations(71, 1, &[config.clone()]).unwrap();
+        let sds =
+            SummaryCatalog::from_materializations(71, 1, std::slice::from_ref(&config)).unwrap();
         let envelope = crate::physical::compiler::PlanEnvelope {
             plan_id: 71,
             plan_version: 1,

@@ -274,7 +274,7 @@ where
             }
             self.nodes.insert(remap[&local], physical);
         }
-        return Ok(id);
+        Ok(id)
     }
 
     fn lower(&mut self, node: &Rc<SummaryNode>) -> Result<QueryNodeId, QueryPlanError> {

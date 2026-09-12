@@ -4,6 +4,9 @@
 //! OTLP DDSketch over HTTP, routes it through the precompute workers into the
 //! SketchStore, and answers a PromQL query from that stored sketch.
 
+#[path = "support/physical_fixture.rs"]
+mod physical_fixture;
+
 use std::io::Write;
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
@@ -128,7 +131,7 @@ async fn production_binary_ingests_ddsketch_and_answers_promql() {
       aggregated: []
     metric: component_process_e2e_latency_ms
     parameters:
-      relativeAccuracy: 0.01
+      relative_accuracy: 0.01
     windowSize: 1
     windowType: tumbling
     spatialFilter: ''
@@ -136,7 +139,17 @@ async fn production_binary_ingests_ddsketch_and_answers_promql() {
     )
     .expect("write streaming config");
 
+    let runtime = data_plane::storage_engines::types::StreamingConfig::from_yaml_data(
+        &serde_yaml::from_slice(&std::fs::read(config.path()).unwrap()).unwrap(),
+    )
+    .unwrap();
+    let install = physical_fixture::artifact(&runtime);
+    let mut physical = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&mut physical, &install).unwrap();
+
     let child = Command::new(env!("CARGO_BIN_EXE_data_plane"))
+        .arg("--physical-plan")
+        .arg(physical.path())
         .arg("--streaming-config")
         .arg(config.path())
         .arg("--http-port")
@@ -165,38 +178,39 @@ async fn production_binary_ingests_ddsketch_and_answers_promql() {
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock")
-        .as_nanos() as u64;
-    for body in [
-        ddsketch_export(
+        .as_secs()
+        * 1_000_000_000;
+    // Supply every pane in the queried ten-second interval.
+    for seconds_ago in (1..=10).rev() {
+        let body = ddsketch_export(
             "component_process_e2e_latency_ms",
-            now_ns.saturating_sub(3_000_000_000),
+            now_ns - seconds_ago * 1_000_000_000,
             vec![5, 10, 15, 20],
-        ),
-        ddsketch_export(
-            "component_process_e2e_latency_ms",
-            now_ns.saturating_sub(1_000_000_000),
-            Vec::new(),
-        ),
-    ] {
+        );
         let response = client
             .post(format!("http://127.0.0.1:{otlp_http_port}/v1/metrics"))
             .header("content-type", "application/x-protobuf")
-            .body(body)
+            .body({
+                let mut request = ExportMetricsServiceRequest::decode(body.as_slice()).unwrap();
+                physical_fixture::stamp(&mut request, &install);
+                request.encode_to_vec()
+            })
             .send()
             .await
             .expect("POST modified OTLP to production receiver");
-        assert!(
-            response.status().is_success(),
-            "OTLP status: {}",
-            response.status()
-        );
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "OTLP {status}: {body}");
     }
 
     let query = "quantile_over_time(0.99, component_process_e2e_latency_ms[10s])";
     for _ in 0..50 {
         let response: serde_json::Value = client
             .get(format!("{base}/api/v1/query"))
-            .query(&[("query", query)])
+            .query(&[
+                ("query", query.to_string()),
+                ("time", (now_ns / 1_000_000_000 - 1).to_string()),
+            ])
             .send()
             .await
             .expect("query production data plane")

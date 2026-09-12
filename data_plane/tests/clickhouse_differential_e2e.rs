@@ -70,7 +70,7 @@ async fn spawn_backend(
         .arg("--clickhouse-http-port")
         .arg(sql_port.to_string())
         .arg("--clickhouse-url")
-        .arg(&clickhouse_url)
+        .arg(clickhouse_url)
         .arg("--clickhouse-backfill-table")
         .arg("deployment_default_not_the_job_table")
         .arg("--clickhouse-backfill-database")

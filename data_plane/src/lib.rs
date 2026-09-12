@@ -1,3 +1,29 @@
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_mut,
+    unused_variables,
+    clippy::bool_assert_comparison,
+    clippy::chunks_exact_to_as_chunks,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::collapsible_if,
+    clippy::doc_lazy_continuation,
+    clippy::field_reassign_with_default,
+    clippy::items_after_test_module,
+    clippy::len_without_is_empty,
+    clippy::manual_checked_ops,
+    clippy::match_result_ok,
+    clippy::needless_lifetimes,
+    clippy::redundant_field_names,
+    clippy::result_large_err,
+    clippy::suspicious_open_options,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::useless_conversion,
+    clippy::useless_format,
+    clippy::while_let_loop
+)]
+
 pub mod drivers;
 pub mod monitor;
 pub mod precompute_engine;

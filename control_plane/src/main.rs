@@ -1,3 +1,5 @@
+#![allow(clippy::doc_lazy_continuation, clippy::type_complexity)]
+
 use control_plane::backend_client;
 use control_plane::clickhouse;
 use control_plane::emit;
@@ -2834,7 +2836,7 @@ mod api_tests {
         let online_store = init_online_store();
         let plan_store = Arc::new(PlanStore::new());
         let workload_store = Arc::new(WorkloadStore::new());
-        let opamp = Arc::new(OpampServer::new());
+        let _opamp = Arc::new(OpampServer::new());
         let scraper = Arc::new(Scraper::new(
             vec![],
             Thresholds::default(),
@@ -2934,10 +2936,10 @@ mod api_tests {
         ));
 
         // Build a workload registry with one entry matching the pre-populated plan.
-        let registry = Arc::new(WorkloadRegistry::load("/nonexistent")); // empty
-                                                                         // We'll create one inline with the correct metric name.
+        let _registry = Arc::new(WorkloadRegistry::load("/nonexistent")); // empty
+                                                                          // We'll create one inline with the correct metric name.
         let yaml = "- metric_name: http_latency\n  accuracy_sla: 0.01\n  assign_to_role: agent\n";
-        let entries: Vec<crate::workload::WorkloadEntry> = serde_yaml::from_str(yaml).unwrap();
+        let _entries: Vec<crate::workload::WorkloadEntry> = serde_yaml::from_str(yaml).unwrap();
         // WorkloadRegistry doesn't have a public constructor from entries, so we
         // test via the first_for_role interface that the on_connect path uses.
         // Bind the cells.

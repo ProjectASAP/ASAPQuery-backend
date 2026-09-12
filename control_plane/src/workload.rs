@@ -1148,7 +1148,8 @@ mod tests {
         // itself the bug, not something this test should keep pinning.
         // ASAPPlanner distinguishes heavy-hitter TopK from generic PromQL
         // ranking. Only the former is a sketchable TopK intent.
-        for q in ["topk(5, count_over_time(m[1m]))"] {
+        {
+            let q = "topk(5, count_over_time(m[1m]))";
             assert_eq!(
                 derive_agg_role(&entry("m", Some(q), None)),
                 AggRole::Topk,
@@ -1220,7 +1221,7 @@ mod tests {
         // workload store collapsed these onto one key and only the
         // last entry's plan survived; the (metric, role) keyed store
         // + per-entry role classification fixes that.
-        let entries = vec![
+        let entries = [
             entry(
                 "http_requests_total",
                 Some("sum by (zone) (http_requests_total)"),
