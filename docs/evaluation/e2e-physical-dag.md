@@ -39,10 +39,9 @@ Planner owns query semantics, summary families, parameters and candidate
 selection. ERP can affect supported evidence-based choices, but supplying an
 artifact does not prove that it was eligible or used. Freshness, source/update
 semantics, parameters and accuracy constraints still apply. The checked-in demo
-is not an empirical-ERP benchmark. For measured cost selection use the version-2
-snapshot workflow in [execution calibration](../../tools/o11y-execution/CALIBRATION.md).
-`compile_workload_artifact` deliberately requires that version; do not bypass it
-by relabeling demo costs as measured evidence.
+is not an empirical-ERP benchmark. For deployment, use the priced snapshot workflow in [execution calibration](../../tools/o11y-execution/CALIBRATION.md).
+`compile_workload_artifact` requires complete workload quotes; do not relabel
+demo costs as measured evidence.
 
 For the existing observation → ERP-selected KLL → installed HTTP correctness
 fixture, see [ERP process validation](../developer_docs/erp-process-validation.md):
@@ -62,8 +61,8 @@ Run the normal snapshot compiler, without selecting a candidate index or
 substituting a preferred sketch family:
 
 ```bash
-cargo run --locked -p control_plane --example inspect_physical_dag -- \
-  docs/examples/asapquery-compatibility-demo-snapshot.json \
+cargo run --locked -p control_plane --example compile_workload_artifact -- \
+  "$ASAPQUERY_PLANNING_SNAPSHOT" \
   > target/physical-dag-inspection/selected.json
 jq '.install_request' target/physical-dag-inspection/selected.json \
   > target/physical-dag-inspection/physical-plan.json
@@ -71,10 +70,12 @@ jq '.install_request | {summary_catalog, precompute_plan, query_plan}' \
   target/physical-dag-inspection/selected.json
 ```
 
-`inspect_physical_dag` calls the same `BackendLocalPlanningSnapshot::compile`
-entry point used by startup. It accepts the checked-in demonstration snapshot
-and labels its output `inspection_only`. `erp_input_supplied` reports only input
-presence. A null `cost_comparison` must not be interpreted as a measured win.
+`compile_workload_artifact` calls the same evidence-required snapshot compiler
+used by startup. Set `ASAPQUERY_PLANNING_SNAPSHOT` to a priced snapshot prepared
+using the [cost evidence workflow](../examples/workload-cost-evidence.md).
+The checked-in unquoted templates support candidate discovery only. The output
+includes the selected plan, logical selection trace and complete cost comparison.
+MetricsQL compilation requires quotes collected for that frontend.
 
 The compiler derives sibling plans from the selected post-ASAP DAG:
 
@@ -95,6 +96,7 @@ participate in identity, cost and coverage checks.
 For the simplest live run:
 
 ```bash
+export ASAPQUERY_PLANNING_SNAPSHOT=/absolute/path/priced-snapshot.json
 ./scripts/e2e.sh asapquery-demo
 ```
 
@@ -116,7 +118,7 @@ Then keep the backend running for inspection:
 ```bash
 cargo run --locked -p data_plane -- \
   --profile asapquery \
-  --planning-snapshot docs/examples/asapquery-compatibility-demo-snapshot.json \
+  --planning-snapshot "$ASAPQUERY_PLANNING_SNAPSHOT" \
   --prometheus-server http://127.0.0.1:9090 \
   --forward-unsupported-queries --http-port 9091 \
   --output-dir target/physical-dag-inspection/runtime
@@ -242,7 +244,7 @@ when comparing, `comparison.json`. A finished run is not proof of benefit.
 | Backend | Drop-in surface and current boundary |
 | --- | --- |
 | Prometheus | Remote Write v1 samples plus PromQL instant/range HTTP; keep Prometheus as the exact fallback and raw-data authority. The strict `asapquery` profile has explicit startup exclusions. |
-| VictoriaMetrics | The broader backend has a MetricsQL compile/adapter path. `inspect_physical_dag SNAPSHOT.json --metricsql` uses it. This does not turn the strict Prometheus profile into a general VM replacement; counter boundary semantics and unsupported expressions must retain exact routing. |
+| VictoriaMetrics | The broader backend has a MetricsQL compile/adapter path. `compile_workload_artifact SNAPSHOT.json --metricsql` uses it. This does not turn the strict Prometheus profile into a general VM replacement; counter boundary semantics and unsupported expressions must retain exact routing. |
 | ClickHouse | The broader backend has a SQL workload compiler and typed exact/relational execution. `compile_clickhouse_workload` reads its own `ClickHouseSqlAutomaticWorkload` JSON from stdin; it does not consume the Prometheus snapshot. List/Map/Tuple support does not imply arbitrary lambdas/counter SQL or full protocol compatibility. External-only DAG coverage is not summary acceleration. |
 
 Use the existing process suites to validate a specific supported protocol shape;
